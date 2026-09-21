@@ -22,6 +22,8 @@ class ProxySetupApp(Container):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("up", "focus_previous", "Up", show=False),
         Binding("down", "focus_next", "Down", show=False),
+        Binding("j", "focus_next", "Down", show=False),
+        Binding("k", "focus_previous", "Up", show=False),
     ]
 
     class ProxySetupClosed(Message):
@@ -54,9 +56,10 @@ class ProxySetupApp(Container):
                 self.inputs[key] = input_widget
                 yield input_widget
 
+            yield NoMarkupStatic("", id="proxysetup-error")
             yield NoMarkupStatic(
                 shortcut_hint(
-                    f"{shortcut('↑↓')} navigate  {shortcut('Enter')} save & exit  "
+                    f"{shortcut('↑↓/jk')} navigate  {shortcut('Enter')} save & exit  "
                     f"{shortcut('Esc')} cancel"
                 ),
                 classes="settings-help",
@@ -109,6 +112,9 @@ class ProxySetupApp(Container):
             != (self._settings.values.get(key) or "")
         }
         self.post_message(self.ProxySetupClosed(saved=True, changes=changes))
+
+    def show_error(self, message: str) -> None:
+        self.query_one("#proxysetup-error", NoMarkupStatic).update(message)
 
     def action_close(self) -> None:
         self.post_message(self.ProxySetupClosed(saved=False))

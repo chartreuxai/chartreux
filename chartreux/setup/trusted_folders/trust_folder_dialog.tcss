@@ -120,9 +120,8 @@ Screen {
 
 .trust-option {
     height: auto;
-    width: auto;
+    width: 100%;
     color: $foreground;
-    margin: 0 3;
     content-align: center middle;
 }
 

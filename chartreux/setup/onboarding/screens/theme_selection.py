@@ -15,8 +15,14 @@ from chartreux.ui.widgets.theme_picker import sorted_theme_names
 
 THEMES = sorted_theme_names()
 _TEXTUAL_THEME_MAP = {"auto": None, "light": "ansi-light", "dark": "ansi-dark"}
+THEME_EXPLANATIONS = (
+    "Auto follows your terminal or system preference.",
+    "Light keeps the interface bright.",
+    "Dark keeps the interface dim.",
+)
 
 VISIBLE_NEIGHBORS = 3
+MIN_HORIZONTAL_WIDTH = 62
 FADE_CLASSES = ["fade-1", "fade-2", "fade-3"]
 
 PREVIEW_MARKDOWN = """\
@@ -69,6 +75,7 @@ class ThemeSelectionScreen(OnboardingScreen):
         with Center(id="theme-outer"):
             with Vertical(id="theme-content"):
                 yield Static("Select your preferred theme", id="theme-title")
+                yield Static("\n".join(THEME_EXPLANATIONS), id="theme-explanations")
                 yield Center(
                     Horizontal(
                         Static(
@@ -90,11 +97,17 @@ class ThemeSelectionScreen(OnboardingScreen):
 
     def on_mount(self) -> None:
         self._update_display()
+        self._update_responsive_layout()
         self._update_preview_height()
         self.focus()
 
     def on_resize(self, _: Resize) -> None:
+        self._update_responsive_layout()
         self._update_preview_height()
+
+    def _update_responsive_layout(self) -> None:
+        row = self.query_one("#theme-row", Horizontal)
+        row.set_class(self.app.size.width < MIN_HORIZONTAL_WIDTH, "narrow")
 
     def _update_preview_height(self) -> None:
         preview = self.query_one("#preview", Container)

@@ -89,6 +89,7 @@ from chartreux.core.proxy_setup import (
     get_current_proxy_settings,
     set_proxy_var,
     unset_proxy_var,
+    validate_proxy_var,
 )
 from chartreux.core.session_types import ScheduledLoop as CoreScheduledLoop
 
@@ -478,6 +479,8 @@ class ResourceRequestHandler:
         self._require_session(params.session_id)
 
         def write() -> None:
+            for key, value in params.changes.items():
+                validate_proxy_var(key, value)
             for key, value in params.changes.items():
                 if value:
                     set_proxy_var(key, value)

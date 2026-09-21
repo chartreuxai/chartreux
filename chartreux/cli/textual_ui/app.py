@@ -337,6 +337,37 @@ class _ProviderConfigService:
             return config_persist_result(False, "Could not save the active model.")
         return config_persist_result(True)
 
+    def validate_active_selection(self, expression: str | None) -> str | None:
+        """Return an actionable error unless the selection is usable at runtime."""
+        try:
+            load_catalog = import_module(
+                "chartreux.core.model_catalog.loader"
+            ).load_catalog
+            model_resolver = import_module(
+                "chartreux.core.model_catalog.resolver"
+            ).ModelResolver
+            resolve_api_key = import_module("chartreux.utils.api_keys").resolve_api_key
+            missing_api_key_error = import_module(
+                "chartreux.core.config.models"
+            ).MissingAPIKeyError
+            selected = (
+                expression
+                if expression is not None
+                else self._app.config.active_model_expression
+            ) or self._app.config.default_model_alias
+            resolved = model_resolver(load_catalog()).resolve(
+                selected, allowed_models=self._app.config.allowed_models
+            )
+            if resolved.provider.api_key_env_var and not resolve_api_key(
+                resolved.provider.api_key_env_var
+            ):
+                raise missing_api_key_error(
+                    resolved.provider.api_key_env_var, resolved.deployment.provider
+                )
+        except (RuntimeError, ValueError) as error:
+            return str(error)
+        return None
+
 
 def persist_api_key_for_provider(env_var: str, key: str) -> str:
     """Persist an explicit provider key while retaining session-only fallback."""
@@ -1976,9 +2007,12 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if not message.saved:
             await self._mount_and_scroll(UserCommandMessage("Proxy setup cancelled."))
         else:
-            await self._run_settings_update(
-                "proxy settings", partial(self._persist_proxy, message.changes)
-            )
+            try:
+                await self._persist_proxy(message.changes)
+            except Exception as exc:
+                logger.warning("Proxy settings update was rejected: %s", exc)
+                self.query_one(ProxySetupApp).show_error(str(exc))
+                return
 
         await self._switch_to_input_app()
 
@@ -3082,6 +3116,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 config=_ProviderConfigService(self),
                 snapshot=catalog_loader.load_catalog(),
                 management=True,
+                validate_selection=_ProviderConfigService(
+                    self
+                ).validate_active_selection,
+                initial_active_model=self.config.active_model_expression,
                 tls=contracts.TLSConfig(
                     enable_system_trust_store=self.config.enable_system_trust_store
                 ),

@@ -6,6 +6,7 @@ import os
 import sys
 
 from chartreux import __version__
+from chartreux.cli.cli import has_usable_terminal
 from chartreux.core.config.harness_files import init_harness_files_manager
 from chartreux.core.paths import HISTORY_FILE, LITERAL_LOG_FILE, LOG_FILE
 from chartreux.observability.logging import init_file_logging, logger
@@ -26,7 +27,11 @@ def parse_arguments() -> Arguments:
     parser.add_argument(
         "-v", "--version", action="version", version=f"%(prog)s {__version__}"
     )
-    parser.add_argument("--setup", action="store_true", help="Setup API key and exit")
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="Run interactive setup: theme, providers, API keys, and model selection.",
+    )
     args = parser.parse_args()
     return Arguments(setup=args.setup)
 
@@ -55,6 +60,13 @@ def main() -> None:
     bootstrap_config_files()
     args = parse_arguments()
     if args.setup:
+        if not has_usable_terminal():
+            print(
+                "Interactive setup requires a terminal. Run `chartreux-acp --setup` "
+                "from an interactive terminal.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         run_onboarding()
         sys.exit(0)
 

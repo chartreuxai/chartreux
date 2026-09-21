@@ -710,6 +710,7 @@ def test_run_cli_setup_resolves_config_before_onboarding(
     calls: list[str] = []
 
     monkeypatch.setattr(cli_mod, "bootstrap_config_files", lambda: None)
+    monkeypatch.setattr(cli_mod, "has_usable_terminal", lambda: True)
 
     def load_config() -> ConfigOrchestrator[ChartreuxConfigSchema]:
         calls.append("config")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pydantic import Field
+
 from chartreux.app_server._model import ProtocolModel
 from chartreux.config_values import (
     THINKING_LEVELS as THINKING_LEVELS,
@@ -22,6 +24,8 @@ class ProxySettingsView(ProtocolModel):
 
 class ConfigView(ProtocolModel):
     active_model: ModelConfigView
+    active_model_expression: str = ""
+    allowed_models: list[str] = Field(default_factory=list)
     # Whether the user has pinned a specific model, vs. the "default" (unpinned)
     active_model_pinned: bool
     default_model_alias: str

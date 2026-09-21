@@ -110,7 +110,11 @@ def parse_arguments() -> argparse.Namespace:
         "for human-readable (default), 'json' for all messages at end, "
         "'streaming' for newline-delimited JSON per message.",
     )
-    parser.add_argument("--setup", action="store_true", help="Setup API key and exit")
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="Run interactive setup: theme, providers, API keys, and model selection.",
+    )
     parser.add_argument(
         "--workdir",
         type=Path,

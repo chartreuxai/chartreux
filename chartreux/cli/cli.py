@@ -30,6 +30,11 @@ if TYPE_CHECKING:
     from chartreux.app_server.local import LocalSessionIntent
 
 
+def has_usable_terminal() -> bool:
+    """Return whether the full-screen setup UI can use both terminal streams."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def get_prompt_from_stdin() -> str | None:
     """Read piped input before mode selection without changing stdin."""
     if sys.stdin.isatty():
@@ -84,7 +89,7 @@ def require_api_key_or_onboard(
     try:
         orchestrator.config.require_active_provider_api_key()
         return orchestrator
-    except MissingAPIKeyError as e:
+    except (MissingAPIKeyError, ValueError) as e:
         if not interactive:
             print(
                 f"Error: {e}. Set the environment variable (e.g. in ~/.chartreux/.env "
@@ -292,6 +297,13 @@ def run_cli(args: argparse.Namespace) -> None:
 
     if args.setup:
         bootstrap_config_files()
+        if not has_usable_terminal():
+            print(
+                "Interactive setup requires a terminal. Run `chartreux --setup` "
+                "from an interactive terminal.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         from chartreux.setup.onboarding import run_onboarding
 
         orchestrator = load_config_orchestrator_or_exit()
@@ -310,14 +322,17 @@ def run_cli(args: argparse.Namespace) -> None:
     )
     bootstrap_config_files()
 
+    if not is_programmatic:
+        restore_interactive_stdin(stdin_isatty=stdin_isatty)
+
     try:
         require_api_key_or_onboard(
-            load_config_orchestrator_or_exit(), interactive=not is_programmatic
+            load_config_orchestrator_or_exit(),
+            interactive=not is_programmatic and has_usable_terminal(),
         )
         if is_programmatic:
             _run_programmatic_mode(args=args, stdin_prompt=stdin_prompt)
         else:
-            restore_interactive_stdin(stdin_isatty=stdin_isatty)
             _run_interactive_mode(args=args, stdin_prompt=stdin_prompt)
 
     except (KeyboardInterrupt, EOFError):

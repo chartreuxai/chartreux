@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 import sys
-from typing import Any
+from typing import Any, cast
 
 from rich import print as rprint
 from textual.app import App
 
-from chartreux.core.config import ChartreuxConfigSchema, ProviderConfig
+from chartreux.core.config import (
+    ChartreuxConfigSchema,
+    MissingAPIKeyError,
+    ProviderConfig,
+)
 from chartreux.core.config.default_orchestrator import build_default_orchestrator
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.model_catalog.discovery import discover_models
@@ -92,6 +97,23 @@ class OnboardingConfigService:
             return ConfigPersistResult(False, str(error))
         return ConfigPersistResult(True)
 
+    def validate_active_selection(self, expression: str | None) -> str | None:
+        """Return an error unless the effective active model can run."""
+        try:
+            config = self.orchestrator.config.model_copy(
+                update={
+                    "active_model": (
+                        expression
+                        if expression is not None
+                        else self.orchestrator.config.active_model
+                    )
+                }
+            ).attach_catalog_snapshot(load_catalog())
+            config.require_active_provider_api_key()
+        except (MissingAPIKeyError, ValueError) as error:
+            return str(error)
+        return None
+
     async def reload_catalog_and_config(self) -> ConfigReloadResult:
         try:
             await self.orchestrator.reload()
@@ -126,6 +148,7 @@ class OnboardingApp(App[ProviderFlowResult | OnboardingFailure | None]):
         self._catalog_writer = catalog_writer or CatalogStore()
         self._credentials = credentials or OnboardingCredentialService(config.provider)
         self._initial_theme = resolve_theme_name(config.theme)
+        self._theme_persisted = False
         resolve_auto_theme()
         self._resolved_theme = resolve_theme(self._initial_theme)
         self._host = OnboardingHost(self._show_theme, self._confirm_theme, self._cancel)
@@ -166,8 +189,15 @@ class OnboardingApp(App[ProviderFlowResult | OnboardingFailure | None]):
         config_service = await self._services()
         persisted = await config_service.persist_theme(theme)
         if not persisted.persisted:
-            self.exit(None)
+            self.exit(
+                OnboardingFailure(
+                    "Could not save the selected theme: "
+                    f"{persisted.message or 'unknown error'}"
+                )
+            )
             return
+        self._theme_persisted = True
+        validator = getattr(config_service, "validate_active_selection", None)
         result = await self.push_screen_wait(
             ProviderManagementScreen(
                 discovery=self._discovery,
@@ -175,6 +205,16 @@ class OnboardingApp(App[ProviderFlowResult | OnboardingFailure | None]):
                 credentials=self._credentials,
                 config=config_service,
                 snapshot=load_catalog(),
+                validate_selection=cast(
+                    Callable[[str | None], str | None] | None,
+                    validator if callable(validator) else None,
+                ),
+                initial_active_model=(
+                    self._orchestrator.config.active_model
+                    if self._orchestrator is not None
+                    else None
+                ),
+                initial_step="picker" if self._config.repair_active_model else None,
                 tls=TLSConfig(
                     enable_system_trust_store=self._config.enable_system_trust_store
                 ),
@@ -191,6 +231,12 @@ class OnboardingApp(App[ProviderFlowResult | OnboardingFailure | None]):
                     )
                 )
                 return
+        if (
+            result.status == "cancelled"
+            and self._theme_persisted
+            and not result.changed
+        ):
+            result = replace(result, changed=True)
         self.exit(result)
 
 
@@ -214,11 +260,11 @@ def run_onboarding(
         if result.warning:
             rprint(f"\n[yellow]{result.warning}[/]")
         if result.status == "cancelled":
-            rprint("\n[yellow]Setup cancelled. See you next time![/]")
+            if result.changed:
+                rprint("\n[yellow]Setup closed. Saved changes were kept.[/]")
+            else:
+                rprint("\n[yellow]Setup cancelled. See you next time![/]")
             sys.exit(0)
-        rprint(
-            '\nSetup complete 🎉. Run "chartreux" to start using the Chartreux CLI.\n'
-        )
     elif isinstance(result, str) and result != "completed":
         # Compatibility for programmatic callers that supply a minimal setup app.
         asyncio.run(
@@ -230,4 +276,16 @@ def run_onboarding(
             )
         )
     asyncio.run(resolved_orchestrator.reload())
+    try:
+        resolved_orchestrator.config.require_active_provider_api_key()
+    except (MissingAPIKeyError, ValueError) as error:
+        rprint(
+            f"\n[red]Setup could not activate the selected provider: {error}. "
+            "Run `chartreux --setup` to choose a usable model or configure its credential.[/]\n"
+        )
+        sys.exit(1)
+    if isinstance(result, ProviderFlowResult):
+        rprint(
+            '\nSetup complete 🎉. Run "chartreux" to start using the Chartreux CLI.\n'
+        )
     return resolved_orchestrator

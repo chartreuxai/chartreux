@@ -43,7 +43,11 @@ On its first run, Chartreux creates `~/.chartreux/config.toml` for your
 selections; built-in defaults remain effective until you add overrides. It also
 creates `~/.chartreux/.env`. Interactive onboarding presents a welcome and theme
 selection, then uses the shared provider-management flow to select a provider
-and enter its credentials; Mistral is the default route. Entered credentials are
+and enter its credentials; Mistral is the default route. It then probes the
+provider for available chat models and lets you choose from a searchable list,
+with already-configured models preselected and non-chat models such as embeddings
+filtered out. Finally, select the active model; the current selection is
+preselected, and `Default` is available when none is set. Entered credentials are
 stored in that `.env` file. You can run the onboarding explicitly with:
 
 ```bash

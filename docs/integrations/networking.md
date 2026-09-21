@@ -2,7 +2,9 @@
 
 Chartreux-owned HTTP clients use proxy settings from the process environment.
 You may set them in the launching shell or in `$CHARTREUX_HOME/.env`; the
-terminal `/proxy-setup` interface writes the supported values there.
+terminal `/proxy-setup` interface validates the full batch of supported settings
+before writing any values there; if a field is invalid, it keeps the editor open
+and shows the error without partial writes.
 
 ## Proxy variables
 

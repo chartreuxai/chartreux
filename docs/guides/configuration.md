@@ -46,7 +46,10 @@ A provider declares the name of its credential variable. For example, the shippe
 export MISTRAL_API_KEY="your-api-key"
 ```
 
-Run `chartreux --setup` to bootstrap setup and save a configured provider key in `$CHARTREUX_HOME/.env`, or create that file yourself:
+Run `chartreux --setup` from an interactive terminal to select a theme,
+provider, credentials, and models, then save the configured provider key in
+`$CHARTREUX_HOME/.env`; otherwise, setup prints actionable guidance instead of
+launching the TUI. You can also create that file yourself:
 
 ```dotenv
 MISTRAL_API_KEY=your-api-key

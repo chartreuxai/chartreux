@@ -89,10 +89,12 @@ def wait_for_request_count_while_draining_child_output(
     while time.monotonic() - start < timeout:
         if request_count_getter() >= expected_count:
             return
-        try:
-            child.expect(r"\S", timeout=0.05)
-        except pexpect.TIMEOUT:
-            pass
+        if drain_child_output(child):
+            rendered_tail = strip_ansi(captured.getvalue())[-1200:]
+            raise AssertionError(
+                "Child exited while waiting for "
+                f"{expected_count} backend request(s).\n\nRendered tail:\n{rendered_tail}"
+            )
     rendered_tail = strip_ansi(captured.getvalue())[-1200:]
     raise AssertionError(
         f"Timed out waiting for {expected_count} backend request(s).\n\n"
@@ -104,6 +106,33 @@ def wait_for_main_screen(child: pexpect.spawn, timeout: float = 20.0) -> None:
     child.expect(ansi_tolerant_pattern("Chartreux v"), timeout=timeout)
 
 
+def drain_child_output(child: pexpect.spawn, *, idle_sleep: float = 0.05) -> bool:
+    """Read all currently-available child output into the capture log.
+
+    ``pexpect.spawn.expect`` only reads until its pattern matches, so it leaves
+    large render bursts sitting in the kernel PTY buffer. A Textual app driven
+    through a pexpect PTY can re-render whole screens on each cursor move; once
+    that output exceeds the PTY buffer the app's writer thread blocks on
+    ``write()``, and the app then deadlocks on shutdown
+    (``driver.close`` -> ``WriterThread.stop`` -> ``join``). Draining the PTY
+    keeps the writer thread unblocked.
+
+    Returns ``True`` if the child reached EOF while draining.
+    """
+    eof = False
+    while True:
+        try:
+            child.read_nonblocking(size=65536, timeout=0)
+        except pexpect.TIMEOUT:
+            break
+        except pexpect.EOF:
+            eof = True
+            break
+    if not eof:
+        time.sleep(idle_sleep)
+    return eof
+
+
 def wait_for_rendered_text(
     child: pexpect.spawn, captured: io.StringIO, needle: str, timeout: float
 ) -> None:
@@ -111,15 +140,11 @@ def wait_for_rendered_text(
     while time.monotonic() - start < timeout:
         if needle in strip_ansi(captured.getvalue()):
             return
-        try:
-            child.expect(r"\S", timeout=0.1)
-        except pexpect.TIMEOUT:
-            pass
-        except pexpect.EOF as exc:
+        if drain_child_output(child):
             rendered_tail = strip_ansi(captured.getvalue())[-1200:]
             raise AssertionError(
                 f"Child exited while waiting for rendered text: {needle!r}\n\nRendered tail:\n{rendered_tail}"
-            ) from exc
+            )
     rendered_tail = strip_ansi(captured.getvalue())[-1200:]
     raise AssertionError(
         f"Timed out waiting for rendered text: {needle!r}\n\nRendered tail:\n{rendered_tail}"

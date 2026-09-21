@@ -28,6 +28,7 @@ from chartreux.ui.providers.contracts import (
     TLSConfig,
 )
 from chartreux.ui.providers.flow import ProviderManagementScreen
+from chartreux.ui.widgets.navigable_option_list import NavigableOptionList
 from tests.conftest import build_test_agent_loop, build_test_chartreux_app
 from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_mcp_registry import FakeMCPRegistry
@@ -129,6 +130,15 @@ async def _wait_for(pilot, predicate, *, attempts: int = 50) -> None:  # type: i
     raise AssertionError("Timed out waiting for the expected UI state")
 
 
+async def _choose_active_model(  # type: ignore[no-untyped-def]
+    pilot, flow: ProviderManagementScreen, expression: str
+) -> None:
+    picker = flow.query_one("#active-model", NavigableOptionList)
+    picker.highlighted = picker.get_option_index(expression)
+    picker.focus()
+    await pilot.press("enter")
+
+
 async def _add_generic_provider(
     pilot,
     flow: ProviderManagementScreen,
@@ -208,8 +218,7 @@ async def test_provider_flow_adopts_unknown_model_through_real_disk_orchestrator
             )
             flow._show("picker")
             await pilot.pause()
-            flow.query_one("#active-model", Select).value = "unknown-wire"
-            flow._finish()
+            await _choose_active_model(pilot, flow, "unknown-wire")
             await pilot.pause()
             await pilot.pause()
 
@@ -308,8 +317,7 @@ async def test_provider_flow_recovers_catalog_validation_and_surfaces_reload_fai
         assert flow.step == "again"
         flow._show("picker")
         await pilot.pause()
-        flow.query_one("#active-model", Select).value = "good-wire"
-        flow._finish()
+        await _choose_active_model(pilot, flow, "good-wire")
         await pilot.pause()
         await pilot.pause()
         assert flow.step == "picker"
@@ -346,8 +354,7 @@ async def test_providers_host_completion_preserves_transcript_and_agent_state(
         await _add_generic_provider(pilot, screen, name="Hosted", wire="hosted-wire")
         screen._show("picker")
         await pilot.pause()
-        screen.query_one("#active-model", Select).value = "glm-5-2"
-        screen._finish()
+        await _choose_active_model(pilot, screen, "glm-5-2")
         for _ in range(50):
             await pilot.pause()
             if app.screen is not screen:

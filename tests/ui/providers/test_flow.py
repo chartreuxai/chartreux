@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import pytest
 from textual.app import App, ComposeResult
-from textual.widgets import Input, Select, SelectionList, Static
+from textual.widgets import Button, Input, Select, SelectionList, Static
 
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.schema import ModelCatalog
@@ -80,10 +80,14 @@ class FlowHost(App[ProviderFlowResult | None]):
 
 
 def snapshot(
-    *, models: dict[str, object] | None = None, tags: dict[str, list[str]] | None = None
+    *,
+    models: dict[str, object] | None = None,
+    tags: dict[str, list[str]] | None = None,
+    providers: dict[str, object] | None = None,
 ) -> CatalogSnapshot:
     catalog = ModelCatalog.model_validate({
-        "providers": {
+        "providers": providers
+        or {
             "example/default": {"api_base": "https://example.test/v1"},
             "mistral/default": {
                 "api_base": "https://api.mistral.ai/v1",
@@ -104,6 +108,7 @@ def make_flow(
     *,
     catalog: CatalogSnapshot | None = None,
     management: bool = False,
+    validate_selection: Callable[[str | None], str | None] | None = None,
 ) -> tuple[ProviderManagementScreen, FakeServices]:
     effective_snapshot = catalog or snapshot(
         models={
@@ -118,6 +123,7 @@ def make_flow(
         config=services,
         snapshot=effective_snapshot,
         management=management,
+        validate_selection=validate_selection,
     ), services
 
 
@@ -164,8 +170,7 @@ async def test_complete_flow_end_to_end_returns_typed_dismiss_result() -> None:
         await wait_for(
             pilot, lambda: flow.step == "picker" and bool(flow.query("#active-model"))
         )
-        flow.query_one("#active-model", Select).value = "wire"
-        flow._finish()
+        flow._finish("wire")
         await wait_for(
             pilot,
             lambda: (
@@ -174,6 +179,76 @@ async def test_complete_flow_end_to_end_returns_typed_dismiss_result() -> None:
         )
     assert services.changes and services.changes[0].provider_id == "example-2/default"
     assert host.results == [ProviderFlowResult("completed", "wire", changed=True)]
+
+
+@pytest.mark.asyncio
+async def test_onboarding_mistral_uses_existing_backend_and_persists_its_key() -> None:
+    catalog = snapshot(
+        models={
+            "mistral-wire": {
+                "deployments": [{"provider": "mistral/default", "name": "mistral-wire"}]
+            }
+        }
+    )
+    flow, services = make_flow(
+        (DiscoveryResult((DiscoveryItem("mistral-wire"),)),), catalog=catalog
+    )
+    host = FlowHost(flow)
+    async with host.run_test() as pilot:
+        flow.query_one("#mistral", Button).press()
+        await wait_for(
+            pilot, lambda: flow.step == "credential" and bool(flow.query("#key"))
+        )
+        assert flow.provider is not None
+        assert flow.provider.provider_id == "mistral/default"
+        assert flow.provider.api_key_env_var == "MISTRAL_API_KEY"
+        flow.query_one("#key", Input).value = "mistral-secret"
+        flow._save_credential()
+        await wait_for(
+            pilot, lambda: flow.step == "models" and bool(flow.query("#models"))
+        )
+        flow.query_one("#models", SelectionList).select("mistral-wire")
+        flow._save_model_selection()
+        await wait_for(
+            pilot, lambda: flow.step == "review" and bool(flow.query("#detail-model"))
+        )
+        flow._commit()
+        await wait_for(pilot, lambda: flow.step == "again")
+        flow._show("picker")
+        await wait_for(pilot, lambda: bool(flow.query("#active-model")))
+        flow._finish("mistral-wire")
+        await wait_for(pilot, lambda: bool(host.results))
+    assert services.saved_keys == [("MISTRAL_API_KEY", "mistral-secret")]
+    assert services.changes == []
+    assert services.active_models == ["mistral-wire"]
+    assert host.results == [
+        ProviderFlowResult("completed", "mistral-wire", changed=True)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_onboarding_mistral_falls_back_to_add_preset_without_existing_backend() -> (
+    None
+):
+    flow, _services = make_flow(
+        catalog=snapshot(
+            providers={"example/default": {"api_base": "https://example.test/v1"}}
+        )
+    )
+    async with FlowHost(flow).run_test() as pilot:
+        flow.query_one("#mistral", Button).press()
+        await wait_for(
+            pilot, lambda: flow.step == "form" and bool(flow.query("#preset"))
+        )
+        assert flow.provider is not None
+        assert flow.provider.provider_id == "mistral/default"
+
+
+def test_manual_mistral_preset_still_deduplicates_existing_provider() -> None:
+    flow, _services = make_flow(management=True)
+    flow._apply_preset("mistral")
+    assert flow.provider is not None
+    assert flow.provider.provider_id == "mistral-2/default"
 
 
 @pytest.mark.asyncio
@@ -246,11 +321,11 @@ async def test_searchable_selection_filters_500_models_and_commits_filtered_wire
     async with FlowHost(flow).run_test() as pilot:
         flow._show("models")
         await pilot.pause()
-        flow.query_one("#search", Input).value = "MODEL-123"
+        flow.query_one("#search", Input).value = "model-123"
         await pilot.pause()
         assert (
             str(flow.query_one("#model-count", Static).render())
-            == "1 models — type to filter"
+            == "1 of 500 chat models"
         )
         models = flow.query_one("#models", SelectionList)
         models.select("model-123")
@@ -260,9 +335,7 @@ async def test_searchable_selection_filters_500_models_and_commits_filtered_wire
 
 
 @pytest.mark.asyncio
-async def test_optional_details_aliases_and_ordered_tag_membership_are_committed() -> (
-    None
-):
+async def test_optional_details_aliases_and_tag_membership_are_committed() -> None:
     catalog = snapshot(
         models={
             "first": {
@@ -286,9 +359,6 @@ async def test_optional_details_aliases_and_ordered_tag_membership_are_committed
         flow.query_one("#tags", Input).value = "preferred"
         flow._save_details()
         await pilot.pause()
-        flow._detail_tag = "preferred"
-        flow._move_tag(-1)
-        await pilot.pause()
         flow._commit()
         await pilot.pause()
     changes = services.changes[0]
@@ -297,8 +367,8 @@ async def test_optional_details_aliases_and_ordered_tag_membership_are_committed
     assert changes.models["third"]["aliases"] == ["third-alias"]
     assert changes.tags is not None and changes.tags["preferred"] == (
         "first",
-        "third",
         "second",
+        "third",
     )
 
 
@@ -341,10 +411,20 @@ def test_match_state_rendering_covers_existing_alias_occupied_and_multiple() -> 
         "",
         None,
     )
-    assert "Already configured as" in flow._model_label(DiscoveryItem("existing"))
-    assert "alias of configured" in flow._model_label(DiscoveryItem("zai-glm-5-3"))
-    assert "occupied slot" in flow._model_label(DiscoveryItem("occupied"))
-    assert "multiple matches" in flow._model_label(DiscoveryItem("same"))
+    assert (
+        flow._model_label(DiscoveryItem("existing")) == "existing\taliases: zai-glm-5-3"
+    )
+    assert flow._configured_base(DiscoveryItem("zai-glm-5-3")) == "configured"
+    assert flow._configured_base(DiscoveryItem("occupied")) is None
+    assert flow._configured_base(DiscoveryItem("same")) is None
+    flow.discovered = (
+        DiscoveryItem("existing"),
+        DiscoveryItem("zai-glm-5-3"),
+        DiscoveryItem("text-embedding-3-small"),
+        DiscoveryItem("voxtral-mini"),
+    )
+    assert [item.wire_id for item in flow._picker_items()] == ["existing"]
+    assert flow._is_configured_model(DiscoveryItem("existing"))
 
 
 @pytest.mark.asyncio
@@ -367,7 +447,7 @@ async def test_final_picker_uses_expressions_and_shows_disabled_entries() -> Non
         flow._show("picker")
         await pilot.pause()
         values = [value for _label, value in flow._active_model_options()]
-        assert values == ["usable", "u", "@preferred"]
+        assert values == ["usable", "@preferred"]
         assert any(
             "disabled (model disabled)" in str(item.render())
             for item in flow.query(Static)
@@ -405,8 +485,7 @@ async def test_mistral_shared_key_confirmation_preserves_entered_key() -> None:
         await pilot.pause()
         flow._show("picker")
         await pilot.pause()
-        flow.query_one("#active-model", Select).value = "mistral-wire"
-        flow._finish()
+        flow._finish("mistral-wire")
         await pilot.pause()
         await pilot.pause()
     assert services.saved_keys == [("MISTRAL_API_KEY", "mistral-secret")]

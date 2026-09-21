@@ -6,17 +6,13 @@ from typing import Any, ClassVar, cast
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import (
-    Center,
-    CenterMiddle,
-    Horizontal,
-    Vertical,
-    VerticalScroll,
-)
+from textual.containers import Center, CenterMiddle, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Static
 
 from chartreux.app_server.models import WorkspaceTrustDecision
+from chartreux.config_values import DEFAULT_THEME, LIGHT_THEME
+from chartreux.ui._theme_detection import resolve_theme
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
@@ -159,7 +155,7 @@ class TrustFolderDialog(CenterMiddle):
                         classes="trust-dialog-repo-root",
                     )
 
-                with Horizontal(id="trust-options-container"):
+                with Vertical(id="trust-options-container"):
                     for idx, (_decision, label) in enumerate(self._options):
                         widget = NoMarkupStatic(
                             f"  {idx + 1}. {label}", classes="trust-option"
@@ -169,7 +165,8 @@ class TrustFolderDialog(CenterMiddle):
 
                 yield NoMarkupStatic(
                     shortcut_hint(
-                        f"{shortcut('←→')} navigate  {shortcut('Enter')} select"
+                        f"{shortcut('←→')} navigate  {shortcut('Enter')} select  "
+                        f"{shortcut('1-3')} choose  {shortcut('Esc')} cancel"
                     ),
                     classes="trust-dialog-help",
                 )
@@ -198,7 +195,7 @@ class TrustFolderDialog(CenterMiddle):
             is_selected = idx == self.selected_option
 
             cursor = "› " if is_selected else "  "
-            widget.update(f"{cursor}{label}")
+            widget.update(f"{cursor}{idx + 1}. {label}")
 
             widget.remove_class("trust-cursor-selected")
             widget.remove_class("trust-option-selected")
@@ -237,6 +234,7 @@ class TrustFolderApp(App[TrustDecision | None]):
     CSS_PATH = "trust_folder_dialog.tcss"
 
     BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "quit_without_saving", "Cancel", show=False, priority=True),
         Binding("ctrl+q", "quit_without_saving", "Quit", show=False, priority=True),
         Binding("ctrl+c", "quit_without_saving", "Quit", show=False, priority=True),
     ]
@@ -250,6 +248,7 @@ class TrustFolderApp(App[TrustDecision | None]):
         offer_repo_trust: bool = False,
         repo_explicitly_untrusted: bool = False,
         settings_path: str | None = None,
+        theme: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -260,11 +259,13 @@ class TrustFolderApp(App[TrustDecision | None]):
         self.detected_files = detected_files
         self.repo_detected_files = repo_detected_files or []
         self.settings_path = settings_path
+        self.configured_theme = theme
         self._result: TrustDecision | None = None
         self._quit_without_saving = False
 
     def on_mount(self) -> None:
-        self.theme = "ansi-dark"
+        resolved_theme = resolve_theme(self.configured_theme or DEFAULT_THEME)
+        self.theme = "ansi-light" if resolved_theme == LIGHT_THEME else "ansi-dark"
 
     def compose(self) -> ComposeResult:
         yield TrustFolderDialog(

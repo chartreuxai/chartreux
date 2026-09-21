@@ -32,28 +32,34 @@ def get_current_proxy_settings() -> dict[str, str | None]:
         return {key: None for key in SUPPORTED_PROXY_VARS}
 
 
-def set_proxy_var(key: str, value: str) -> None:
+def validate_proxy_var(key: str, value: str | None = None) -> None:
     key = key.upper()
     if key not in SUPPORTED_PROXY_VARS:
         raise ProxySetupError(
             f"Unknown key '{key}'. Supported: {', '.join(SUPPORTED_PROXY_VARS.keys())}"
         )
 
-    if key in PROXY_URL_VARS and not value.startswith(("http://", "https://")):
+    if (
+        value is not None
+        and key in PROXY_URL_VARS
+        and not value.startswith(("http://", "https://"))
+    ):
         raise ProxySetupError(
             f"{key} must start with http:// or https:// (got '{value}')"
         )
+
+
+def set_proxy_var(key: str, value: str) -> None:
+    validate_proxy_var(key, value)
+    key = key.upper()
 
     GLOBAL_ENV_FILE.path.parent.mkdir(parents=True, exist_ok=True)
     set_key(GLOBAL_ENV_FILE.path, key, value)
 
 
 def unset_proxy_var(key: str) -> None:
+    validate_proxy_var(key)
     key = key.upper()
-    if key not in SUPPORTED_PROXY_VARS:
-        raise ProxySetupError(
-            f"Unknown key '{key}'. Supported: {', '.join(SUPPORTED_PROXY_VARS.keys())}"
-        )
 
     if not GLOBAL_ENV_FILE.path.exists():
         return

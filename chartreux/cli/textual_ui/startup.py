@@ -10,6 +10,7 @@ from chartreux.setup.trusted_folders.trust_folder_dialog import (
     TrustDialogQuitException,
     TrustFolderApp,
 )
+from chartreux.ui.theme import resolve_theme, resolve_theme_name
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,11 +38,17 @@ async def resolve_session_open_plan(
     show_resume_picker: bool,
     initially_resuming: bool,
     resume_session_id: str | None = None,
+    theme: str | None = None,
 ) -> SessionOpenPlan | None:
     showed_trust_prompt = False
     try:
         if prompt_for_workspace_trust:
-            trust_granted, showed_trust_prompt = await _resolve_workspace_trust(host)
+            configured_theme = theme
+            if configured_theme is None:
+                configured_theme = (await host.read_config()).config.theme
+            trust_granted, showed_trust_prompt = await _resolve_workspace_trust(
+                host, theme=configured_theme
+            )
             if not trust_granted:
                 await host.close()
                 return None
@@ -106,7 +113,9 @@ async def open_textual_session(
     )
 
 
-async def _resolve_workspace_trust(host: AppServerHost) -> tuple[bool, bool]:
+async def _resolve_workspace_trust(
+    host: AppServerHost, *, theme: str | None = None
+) -> tuple[bool, bool]:
     """Returns (trust_granted, prompt_shown)."""
     status = await host.trust_status(host.cwd)
     details = status.details
@@ -120,6 +129,7 @@ async def _resolve_workspace_trust(host: AppServerHost) -> tuple[bool, bool]:
         offer_repo_trust="trust_repo" in details.available_decisions,
         repo_explicitly_untrusted=details.repo_explicitly_untrusted,
         settings_path=details.settings_path,
+        theme=(resolve_theme(resolve_theme_name(theme)) if theme is not None else None),
     )
     try:
         decision = await dialog.run_trust_dialog_async()

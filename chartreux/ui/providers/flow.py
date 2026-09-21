@@ -7,15 +7,27 @@ safe to mount in onboarding and the main TUI alike.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from typing import ClassVar, Literal, cast
 
+from rich.segment import Segment
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, Select, SelectionList, Static
+from textual.strip import Strip
+from textual.widgets import (
+    Button,
+    Input,
+    Label,
+    OptionList,
+    Select,
+    SelectionList,
+    Static,
+)
+from textual.widgets.option_list import Option, OptionDoesNotExist
 from textual.widgets.selection_list import Selection
 from textual.worker import Worker, WorkerState
 
@@ -41,6 +53,9 @@ from chartreux.ui.providers.contracts import (
     ProviderFlowResult,
     TLSConfig,
 )
+from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
+from chartreux.ui.widgets.navigable_option_list import NavigableOptionList
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
 Step = Literal[
     "overview",
@@ -53,6 +68,8 @@ Step = Literal[
     "again",
     "picker",
 ]
+
+DEFAULT_ACTIVE_MODEL_OPTION = "\x00default"
 
 
 def provider_id_for_name(name: str, existing: Iterable[str] = ()) -> str:
@@ -105,21 +122,73 @@ def validate_provider_draft(provider: ProviderDraft) -> str | None:
     return None
 
 
+class ChatModelSelectionList(SelectionList[str]):
+    """Selection list with unambiguous empty and selected checkbox glyphs."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        *SelectionList.BINDINGS,
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+    ]
+
+    def render_line(self, y: int) -> Strip:
+        line = super().render_line(y)
+        index = self.scroll_offset.y + y
+        try:
+            selected = self.get_option_at_index(index).value in self.selected
+        except OptionDoesNotExist:
+            return line
+        replaced = False
+        segments: list[Segment] = []
+        for segment in line:
+            if not replaced and segment.text == "X":
+                segments.append(Segment("✓" if selected else " ", segment.style))
+                replaced = True
+            else:
+                segments.append(segment)
+        return Strip(segments)
+
+
 class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
     """A fresh, full-screen provider flow with injected service boundaries."""
 
     DEFAULT_CSS = """
     ProviderManagementScreen { align: center middle; }
     #provider-management { width: 90%; height: 100%; padding: 0 2; border: round $primary; }
+    #provider-management #flow-title { color: $primary; text-style: bold; }
+    #provider-management #flow-content { height: 1fr; overflow-y: auto; }
+    #provider-management #provider-actions { height: auto; }
+    #provider-management #provider-shortcut-hint { color: $text-muted; height: 1; }
+    #provider-management .primary-actions Button { text-style: bold; }
+    #provider-management .destructive-actions { height: auto; margin-top: 1; }
+    #provider-management .destructive-actions Button { color: $error; }
+    #provider-management .field-help { color: $text-muted; }
+    #provider-management .read-only-value { color: $text-muted; }
+    #provider-management .advanced-actions { height: auto; layout: grid; grid-size: 3; }
     #provider-management .error { color: $error; }
     #provider-management .muted { color: $text-muted; }
-    #provider-management Input { width: 1fr; height: 1; border: none; }
+    #provider-management Input {
+        width: 1fr;
+        height: 3;
+        border: solid $foreground-muted;
+    }
+    #provider-management Input:focus { border: solid $primary; }
+    #provider-management Input.-invalid { border: solid $error; }
+    #provider-management #overview-provider,
+    #provider-management #active-model { width: 100%; max-height: 50vh; border: none; }
+    #provider-management #overview-provider:focus,
+    #provider-management #active-model:focus { border: none; }
     #provider-management SelectionList { height: 1fr; }
+    #provider-management #models > .selection-list--button { color: $foreground-muted; background: $surface; }
+    #provider-management #models > .selection-list--button-highlighted { color: $foreground; background: $primary 20%; }
+    #provider-management #models > .selection-list--button-selected { color: $success; background: $success 20%; text-style: bold; }
+    #provider-management #models > .selection-list--button-selected-highlighted { color: $success; background: $success 35%; text-style: bold reverse; }
     #provider-management #actions { height: auto; layout: grid; grid-size: 3; }
     """
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "back", "Back", show=False, priority=True),
-        Binding("ctrl+c", "cancel", "Cancel", show=False),
+        Binding("j", "picker_down", "Down", show=False),
+        Binding("k", "picker_up", "Up", show=False),
     ]
 
     def __init__(
@@ -132,6 +201,9 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         snapshot: CatalogSnapshot,
         management: bool = False,
         tls: TLSConfig | None = None,
+        validate_selection: Callable[[str | None], str | None] | None = None,
+        initial_active_model: str | None = None,
+        initial_step: Step | None = None,
     ) -> None:
         super().__init__()
         self.discovery = discovery
@@ -141,14 +213,19 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         self.snapshot = snapshot
         self.management = management
         self.tls = tls or TLSConfig()
-        self.step: Step = "overview" if management else "choice"
+        # A missing callback deliberately skips host-specific runtime validation.
+        # ``None`` selection asks the host to validate its configured active model.
+        self.validate_selection = validate_selection
+        self.step: Step = initial_step or ("overview" if management else "choice")
         self.provider: ProviderDraft | None = None
         self._selected_models: dict[str, ModelSelectionDraft] = {}
         self._selected_wires: set[str] = set()
         self._detail_wire: str | None = None
-        self._detail_tag: str | None = None
         self._tag_orders: dict[str, tuple[str, ...]] = dict(snapshot.catalog.tags)
+        self._review_inputs: dict[str, dict[str, str]] = {}
         self._overview_provider_id: str | None = None
+        self._active_model_expression = initial_active_model
+        self._invalid_inputs: set[str] = set()
         self._management_action: Literal["edit", "discover", "credential"] | None = None
         self.discovered: tuple[DiscoveryItem, ...] = ()
         self.error: str | None = None
@@ -160,6 +237,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         self._credential_value: str | None = None
         self._warning: str | None = None
         self._dismissed = False
+        self._composing_actions = False
 
     @property
     def catalog(self) -> ModelCatalog:
@@ -167,21 +245,39 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="provider-management"):
-            yield Label("Provider management", id="flow-title")
-            yield from self._step_widgets()
+            yield NoMarkupStatic("Provider Management", id="flow-title")
+            with Vertical(id="flow-content"):
+                yield from self._step_widgets()
+            with Vertical(id="provider-actions"):
+                yield Static(
+                    shortcut_hint(self._shortcut_hint()), id="provider-shortcut-hint"
+                )
+                self._composing_actions = True
+                yield from self._step_widgets()
+                self._composing_actions = False
 
     def _step_widgets(self) -> ComposeResult:  # noqa: PLR0912, PLR0915
+        if self._composing_actions:
+            yield from self._action_buttons()
+            return
         if self.step == "overview":
-            yield Label("Configured providers")
-            yield Select(
-                [
-                    (provider_id, provider_id)
-                    for provider_id in sorted(self.catalog.providers)
+            yield Label("Providers")
+            providers = sorted(self.catalog.providers)
+            yield NavigableOptionList(
+                *[
+                    Option(
+                        self._option_text(
+                            self._overview_label(provider_id),
+                            provider_id == self._overview_provider_id,
+                        ),
+                        id=provider_id,
+                    )
+                    for provider_id in providers
                 ],
-                value=self._overview_provider_id or Select.NULL,
-                prompt="Select a provider to manage",
                 id="overview-provider",
             )
+            if self.error:
+                yield NoMarkupStatic(self.error, classes="error")
             if not self.catalog.providers:
                 yield Static("No providers yet.")
             yield from self._buttons(
@@ -201,6 +297,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         elif self.step == "form":
             current = self.provider
             preset_options = [(preset.name, preset.id) for preset in PRESETS]
+            yield Label("Preset")
             yield Select(
                 preset_options,
                 value=current.preset
@@ -209,13 +306,31 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 id="preset",
                 prompt="Preset",
             )
+            yield Label("Provider name *")
             yield Input(
-                current.name if current else "", placeholder="Provider name", id="name"
+                current.name if current else "",
+                placeholder="Provider name",
+                id="name",
+                validate_on=["blur", "submitted"],
+                disabled=bool(
+                    current and current.provider_id in self.catalog.providers
+                ),
             )
+            if current and current.provider_id in self.catalog.providers:
+                yield Static(
+                    "Provider names are fixed after creation.", classes="muted"
+                )
+            yield Label("API base *")
             yield Input(
                 current.api_base if current else "",
                 placeholder="API base",
                 id="api-base",
+                validate_on=["blur", "submitted"],
+            )
+            yield Label("API style")
+            yield Static(
+                "API style controls how requests are formatted for the provider.",
+                classes="muted",
             )
             yield Select(
                 [
@@ -226,32 +341,36 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 value=current.api_style if current else "openai",
                 id="api-style",
             )
+            yield Label("Credential environment variable")
             yield Input(
                 current.api_key_env_var if current else "",
                 placeholder="API key environment variable (blank = no authentication)",
                 id="env-var",
+                validate_on=["blur", "submitted"],
             )
+            yield Label("Reasoning field")
             yield Input(
                 current.reasoning_field_name if current else "reasoning_content",
                 placeholder="Reasoning field",
                 id="reasoning-field",
+                validate_on=["blur", "submitted"],
             )
             listing, inference = provider_urls(current) if current else ("", "")
-            yield Static(
+            yield NoMarkupStatic(
                 f"Provider ID: {current.provider_id if current else '<name>/default'}\n"
                 f"Listing URL: {listing}\nInference URL: {inference}",
                 classes="muted",
                 id="urls",
             )
             if self.error:
-                yield Static(self.error, classes="error")
+                yield NoMarkupStatic(self.error, classes="error")
             yield from self._buttons(
                 ("continue", "Continue"), ("back", "Back"), ("cancel", "Cancel")
             )
         elif self.step == "credential":
             assert self.provider is not None
             yield Label("Credential")
-            yield Static(
+            yield NoMarkupStatic(
                 "No authentication is enabled."
                 if not self.provider.api_key_env_var
                 else (
@@ -261,20 +380,22 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 )
             )
             if self.provider.api_key_env_var:
+                yield Label("API Key *")
                 yield Input(
                     self._credential_value or "",
                     password=True,
                     placeholder="API key",
                     id="key",
+                    validate_on=["blur", "submitted"],
                 )
             if self.error:
-                yield Static(self.error, classes="error")
+                yield NoMarkupStatic(self.error, classes="error")
             yield from self._buttons(
                 ("continue", "Continue"), ("back", "Back"), ("cancel", "Cancel")
             )
         elif self.step == "probe":
             yield Label("Discover models")
-            yield Static(
+            yield NoMarkupStatic(
                 self.error
                 or "Ready to list models. Discovery success only means models were discovered; it does not prove inference support."
             )
@@ -286,28 +407,37 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 ("cancel", "Cancel"),
             )
         elif self.step == "models":
-            yield Input(placeholder="Search wire IDs (case-insensitive)", id="search")
+            picker_items = self._picker_items()
+            yield Label("Search")
+            yield Input(
+                placeholder="Search model names",
+                id="search",
+                validate_on=["blur", "submitted"],
+            )
             if any(not item.wire_id for item in self.discovered):
+                yield Label("Wire ID")
                 yield Input(
                     placeholder="Enter the provider wire name", id="manual-wire-name"
                 )
-            yield Static(
-                f"{len(self.discovered)} models — type to filter", id="model-count"
+            yield NoMarkupStatic(
+                f"{len(picker_items)} of {len(picker_items)} chat models",
+                id="model-count",
             )
-            yield SelectionList(
+            yield ChatModelSelectionList(
                 *[
                     (
                         self._model_label(item),
                         item.wire_id,
                         item.wire_id in self._selected_wires
-                        or item.wire_id in self._selected_models,
+                        or item.wire_id in self._selected_models
+                        or self._is_configured_model(item),
                     )
-                    for item in sorted(self.discovered, key=lambda value: value.wire_id)
+                    for item in picker_items
                 ],
                 id="models",
             )
             if self.error:
-                yield Static(self.error, classes="error")
+                yield NoMarkupStatic(self.error, classes="error")
             yield from self._buttons(
                 ("continue", "Review selected models"),
                 ("back", "Back"),
@@ -327,56 +457,74 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             )
             if selection is not None:
                 yield from self._collision_widgets(selection)
-            yield Input(
-                selection.base_name if selection else "",
-                placeholder="Base name",
-                id="base-name",
+            yield Label("Base Name")
+            yield NoMarkupStatic(
+                selection.base_name if selection else "", classes="read-only-value"
             )
+            yield Label("Input Price Per Million Tokens")
             yield Input(
-                self._edit_value(selection, "input_price"),
+                self._review_value(
+                    selection, "input-price", self._edit_value(selection, "input_price")
+                ),
                 placeholder="Input price per million tokens (blank = unknown)",
                 id="input-price",
+                validate_on=["blur", "submitted"],
             )
+            yield Label("Output Price Per Million Tokens")
             yield Input(
-                self._edit_value(selection, "output_price"),
+                self._review_value(
+                    selection,
+                    "output-price",
+                    self._edit_value(selection, "output_price"),
+                ),
                 placeholder="Output price per million tokens (blank = unknown)",
                 id="output-price",
+                validate_on=["blur", "submitted"],
             )
+            yield Label("Cached Input Price Per Million Tokens")
             yield Input(
-                self._edit_value(selection, "cached_input_price"),
+                self._review_value(
+                    selection,
+                    "cached-price",
+                    self._edit_value(selection, "cached_input_price"),
+                ),
                 placeholder="Cached input price per million tokens (blank = unknown)",
                 id="cached-price",
+                validate_on=["blur", "submitted"],
+            )
+            yield Label("Aliases")
+            yield Static(
+                "Alternative names you can use to select this model.",
+                classes="field-help",
             )
             yield Input(
-                self._edit_value(selection, "aliases"),
+                self._review_value(
+                    selection, "aliases", self._edit_value(selection, "aliases")
+                ),
                 placeholder="Aliases, comma separated",
                 id="aliases",
+                validate_on=["blur", "submitted"],
+            )
+            yield Label("Tags")
+            yield Static(
+                "Groups that let you select related models together.",
+                classes="field-help",
             )
             yield Input(
-                self._edit_value(selection, "tags"),
+                self._review_value(
+                    selection, "tags", self._edit_value(selection, "tags")
+                ),
                 placeholder="Tags, comma separated",
                 id="tags",
-            )
-            tag_options = self._ordered_tag_options(selection)
-            yield Select(
-                [(tag, tag) for tag in tag_options],
-                value=(
-                    self._detail_tag
-                    if self._detail_tag in tag_options
-                    else (tag_options[0] if tag_options else Select.NULL)
-                ),
-                prompt="Tag whose members to reorder",
-                id="ordered-tag",
+                validate_on=["blur", "submitted"],
             )
             if self.error:
-                yield Static(self.error, classes="error")
+                yield NoMarkupStatic(self.error, classes="error")
             yield from self._buttons(
                 ("save-details", "Save details"),
                 ("clear-prices", "Clear prices"),
                 ("clear-aliases", "Clear aliases"),
                 ("clear-tags", "Clear tags"),
-                ("tag-up", "Move tag up"),
-                ("tag-down", "Move tag down"),
                 ("bulk-tags", "Assign tags to all selected"),
                 ("continue", "Save / Continue"),
                 ("back", "Back"),
@@ -384,20 +532,42 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             )
         elif self.step == "again":
             yield Label("Provider saved.")
+            if self.error:
+                yield NoMarkupStatic(self.error, classes="error")
             yield from self._buttons(
                 ("add", "Add another provider"),
                 ("picker", "Choose active model"),
                 ("finish-unchanged", "Finish without changing active model"),
             )
         else:
-            options = self._active_model_options()
+            options = self._active_model_picker_options()
             unavailable = self._unavailable_model_labels()
-            yield Label("Choose active model")
+            yield Label("Choose Active Model")
             if self.error:
-                yield Static(self.error, classes="error")
-            yield Select(options, id="active-model", prompt="Active model")
+                yield NoMarkupStatic(self.error, classes="error")
+            yield NavigableOptionList(
+                *[
+                    Option(
+                        self._option_text(
+                            label,
+                            value == self._active_model_expression
+                            or (
+                                value == DEFAULT_ACTIVE_MODEL_OPTION
+                                and self._active_model_expression
+                                not in {
+                                    option_value
+                                    for _option_label, option_value in self._active_model_options()
+                                }
+                            ),
+                        ),
+                        id=value,
+                    )
+                    for label, value in options
+                ],
+                id="active-model",
+            )
             if unavailable:
-                yield Static(
+                yield NoMarkupStatic(
                     "Unavailable (visible but not selectable):\n"
                     + "\n".join(unavailable),
                     classes="muted",
@@ -408,20 +578,99 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             )
             yield from self._buttons(("finish", "Finish"), ("cancel", "Cancel"))
 
+    def _shortcut_hint(self) -> str:
+        if self.step == "overview":
+            return (
+                f"{shortcut('↑↓/jk')} Navigate  {shortcut('Enter')} Select  "
+                f"{shortcut('Esc')} Close"
+            )
+        if self.step == "picker":
+            return (
+                f"{shortcut('↑↓/jk')} Navigate  {shortcut('Enter')} Select  "
+                f"{shortcut('Esc')} Back"
+            )
+        if self.step == "models":
+            return (
+                f"{shortcut('↑↓/jk')} Navigate  {shortcut('Space/Enter')} Toggle  "
+                f"{shortcut('Search: Enter')} Continue  {shortcut('Esc')} Back"
+            )
+        if self.step in {"form", "credential", "review"}:
+            return f"{shortcut('Enter')} Continue  {shortcut('Esc')} Back"
+        if self.step == "choice":
+            return f"{shortcut('Esc')} Cancel"
+        return f"{shortcut('Esc')} Back"
+
+    @staticmethod
+    def _option_text(label: str, is_current: bool) -> Text:
+        """Render house-style current markers with dimmed row metadata."""
+        primary, separator, metadata = label.partition("\t")
+        text = Text(no_wrap=True)
+        text.append("› " if is_current else "  ", style="green" if is_current else "")
+        text.append(primary, style="bold" if is_current else "")
+        if separator:
+            text.append(f"  {metadata}", style="dim")
+        return text
+
+    def on_mount(self) -> None:
+        self._focus_current_picker()
+
+    def _focus_current_picker(self) -> None:
+        if self.step == "overview" and self.query("#overview-provider"):
+            option_list = self.query_one("#overview-provider", OptionList)
+            providers = sorted(self.catalog.providers)
+            if self._overview_provider_id in providers:
+                option_list.highlighted = providers.index(self._overview_provider_id)
+            elif providers:
+                option_list.highlighted = 0
+            option_list.focus()
+        elif self.step == "models" and self.query("#models"):
+            models = self.query_one("#models", SelectionList)
+            if models.option_count:
+                models.highlighted = 0
+            models.focus()
+        elif self.step == "again" and self.query("#picker"):
+            self.query_one("#picker", Button).focus()
+        elif self.step == "picker" and self.query("#active-model"):
+            option_list = self.query_one("#active-model", OptionList)
+            options = self._active_model_picker_options()
+            selected = (
+                self._active_model_expression
+                if self._active_model_expression in {value for _label, value in options}
+                else DEFAULT_ACTIVE_MODEL_OPTION
+            )
+            option_list.highlighted = next(
+                index
+                for index, (_label, value) in enumerate(options)
+                if value == selected
+            )
+            option_list.focus()
+        self._apply_invalid_input_state()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if not event.option.id:
+            return
+        if event.option_list.id == "overview-provider" and self.step == "overview":
+            self._overview_provider_id = event.option.id
+            self._show("overview")
+        elif event.option_list.id == "active-model" and self.step == "picker":
+            expression = (
+                ""
+                if event.option.id == DEFAULT_ACTIVE_MODEL_OPTION
+                else event.option.id
+            )
+            self._active_model_expression = expression
+            self._finish(expression)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Submit each single-line field through the same primary action as Continue."""
+        if self.step in {"form", "credential", "models", "review"}:
+            self._continue()
+
     def _review_selection(self) -> ModelSelectionDraft | None:
         """Return the selected detail row, defaulting to insertion order."""
         if self._detail_wire is not None:
             return self._selected_models.get(self._detail_wire)
         return next(iter(self._selected_models.values()), None)
-
-    def _ordered_tag_options(
-        self, selection: ModelSelectionDraft | None
-    ) -> tuple[str, ...]:
-        """Return tags that can scope ordering for the current detail model."""
-        if selection is None:
-            return ()
-        selected_tags = selection.edits.tags.value or ()
-        return tuple(dict.fromkeys((*selected_tags, *self._tag_orders)))
 
     def _edit_value(self, selection: ModelSelectionDraft | None, field: str) -> str:
         if selection is None:
@@ -430,6 +679,37 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         if value is None:
             return ""
         return ", ".join(value) if isinstance(value, tuple) else str(value)
+
+    def _review_value(
+        self, selection: ModelSelectionDraft | None, field: str, default: str
+    ) -> str:
+        if selection is None:
+            return default
+        return self._review_inputs.get(selection.wire_name, {}).get(field, default)
+
+    def _capture_review_inputs(self, wire: str | None = None) -> str | None:
+        if self.step != "review":
+            return wire
+        current = self._review_selection()
+        wire = wire or (current.wire_name if current else None)
+        if wire is None or not self.query("#input-price"):
+            return wire
+        self._review_inputs[wire] = {
+            field: self.query_one(f"#{field}", Input).value
+            for field in (
+                "input-price",
+                "output-price",
+                "cached-price",
+                "aliases",
+                "tags",
+            )
+        }
+        return wire
+
+    def _clear_review_input(self, selection: ModelSelectionDraft, *fields: str) -> None:
+        values = self._review_inputs.setdefault(selection.wire_name, {})
+        for field in fields:
+            values[field] = ""
 
     def _collision_widgets(self, selection: ModelSelectionDraft) -> ComposeResult:
         outcome = match_discovered_model(
@@ -443,11 +723,8 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 "This provider already occupies the proposed base. Choose an explicit resolution."
             )
             yield Select(
-                [
-                    (f"Add as deployment to {outcome.existing_base}", "existing"),
-                    ("Use a new unambiguous base name", "new"),
-                ],
-                value="new",
+                [(f"Add as deployment to {outcome.existing_base}", "existing")],
+                value="existing",
                 id="collision-choice",
             )
         elif outcome.kind == "multiple_matches":
@@ -460,31 +737,195 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 id="collision-choice",
             )
         elif outcome.kind == "alias_collision":
-            yield Label(
-                f"{selection.wire_name} is an alias of {outcome.existing_base}; enter an unambiguous base name."
+            yield NoMarkupStatic(
+                f"{selection.wire_name} is an alias of {outcome.existing_base}; it will be added to that base."
             )
 
-    def _buttons(self, *buttons: tuple[str, str]) -> ComposeResult:
-        with Horizontal(id="actions"):
-            for button_id, label in buttons:
-                yield Button(label, id=button_id)
+    def _action_buttons(self) -> ComposeResult:
+        buttons: tuple[tuple[str, str] | tuple[str, str, bool], ...]
+        if self.step == "overview":
+            unavailable = not self.catalog.providers
+            buttons = (
+                ("add", "Add provider"),
+                ("edit", "Edit connection details", unavailable),
+                ("discover", "Discover + add models", unavailable),
+                ("credential", "Replace credential", unavailable),
+                ("cancel", "Close"),
+            )
+        elif self.step == "choice":
+            buttons = (
+                ("mistral", "Use Mistral"),
+                ("add", "Add a provider"),
+                ("cancel", "Cancel"),
+            )
+        elif self.step == "form":
+            buttons = (("continue", "Continue"), ("back", "Back"), ("cancel", "Cancel"))
+        elif self.step == "credential":
+            buttons = (("continue", "Continue"), ("back", "Back"), ("cancel", "Cancel"))
+        elif self.step == "probe":
+            busy = self.error == "Discovering models…"
+            buttons = (
+                ("retry", "Retry", busy),
+                ("manual", "Manual entry", busy),
+                ("edit-key", "Edit key", busy),
+                ("back", "Back"),
+                ("cancel", "Cancel"),
+            )
+        elif self.step == "models":
+            buttons = (
+                ("continue", "Review selected models"),
+                ("back", "Back"),
+                ("cancel", "Cancel"),
+            )
+        elif self.step == "review":
+            with Horizontal(classes="primary-actions"):
+                yield Button("Save Models", id="continue")
+                yield Button("Back", id="back")
+                yield Button("Cancel", id="cancel")
+            with Horizontal(classes="advanced-actions"):
+                yield Button("Apply Tags To Selected", id="bulk-tags")
+            with Horizontal(classes="destructive-actions"):
+                yield Button("Clear Prices", id="clear-prices")
+                yield Button("Clear Aliases", id="clear-aliases")
+                yield Button("Clear Tags", id="clear-tags")
+            return
+        elif self.step == "again":
+            buttons = (
+                ("add", "Add another provider"),
+                ("picker", "Choose active model"),
+                ("finish-unchanged", "Finish without changing active model"),
+            )
+        else:
+            buttons = (("cancel", "Cancel"),)
+        yield from self._buttons(*buttons)
 
-    def _model_label(self, item: DiscoveryItem) -> str:
+    def _buttons(
+        self, *buttons: tuple[str, str] | tuple[str, str, bool]
+    ) -> ComposeResult:
+        if not self._composing_actions:
+            return
+        with Horizontal(id="actions"):
+            for button in buttons:
+                button_id, label = button[:2]
+                disabled = button[-1] if isinstance(button[-1], bool) else False
+                yield Button(label, id=button_id, disabled=disabled)
+
+    @staticmethod
+    def _is_chat_model(item: DiscoveryItem) -> bool:
+        """Exclude known non-chat families from the interactive discovery picker."""
+        value = f"{item.wire_id} {item.display_label or ''}".casefold()
+        return not any(
+            marker in value
+            for marker in (
+                "embed",
+                "moderation",
+                "ocr",
+                "voxtral",
+                "audio",
+                "transcri",
+                "whisper",
+                "tts",
+                "image-gen",
+                "video",
+                "rerank",
+                "guard",
+                "realtime",
+                "labs",
+                "experimental",
+            )
+        )
+
+    def _configured_base(self, item: DiscoveryItem) -> str | None:
         outcome = match_discovered_model(
             self.catalog,
             self.provider_id,
             item.wire_id,
             provider=self._provider_definition(),
         )
-        if outcome.kind == "existing":
-            return f"{item.wire_id} — Already configured as {outcome.existing_base}"
-        if outcome.kind == "alias_collision":
-            return f"{item.wire_id} — alias of {outcome.existing_base}; choose an unambiguous base name"
-        if outcome.kind == "occupied_slot":
-            return f"{item.wire_id} — occupied slot; add to existing base or use an unambiguous name"
-        if outcome.kind == "multiple_matches":
-            return f"{item.wire_id} — multiple matches: {', '.join(match.base_name for match in outcome.matches)}"
-        return f"{item.wire_id} — {outcome.proposed.base_name if outcome.proposed else item.wire_id}"
+        return (
+            outcome.existing_base
+            if outcome.kind in {"existing", "alias_collision"}
+            else None
+        )
+
+    def _picker_items(self) -> tuple[DiscoveryItem, ...]:
+        """Return one chat-capable row for each canonical configured or wire ID."""
+        groups: dict[str, list[DiscoveryItem]] = {}
+        for item in self.discovered:
+            if item.wire_id and self._is_chat_model(item):
+                groups.setdefault(
+                    self._configured_base(item) or item.wire_id, []
+                ).append(item)
+        selected: list[DiscoveryItem] = []
+        for base, items in groups.items():
+            definition = self.catalog.models.get(base)
+            deployment_names = (
+                {
+                    deployment.name
+                    for deployment in definition.deployments
+                    if deployment.provider == self.provider_id
+                }
+                if definition
+                else set()
+            )
+            selected.append(
+                next(
+                    (item for item in items if item.wire_id in deployment_names),
+                    items[0],
+                )
+            )
+        return tuple(sorted(selected, key=lambda item: item.wire_id.casefold()))
+
+    def _is_configured_model(self, item: DiscoveryItem) -> bool:
+        return self._configured_base(item) is not None
+
+    def _model_label(self, item: DiscoveryItem) -> str:
+        """Render one canonical target with dim aliases as supporting metadata."""
+        base = self._configured_base(item)
+        if base is not None:
+            aliases = self.catalog.models[base].aliases
+            metadata = f"aliases: {', '.join(aliases)}" if aliases else base
+            return f"{item.wire_id}\t{metadata}"
+        return (
+            f"{item.wire_id}\t{item.display_label}"
+            if item.display_label and item.display_label != item.wire_id
+            else item.wire_id
+        )
+
+    def _is_configured_provider(self, provider_id: str) -> bool:
+        """Return whether a provider is user-configured rather than only shipped."""
+        from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
+
+        definition = self.catalog.providers[provider_id]
+        shipped_definition = SHIPPED_CATALOG.providers.get(provider_id)
+        return (
+            shipped_definition is None
+            or definition != shipped_definition
+            or bool(self._configured_credential(definition.api_key_env_var))
+        )
+
+    def _overview_label(self, provider_id: str) -> str:
+        definition = self.catalog.providers[provider_id]
+        friendly_name = provider_id.rsplit("/", 1)[0].replace("-", " ").title()
+        model_count = sum(
+            1
+            for model in self.catalog.models.values()
+            for deployment in model.deployments
+            if deployment.provider == provider_id
+        )
+        if not definition.api_key_env_var:
+            auth_status = "no authentication"
+        elif self._configured_credential(definition.api_key_env_var):
+            auth_status = "api key set"
+        else:
+            auth_status = "api key required"
+        status = (
+            "Configured" if self._is_configured_provider(provider_id) else "Available"
+        )
+        return (
+            f"{friendly_name}\t{status}; {provider_id}, {definition.api_base}, "
+            f"{model_count} models, {auth_status}"
+        )
 
     @property
     def provider_id(self) -> str:
@@ -512,8 +953,11 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             self.action_back()
             return
         if button == "mistral":
-            self._apply_preset("mistral")
-            self._show("form")
+            if not self.management and self._select_onboarding_mistral_provider():
+                self._show("credential")
+            else:
+                self._apply_preset("mistral")
+                self._show("form")
             return
         if button == "add":
             self._management_action = None
@@ -531,7 +975,12 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 self.error = "Select a configured provider first."
                 self._show("overview")
                 return
-            self._select_existing_provider()
+            if len(self.catalog.providers) > 1 and self._overview_provider_id is None:
+                self.error = "Select a configured provider first."
+                self._show("overview")
+                return
+            if not self._select_existing_provider():
+                return
             self._reset_unsaved_model_metadata()
             self._management_action = cast(
                 Literal["edit", "discover", "credential"], button
@@ -559,9 +1008,6 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             self.discovered = (DiscoveryItem(""),)
             self._show("models")
             return
-        if button == "save-details":
-            self._save_details()
-            return
         if button == "clear-prices":
             self._clear_prices()
             return
@@ -570,9 +1016,6 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 "aliases" if button == "clear-aliases" else "tags"
             )
             return
-        if button in {"tag-up", "tag-down"}:
-            self._move_tag(-1 if button == "tag-up" else 1)
-            return
         if button == "bulk-tags":
             self._assign_bulk_tags()
             return
@@ -580,6 +1023,8 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             self._show("picker")
             return
         if button == "finish-unchanged":
+            if not self._validate_selection(None, step="again"):
+                return
             self._dismissed = True
             self.dismiss(
                 ProviderFlowResult(
@@ -603,41 +1048,73 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
     def _save_form(self) -> None:
         preset_id = self.query_one("#preset", Select).value
         preset = next((item for item in PRESETS if item.id == preset_id), None)
-        name = self.query_one("#name", Input).value.strip()
-        api_base = self.query_one("#api-base", Input).value.strip()
+        name = self.query_one("#name", Input).value
+        api_base = self.query_one("#api-base", Input).value
         style = self.query_one("#api-style", Select).value
-        env_var = self.query_one("#env-var", Input).value.strip()
-        reasoning = (
-            self.query_one("#reasoning-field", Input).value.strip()
-            or "reasoning_content"
-        )
+        env_var = self.query_one("#env-var", Input).value
+        reasoning = self.query_one("#reasoning-field", Input).value
         if not isinstance(preset_id, str) or not isinstance(style, str):
             self.error = "Choose a preset and API style."
             self._show("form")
             return
+        previous = self.provider
         provider = ProviderDraft(
             preset_id,
             (
-                self.provider.provider_id
-                if self.provider is not None
-                and self.provider.provider_id in self.catalog.providers
+                previous.provider_id
+                if previous is not None
+                and previous.provider_id in self.catalog.providers
                 else provider_id_for_name(name, self.catalog.providers)
             ),
             name,
             api_base,
             cast(ApiStyle, style),
             env_var,
-            self.provider.key if self.provider else None,
+            previous.key if previous else None,
             backend=preset.backend if preset else "generic",
             reasoning_field_name=reasoning,
         )
+        identity_changed = previous and (
+            provider.api_base != previous.api_base
+            or provider.api_key_env_var != previous.api_key_env_var
+            or provider.preset != previous.preset
+        )
+        if identity_changed:
+            provider = replace(provider, key=None)
+            self._credential_value = None
+            self._credential_collision_warning = None
         self.error = validate_provider_draft(provider)
+        self._invalid_inputs = self._form_invalid_inputs(provider)
         if self.error:
+            self.provider = provider
             self._show("form")
             return
+        provider = replace(
+            provider,
+            name=provider.name.strip(),
+            api_base=provider.api_base.strip(),
+            api_key_env_var=provider.api_key_env_var.strip(),
+            reasoning_field_name=provider.reasoning_field_name.strip()
+            or "reasoning_content",
+        )
+        if previous and (
+            provider.api_base != previous.api_base
+            or provider.api_key_env_var != previous.api_key_env_var
+            or provider.preset != previous.preset
+        ):
+            provider = replace(provider, key=None)
+            self._credential_value = None
+            self._credential_collision_warning = None
+        if not provider.api_key_env_var:
+            provider = replace(provider, key=None)
+            self._credential_value = None
+        self._invalid_inputs.clear()
         self.provider = provider
         if self._management_action == "edit":
-            self._save_connection_details()
+            if self.provider.api_key_env_var and self.provider.key is None:
+                self._show("credential")
+            else:
+                self._save_connection_details()
             return
         self._show("credential")
 
@@ -670,6 +1147,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             self._show("form")
             return
         self.snapshot = result.snapshot
+        self._tag_orders = dict(self.catalog.tags)
         self._changed = self._changed or result.changed
         self.dismiss(
             ProviderFlowResult(
@@ -677,9 +1155,11 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             )
         )
 
-    def _save_credential(self) -> None:
+    def _save_credential(self) -> None:  # noqa: PLR0911
         assert self.provider is not None
         if not self.provider.api_key_env_var:
+            self.provider = replace(self.provider, key=None)
+            self._credential_value = None
             if self._management_action == "credential":
                 self.error = "Configure an API key environment variable before replacing a credential."
                 self._show("credential")
@@ -727,6 +1207,9 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             else self._warning
         )
         self.error = self._warning if result.status == "session_only" else None
+        if self._management_action == "edit":
+            self._save_connection_details()
+            return
         if self._management_action == "credential":
             self.dismiss(
                 ProviderFlowResult(
@@ -780,15 +1263,18 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             )
             return
         if event.select.id == "detail-model" and self.step == "review":
-            wire = event.value if isinstance(event.value, str) else None
             current = self._review_selection()
-            self._detail_wire = wire
+            wire = event.value if isinstance(event.value, str) else None
             if current is None or wire == current.wire_name:
                 return
+            self._capture_review_inputs(current.wire_name)
+            if not self._save_details(wire=current.wire_name, recompose=False):
+                return
+            self._detail_wire = wire
             self._show("review")
             return
-        if event.select.id == "ordered-tag" and self.step == "review":
-            self._detail_tag = event.value if isinstance(event.value, str) else None
+        if self.step == "form" and event.select.id == "api-style":
+            self._refresh_form_previews()
             return
         if event.select.id != "preset" or self.step != "form":
             return
@@ -808,6 +1294,8 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             api_style.value = preset.api_style
         env_var.value = preset.api_key_env_var or self._suggest_env_var(preset.name)
         reasoning.value = preset.reasoning_field_name
+        self._credential_value = None
+        self._credential_collision_warning = None
         self.provider = (
             replace(
                 self.provider,
@@ -816,12 +1304,14 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 api_base=preset.api_base or "",
                 api_style=preset.api_style or "openai",
                 api_key_env_var=env_var.value,
+                key=None,
                 backend=preset.backend,
                 reasoning_field_name=preset.reasoning_field_name,
             )
             if self.provider
             else None
         )
+        self._refresh_form_previews()
 
     @staticmethod
     def _suggest_env_var(name: str) -> str:
@@ -831,29 +1321,147 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         )
         return f"{stem.upper()}_API_KEY" if stem else "API_KEY"
 
+    def _refresh_form_previews(self) -> None:
+        if self.step != "form" or not self.query("#urls"):
+            return
+        name = self.query_one("#name", Input).value.strip()
+        current = self.provider
+        provider = ProviderDraft(
+            current.preset if current else None,
+            (
+                current.provider_id
+                if current and current.provider_id in self.catalog.providers
+                else provider_id_for_name(name, self.catalog.providers)
+            ),
+            name,
+            self.query_one("#api-base", Input).value.strip(),
+            cast(ApiStyle, self.query_one("#api-style", Select).value),
+            self.query_one("#env-var", Input).value.strip(),
+            None,
+            backend=current.backend if current else "generic",
+        )
+        listing, inference = provider_urls(provider)
+        self.query_one("#urls", Static).update(
+            f"Provider ID: {provider.provider_id}\n"
+            f"Listing URL: {listing}\nInference URL: {inference}"
+        )
+
+    def _form_invalid_inputs(self, provider: ProviderDraft) -> set[str]:
+        """Return the field responsible for the current provider-form error."""
+        if not provider.name.strip():
+            return {"name"}
+        if not provider.api_base.startswith(("http://", "https://")):
+            return {"api-base"}
+        if provider.backend == "mistral" and not provider.api_base.rstrip("/").endswith(
+            "/v1"
+        ):
+            return {"api-base"}
+        if (
+            provider.backend == "mistral"
+            and provider.reasoning_field_name != "reasoning_content"
+        ):
+            return {"reasoning-field"}
+        if (
+            provider.api_key_env_var
+            and not provider.api_key_env_var.replace("_", "a").isalnum()
+        ):
+            return {"env-var"}
+        return set()
+
+    def _apply_invalid_input_state(self) -> None:
+        for input_id in self._invalid_inputs:
+            if self.query(f"#{input_id}"):
+                self.query_one(f"#{input_id}", Input).add_class("-invalid")
+        if self._invalid_inputs:
+            input_id = next(iter(self._invalid_inputs))
+            if self.query(f"#{input_id}"):
+                self.query_one(f"#{input_id}", Input).focus()
+
+    def _revalidate_form_after_error(self) -> None:
+        """Give recovery feedback only after a submit or blur has shown an error."""
+        assert self.provider is not None
+        provider = replace(
+            self.provider,
+            name=self.query_one("#name", Input).value,
+            api_base=self.query_one("#api-base", Input).value,
+            api_key_env_var=self.query_one("#env-var", Input).value,
+            reasoning_field_name=self.query_one("#reasoning-field", Input).value,
+        )
+        self.error = validate_provider_draft(provider)
+        self._invalid_inputs = self._form_invalid_inputs(provider)
+        for field in ("name", "api-base", "env-var", "reasoning-field"):
+            input_widget = self.query_one(f"#{field}", Input)
+            input_widget.set_class(field in self._invalid_inputs, "-invalid")
+        for error_widget in self.query(Static):
+            if not error_widget.has_class("error"):
+                continue
+            error_widget.update(self.error or "")
+            error_widget.display = self.error is not None
+
+    def _highlighted_model_label(self, item: DiscoveryItem, query: str) -> Text:
+        label = self._model_label(item)
+        text = Text(label, no_wrap=True)
+        if not query:
+            return text
+        needle = (
+            query
+            if any(character.isupper() for character in query)
+            else query.casefold()
+        )
+        haystack = label if query == needle else label.casefold()
+        start = 0
+        while (index := haystack.find(needle, start)) >= 0:
+            text.stylize("reverse", index, index + len(query))
+            start = index + len(query)
+        return text
+
     def on_input_changed(self, event: Input.Changed) -> None:
+        if self.step == "form" and event.input.id in {"name", "api-base"}:
+            self._refresh_form_previews()
+        if self.step == "form" and self._invalid_inputs:
+            self._revalidate_form_after_error()
         if event.input.id != "search" or self.step != "models":
             return
-        query = event.value.casefold()
+        query = event.value
+        needle = (
+            query
+            if any(character.isupper() for character in query)
+            else query.casefold()
+        )
         selection = self.query_one("#models", SelectionList)
         visible = {
             option.value for option in cast(list[Selection[str]], selection.options)
         }
         self._selected_wires.difference_update(visible - set(selection.selected))
         self._selected_wires.update(selection.selected)
-        found = [item for item in self.discovered if query in item.wire_id.casefold()]
+        picker_items = self._picker_items()
+        found = [
+            item
+            for item in picker_items
+            if needle in (item.wire_id if query == needle else item.wire_id.casefold())
+            or (
+                item.display_label
+                and needle
+                in (
+                    item.display_label
+                    if query == needle
+                    else item.display_label.casefold()
+                )
+            )
+        ]
         selection.clear_options()
         selection.add_options(
             (
-                self._model_label(item),
+                self._highlighted_model_label(item, query),
                 item.wire_id,
                 item.wire_id in self._selected_wires
-                or item.wire_id in self._selected_models,
+                or item.wire_id in self._selected_models
+                or self._is_configured_model(item),
             )
-            for item in sorted(found, key=lambda value: value.wire_id)
+            for item in found
         )
         self.query_one("#model-count", Static).update(
-            f"{len(found)} models — type to filter"
+            f"{len(found)} of {len(picker_items)} chat models"
         )
 
     def _save_model_selection(self) -> None:
@@ -887,7 +1495,11 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 wire,
                 provider=self._provider_definition(),
             )
-            base_name = outcome.existing_base if outcome.kind == "existing" else wire
+            base_name = (
+                outcome.existing_base
+                if outcome.kind in {"existing", "alias_collision"}
+                else wire
+            )
             assert base_name is not None
             retained[wire] = ModelSelectionDraft(wire, base_name)
         self._selected_models = retained
@@ -900,10 +1512,12 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         self.error = None
         self._show("review")
 
-    def _save_details(self, *, recompose: bool = True) -> bool:
-        wire = self.query_one("#detail-model", Select).value
-        if not isinstance(wire, str):
+    def _save_details(self, *, wire: str | None = None, recompose: bool = True) -> bool:
+        selected_wire = self.query_one("#detail-model", Select).value
+        wire = wire or (selected_wire if isinstance(selected_wire, str) else None)
+        if wire is None:
             wire = self._detail_wire
+        self._capture_review_inputs(wire)
         if not isinstance(wire, str) or wire not in self._selected_models:
             self.error = "Choose a selected model to edit."
             self._show("review")
@@ -937,20 +1551,12 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             aliases=self._optional_csv(aliases, selection.edits.aliases),
             tags=self._optional_csv(tags, selection.edits.tags),
         )
-        base = self.query_one("#base-name", Input).value.strip() or selection.base_name
+        base = selection.base_name
         outcome = match_discovered_model(
             self.catalog, self.provider_id, wire, provider=self._provider_definition()
         )
         if outcome.kind == "occupied_slot":
-            resolution = self.query_one("#collision-choice", Select).value
-            if resolution == "existing":
-                base = cast(str, outcome.existing_base)
-            elif base == outcome.existing_base:
-                self.error = (
-                    "Enter an unambiguous new base name for this occupied slot."
-                )
-                self._show("review")
-                return False
+            base = cast(str, outcome.existing_base)
         elif outcome.kind == "multiple_matches":
             choice = self.query_one("#collision-choice", Select).value
             if isinstance(choice, str):
@@ -978,6 +1584,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         selection = self._review_selection()
         if selection is None:
             return
+        self._capture_review_inputs(selection.wire_name)
         self._selected_models[selection.wire_name] = replace(
             selection,
             edits=replace(
@@ -987,15 +1594,20 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 cached_input_price=OptionalEdit.cleared(),
             ),
         )
+        self._clear_review_input(
+            selection, "input-price", "output-price", "cached-price"
+        )
         self._show("review")
 
     def _clear_detail_metadata(self, field: Literal["aliases", "tags"]) -> None:
         selection = self._review_selection()
         if selection is None:
             return
+        self._capture_review_inputs(selection.wire_name)
         self._selected_models[selection.wire_name] = replace(
             selection, edits=replace(selection.edits, **{field: OptionalEdit.cleared()})
         )
+        self._clear_review_input(selection, field)
         self._show("review")
 
     def _price(self, selector: str) -> float | None:
@@ -1007,28 +1619,11 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             raise ValueError
         return price
 
-    def _move_tag(self, direction: int) -> None:
-        """Move the detail model inside the explicitly selected tag's member order."""
-        selection = self._review_selection()
-        tag = self._detail_tag or self.query_one("#ordered-tag", Select).value
-        if selection is None or not isinstance(tag, str):
-            self.error = "Choose a tag whose members to reorder."
-            self._show("review")
-            return
-        members = list(self._tag_orders.get(tag, self.catalog.tags.get(tag, ())))
-        if selection.base_name not in members:
-            members.append(selection.base_name)
-        index = members.index(selection.base_name)
-        other = index + direction
-        if 0 <= other < len(members):
-            members[index], members[other] = members[other], members[index]
-        self._tag_orders[tag] = tuple(members)
-        self._detail_tag = tag
-        self.error = None
-        self._show("review")
-
     def _assign_bulk_tags(self) -> None:
         """Apply the current ordered tags to every selected model, not prices or aliases."""
+        current = self._review_selection()
+        if current is not None:
+            self._capture_review_inputs(current.wire_name)
         tags = self._csv("#tags")
         if not tags:
             self.error = "Enter at least one tag before bulk assignment."
@@ -1038,6 +1633,9 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             self._selected_models[wire] = replace(
                 selection, edits=replace(selection.edits, tags=OptionalEdit.set(tags))
             )
+            # Programmatic edits supersede captured tag text without discarding
+            # unrelated raw fields for the model currently being edited.
+            self._review_inputs.setdefault(wire, {})["tags"] = ", ".join(tags)
         self.error = None
         self._show("review")
 
@@ -1053,11 +1651,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         if not self._save_details(recompose=False):
             return
         patches: dict[str, dict[str, object]] = {}
-        tags: dict[str, tuple[str, ...]] = (
-            dict(self._tag_orders)
-            if self._tag_orders != dict(self.catalog.tags)
-            else {}
-        )
+        tags: dict[str, tuple[str, ...]] = dict(self._tag_orders)
         for selection in self._selected_models.values():
             outcome: MatchOutcome = match_discovered_model(
                 self.catalog,
@@ -1069,7 +1663,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 continue
             base_name = (
                 outcome.existing_base
-                if outcome.kind == "existing"
+                if outcome.kind in {"existing", "alias_collision"}
                 else selection.base_name
             )
             assert base_name is not None
@@ -1155,7 +1749,9 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 if getattr(current_provider, name) != value
             }
         )
-        self._apply_changes(provider_patch, patches, tags)
+        self._apply_changes(
+            provider_patch, patches, tags if tags != dict(self.catalog.tags) else {}
+        )
 
     def _apply_changes(
         self,
@@ -1180,6 +1776,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             self._show("review")
             return
         self.snapshot = result.snapshot
+        self._tag_orders = dict(self.catalog.tags)
         self._changed = self._changed or result.changed
         self._show("again")
 
@@ -1207,38 +1804,77 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         )
 
     def _active_model_options(self) -> list[tuple[str, str]]:
+        """Return one selectable canonical row per model, plus usable tag expressions."""
         options: list[tuple[str, str]] = []
         for base, definition in sorted(self.catalog.models.items()):
-            if definition.disabled:
+            if definition.disabled or not self._has_usable_deployment(base):
                 continue
-            usable = self._has_usable_deployment(base)
-            if usable:
-                for deployment in definition.deployments:
-                    if (
-                        not deployment.disabled
-                        and not self.catalog.providers[deployment.provider].disabled
-                    ):
-                        options.append((
-                            f"{deployment.provider}/{deployment.name} ({base})",
-                            base,
-                        ))
-                        break
-                options.extend(
-                    (f"{base} alias: {alias}", alias) for alias in definition.aliases
-                )
+            deployment = next(
+                item
+                for item in definition.deployments
+                if not item.disabled
+                and not self.catalog.providers[item.provider].disabled
+            )
+            provider_status = (
+                "Configured"
+                if self._is_configured_provider(deployment.provider)
+                else "Available"
+            )
+            aliases = (
+                f"aliases: {', '.join(definition.aliases)}; "
+                if definition.aliases
+                else ""
+            )
+            options.append((
+                f"{deployment.provider}/{deployment.name} ({base})\t"
+                f"{aliases}{provider_status}",
+                base,
+            ))
         options.extend(
-            (f"@{tag}", f"@{tag}")
+            (f"@{tag}\ttag expression", f"@{tag}")
             for tag, members in sorted(self.catalog.tags.items())
             if any(self._has_usable_deployment(member) for member in members)
         )
         return options
 
-    def _finish(self) -> None:
-        expression = self.query_one("#active-model", Select).value
+    def _active_model_picker_options(self) -> list[tuple[str, str]]:
+        """Include a visible Default row when no configured model is selectable."""
+        options = self._active_model_options()
+        if self._active_model_expression not in {value for _label, value in options}:
+            current = self._active_model_expression or "catalog default"
+            return [
+                (f"Default\t(currently {current})", DEFAULT_ACTIVE_MODEL_OPTION),
+                *options,
+            ]
+        return options
+
+    def _validate_selection(self, expression: str | None, *, step: Step) -> bool:
+        if self.validate_selection is None:
+            return True
+        try:
+            error = self.validate_selection(expression)
+        except Exception as failure:
+            self.error = f"Could not validate the active model: {failure}"
+            self._show(step)
+            return False
+        if error:
+            self.error = error
+            self._show(step)
+            return False
+        self.error = None
+        return True
+
+    def _finish(self, expression: str | None = None) -> None:
+        if expression is None:
+            expression = self._active_model_expression
         valid_expressions = {value for _label, value in self._active_model_options()}
-        if not isinstance(expression, str) or expression not in valid_expressions:
+        if expression != "" and (
+            not isinstance(expression, str) or expression not in valid_expressions
+        ):
             self.error = "Choose a usable canonical name, alias, or @tag."
             self._show("picker")
+            return
+        if not self._validate_selection(expression, step="picker"):
             return
         self.run_worker(
             self._persist_active(expression),
@@ -1280,15 +1916,37 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             reasoning_field_name=preset.reasoning_field_name,
         )
 
-    def _select_existing_provider(self) -> None:
-        provider_id = self._overview_provider_id or next(
-            iter(self.catalog.providers), None
+    def _select_onboarding_mistral_provider(self) -> bool:
+        """Select an existing Mistral backend for the onboarding shortcut."""
+        provider_id = next(
+            (
+                candidate
+                for candidate, definition in self.catalog.providers.items()
+                if definition.backend == "mistral"
+            ),
+            None,
         )
+        if provider_id is None:
+            return False
+        self._overview_provider_id = provider_id
+        self._select_existing_provider()
+        return True
+
+    def _select_existing_provider(self) -> bool:
+        provider_id = self._overview_provider_id
+        if provider_id is None and len(self.catalog.providers) == 1:
+            provider_id = next(iter(self.catalog.providers))
         if provider_id is None:
             self.error = "Select a configured provider first."
             self._show("overview")
-            return
+            return False
         definition = self.catalog.providers[provider_id]
+        previous_id = self.provider.provider_id if self.provider is not None else None
+        if previous_id != provider_id:
+            # A masked value belongs to the prior provider identity, never the
+            # newly selected provider (including the onboarding Mistral shortcut).
+            self._credential_value = None
+            self._credential_collision_warning = None
         self.provider = ProviderDraft(
             (
                 "mistral"
@@ -1307,6 +1965,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             reasoning_field_name=definition.reasoning_field_name,
             extra_headers=definition.extra_headers,
         )
+        return True
 
     def _configured_credential(self, env_var: str) -> str | None:
         """Resolve an existing provider credential through the host boundary."""
@@ -1318,22 +1977,42 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         """Discard draft model state before entering another management path."""
         self._selected_models = {}
         self._selected_wires = set()
+        self._review_inputs = {}
         self._detail_wire = None
-        self._detail_tag = None
         self.discovered = ()
         self._credential_value = None
         self._credential_collision_warning = None
         self.error = None
 
     def _show(self, step: Step) -> None:
+        if step != self.step:
+            self._invalid_inputs.clear()
         if step == "form" and self.step == "again":
             self.provider = None
             self._selected_models = {}
             self._detail_wire = None
         self.step = step
         self.refresh(recompose=True)
+        self.call_after_refresh(self._focus_current_picker)
+        self.call_later(self._focus_current_picker)
+
+    def action_picker_down(self) -> None:
+        if self.step == "picker" and self.query("#active-model"):
+            self.query_one("#active-model", OptionList).action_cursor_down()
+
+    def action_picker_up(self) -> None:
+        if self.step == "picker" and self.query("#active-model"):
+            self.query_one("#active-model", OptionList).action_cursor_up()
 
     def action_back(self) -> None:
+        if self.step == "models" and self.query("#search"):
+            search = self.query_one("#search", Input)
+            if search.value:
+                search.value = ""
+                return
+        if self.step == "picker" and self.provider is None:
+            self._show("overview" if self.management else "choice")
+            return
         previous: dict[Step, Step] = {
             "choice": "overview" if self.management else "choice",
             "form": "choice",
@@ -1348,6 +2027,8 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             self.action_cancel()
         else:
             self._probe_generation += 1
+            if self.step == "review":
+                self._capture_review_inputs()
             if self._management_action == "edit" and self.step == "form":
                 self._show("overview")
             elif self._management_action == "credential" and self.step == "credential":

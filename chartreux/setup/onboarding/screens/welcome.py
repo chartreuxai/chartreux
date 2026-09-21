@@ -35,8 +35,10 @@ class WelcomeScreen(OnboardingScreen):
         self._char_index = 0
         self._gradient_offset = 0
         self._typing_done = False
+        self._prompt_visible = False
         self._paused = False
         self._typing_timer: Timer | None = None
+        self._gradient_timer: Timer | None = None
         self._button_char_index = 0
         self._button_typing_timer: Timer | None = None
         self._welcome_text: Static
@@ -74,13 +76,15 @@ class WelcomeScreen(OnboardingScreen):
         if self._char_index >= len(WELCOME_TEXT):
             if not self._typing_done:
                 self._typing_done = True
+                if self._typing_timer:
+                    self._typing_timer.stop()
                 self.set_timer(0.5, self._show_button)
             return
         if self._char_index == HIGHLIGHT_END and not self._paused:
             self._paused = True
             if self._typing_timer:
                 self._typing_timer.stop()
-            self.set_interval(0.08, self._animate_gradient)
+            self._gradient_timer = self.set_interval(0.08, self._animate_gradient)
             self.set_timer(1.4, self._resume_typing)
             return
         self._char_index += 1
@@ -90,8 +94,24 @@ class WelcomeScreen(OnboardingScreen):
         self._typing_timer = self.set_interval(0.03, self._type_next_char)
 
     def _show_button(self) -> None:
+        self._prompt_visible = True
         self._enter_hint.remove_class("hidden")
         self._button_typing_timer = self.set_interval(0.03, self._type_button_char)
+
+    def _complete_animation(self) -> None:
+        if self._typing_timer:
+            self._typing_timer.stop()
+        if self._gradient_timer:
+            self._gradient_timer.stop()
+        if self._button_typing_timer:
+            self._button_typing_timer.stop()
+        self._char_index = len(WELCOME_TEXT)
+        self._typing_done = True
+        self._welcome_text.update(self._render_text(self._char_index))
+        self._button_char_index = len(BUTTON_TEXT)
+        self._enter_hint.update(shortcut_hint(BUTTON_TEXT_MARKUP))
+        self._enter_hint.remove_class("hidden")
+        self._prompt_visible = True
 
     def _type_button_char(self) -> None:
         if self._button_char_index >= len(BUTTON_TEXT):
@@ -110,5 +130,7 @@ class WelcomeScreen(OnboardingScreen):
         self._welcome_text.update(self._render_text(self._char_index), layout=False)
 
     def action_next(self) -> None:
-        if self._typing_done:
-            self.host.show_theme()
+        if not self._prompt_visible:
+            self._complete_animation()
+            return
+        self.host.show_theme()

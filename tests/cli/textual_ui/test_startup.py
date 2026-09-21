@@ -5,9 +5,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from chartreux.app_server.models import WorkspaceTrustDetails
-from chartreux.app_server.protocol import WorkspaceTrustStatusResponse
+from chartreux.app_server.protocol import (
+    ConfigReadResponse,
+    WorkspaceTrustStatusResponse,
+)
 from chartreux.cli.textual_ui import startup
-from chartreux.setup.trusted_folders.trust_folder_dialog import TrustFolderApp
+from tests.stubs.app_config import build_test_app_config
 
 
 @pytest.mark.asyncio
@@ -37,6 +40,15 @@ async def test_trust_is_resolved_before_session_open(
             or WorkspaceTrustStatusResponse(status="trusted")
         )
     )
+    host.read_config = AsyncMock(
+        return_value=ConfigReadResponse(
+            config=build_test_app_config().model_copy(update={"theme": "dark"})
+        )
+    )
+    dialog = MagicMock()
+    dialog.run_trust_dialog_async = AsyncMock(return_value="trust_cwd")
+    trust_folder_app = MagicMock(return_value=dialog)
+    monkeypatch.setattr(startup, "TrustFolderApp", trust_folder_app)
     session = MagicMock()
 
     async def open_session():
@@ -44,9 +56,6 @@ async def test_trust_is_resolved_before_session_open(
         return session
 
     host.open_session = open_session
-    monkeypatch.setattr(
-        TrustFolderApp, "run_trust_dialog_async", AsyncMock(return_value="trust_cwd")
-    )
 
     opened = await startup.open_textual_session(
         host,
@@ -60,6 +69,8 @@ async def test_trust_is_resolved_before_session_open(
     assert opened.showed_trust_prompt is True
     assert opened.showed_resume_picker is False
     assert calls == ["trust_status", "trust_decision", "open_session"]
+    host.read_config.assert_awaited_once_with()
+    assert trust_folder_app.call_args.kwargs["theme"] == "dark"
 
 
 @pytest.mark.asyncio

@@ -90,6 +90,8 @@ def project_config_view(
 ) -> ConfigView:
     return ConfigView(
         active_model=_project_model_config(config.get_active_model()),
+        active_model_expression=config.active_model,
+        allowed_models=list(config.allowed_models),
         active_model_pinned=active_model_pinned,
         # The configured default, never the active model: clients render it as
         # the "Default (currently X)" hint, which must stay stable while a pin

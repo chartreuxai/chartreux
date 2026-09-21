@@ -17,7 +17,7 @@ prompt, prints a response, and exits.
 | `--enabled-tools TOOL` | Repeatable exact, glob, or `re:` tool filter; in programmatic mode it disables other tools. |
 | `--disabled-tools TOOL` | Repeatable exact, glob, or `re:` tool filter applied after `--enabled-tools`. |
 | `--output {text,json,streaming}` | Programmatic output: human text (default), one JSON result, or newline-delimited JSON. |
-| `--setup` | Run API-key setup and exit. |
+| `--setup` | Run interactive setup—theme, provider, credentials, and model selection—then exit. Requires an interactive terminal; otherwise, it prints actionable guidance instead of launching the TUI. |
 | `--workdir DIR` | Change to this directory before launch. |
 | `--worktree [NAME]` | Run in a managed Git worktree. With a name, create or reuse it; without one, create a name from the prompt or a random slug. Ignored with `--setup`. |
 | `--add-dir DIR` | Repeatable additional workspace root; trusted for this session. |

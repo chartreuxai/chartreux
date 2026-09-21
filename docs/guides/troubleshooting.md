@@ -23,10 +23,11 @@ session override, then `DEBUG_MODE`/`LOG_LEVEL`, then `log_level` in
 
 ### Missing provider credential
 
-Run `chartreux --setup` interactively, or export `MISTRAL_API_KEY` for the
-default provider before launching. A non-empty shell value takes precedence over
-`~/.chartreux/.env`; an unset or empty shell value allows a non-empty `.env`
-value to be used. Programmatic mode cannot display onboarding prompts.
+Run `chartreux --setup` from an interactive terminal, or export `MISTRAL_API_KEY`
+for the default provider before launching. A non-empty shell value takes precedence
+over `~/.chartreux/.env`; an unset or empty shell value allows a non-empty `.env`
+value to be used. Non-interactive and programmatic environments never launch the
+onboarding TUI; setup prints guidance when an interactive terminal is unavailable.
 
 ### Project configuration is ignored
 
