@@ -309,8 +309,9 @@ async def test_overview_requires_selection_and_disables_empty_actions() -> None:
     flow, _ = make_flow(catalog=empty, management=True)
     async with FlowHost(flow).run_test() as pilot:
         await wait_for(pilot, lambda: bool(flow.query("#edit")))
-        for button_id in ("edit", "discover", "credential"):
+        for button_id in ("edit", "discover"):
             assert flow.query_one(f"#{button_id}", Button).disabled
+        assert not flow.query("#credential")
 
 
 @pytest.mark.asyncio
@@ -405,6 +406,97 @@ async def test_invalid_form_submission_drops_credential_after_endpoint_change() 
         assert flow.provider.key is None
         assert flow._credential_value is None
         assert flow.query_one("#key", Input).value == ""
+
+
+@pytest.mark.asyncio
+async def test_onboarding_offers_and_adopts_available_keyless_shipped_provider() -> (
+    None
+):
+    catalog = snapshot(
+        providers={
+            "codex/local": {
+                "api_base": "http://127.0.0.1:18080/v1",
+                "api_style": "openai-responses",
+            }
+        }
+    )
+    flow, services = make_flow(
+        (DiscoveryResult((DiscoveryItem("gpt-6-astra"),)),), catalog=catalog
+    )
+    async with FlowHost(flow).run_test(size=(80, 24)) as pilot:
+        await wait_for(pilot, lambda: bool(flow.query("#use-provider-codex-local")))
+        assert (
+            flow.query_one("#use-provider-codex-local", Button).label
+            == "Use Codex (local)"
+        )
+        await pilot.click("#use-provider-codex-local")
+        await wait_for(
+            pilot, lambda: flow.step == "models" and bool(flow.query("#models"))
+        )
+
+    assert flow.provider is not None
+    assert flow.provider.provider_id == "codex/local"
+    assert services.discovery_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_overview_use_action_adopts_available_keyless_provider() -> None:
+    catalog = snapshot(
+        providers={
+            "codex/local": {
+                "api_base": "http://127.0.0.1:18080/v1",
+                "api_style": "openai-responses",
+            },
+            "custom/default": {"api_base": "https://custom.example/v1"},
+        }
+    )
+    flow, services = make_flow(
+        (DiscoveryResult((DiscoveryItem("gpt-6-astra"),)),),
+        catalog=catalog,
+        management=True,
+    )
+    async with FlowHost(flow).run_test(size=(80, 24)) as pilot:
+        await wait_for(pilot, lambda: bool(flow.query("#overview-provider")))
+        flow._overview_provider_id = "codex/local"
+        flow._show("overview")
+        await wait_for(pilot, lambda: bool(flow.query("#use")))
+        assert not flow.query("#credential")
+        await pilot.click("#use")
+        await wait_for(
+            pilot, lambda: flow.step == "models" and bool(flow.query("#models"))
+        )
+
+    assert flow.provider is not None
+    assert flow.provider.provider_id == "codex/local"
+    assert services.discovery_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_noop_connection_edit_reports_status_without_writing() -> None:
+    flow, services = make_flow(management=True)
+    flow._overview_provider_id = "example/default"
+    host = FlowHost(flow)
+    async with host.run_test() as pilot:
+        await wait_for(pilot, lambda: bool(flow.query("#edit")))
+        await pilot.click("#edit")
+        await wait_for(pilot, lambda: flow.step == "form")
+        flow._save_form()
+        await wait_for(pilot, lambda: flow.status == "No changes.")
+        await pilot.pause()
+        assert "No changes." in [str(item.render()) for item in flow.query(Static)]
+
+    assert services.changes == []
+    assert host.results == []
+
+
+@pytest.mark.asyncio
+async def test_missing_overview_selection_uses_provider_wording() -> None:
+    flow, _ = make_flow(management=True)
+    async with FlowHost(flow).run_test() as pilot:
+        await wait_for(pilot, lambda: bool(flow.query("#edit")))
+        await pilot.click("#edit")
+        await wait_for(pilot, lambda: flow.error is not None)
+        assert flow.error == "Select a provider first."
 
 
 @pytest.mark.asyncio

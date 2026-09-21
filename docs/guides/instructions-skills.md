@@ -20,7 +20,7 @@ Store custom prompt files as `my-review-prompt.md` in `.chartreux/prompts/` for 
 
 ## Custom compaction prompts
 
-Compaction uses the built-in `compact` prompt unless `compaction_prompt_id` names a custom prompt. Prompt lookup and precedence are the same as for system prompts.
+Compaction uses the built-in `compact` prompt by default; custom prompt IDs remain available. Prompt lookup and precedence are the same as for system prompts.
 
 ```toml
 compaction_prompt_id = "project-summary"

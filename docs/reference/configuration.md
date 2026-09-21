@@ -78,7 +78,7 @@ The built-in read/edit/write/image/grep configurations include sensitive pattern
 | `show_thinking_nodes` | `false` | Boolean. |
 | `raise_on_compaction_failure` | `false` | Boolean. |
 | `system_prompt_id` | `"cli"` | Prompt ID. Built-ins are `cli`, `explore`, `tests`, and `minimal`; custom IDs resolve from prompt directories. |
-| `compaction_prompt_id` | `"compact"` | Compaction prompt ID; `compact` is built in. |
+| `compaction_prompt_id` | `"compact"` | Compaction prompt ID; `compact` is the default built-in. |
 | `include_commit_signature` | `true` | Boolean. |
 | `include_model_info` | `true` | Boolean. |
 | `include_project_context` | `true` | Boolean. |

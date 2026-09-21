@@ -5,6 +5,7 @@ import pytest
 
 from chartreux.core.config import MissingAPIKeyError
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+from chartreux.core.prompts import UtilityPrompt
 from tests.conftest import build_test_vibe_config
 
 
@@ -12,6 +13,12 @@ def test_unpinned_configuration_uses_shipped_default() -> None:
     config = build_test_vibe_config()
     assert config.active_model == ""
     assert config.get_active_model().alias == "glm-5-2"
+
+
+def test_default_compaction_prompt_is_compact() -> None:
+    config = build_test_vibe_config()
+    assert config.compaction_prompt_id == "compact"
+    assert config.compaction_prompt == UtilityPrompt.COMPACT.read()
 
 
 def test_catalog_backed_unknown_active_model_fails_at_resolution() -> None:

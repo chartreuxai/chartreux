@@ -229,6 +229,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         self._management_action: Literal["edit", "discover", "credential"] | None = None
         self.discovered: tuple[DiscoveryItem, ...] = ()
         self.error: str | None = None
+        self.status: str | None = None
         self._changed = False
         self._probe_worker: Worker[DiscoveryResult | DiscoveryError] | None = None
         self._probe_generation = 0
@@ -282,6 +283,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 yield Static("No providers yet.")
             yield from self._buttons(
                 ("add", "Add provider"),
+                ("use", "Use provider"),
                 ("edit", "Edit connection details"),
                 ("discover", "Discover + add models"),
                 ("credential", "Replace credential"),
@@ -292,6 +294,13 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             yield from self._buttons(
                 ("mistral", "Use Mistral"),
                 ("add", "Add a provider"),
+                *[
+                    (
+                        self._onboarding_provider_button_id(provider_id),
+                        f"Use {self._provider_choice_label(provider_id)}",
+                    )
+                    for provider_id in self._available_shipped_keyless_provider_ids()
+                ],
                 ("cancel", "Cancel"),
             )
         elif self.step == "form":
@@ -364,6 +373,8 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             )
             if self.error:
                 yield NoMarkupStatic(self.error, classes="error")
+            if self.status:
+                yield NoMarkupStatic(self.status, classes="muted")
             yield from self._buttons(
                 ("continue", "Continue"), ("back", "Back"), ("cancel", "Cancel")
             )
@@ -745,17 +756,45 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         buttons: tuple[tuple[str, str] | tuple[str, str, bool], ...]
         if self.step == "overview":
             unavailable = not self.catalog.providers
+            selected_provider_id = self._overview_provider_id
+            selected = (
+                self.catalog.providers.get(selected_provider_id)
+                if selected_provider_id
+                else None
+            )
+            use_available = (
+                selected is not None
+                and selected_provider_id is not None
+                and not self._is_configured_provider(selected_provider_id)
+            )
+            credential_available = bool(selected and selected.api_key_env_var) or (
+                selected is None
+                and len(self.catalog.providers) == 1
+                and next(iter(self.catalog.providers.values())).api_key_env_var
+            )
             buttons = (
+                *((("use", "Use provider"),) if use_available else ()),
                 ("add", "Add provider"),
                 ("edit", "Edit connection details", unavailable),
                 ("discover", "Discover + add models", unavailable),
-                ("credential", "Replace credential", unavailable),
+                *(
+                    (("credential", "Replace credential"),)
+                    if credential_available
+                    else ()
+                ),
                 ("cancel", "Close"),
             )
         elif self.step == "choice":
             buttons = (
                 ("mistral", "Use Mistral"),
                 ("add", "Add a provider"),
+                *[
+                    (
+                        self._onboarding_provider_button_id(provider_id),
+                        f"Use {self._provider_choice_label(provider_id)}",
+                    )
+                    for provider_id in self._available_shipped_keyless_provider_ids()
+                ],
                 ("cancel", "Cancel"),
             )
         elif self.step == "form":
@@ -942,6 +981,47 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             reasoning_field_name=self.provider.reasoning_field_name,
         )
 
+    @staticmethod
+    def _onboarding_provider_button_id(provider_id: str) -> str:
+        return f"use-provider-{provider_id.replace('/', '-')}"
+
+    @staticmethod
+    def _provider_choice_label(provider_id: str) -> str:
+        name, separator, variant = provider_id.partition("/")
+        return f"{name.title()} ({variant})" if separator else name.title()
+
+    def _available_shipped_keyless_provider_ids(self) -> tuple[str, ...]:
+        """Return unconfigured shipped providers that onboarding can use directly."""
+        from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
+
+        if self.management:
+            return ()
+        return tuple(
+            provider_id
+            for provider_id, definition in sorted(self.catalog.providers.items())
+            if (
+                provider_id in SHIPPED_CATALOG.providers
+                and not definition.api_key_env_var
+                and not self._is_configured_provider(provider_id)
+            )
+        )
+
+    def _adopt_existing_provider(self, provider_id: str | None = None) -> bool:
+        """Select a shipped provider and continue through its required setup path."""
+        if provider_id is not None:
+            self._overview_provider_id = provider_id
+        if not self._select_existing_provider():
+            return False
+        self._reset_unsaved_model_metadata()
+        self._management_action = None
+        assert self.provider is not None
+        if self.provider.api_key_env_var:
+            self._show("credential")
+        else:
+            self._show("probe")
+            self._run_probe()
+        return True
+
     def on_button_pressed(  # noqa: PLR0911, PLR0912, PLR0915
         self, event: Button.Pressed
     ) -> None:
@@ -959,6 +1039,21 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 self._apply_preset("mistral")
                 self._show("form")
             return
+        onboarding_provider_ids = self._available_shipped_keyless_provider_ids()
+        if button in {
+            self._onboarding_provider_button_id(provider_id)
+            for provider_id in onboarding_provider_ids
+        }:
+            provider_id = next(
+                provider_id
+                for provider_id in onboarding_provider_ids
+                if self._onboarding_provider_button_id(provider_id) == button
+            )
+            self._adopt_existing_provider(provider_id)
+            return
+        if button == "use":
+            self._adopt_existing_provider()
+            return
         if button == "add":
             self._management_action = None
             self._reset_unsaved_model_metadata()
@@ -972,11 +1067,11 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             return
         if button in {"edit", "discover", "credential"}:
             if not self.catalog.providers:
-                self.error = "Select a configured provider first."
+                self.error = "Select a provider first."
                 self._show("overview")
                 return
             if len(self.catalog.providers) > 1 and self._overview_provider_id is None:
-                self.error = "Select a configured provider first."
+                self.error = "Select a provider first."
                 self._show("overview")
                 return
             if not self._select_existing_provider():
@@ -1046,6 +1141,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             self._commit()
 
     def _save_form(self) -> None:
+        self.status = None
         preset_id = self.query_one("#preset", Select).value
         preset = next((item for item in PRESETS if item.id == preset_id), None)
         name = self.query_one("#name", Input).value
@@ -1134,6 +1230,10 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             for name, value in values.items()
             if getattr(current, name) != value
         }
+        if not patch:
+            self.status = "No changes."
+            self._show("form")
+            return
         try:
             result = self.catalog_writer.apply_changes(
                 CatalogChanges(self.provider.provider_id, patch)
@@ -1937,7 +2037,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         if provider_id is None and len(self.catalog.providers) == 1:
             provider_id = next(iter(self.catalog.providers))
         if provider_id is None:
-            self.error = "Select a configured provider first."
+            self.error = "Select a provider first."
             self._show("overview")
             return False
         definition = self.catalog.providers[provider_id]
