@@ -232,7 +232,7 @@ async def test_child_waits_for_operation_and_interrupts_successor(cancel: bool) 
     registry._track_child_close = SessionRuntimeRegistry._track_child_close.__get__(
         registry
     )
-    registry._create_registered_child = AsyncMock(return_value=runtime)
+    registry._create_registered_child = AsyncMock(return_value=(runtime, None))
     plan = _turn("plan", "child")
     successor = _turn("implementation", "replacement-child")
     runtime.turns.start.return_value = (TurnStartResponse(turn=plan), lambda: None)

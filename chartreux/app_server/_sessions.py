@@ -195,6 +195,7 @@ class AgentRecord:
     session_id: str
     runtime: SessionRuntime
     root_generation: int
+    idle_ttl_seconds: int | None = None
     parent_session_id: str = ""
     initial_task_summary: str | None = None
     state: _AgentState = _AgentState.IDLE
@@ -208,6 +209,11 @@ class AgentRecord:
     base_model: str | None = None
     active_provider: str | None = None
     effective_thinking: str | None = None
+
+    def effective_idle_ttl(self, global_ttl: int | float) -> int | float:
+        return (
+            self.idle_ttl_seconds if self.idle_ttl_seconds is not None else global_ttl
+        )
 
     @property
     def availability(self) -> AgentAvailability:
@@ -1288,7 +1294,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
 
     async def _create_registered_child(
         self, parent: SessionRuntime, args: TaskArgs, ctx: InvokeContext
-    ) -> SessionRuntime:
+    ) -> tuple[SessionRuntime, int | None]:
         candidate = self._resolve_launch_candidate(parent, args)
         generation_identity = (
             parent.agent_loop.session_id,
@@ -1350,7 +1356,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                         child.session_id, child.config.session_logging
                     )
                 raise
-            return runtime
+            return runtime, candidate.profile.idle_ttl_seconds
 
     @staticmethod
     def _start_child_turn(
@@ -1917,7 +1923,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 runtime = record.runtime
             else:
                 self._require_task_profile_allowed(parent, args.agent)
-                runtime = await self._create_registered_child(parent, args, ctx)
+                runtime, idle_ttl_seconds = await self._create_registered_child(
+                    parent, args, ctx
+                )
                 agent_id = await self._issue_agent_id(parent)
                 record = AgentRecord(
                     agent_id=agent_id,
@@ -1925,6 +1933,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     session_id=runtime.agent_loop.session_id,
                     runtime=runtime,
                     root_generation=parent.agent_loop._session_generation,
+                    idle_ttl_seconds=idle_ttl_seconds,
                     parent_session_id=parent.agent_loop.session_id,
                     initial_task_summary=normalize_task_summary(
                         args.task_summary, fallback=args.task
@@ -2200,7 +2209,14 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                                         record.root_generation
                                     )
                                 ):
-                                    if self._retention_policy == (0, 0):
+                                    if (
+                                        record.effective_idle_ttl(
+                                            self._retention_policy[0]
+                                        )
+                                        == 0
+                                        and record.idle_ttl_seconds is None
+                                        and self._retention_policy[1] == 0
+                                    ):
                                         record.state = _AgentState.EVICTING
                                         self._agent_records.pop(agent_id, None)
                                         self._children.pop(record.session_id, None)
@@ -2394,7 +2410,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         if args.agent_id is not None:
             raise ValueError("agent_id is only supported for background tasks")
         self._require_task_profile_allowed(parent, args.agent)
-        runtime = await self._create_registered_child(parent, args, ctx)
+        runtime, _idle_ttl_seconds = await self._create_registered_child(
+            parent, args, ctx
+        )
         child = runtime.agent_loop
         progress = BoundedEventQueue[ToolStreamEvent]()
         accumulator = SubagentRunAccumulator()
@@ -2548,7 +2566,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
 
     def _agent_summaries(self) -> list[AgentSummary]:
         now = self._clock()
-        ttl = (
+        global_ttl = (
             self._retention_policy[0]
             if self._generation_identity is not None
             else (
@@ -2559,6 +2577,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         )
         resident = []
         for record in self._agent_records.values():
+            ttl = record.effective_idle_ttl(global_ttl)
             run = record.current_run
             latest_run_id = record.latest_run_id or (
                 record.run_history[-1].run_id if record.run_history else None
@@ -2779,14 +2798,21 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._reaper_task = None
         ttl, cap = self._retention_policy
         eligible = self._eligible_idle_locked()
-        if not eligible or (ttl == 0 and cap == 0):
+        ttl_eligible = [
+            record for record in eligible if record.effective_idle_ttl(ttl) > 0
+        ]
+        if not eligible or (not ttl_eligible and cap == 0):
             return
         if cap and len(eligible) > cap:
             delay = 0.0
-        elif ttl:
+        elif ttl_eligible:
             delay = max(
                 0.0,
-                min(cast(float, r.idle_since) for r in eligible) + ttl - self._clock(),
+                min(
+                    cast(float, record.idle_since) + record.effective_idle_ttl(ttl)
+                    for record in ttl_eligible
+                )
+                - self._clock(),
             )
         else:
             return
@@ -2807,12 +2833,15 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     key=lambda record: (record.idle_since, record.agent_id),
                 )
                 victims: list[tuple[str, str]] = []
-                if ttl:
-                    victims.extend(
-                        (record.agent_id, "ttl")
-                        for record in eligible
-                        if now - cast(float, record.idle_since) >= ttl
+                victims.extend(
+                    (record.agent_id, "ttl")
+                    for record in eligible
+                    if (
+                        now - cast(float, record.idle_since)
+                        >= record.effective_idle_ttl(ttl)
+                        > 0
                     )
+                )
                 selected = {agent_id for agent_id, _ in victims}
                 remaining = [r for r in eligible if r.agent_id not in selected]
                 if cap and len(remaining) > cap:

@@ -8,6 +8,7 @@ from chartreux.core.agents.manager import AgentManager
 from chartreux.core.agents.models import (
     BUILTIN_SUBAGENTS,
     WORKER,
+    AgentProfile,
     AgentSafety,
     AgentType,
 )
@@ -27,6 +28,15 @@ class TestAgentProfile:
     def test_worker_agent_has_no_overrides(self) -> None:
         assert WORKER.overrides == {}
         assert WORKER.instructions is None
+
+    def test_profile_idle_ttl_is_metadata_not_an_override(self, tmp_path: Path) -> None:
+        profile_path = tmp_path / "persistent.toml"
+        profile_path.write_text("idle_ttl_seconds = 0\n", encoding="utf-8")
+
+        profile = AgentProfile.from_toml(profile_path)
+
+        assert profile.idle_ttl_seconds == 0
+        assert profile.overrides == {}
 
     def test_builtin_subagents_contains_worker(self) -> None:
         assert BUILTIN_SUBAGENTS["worker"] is WORKER
@@ -86,6 +96,27 @@ class TestAgentManager:
 
     def test_get_subagents_includes_worker(self, manager: AgentManager) -> None:
         assert "worker" in [agent.name for agent in manager.get_subagents()]
+
+    @pytest.mark.parametrize("idle_ttl_seconds", ["-1", '"invalid"', "true"])
+    def test_invalid_profile_idle_ttl_is_rejected_at_discovery(
+        self,
+        tmp_path: Path,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+        idle_ttl_seconds: str,
+    ) -> None:
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "invalid.toml").write_text(
+            f"idle_ttl_seconds = {idle_ttl_seconds}\n", encoding="utf-8"
+        )
+
+        manager = AgentManager(
+            load_orchestrator(build_config(agent_paths=[agents_dir]))
+        )
+
+        with pytest.raises(ValueError, match="not found"):
+            manager.get_agent("invalid")
 
     def test_get_builtin_subagent(self, manager: AgentManager) -> None:
         assert manager.get_agent("worker") is WORKER

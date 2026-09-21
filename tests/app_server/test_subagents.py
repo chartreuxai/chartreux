@@ -1622,7 +1622,11 @@ def _stored_result(
 
 
 def _idle_record(
-    agent_id: str, *, clock: _ManualClock, summary: str = "initial"
+    agent_id: str,
+    *,
+    clock: _ManualClock,
+    summary: str = "initial",
+    idle_ttl_seconds: int | None = None,
 ) -> AgentRecord:
     runtime = MagicMock()
     runtime.close = AsyncMock()
@@ -1632,6 +1636,7 @@ def _idle_record(
         session_id=f"session-{agent_id}",
         runtime=runtime,
         root_generation=0,
+        idle_ttl_seconds=idle_ttl_seconds,
         initial_task_summary=summary,
         state=_AgentState.IDLE,
         idle_since=clock(),
@@ -2150,6 +2155,89 @@ async def test_reaper_ttl_ages_from_completion_not_observation() -> None:
 
     assert record.agent_id not in registry._agent_records
     assert registry._evicted_agents[record.agent_id].summary.idle_seconds == 10
+
+
+@pytest.mark.asyncio
+async def test_reaper_uses_profile_ttl_before_global_ttl() -> None:
+    clock = _ManualClock()
+    wakeup = _GatedWakeup()
+    registry, _root = _reaper_registry(clock, ttl=10, wakeup=wakeup)
+    profile = _idle_record("profile", clock=clock, idle_ttl_seconds=5)
+    global_ttl = _idle_record("global", clock=clock)
+    registry._agent_records = {
+        profile.agent_id: profile,
+        global_ttl.agent_id: global_ttl,
+    }
+
+    await _rearm(registry)
+    assert await wakeup.arrivals.get() == 5
+    clock.advance(5)
+    wakeup.gates[0].set()
+    reaper = registry._reaper_task
+    assert reaper is not None
+    await reaper
+    assert set(registry._agent_records) == {"global"}
+    assert await wakeup.arrivals.get() == 5
+    await registry.drain_children()
+
+
+@pytest.mark.asyncio
+async def test_zero_profile_ttl_disables_ttl_eviction_but_not_cap_eviction() -> None:
+    clock = _ManualClock()
+    wakeup = _GatedWakeup()
+    registry, _root = _reaper_registry(clock, ttl=10, cap=1, wakeup=wakeup)
+    exempt = _idle_record("exempt", clock=clock, idle_ttl_seconds=0)
+    other = _idle_record("other", clock=clock)
+    other.idle_since = 1
+    registry._agent_records = {exempt.agent_id: exempt, other.agent_id: other}
+
+    await _rearm(registry)
+    assert await wakeup.arrivals.get() == 0
+    wakeup.gates[0].set()
+    reaper = registry._reaper_task
+    assert reaper is not None
+    await reaper
+    assert set(registry._agent_records) == {"other"}
+    assert (
+        registry._evicted_agents["exempt"].summary.availability
+        is AgentAvailability.EVICTED
+    )
+    await registry.drain_children()
+
+
+@pytest.mark.asyncio
+async def test_reaper_arms_for_earliest_mixed_ttl_and_not_all_exempt_agents() -> None:
+    clock = _ManualClock()
+    wakeup = _GatedWakeup()
+    registry, _root = _reaper_registry(clock, ttl=10, wakeup=wakeup)
+    slow = _idle_record("slow", clock=clock, idle_ttl_seconds=20)
+    fast = _idle_record("fast", clock=clock, idle_ttl_seconds=5)
+    registry._agent_records = {slow.agent_id: slow, fast.agent_id: fast}
+
+    await _rearm(registry)
+    assert await wakeup.arrivals.get() == 5
+    slow.idle_ttl_seconds = 0
+    fast.idle_ttl_seconds = 0
+    await _rearm(registry)
+    assert registry._reaper_task is None
+
+
+@pytest.mark.asyncio
+async def test_idle_summaries_use_each_record_ttl() -> None:
+    clock = _ManualClock()
+    registry, _root = _reaper_registry(clock, ttl=10)
+    exempt = _idle_record("exempt", clock=clock, idle_ttl_seconds=0)
+    overridden = _idle_record("overridden", clock=clock, idle_ttl_seconds=5)
+    inherited = _idle_record("inherited", clock=clock)
+    registry._agent_records = {
+        record.agent_id: record for record in (exempt, overridden, inherited)
+    }
+
+    clock.advance(3)
+    summaries = {summary.agent_id: summary for summary in await registry.check_agents()}
+    assert summaries["exempt"].ttl_remaining_seconds is None
+    assert summaries["overridden"].ttl_remaining_seconds == 2
+    assert summaries["inherited"].ttl_remaining_seconds == 7
 
 
 @pytest.mark.asyncio
@@ -3691,6 +3779,7 @@ _DYNAMIC_PROFILE = AgentProfile(
     safety=AgentSafety.NEUTRAL,
     agent_type=AgentType.SUBAGENT,
     instructions="Retained role instruction.",
+    idle_ttl_seconds=300,
 )
 
 
@@ -3780,6 +3869,70 @@ async def _dynamic_registry(monkeypatch: pytest.MonkeyPatch):
         first,
         backends,
     )
+
+
+@pytest.mark.asyncio
+async def test_real_child_creation_carries_profile_idle_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, parent, record, _context, _first, _backends = await _dynamic_registry(
+        monkeypatch
+    )
+    try:
+        assert record.idle_ttl_seconds == 300
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("idle_ttl_seconds", [300, 0])
+async def test_profile_ttl_overrides_zero_global_retention_at_completion(
+    monkeypatch: pytest.MonkeyPatch, idle_ttl_seconds: int
+) -> None:
+    clock = _ManualClock()
+    wakeup = _GatedWakeup()
+    registry, parent, _notifications = await _zero_retention_registry(
+        monkeypatch, FakeBackend([mock_llm_chunk(content="done")])
+    )
+    parent.agent_manager._discovered["persistent"] = AgentProfile(
+        name="persistent",
+        display_name="Persistent",
+        description="Retained under zero global retention.",
+        safety=AgentSafety.NEUTRAL,
+        agent_type=AgentType.SUBAGENT,
+        idle_ttl_seconds=idle_ttl_seconds,
+    )
+    registry._clock = clock
+    registry._wakeup = wakeup
+    try:
+        launch = await _background_result(
+            registry,
+            TaskArgs(task="persist", agent="persistent", background=True),
+            InvokeContext(tool_call_id="persistent", session_id=parent.session_id),
+        )
+        assert launch.agent_id is not None and launch.run_id is not None
+        record = registry._agent_records[launch.agent_id]
+        assert record.idle_ttl_seconds == idle_ttl_seconds
+        completion = record.current_run.completion_task if record.current_run else None
+        assert isinstance(completion, asyncio.Task)
+        await completion
+        assert record.state is _AgentState.IDLE
+
+        if idle_ttl_seconds == 0:
+            assert registry._reaper_task is None
+            assert launch.agent_id in registry._agent_records
+        else:
+            assert await wakeup.arrivals.get() == 300
+            clock.advance(300)
+            wakeup.gates[0].set()
+            reaper = registry._reaper_task
+            assert reaper is not None
+            await reaper
+            assert launch.agent_id not in registry._agent_records
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
 
 
 @pytest.mark.asyncio
