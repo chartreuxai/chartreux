@@ -1,0 +1,16 @@
+[default]
+extend-ignore-re = ["(?m)^.*(#|//)\\s*typos:disable-line$", "datas"]
+
+[default.extend-words]
+iterm = "iterm"
+ITERM = "ITERM"
+asend = "asend"
+certifi = "certifi"
+# Additive Increase / Multiplicative Decrease — congestion-control acronym,
+# not the word "aimed".
+AIMD = "AIMD"
+
+[default.extend-identifiers]
+# macOS pasteboard four-char-code for the PNG flavor — required verbatim
+# by AppleScript syntax (`the clipboard as «class PNGf»`).
+PNGf = "PNGf"

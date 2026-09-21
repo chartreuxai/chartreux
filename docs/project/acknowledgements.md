@@ -1,0 +1,175 @@
+# Acknowledgements
+
+Chartreux is a fork of the Mistral Vibe CLI. This file acknowledges the people who built it.
+
+## Contributors
+
+- Marie-Camille Achard
+- Sylvain Afchain
+- Hammadi Agharass
+- Aymeric Agré
+- ahmedkooli
+- Ali
+- AliceGrg
+- Alodie
+- Corentin André
+- Antoine
+- Victor Antoine
+- AZERDSQ131
+- Marius Ballot
+- Torbjørn Bang
+- Raquel Barbadillo
+- Bastien
+- Valentin Berard
+- Nikhil Bhima
+- Nabil Bourenane
+- Julien Brgnd
+- David Brochart
+- Hervé Brun
+- Delphine Bugner
+- Jean Burellier
+- Paul Cacheux
+- Charles-Edouard Cady
+- Xing Shi Cai
+- Laurent Callot
+- Luis Cardoso
+- Diego Carlino
+- Carlo
+- Brice Carpentier
+- Hiba Chaabnia
+- Julien Cheype
+- Coiffeur
+- Paul Colleoni
+- Pierre Collignon
+- Cyprien
+- Denis D'Ambrosi
+- Henri Dandria
+- Jean-Malo Delignon
+- Timothé Delion
+- Guillaume Desforges
+- Arnaud Desquerre
+- Madiou Diallo
+- Djiit
+- Maxime Dolores
+- Marie Douriez
+- Alexandre Drean
+- Clément Drouin
+- Ivana Dunisijevic
+- Dylan
+- EmmaBouhanna
+- Jules Espinoux
+- Peter Evers
+- Nicolas Faurie
+- CHEN Fengyu
+- Sam Fenwick
+- Guillaume Fournier
+- Vincent G
+- Guillaume Gauvain
+- Pepe GC
+- Mathias Gesbert
+- Matthieu Gicquel
+- Julien Godenir
+- Guillaume LE GOFF
+- Grégoire
+- Joseph Guhlin
+- Vincent Guilloux
+- Gauthier Guinet
+- Robin Gullo
+- Jade Hardouin
+- Laure Hugo
+- Ronan Jaffré
+- JeroenvdV
+- Albert Jiang
+- josephine-delas
+- Nicolas Karolak
+- Thomas Kenbeek
+- Simon Van de Kerckhove
+- Mael Kerichard
+- Amine Kettani
+- PLATEL Kevin
+- Ivica Kicic
+- Anton Kluge
+- Kracekumar
+- Kenneth Kreindler
+- kris-szczepaniak
+- Tim Lacroix
+- Imane Lafnoune
+- Henry Lagarde
+- laurens
+- François Lefebvre
+- Vincent Lefeuve
+- Julien Legrand
+- Angèle Lenglemetz
+- Melody Liu
+- Aïmen Louafi
+- Louise-GdeFdeG
+- Liam Lyons
+- maiengineering
+- Lino Mallevaey
+- Lucas Marandat
+- MaranZeal678
+- Spencer Martin
+- Niccolò Massei
+- Paul Mathon
+- Issa Memari
+- MichisGitIsKing
+- Kim-Adeline Miguel
+- Praveen Kumar Mittal
+- Devon Mizelle
+- Nicolas Mourad
+- Jean-Baptiste Muscat
+- Isidor Nikolic
+- Maël Nison
+- Nkipohcs
+- Mike O'Beirne
+- Samy Ouyahia
+- Thiago Padilha
+- Cédric Patchane
+- Staszek Paśko
+- Pavel Penev
+- Valentin D. Pinkman
+- Christophe Poucet
+- Rémi Pradal
+- Nicolas Preuss
+- Nelson PROIA
+- Octave Raimbault
+- Kushwanth Ram
+- Remenby31
+- Renaud
+- Pierre Rossinès
+- Antoine Roux
+- Sami Salam
+- Louis Sanna
+- Charlotte Sasson
+- Asiya Shakhmametova
+- Allan Simon
+- Clément Sirieix
+- Martin Spiering
+- Stanislas
+- Junichi Sugiura
+- Armand Sylvain
+- Andrey Syschikov
+- Alexis Tacnet
+- Julien Tanay
+- Michel Thomazo
+- TomDarmon
+- Quentin Torroba
+- Alex Toudic
+- Benjamin Trom
+- Thaddee Tyl
+- Mert Unsal
+- Val
+- vans
+- Gabriel Vergnaud
+- Quentin Verlhac
+- Paul VEZIA
+- VKorelsky
+- Maxime Voisin
+- Thibaud Vouillon
+- Antoine W
+- Emma Wang
+- yihong0618
+- Yousria
+- Jules YZERD
+
+Chartreux is licensed under Apache-2.0 and retains upstream attribution; this file supplements, and does not replace, the LICENSE notice.

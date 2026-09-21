@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
+import io
+from pathlib import Path
+import re
+import time
+from typing import Protocol
+
+import pexpect
+
+
+class SpawnedChartreuxProcessFixture(Protocol):
+    def __call__(
+        self, workdir: Path, extra_args: Sequence[str] | None = None
+    ) -> AbstractContextManager[tuple[pexpect.spawn, io.StringIO]]: ...
+
+
+def ansi_tolerant_pattern(text: str) -> re.Pattern[str]:
+    ansi = r"(?:\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\r|\n)*"
+    return re.compile(ansi.join(re.escape(char) for char in text))
+
+
+def write_e2e_config(
+    vibe_home: Path, api_base: str, *, provider_name: str = "mock-provider"
+) -> None:
+    vibe_home.mkdir(parents=True, exist_ok=True)
+    (vibe_home / "config.toml").write_text(
+        "\n".join([
+            'active_model = "mock-model"',
+            "disable_welcome_banner_animation = true",
+        ]),
+        encoding="utf-8",
+    )
+    (vibe_home / "models.toml").write_text(
+        "\n".join([
+            f'[providers."{provider_name}/default"]',
+            f'api_base = "{api_base}"',
+            'api_key_env_var = "MISTRAL_API_KEY"',
+            'backend = "generic"',
+            "",
+            '[models."mock-model"]',
+            "aliases = []",
+            'thinking = "off"',
+            "temperature = 0.2",
+            "",
+            '[[models."mock-model".deployments]]',
+            f'provider = "{provider_name}/default"',
+            'name = "mock-model"',
+            "supports_images = false",
+        ]),
+        encoding="utf-8",
+    )
+
+
+def strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07", "", text)
+
+
+def poll_until(predicate: Callable[[], bool], timeout: float, message: str) -> None:
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        if predicate():
+            return
+        time.sleep(0.05)
+    raise AssertionError(message)
+
+
+def wait_for_request_count(
+    request_count_getter: Callable[[], int], expected_count: int, timeout: float
+) -> None:
+    poll_until(
+        lambda: request_count_getter() >= expected_count,
+        timeout,
+        f"Timed out waiting for {expected_count} backend request(s).",
+    )
+
+
+def wait_for_request_count_while_draining_child_output(
+    child: pexpect.spawn,
+    captured: io.StringIO,
+    request_count_getter: Callable[[], int],
+    *,
+    expected_count: int,
+    timeout: float,
+) -> None:
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        if request_count_getter() >= expected_count:
+            return
+        try:
+            child.expect(r"\S", timeout=0.05)
+        except pexpect.TIMEOUT:
+            pass
+    rendered_tail = strip_ansi(captured.getvalue())[-1200:]
+    raise AssertionError(
+        f"Timed out waiting for {expected_count} backend request(s).\n\n"
+        f"Rendered tail:\n{rendered_tail}"
+    )
+
+
+def wait_for_main_screen(child: pexpect.spawn, timeout: float = 20.0) -> None:
+    child.expect(ansi_tolerant_pattern("Chartreux v"), timeout=timeout)
+
+
+def wait_for_rendered_text(
+    child: pexpect.spawn, captured: io.StringIO, needle: str, timeout: float
+) -> None:
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        if needle in strip_ansi(captured.getvalue()):
+            return
+        try:
+            child.expect(r"\S", timeout=0.1)
+        except pexpect.TIMEOUT:
+            pass
+        except pexpect.EOF as exc:
+            rendered_tail = strip_ansi(captured.getvalue())[-1200:]
+            raise AssertionError(
+                f"Child exited while waiting for rendered text: {needle!r}\n\nRendered tail:\n{rendered_tail}"
+            ) from exc
+    rendered_tail = strip_ansi(captured.getvalue())[-1200:]
+    raise AssertionError(
+        f"Timed out waiting for rendered text: {needle!r}\n\nRendered tail:\n{rendered_tail}"
+    )
+
+
+def send_ctrl_c_until_quit_confirmation(
+    child: pexpect.spawn, captured: io.StringIO, timeout: float = 3
+) -> None:
+    """Send Ctrl+C and wait for quit confirmation prompt. Retries if first Ctrl+C interrupts."""
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        child.sendcontrol("c")
+        try:
+            child.expect(ansi_tolerant_pattern("Press Ctrl+C again to quit"), timeout=2)
+            # Confirmation prompt appeared, send second Ctrl+C
+            child.sendcontrol("c")
+            return
+        except pexpect.TIMEOUT:
+            # First Ctrl+C may have interrupted something, try again
+            continue
+    rendered_tail = strip_ansi(captured.getvalue())[-1200:]
+    raise AssertionError(
+        f"Timed out waiting for quit confirmation prompt.\n\nRendered tail:\n{rendered_tail}"
+    )

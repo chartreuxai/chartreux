@@ -1,0 +1,14 @@
+strace_code = "import chartreux"
+slowest_count = 15
+
+# Budgets set from baseline run (observed module count + ~10% headroom).
+
+[[commands]]
+label = "import chartreux"
+code = "import chartreux"
+budget = 68
+
+[[commands]]
+label = "from chartreux.cli.textual_ui.app import ChartreuxApp"
+code = "from chartreux.cli.textual_ui.app import ChartreuxApp"
+budget = 791

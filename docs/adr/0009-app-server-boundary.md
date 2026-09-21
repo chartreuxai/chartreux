@@ -1,0 +1,576 @@
+# 0009 App Server as the Harness Boundary
+
+## Decision
+
+`chartreux.app_server` is Chartreux's harness and the only runtime boundary used by
+delivery surfaces. It owns live sessions and composes reusable engine
+implementations from `chartreux.core`. Textual, ACP, and programmatic mode are
+clients of its typed JSON-RPC 2.0 protocol.
+
+Delivery surfaces never construct, receive, or inspect an `AgentLoop`. The
+client and server exchange serialized JSON values, including when both run in
+one Python process.
+
+```mermaid
+flowchart LR
+    Surfaces["Textual / ACP / programmatic"]
+    Client["Public app-server client API"]
+    Wire["Serialized JSON-RPC"]
+    Harness["chartreux.app_server harness"]
+    Core["Reusable chartreux.core engine"]
+
+    Surfaces --> Client
+    Client <--> Wire
+    Wire <--> Harness
+    Harness --> Core
+```
+
+`chartreux.core` and `chartreux.app_server` are source-module boundaries, not peer
+services. Core owns surface-neutral model and tool execution. The app server
+owns cross-surface session, turn, callback, resource, persistence-access, and
+cleanup lifecycles.
+
+Related decisions:
+
+- event-driven engine execution: [0003](0003-event-driven-agent-loop.md);
+- tools, permissions, effects, and client-hosted I/O:
+  [0004](0004-typed-permissioned-tools.md);
+- configuration ownership: [0005](0005-layered-configuration.md);
+- private session storage and public session state:
+  [0006](0006-local-sessions.md); and
+- agents, subagents, skills, hooks, MCP, and configured local tools:
+  [0007](0007-extension-mechanisms.md).
+
+The approved standalone policy supersedes previous per-call approvals, persistent defaults, and model pinning at the harness boundary.
+
+## Rationale
+
+Chartreux serves several delivery surfaces with one engine. A real serialized
+boundary gives the runtime one owner, prevents UI and protocol adapters from
+depending on Python object identity, and lets every surface observe the same
+turn, callback, effect, resource, and cleanup semantics.
+
+Public projections deliberately differ from private runtime and storage state.
+That keeps secrets and implementation details server-side while giving clients
+stable values they can reduce, render, page, and recover after an event gap.
+
+## Ownership
+
+The server is authoritative for state that can affect the model, workspace,
+session durability, or shared runtime:
+
+| Server or harness ownership | Client ownership |
+| --- | --- |
+| Root and child runtime construction | Widgets and layout |
+| Session identity, active and queued turns, turn ordering, and execution reservations | Keyboard and prompt editing |
+| Private session storage and public projections | Rendering public models |
+| Canonical cwd, workspace roots, trust, and prompt preparation | Display aliases and autocomplete presentation |
+| Effective config, persistence, agents, and model selection | Applying an accepted theme |
+| Tools, permissions, effects, and model-visible results | Clipboard integration |
+| Skills, hooks, MCP, configured tools, and subagents | Rendering public extension state |
+| Scheduled loops, finite shell effects, reviews, diagnostics, session logs, and cleanup | Other explicitly client-local presentation services |
+
+Client-hosted filesystem or terminal execution, for tools that support it, is a
+capability rather than a transfer of harness ownership. The server still
+validates the tool, resolves permission, orchestrates execution, projects one
+public effect, and supplies the result to the model. Client-terminal delegation
+remains available when advertised; its client-produced output may be merged and
+is not promised to preserve the local shell's stream split.
+
+The local model-facing shell is intentionally finite: each call starts a fresh
+shell, closes stdin with EOF, enforces a timeout, and returns separate stdout and
+stderr. It does not retain a process handle across calls or expose managed shell
+continuation, polling, input, cursor, or output-storage controls. User-authored
+manual `!` commands remain a separate shell effect path.
+
+Persisted settings remain server-owned even when the client applies their
+accepted value to local hardware or presentation.
+
+## Package and dependency boundaries
+
+The dependency direction is strict:
+
+- `chartreux.core` does not import `chartreux.app_server`, Textual, or ACP protocol types.
+- Private server modules under `chartreux.app_server` may import core implementations
+  because they compose and project them.
+- Public models, protocol envelopes, transports, client facades, client state,
+  and reducers do not import `chartreux.core`.
+- Attached runtime code in `chartreux.cli`, `chartreux.acp`, and programmatic mode uses
+  public app-server facades. Feature code must not import private app-server
+  modules.
+- `chartreux.app_server._runtime` is the construction boundary for `AgentLoop`.
+  Delivery surfaces pass serialized launch intent, not prebuilt core objects.
+
+Launcher, setup, and authentication code still performs pre-session bootstrap
+before a runtime is attached. That code may load startup configuration, but it
+must not own or mutate the live attached runtime or its config.
+
+Production code under `chartreux/cli/textual_ui` has no core imports and no
+`agent_loop` references, including through helper modules.
+
+The public package exports a narrow client API:
+
+- `AppServerHost` for passive pre-session operations and opening a session;
+- `AppServerSession` for an attached session, turns, resources, and live events;
+- `ClientToolHandler` for explicitly advertised client-hosted operations;
+- `AppServerConnectionClosed` for attached-session connection closure; and
+- `SessionExitSummary` for delivery-surface shutdown presentation.
+
+### Type ownership
+
+There is one definition for each public concept:
+
+- `chartreux.app_server.models` owns public session, history, callback, effect, and
+  shared resource values;
+- focused modules such as `chartreux.app_server.config` own redacted public views;
+- `chartreux.app_server.protocol` owns request, response, error, and notification
+  envelopes and imports the public values; and
+- client events wrap those public values without redefining their fields.
+
+A public model is separate from a core model only when it is intentionally
+redacted, aggregated, transport-oriented, or has a different lifecycle.
+Translation belongs in server-only projectors and handlers. Identical concepts
+use one dependency-neutral definition rather than parallel model hierarchies.
+
+`ProtocolModel` defines strict camel-case serialization and rejects unknown
+fields. It is a serialization policy, not a second domain type system.
+
+The app server reuses core config, session storage, agent management, tools,
+permissions, skills, hooks, MCP, and utilities. It must not grow shadow managers,
+parallel persistence, copied config schemas, or untyped reconstruction of core events.
+
+## Serialized protocol lifecycle
+
+The implemented transports are serialized in-process queues and newline-
+delimited stdio. Both pass through the same JSON-RPC client, server, models, and
+handlers. In-process calls are not allowed to bypass serialization.
+
+Both transports use bounded queues. Stdio has one writer that preserves message
+order and applies backpressure. In stdio mode, stdout is reserved for JSON-RPC;
+human logs use the configured log file or stderr.
+
+### Initialization and attachment
+
+Every connection follows this order:
+
+1. The client sends `initialize` with `ClientInfo` and capabilities.
+2. The server returns its identity, protocol version, methods, callback kinds,
+   and transports.
+3. The client sends `initialized`.
+4. Passive host requests may run without a live root runtime.
+5. `session/start`, `session/resume`, or `session/continue` lazily creates or
+   loads the root runtime and attaches the connection.
+6. The client reads the canonical runtime snapshot and consumes live events.
+
+No ordinary request is accepted before initialization. Initialization occurs
+once per connection. Creating a server does not eagerly create an agent runtime
+or load a workspace session.
+
+`AppServerHost` supports passive session list/read/history/delete, config-schema,
+and workspace-trust operations. Opening a session transfers that connection to
+`AppServerSession`; the same facade is not both a passive host and an attached
+runtime client.
+
+One `AppServer` instance owns one attached root runtime and its child-session
+registry. The protocol does not currently model several simultaneous attached
+observers of one runtime.
+
+### Message directions
+
+The protocol has three explicit directions:
+
+1. Clients send typed requests for session actions and resource operations.
+2. The server sends typed notifications for public state and resource changes.
+3. The server sends typed requests when it needs client participation:
+   `callback/call` and advertised `clientTool/*` operations.
+
+The response to `callback/call` acknowledges delivery only. The semantic answer
+always returns in a client-to-server `callback/result` request. Client-tool
+responses carry the result of the requested filesystem or terminal operation.
+
+Methods are explicit and typed. There is no generic slash-command execution,
+`executeCommand`, or generic session-event request. The current method catalogue
+is `chartreux.app_server.protocol.SERVER_METHODS`; its Pydantic parameter and result
+models are the source of truth. Removed account, registry, plugin, cloud, and
+hosted-connector methods are outside that catalogue and return the generic
+unknown-method error. Obsolete explicit configuration keys fail source validation;
+they are not silently ignored or migrated.
+
+Accepted actions write their response before notifications caused by that
+action. Attach operations establish the returned snapshot and live event route
+as one lifecycle transition so accepted events are not lost between them.
+
+## Sessions and turns
+
+Session creation and user execution are separate:
+
+- `session/start` creates and attaches an empty session;
+- `session/resume` loads saved state and attaches it;
+- `session/continue` resolves and attaches the latest eligible session;
+- `session/read`, `session/list`, and `session/history/list` are passive reads;
+- `session/fork` creates a session from an existing public boundary;
+- `session/stop` flushes and shuts down the attached runtime;
+- `turn/start` begins structured user input and may mark harness instructions as
+  injected so they remain hidden from public history;
+- `app_server/session/turn/enqueue` accepts canonical `entries` containing
+  context entries followed by at most one user entry as a separate future
+  turn;
+- `app_server/session/turn/queue/read` reads the accepted queued turns;
+- `app_server/session/turn/queue/remove` removes one accepted queued turn by its stable queue item
+  ID;
+- `app_server/session/turn/queue/replace` replaces one accepted queued turn
+  without changing its identity or FIFO position;
+- `app_server/session/turn/queue/resume` resumes automatic draining after an
+  interruption;
+- `turn/steer` adds input to the active turn; and
+- `turn/interrupt` interrupts the active turn.
+
+A session has at most one active turn. Steering and interruption include the
+expected turn identity so stale control requests fail instead of affecting a
+new turn.
+
+Starting, steering, and queueing are different actions. `turn/start` begins
+work immediately and requires the session to be idle. `turn/steer` adds input
+to the expected active turn and never creates a future turn.
+`app_server/session/turn/enqueue`
+accepts one future user turn and never changes the active turn. If queueing
+finds an idle, unpaused session, the server promotes exactly one queued item
+after returning the enqueue response. This makes a busy-submit race safe
+without changing `turn/start` semantics.
+
+Queue editing uses the `app_server/session/turn/queue/replace` Session
+procedure. It accepts the same typed entries as enqueue plus the target queue
+item ID. A successful replacement preserves the item's ID, creation time, and
+FIFO position. The enqueue request does not accept legacy `message`,
+`messageEntryId`, or `replaceQueueItemId` fields.
+
+The accepted turn queue has these rules:
+
+- Queue items are structured user turns. Shell commands, slash commands,
+  scheduled loops, and other harness work are not queue items.
+- Items have stable IDs and run in FIFO order as separate turns. The server
+  never combines adjacent queued prompts.
+- Replacement returns `not_found` after the target starts or is removed.
+- A completed or failed turn promotes at most one next item. An interrupted
+  turn preserves the remaining items and pauses automatic draining.
+- Removal and resume are idempotent. Enqueue and replacement retries use an
+  idempotency key. Accepted keys remain reserved for the lifetime of the live
+  session backend. Reusing a key with different input is a conflict.
+- The server enforces a fixed queue size limit and rejects enqueue requests
+  beyond it without changing the queue.
+- Unsolicited work such as scheduled loops does not overtake accepted user
+  turns.
+
+Promoting an item removes it from the queue before emitting `turn/started`.
+The resulting public turn keeps the queue item ID so clients can replace a
+pending message with the running turn. Queued input does not enter public
+history until its turn starts.
+
+Terminal and promotion notifications have one order: `turn/completed`, then
+the queue update that records a pause or removes the promoted item, then the
+next `turn/started`. Responses are still written before notifications caused
+by the accepted request.
+
+Turn input is structured content. The server owns normalization into
+model-visible input and persistence. Delivery surfaces do not construct private
+messages or maintain a second prompt renderer.
+
+Compaction preserves the active session identity and appends a checkpoint to the
+same public history. Plan-context clearing may replace the active session while
+preserving the turn. For replacement operations, the server emits a typed
+handoff containing the old ID, replacement `PublicSessionState`, event
+watermark, and session-log summary. The client adopts all of those values
+atomically before processing later events.
+
+Root creation and replacement are serialized lifecycle transitions. A staged
+replacement is either adopted after the previous root closes or is itself
+closed on failure; requests never observe two authoritative roots or a
+half-replaced runtime.
+
+## Public state and event reduction
+
+`PublicSessionState` is a lossy, renderable projection. It contains:
+
+- a format identifier and per-session event watermark;
+- public session metadata;
+- a page of public history;
+- currently open callback entries;
+- the active or most recently terminal turn;
+- the accepted queued turns and whether automatic draining is paused; and
+- the current model-provider retry, including its turn, category, and technical
+  detail.
+
+It is not the private persistence format and is not sufficient to reconstruct
+the engine. Only the server reads session files.
+
+The optional `retrying` value is present only while the current live turn is
+waiting to retry a model request. The server sets it before announcing the
+retry and clears it before resumed model output, terminal turn state,
+interruption, shutdown, or session replacement. Other projection changes,
+including session metadata and statistics updates, preserve it. The public retry
+state currently includes only the turn ID, retry category, and technical detail.
+
+Within a session, public history is an append-only timeline of these closed
+variants:
+
+- message;
+- reasoning;
+- effect;
+- callback;
+- checkpoint; and
+- notice.
+
+Entries have stable IDs and generation status. An in-progress entry may receive
+typed patches. A completed entry is immutable. Compaction appends a checkpoint
+without replacing the session. Forked rewind and clear create a replacement
+session derived from an earlier boundary plus a checkpoint, leaving the original
+stored session untouched; an explicitly selected in-place rewind instead
+rewrites the current session destructively. For replacement operations, the
+client adopts the returned replacement snapshot rather than editing its existing
+projection.
+
+One effect entry owns the complete visible lifecycle of work: call, streaming
+output, policy-blocked state when applicable, result, duration, and terminal state. Tool names are
+data, not app-server dispatch keys. Semantic presentation kinds enable bounded
+rich renderers, and arbitrary tools use a generic effect fallback.
+
+Core engine events remain canonical inside the server. The app server consumes
+their async stream and projects only client-relevant semantics. It does not
+mirror every core event into a second private hierarchy.
+
+Projection-changing notifications carry a positive, monotonic event ID scoped
+to one loaded session runtime. A restored runtime may begin a new sequence and
+its subscription snapshot replaces the earlier projection and watermark. A
+subscription never promises replay of events from an earlier connection or
+process. The snapshot's `eventId` is its watermark. The client reducer:
+
+1. ignores IDs at or below the watermark;
+2. accepts only the next ID;
+3. treats a larger ID as a gap; and
+4. recovers by replacing state from `session/read` and reconciling public events.
+
+The core notification families are `session/snapshot`, session handoffs,
+`session/updated`, `history/entryAdded`, `history/entryUpdated`,
+`turn_queue_updated`, `turn/started`, `turn/completed`, and
+`session/statsUpdated`. Warnings, errors, and resource notifications remain
+typed rather than using a generic envelope.
+
+Retry-state changes use numbered `session/snapshot` notifications and therefore
+share the session event watermark. A live same-session snapshot contains a
+bounded latest history and turn page. Reducers retain an already-loaded
+contiguous prefix when that page overlaps it, while explicit resyncs and session
+handoffs still replace state. The unnumbered `turn/retrying` notification remains
+temporarily because the ACP client path and previously released clients may
+still depend on it. New reducers derive retry presentation from
+`PublicSessionState.retrying` and do not keep a second local retry value from that
+compatibility notification.
+
+## Callbacks and client participation
+
+Plan acceptance, user questions, and MCP OAuth originate as typed core request events
+with stable request IDs. Ordinary tool execution does not use a routine approval
+callback or durable approval store. The server projects genuine participation needs
+as callback history entries and related effect state. Neither Textual nor the app
+server installs callback functions, message observers, or listeners on `AgentLoop`.
+
+The live callback lifecycle is:
+
+1. record the open callback in the public session projection;
+2. mark the related effect and session as blocked when applicable;
+3. send `callback/call` to a client that advertised the callback kind;
+4. receive delivery acknowledgement;
+5. accept the semantic result through `callback/result`;
+6. resolve the original core request exactly once; and
+7. complete or cancel the callback and related effect.
+
+An identical semantic response retry is a duplicate no-op. A conflicting second
+response is rejected. Open callbacks remain visible in `activeCallbacks` and are
+re-delivered when a connection resumes the same live runtime.
+
+Client-hosted tool I/O follows the same explicit participation rule. The client
+advertises filesystem and/or terminal capability during initialization. The server
+adapts those requests through `ToolIOPort`; unsupported operations fail instead of
+silently switching ownership or implementation.
+
+## Server-owned resources
+
+State outside the main timeline uses typed resource families. Live-session
+configuration mutations such as agent switching, session settings updates, session
+patches, explicit user/project config saves, and config reloads are applied through
+the selected session backend; persistent saves carry an expected revision and return
+separate persistence/application outcomes. The app server remains responsible for
+the typed Host API and public result. Root authority is separate: `policy/roots/read` is passive inspection with only the root session's `sessionId`; `policy/roots/replace` is the mutating operation and requires the root session's `sessionId`, `expectedRevision`, and literal `userInitiated: true`; child-session IDs are not authoritative. It updates in-memory tree policy only and cannot grant roots via general `config/write`. Persistent root maps belong in the explicit user config file.
+Current resource families include runtime/config, agents, skills, tools, MCP,
+diagnostics, statistics, session logs, scheduled loops, workspace trust and
+prompt preparation, review, shell, and local extension operations.
+
+MCP resource mutations use the canonical `mcp_catalog/*` methods and return the
+runtime snapshot before any resulting notification. The public protocol keeps
+its existing permission and transport boundaries: local configuration accepts
+`streamable-http` and `stdio`, while retired aliases and obsolete configuration
+keys fail explicitly rather than being migrated. MCP discovery and result
+normalization remain server-owned; clients receive error status, structured or
+text content, explicit null/omitted distinctions, and bounded page outcomes
+through the existing typed projections.
+
+The client receives public views, not managers or registries. Mutations return
+authoritative results. When a change affects several derived views,
+`runtime/updated` carries one canonical `RuntimeSnapshot`; clients replace their
+cached config, agents, tools, skills, hook count, MCP, config issues,
+and statistics together.
+
+Slash commands are presentation affordances over these resources. Client-only
+commands may change presentation locally. Any command that changes session,
+workspace, model-visible, persisted, or integration state calls an explicit
+app-server resource method.
+
+## Subagents and child sessions
+
+Subagents are server-owned child sessions. Each child has its own session ID,
+runtime, and public projection. The parent exposes a subagent effect containing
+the child session ID; it does not embed the child's runtime or history. The
+parent-child link is persisted when session logging is enabled.
+
+The server registry routes child events and lifecycle operations. Child
+execution uses the server-owned `ToolIOPort`, including client-hosted I/O when
+advertised. Clients may read a child session by ID and render a tree, but they
+do not construct child loops, reduce child core events, or duplicate subagent
+result handling.
+
+## Delivery adapters
+
+Textual, ACP, and programmatic mode share the same app-server session and
+resource APIs:
+
+- Textual renders and edits the server-owned prompt queue. It does not keep a
+  second accepted queue or schedule queued work itself.
+- Textual `!` commands and non-side-channel slash commands require an idle
+  session. They are rejected while other work or accepted prompts are pending.
+- Other delivery surfaces use the same enqueue, read, remove, and resume
+  methods when they add queueing; they do not implement another accepted
+  queue.
+
+- Textual renders public models and owns terminal-local facilities.
+- ACP translates ACP requests, callbacks, content, client tools, and updates to
+  and from the app-server API.
+- Programmatic mode starts turns and consumes the same public event stream
+  without depending on Textual.
+
+No attached delivery-surface runtime owns a parallel agent loop, config manager,
+session loader, tool execution path, or extension lifecycle.
+
+## Reconnect, shutdown, and security
+
+The in-process harness can replace a failed memory connection. The client
+initializes the new connection, resumes the attached session, replaces its
+projection from the returned snapshot, receives still-open callbacks, and sees
+the current retry state when the live turn is waiting to retry. Stdio EOF closes
+its server process; process restart uses normal persisted-session resume
+semantics and does not restore an in-flight turn or its retry state.
+
+Accepted queued turns belong to the live session backend. Reconnecting to the
+same live backend recovers them through the subscription snapshot or
+`session/read`. Stopping the session or restarting the app-server process
+discards them. Persisting queued turns across process restarts requires a
+separate storage decision and is not part of the initial queue implementation.
+
+Transport detachment only removes that connection's subscriptions and callback
+claims. A successful `session/stop` is the delivery surface's durability and
+runtime-cleanup boundary. The server records eligible last-session state,
+flushes session-owned data, closes child runtimes, interrupts or rejects pending
+work, and releases owned runtime resources such as MCP clients, model backends,
+and client-terminal resources before shutdown finishes. Experiment functionality
+has been retired; its remaining compatibility stubs own no runtime resources.
+
+Security rules:
+
+- the server enforces tool, workspace, network, and MCP policy;
+- public rendering metadata cannot grant permission;
+- public projections redact secrets, credentials, model context, and unsafe
+  internal errors;
+- config views expose environment variable names, not resolved values;
+- workspace and tool policy is enforced server-side where applicable;
+- callback and client-tool results are validated before runtime state changes;
+  and
+- unknown methods, fields, variants, notifications, or unsolicited responses
+  fail explicitly.
+
+## Consequences
+
+- Interactive startup constructs the harness behind `chartreux.app_server`; Textual
+  receives only client-facing services.
+- Session files and private config objects are never read by Textual.
+- Agent, model, permission, config, MCP, skill, hook, and subagent changes are
+  server operations.
+- ACP and programmatic mode do not maintain parallel runtime implementations.
+- Public models and private core types may differ only for a real semantic
+  boundary.
+- A feature is not migrated merely because an RPC wrapper exists. Ownership,
+  persistence, projection, cleanup, reconnect behavior, and tests must all sit
+  on the correct side.
+
+## Agent Guidance
+
+- Start changes from the owning app-server resource or session facade, not from
+  a Textual widget's access to core state.
+- Add explicit typed methods and models. Do not add generic command or event
+  payloads.
+- Consume core events in server-only projectors. Do not reconstruct core events
+  from strings or dictionaries in the client.
+- Keep one public definition for each concept and one server-only translation
+  point where semantics differ.
+- Keep arbitrary tool support generic; rich rendering is keyed by bounded
+  semantic presentation kinds.
+- Preserve monotonic event sequencing, immutable completed entries, and
+  response-before-notification ordering.
+- Treat plan acceptance, user questions, and MCP OAuth as explicit server-to-client
+  requests with validated response lifecycles. Do not add a routine tool-approval
+  callback or approval store.
+- Return or notify canonical resource state after mutations rather than
+  maintaining client/server shadow state.
+- Derive retry presentation from `PublicSessionState.retrying`; do not maintain
+  a client-local retry lifecycle.
+- Keep blocking serialization, file I/O, subprocess work, and discovery off the
+  shared UI event loop.
+
+## Flag To User When
+
+- A delivery surface needs a live `AgentLoop`, manager, registry, config object,
+  or session loader.
+- A change introduces a second runtime, persistence path, reducer, or extension
+  lifecycle.
+- A new public type is field-for-field identical to an existing
+  dependency-neutral type.
+- A new tool requires dispatch by tool name instead of the generic effect path.
+- A server-owned mutation has no explicit typed method or cannot return an
+  authoritative public result.
+- A change lets general configuration writes grant workspace roots, bypasses
+  source revisions, or hides saved-but-not-applied outcomes.
+- A feature assumes multiple attached clients, a new transport, or persistence
+  of in-flight execution that the current implementation does not provide.
+
+## Enforcement
+
+Existing boundary and protocol tests guard these representative invariants and
+must remain in place as the architecture evolves:
+
+- Textual has no core imports or `agent_loop` references;
+- only the server runtime composition constructs `AgentLoop`;
+- memory and stdio use the same serialized protocol models;
+- initialization precedes other requests and runtime creation is lazy;
+- unknown protocol shapes fail strictly;
+- public event IDs are monotonic and gaps trigger snapshot recovery;
+- completed entries cannot be patched and one effect spans the full lifecycle;
+- callback delivery and semantic response are separate and resolve core requests
+  once;
+- reconnect re-adopts a snapshot and open callbacks;
+- session handoffs atomically replace identity and projection;
+- child callbacks, client-hosted I/O, result projection, and cleanup remain
+  server-routed; and
+- root and child cleanup attempts all owned runtimes even when one cleanup
+  fails.
+
+The architecture boundary suite lives under
+`tests/cli/textual_ui/test_app_server_boundary.py`, with protocol, event,
+session, callback, transport, resource, ACP, and programmatic behavior covered
+by focused tests under `tests/app_server`, `tests/acp`, and `tests`.

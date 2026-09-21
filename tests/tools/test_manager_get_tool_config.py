@@ -1,0 +1,578 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from chartreux.core.config import MCPStdio
+from chartreux.core.tools.base import BaseToolConfig, ToolPermission
+from chartreux.core.tools.manager import NoSuchToolError, ToolManager
+from chartreux.core.tools.mcp.tools import RemoteTool, create_mcp_stdio_proxy_tool_class
+from tests.conftest import build_test_vibe_config
+from tests.stubs.fake_mcp_registry import FakeMCPRegistry
+
+
+def _manager(vibe_config) -> ToolManager:
+    return ToolManager(lambda: vibe_config)
+
+
+@pytest.fixture
+def tool_manager(vibe_config):
+    return _manager(vibe_config)
+
+
+def test_returns_default_config_when_no_overrides(tool_manager):
+    config = tool_manager.get_tool_config("bash")
+
+    assert (
+        type(config).__name__ == "BashToolConfig"
+    )  # due to vibe's discover system isinstance would fail
+    assert config.default_timeout == 300  # type: ignore[attr-defined]
+    assert config.max_output_bytes == 16000  # type: ignore[attr-defined]
+    assert config.permission == ToolPermission.ASK
+
+
+def test_removed_shell_builtins_are_not_discovered(tool_manager):
+    from chartreux.core.tools.builtins.bash import Bash
+
+    removed = {"bash_output", "bash_stdin", "bash_sessions", "bash_log_file"}
+    assert removed.isdisjoint(tool_manager.registered_tools)
+    assert removed.isdisjoint(tool_manager.available_tools)
+    specs = {spec.name: spec for spec in tool_manager.available_tool_specs()}
+    assert removed.isdisjoint(specs)
+    assert tool_manager.registered_tools["bash"] is Bash
+    assert tool_manager.available_tools["bash"] is Bash
+    assert type(tool_manager.get("bash")) is Bash
+    assert set(specs["bash"].parameters["properties"]) == {"command", "timeout"}
+
+
+def test_merges_user_overrides_with_defaults():
+    vibe_config = build_test_vibe_config(tools={"bash": {"permission": "always"}})
+    manager = ToolManager(lambda: vibe_config)
+
+    config = manager.get_tool_config("bash")
+
+    assert (
+        type(config).__name__ == "BashToolConfig"
+    )  # due to vibe's discover system isinstance would fail
+    assert config.permission == ToolPermission.ALWAYS
+    assert config.default_timeout == 300  # type: ignore[attr-defined]
+
+
+def test_preserves_tool_specific_fields_from_overrides():
+    vibe_config = build_test_vibe_config(tools={"bash": {"permission": "ask"}})
+    vibe_config.tools["bash"]["default_timeout"] = 600
+    manager = ToolManager(lambda: vibe_config)
+
+    config = manager.get_tool_config("bash")
+
+    assert type(config).__name__ == "BashToolConfig"
+    assert config.default_timeout == 600  # type: ignore[attr-defined]
+
+
+def test_falls_back_to_base_config_for_unknown_tool(tool_manager):
+    config = tool_manager.get_tool_config("nonexistent_tool")
+
+    assert type(config) is BaseToolConfig
+    assert config.permission == ToolPermission.ASK
+
+
+def test_partial_override_preserves_tool_defaults():
+    vibe_config = build_test_vibe_config(
+        tools={"read_file": {"sensitive_patterns": ["**/*.key"]}}
+    )
+    manager = ToolManager(lambda: vibe_config)
+
+    config = manager.get_tool_config("read_file")
+
+    assert (
+        config.permission == ToolPermission.ALWAYS
+    )  # ReadConfig default, not BaseToolConfig.ASK
+    assert config.sensitive_patterns == ["**/*.key"]  # type: ignore[attr-defined]
+
+
+class TestToolManagerFiltering:
+    def test_enabled_tools_filters_to_only_enabled(self):
+        vibe_config = build_test_vibe_config(enabled_tools=["bash", "grep"])
+        manager = ToolManager(lambda: vibe_config)
+
+        tools = manager.available_tools
+        assert len(tools) < len(manager._all_tools)
+        assert "bash" in tools
+        assert "grep" in tools
+        assert "read_file" not in tools
+        assert "write_file" not in tools
+
+    def test_disabled_tools_excludes_disabled(self):
+        vibe_config = build_test_vibe_config(disabled_tools=["bash", "write_file"])
+        manager = ToolManager(lambda: vibe_config)
+
+        tools = manager.available_tools
+        assert len(tools) < len(manager._all_tools)
+        assert "bash" not in tools
+        assert "write_file" not in tools
+        assert "grep" in tools
+        assert "read_file" in tools
+
+    def test_disabled_tools_filter_enabled_tools(self):
+        vibe_config = build_test_vibe_config(
+            enabled_tools=["bash"], disabled_tools=["bash"]
+        )
+        manager = ToolManager(lambda: vibe_config)
+
+        tools = manager.available_tools
+        assert tools == {}
+
+    def test_glob_pattern_matching(self):
+        vibe_config = build_test_vibe_config(
+            disabled_tools=["write_*"]  # Matches write_file
+        )
+        manager = ToolManager(lambda: vibe_config)
+
+        tools = manager.available_tools
+        assert "write_file" not in tools
+        assert "bash" in tools
+        assert "grep" in tools
+
+    def test_regex_pattern_matching(self):
+        vibe_config = build_test_vibe_config(enabled_tools=["re:^(bash|grep)$"])
+        manager = ToolManager(lambda: vibe_config)
+
+        tools = manager.available_tools
+        assert len(tools) == 2
+        assert "bash" in tools
+        assert "grep" in tools
+
+    def test_get_raises_for_disabled_tool(self):
+        vibe_config = build_test_vibe_config(disabled_tools=["bash"])
+        manager = ToolManager(lambda: vibe_config)
+
+        assert "bash" not in manager.available_tools
+        with pytest.raises(NoSuchToolError):
+            manager.get("bash")
+
+    def test_web_search_builtin_is_discovered(self):
+        from chartreux.core.tools.builtins.web_search import WebSearch
+
+        vibe_config = build_test_vibe_config(enabled_tools=["web_search"])
+        manager = ToolManager(lambda: vibe_config)
+
+        assert manager.available_tools["web_search"] is WebSearch
+        assert any(spec.name == "web_search" for spec in manager.available_tool_specs())
+        assert type(manager.get("web_search")) is WebSearch
+
+    def test_case_insensitive_matching(self):
+        vibe_config = build_test_vibe_config(enabled_tools=["BASH", "GREP"])
+        manager = ToolManager(lambda: vibe_config)
+
+        tools = manager.available_tools
+        assert "bash" in tools
+        assert "grep" in tools
+
+    def test_empty_enabled_tools_returns_all(self):
+        vibe_config = build_test_vibe_config(enabled_tools=[])
+        manager = ToolManager(lambda: vibe_config)
+
+        tools = manager.available_tools
+        assert "bash" in tools
+        assert "grep" in tools
+        assert "read_file" in tools
+
+    def test_tool_paths_with_file_and_directory(self, tmp_path: Path):
+        """Should handle a mix of file and directory paths in tool_paths."""
+        import sys
+
+        # Create a directory with a tool
+        tool_dir = tmp_path / "tools"
+        tool_dir.mkdir()
+        (tool_dir / "dir_tool.py").write_text("""
+from chartreux.core.tools.base import BaseTool, BaseToolConfig, BaseToolState
+from pydantic import BaseModel
+from collections.abc import AsyncGenerator
+
+class DirToolArgs(BaseModel):
+    pass
+
+class DirToolResult(BaseModel):
+    pass
+
+class DirTool(BaseTool[DirToolArgs, DirToolResult, BaseToolConfig, BaseToolState]):
+    description = "Tool from directory"
+
+    async def run(self, args, ctx=None):
+        yield DirToolResult()
+""")
+
+        # Create a standalone tool file
+        file_tool = tmp_path / "file_tool.py"
+        file_tool.write_text("""
+from chartreux.core.tools.base import BaseTool, BaseToolConfig, BaseToolState
+from pydantic import BaseModel
+from collections.abc import AsyncGenerator
+
+class FileToolArgs(BaseModel):
+    pass
+
+class FileToolResult(BaseModel):
+    pass
+
+class FileTool(BaseTool[FileToolArgs, FileToolResult, BaseToolConfig, BaseToolState]):
+    description = "Tool from file path"
+
+    async def run(self, args, ctx=None):
+        yield FileToolResult()
+""")
+
+        # Clean up any previously loaded modules
+        to_remove = [k for k in sys.modules if "dir_tool" in k or "file_tool" in k]
+        for k in to_remove:
+            del sys.modules[k]
+
+        vibe_config = build_test_vibe_config(tool_paths=[tool_dir, file_tool])
+        manager = ToolManager(lambda: vibe_config)
+
+        tools = manager.available_tools
+        assert "dir_tool" in tools
+        assert "file_tool" in tools
+
+    def test_custom_tool_names_include_only_available_custom_tools(
+        self, tmp_path: Path
+    ):
+        tool_dir = tmp_path / "tools"
+        tool_dir.mkdir()
+        (tool_dir / "weather.py").write_text("""
+from chartreux.core.tools.base import BaseTool, BaseToolConfig, BaseToolState
+from pydantic import BaseModel
+
+class WeatherArgs(BaseModel):
+    pass
+
+class WeatherResult(BaseModel):
+    pass
+
+class WeatherTool(BaseTool[WeatherArgs, WeatherResult, BaseToolConfig, BaseToolState]):
+    async def run(self, args, ctx=None):
+        yield WeatherResult()
+""")
+
+        vibe_config = build_test_vibe_config(tool_paths=[tool_dir])
+        holder = {"config": vibe_config}
+        manager = ToolManager(lambda: holder["config"])
+
+        assert manager.custom_tool_names == {"weather_tool"}
+
+        holder["config"] = vibe_config.model_copy(
+            update={"disabled_tools": ["weather_tool"]}
+        )
+        assert manager.custom_tool_names == set()
+
+    def test_reexported_builtin_counts_as_a_custom_tool_override(self, tmp_path: Path):
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "reexport.py").write_text(
+            "from chartreux.core.tools.builtins.todo import Todo\n"
+        )
+
+        vibe_config = build_test_vibe_config(tool_paths=[tools_dir])
+        manager = ToolManager(lambda: vibe_config)
+
+        assert "todo" in manager.custom_tool_names
+
+
+class TestToolRuntimeAvailability:
+    """Tests for is_available() filtering in ToolManager."""
+
+    def test_unavailable_tool_excluded_from_available_tools(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Tools where is_available() returns False should be excluded."""
+        import sys
+
+        tool_dir = tmp_path / "tools"
+        tool_dir.mkdir()
+        (tool_dir / "conditional_tool.py").write_text("""
+import os
+from chartreux.core.tools.base import BaseTool, BaseToolConfig, BaseToolState
+from pydantic import BaseModel
+
+class ConditionalToolArgs(BaseModel):
+    pass
+
+class ConditionalToolResult(BaseModel):
+    pass
+
+class ConditionalTool(BaseTool[ConditionalToolArgs, ConditionalToolResult, BaseToolConfig, BaseToolState]):
+    description = "Tool that requires TEST_VAR"
+
+    @classmethod
+    def is_available(cls) -> bool:
+        return bool(os.getenv("TEST_VAR"))
+
+    async def run(self, args, ctx=None):
+        yield ConditionalToolResult()
+""")
+
+        to_remove = [k for k in sys.modules if "conditional_tool" in k]
+        for k in to_remove:
+            del sys.modules[k]
+
+        monkeypatch.delenv("TEST_VAR", raising=False)
+        vibe_config = build_test_vibe_config(tool_paths=[tool_dir])
+        manager = ToolManager(lambda: vibe_config)
+        assert "conditional_tool" not in manager.available_tools
+
+        to_remove = [k for k in sys.modules if "conditional_tool" in k]
+        for k in to_remove:
+            del sys.modules[k]
+
+        monkeypatch.setenv("TEST_VAR", "1")
+        manager2 = ToolManager(lambda: vibe_config)
+        assert "conditional_tool" in manager2.available_tools
+
+    def test_default_is_available_returns_true(self):
+        """Tools without is_available() override should be available."""
+        vibe_config = build_test_vibe_config()
+        manager = ToolManager(lambda: vibe_config)
+
+        assert "bash" in manager.available_tools
+
+
+class TestToolManagerModuleReuse:
+    """Tests for module reuse across ToolManager instances.
+
+    When multiple ToolManager instances are created (e.g., main agent + subagent),
+    they should reuse the same tool modules from sys.modules to preserve class identity.
+    This prevents Pydantic validation errors when tool results from one agent
+    are validated against types from another.
+    """
+
+    def test_multiple_managers_share_tool_classes(self):
+        """Tool classes should be identical across multiple ToolManager instances."""
+        vibe_config = build_test_vibe_config()
+
+        manager1 = ToolManager(lambda: vibe_config)
+        manager2 = ToolManager(lambda: vibe_config)
+
+        # Get the same tool class from both managers
+        todo_class1 = manager1.available_tools.get("todo")
+        todo_class2 = manager2.available_tools.get("todo")
+
+        assert todo_class1 is not None
+        assert todo_class2 is not None
+        # Class objects should be identical (same id), not just equal
+        assert todo_class1 is todo_class2
+
+    def test_tool_state_classes_are_identical(self):
+        """Tool state classes should be identical across managers."""
+        vibe_config = build_test_vibe_config()
+
+        manager1 = ToolManager(lambda: vibe_config)
+        manager2 = ToolManager(lambda: vibe_config)
+
+        todo_class1 = manager1.available_tools["todo"]
+        todo_class2 = manager2.available_tools["todo"]
+
+        state_class1 = todo_class1._get_tool_state_class()
+        state_class2 = todo_class2._get_tool_state_class()
+
+        assert state_class1 is state_class2
+
+    def test_tool_args_results_classes_are_identical(self):
+        """Tool args and result classes should be identical across managers."""
+        vibe_config = build_test_vibe_config()
+
+        manager1 = ToolManager(lambda: vibe_config)
+        manager2 = ToolManager(lambda: vibe_config)
+
+        todo_class1 = manager1.available_tools["todo"]
+        todo_class2 = manager2.available_tools["todo"]
+
+        args1, result1 = todo_class1._get_tool_args_results()
+        args2, result2 = todo_class2._get_tool_args_results()
+
+        assert args1 is args2
+        assert result1 is result2
+
+    def test_tool_instances_are_isolated(self):
+        """Tool instances should be separate even though classes are shared.
+
+        This ensures subagents have isolated state (e.g., separate todo lists)
+        while still sharing class definitions for Pydantic validation.
+        """
+        vibe_config = build_test_vibe_config()
+
+        manager1 = ToolManager(lambda: vibe_config)
+        manager2 = ToolManager(lambda: vibe_config)
+
+        # Get tool instances from each manager
+        tool1 = manager1.get("todo")
+        tool2 = manager2.get("todo")
+
+        # Instances should be different objects
+        assert tool1 is not tool2
+
+        # State should be different objects
+        assert tool1.state is not tool2.state
+
+        # Verify state is truly isolated by modifying one
+        from chartreux.core.tools.builtins.todo import TodoItem
+
+        tool1.state.todos = [TodoItem(id="1", content="test")]
+        assert len(tool1.state.todos) == 1
+        assert len(tool2.state.todos) == 0  # Unaffected!
+
+    def test_class_shared_but_instances_isolated(self):
+        """Classes must be shared (for validation) but instances isolated (for state)."""
+        vibe_config = build_test_vibe_config()
+
+        manager1 = ToolManager(lambda: vibe_config)
+        manager2 = ToolManager(lambda: vibe_config)
+
+        tool1 = manager1.get("todo")
+        tool2 = manager2.get("todo")
+
+        # Classes are shared (same object)
+        assert type(tool1) is type(tool2)
+        assert type(tool1.state) is type(tool2.state)
+
+        # But instances are different
+        assert tool1 is not tool2
+        assert tool1.state is not tool2.state
+
+    def test_different_files_same_stem_get_different_modules(self, tmp_path: Path):
+        """Tools with same stem but different paths should be separate modules.
+
+        This ensures user tools can override builtins - a custom todo.py in
+        ~/.config/vibe/tools/ should override the builtin todo.py.
+        """
+        import sys
+
+        # Create two tool files with the same stem but different content
+        dir1 = tmp_path / "tools1"
+        dir2 = tmp_path / "tools2"
+        dir1.mkdir()
+        dir2.mkdir()
+
+        tool_code_v1 = """
+from chartreux.core.tools.base import BaseTool, BaseToolConfig, BaseToolState
+from pydantic import BaseModel
+from collections.abc import AsyncGenerator
+
+class DummyArgs(BaseModel):
+    value: str
+
+class DummyResult(BaseModel):
+    version: str = "v1"
+
+class DummyTool(BaseTool[DummyArgs, DummyResult, BaseToolConfig, BaseToolState]):
+    description = "Dummy tool v1"
+
+    async def run(self, args: DummyArgs, ctx=None) -> AsyncGenerator[DummyResult, None]:
+        yield DummyResult(version="v1")
+"""
+
+        tool_code_v2 = """
+from chartreux.core.tools.base import BaseTool, BaseToolConfig, BaseToolState
+from pydantic import BaseModel
+from collections.abc import AsyncGenerator
+
+class DummyArgs(BaseModel):
+    value: str
+
+class DummyResult(BaseModel):
+    version: str = "v2"
+
+class DummyTool(BaseTool[DummyArgs, DummyResult, BaseToolConfig, BaseToolState]):
+    description = "Dummy tool v2"
+
+    async def run(self, args: DummyArgs, ctx=None) -> AsyncGenerator[DummyResult, None]:
+        yield DummyResult(version="v2")
+"""
+
+        (dir1 / "dummy.py").write_text(tool_code_v1)
+        (dir2 / "dummy.py").write_text(tool_code_v2)
+
+        # Clean up any previously loaded dummy modules
+        to_remove = [k for k in sys.modules if "dummy" in k]
+        for k in to_remove:
+            del sys.modules[k]
+
+        # Load tools from both directories (dir2 comes after, should override)
+        classes = list(ToolManager._iter_tool_classes([dir1, dir2]))
+        dummy_classes = [c for c in classes if "dummy" in c.get_name().lower()]
+
+        # Should have 2 separate classes (from different modules)
+        assert len(dummy_classes) == 2
+
+        # They should be different class objects
+        assert dummy_classes[0] is not dummy_classes[1]
+
+        # When put in a dict (like _available), the second one wins
+        available = {c.get_name(): c for c in classes}
+        final_class = available.get("dummy_tool")
+        assert final_class is not None
+        assert final_class.description == "Dummy tool v2"
+
+    def test_reexported_custom_tool_is_discovered(self, tmp_path: Path):
+        # A custom tool file may import/re-export a tool class defined in another
+        # module; its __module__ points at the origin, not the file. The builtin
+        # base-class dedup filter must not drop such tools from user/project dirs.
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "reexport.py").write_text(
+            "from chartreux.core.tools.builtins.todo import Todo\n"
+        )
+
+        classes = list(ToolManager._iter_tool_classes([tools_dir]))
+
+        assert any(c.get_name() == "todo" for c in classes)
+
+
+class _CollidingMCPRegistry(FakeMCPRegistry):
+    def __init__(self, tools):
+        super().__init__()
+        self.tools = tools
+
+    async def get_tools_async(self, servers):
+        self.sync_active_servers(servers)
+        return self.tools
+
+
+@pytest.mark.asyncio
+async def test_mcp_collisions_use_variant_precedence_and_preserve_builtins():
+    from chartreux.core.tools.builtins.read_image import ReadImage
+    from chartreux.core.tools.builtins.web_search import WebSearch
+
+    server = MCPStdio(name="web", transport="stdio", command="echo")
+    web_search_proxy = create_mcp_stdio_proxy_tool_class(
+        command=["echo"], remote=RemoteTool(name="search"), alias="web"
+    )
+    read_image_proxy = create_mcp_stdio_proxy_tool_class(
+        command=["echo"], remote=RemoteTool(name="image"), alias="read"
+    )
+    registry = _CollidingMCPRegistry({
+        "web_search": web_search_proxy,
+        "read_image": read_image_proxy,
+    })
+    config = build_test_vibe_config(mcp_servers=[server])
+    manager = ToolManager(lambda: config, mcp_registry=registry, defer_mcp=True)
+
+    await manager._integrate_mcp_async()
+
+    # Same-priority variants favor later discovery, as custom tool collisions do.
+    assert manager._all_tools["web_search"] is WebSearch
+    assert manager._all_tools["read_image"] is ReadImage
+    assert manager.registered_tools["web_search"] is web_search_proxy
+    assert manager.registered_tools["read_image"] is read_image_proxy
+    assert manager.available_tools["web_search"] is web_search_proxy
+    assert manager.available_tools["read_image"] is read_image_proxy
+    assert type(manager.get("web_search")) is web_search_proxy
+
+    registry.tools = {}
+    await manager.reconfigure_mcp_async()
+
+    assert manager.registered_tools["web_search"] is WebSearch
+    assert manager.registered_tools["read_image"] is ReadImage
+    assert "web_search" not in manager._instances
+    assert manager._tool_variants_by_name["web_search"] == [WebSearch]
+    assert manager._tool_variants_by_name["read_image"] == [ReadImage]

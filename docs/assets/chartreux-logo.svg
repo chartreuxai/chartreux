@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="short-title short-desc">
+  <title id="short-title">Chartreux rounded pixel logo with short whiskers</title>
+  <desc id="short-desc">A broad, rounded slate blue pixel Chartreux observing its surroundings with calm copper eyes, a small nose, neutral mouth, and short dark whiskers.</desc>
+  <g transform="scale(16)" shape-rendering="crispEdges">
+    <polygon fill="#66798B" points="6,5 8,5 8,6 9,6 9,7 12,7 12,8 20,8 20,7 23,7 23,6 24,6 24,5 26,5 26,12 27,12 27,14 28,14 28,21 27,21 27,24 25,24 25,26 22,26 22,27 18,27 18,28 14,28 14,27 10,27 10,26 7,26 7,24 5,24 5,21 4,21 4,14 5,14 5,12 6,12"/>
+    <rect fill="#D58B45" x="9" y="15" width="5" height="3"/><rect fill="#D58B45" x="18" y="15" width="5" height="3"/>
+    <rect fill="#283D4B" x="12" y="15" width="1" height="3"/><rect fill="#283D4B" x="21" y="15" width="1" height="3"/>
+    <rect fill="#283D4B" x="15" y="20" width="2" height="1"/><rect fill="#283D4B" x="15" y="21" width="2" height="1"/><rect fill="#283D4B" x="13" y="22" width="6" height="1"/>
+    <g fill="#354B5A">
+      <rect x="5" y="20.25" width="3" height=".5"/><rect x="4" y="22.25" width="4" height=".5"/><rect x="6" y="24.25" width="3" height=".5"/>
+      <rect x="24" y="20.25" width="3" height=".5"/><rect x="24" y="22.25" width="4" height=".5"/><rect x="23" y="24.25" width="3" height=".5"/>
+    </g>
+  </g>
+</svg>

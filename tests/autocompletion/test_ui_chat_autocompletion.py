@@ -1,0 +1,321 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from textual.widgets import Markdown
+
+from chartreux.cli.textual_ui.app import ChartreuxApp
+from chartreux.cli.textual_ui.widgets.chat_input.completion_popup import CompletionPopup
+from chartreux.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
+
+
+@pytest.mark.asyncio
+async def test_popup_appears_with_matching_suggestions(
+    chartreux_app: ChartreuxApp,
+) -> None:
+    async with chartreux_app.run_test() as pilot:
+        chat_input = chartreux_app.query_one(ChatInputContainer)
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        await pilot.press(*"/com")
+
+        popup_content = popup.content_text
+        assert popup.styles.display == "block"
+        assert "/compact" in popup_content
+        assert "Compact conversation history by summarizing" in popup_content
+        assert chat_input.value == "/com"
+
+
+@pytest.mark.asyncio
+async def test_popup_hides_when_input_cleared(chartreux_app: ChartreuxApp) -> None:
+    async with chartreux_app.run_test() as pilot:
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        await pilot.press(*"/c")
+        await pilot.press("backspace", "backspace")
+
+        assert popup.styles.display == "none"
+
+
+@pytest.mark.asyncio
+async def test_new_alias_is_suggested(chartreux_app: ChartreuxApp) -> None:
+    async with chartreux_app.run_test() as pilot:
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        await pilot.press(*"/new")
+
+        assert popup.styles.display == "block"
+        assert "/new" in popup.content_text
+
+
+@pytest.mark.asyncio
+async def test_pressing_tab_completes_command_and_hides_popup_when_exact_match(
+    chartreux_app: ChartreuxApp,
+) -> None:
+    async with chartreux_app.run_test() as pilot:
+        chat_input = chartreux_app.query_one(ChatInputContainer)
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        await pilot.press(*"/co")
+        await pilot.press("tab")
+
+        assert chat_input.value == "/compact"
+        assert popup.styles.display == "none"
+
+
+@pytest.mark.asyncio
+async def test_pressing_enter_submits_selected_command_and_hides_popup(
+    chartreux_app: ChartreuxApp,
+) -> None:
+    async with chartreux_app.run_test() as pilot:
+        chat_input = chartreux_app.query_one(ChatInputContainer)
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        await pilot.press(*"/hel")  # typos:disable-line
+        await pilot.press("enter")
+
+        assert chat_input.value == ""
+        assert popup.styles.display == "none"
+        message = chartreux_app.query_one(".user-command-message")
+        message_content = message.query_one(Markdown)
+        assert "Show help message" in message_content.source
+
+
+@pytest.fixture()
+def file_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    (tmp_path / "src" / "utils").mkdir(parents=True)
+    (tmp_path / "src" / "utils" / "config.py").write_text("", encoding="utf-8")
+    (tmp_path / "src" / "utils" / "database.py").write_text("", encoding="utf-8")
+    (tmp_path / "src" / "utils" / "error_handling.py").write_text("", encoding="utf-8")
+    (tmp_path / "src" / "utils" / "logger.py").write_text("", encoding="utf-8")
+    (tmp_path / "src" / "utils" / "sanitize.py").write_text("", encoding="utf-8")
+    (tmp_path / "src" / "utils" / "validate.py").write_text("", encoding="utf-8")
+    (tmp_path / "src" / "main.py").write_text("", encoding="utf-8")
+    (tmp_path / "chartreux" / "acp").mkdir(parents=True)
+    (tmp_path / "chartreux" / "acp" / "entrypoint.py").write_text("", encoding="utf-8")
+    (tmp_path / "chartreux" / "acp" / "agent.py").write_text("", encoding="utf-8")
+    (tmp_path / "README.md").write_text("", encoding="utf-8")
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+@pytest.mark.asyncio
+async def test_path_completion_popup_lists_files_and_directories(
+    chartreux_app: ChartreuxApp, file_tree: Path
+) -> None:
+    async with chartreux_app.run_test() as pilot:
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        await pilot.press(*"@s")
+
+        popup_content = popup.content_text
+        assert "src/" in popup_content
+        assert popup.styles.display == "block"
+
+
+@pytest.mark.asyncio
+async def test_path_completion_popup_shows_up_to_ten_results(
+    chartreux_app: ChartreuxApp, file_tree: Path
+) -> None:
+    async with chartreux_app.run_test() as pilot:
+        (file_tree / "src" / "core" / "extra").mkdir(parents=True)
+        [
+            (file_tree / "src" / "core" / "extra" / f"extra_file_{i}.py").write_text(
+                "", encoding="utf-8"
+            )
+            for i in range(1, 13)
+        ]
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        await pilot.press(*"@src/core/extra/")
+
+        popup_content = popup.content_text
+        assert "src/core/extra/extra_file_1.py" in popup_content
+        assert "src/core/extra/extra_file_10.py" in popup_content
+        assert "src/core/extra/extra_file_11.py" in popup_content
+        assert "src/core/extra/extra_file_12.py" in popup_content
+        assert "src/core/extra/extra_file_2.py" in popup_content
+        assert "src/core/extra/extra_file_3.py" in popup_content
+        assert "src/core/extra/extra_file_4.py" in popup_content
+        assert "src/core/extra/extra_file_5.py" in popup_content
+        assert "src/core/extra/extra_file_6.py" in popup_content
+        assert "src/core/extra/extra_file_7.py" in popup_content
+        assert popup.styles.display == "block"
+
+
+@pytest.mark.asyncio
+async def test_pressing_tab_on_directory_keeps_popup_visible_with_contents(
+    chartreux_app: ChartreuxApp, file_tree: Path
+) -> None:
+    async with chartreux_app.run_test() as pilot:
+        chat_input = chartreux_app.query_one(ChatInputContainer)
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        await pilot.press(*"@sr")
+        await pilot.press("tab")
+        await pilot.pause(0.2)
+
+        assert chat_input.value == "@src/"
+        popup_content = popup.content_text
+        assert popup.styles.display == "block"
+        assert "src/main.py" in popup_content
+
+
+@pytest.mark.asyncio
+async def test_pressing_tab_writes_selected_path_name_and_hides_popup(
+    chartreux_app: ChartreuxApp, file_tree: Path
+) -> None:
+    async with chartreux_app.run_test() as pilot:
+        chat_input = chartreux_app.query_one(ChatInputContainer)
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        await pilot.press(*"Print @REA")
+        await pilot.press("tab")
+        await pilot.pause(0.2)
+
+        assert chat_input.value == "Print @README.md "
+        assert popup.styles.display == "none"
+
+
+@pytest.mark.asyncio
+async def test_pressing_enter_writes_selected_path_name_and_hides_popup(
+    chartreux_app: ChartreuxApp, file_tree: Path
+) -> None:
+    async with chartreux_app.run_test() as pilot:
+        chat_input = chartreux_app.query_one(ChatInputContainer)
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        await pilot.press(*"Print @src/m")
+        await pilot.press("enter")
+
+        assert chat_input.value == "Print @src/main.py "
+        assert popup.styles.display == "none"
+
+
+@pytest.mark.asyncio
+async def test_fuzzy_matches_subsequence_characters(
+    file_tree: Path, chartreux_app: ChartreuxApp
+) -> None:
+    async with chartreux_app.run_test() as pilot:
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        await pilot.press(*"@src/utils/handling")
+
+        popup_content = popup.content_text
+        assert "src/utils/error_handling.py" in popup_content
+        assert popup.styles.display == "block"
+
+
+@pytest.mark.asyncio
+async def test_fuzzy_matches_word_boundaries(
+    file_tree: Path, chartreux_app: ChartreuxApp
+) -> None:
+    async with chartreux_app.run_test() as pilot:
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        await pilot.press(*"@src/utils/eh")
+
+        popup_content = popup.content_text
+        assert "src/utils/error_handling.py" in popup_content
+        assert popup.styles.display == "block"
+
+
+@pytest.mark.asyncio
+async def test_finds_files_recursively_by_filename(
+    file_tree: Path, chartreux_app: ChartreuxApp
+) -> None:
+    async with chartreux_app.run_test() as pilot:
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        await pilot.press(*"@entryp")
+
+        popup_content = popup.content_text
+        assert "chartreux/acp/entrypoint.py" in popup_content
+        assert popup.styles.display == "block"
+
+
+@pytest.mark.asyncio
+async def test_finds_files_recursively_with_partial_path(
+    file_tree: Path, chartreux_app: ChartreuxApp
+) -> None:
+    async with chartreux_app.run_test() as pilot:
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        await pilot.press(*"@acp/entry")
+
+        popup_content = popup.content_text
+        assert "chartreux/acp/entrypoint.py" in popup_content
+        assert popup.styles.display == "block"
+
+
+@pytest.mark.asyncio
+async def test_does_not_trigger_completion_when_navigating_history(
+    file_tree: Path, chartreux_app: ChartreuxApp
+) -> None:
+    async with chartreux_app.run_test() as pilot:
+        chat_input = chartreux_app.query_one(ChatInputContainer)
+        popup = chartreux_app.query_one(CompletionPopup)
+        message_with_path = "Check @src/m"
+        message_to_fill_history = "Yet another message to fill history"
+
+        await pilot.press(*message_with_path)
+        await pilot.press("tab", "enter")
+        await pilot.press(*message_to_fill_history)
+        await pilot.press("enter")
+        await pilot.press("up", "up")
+        assert chat_input.value == "Check @src/main.py"
+        await pilot.pause(0.2)
+        # ensure popup is hidden - user was navigating history: we don't want to interrupt
+        assert popup.styles.display == "none"
+        await pilot.press("down")
+        await pilot.pause(0.1)
+        assert popup.styles.display == "none"
+        # get back to the message with path completion; ensure again
+        await pilot.press("up")
+        await pilot.pause(0.1)
+        assert chat_input.value == "Check @src/main.py"
+        await pilot.pause(0.2)
+        assert popup.styles.display == "none"
+
+
+@pytest.mark.asyncio
+async def test_completion_works_after_exhausting_history_navigation(
+    file_tree: Path, chartreux_app: ChartreuxApp
+) -> None:
+    """Regression: pressing Up past the oldest entry must not leave
+    _navigating_history stuck, which would suppress path completion
+    on subsequent caret moves.
+    """
+    async with chartreux_app.run_test() as pilot:
+        chat_input = chartreux_app.query_one(ChatInputContainer)
+        popup = chartreux_app.query_one(CompletionPopup)
+
+        # Seed history directly: oldest entry has a path trigger so
+        # caret-only moves inside it can exercise watch_selection.
+        body = chat_input._body
+        assert body is not None
+        assert body.history is not None
+        body.history.add("Check @src/m")
+        body.history.add("Second message")
+        await pilot.pause()
+
+        # Navigate up twice to reach the oldest entry, then once more
+        # past it. _navigating_history is set before each HistoryPrevious
+        # post; the body handler must reset it when get_previous returns
+        # None on the third press.
+        await pilot.press("up", "up", "up")
+        await pilot.pause()
+        assert chat_input.value == "Check @src/m"
+
+        # Move the caret left then right without editing text. watch_selection
+        # fires on the selection change. If _navigating_history were stuck
+        # True, completion would be suppressed and the popup would stay
+        # hidden despite the @src/ trigger in the input.
+        await pilot.press("left")
+        await pilot.pause(0.1)
+        await pilot.press("right")
+        await pilot.pause(0.2)
+        assert popup.styles.display == "block"
+        assert "src/" in popup.content_text

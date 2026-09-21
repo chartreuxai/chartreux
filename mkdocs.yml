@@ -1,0 +1,60 @@
+site_name: Chartreux
+site_url: https://chartreuxai.github.io/chartreux/docs/
+docs_dir: docs
+strict: true
+theme:
+  name: mkdocs
+extra_css:
+  - stylesheets/chartreux.css
+validation:
+  nav:
+    not_found: ignore
+  links:
+    anchors: warn
+    not_found: ignore
+hooks:
+  - docs/hooks.py
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Guides:
+      - Terminal: guides/terminal.md
+      - Configuration: guides/configuration.md
+      - Models: guides/models.md
+      - Subagents: guides/subagents.md
+      - Sessions and workspaces: guides/sessions-workspaces.md
+      - Instructions and skills: guides/instructions-skills.md
+      - Tools and safety: guides/tools-safety.md
+      - MCP: guides/mcp.md
+      - Hooks: guides/hooks.md
+      - Automation: guides/automation.md
+      - Troubleshooting: guides/troubleshooting.md
+  - Reference:
+      - Configuration: reference/configuration.md
+      - Commands: reference/commands.md
+  - Integrations:
+      - ACP: integrations/acp.md
+      - App server: integrations/app-server.md
+      - Networking: integrations/networking.md
+  - Architecture: architecture/index.md
+  - ADRs:
+      - 0001 Architecture Principles: adr/0001-architecture-principles.md
+      - 0002 Core Engine And Delivery Surfaces: adr/0002-core-engine-and-delivery-surfaces.md
+      - 0003 Event Driven Agent Loop: adr/0003-event-driven-agent-loop.md
+      - 0004 Typed Permissioned Tools: adr/0004-typed-permissioned-tools.md
+      - 0005 Layered Configuration: adr/0005-layered-configuration.md
+      - 0006 Local Sessions: adr/0006-local-sessions.md
+      - 0007 Extension Mechanisms: adr/0007-extension-mechanisms.md
+      - 0008 Feature Instrumentation: adr/0008-feature-instrumentation.md
+      - 0009 App Server as the Harness Boundary: adr/0009-app-server-boundary.md
+      - 0010 Textual Content Rendering: adr/0010-textual-content-rendering.md
+      - 0011 Unified Harness Backend: adr/0011-unified-harness-backend.md
+      - 0012 Slash Commands While Busy: adr/0012-two-phase-slash-command-execution.md
+      - 0013 Queue Selection and Edit Mode for Queued Prompts: adr/0013-queue-edit-mode.md
+      - 0014 Backend Contract Compatibility: adr/0014-backend-contract-compatibility.md
+      - 0015 Outbound TLS Trust Policy: adr/0015-outbound-tls-trust-policy.md
+  - Project:
+      - Migration: project/migration.md
+      - Privacy: project/privacy.md
+      - Changelog: project/changelog.md
+      - Acknowledgements: project/acknowledgements.md

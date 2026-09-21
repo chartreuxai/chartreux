@@ -1,0 +1,1 @@
+Track tasks for the current session. Use for multi-step work. Keep one task in_progress at a time; mark completed when done. `action: "write"` replaces the full list — include every item you want to keep.

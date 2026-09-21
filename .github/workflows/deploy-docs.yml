@@ -1,0 +1,74 @@
+name: Deploy documentation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "landing/**"
+      - "mkdocs.yml"
+      - "CHANGELOG.md"
+      - "ACKNOWLEDGEMENTS.md"
+      - ".github/workflows/deploy-docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv with caching
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "latest"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install documentation dependencies
+        run: uv sync --locked --group docs
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Assemble Pages artifact
+        run: |
+          staging_dir="$RUNNER_TEMP/pages-artifact"
+          mkdir -p "$staging_dir/docs"
+          cp -a landing/. "$staging_dir/"
+          uv run --no-sync mkdocs build --strict --site-dir "$staging_dir/docs"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/pages-artifact
+
+  deploy:
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

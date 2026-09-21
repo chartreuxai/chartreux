@@ -1,0 +1,289 @@
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
+import time
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+
+from chartreux.cli.textual_ui.app import BottomApp
+from chartreux.config_values import AUTO_THEME
+from chartreux.ui.widgets.theme_picker import ThemePickerApp
+from tests.conftest import build_test_chartreux_app, build_test_vibe_config
+
+
+async def _wait_until(
+    pilot, predicate: Callable[[], bool], timeout: float = 2.0
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await pilot.pause(0.05)
+    return False
+
+
+@pytest.mark.asyncio
+async def test_theme_opens_theme_picker() -> None:
+    app = build_test_chartreux_app(config=build_test_vibe_config())
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        await app._show_theme()
+        await pilot.pause(0.2)
+
+        assert app._current_bottom_app == BottomApp.ThemePicker
+        assert len(app.query(ThemePickerApp)) == 1
+
+
+@pytest.mark.asyncio
+async def test_theme_picker_lists_themes_and_marks_current() -> None:
+    config = build_test_vibe_config(theme="dark")
+    app = build_test_chartreux_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        await app._show_theme()
+        await pilot.pause(0.2)
+
+        picker = app.query_one(ThemePickerApp)
+        assert picker._theme_names == ["auto", "light", "dark"]
+        assert picker._current_theme == "dark"
+
+
+@pytest.mark.asyncio
+async def test_theme_picker_escape_restores_original_theme() -> None:
+    config = build_test_vibe_config(theme="dark")
+    app = build_test_chartreux_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        await app._show_theme()
+        await pilot.pause(0.2)
+
+        # Move highlight to a different theme to trigger preview.
+        await pilot.press("down")
+        await pilot.pause(0.2)
+
+        with patch.object(
+            app.app_server.resources.config, "update", new=AsyncMock()
+        ) as update_config:
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+
+            update_config.assert_not_awaited()
+
+        assert app._current_bottom_app == BottomApp.Input
+        assert len(app.query(ThemePickerApp)) == 0
+        assert app.config.theme == "dark"
+        assert app.theme == "ansi-dark"
+
+
+@pytest.mark.asyncio
+async def test_theme_picker_select_persists_and_applies() -> None:
+    config = build_test_vibe_config(theme="light")
+    app = build_test_chartreux_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        await app._show_theme()
+        await pilot.pause(0.2)
+
+        picker = app.query_one(ThemePickerApp)
+        names = picker._theme_names
+        current_index = names.index("light")
+        target_index = (current_index + 1) % len(names)
+        target = names[target_index]
+
+        await pilot.press("down")
+
+        config_resource = app.app_server.resources.config
+        with patch.object(
+            config_resource, "update", new=AsyncMock(wraps=config_resource.update)
+        ) as update_config:
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+
+            update_config.assert_awaited_once_with({"theme": target})
+
+        assert app._current_bottom_app == BottomApp.Input
+        assert len(app.query(ThemePickerApp)) == 0
+        assert app.config.theme == target
+        assert app.theme == "ansi-dark"
+
+
+@pytest.mark.asyncio
+async def test_theme_picker_select_does_not_reload_config() -> None:
+    config = build_test_vibe_config(theme="dark")
+    app = build_test_chartreux_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+
+        config_resource = app.app_server.resources.config
+        with (
+            patch.object(
+                config_resource, "update", new=AsyncMock(wraps=config_resource.update)
+            ) as update_config,
+            patch.object(config_resource, "reload", new=AsyncMock()) as reload_config,
+        ):
+            await app.on_theme_picker_app_theme_selected(
+                ThemePickerApp.ThemeSelected("light")
+            )
+
+        update_config.assert_awaited_once_with({"theme": "light"})
+        reload_config.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_theme_picker_select_applies_before_persisting() -> None:
+    config = build_test_vibe_config(theme="dark")
+    app = build_test_chartreux_app(config=config)
+    update_started = asyncio.Event()
+    allow_update = asyncio.Event()
+
+    async def delayed_update(_changes: dict[str, object]) -> None:
+        update_started.set()
+        await allow_update.wait()
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+
+        with patch.object(
+            app.app_server.resources.config,
+            "update",
+            new=AsyncMock(side_effect=delayed_update),
+        ):
+            selection = asyncio.create_task(
+                app.on_theme_picker_app_theme_selected(
+                    ThemePickerApp.ThemeSelected("light")
+                )
+            )
+            await update_started.wait()
+
+            # The visual theme is applied before the app-server write completes.
+            assert app.theme == "ansi-light"
+
+            allow_update.set()
+            await selection
+
+
+@pytest.mark.asyncio
+async def test_theme_picker_restores_canonical_theme_when_write_fails() -> None:
+    config = build_test_vibe_config(theme="dark")
+    app = build_test_chartreux_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        await app._apply_theme("light")
+
+        with patch.object(
+            app.app_server.resources.config,
+            "update",
+            new=AsyncMock(side_effect=RuntimeError("rejected")),
+        ):
+            await app.on_theme_picker_app_theme_selected(
+                ThemePickerApp.ThemeSelected("light")
+            )
+
+        assert app.config.theme == "dark"
+        assert app.theme == "ansi-dark"
+
+
+@pytest.mark.asyncio
+async def test_apply_theme_skips_diff_restyle_for_same_render_mode() -> None:
+    config = build_test_vibe_config(theme="dark")
+    app = build_test_chartreux_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+
+        with patch.object(app, "_restyle_diff_widgets", new=Mock()) as restyle_diffs:
+            await app._apply_theme("dark")
+
+        assert app.theme == "ansi-dark"
+        restyle_diffs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_apply_theme_restyles_diffs_when_render_mode_changes() -> None:
+    config = build_test_vibe_config(theme="light")
+    app = build_test_chartreux_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+
+        with patch.object(app, "_restyle_diff_widgets", new=Mock()) as restyle_diffs:
+            await app._apply_theme("dark")
+
+        assert app.theme == "ansi-dark"
+        restyle_diffs.assert_called_once_with(ansi=True, dark=True)
+
+
+@pytest.mark.asyncio
+async def test_opening_theme_picker_does_not_restyle_current_theme() -> None:
+    config = build_test_vibe_config(theme="dark")
+    app = build_test_chartreux_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+
+        with patch.object(app, "_restyle_diff_widgets", new=Mock()) as restyle_diffs:
+            await app._show_theme()
+            await pilot.pause(0.2)
+
+        restyle_diffs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_config_theme_change_applies_via_pubsub() -> None:
+    config = build_test_vibe_config(theme="dark")
+    app = build_test_chartreux_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        assert app.theme == "ansi-dark"
+
+        await app.app_server.resources.config.update({"theme": "light"})
+        await pilot.pause(0.2)
+
+        assert app.config.theme == "light"
+        assert app.theme == "ansi-light"
+
+
+@pytest.mark.asyncio
+async def test_theme_picker_persists_auto_and_applies_resolved_theme() -> None:
+    config = build_test_vibe_config(theme="dark")
+    app = build_test_chartreux_app(config=config)
+
+    with patch(
+        "chartreux.ui._theme_detection.resolve_auto_theme", return_value="light"
+    ):
+        async with app.run_test() as pilot:
+            await pilot.pause(0.1)
+            await app._show_theme()
+            await pilot.pause(0.2)
+
+            picker = app.query_one(ThemePickerApp)
+            current_index = picker._theme_names.index(config.theme)
+            await pilot.press(*["up"] * current_index)
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+
+    assert app.config.theme == AUTO_THEME
+    assert app.theme == "ansi-light"
+
+
+@pytest.mark.asyncio
+async def test_theme_picker_jk_moves_cursor() -> None:
+    from textual.widgets import OptionList
+
+    config = build_test_vibe_config(theme="dark")
+    app = build_test_chartreux_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        await app._show_theme()
+        await pilot.pause(0.2)
+
+        option_list = app.query_one(ThemePickerApp).query_one(OptionList)
+        start = option_list.highlighted
+        assert start is not None
+
+        await pilot.press("j")
+        await pilot.pause(0.1)
+        assert option_list.highlighted == (start + 1) % option_list.option_count
+
+        await pilot.press("k")
+        await pilot.pause(0.1)
+        assert option_list.highlighted == start

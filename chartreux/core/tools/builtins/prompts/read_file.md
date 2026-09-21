@@ -1,0 +1,1 @@
+Read a file. Use absolute paths. For large files, use `offset` and `limit` to page through sections. Use `grep` to find specific content instead of reading sequentially. Do not read binary or model weight files (.bin, .safetensors, .pt, .gguf).

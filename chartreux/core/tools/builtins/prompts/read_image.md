@@ -1,0 +1,1 @@
+View one image file. Supported formats are PNG, JPEG (`.jpg` or `.jpeg`), GIF, and WebP, up to 10 MiB. The result contains image metadata and the image itself. Relative paths resolve against the current working directory; absolute paths are also accepted.

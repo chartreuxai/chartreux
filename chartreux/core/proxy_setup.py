@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+from dotenv import dotenv_values, set_key, unset_key
+
+from chartreux.core.paths import GLOBAL_ENV_FILE
+
+SUPPORTED_PROXY_VARS: dict[str, str] = {
+    "HTTP_PROXY": "Proxy URL for HTTP requests",
+    "HTTPS_PROXY": "Proxy URL for HTTPS requests",
+    "ALL_PROXY": "Proxy URL for all requests (fallback)",
+    "NO_PROXY": "Comma-separated list of hosts to bypass proxy",
+    "SSL_CERT_FILE": "Path to custom SSL certificate file",
+    "SSL_CERT_DIR": "Path to directory containing SSL certificates",
+}
+
+# Proxy URL vars need an http(s):// scheme, else httpx crashes on startup (VIBE-4084).
+PROXY_URL_VARS: frozenset[str] = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"})
+
+
+class ProxySetupError(Exception):
+    pass
+
+
+def get_current_proxy_settings() -> dict[str, str | None]:
+    if not GLOBAL_ENV_FILE.path.exists():
+        return {key: None for key in SUPPORTED_PROXY_VARS}
+
+    try:
+        env_vars = dotenv_values(GLOBAL_ENV_FILE.path)
+        return {key: env_vars.get(key) for key in SUPPORTED_PROXY_VARS}
+    except Exception:
+        return {key: None for key in SUPPORTED_PROXY_VARS}
+
+
+def set_proxy_var(key: str, value: str) -> None:
+    key = key.upper()
+    if key not in SUPPORTED_PROXY_VARS:
+        raise ProxySetupError(
+            f"Unknown key '{key}'. Supported: {', '.join(SUPPORTED_PROXY_VARS.keys())}"
+        )
+
+    if key in PROXY_URL_VARS and not value.startswith(("http://", "https://")):
+        raise ProxySetupError(
+            f"{key} must start with http:// or https:// (got '{value}')"
+        )
+
+    GLOBAL_ENV_FILE.path.parent.mkdir(parents=True, exist_ok=True)
+    set_key(GLOBAL_ENV_FILE.path, key, value)
+
+
+def unset_proxy_var(key: str) -> None:
+    key = key.upper()
+    if key not in SUPPORTED_PROXY_VARS:
+        raise ProxySetupError(
+            f"Unknown key '{key}'. Supported: {', '.join(SUPPORTED_PROXY_VARS.keys())}"
+        )
+
+    if not GLOBAL_ENV_FILE.path.exists():
+        return
+
+    unset_key(GLOBAL_ENV_FILE.path, key)

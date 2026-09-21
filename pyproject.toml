@@ -1,0 +1,242 @@
+[project]
+name = "chartreux"
+version = "0.1.0"
+description = "Independent CLI coding assistant derived from Mistral Vibe"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Chartreux" }]
+keywords = [
+    "ai",
+    "cli",
+    "coding-assistant",
+    "llm",
+    "developer-tools",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "agent-client-protocol==0.11.0",
+    "annotated-types==0.7.0",
+    "anyio==4.14.1",
+    "attrs==26.1.0",
+    "beautifulsoup4==4.14.3",
+    "cachetools==7.0.6",
+    "certifi==2026.7.22",
+    "cffi==2.0.0",
+    "charset-normalizer==3.4.7",
+    "click==8.3.3 ; sys_platform != 'emscripten'",
+    "cryptography==50.0.0",
+    "ddgs==9.16.0",
+    "eval-type-backport==0.3.1",
+    "gitdb==4.0.12",
+    "gitpython==3.1.58",
+    "giturlparse==0.15.0",
+    "h11==0.16.0",
+    "httpcore==1.0.9",
+    "httpx==0.28.1",
+    "httpx-sse==0.4.3",
+    "humanize==4.16.0",
+    "idna==3.18",
+    "importlib-metadata==8.7.1",
+    "jaraco-classes==3.4.0",
+    "jaraco-context==6.1.2",
+    "jaraco-functools==4.4.0",
+    "jeepney==0.9.0 ; sys_platform == 'linux'",
+    "jsonpatch==1.33",
+    "jsonpath-python==1.1.5",
+    "jsonpointer==3.1.1",
+    "jsonschema==4.26.0",
+    "jsonschema-specifications==2025.9.1",
+    "keyring==25.7.0",
+    "linkify-it-py==2.1.0",
+    "markdown-it-py==4.0.0",
+    "markdownify==1.2.3",
+    "mcp==1.28.1",
+    "mdit-py-plugins==0.5.0",
+    "mdurl==0.1.2",
+    "mistralai==2.6.0",
+    "more-itertools==11.0.2",
+    "platformdirs==4.9.6",
+    "pyasn1==0.6.4",
+    "pycparser==3.0 ; implementation_name != 'PyPy'",
+    "pydantic==2.13.4",
+    "pydantic-core==2.46.4",
+    "pydantic-settings==2.14.2",
+    "pygments==2.20.0",
+    "pyjwt==2.13.0",
+    "pyperclip==1.11.0",
+    "python-dateutil==2.9.0.post0",
+    "python-dotenv==1.2.2",
+    "pyyaml==6.0.3",
+    "referencing==0.37.0",
+    "requests==2.34.2",
+    "rich==15.0.0",
+    "rpds-py==0.30.0",
+    "secretstorage==3.5.0 ; sys_platform == 'linux'",
+    "setproctitle==1.3.7",
+    "six==1.17.0",
+    "smmap==5.0.3",
+    "soupsieve==2.8.4",
+    "textual==8.2.8",
+    "textual-speedups==0.2.1",
+    "tomli-w==1.2.0",
+    "tree-sitter==0.26.0",
+    "tree-sitter-bash==0.25.1",
+    "truststore==0.10.4",
+    "typing-extensions==4.15.0",
+    "typing-inspection==0.4.2",
+    "uc-micro-py==2.0.0",
+    "urllib3==2.7.0",
+    "watchfiles==1.2.0",
+    "zipp==3.23.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/pavelpenev/chartreux"
+Repository = "https://github.com/pavelpenev/chartreux"
+"Upstream source" = "https://github.com/mistralai/mistral-vibe"
+
+[build-system]
+requires = ["hatchling==1.31.0", "hatch-vcs==0.5.0", "editables==0.6"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[[tool.uv.index]]
+default = true
+name = "pypi"
+url = "https://pypi.org/simple"
+
+[tool.hatch.build.targets.wheel]
+include = ["chartreux/"]
+
+[project.scripts]
+chartreux = "chartreux.cli.entrypoint:main"
+chartreux-acp = "chartreux.acp.entrypoint:main"
+chartreux-app-server = "chartreux.app_server.stdio:main"
+
+[tool.uv]
+exclude-newer = "2 days"
+index-strategy = "first-index"
+package = true
+required-version = ">=0.8.0"
+override-dependencies = [
+    # pytest-textual-snapshot exact-pins syrupy==4.8.0, which caps pytest<9.
+    # syrupy 4.8.0 runs fine on pytest 9 (generation, comparison and diffs all
+    # verified); the cap is conservative, so override it to clear GHSA-6w46-j5rx-g56g.
+    "pytest>=9.0.3",
+]
+
+[dependency-groups]
+dev = [
+    "cryptography>=48.0.0",
+    "packaging==26.2",
+    "pre-commit-uv>=4.3.0",
+    "pre-commit>=4.2.0",
+    "pexpect==4.9.0",
+    "pyright>=1.1.403",
+    "pytest>=8.3.5",
+    "pytest-asyncio>=1.2.0",
+    "pytest-textual-snapshot>=1.1.0",
+    "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.8.0",
+    "respx>=0.22.0",
+    "ruff>=0.15.18",
+    "typos>=1.34.0",
+    "vulture>=2.14",
+]
+
+docs = [
+    "mkdocs>=1.6.1",
+]
+
+[tool.pyright]
+pythonVersion = "3.12"
+reportMissingTypeStubs = false
+reportPrivateImportUsage = false
+
+include = ["chartreux/**/*.py", "tests/**/*.py"]
+venvPath = "."
+venv = ".venv"
+
+[tool.ruff]
+include = ["chartreux/**/*.py", "tests/**/*.py"]
+line-length = 88
+target-version = "py312"
+preview = true
+
+[tool.ruff.format]
+skip-magic-trailing-comma = true
+
+[tool.ruff.lint]
+select = [
+    "F",
+    "I",
+    "D2",
+    "UP",
+    "TID",
+    "ANN",
+    "PLR",
+    "B0",
+    "B905",
+    "RUF022",
+    "RUF010",
+    "RUF012",
+    "RUF019",
+    "RUF100",
+    "TC004",
+]
+ignore = ["D203", "D205", "D213", "ANN401", "PLR6301"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN", "PLR"]
+
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.isort]
+known-first-party = ["chartreux"]
+force-sort-within-sections = true
+split-on-trailing-comma = false
+combine-as-imports = true
+force-wrap-aliases = false
+order-by-type = true
+required-imports = ["from __future__ import annotations"]
+
+[tool.ruff.lint.pylint]
+max-public-methods = 26
+max-positional-args = 10
+max-statements = 50
+max-branches = 15
+max-locals = 15
+max-args = 10
+max-returns = 6
+max-nested-blocks = 5
+
+[tool.vulture]
+ignore_decorators = ["@*"]
+
+[tool.pytest.ini_options]
+addopts = "-p pytest_chartreux -vvvv -q -n auto --dist=loadgroup --durations=10 --import-mode=importlib --maxschedchunk=1"
+timeout = 10
+markers = [
+]
+filterwarnings = [
+    # (e2e) streaming mock server is started in a thread; and the cli is spawn in a fork
+    "ignore:This process \\(pid=.*\\) is multi-threaded, use of forkpty\\(\\) may lead to deadlocks in the child\\.:DeprecationWarning",
+]
