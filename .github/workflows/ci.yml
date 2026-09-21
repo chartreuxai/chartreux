@@ -33,7 +33,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Sync dependencies
-        run: uv sync --locked --dev
+        run: uv sync --locked --dev --group docs
 
       - name: Install pip (required by pre-commit)
         run: uv pip install pip
