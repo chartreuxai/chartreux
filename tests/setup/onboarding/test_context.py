@@ -38,32 +38,15 @@ def test_context_preserves_initial_theme() -> None:
 
 
 def _disabled_active_model_config() -> ChartreuxConfigSchema:
-    config = build_test_vibe_config(active_model="glm-5-2")
+    config = build_test_vibe_config(active_model="glm-5-3")
     catalog = config.catalog_snapshot.catalog
-    disabled = catalog.models["glm-5-2"].model_copy(update={"disabled": True})
+    disabled = catalog.models["glm-5-3"].model_copy(update={"disabled": True})
     config.attach_catalog_snapshot(
         CatalogSnapshot(
             catalog.model_copy(
-                update={"models": {**catalog.models, "glm-5-2": disabled}}
+                update={"models": {**catalog.models, "glm-5-3": disabled}}
             ),
             "disabled-active-model",
-        )
-    )
-    return config
-
-
-def _unresolvable_alias_config() -> ChartreuxConfigSchema:
-    config = build_test_vibe_config(active_model="repair-alias")
-    catalog = config.catalog_snapshot.catalog
-    disabled = catalog.models["glm-5-2"].model_copy(
-        update={"aliases": ("repair-alias",), "disabled": True}
-    )
-    config.attach_catalog_snapshot(
-        CatalogSnapshot(
-            catalog.model_copy(
-                update={"models": {**catalog.models, "glm-5-2": disabled}}
-            ),
-            "unresolvable-alias",
         )
     )
     return config
@@ -75,10 +58,9 @@ def _unresolvable_alias_config() -> ChartreuxConfigSchema:
         pytest.param(build_test_vibe_config(active_model="missing"), id="missing"),
         pytest.param(_disabled_active_model_config(), id="disabled"),
         pytest.param(
-            build_test_vibe_config(active_model="glm-5-2", allowed_models=["not-glm"]),
+            build_test_vibe_config(active_model="glm-5-3", allowed_models=["not-glm"]),
             id="excluded",
         ),
-        pytest.param(_unresolvable_alias_config(), id="alias"),
     ],
 )
 def test_unresolvable_active_model_opens_onboarding_repair_entry(
@@ -108,7 +90,7 @@ def test_context_uses_active_provider_when_it_resolves() -> None:
 
 
 def test_credential_adapter_uses_safe_repair_provider() -> None:
-    config = build_test_vibe_config(active_model="glm-5-2")
+    config = build_test_vibe_config(active_model="glm-5-3")
     catalog = config.catalog_snapshot.catalog
     config.attach_catalog_snapshot(
         CatalogSnapshot(
@@ -158,12 +140,12 @@ def test_onboarding_selected_model_writes_selections_only_config(config_dir) -> 
 
     class SelectedModelApp:
         def run(self) -> str:
-            return "glm-5-2"
+            return "glm-5-3"
 
     run_onboarding(app=SelectedModelApp(), orchestrator=orchestrator)  # type: ignore[arg-type]
 
     with config_file.open("rb") as stream:
-        assert tomllib.load(stream) == {"active_model": "glm-5-2"}
+        assert tomllib.load(stream) == {"active_model": "glm-5-3"}
     assert not (config_dir / "models.toml").exists()
 
 
@@ -256,3 +238,12 @@ async def test_config_service_reports_set_field_failures() -> None:
 
     assert not result.persisted
     assert result.message == "disk unavailable"
+
+
+def test_unpinned_onboarding_context_resolves_orchestrator_role() -> None:
+    config = build_test_vibe_config(active_model="")
+
+    assert (
+        OnboardingContext.from_config(config).provider == config.get_active_provider()
+    )
+    assert config.get_active_model().name == "zai-glm-5-3"

@@ -492,7 +492,7 @@ def _run_cli_with_worktree_cleanup(
         if (
             worktree_session is not None
             and worktree_session.created
-            and args.prompt is None
+            and not getattr(args, "is_programmatic", False)
             and session_started
             and cli_token is not None
         ):

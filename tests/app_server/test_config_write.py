@@ -105,10 +105,10 @@ def test_config_write_translation_preserves_order_paths_and_targets() -> None:
 @pytest.mark.asyncio
 async def test_session_catalog_batch_requires_explicit_user_save() -> None:
     models = await _write_model_ops(
-        config=build_test_vibe_config(active_model="glm-5-2"),
+        config=build_test_vibe_config(active_model="glm-5-3"),
         ops=[
-            ConfigWriteOpWire(op="set", path="/models/glm-5-2/thinking", value="low"),
-            ConfigWriteOpWire(op="set", path="/models/glm-5-2/temperature", value=0.7),
+            ConfigWriteOpWire(op="set", path="/models/glm-5-3/thinking", value="low"),
+            ConfigWriteOpWire(op="set", path="/models/glm-5-3/temperature", value=0.7),
         ],
     )
     assert models["rejected"] is True
@@ -117,9 +117,9 @@ async def test_session_catalog_batch_requires_explicit_user_save() -> None:
 @pytest.mark.asyncio
 async def test_session_catalog_field_requires_explicit_user_save() -> None:
     # Definitions belong to the user source, including changes to existing models.
-    config = build_test_vibe_config(active_model="glm-5-2")
+    config = build_test_vibe_config(active_model="glm-5-3")
     persisted = await _write_model_field(
-        config=config, alias="glm-5-2", field="thinking", value="low"
+        config=config, alias="glm-5-3", field="thinking", value="low"
     )
 
     assert persisted["persistence"] == "not_saved"

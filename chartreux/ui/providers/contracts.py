@@ -71,8 +71,9 @@ class ModelEdits:
     input_price: OptionalEdit[float] = field(default_factory=OptionalEdit)
     output_price: OptionalEdit[float] = field(default_factory=OptionalEdit)
     cached_input_price: OptionalEdit[float] = field(default_factory=OptionalEdit)
-    aliases: OptionalEdit[tuple[str, ...]] = field(default_factory=OptionalEdit)
-    tags: OptionalEdit[tuple[str, ...]] = field(default_factory=OptionalEdit)
+    role_memberships: OptionalEdit[tuple[str, ...]] = field(
+        default_factory=OptionalEdit
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +134,7 @@ class CatalogChanges:
     provider_id: str
     provider: Mapping[str, object]
     models: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
-    tags: Mapping[str, tuple[str, ...]] | None = None
+    roles: Mapping[str, Mapping[str, object]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,7 +226,7 @@ class ConfigService(Protocol):
         ...
 
     async def persist_active_model(self, expression: str) -> ConfigPersistResult:
-        """Persist only a v0.1 canonical name, alias, or ``@tag`` expression."""
+        """Persist only a v0.1 canonical name or ``@role`` expression."""
         ...
 
     async def reload_catalog_and_config(self) -> ConfigReloadResult:
@@ -267,14 +268,13 @@ def _serialize_edits(edits: ModelEdits) -> dict[str, dict[str, object]]:
             ("input_price", edits.input_price),
             ("output_price", edits.output_price),
             ("cached_input_price", edits.cached_input_price),
-            ("aliases", edits.aliases),
-            ("tags", edits.tags),
+            ("role_memberships", edits.role_memberships),
         )
     }
 
 
 def active_model_expression_is_valid(expression: str) -> bool:
-    """Recognize v0.1 active-model expressions: name, alias, or a nonempty tag."""
+    """Recognize v0.1 active-model expressions: name or a nonempty role."""
     if not expression or "/" in expression:
         return False
     if expression.startswith("@"):

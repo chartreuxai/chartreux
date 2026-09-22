@@ -97,7 +97,7 @@ def test_provider_validation_uses_projected_expression_and_allowlist(
                 "a": {"deployments": [{"provider": "a/default", "name": "a"}]},
                 "b": {"deployments": [{"provider": "b/default", "name": "b"}]},
             },
-            "tags": {"preferred": ["a", "b"]},
+            "roles": {"preferred": {"models": ["a", "b"]}},
         }),
         "initial",
     )
@@ -108,7 +108,10 @@ def test_provider_validation_uses_projected_expression_and_allowlist(
         active_model="@preferred"
     ).attach_catalog_snapshot(initial)
     reordered = CatalogSnapshot(
-        initial.catalog.model_copy(update={"tags": {"preferred": ("b", "a")}}),
+        ModelCatalog.model_validate({
+            **initial.catalog.model_dump(),
+            "roles": {"preferred": {"models": ("b", "a")}},
+        }),
         "reordered",
     )
     monkeypatch.delenv("B_KEY", raising=False)
@@ -140,7 +143,7 @@ def test_provider_validation_accepts_unpinned_default_from_config_view(
                     "deployments": [{"provider": "glm/default", "name": "glm-5-2"}]
                 }
             },
-            "tags": {},
+            "roles": {"orchestrator": {"models": ["glm-5-2"]}},
         }),
         "default",
     )

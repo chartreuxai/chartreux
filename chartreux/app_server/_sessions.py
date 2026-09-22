@@ -13,6 +13,7 @@ from contextlib import ExitStack, asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field, replace
 import enum
 import fnmatch
+import itertools
 from pathlib import Path
 import time
 from typing import Any, cast
@@ -76,6 +77,7 @@ from chartreux.core.subagents import (
     InvalidLaunchModelError,
     LaunchConfig,
     LaunchConfigError,
+    ReleaseAgentOutcome,
     RunStatus,
     SubagentRunAccumulator,
     SubagentRunnerPort,
@@ -181,6 +183,7 @@ class RunRecord:
     status: RunStatus
     completion_task: asyncio.Future[Any]
     task_summary: str | None = None
+    start_count: int = 0
     result: TaskResult | None = None
     completed_at: float | None = None
     terminal_identity: tuple[str, str, str] | None = None
@@ -256,6 +259,19 @@ class TranscriptReadSnapshot:
     @property
     def has_saved_transcript(self) -> bool:
         return self.child_dir is not None
+
+
+@dataclass(frozen=True, slots=True)
+class ResidentTranscriptReadSnapshot:
+    """An authorized immutable message snapshot from a resident child runtime."""
+
+    agent_id: str
+    child_session_id: str
+    parent_identity: tuple[str, int]
+    parent_runtime_token: int
+    record_token: int
+    runtime_token: int
+    messages: list[LLMMessage]
 
 
 @dataclass(frozen=True, slots=True)
@@ -767,6 +783,65 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             ),
             None,
         )
+
+    async def resolve_resident_transcript_read(
+        self, agent_id: str
+    ) -> ResidentTranscriptReadSnapshot | None:
+        """Snapshot a running resident child's messages under its MessageList lock."""
+        async with self._registry_lock:
+            root = self._root
+            if root is None:
+                raise UnknownAgentError(f"Unknown agent: {agent_id}")
+            identity = (root.agent_loop.session_id, root.agent_loop._session_generation)
+            if self._generation_identity != identity:
+                raise UnknownAgentError(f"Unknown agent: {agent_id}")
+            record = self._agent_records.get(agent_id)
+            if record is None:
+                if agent_id not in self._evicted_agents:
+                    raise UnknownAgentError(f"Unknown agent: {agent_id}")
+                return None
+            if (
+                record.root_generation != identity[1]
+                or record.parent_session_id != identity[0]
+                or record.state not in {_AgentState.RUNNING, _AgentState.FINALIZING}
+                or self._children.get(record.session_id) is not record.runtime
+            ):
+                return None
+            return ResidentTranscriptReadSnapshot(
+                agent_id=agent_id,
+                child_session_id=record.session_id,
+                parent_identity=identity,
+                parent_runtime_token=id(root),
+                record_token=id(record),
+                runtime_token=id(record.runtime),
+                messages=list(record.runtime.agent_loop.messages),
+            )
+
+    async def resident_transcript_read_is_current(
+        self, snapshot: ResidentTranscriptReadSnapshot
+    ) -> bool:
+        """Check that a resident transcript snapshot remains authorized."""
+        async with self._registry_lock:
+            root = self._root
+            if (
+                root is None
+                or id(root) != snapshot.parent_runtime_token
+                or (root.agent_loop.session_id, root.agent_loop._session_generation)
+                != snapshot.parent_identity
+                or self._generation_identity != snapshot.parent_identity
+            ):
+                return False
+            record = self._agent_records.get(snapshot.agent_id)
+            return (
+                record is not None
+                and id(record) == snapshot.record_token
+                and record.session_id == snapshot.child_session_id
+                and record.parent_session_id == snapshot.parent_identity[0]
+                and record.root_generation == snapshot.parent_identity[1]
+                and record.state in {_AgentState.RUNNING, _AgentState.FINALIZING}
+                and id(record.runtime) == snapshot.runtime_token
+                and self._children.get(record.session_id) is record.runtime
+            )
 
     async def resolve_transcript_read(self, agent_id: str) -> TranscriptReadSnapshot:
         """Capture parent-authorized disk-read inputs without touching child runtime state."""
@@ -1606,35 +1681,36 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
     async def _run_fan_out(  # noqa: PLR0912, PLR0915
         self, parent: SessionRuntime, args: TaskArgs, ctx: InvokeContext
     ) -> TaskResult:
-        """Launch every explicit tag member through the ordinary retained path."""
+        """Launch every explicit role member through the ordinary retained path."""
         if args.agent_id is not None:
             raise InvalidLaunchModelError("agent_id", "fan_out cannot reuse an agent")
         if args.config is None or "model" not in args.config.model_fields_set:
             raise InvalidLaunchModelError(
-                "config.model", "fan_out requires an explicitly supplied @tag model"
+                "config.model", "fan_out requires an explicitly supplied @role model"
             )
         expression = args.config.model
         if not isinstance(expression, str):
             raise InvalidLaunchModelError(
-                "config.model", "fan_out requires exactly one string @tag model"
+                "config.model", "fan_out requires exactly one string @role model"
             )
         if not expression.startswith("@") or expression == "@":
             raise InvalidLaunchModelError(
-                "config.model", "fan_out requires an explicitly supplied @tag model"
+                "config.model", "fan_out requires an explicitly supplied @role model"
             )
         snapshot = parent.agent_loop.config.catalog_snapshot
         if snapshot is None:
             raise InvalidLaunchModelError(
                 "config.model", "Model catalog is unavailable"
             )
-        members = snapshot.catalog.tags.get(expression[1:])
-        if members is None:
+        role = snapshot.catalog.roles.get(expression[1:])
+        if role is None:
             raise InvalidLaunchModelError(
-                "config.model", f"Unknown model tag {expression!r}"
+                "config.model", f"Unknown model role {expression!r}"
             )
+        members = role.models
 
         # Resolve every member before creating any child.  Passing its canonical base
-        # rather than the tag also makes each child assignment-time concrete.
+        # rather than the role also makes each child assignment-time concrete.
         member_args: list[tuple[str, TaskArgs, LaunchCandidate]] = []
         for base in members:
             member_config = args.config.model_copy(update={"model": base})
@@ -1982,7 +2058,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             record.current_run = run_record
             record.latest_run_id = run_id
             self._latest_run_ids[agent_id] = run_id
-            start_count = sum(
+            run_record.start_count = sum(
                 message.role is Role.assistant
                 for message in runtime.agent_loop.messages
             )
@@ -2013,7 +2089,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                             for message in runtime.agent_loop.messages
                         )
                         run_record.result = accumulator.build_result(
-                            turns_used=end_count - start_count,
+                            turns_used=end_count - run_record.start_count,
                             completed=turn.status is PublicTurnStatus.COMPLETED,
                         ).model_copy(
                             update={
@@ -2391,12 +2467,16 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 logger.warning(
                     "Failed to publish initial background agent update", exc_info=exc
                 )
-            # A populated agent_id makes this a launch acknowledgment rather than
-            # a terminal zero-turn task result.
+            # An explicit status distinguishes this successful launch acknowledgment
+            # from the terminal result that get_agent_result later returns.
             yield TaskResult(
-                response="",
+                response=(
+                    "Background agent launched and running; use check_agents to monitor, "
+                    "get_agent_result or wait_for_agent to retrieve the result."
+                ),
                 turns_used=0,
                 completed=True,
+                status="launched",
                 agent_id=agent_id,
                 run_id=run_id,
                 metadata={
@@ -2564,6 +2644,21 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                         if run.run_id == stored.run_id:
                             run.result = None
 
+    def _agent_turns_used(self, record: AgentRecord) -> int | None:
+        run = record.current_run
+        if run is not None:
+            return max(
+                0,
+                sum(
+                    message.role is Role.assistant
+                    for message in record.runtime.agent_loop.messages
+                )
+                - run.start_count,
+            )
+        if record.run_history and record.run_history[-1].result is not None:
+            return record.run_history[-1].result.turns_used
+        return None
+
     def _agent_summaries(self) -> list[AgentSummary]:
         now = self._clock()
         global_ttl = (
@@ -2595,6 +2690,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     availability=record.availability,
                     current_run_id=run.run_id if run is not None else None,
                     current_run_status=run.status if run is not None else None,
+                    turns_used=self._agent_turns_used(record),
                     last_run_status=record.last_run_status,
                     initial_task_summary=record.initial_task_summary,
                     current_task_summary=(
@@ -2641,6 +2737,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                         if summary.current_run_status is not None
                         else None
                     ),
+                    turns_used=summary.turns_used,
                     last_run_status=(
                         summary.last_run_status.value
                         if summary.last_run_status is not None
@@ -2849,9 +2946,12 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                         (record.agent_id, "idle_cap")
                         for record in remaining[: len(remaining) - cap]
                     )
+            eviction_notifications: list[
+                tuple[AgentRecord, AgentEviction, _AgentTombstone]
+            ] = []
             eviction_tasks = [
                 asyncio.create_task(
-                    self._evict_agent(agent_id, reason),
+                    self._evict_agent(agent_id, reason, eviction_notifications),
                     name=f"vibe-subagent-eviction:{agent_id}",
                 )
                 for agent_id, reason in victims
@@ -2860,16 +2960,29 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             for task in eviction_tasks:
                 task.add_done_callback(self._eviction_tasks.discard)
             if eviction_tasks:
-                await asyncio.shield(
-                    asyncio.gather(*eviction_tasks, return_exceptions=True)
+                eviction_results = asyncio.gather(
+                    *eviction_tasks, return_exceptions=True
                 )
+                try:
+                    await asyncio.shield(eviction_results)
+                except asyncio.CancelledError:
+                    await asyncio.shield(eviction_results)
+                    await self._notify_evictions(eviction_notifications)
+                    raise
+                await self._notify_evictions(eviction_notifications)
         finally:
             async with self._registry_lock:
                 if asyncio.current_task() is self._reaper_task:
                     self._reaper_task = None
                     self._rearm_reaper_locked()
 
-    async def _evict_agent(self, agent_id: str, reason: str) -> bool:
+    async def _evict_agent(
+        self,
+        agent_id: str,
+        reason: str,
+        notifications: list[tuple[AgentRecord, AgentEviction, _AgentTombstone]]
+        | None = None,
+    ) -> bool:
         if reason not in {"ttl", "idle_cap"}:
             raise ValueError(f"Unknown eviction reason: {reason}")
         async with self._registry_lock:
@@ -2913,6 +3026,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     availability=AgentAvailability.EVICTED,
                     current_run_id=run.run_id if run is not None else None,
                     current_run_status=run.status if run is not None else None,
+                    turns_used=self._agent_turns_used(record),
                     last_run_status=record.last_run_status,
                     initial_task_summary=record.initial_task_summary,
                     current_task_summary=run.task_summary if run is not None else None,
@@ -2948,18 +3062,104 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             idle_duration_seconds=idle_duration,
             root_generation=record.root_generation,
         )
-        async with self._registry_lock:
-            notify = (
-                self._generation_is_current(record.root_generation)
-                and not self._draining_children
-                and agent_id not in self._suppressed_notifications
-                and self._evicted_agents.get(agent_id) is tombstone
-            )
-        if notify:
-            await self._emit_agents_update([eviction])
+        if notifications is not None:
+            notifications.append((record, eviction, tombstone))
+        else:
+            await self._notify_evictions([(record, eviction, tombstone)])
         return True
 
-    async def release_agent(self, agent_id: str) -> None:  # noqa: PLR0915
+    async def _notify_evictions(
+        self, notifications: list[tuple[AgentRecord, AgentEviction, _AgentTombstone]]
+    ) -> None:
+        permitted: list[tuple[AgentRecord, AgentEviction]] = []
+        async with self._registry_lock:
+            for record, eviction, tombstone in sorted(
+                notifications, key=lambda notification: notification[1].agent_id
+            ):
+                if (
+                    self._generation_is_current(record.root_generation)
+                    and not self._draining_children
+                    and record.agent_id not in self._suppressed_notifications
+                    and self._evicted_agents.get(record.agent_id) is tombstone
+                ):
+                    permitted.append((record, eviction))
+
+            for parent_session_id, parent_notifications in itertools.groupby(
+                sorted(
+                    permitted,
+                    key=lambda notification: notification[0].parent_session_id,
+                ),
+                key=lambda notification: notification[0].parent_session_id,
+            ):
+                root = self._root
+                parent = (
+                    root
+                    if root is not None
+                    and root.agent_loop.session_id == parent_session_id
+                    else self._children.get(parent_session_id)
+                )
+                if parent is None:
+                    continue
+                parent_notifications = list(parent_notifications)
+                details = "; ".join(
+                    f"{eviction.agent_id} ({eviction.reason}, idle "
+                    f"{eviction.idle_duration_seconds:g}s)"
+                    for _record, eviction in parent_notifications
+                )
+                if len(parent_notifications) == 1:
+                    _record, eviction = parent_notifications[0]
+                    notification = (
+                        f"Background agent {eviction.agent_id} evicted "
+                        f"({eviction.reason}, idle {eviction.idle_duration_seconds:g}s); "
+                        "launch a new agent for further work."
+                    )
+                else:
+                    notification = (
+                        "Background agents evicted: "
+                        f"{details}; launch a new agent for further work."
+                    )
+                try:
+                    if (
+                        parent.turns.active_turn is None
+                        and parent.turns._active_task is None
+                        and not parent.turns.queue_state.items
+                    ):
+                        try:
+                            _response, start = parent.turns.start(
+                                TurnStartParams(
+                                    session_id=parent.agent_loop.session_id,
+                                    message=[TextContentBlock(text=notification)],
+                                )
+                            )
+                            start()
+                        except Exception:
+                            parent.agent_loop._pending_injected_messages.append(
+                                LLMMessage(
+                                    role=Role.user, content=notification, injected=True
+                                )
+                            )
+                    else:
+                        parent.agent_loop._pending_injected_messages.append(
+                            LLMMessage(
+                                role=Role.user, content=notification, injected=True
+                            )
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to notify parent of background agent eviction",
+                        exc_info=exc,
+                    )
+        if permitted:
+            try:
+                await self._emit_agents_update([
+                    eviction for _record, eviction in permitted
+                ])
+            except Exception as exc:
+                logger.warning(
+                    "Failed to publish background agent eviction", exc_info=exc
+                )
+
+    async def release_agent(self, agent_id: str) -> ReleaseAgentOutcome:  # noqa: PLR0915
         async with self._registry_lock:  # noqa: PLR1702
             self._acquire_notification_suppression(agent_id)
             record = self._agent_records.pop(agent_id, None)
@@ -3092,6 +3292,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             )
         if cancellation is not None:
             raise cancellation
+        return (
+            ReleaseAgentOutcome.EVICTED
+            if known_evicted
+            else ReleaseAgentOutcome.RELEASED
+        )
 
     def _build_child_runtime(
         self,

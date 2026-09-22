@@ -57,8 +57,8 @@ still contributes.
 
 Catalog definitions (`models` and `providers`) come from the shipped catalog plus the
 user-owned `models.toml` overlay, not a user or project `config.toml` layer.
-Project, environment, profile, and session sources may select aliases and set
-execution behavior, but cannot define catalogs. A wrong-scope definition fails
+Project, environment, profile, and session sources may select canonical model names
+and `@role` expressions and set execution behavior, but cannot define catalogs. A wrong-scope definition fails
 before shadowing or persistence. `authorized_roots_by_project` is likewise
 accepted only from an installed user layer; an ordinary config write cannot grant
 or change roots.

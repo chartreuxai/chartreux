@@ -92,39 +92,6 @@ async def test_stale_probe_result_after_back_and_form_edit_does_not_switch_scree
 
 
 @pytest.mark.asyncio
-async def test_clear_aliases_and_tags_actions_commit_explicitly_cleared_values() -> (
-    None
-):
-    catalog = snapshot(
-        models={
-            "configured": {
-                "aliases": ["old-alias"],
-                "deployments": [{"provider": "example/default", "name": "wire"}],
-            },
-            "other": {
-                "deployments": [{"provider": "example/default", "name": "other"}]
-            },
-        },
-        tags={"preferred": ["configured", "other"]},
-    )
-    flow, services = make_flow(catalog=catalog)
-    flow._overview_provider_id = "example/default"
-    flow._select_existing_provider()
-    flow._selected_models = {"wire": ModelSelectionDraft("wire", "configured")}
-    flow._detail_wire = "wire"
-    async with FlowHost(flow).run_test() as pilot:
-        flow._show("review")
-        await pilot.pause()
-        flow._clear_detail_metadata("aliases")
-        flow._clear_detail_metadata("tags")
-        flow._commit()
-        await pilot.pause()
-    changes = services.changes[0]
-    assert changes.models["configured"]["aliases"] == []  # type: ignore[index]
-    assert changes.tags == {"preferred": ("other",)}
-
-
-@pytest.mark.asyncio
 async def test_partial_input_price_edit_preserves_inherited_other_prices() -> None:
     catalog = snapshot(
         models={
@@ -329,26 +296,25 @@ def test_rediscovery_uses_configured_provider_credential() -> None:
     assert flow.provider.key == "configured-key"
 
 
-def test_final_picker_excludes_aliases_and_tags_without_usable_deployments() -> None:
+def test_final_picker_excludes_roles_without_usable_deployments() -> None:
     catalog = snapshot(
         models={
-            "usable": {
-                "aliases": ["u"],
-                "deployments": [{"provider": "example/default", "name": "u"}],
-            },
+            "usable": {"deployments": [{"provider": "example/default", "name": "u"}]},
             "unusable": {
-                "aliases": ["no"],
                 "deployments": [
                     {"provider": "example/default", "name": "no", "disabled": True}
-                ],
+                ]
             },
         },
-        tags={"usable-tag": ["usable"], "empty-tag": ["unusable"]},
+        roles={
+            "usable-role": {"description": "usable models", "models": ["usable"]},
+            "empty-role": {"description": "unusable models", "models": ["unusable"]},
+        },
     )
     flow, _ = make_flow(catalog=catalog)
     assert [value for _, value in flow._active_model_options()] == [
         "usable",
-        "@usable-tag",
+        "@usable-role",
     ]
 
 
@@ -609,46 +575,40 @@ async def test_finish_active_model_requires_host_validation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_keyboard_clearing_tags_from_multiple_models_composes_pending_edits() -> (
-    None
-):
+async def test_role_checkbox_recheck_appends_model_after_existing_members() -> None:
     catalog = snapshot(
         models={
-            "first": {"deployments": [{"provider": "mistral/default", "name": "one"}]},
-            "second": {"deployments": [{"provider": "mistral/default", "name": "two"}]},
-            "third": {
-                "deployments": [{"provider": "mistral/default", "name": "three"}]
+            "first": {
+                "deployments": [{"provider": "example/default", "name": "first"}]
+            },
+            "second": {
+                "deployments": [{"provider": "example/default", "name": "second"}]
             },
         },
-        tags={"preferred": ["first", "second", "third"]},
+        roles={"worker": {"description": "does work", "models": ["first", "second"]}},
     )
-    flow, services = make_flow(
-        (DiscoveryResult((DiscoveryItem("one"), DiscoveryItem("two"))),),
-        catalog=catalog,
-        management=True,
+    flow, services = make_flow(catalog=catalog)
+    flow.provider = ProviderDraft(
+        None,
+        "example/default",
+        "Example",
+        "https://example.test/v1",
+        "openai",
+        "",
+        None,
     )
-    async with FlowHost(flow).run_test(size=(80, 24)) as pilot:
-        await wait_for(pilot, lambda: flow.step == "overview")
-        await pilot.press("enter", "down", "enter", "tab", "tab", "tab", "enter")
-        await wait_for(
-            pilot, lambda: flow.step == "models" and bool(flow.query("#models"))
-        )
-        await pilot.press("tab", "enter")
-        await wait_for(pilot, lambda: flow.step == "review")
-        clear_tags = flow.query_one("#clear-tags", Button)
-        clear_tags.focus()
-        await pilot.press("enter")
-        await pilot.pause()
-        first_wire = flow.query_one("#detail-model", Select).value
-        detail_model = flow.query_one("#detail-model", Select)
-        detail_model.focus()
-        await pilot.press("enter", "down", "enter")
-        await wait_for(
-            pilot, lambda: flow.query_one("#detail-model", Select).value != first_wire
-        )
-        flow.query_one("#clear-tags", Button).focus()
-        await pilot.press("enter")
-        flow.query_one("#continue", Button).focus()
-        await pilot.press("enter")
+    flow._selected_models = {"first": ModelSelectionDraft("first", "first")}
+    flow._detail_wire = "first"
+    async with FlowHost(flow).run_test() as pilot:
+        flow._show("review")
+        await wait_for(pilot, lambda: bool(flow.query("#roles")))
+        roles = flow.query_one("#roles", SelectionList)
+        roles.deselect("worker")
+        flow._save_details()
+        roles = flow.query_one("#roles", SelectionList)
+        roles.select("worker")
+        flow._commit()
         await wait_for(pilot, lambda: flow.step == "again")
-    assert services.changes[0].tags == {"preferred": ("third",)}
+    assert services.changes[0].roles == {
+        "worker": {"description": "does work", "models": ["second", "first"]}
+    }

@@ -4,24 +4,11 @@ import pytest
 
 from chartreux.core.llm.backend.base import apply_reasoning_effort
 from chartreux.core.llm.thinking_levels import (
-    GLM_5_2_THINKING_LEVELS,
     GLM_5_3_THINKING_LEVELS,
     MISTRAL_THINKING_LEVELS,
     get_thinking_levels,
 )
 from chartreux.core.subagents import InvalidLaunchThinkingError
-
-
-@pytest.mark.parametrize("model_name", ["glm-5-2", "zai-glm-5-2"])
-def test_glm_5_2_exact_aliases_share_mapping(model_name: str) -> None:
-    assert get_thinking_levels("mistral", None, model_name) is GLM_5_2_THINKING_LEVELS
-    assert GLM_5_2_THINKING_LEVELS == {
-        "off": "none",
-        "low": "high",
-        "medium": "high",
-        "high": "high",
-        "max": "max",
-    }
 
 
 @pytest.mark.parametrize("model_name", ["zai-glm-5-3", "zai-glm-5", "zai-glm-latest"])

@@ -34,16 +34,18 @@ selected.
 
 ## Where skills live (discovery order, first match wins)
 
-1. `skill_paths` entries from `config.toml`
-2. `.chartreux/skills/` — project scope (requires a trusted folder)
-3. `.agents/skills/` — project scope (requires a trusted folder)
-4. `~/.chartreux/skills/` — user global
-5. `~/.agents/skills/` — user global
+1. Python built-in skills (reserved names; cannot be overridden)
+2. `skill_paths` entries from `config.toml`
+3. Shipped skills bundled with Chartreux
+4. `.chartreux/skills/` — project scope (requires a trusted folder)
+5. `.agents/skills/` — project scope (requires a trusted folder)
+6. `~/.chartreux/skills/` — user global
+7. `~/.agents/skills/` — user global
 
-Precedence: built-in skills are seeded first and their names are **reserved** —
-a user skill whose name collides with a built-in is silently skipped at load
-time and never appears. Among the paths above, the first directory to define a
-given name wins; later duplicates are skipped. Built-in skills are read-only.
+Python built-in skill names are **reserved** — a user skill whose name collides
+with one is silently skipped at load time and never appears. Among local paths,
+the first directory to define a given name wins; configured, project, and user
+skills shadow a shipped skill. Shipped and Python built-in skills are read-only.
 
 Choose the scope before writing: use `.chartreux/skills/<name>/` for a skill scoped
 to this project, or `~/.chartreux/skills/<name>/` for one available everywhere. Ask

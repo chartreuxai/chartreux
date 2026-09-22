@@ -26,22 +26,9 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
         },
     },
     "models": {
-        "glm-5-2": {
-            "aliases": (),
-            "thinking": "high",
-            "temperature": 0.2,
-            "deployments": [
-                {
-                    "provider": "mistral/default",
-                    "name": "glm-5-2",
-                    "supports_images": False,
-                    "auto_compact_threshold": 400000,
-                }
-            ],
-        },
         "glm-5-3": {
-            "aliases": ("zai-glm-5-3", "zai-glm-5", "zai-glm-latest"),
             "thinking": "medium",
+            "temperature": 0.2,
             "deployments": [
                 {
                     "provider": "mistral/default",
@@ -50,20 +37,8 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
                 }
             ],
         },
-        "mistral-small": {
-            "aliases": ("mistral-small-latest",),
-            "thinking": "high",
-            "deployments": [
-                {
-                    "provider": "mistral/default",
-                    "name": "mistral-small-latest",
-                    "supports_images": False,
-                }
-            ],
-        },
         "gpt-6-astra": {
-            "aliases": (),
-            "thinking": "medium",
+            "thinking": "low",
             "deployments": [
                 {
                     "provider": "codex/local",
@@ -73,8 +48,7 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
             ],
         },
         "gpt-5.6-luna": {
-            "aliases": (),
-            "thinking": "medium",
+            "thinking": "high",
             "deployments": [
                 {
                     "provider": "codex/local",
@@ -84,8 +58,7 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
             ],
         },
         "gpt-5.6-sol": {
-            "aliases": (),
-            "thinking": "low",
+            "thinking": "medium",
             "deployments": [
                 {
                     "provider": "codex/local",
@@ -95,7 +68,6 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
             ],
         },
         "gpt-5.6-terra": {
-            "aliases": (),
             "thinking": "medium",
             "deployments": [
                 {
@@ -106,5 +78,38 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
             ],
         },
     },
-    "tags": {},
+    "roles": {
+        "orchestrator": {
+            "description": "primary model for orchestration and coordination",
+            "models": ["glm-5-3"],
+        },
+        "advisor": {
+            "description": "independent perspective for architectural guidance",
+            "models": ["gpt-6-astra"],
+        },
+        "small-worker": {
+            "description": "fast model for focused implementation tasks",
+            "models": ["gpt-5.6-luna"],
+        },
+        "medium-worker": {
+            "description": "capable model for general implementation tasks",
+            "models": ["gpt-5.6-terra"],
+        },
+        "large-worker": {
+            "description": "strongest model for complex, high-stakes tasks",
+            "models": ["gpt-5.6-sol", "glm-5-3"],
+        },
+        "small-reviewer": {
+            "description": "fast model for focused reviews",
+            "models": ["gpt-5.6-luna"],
+        },
+        "medium-reviewer": {
+            "description": "capable model for general reviews",
+            "models": ["gpt-5.6-terra"],
+        },
+        "deep-reviewer": {
+            "description": "strongest model for complex, high-stakes reviews",
+            "models": ["gpt-6-astra", "glm-5-3"],
+        },
+    },
 })

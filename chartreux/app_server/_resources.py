@@ -315,7 +315,7 @@ class ResourceRequestHandler:
             self._require_session(params.session_id)
         config = project_config(self._agent_loop)
         skills_count = sum(
-            1 for skill in project_skills(self._agent_loop) if skill.source != "builtin"
+            1 for skill in project_skills(self._agent_loop) if skill.source == "local"
         )
         _, hooks_count = project_diagnostics(self._agent_loop)
         mcp_servers_total = len(self._agent_loop.config.mcp_servers)

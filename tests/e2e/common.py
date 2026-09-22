@@ -41,7 +41,6 @@ def write_e2e_config(
             'backend = "generic"',
             "",
             '[models."mock-model"]',
-            "aliases = []",
             'thinking = "off"',
             "temperature = 0.2",
             "",
@@ -49,6 +48,10 @@ def write_e2e_config(
             f'provider = "{provider_name}/default"',
             'name = "mock-model"',
             "supports_images = false",
+            "",
+            '[roles."small-worker"]',
+            'description = "E2E worker role"',
+            'models = ["mock-model"]',
         ]),
         encoding="utf-8",
     )

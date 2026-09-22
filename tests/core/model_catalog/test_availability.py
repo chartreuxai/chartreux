@@ -40,7 +40,7 @@ def test_resolver_skips_incompatible_or_cooled_tag_members() -> None:
                     "deployments": [{"provider": "test/second", "name": "second"}]
                 },
             },
-            "tags": {"preferred": ["incompatible", "available"]},
+            "roles": {"preferred": {"models": ["incompatible", "available"]}},
         }),
         "selection",
     )
@@ -76,7 +76,7 @@ def test_compaction_checks_actual_destination_deployment_capabilities() -> None:
                     ]
                 },
             },
-            "tags": {},
+            "roles": {},
         }),
         "compaction",
     )
@@ -131,7 +131,7 @@ def test_compaction_destination_declared_thinking_restriction_excludes_requested
                     ]
                 },
             },
-            "tags": {},
+            "roles": {},
         }),
         "compaction",
     )
@@ -158,9 +158,8 @@ def test_compaction_destination_declared_thinking_restriction_excludes_requested
     ]
 
 
-def test_compaction_alias_uses_its_canonical_base_for_eligibility() -> None:
+def test_compaction_canonical_base_for_eligibility() -> None:
     raw = _catalog().catalog.model_dump()
-    raw["models"]["compact"]["aliases"] = ["short"]  # type: ignore[index]
     raw["models"]["compact"]["deployments"] = [  # type: ignore[index]
         {"provider": "test/first", "name": "compact-first"},
         {"provider": "test/second", "name": "compact-second"},
@@ -173,7 +172,7 @@ def test_compaction_alias_uses_its_canonical_base_for_eligibility() -> None:
         registry=AvailabilityRegistry(),
         config=_config(snapshot),
         thinking="off",
-        compaction_base="short",
+        compaction_base="compact",
     )
 
     assert [item.resolved.deployment.provider for item in result.candidates] == [
@@ -185,9 +184,8 @@ def test_compaction_alias_uses_its_canonical_base_for_eligibility() -> None:
     }
 
 
-def test_compaction_alias_without_canonical_deployment_excludes_provider() -> None:
+def test_compaction_without_canonical_deployment_excludes_provider() -> None:
     raw = _catalog().catalog.model_dump()
-    raw["models"]["compact"]["aliases"] = ["short"]  # type: ignore[index]
     snapshot = CatalogSnapshot(ModelCatalog.model_validate(raw), "alias")
 
     result = eligible_deployments(
@@ -196,7 +194,7 @@ def test_compaction_alias_without_canonical_deployment_excludes_provider() -> No
         registry=AvailabilityRegistry(),
         config=_config(snapshot),
         thinking="off",
-        compaction_base="short",
+        compaction_base="compact",
     )
 
     assert [item.resolved.deployment.provider for item in result.candidates] == [
@@ -322,7 +320,7 @@ def _catalog() -> CatalogSnapshot:
                     ]
                 },
             },
-            "tags": {},
+            "roles": {},
         }),
         "test",
     )

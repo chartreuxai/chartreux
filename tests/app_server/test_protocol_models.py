@@ -705,6 +705,7 @@ def test_agents_update_carries_retention_metadata() -> None:
         "availability": "evicted",
         "currentRunId": None,
         "currentRunStatus": None,
+        "turnsUsed": None,
         "lastRunStatus": None,
         "initialTaskSummary": "Initial task",
         "currentTaskSummary": None,

@@ -13,7 +13,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from chartreux.core.llm.thinking_levels import (
     ANTHROPIC_THINKING_LEVELS,
-    GLM_5_2_THINKING_LEVELS,
     GLM_5_3_THINKING_LEVELS,
     MISTRAL_THINKING_LEVELS,
     OPENAI_RESPONSES_THINKING_LEVELS,
@@ -26,7 +25,6 @@ _THINKING_LEVELS = frozenset().union(
     OPENAI_THINKING_LEVELS,
     OPENAI_RESPONSES_THINKING_LEVELS,
     ANTHROPIC_THINKING_LEVELS,
-    GLM_5_2_THINKING_LEVELS,
     GLM_5_3_THINKING_LEVELS,
 )
 
@@ -140,20 +138,10 @@ class DeploymentDefinition(_FrozenCatalogModel):
 
 
 class BaseModelDefinition(_FrozenCatalogModel):
-    aliases: tuple[str, ...] = ()
     thinking: str = "medium"
     temperature: float | None = None
     deployments: tuple[DeploymentDefinition, ...] = Field(min_length=1)
     disabled: bool = False
-
-    @field_validator("aliases")
-    @classmethod
-    def unique_aliases_without_at(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(value) != len(set(value)):
-            raise ValueError("Duplicate aliases are not allowed")
-        if any("@" in alias for alias in value):
-            raise ValueError("'@' is reserved in aliases")
-        return value
 
     @field_validator("thinking")
     @classmethod
@@ -170,10 +158,17 @@ class BaseModelDefinition(_FrozenCatalogModel):
         return self
 
 
+class RoleDefinition(_FrozenCatalogModel):
+    """An ordered, documented priority list of canonical model names."""
+
+    description: str = ""
+    models: tuple[str, ...] = Field(min_length=1)
+
+
 class ModelCatalog(_FrozenCatalogModel):
     providers: Mapping[str, ProviderDefinition]
     models: Mapping[str, BaseModelDefinition]
-    tags: Mapping[str, tuple[str, ...]] = Field(
+    roles: Mapping[str, RoleDefinition] = Field(
         default_factory=lambda: MappingProxyType({})
     )
 
@@ -212,36 +207,22 @@ class ModelCatalog(_FrozenCatalogModel):
     ) -> Mapping[str, BaseModelDefinition]:
         if any("@" in name for name in value):
             raise ValueError("'@' is reserved in model names")
-        aliases = [
-            alias for definition in value.values() for alias in definition.aliases
-        ]
-        if len(aliases) != len(set(aliases)):
-            raise ValueError("Duplicate aliases are not allowed")
-        collisions = set(value).intersection(aliases)
-        if collisions:
-            raise ValueError(
-                "Model aliases must not collide with canonical model names: "
-                f"{sorted(collisions)!r}"
-            )
         return MappingProxyType(dict(value))
 
-    @field_validator("tags")
+    @field_validator("roles")
     @classmethod
-    def nonempty_unique_tags(
-        cls, value: Mapping[str, tuple[str, ...]]
-    ) -> Mapping[str, tuple[str, ...]]:
-        for name, members in value.items():
+    def nonempty_unique_roles(
+        cls, value: Mapping[str, RoleDefinition]
+    ) -> Mapping[str, RoleDefinition]:
+        for name, definition in value.items():
+            members = definition.models
             if "@" in name:
-                raise ValueError("'@' is reserved in tag names")
-            if not members:
-                raise ValueError("Tag member lists must not be empty")
+                raise ValueError("'@' is reserved in role names")
             if len(members) != len(set(members)):
-                raise ValueError("Duplicate tag members are not allowed")
+                raise ValueError("Duplicate role members are not allowed")
             if any("@" in member for member in members):
-                raise ValueError("'@' is reserved in tag members")
-        return MappingProxyType({
-            name: tuple(members) for name, members in value.items()
-        })
+                raise ValueError("'@' is reserved in role members")
+        return MappingProxyType(dict(value))
 
     @model_validator(mode="after")
     def references_exist(self) -> ModelCatalog:
@@ -252,10 +233,10 @@ class ModelCatalog(_FrozenCatalogModel):
                         f"Model {base_name!r} references unknown provider "
                         f"{deployment.provider!r}"
                     )
-        for tag_name, members in self.tags.items():
-            unknown = set(members) - set(self.models)
+        for role_name, definition in self.roles.items():
+            unknown = set(definition.models) - set(self.models)
             if unknown:
                 raise ValueError(
-                    f"Tag {tag_name!r} references unknown models: {sorted(unknown)!r}"
+                    f"Role {role_name!r} references unknown models: {sorted(unknown)!r}"
                 )
         return self

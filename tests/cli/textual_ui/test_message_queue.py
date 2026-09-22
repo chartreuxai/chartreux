@@ -632,6 +632,43 @@ async def test_sync_restores_single_merged_widget_on_resume() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sync_restores_multiple_items_as_independent_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(UserMessage, "remove", _noop_async)
+    calls: dict[str, list[str]] = {"replace": [], "remove": []}
+    queue = PublicTurnQueue(
+        items=[
+            _server_turn("item-1", "first", "entry-1"),
+            _server_turn("item-2", "second", "entry-2"),
+        ]
+    )
+
+    async def replace_queued_turn(
+        item_id: str, content: str, **_kwargs
+    ) -> PublicQueuedTurn:
+        calls["replace"].append(item_id)
+        return _server_turn(item_id, content)
+
+    async def remove_queued_turn(item_id: str) -> bool:
+        calls["remove"].append(item_id)
+        return True
+
+    controller = _queue_controller(
+        current_turn_queue=lambda: queue,
+        replace_queued_turn=replace_queued_turn,
+        remove_queued_turn=remove_queued_turn,
+    )
+    await controller.sync_server_queue(queue)
+
+    assert await controller.update_prompt(1, "edited")
+    assert calls["replace"] == ["item-2"]
+    assert await controller.pop_at(1)
+    assert calls["remove"] == ["item-2"]
+    assert [widget.get_content() for widget in controller.widgets] == ["first"]
+
+
+@pytest.mark.asyncio
 async def test_append_promoted_mid_replace_requeues_new_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

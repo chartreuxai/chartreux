@@ -182,6 +182,9 @@ class SessionBackendImpl:
     _events_idle: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     _events_closed: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     _events_subscribed: bool = field(default=False, init=False, repr=False)
+    _pending_mcp_authorization_required: dict[str, SessionBackendEvent] = field(
+        default_factory=dict, init=False, repr=False
+    )
     _mcp_catalog_revision: str = field(default="", init=False, repr=False)
     _mcp_route_revision: int = field(default=0, init=False, repr=False)
     _mcp_save_task: asyncio.Task[Any] | None = field(
@@ -231,15 +234,18 @@ class SessionBackendImpl:
             descriptor_revision=required.descriptor_revision,
             observed_connection_revision=required.observed_connection_revision,
         )
-        self._events_idle.clear()
-        await self._events.put(
-            SessionBackendEvent(
-                event=MCPAuthorizationRequiredEvent(params),
-                method="mcp_catalog/authRequired",
-                params=params,
-                session_id=self.session_id,
-            )
+        event = SessionBackendEvent(
+            event=MCPAuthorizationRequiredEvent(params),
+            method="mcp_catalog/authRequired",
+            params=params,
+            session_id=self.session_id,
         )
+        async with self._events_lock:
+            self._events_idle.clear()
+            if self._events_subscribed:
+                await self._put_event(event)
+            else:
+                self._pending_mcp_authorization_required[name] = event
 
     @property
     def session_id(self) -> str:
@@ -386,6 +392,8 @@ class SessionBackendImpl:
             self._mcp_route_revision += 1
             return self._session_mcp_state()
         registry.invalidate(name)
+        async with self._events_lock:
+            self._pending_mcp_authorization_required.pop(name, None)
         await manager.reconfigure_mcp_async()
         await self.session.agent_loop.refresh_system_prompt()
         self._mcp_route_revision += 1
@@ -569,7 +577,14 @@ class SessionBackendImpl:
             self.adopt_state(response.state)
             while not self._events.empty():
                 self._events.get_nowait()
-            self._events_idle.set()
+            pending_auth_required = tuple(
+                self._pending_mcp_authorization_required.values()
+            )
+            self._pending_mcp_authorization_required.clear()
+            if pending_auth_required:
+                self._events_idle.clear()
+            else:
+                self._events_idle.set()
             self._events_closed.clear()
             self._events_subscribed = True
         return SessionEventSubscription(
@@ -577,6 +592,7 @@ class SessionBackendImpl:
             events=self._event_stream(
                 session_id=response.state.session.id,
                 after_event_id=response.last_event_id,
+                replay=pending_auth_required,
             ),
         )
 
@@ -779,9 +795,17 @@ class SessionBackendImpl:
         return await self._request("session/compact", params, SessionCompactResponse)
 
     async def _event_stream(
-        self, *, session_id: str, after_event_id: int
+        self,
+        *,
+        session_id: str,
+        after_event_id: int,
+        replay: tuple[SessionBackendEvent, ...] = (),
     ) -> AsyncIterator[SessionBackendEvent]:
         try:
+            for event in replay:
+                yield event
+            if self._events.empty():
+                self._events_idle.set()
             while True:
                 queued = await self._events.get()
                 try:

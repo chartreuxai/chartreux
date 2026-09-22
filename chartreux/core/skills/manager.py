@@ -5,6 +5,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
+from chartreux import CHARTREUX_ROOT
 from chartreux.core.config.harness_files import (
     HarnessFilesManager,
     get_harness_files_manager,
@@ -25,6 +26,9 @@ from chartreux.utils.io import read_safe
 
 if TYPE_CHECKING:
     from chartreux.core.config import ChartreuxConfigSchema
+
+
+SHIPPED_SKILLS_DIR = CHARTREUX_ROOT / "skills"
 
 
 class SkillManager:
@@ -74,54 +78,64 @@ class SkillManager:
 
     def _compute_search_paths(
         self, config: ChartreuxConfigSchema
-    ) -> list[tuple[Path, SkillScope]]:
-        paths: list[tuple[Path, SkillScope]] = []
+    ) -> list[tuple[Path, SkillScope, SkillSource]]:
+        paths: list[tuple[Path, SkillScope, SkillSource]] = []
 
         for path in config.skill_paths:
             if path.is_dir():
-                paths.append((path, SkillScope.GLOBAL))
+                paths.append((path, SkillScope.GLOBAL, SkillSource.LOCAL))
+
+        paths.append((SHIPPED_SKILLS_DIR, SkillScope.BUILTIN, SkillSource.SHIPPED))
 
         mgr = self._harness_files
-        paths.extend((p, SkillScope.PROJECT) for p in mgr.project_skills_dirs)
-        paths.extend((p, SkillScope.GLOBAL) for p in mgr.user_skills_dirs)
+        paths.extend(
+            (p, SkillScope.PROJECT, SkillSource.LOCAL) for p in mgr.project_skills_dirs
+        )
+        paths.extend(
+            (p, SkillScope.GLOBAL, SkillSource.LOCAL) for p in mgr.user_skills_dirs
+        )
 
         global_paths = {p.resolve() for p in mgr.user_skills_dirs}
         global_paths.update(
-            p.resolve() for p, scope in paths if scope is SkillScope.GLOBAL
+            p.resolve() for p, scope, _ in paths if scope is SkillScope.GLOBAL
         )
 
-        unique: list[tuple[Path, SkillScope]] = []
+        unique: list[tuple[Path, SkillScope, SkillSource]] = []
         seen: set[Path] = set()
-        for p, scope in paths:
+        for p, scope, source in paths:
             rp = p.resolve()
             if rp in seen:
                 continue
             seen.add(rp)
             if scope is SkillScope.PROJECT and rp in global_paths:
                 scope = SkillScope.GLOBAL
-            unique.append((rp, scope))
+            unique.append((rp, scope, source))
 
         return unique
 
     def _discover_skills(self) -> dict[str, SkillInfo]:
         skills: dict[str, SkillInfo] = {**BUILTIN_SKILLS}
-        for base, scope in self._search_paths:
+        for base, scope, source in self._search_paths:
             if not base.is_dir():
                 continue
-            for name, info in self._discover_skills_in_dir(base, scope).items():
-                if name not in skills:
+            for name, info in self._discover_skills_in_dir(base, scope, source).items():
+                existing = skills.get(name)
+                if existing is None or (
+                    existing.source is SkillSource.SHIPPED
+                    and info.source is SkillSource.LOCAL
+                ):
                     skills[name] = info
                 else:
                     logger.debug(
                         "Skipping duplicate skill '%s' at %s (already loaded from %s)",
                         name,
                         info.skill_path,
-                        skills[name].skill_path,
+                        existing.skill_path,
                     )
         return skills
 
     def _discover_skills_in_dir(
-        self, base: Path, scope: SkillScope
+        self, base: Path, scope: SkillScope, source: SkillSource
     ) -> dict[str, SkillInfo]:
         skills: dict[str, SkillInfo] = {}
         for skill_dir in base.iterdir():
@@ -130,9 +144,7 @@ class SkillManager:
             skill_file = skill_dir / "SKILL.md"
             if not skill_file.is_file():
                 continue
-            skill_info = self._try_load_skill(
-                skill_file, source=SkillSource.LOCAL, scope=scope
-            )
+            skill_info = self._try_load_skill(skill_file, source=source, scope=scope)
             if skill_info is None:
                 continue
             if skill_info.name in BUILTIN_SKILLS:
@@ -205,7 +217,9 @@ class SkillManager:
 
     @property
     def custom_skills_count(self) -> int:
-        return sum(name not in BUILTIN_SKILLS for name in self.available_skills)
+        return sum(
+            info.source is SkillSource.LOCAL for info in self.available_skills.values()
+        )
 
     def get_skill(self, name: str) -> SkillInfo | None:
         return self.available_skills.get(name)

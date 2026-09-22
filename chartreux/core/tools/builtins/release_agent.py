@@ -5,7 +5,7 @@ from collections.abc import AsyncGenerator
 from pydantic import BaseModel, ConfigDict, Field
 
 from chartreux.core.events import ToolCallEvent, ToolResultEvent
-from chartreux.core.subagents import UnknownAgentError
+from chartreux.core.subagents import ReleaseAgentOutcome, UnknownAgentError
 from chartreux.core.tools.base import (
     BaseTool,
     BaseToolConfig,
@@ -73,11 +73,16 @@ class ReleaseAgent(
         if not ctx or not ctx.subagent_manager:
             raise ToolError("release_agent requires a subagent manager in context")
         try:
-            await ctx.subagent_manager.release_agent(args.agent_id)
+            outcome = await ctx.subagent_manager.release_agent(args.agent_id)
         except UnknownAgentError as exc:
             raise ToolError(
                 "No such agent. Check the agent_id with check_agents."
             ) from exc
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
-        yield ReleaseAgentResult(agent_id=args.agent_id, message="Agent released")
+        message = (
+            "Evicted agent tombstone removed"
+            if outcome is ReleaseAgentOutcome.EVICTED
+            else "Agent released"
+        )
+        yield ReleaseAgentResult(agent_id=args.agent_id, message=message)

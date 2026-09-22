@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
 from chartreux.core.config import ChartreuxConfigSchema
+from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.skills.builtins import BUILTIN_SKILLS
-from chartreux.core.skills.manager import SkillManager
+from chartreux.core.skills.manager import SHIPPED_SKILLS_DIR, SkillManager
+from chartreux.core.skills.models import SkillSource
 from chartreux.core.trusted_folders import trusted_folders_manager
 from tests.conftest import build_test_vibe_config
 from tests.skills.conftest import create_skill
+
+SHIPPED_SKILL_COUNT = len(list(SHIPPED_SKILLS_DIR.glob("*/SKILL.md")))
 
 
 @pytest.fixture
@@ -27,7 +32,10 @@ class TestSkillManagerDiscovery:
     def test_discovers_no_skills_when_directory_empty(
         self, skill_manager: SkillManager
     ) -> None:
-        assert skill_manager.available_skills == BUILTIN_SKILLS
+        assert set(skill_manager.available_skills) == (
+            set(BUILTIN_SKILLS)
+            | {path.parent.name for path in SHIPPED_SKILLS_DIR.glob("*/SKILL.md")}
+        )
 
     def test_discovers_skill_from_skill_paths(self, skills_dir: Path) -> None:
         create_skill(skills_dir, "test-skill", "A test skill")
@@ -46,7 +54,10 @@ class TestSkillManagerDiscovery:
         config = build_test_vibe_config(skill_paths=[skills_dir])
         manager = SkillManager(lambda: config)
 
-        assert len(manager.available_skills) == 3 + len(BUILTIN_SKILLS)
+        assert (
+            len(manager.available_skills)
+            == 3 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
+        )
         assert "skill-one" in manager.available_skills
         assert "skill-two" in manager.available_skills
         assert "skill-three" in manager.available_skills
@@ -64,7 +75,7 @@ class TestSkillManagerDiscovery:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 1 + len(BUILTIN_SKILLS)
+        assert len(skills) == 1 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
         assert "valid-skill" in skills
         assert "not-a-skill" not in skills
 
@@ -79,7 +90,7 @@ class TestSkillManagerDiscovery:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 1 + len(BUILTIN_SKILLS)
+        assert len(skills) == 1 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
         assert "valid-skill" in skills
 
 
@@ -131,7 +142,7 @@ class TestSkillManagerParsing:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 1 + len(BUILTIN_SKILLS)
+        assert len(skills) == 1 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
         assert "valid-skill" in skills
         assert "invalid-skill" not in skills
 
@@ -148,7 +159,7 @@ class TestSkillManagerParsing:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 1 + len(BUILTIN_SKILLS)
+        assert len(skills) == 1 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
         assert "valid-skill" in skills
 
 
@@ -202,7 +213,7 @@ class TestSkillManagerSearchPaths:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 2 + len(BUILTIN_SKILLS)
+        assert len(skills) == 2 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
         assert skills["vibe-only"].description == "From .chartreux"
         assert skills["agents-only"].description == "From .agents"
 
@@ -221,7 +232,7 @@ class TestSkillManagerSearchPaths:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 1 + len(BUILTIN_SKILLS)
+        assert len(skills) == 1 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
         assert skills["shared-skill"].description == "First from .chartreux"
 
     def test_discovers_from_multiple_skill_paths(self, tmp_path: Path) -> None:
@@ -238,7 +249,7 @@ class TestSkillManagerSearchPaths:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 2 + len(BUILTIN_SKILLS)
+        assert len(skills) == 2 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
         assert "skill-from-dir1" in skills
         assert "skill-from-dir2" in skills
 
@@ -256,7 +267,7 @@ class TestSkillManagerSearchPaths:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 1 + len(BUILTIN_SKILLS)
+        assert len(skills) == 1 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
         assert skills["duplicate-skill"].description == "First version"
 
     def test_ignores_nonexistent_skill_paths(self, tmp_path: Path) -> None:
@@ -270,8 +281,60 @@ class TestSkillManagerSearchPaths:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 1 + len(BUILTIN_SKILLS)
+        assert len(skills) == 1 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
         assert "valid-skill" in skills
+
+
+class TestShippedSkillPrecedence:
+    @pytest.mark.parametrize("override_tier", ("config", "project", "user"))
+    def test_local_skills_shadow_shipped_skills(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override_tier: str
+    ) -> None:
+        shipped_dir = tmp_path / "shipped"
+        override_dir = tmp_path / override_tier
+        create_skill(shipped_dir, "promoted-skill", "Shipped skill")
+        create_skill(override_dir, "promoted-skill", f"{override_tier} override")
+        monkeypatch.setattr(
+            "chartreux.core.skills.manager.SHIPPED_SKILLS_DIR", shipped_dir
+        )
+
+        config_paths = [override_dir] if override_tier == "config" else []
+        harness_files = cast(
+            HarnessFilesManager,
+            SimpleNamespace(
+                project_skills_dirs=(
+                    [override_dir] if override_tier == "project" else []
+                ),
+                user_skills_dirs=[override_dir] if override_tier == "user" else [],
+            ),
+        )
+        config = build_test_vibe_config(skill_paths=config_paths)
+        manager = SkillManager(lambda: config, harness_files=harness_files)
+
+        skill = manager.get_skill("promoted-skill")
+        assert skill is not None
+        assert skill.description == f"{override_tier} override"
+        assert skill.source is SkillSource.LOCAL
+
+    def test_shipped_skill_is_marked_and_not_counted_as_custom(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        shipped_dir = tmp_path / "shipped"
+        create_skill(shipped_dir, "promoted-skill", "Shipped skill")
+        monkeypatch.setattr(
+            "chartreux.core.skills.manager.SHIPPED_SKILLS_DIR", shipped_dir
+        )
+        harness_files = cast(
+            HarnessFilesManager,
+            SimpleNamespace(project_skills_dirs=[], user_skills_dirs=[]),
+        )
+        config = build_test_vibe_config(skill_paths=[])
+        manager = SkillManager(lambda: config, harness_files=harness_files)
+
+        skill = manager.get_skill("promoted-skill")
+        assert skill is not None
+        assert skill.source is SkillSource.SHIPPED
+        assert manager.custom_skills_count == 0
 
 
 class TestSkillManagerGetSkill:
@@ -317,7 +380,7 @@ class TestSkillManagerFiltering:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 2 + len(BUILTIN_SKILLS)
+        assert len(skills) == 2 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
         assert "skill-a" in skills
         assert "skill-b" not in skills
         assert "skill-c" in skills
@@ -428,7 +491,7 @@ class TestSkillUserInvocable:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 3 + len(BUILTIN_SKILLS)
+        assert len(skills) == 3 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
         assert skills["visible-skill"].user_invocable is True
         assert skills["hidden-skill"].user_invocable is False
         assert skills["default-skill"].user_invocable is True

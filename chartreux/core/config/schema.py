@@ -97,7 +97,7 @@ class MergeFieldMetadata:
 
     Usage::
 
-        active_model: Annotated[str, WithReplaceMerge()] = "glm-5-2"
+        active_model: Annotated[str, WithReplaceMerge()] = "@orchestrator"
         models: Annotated[list[M], WithUnionMerge(merge_key="alias")]
 
     Use the concrete subclasses (``WithReplaceMerge``, ``WithConcatMerge``, etc.)

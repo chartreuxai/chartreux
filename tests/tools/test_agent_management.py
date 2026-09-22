@@ -10,6 +10,7 @@ from chartreux.core.subagents import (
     AgentAvailability,
     AgentResultExpiredError,
     AgentSummary,
+    ReleaseAgentOutcome,
     RunStatus,
     TaskArgs,
     TaskResult,
@@ -76,12 +77,20 @@ class FakeSubagentManager:
             await asyncio.wait_for(event.wait(), timeout)
         return self.results[key]
 
-    async def release_agent(self, agent_id: str) -> None:
+    async def release_agent(self, agent_id: str) -> ReleaseAgentOutcome:
         if self.release_error is not None:
             raise self.release_error
-        if not any(agent.agent_id == agent_id for agent in self.agents):
+        agent = next(
+            (agent for agent in self.agents if agent.agent_id == agent_id), None
+        )
+        if agent is None:
             raise ValueError(f"Unknown agent: {agent_id}")
         self.released_agent_ids.append(agent_id)
+        return (
+            ReleaseAgentOutcome.EVICTED
+            if agent.availability is AgentAvailability.EVICTED
+            else ReleaseAgentOutcome.RELEASED
+        )
 
 
 def _context(manager: FakeSubagentManager | None = None) -> InvokeContext:
@@ -149,6 +158,7 @@ async def test_check_agents_returns_agent_summaries() -> None:
         "availability": "evicted",
         "current_run_id": None,
         "current_run_status": None,
+        "turns_used": None,
         "initial_task_summary": "Inspect agent management",
         "current_task_summary": None,
         "idle_seconds": 3.5,
@@ -373,7 +383,7 @@ async def test_release_evicted_agent_succeeds() -> None:
     )
 
     assert manager.released_agent_ids == ["agent-1"]
-    assert result.message == "Agent released"
+    assert result.message == "Evicted agent tombstone removed"
 
     with pytest.raises(ToolError, match="Unknown agent"):
         await collect_result(

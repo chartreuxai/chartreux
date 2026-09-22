@@ -56,10 +56,19 @@ TextArea > .text-area--cursor {
 
 #agent-bar {
     width: 100%;
-    height: auto;
-    max-height: 3;
+    height: 1;
+    max-height: 10;
+    overflow-y: auto;
     text-wrap: nowrap;
     color: $text-muted;
+}
+
+#agent-bar:focus {
+    border-left: solid $primary;
+}
+
+#agent-bar.-expanded {
+    height: auto;
 }
 
 #bottom-app-container,
@@ -1758,18 +1767,6 @@ NarratorStatus {
 }
 
 /* Debug Console */
-
-#agent-sidebar {
-    dock: right;
-    width: 32;
-    min-width: 28;
-    max-width: 48;
-    height: 100%;
-    background: transparent;
-    border-left: solid $foreground-muted;
-    padding: 0 1;
-    overflow-y: auto;
-}
 
 #debug-console {
     dock: right;

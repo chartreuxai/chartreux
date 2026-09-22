@@ -6,8 +6,9 @@ from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.message import Message
+from textual.timer import Timer
 from textual.widgets import Static
 
 from chartreux.app_server.protocol import (
@@ -25,17 +26,15 @@ _SAVED_SNAPSHOT_NOTICE = "Saved transcript — may lag the running agent."
 
 
 class AgentTranscriptViewer(Vertical):
-    """A read-only, paginated view of an agent's saved transcript."""
+    """A read-only, paginated view of an agent transcript."""
 
     can_focus = True
 
     DEFAULT_CSS = """
     AgentTranscriptViewer {
-        layer: overlay;
-        width: 90%;
-        height: 85%;
-        margin: 2 5;
-        border: round $accent;
+        width: 100%;
+        height: 1fr;
+        border: solid $foreground-muted;
         background: $surface;
     }
 
@@ -51,10 +50,15 @@ class AgentTranscriptViewer(Vertical):
         color: $text-muted;
     }
 
-    #agent-transcript-content {
+    #agent-transcript-content-scroll {
         height: 1fr;
         padding: 0 1;
         overflow-y: auto;
+    }
+
+    #agent-transcript-content {
+        width: 100%;
+        height: auto;
     }
     """
 
@@ -76,13 +80,20 @@ class AgentTranscriptViewer(Vertical):
         source: AgentTranscriptSource,
         agent_id: str,
         *,
+        profile: str = "unknown",
+        live: bool = False,
         page_size: int = DEFAULT_TRANSCRIPT_PAGE_SIZE,
     ) -> None:
         super().__init__(id="agent-transcript-viewer")
         self._source = source
         self._agent_id = agent_id
+        self._profile = profile
+        self._live = live
+        self._live_timer: Timer | None = None
+        self._on_newest_page = True
         self._page_size = page_size
         self._content: Static | None = None
+        self._content_scroll: VerticalScroll | None = None
         self._cursor: str | None = None
         self._has_more = False
         self._entries: list[AgentTranscriptEntry] = []
@@ -91,24 +102,66 @@ class AgentTranscriptViewer(Vertical):
         self._reading_page = False
         self._viewer_closed = False
 
+    @property
+    def agent_id(self) -> str:
+        return self._agent_id
+
     def compose(self) -> ComposeResult:
         yield Static(
-            "Agent Transcript  [PageUp: older • r: refresh • Esc: close]",
+            f"Subagent: {self._agent_id} · {self._profile}  [PageUp: older · r: refresh · Esc: close]",
             id="agent-transcript-header",
         )
-        yield Static(_SAVED_SNAPSHOT_NOTICE, id="agent-transcript-notice")
-        self._content = Static(
-            "Loading saved transcript…", id="agent-transcript-content"
-        )
-        yield self._content
+        yield Static(self._notice_text(), id="agent-transcript-notice")
+        self._content = Static(self._loading_text(), id="agent-transcript-content")
+        with VerticalScroll(id="agent-transcript-content-scroll") as content_scroll:
+            self._content_scroll = content_scroll
+            yield self._content
 
     def on_mount(self) -> None:
         self.focus()
         self._start_refresh()
+        if self._live:
+            self._live_timer = self.set_interval(1.0, self._append_live_output)
 
     def on_unmount(self) -> None:
         self._viewer_closed = True
         self._request_epoch += 1
+        if self._live_timer is not None:
+            self._live_timer.stop()
+            self._live_timer = None
+
+    def set_live(self, live: bool) -> None:
+        """Update live state without replacing the converged transcript view."""
+        was_live = self._live
+        self._live = live
+        if self.is_mounted and live and self._live_timer is None:
+            self._live_timer = self.set_interval(1.0, self._append_live_output)
+        elif not live and self._live_timer is not None:
+            self._live_timer.stop()
+            self._live_timer = None
+            if was_live:
+                self._start_request(before=None, replace=False)
+        self._update_notice()
+
+    def _loading_text(self) -> str:
+        return "Loading live output…" if self._live else "Loading saved transcript…"
+
+    def _notice_text(self) -> str:
+        return (
+            "Live output — refreshes about every second."
+            if self._live
+            else _SAVED_SNAPSHOT_NOTICE
+        )
+
+    def _update_notice(self, extra: str = "") -> None:
+        notice = self.query_one("#agent-transcript-notice", Static)
+        notice.update(f"{self._notice_text()}{extra}")
+
+    def _append_live_output(self) -> None:
+        if self._live and self._on_newest_page and not self._reading_page:
+            self._start_request(before=None, replace=False)
+        elif self._live and not self._on_newest_page:
+            self._update_notice(" New output available.")
 
     def on_key(self, event: events.Key) -> None:
         if event.key == "escape":
@@ -119,6 +172,7 @@ class AgentTranscriptViewer(Vertical):
     def action_older_page(self) -> None:
         if self._reading_page or not self._has_more or self._cursor is None:
             return
+        self._on_newest_page = False
         self._start_request(before=self._cursor, replace=False)
 
     def action_refresh(self) -> None:
@@ -135,11 +189,12 @@ class AgentTranscriptViewer(Vertical):
         if self._viewer_closed:
             return
         self._request_epoch += 1
+        self._on_newest_page = True
         self._cursor = None
         self._has_more = False
         self._entries.clear()
         self._seen_entry_ids.clear()
-        self._set_content("Loading saved transcript…")
+        self._set_content(self._loading_text())
         self._start_request(before=None, replace=True, advance_epoch=False)
 
     def _start_request(
@@ -171,7 +226,7 @@ class AgentTranscriptViewer(Vertical):
 
         if not self._is_current(epoch):
             return
-        self._apply_response(response, replace=replace)
+        self._apply_response(response, replace=replace, before=before)
 
     def _is_current(self, epoch: int) -> bool:
         return (
@@ -179,7 +234,7 @@ class AgentTranscriptViewer(Vertical):
         )
 
     def _apply_response(
-        self, response: AgentTranscriptGetResponse, *, replace: bool
+        self, response: AgentTranscriptGetResponse, *, replace: bool, before: str | None
     ) -> None:
         if response.state is AgentTranscriptState.NO_SAVED_TRANSCRIPT:
             self._set_content("No saved transcript available.")
@@ -204,6 +259,8 @@ class AgentTranscriptViewer(Vertical):
         self._seen_entry_ids.update(entry.entry_id for entry in new_entries)
         if replace:
             self._entries = new_entries
+        elif before is None:
+            self._entries.extend(new_entries)
         else:
             self._entries[0:0] = new_entries
         self._cursor = response.oldest_cursor
@@ -243,6 +300,13 @@ class AgentTranscriptViewer(Vertical):
     def _set_content(self, content: str | Text) -> None:
         if self._content is not None:
             self._content.update(content)
+        if self._on_newest_page and self._content_scroll is not None:
+            self.call_after_refresh(
+                self._content_scroll.scroll_end,
+                animate=False,
+                immediate=True,
+                x_axis=False,
+            )
 
 
 def _display_text(value: str) -> tuple[str, bool]:

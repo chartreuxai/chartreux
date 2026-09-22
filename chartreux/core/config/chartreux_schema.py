@@ -80,7 +80,7 @@ def load_dotenv_values(
 
 
 DEFAULT_ACTIVE_MODEL_CONFIG = ModelConfig(
-    name="glm-5-2", provider="mistral/default", alias="glm-5-2", thinking="high"
+    name="zai-glm-5-3", provider="mistral/default", alias="glm-5-3", thinking="medium"
 )
 
 # The catalog is deliberately not a field of ChartreuxConfigSchema.  It is loaded
@@ -397,7 +397,7 @@ class ChartreuxConfigSchema(ConfigSchema):
 
         return (
             resolver_for(self)
-            .resolve("glm-5-2", allowed_models=self.allowed_models)
+            .resolve("@orchestrator", allowed_models=self.allowed_models)
             .base_model
         )
 
@@ -430,7 +430,7 @@ class ChartreuxConfigSchema(ConfigSchema):
             )
             if self._committed_model is not None
             else resolver.resolve(
-                self.active_model or "glm-5-2", allowed_models=self.allowed_models
+                self.active_model or "@orchestrator", allowed_models=self.allowed_models
             )
         )
         return resolved.materialize(

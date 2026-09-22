@@ -16,10 +16,10 @@ Unless noted, list defaults are `[]`, map defaults are `{}`, and booleans shown 
 
 | Key | Default | Accepted value |
 | --- | --- | --- |
-| `active_model` | `""` | Base model name, unique alias, or `@tag`; empty selects `glm-5-2`. |
+| `active_model` | `""` | Canonical base-model name or `@role`; empty selects `@orchestrator`. |
 | `compaction_model` | `""` | Model expression; empty uses the active model. The resolved model must share the active provider. |
 | `allowed_models` | `[]` | Model-expression patterns. A non-empty list restricts selection. |
-| `thinking_overrides` | `{}` | Table mapping a known base-model alias to `off`, `low`, `medium`, `high`, or `max`. |
+| `thinking_overrides` | `{}` | Table mapping a canonical base-model name to `off`, `low`, `medium`, `high`, or `max`. |
 | `auto_compact_threshold` | `200000` | Positive fallback token threshold; a catalog deployment may set its own. |
 
 ### Tools and integrations
@@ -77,7 +77,7 @@ The built-in read/edit/write/image/grep configurations include sensitive pattern
 | `context_warnings` | `false` | Boolean. |
 | `show_thinking_nodes` | `false` | Boolean. |
 | `raise_on_compaction_failure` | `false` | Boolean. |
-| `system_prompt_id` | `"cli"` | Prompt ID. Built-ins are `cli`, `explore`, `tests`, and `minimal`; custom IDs resolve from prompt directories. |
+| `system_prompt_id` | `"cli"` | Prompt ID. Built-ins are `cli`, `explore`, `tests`, `minimal`, `worker`, `advisor`, and `reviewer`; custom IDs resolve from prompt directories. |
 | `compaction_prompt_id` | `"compact"` | Compaction prompt ID; `compact` is the default built-in. |
 | `include_commit_signature` | `true` | Boolean. |
 | `include_model_info` | `true` | Boolean. |
@@ -126,7 +126,7 @@ For local servers, set `transport = "stdio"`, `command`, optional `args = []`, `
 
 ## `models.toml` catalog overlay
 
-The overlay patches the shipped catalog. Scalars replace shipped values, lists replace lists, and deployments are matched by base model and provider. Provider IDs contain `/`; canonical model names, aliases, tags, and deployment identities must not contain `@`.
+The overlay patches the shipped catalog. Scalars replace shipped values, lists replace lists, deployments are matched by base model and provider, and roles are merged per role key. Provider IDs contain `/`; canonical model names, role names, role members, and deployment identities must not contain `@`.
 
 | Table and field | Default / allowed value |
 | --- | --- |
@@ -140,7 +140,6 @@ The overlay patches the shipped catalog. Scalars replace shipped values, lists r
 | `extra_headers` | `{}` string-to-string map. |
 | `disabled` | `false`; valid on providers, models, and deployments. |
 | `[models."base"]` | Base-model definition; it must have at least one deployment. |
-| `aliases` | `[]`; unique aliases. |
 | `thinking` | `"medium"`; `off`, `low`, `medium`, `high`, or `max`. |
 | `temperature` | Unset number. |
 | `[[models."base".deployments]]` | Deployment definition. `provider` and `name` are required. |
@@ -148,7 +147,7 @@ The overlay patches the shipped catalog. Scalars replace shipped values, lists r
 | `supported_thinking_levels` | Unset, or a list of known thinking levels. |
 | `auto_compact_threshold` | Unset positive number. |
 | `[models."base".deployments.prices]` | `input`, `output`, and `cached_input`: non-negative price per million tokens. Omit an unknown price; zero means explicitly free. |
-| `[tags]` | Tag name to a non-empty, unique ordered list of canonical base-model names. |
+| `[roles."name"]` | Role definition: `description` is an optional string and `models` is a non-empty, unique ordered list of canonical base-model names. |
 
 ```toml
 [providers."example/openai"]
@@ -157,7 +156,6 @@ api_key_env_var = "EXAMPLE_API_KEY"
 api_style = "openai"
 
 [models."example-model"]
-aliases = ["example"]
 thinking = "medium"
 
 [[models."example-model".deployments]]
@@ -165,8 +163,9 @@ provider = "example/openai"
 name = "example-model-v1"
 supports_images = false
 
-[tags]
-reviewers = ["glm-5-2", "example-model"]
+[roles.reviewers]
+description = "Models used for independent review"
+models = ["glm-5-3", "example-model"]
 ```
 
 ## Environment variables and `.env`

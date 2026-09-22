@@ -84,9 +84,7 @@ async def test_model_picker_shows_all_models() -> None:
 
         picker = app.query_one(ModelPickerApp)
         assert [model.alias for model in picker._models] == [
-            "glm-5-2",
             "glm-5-3",
-            "mistral-small",
             "gpt-6-astra",
             "gpt-5.6-luna",
             "gpt-5.6-sol",
@@ -103,10 +101,10 @@ async def test_model_picker_shows_display_name_but_persists_alias() -> None:
     models = [
         ModelConfig(name="model-a", provider="mistral", alias="alpha"),
         ModelConfig(
-            name="zai-glm-5-2",
+            name="custom-model",
             provider="mistral",
-            alias="glm-5-2",
-            display_name="glm-5.2 (Mistral Hosted)",
+            alias="custom",
+            display_name="Custom Mistral Model",
         ),
     ]
     config = build_test_vibe_config(models=models, active_model="alpha")
@@ -117,25 +115,26 @@ async def test_model_picker_shows_display_name_but_persists_alias() -> None:
 
         picker = app.query_one(ModelPickerApp)
         assert [model.display_name for model in picker._models] == [
-            "mistral/default/zai-glm-5-2",
             "mistral/default/zai-glm-5-3",
-            "mistral/default/mistral-small-latest",
             "codex/local/gpt-6-astra",
             "codex/local/gpt-5.6-luna",
             "codex/local/gpt-5.6-sol",
             "codex/local/gpt-5.6-terra",
             "mistral/default/model-a",
+            "mistral/default/custom-model",
         ]
         option_list = picker.query_one(OptionList)
-        assert "mistral/default/zai-glm-5-2" in str(
-            option_list.get_option_at_index(1).prompt
+        assert "mistral/default/custom-model" in str(
+            option_list.get_option_at_index(7).prompt
         )
 
         # Selecting it still persists the alias, not the label.
-        await pilot.press("home", "down", "enter")
-        await wait_until(pilot, lambda: app.config.active_model.alias == "glm-5-2")
+        await pilot.press(
+            "home", "down", "down", "down", "down", "down", "down", "down", "enter"
+        )
+        await wait_until(pilot, lambda: app.config.active_model.alias == "custom")
 
-        assert app.config.active_model.alias == "glm-5-2"
+        assert app.config.active_model.alias == "custom"
 
 
 @pytest.mark.asyncio
@@ -245,12 +244,12 @@ async def test_model_picker_offers_default_row() -> None:
 
         picker = app.query_one(ModelPickerApp)
         option_list = picker.query_one(OptionList)
-        # Default + seven shipped and three explicitly configured models.
-        assert option_list.option_count == 11
+        # Default + five shipped and three explicitly configured models.
+        assert option_list.option_count == 9
         # A pinned model pre-highlights that model, not the Default row.
         assert picker._is_pinned is True
         assert (
-            option_list.highlighted == 8
+            option_list.highlighted == 6
         )  # "alpha", offset by Default and shipped models
 
 

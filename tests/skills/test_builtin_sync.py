@@ -103,7 +103,11 @@ class TestBuiltinSkills:
         assert "plugin" not in skill.description.lower()
 
     def test_skill_sources_are_builtin_or_local(self) -> None:
-        assert set(SkillSource) == {SkillSource.BUILTIN, SkillSource.LOCAL}
+        assert set(SkillSource) == {
+            SkillSource.BUILTIN,
+            SkillSource.SHIPPED,
+            SkillSource.LOCAL,
+        }
         with pytest.raises(ValueError):
             SkillSource("plugin")
 

@@ -15,13 +15,14 @@ from chartreux.app_server.protocol import (
     AgentTranscriptState,
     AgentTranscriptTruncation,
 )
+from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session.session_loader import (
     BoundedSessionLoadState,
     SessionFileContainmentError,
     SessionLoader,
 )
 
-__all__ = ["read_agent_transcript"]
+__all__ = ["read_agent_transcript", "read_live_agent_transcript"]
 
 _INPUT_BYTE_LIMIT = 16 * 1024 * 1024
 _RESPONSE_BYTE_LIMIT = 512 * 1024
@@ -30,7 +31,7 @@ _DEFAULT_LIMIT = 50
 _MAX_LIMIT = 200
 
 
-def read_agent_transcript(  # noqa: PLR0911
+def read_agent_transcript(
     session_dir: Path,
     validate: Callable[[], bool],
     *,
@@ -63,7 +64,31 @@ def read_agent_transcript(  # noqa: PLR0911
     except (OSError, ValueError):
         return _no_saved_transcript()
 
-    entries = _project_entries(loaded.messages or [])
+    return _read_projected_entries(
+        _project_entries(loaded.messages or []), before, limit
+    )
+
+
+def read_live_agent_transcript(
+    messages: list[LLMMessage],
+    *,
+    before: str | None = None,
+    limit: int = _DEFAULT_LIMIT,
+) -> AgentTranscriptGetResponse:
+    """Project an in-memory child transcript through the persisted-view rules."""
+    if not 1 <= limit <= _MAX_LIMIT:
+        raise ValueError(f"limit must be between 1 and {_MAX_LIMIT}")
+    persisted_messages = [
+        message.model_dump(exclude_none=True, mode="json")
+        for message in messages
+        if message.role is not Role.system
+    ]
+    return _read_projected_entries(_project_entries(persisted_messages), before, limit)
+
+
+def _read_projected_entries(
+    entries: list[tuple[AgentTranscriptEntry, str]], before: str | None, limit: int
+) -> AgentTranscriptGetResponse:
     boundary_index = len(entries)
     if before is not None:
         boundary = _decode_cursor(before)
@@ -72,7 +97,6 @@ def read_agent_transcript(  # noqa: PLR0911
         boundary_index = _find_boundary(entries, boundary)
         if boundary_index is None:
             return _state(AgentTranscriptState.CHANGED)
-
     return _page(entries[:boundary_index], limit)
 
 

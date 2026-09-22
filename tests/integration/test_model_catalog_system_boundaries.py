@@ -31,7 +31,7 @@ from chartreux.core.llm_models import LLMChunk, LLMMessage, Role
 from chartreux.core.model_catalog.loader import CatalogSnapshot, load_catalog
 from chartreux.core.model_catalog.migration import apply_migration, plan_migration
 from chartreux.core.model_catalog.resolver import ModelResolutionError, ModelResolver
-from chartreux.core.model_catalog.schema import ModelCatalog
+from chartreux.core.model_catalog.schema import ModelCatalog, RoleDefinition
 from chartreux.core.session_types import CommittedModelIdentity
 from chartreux.core.subagents import LaunchConfig, TaskArgs, TaskResult
 from chartreux.core.tools.base import InvokeContext
@@ -50,17 +50,15 @@ def _snapshot(revision: str, *, first_wire: str = "first") -> CatalogSnapshot:
             },
             "models": {
                 "first": {
-                    "aliases": ["first-alias"],
                     "deployments": [
                         {"provider": "test/one", "name": first_wire},
                         {"provider": "test/two", "name": "first-two-wire"},
-                    ],
+                    ]
                 },
                 "later": {
                     "deployments": [{"provider": "test/two", "name": "later-wire"}]
                 },
                 "compact": {
-                    "aliases": ["compact-alias"],
                     "thinking": "low",
                     "deployments": [
                         {"provider": "test/one", "name": "compact-one"},
@@ -68,7 +66,7 @@ def _snapshot(revision: str, *, first_wire: str = "first") -> CatalogSnapshot:
                     ],
                 },
             },
-            "tags": {"ordered": ["first", "later"]},
+            "roles": {"ordered": {"models": ["first", "later"]}},
         }),
         revision,
     )
@@ -128,8 +126,10 @@ async def test_reload_patch_new_child_preserves_old_child_catalog_snapshot() -> 
 
 
 @pytest.mark.asyncio
-async def test_parent_committed_later_tag_member_is_inherited_by_child() -> None:
-    """The registry child-launch seam must forward the parent's committed identity."""
+async def test_role_bound_child_uses_its_role_instead_of_parent_committed_model() -> (
+    None
+):
+    """A profile role is an explicit model choice, not inherited parent state."""
     snapshot = _snapshot("A")
     config = ChartreuxConfigSchema.model_validate(
         {"active_model": "@ordered"}, context={"catalog_snapshot": snapshot}
@@ -142,22 +142,72 @@ async def test_parent_committed_later_tag_member_is_inherited_by_child() -> None
         catalog_revision="A",
     )
     parent_loop.committed_model = committed
+    parent_loop.agent_manager._discovered["worker"] = AgentProfile(**{
+        **_profile().__dict__,
+        "role": "ordered",
+    })
     registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
 
     candidate = registry._resolve_launch_candidate(
         cast(SessionRuntime, SimpleNamespace(agent_loop=parent_loop)),
-        TaskArgs(task="inherit", agent="worker", background=True),
+        TaskArgs(task="role-bound", agent="worker", background=True),
     )
 
-    assert candidate.committed_model == committed
+    assert candidate.committed_model != committed
     assert (candidate.effective_model.alias, candidate.effective_model.name) == (
-        "later",
-        "later-wire",
+        "first",
+        "first",
     )
     await parent_loop.aclose()
 
 
-def test_tag_thinking_resolves_base_and_rejects_v0_1_expressions() -> None:
+@pytest.mark.asyncio
+async def test_resumed_role_bound_child_reresolves_its_role(tmp_path: Path) -> None:
+    """Cross-restart resume follows the current role instead of its saved identity."""
+    snapshot = _snapshot("A")
+    logging = SessionLoggingConfig(enabled=True, save_dir=str(tmp_path / "sessions"))
+    config = ChartreuxConfigSchema.model_validate(
+        {"active_model": "@ordered", "session_logging": logging.model_dump()},
+        context={"catalog_snapshot": snapshot},
+    ).attach_catalog_snapshot(snapshot)
+    parent = build_test_agent_loop(config=config, backend=FakeBackend())
+    profile = AgentProfile(**{**_profile().__dict__, "role": "ordered"})
+    parent.agent_manager._discovered["worker"] = profile
+    try:
+        await parent.persist_empty_session()
+        candidate = resolve_launch(
+            profile_name="worker",
+            config=None,
+            parent_orchestrator=parent.config_orchestrator,
+            tool_inventory={},
+            profile_lookup=lambda _name: profile,
+        )
+        child = await AgentRuntimeFactory().create_child(parent, candidate)
+        await child.wait_until_ready()
+        await child.persist_empty_session()
+        child_id = child.session_id
+        child_dir = child.session_logger.session_dir
+        assert child_dir is not None
+        await child.aclose()
+
+        updated_catalog = snapshot.catalog.model_copy(
+            update={"roles": {"ordered": RoleDefinition(models=("later",))}}
+        )
+        parent.config.attach_catalog_snapshot(CatalogSnapshot(updated_catalog, "B"))
+        resumed = await AgentRuntimeFactory().resume_child(
+            parent, "worker", child_id, child_dir
+        )
+        try:
+            assert resumed.config.active_model == "@ordered"
+            assert resumed.committed_model is not None
+            assert resumed.committed_model.base_model == "later"
+        finally:
+            await resumed.aclose()
+    finally:
+        await parent.aclose()
+
+
+def test_role_thinking_resolves_base_and_rejects_v0_1_expressions() -> None:
     snapshot = _snapshot("A")
     parent = asyncio.run(_orchestrator(snapshot))
     candidate = resolve_launch(
@@ -186,7 +236,7 @@ async def test_compaction_alias_materializes_destination_deployment_and_thinking
 ):
     snapshot = _snapshot("A")
     config = ChartreuxConfigSchema.model_validate(
-        {"active_model": "first", "compaction_model": "compact-alias"},
+        {"active_model": "first", "compaction_model": "compact"},
         context={"catalog_snapshot": snapshot},
     ).attach_catalog_snapshot(snapshot)
     backend = _ModelTrackingBackend([
@@ -261,9 +311,13 @@ async def test_failover_terminal_identity_survives_eviction_and_result_serializa
     """A real fan-out preserves the terminal failover identity after eviction."""
     snapshot = _snapshot("A")
     snapshot = CatalogSnapshot(
-        snapshot.catalog.model_copy(
-            update={"tags": {**snapshot.catalog.tags, "single": ["first"]}}
-        ),
+        ModelCatalog.model_validate({
+            **snapshot.catalog.model_dump(),
+            "roles": {
+                **snapshot.catalog.model_dump()["roles"],
+                "single": {"models": ["first"]},
+            },
+        }),
         snapshot.revision,
     )
     config = build_test_vibe_config(active_model="first").attach_catalog_snapshot(

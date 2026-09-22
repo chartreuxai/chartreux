@@ -1,6 +1,6 @@
 [project]
 name = "chartreux"
-version = "0.1.0"
+version = "0.1.1"
 description = "Independent CLI coding assistant derived from Mistral Vibe"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -105,8 +105,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/pavelpenev/chartreux"
-Repository = "https://github.com/pavelpenev/chartreux"
+Homepage = "https://github.com/chartreuxai/chartreux"
+Repository = "https://github.com/chartreuxai/chartreux"
 "Upstream source" = "https://github.com/mistralai/mistral-vibe"
 
 [build-system]

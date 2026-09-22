@@ -690,13 +690,16 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
         place, otherwise the value is appended (or the section is created
         when empty).
         """
-        layer_name = target_layer or self._resolve_default_layer_name()
-        raw: dict[str, Any] = (await (self.get_layer(layer_name)).load()).model_dump()
-        existing = JsonPointer(path).resolve(raw, default=[])
-        operation = resolve_upsert_op(
-            existing, path, key_field, value, target_layer_name=layer_name
-        )
-        return await self.apply_patch([operation], reason=reason)
+        async with self._mutation_lock:
+            layer_name = target_layer or self._resolve_default_layer_name()
+            raw: dict[str, Any] = (await self.get_layer(layer_name).load()).model_dump()
+            existing = JsonPointer(path).resolve(raw, default=[])
+            operation = resolve_upsert_op(
+                existing, path, key_field, value, target_layer_name=layer_name
+            )
+            return await self._apply_patch_locked(
+                [operation], reason, on_conflict=ConflictStrategy.CANCEL, preflight=None
+            )
 
     async def apply_session_patch(
         self,

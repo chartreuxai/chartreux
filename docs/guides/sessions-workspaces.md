@@ -24,7 +24,7 @@ therefore show sessions for the current directory or worktree. To move a
 conversation to another worktree, resume it explicitly by ID.
 
 A session commits its base model and provider deployment when assigned. Resume
-validates and restores that identity rather than resolving a model tag again.
+validates and restores that identity rather than resolving a role again.
 `/clear` begins a new conversation using current configuration; `/branch`
 creates a separate resumable copy. See the [command reference](../reference/commands.md)
 for the complete command surface.

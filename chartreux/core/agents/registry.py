@@ -21,8 +21,13 @@ if TYPE_CHECKING:
 def apply_profile_overrides(
     orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
     overrides: dict[str, object],
+    *,
+    role: str | None = None,
 ) -> None:
     """Install profile overrides before the first runtime override layer."""
+    data = dict(overrides)
+    if role is not None:
+        data["active_model"] = f"@{role}"
     layers = orchestrator.layers
     profile = next(
         (
@@ -33,11 +38,11 @@ def apply_profile_overrides(
         None,
     )
     if profile is None:
-        profile_layer = AgentProfileLayer(data=overrides)
+        profile_layer = AgentProfileLayer(data=data)
         profile_index = None
     else:
         profile_index, current_layer = profile
-        profile_layer = AgentProfileLayer(data=overrides, name=current_layer.name)
+        profile_layer = AgentProfileLayer(data=data, name=current_layer.name)
         orchestrator.remove_layer(profile_index)
 
     insertion_index = next(
@@ -95,6 +100,8 @@ def build_child_orchestrator(
     source: ConfigOrchestrator[ChartreuxConfigSchema],
     profile_overrides: dict[str, object] | None,
     launch_overrides: Mapping[str, object],
+    *,
+    profile_role: str | None = None,
 ) -> ConfigOrchestrator[ChartreuxConfigSchema]:
     """Build the authoritative resource-free child configuration assembly.
 
@@ -102,7 +109,7 @@ def build_child_orchestrator(
     """
     candidate = source._copy_for_child()
     if profile_overrides is not None:
-        apply_profile_overrides(candidate, profile_overrides)
+        apply_profile_overrides(candidate, profile_overrides, role=profile_role)
     apply_launch_overrides(candidate, dict(launch_overrides))
     return candidate
 
@@ -177,7 +184,7 @@ class AgentRegistry:
     ) -> AgentProfile | None:
         try:
             agent = AgentProfile.from_toml(agent_file)
-            apply_profile_overrides(candidate, agent.overrides)
+            apply_profile_overrides(candidate, agent.overrides, role=agent.role)
             return agent
         except Exception as e:
             logger.warning("Failed to load agent at %s: %s", agent_file, e)

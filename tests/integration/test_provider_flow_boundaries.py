@@ -103,7 +103,9 @@ class _FailOnceStore:
             self.fail = False
             return self.store.apply_changes(
                 CatalogChanges(
-                    changes.provider_id, changes.provider, tags={"invalid": ()}
+                    changes.provider_id,
+                    changes.provider,
+                    roles={"invalid": {"models": ()}},
                 )
             )
         return self.store.apply_changes(changes)
@@ -177,7 +179,7 @@ async def _add_generic_provider(
 
 async def _real_orchestrator(home: Path) -> ConfigOrchestrator[ChartreuxConfigSchema]:
     config_path = home / "config.toml"
-    config_path.write_text('active_model = "glm-5-2"\n')
+    config_path.write_text('active_model = "glm-5-3"\n')
     user = UserConfigLayer(path=config_path)
     return await ConfigOrchestrator.create(
         schema=ChartreuxConfigSchema,
@@ -302,7 +304,7 @@ async def test_provider_flow_recovers_catalog_validation_and_surfaces_reload_fai
             pilot, flow, name="Retry", wire="retry-wire", expected_step="review"
         )
         assert flow.step == "review"
-        assert "cannot be empty" in (flow.error or "")
+        assert "at least 1 item" in (flow.error or "")
         assert (config_dir / "models.toml").read_bytes() == before
         flow._selected_models = {
             "good-wire": flow._selected_models["retry-wire"].__class__(
@@ -354,7 +356,7 @@ async def test_providers_host_completion_preserves_transcript_and_agent_state(
         await _add_generic_provider(pilot, screen, name="Hosted", wire="hosted-wire")
         screen._show("picker")
         await pilot.pause()
-        await _choose_active_model(pilot, screen, "glm-5-2")
+        await _choose_active_model(pilot, screen, "glm-5-3")
         for _ in range(50):
             await pilot.pause()
             if app.screen is not screen:

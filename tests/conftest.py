@@ -132,7 +132,7 @@ def _disable_os_keyring(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None
 
 
 def get_base_config() -> dict[str, Any]:
-    return {"active_model": "glm-5-2"}
+    return {"active_model": "glm-5-3"}
 
 
 @pytest.fixture(autouse=True)
@@ -327,13 +327,13 @@ def make_orchestrator() -> Callable[
 
 
 def make_test_models(auto_compact_threshold: int) -> list[ModelConfig]:
-    definition = SHIPPED_CATALOG.models["glm-5-2"]
+    definition = SHIPPED_CATALOG.models["glm-5-3"]
     deployment = definition.deployments[0]
     return [
         ModelConfig.model_validate({
             "name": deployment.name,
             "provider": deployment.provider,
-            "alias": "glm-5-2",
+            "alias": "glm-5-3",
             "thinking": definition.thinking,
             "temperature": definition.temperature,
             "input_price": (

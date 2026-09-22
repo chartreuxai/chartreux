@@ -894,7 +894,7 @@ async def test_v1_resume_explicitly_reselects_current_model_and_marks_cost_incom
 ) -> None:
     logging = SessionLoggingConfig(enabled=True, save_dir=str(tmp_path))
     saved_config = build_test_vibe_config(
-        active_model="glm-5-2", session_logging=logging
+        active_model="glm-5-3", session_logging=logging
     )
     saved = build_test_agent_loop(config=saved_config)
     saved.stats.known_cost_total = 9.0

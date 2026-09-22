@@ -237,7 +237,7 @@ class HostRequestHandler:
         skills_count = sum(
             1
             for skill in skill_mgr.available_skills.values()
-            if skill.source is not SkillSource.BUILTIN
+            if skill.source is SkillSource.LOCAL
         )
         hooks_count = len(load_hooks_from_fs(harness_files=session_files).hooks)
         mcp_servers_total = len(config.mcp_servers)

@@ -71,9 +71,12 @@ async def test_builtin_skills_are_reported_as_builtin(
     like something the user installed.
     """
     builtin = backend_contract_session.resources.runtime.get_skill("chartreux")
+    shipped = backend_contract_session.resources.runtime.get_skill("main-debugging")
 
     assert builtin is not None
     assert builtin.source == "builtin"
+    assert shipped is not None
+    assert shipped.source == "shipped"
     assert backend_contract_session.resources.runtime.custom_skills_count == 1
 
 

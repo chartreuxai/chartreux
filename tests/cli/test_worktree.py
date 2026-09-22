@@ -4,6 +4,8 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 from git import Repo
 import pytest
@@ -18,6 +20,7 @@ from chartreux.core.git.worktree import (
     acquire_for_attachment,
 )
 from chartreux.core.git.worktree.record import (
+    OwnershipToken,
     WorktreeClaim,
     inspect_holders,
     release_holder,
@@ -342,6 +345,35 @@ def test_cli_acquires_holder_before_chdir_and_releases_on_chdir_failure(
     claim = WorktreeClaim.locate(_expected_worktree_target(tmp_path, "feature"))
     assert claim is not None
     assert inspect_holders(claim).holders == {}
+
+
+@pytest.mark.parametrize("source", ["initial_prompt", "piped_stdin"])
+def test_programmatic_worktree_run_skips_interactive_cleanup(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    args = argparse.Namespace(prompt=None, initial_prompt=None)
+    if source == "initial_prompt":
+        args.initial_prompt = "prompt"
+
+    def run_cli(reported_args: argparse.Namespace) -> None:
+        reported_args.is_programmatic = True
+
+    cleanup_called = False
+
+    def cleanup(*_args: object) -> None:
+        nonlocal cleanup_called
+        cleanup_called = True
+
+    monkeypatch.setattr("chartreux.cli.cli.run_cli", run_cli)
+    monkeypatch.setattr(entrypoint, "_cleanup_worktree_on_exit", cleanup)
+
+    entrypoint._run_cli_with_worktree_cleanup(
+        args,
+        cast(PreparedWorktree, SimpleNamespace(created=True)),
+        cast(OwnershipToken, SimpleNamespace(consumed=True)),
+    )
+
+    assert not cleanup_called
 
 
 def test_cli_cleanup_keeps_worktree_when_attachment_arrives_during_prompt(

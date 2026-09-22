@@ -124,6 +124,9 @@ class PathCompleter(Completer):
         self._max_entries_to_process = max_entries_to_process
         self._target_matches = target_matches
 
+    def shutdown(self) -> None:
+        self._indexer.shutdown()
+
     class _SearchContext(NamedTuple):
         suffix: str
         search_pattern: str

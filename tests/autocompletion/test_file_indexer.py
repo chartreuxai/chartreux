@@ -84,6 +84,25 @@ def test_updates_index_on_file_creation(
     )
 
 
+def test_rescans_after_watcher_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    indexer = FileIndexer(should_enable_watcher=lambda: True)
+    target = tmp_path / "created_during_watcher_start.py"
+
+    def start_watcher(_root: Path) -> None:
+        target.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(indexer._watcher, "start", start_watcher)
+    try:
+        entries = indexer.get_index(Path("."))
+    finally:
+        indexer.shutdown()
+
+    assert {entry.rel for entry in entries} == {target.name}
+
+
 def test_updates_index_on_file_deletion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, file_indexer: FileIndexer
 ) -> None:

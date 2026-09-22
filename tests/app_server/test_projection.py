@@ -219,8 +219,8 @@ def test_config_view_reports_unpinned_default_model() -> None:
 
     assert config.active_model_pinned is False
     # The unpinned state resolves to the shipped catalog default for display.
-    assert config.default_model_alias == "glm-5-2"
-    assert config.active_model.alias == "glm-5-2"
+    assert config.default_model_alias == "glm-5-3"
+    assert config.active_model.alias == "glm-5-3"
 
 
 def test_config_view_default_alias_never_follows_the_active_model() -> None:
@@ -248,11 +248,11 @@ def test_config_view_default_alias_never_follows_the_active_model() -> None:
     )
 
     assert pinned.active_model.alias == "beta"
-    assert pinned.default_model_alias == "glm-5-2"
-    assert pinned.default_model_display_name == "mistral/default/glm-5-2"
-    assert unflagged.default_model_alias == "glm-5-2"
-    assert unpinned.active_model.alias == "glm-5-2"
-    assert unpinned.default_model_alias == "glm-5-2"
+    assert pinned.default_model_alias == "glm-5-3"
+    assert pinned.default_model_display_name == "mistral/default/zai-glm-5-3"
+    assert unflagged.default_model_alias == "glm-5-3"
+    assert unpinned.active_model.alias == "glm-5-3"
+    assert unpinned.default_model_alias == "glm-5-3"
 
 
 def test_config_view_hydrates_display_name_from_alias() -> None:
@@ -276,7 +276,7 @@ def test_config_view_hydrates_display_name_from_alias() -> None:
     # UI renders canonical provider/wire display names from the catalog.
     assert "mistral/default/model-a" in [model.display_name for model in config.models]
     assert config.model_display_name("glm-5-2") == "mistral/default/zai-glm-5-2"
-    assert config.default_model_display_name == "mistral/default/zai-glm-5-2"
+    assert config.default_model_display_name == "mistral/default/zai-glm-5-3"
     # An alias that names no configured model is echoed back unchanged.
     assert config.model_display_name("unknown") == "unknown"
 

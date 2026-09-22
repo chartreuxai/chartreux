@@ -8,9 +8,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+from fnmatch import fnmatch
 import hashlib
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import threading
@@ -31,6 +33,11 @@ _MARKER_NAME = ".models-migration-recovery.toml"
 _LOCK_NAME = ".models-migration.lock"
 _BACKUP_SUFFIX = ".pre-model-catalog-migration.bak"
 _LEGACY_PROVIDER_DEFAULTS = {"project_id": "", "region": ""}
+# Explicit legacy model tables are user-owned and remain distinct models, even when
+# their names match a removed shipped identity. Selections and role members named
+# after removed shipped identities still target their replacement, independently
+# of aliases collected from those preserved tables.
+_LEGACY_SHIPPED_MODEL_ALIASES = {"glm-5-2": "glm-5-3"}
 _MIGRATION_LOCKS: dict[Path, Any] = {}
 _MIGRATION_LOCKS_GUARD = threading.Lock()
 _MIGRATION_LOCK_STATE = threading.local()
@@ -52,6 +59,7 @@ class MigrationPlan:
     catalog: dict[str, Any]
     cleaned_config: bytes
     original_config: bytes
+    warnings: tuple[str, ...] = ()
 
 
 def _provider_id(name: str) -> str:
@@ -92,14 +100,13 @@ def _migration_base(provider_id: str, wire_name: str) -> str | None:
     candidates = {
         base
         for base, definition in SHIPPED_CATALOG.models.items()
-        if wire_name in definition.aliases
-        or any(deployment.name == wire_name for deployment in definition.deployments)
+        if any(deployment.name == wire_name for deployment in definition.deployments)
     }
     if len(candidates) == 1:
         return candidates.pop()
     if len(candidates) > 1:
         raise MigrationConflictError(
-            f"Ambiguous shipped alias {wire_name!r}: {sorted(candidates)!r}; resolve manually."
+            f"Ambiguous shipped deployment name {wire_name!r}: {sorted(candidates)!r}; resolve manually."
         )
     return None
 
@@ -155,11 +162,9 @@ def _legacy_deployment(
     return deployment
 
 
-def _shipped_aliases(base: str, entries: list[dict[str, Any]]) -> tuple[str, ...]:
-    aliases = set(SHIPPED_CATALOG.models[base].aliases)
-    aliases.update(entry.get("alias", base) for entry in entries)
-    aliases.discard(base)
-    return tuple(sorted(aliases))
+def _canonical_legacy_reference(name: str, aliases: dict[str, str]) -> str:
+    """Canonicalize removed shipped identities before user-owned aliases."""
+    return _LEGACY_SHIPPED_MODEL_ALIASES.get(name, aliases.get(name, name))
 
 
 def _build_catalog(  # noqa: PLR0912, PLR0914, PLR0915
@@ -236,24 +241,48 @@ def _build_catalog(  # noqa: PLR0912, PLR0914, PLR0915
                     f"Ambiguous legacy identity {base!r}: multiple deployments for {provider_id!r}; resolve manually."
                 )
             deployment_by_provider[provider_id] = deployment
-        if base in reconciled:
-            models[base] = {
-                "aliases": _shipped_aliases(base, entries),
-                "thinking": first.get("thinking", "off"),
-                "temperature": first.get("temperature", 0.2),
-                "deployments": list(deployment_by_provider.values()),
-            }
-        else:
-            model_aliases = tuple(
-                sorted({entry.get("alias", base) for entry in entries} - {base})
+        models[base] = {
+            "thinking": first.get("thinking", "off"),
+            "temperature": first.get("temperature", 0.2),
+            "deployments": list(deployment_by_provider.values()),
+        }
+    roles: dict[str, dict[str, Any]] = {}
+
+    def add_role(role_name: str, description: str, members: Any) -> None:
+        if not isinstance(role_name, str) or not isinstance(members, list):
+            raise MigrationError("Legacy role entries must be arrays of model names.")
+        definition = {
+            "description": description,
+            "models": [
+                _canonical_legacy_reference(member, aliases) for member in members
+            ],
+        }
+        if role_name in roles and roles[role_name] != definition:
+            raise MigrationConflictError(
+                f"Legacy role {role_name!r} has conflicting definitions."
             )
-            models[base] = {
-                "aliases": model_aliases,
-                "thinking": first.get("thinking", "off"),
-                "temperature": first.get("temperature", 0.2),
-                "deployments": list(deployment_by_provider.values()),
-            }
+        roles[role_name] = definition
+
+    raw_tags = data.get("tags", {})
+    if not isinstance(raw_tags, dict):
+        raise MigrationError("Legacy [tags] must be a TOML table.")
+    for role_name, members in raw_tags.items():
+        add_role(role_name, "", members)
+
+    raw_roles = data.get("roles", {})
+    if not isinstance(raw_roles, dict):
+        raise MigrationError("Legacy [roles] must be a TOML table.")
+    for role_name, definition in raw_roles.items():
+        if not isinstance(definition, dict):
+            raise MigrationError("Legacy [roles] entries must be TOML tables.")
+        description = definition.get("description", "")
+        members = definition.get("models")
+        if not isinstance(description, str):
+            raise MigrationError("Legacy role descriptions must be strings.")
+        add_role(role_name, description, members)
     catalog = {"providers": providers, "models": models}
+    if roles:
+        catalog["roles"] = roles
     try:
         merge_catalog_overlay(SHIPPED_CATALOG, catalog)
     except ValueError as exc:
@@ -261,15 +290,129 @@ def _build_catalog(  # noqa: PLR0912, PLR0914, PLR0915
     return catalog, aliases
 
 
-def _canonicalize_selections(config: dict[str, Any], aliases: dict[str, str]) -> bytes:
+def _alias_pattern_matches(pattern: str, alias: str) -> bool:
+    if pattern.startswith("re:"):
+        try:
+            return (
+                re.fullmatch(pattern.removeprefix("re:"), alias, re.IGNORECASE)
+                is not None
+            )
+        except re.error:
+            return False
+    return fnmatch(alias.casefold(), pattern.casefold())
+
+
+def _migration_warnings(  # noqa: PLR0912
+    data: dict[str, Any], catalog: dict[str, Any], aliases: dict[str, str]
+) -> tuple[str, ...]:
+    """Report legacy references retargeted or left unreferenced by migration."""
+    warnings: list[str] = []
+    references: set[str] = set()
+
+    for field in ("active_model", "compaction_model"):
+        value = data.get(field)
+        if isinstance(value, str):
+            canonical = _canonical_legacy_reference(value, aliases)
+            references.add(canonical)
+            if value in _LEGACY_SHIPPED_MODEL_ALIASES:
+                warnings.append(
+                    f"{field} selection {value!r} was retargeted to {canonical!r}."
+                )
+
+    for field in ("allowed_models",):
+        values = data.get(field)
+        if isinstance(values, list):
+            references.update(
+                _canonical_legacy_reference(value, aliases)
+                for value in values
+                if isinstance(value, str)
+                and not value.startswith("re:")
+                and not any(char in value for char in "*?[")
+            )
+    overrides = data.get("thinking_overrides")
+    if isinstance(overrides, dict):
+        references.update(
+            _canonical_legacy_reference(key, aliases)
+            for key in overrides
+            if isinstance(key, str)
+        )
+
+    for source in (data.get("tags", {}), data.get("roles", {})):
+        if not isinstance(source, dict):
+            continue
+        for role_name, definition in source.items():
+            members = (
+                definition
+                if isinstance(definition, list)
+                else (
+                    definition.get("models") if isinstance(definition, dict) else None
+                )
+            )
+            if not isinstance(role_name, str) or not isinstance(members, list):
+                continue
+            for member in members:
+                if not isinstance(member, str):
+                    continue
+                canonical = _canonical_legacy_reference(member, aliases)
+                references.add(canonical)
+                if member in _LEGACY_SHIPPED_MODEL_ALIASES:
+                    warnings.append(
+                        f"role {role_name!r} member {member!r} was retargeted to {canonical!r}."
+                    )
+
+    models = catalog.get("models", {})
+    if isinstance(models, dict):
+        for base in models:
+            if base not in SHIPPED_CATALOG.models and base not in references:
+                warnings.append(
+                    f"Preserved user model table {base!r} is no longer referenced after canonicalization."
+                )
+    return tuple(warnings)
+
+
+def _canonicalize_selections(
+    config: dict[str, Any], aliases: dict[str, str]
+) -> tuple[bytes, tuple[str, ...]]:
     """Remove catalog tables and canonicalize selections in parsed legacy TOML."""
     config.pop("providers", None)
     config.pop("models", None)
+    config.pop("tags", None)
+    config.pop("roles", None)
 
     for field in ("active_model", "compaction_model"):
         value = config.get(field)
         if isinstance(value, str):
-            config[field] = aliases.get(value, value)
+            config[field] = _canonical_legacy_reference(value, aliases)
+
+    warnings: list[str] = []
+    allowed_models = config.get("allowed_models")
+    if isinstance(allowed_models, list):
+        canonical_allowed_models: list[Any] = []
+        for pattern in allowed_models:
+            if isinstance(pattern, str) and (
+                pattern in aliases or pattern in _LEGACY_SHIPPED_MODEL_ALIASES
+            ):
+                canonical_allowed_models.append(
+                    _canonical_legacy_reference(pattern, aliases)
+                )
+                continue
+            canonical_allowed_models.append(pattern)
+            if not isinstance(pattern, str) or not (
+                pattern.startswith("re:") or any(char in pattern for char in "*?[")
+            ):
+                continue
+            matches = [
+                (alias, base)
+                for alias, base in aliases.items()
+                if alias != base and _alias_pattern_matches(pattern, alias)
+            ]
+            canonical_names = sorted({base for _alias, base in matches})
+            if canonical_names:
+                warnings.append(
+                    f"allowed_models pattern {pattern!r} may reference removed aliases; "
+                    f"use canonical names {canonical_names!r}."
+                )
+        config["allowed_models"] = canonical_allowed_models
 
     overrides = config.get("thinking_overrides")
     if isinstance(overrides, dict):
@@ -277,7 +420,7 @@ def _canonicalize_selections(config: dict[str, Any], aliases: dict[str, str]) ->
         for key, value in overrides.items():
             if not isinstance(key, str):
                 raise MigrationError("Legacy thinking override keys must be strings.")
-            canonical_key = aliases.get(key, key)
+            canonical_key = _canonical_legacy_reference(key, aliases)
             if canonical_key in canonical_overrides:
                 raise MigrationConflictError(
                     f"Ambiguous legacy identity {canonical_key!r}: multiple thinking overrides resolve to it; resolve manually."
@@ -285,7 +428,7 @@ def _canonicalize_selections(config: dict[str, Any], aliases: dict[str, str]) ->
             canonical_overrides[canonical_key] = value
         config["thinking_overrides"] = canonical_overrides
 
-    return tomli_w.dumps(config).encode()
+    return tomli_w.dumps(config).encode(), tuple(warnings)
 
 
 def plan_migration(config_path: Path, catalog_path: Path) -> MigrationPlan:
@@ -297,10 +440,11 @@ def plan_migration(config_path: Path, catalog_path: Path) -> MigrationPlan:
         parsed = tomllib.loads(original.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise MigrationError(f"Cannot parse legacy config.toml: {exc}") from exc
-    if not {"providers", "models"}.intersection(parsed):
+    if not {"providers", "models", "tags", "roles"}.intersection(parsed):
         raise MigrationError(f"No legacy catalog tables found. {_MIGRATION_HINT}")
     catalog, aliases = _build_catalog(parsed)
-    cleaned = _canonicalize_selections(parsed, aliases)
+    migration_warnings = _migration_warnings(parsed, catalog, aliases)
+    cleaned, canonicalization_warnings = _canonicalize_selections(parsed, aliases)
     return MigrationPlan(
         config_path,
         catalog_path,
@@ -308,6 +452,7 @@ def plan_migration(config_path: Path, catalog_path: Path) -> MigrationPlan:
         catalog,
         cleaned,
         original,
+        migration_warnings + canonicalization_warnings,
     )
 
 
@@ -535,11 +680,15 @@ def run_models_cli(argv: list[str]) -> None:
                     return
                 plan = plan_migration(config_path, catalog_path)
                 print(apply_migration(plan))
+                for warning in plan.warnings:
+                    print(f"Warning: {warning}", file=sys.stderr)
         else:
             plan = plan_migration(config_path, catalog_path)
             print(
                 f"Preview: would write {catalog_path}, back up {config_path} to {plan.backup_path}, and remove legacy [providers]/[models] tables."
             )
+            for warning in plan.warnings:
+                print(f"Warning: {warning}", file=sys.stderr)
     except MigrationError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

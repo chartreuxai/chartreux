@@ -54,7 +54,7 @@ can add commands.
 | `/log` | Show the current interaction-log path. |
 | `/log-level` | Change the session log level or persist it. |
 | `/debug` | Toggle the debug console. |
-| `/agents` | Toggle the retained-background-agents sidebar. |
+| `/agents` | Toggle the expanded retained-background-agent list above the input. |
 | `/compact [instructions]` | Summarize the conversation context. |
 | `/exit`, `exit`, `quit`, `:q`, `:quit` | Exit. |
 | `/status` | Display agent statistics. |
@@ -84,7 +84,7 @@ can add commands.
 | `Ctrl+Y` or `Ctrl+Shift+C` | Copy the current selection. |
 | `Shift+Up` / `Shift+Down` | Scroll chat. |
 | `Ctrl+\\` | Toggle the debug console. |
-| `Ctrl+Shift+A` | Toggle the background-agents sidebar. |
+| `Ctrl+Shift+A` | Toggle the expanded background-agent list above the input. |
 | `Alt+Left` / `Alt+Right` | Move by word in input. |
 | `Ctrl+V` | Paste a clipboard image where that platform feature is available. |
 

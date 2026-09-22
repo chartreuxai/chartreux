@@ -93,6 +93,37 @@ class RawWritableLayer(FakeLayer):
         return "write-fp"
 
 
+class CoordinatedLoadLayer(RawWritableLayer):
+    def __init__(self, *, name: str, data: dict[str, Any]) -> None:
+        super().__init__(name=name, data=data)
+        self._block_loads = False
+        self._blocked_loads = 0
+        self.first_load_entered = asyncio.Event()
+        self.second_load_entered = asyncio.Event()
+        self.release_loads = asyncio.Event()
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> CoordinatedLoadLayer:
+        clone = type(self)(name=self.name, data=copy.deepcopy(self._data, memo))
+        clone._state = copy.deepcopy(self._state, memo)
+        clone._block_loads = self._block_loads
+        clone._blocked_loads = self._blocked_loads
+        clone.first_load_entered = self.first_load_entered
+        clone.second_load_entered = self.second_load_entered
+        clone.release_loads = self.release_loads
+        return clone
+
+    async def load(self, *, force: bool = False) -> RawConfig:
+        data = await super().load(force=force)
+        if self._block_loads:
+            self._blocked_loads += 1
+            if self._blocked_loads == 1:
+                self.first_load_entered.set()
+            elif self._blocked_loads == 2:
+                self.second_load_entered.set()
+            await self.release_loads.wait()
+        return data
+
+
 class FailingSaveLayer(FakeLayer):
     async def _save_to_store(self, _next_config: RawConfig) -> str:
         raise RuntimeError("boom")
@@ -144,6 +175,12 @@ class MultiValueSchema(ConfigSchema):
 
 class ListSchema(ConfigSchema):
     values: Annotated[list[str], WithReplaceMerge()] = Field(default_factory=list)
+
+
+class EntriesSchema(ConfigSchema):
+    entries: Annotated[list[dict[str, str]], WithReplaceMerge()] = Field(
+        default_factory=list
+    )
 
 
 class ToolsFragment(ConfigFragment):
@@ -519,6 +556,38 @@ async def test_mutate_field_serializes_read_modify_write_with_preflight() -> Non
     assert await second == []
     assert layer._data == {"values": ["first", "second"]}
     assert orch.config.values == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_upsert_field_serializes_read_select_apply() -> None:
+    layer = CoordinatedLoadLayer(name="user-toml", data={"entries": []})
+    orch = await ConfigOrchestrator.create(
+        schema=EntriesSchema, layers=[layer], default_layer_resolver=lambda: layer
+    )
+    layer._block_loads = True
+    first = asyncio.create_task(
+        orch.upsert_field(
+            "/entries", key_field="name", value={"name": "provider", "value": "one"}
+        )
+    )
+    await asyncio.wait_for(layer.first_load_entered.wait(), timeout=1)
+    second = asyncio.create_task(
+        orch.upsert_field(
+            "/entries", key_field="name", value={"name": "provider", "value": "two"}
+        )
+    )
+    try:
+        await asyncio.wait_for(layer.second_load_entered.wait(), timeout=0.1)
+    except TimeoutError:
+        pass
+    finally:
+        layer.release_loads.set()
+
+    assert await first == []
+    assert await second == []
+    assert len(layer._data["entries"]) == 1
+    assert layer._data["entries"][0]["name"] == "provider"
+    assert len(orch.config.entries) == 1
 
 
 @pytest.mark.asyncio

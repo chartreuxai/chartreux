@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 import enum
+import json
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -63,15 +64,27 @@ class TaskArgs(BaseModel):
     )
     fan_out: bool = Field(
         default=False,
-        description="Launch one retained child for every member of an explicit @tag model.",
+        description="Launch one retained child for every member of an explicit @role model.",
     )
 
     @model_validator(mode="before")
     @classmethod
     def _omit_null_config(cls, value: Any) -> Any:
-        if isinstance(value, dict) and value.get("config") is None:
+        if not isinstance(value, dict):
+            return value
+
+        config = value.get("config")
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except json.JSONDecodeError as error:
+                raise ValueError("config must be a valid JSON object") from error
+            if config is not None and not isinstance(config, dict):
+                raise ValueError("config JSON must decode to an object")
+
+        if config is None:
             return {key: item for key, item in value.items() if key != "config"}
-        return value
+        return {**value, "config": config}
 
     @field_validator("task_summary")
     @classmethod
@@ -106,6 +119,11 @@ class TaskResult(BaseModel):
     response: str = Field(description="The accumulated response from the subagent")
     turns_used: int = Field(description="Number of turns the subagent used")
     completed: bool = Field(description="Whether the task completed normally")
+    status: Literal["launched"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Launch state for a background launch acknowledgment; None for task results.",
+    )
     agent_id: str | None = Field(
         default=None,
         description="Stable agent handle. Populated for background launches; None for foreground.",
@@ -139,6 +157,11 @@ class AgentAvailability(enum.StrEnum):
     EVICTED = "evicted"
 
 
+class ReleaseAgentOutcome(enum.StrEnum):
+    RELEASED = "released"
+    EVICTED = "evicted"
+
+
 @dataclass(frozen=True, slots=True)
 class AgentEviction:
     agent_id: str
@@ -155,6 +178,7 @@ class AgentSummary:
     availability: AgentAvailability
     current_run_id: str | None
     current_run_status: RunStatus | None
+    turns_used: int | None = None
     initial_task_summary: str | None = None
     current_task_summary: str | None = None
     idle_seconds: float | None = None
@@ -269,9 +293,10 @@ class SubagentManagementPort(Protocol):
         """
         ...
 
-    async def release_agent(self, agent_id: str) -> None:
-        """Close and remove a retained agent.
+    async def release_agent(self, agent_id: str) -> ReleaseAgentOutcome:
+        """Close and remove a retained agent or evicted tombstone.
 
+        Returns RELEASED for a live agent and EVICTED when removing its tombstone.
         Raises ValueError for unknown agent_id.
         """
         ...

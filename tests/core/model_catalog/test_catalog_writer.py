@@ -66,25 +66,21 @@ def test_apply_changes_writes_sparse_atomic_provider_model_and_tag_batch(
         _changes(
             models={
                 "new-model": {
-                    "aliases": ["new-alias"],
-                    "deployments": [{"provider": "test/default", "name": "new-wire"}],
+                    "deployments": [{"provider": "test/default", "name": "new-wire"}]
                 }
             },
-            tags={"new": ("new-model",)},
+            roles={"new": {"description": "", "models": ["new-model"]}},
         )
     )
 
     assert isinstance(result, CatalogWriteResult) and result.changed
     raw = _written(path)
-    assert set(raw) == {"providers", "models", "tags"}
+    assert set(raw) == {"providers", "models", "roles"}
     assert raw["providers"] == {"test/default": {"api_base": "https://test.example/v1"}}
     assert raw["models"] == {
-        "new-model": {
-            "aliases": ["new-alias"],
-            "deployments": [{"provider": "test/default", "name": "new-wire"}],
-        }
+        "new-model": {"deployments": [{"provider": "test/default", "name": "new-wire"}]}
     }
-    assert raw["tags"] == {"new": ["new-model"]}
+    assert raw["roles"] == {"new": {"description": "", "models": ["new-model"]}}
     assert result.snapshot.catalog.models["new-model"].deployments[0].name == "new-wire"
 
 
@@ -95,8 +91,10 @@ def test_unchanged_existing_selection_is_a_noop(tmp_path: Path) -> None:
         _changes(
             provider={},
             models={
-                "glm-5-2": {
-                    "deployments": [{"provider": "mistral/default", "name": "glm-5-2"}]
+                "glm-5-3": {
+                    "deployments": [
+                        {"provider": "mistral/default", "name": "zai-glm-5-3"}
+                    ]
                 }
             },
         )
@@ -114,7 +112,7 @@ def test_append_preserves_effective_order_and_raw_user_overrides(
 [providers."test/default"]
 api_base = "https://test.example"
 
-[models.glm-5-2]
+[models.glm-5-3]
 deployments = [
   { provider = "mistral/default", name = "user-wire", supports_images = true },
 ]
@@ -123,7 +121,7 @@ deployments = [
     result = CatalogStore(path).apply_changes(
         _changes(
             models={
-                "glm-5-2": {
+                "glm-5-3": {
                     "deployments": [{"provider": "test/default", "name": "test-wire"}]
                 }
             }
@@ -131,7 +129,7 @@ deployments = [
     )
 
     assert isinstance(result, CatalogWriteResult) and result.changed
-    deployments = _written(path)["models"]["glm-5-2"]["deployments"]  # type: ignore[index]
+    deployments = _written(path)["models"]["glm-5-3"]["deployments"]  # type: ignore[index]
     assert deployments == [
         {"provider": "mistral/default", "name": "user-wire", "supports_images": True},
         {"provider": "test/default", "name": "test-wire"},
@@ -145,9 +143,9 @@ def test_append_uses_shipped_stubs_without_losing_inherited_metadata(
     result = CatalogStore(path).apply_changes(
         _changes(
             models={
-                "glm-5-2": {
+                "glm-5-3": {
                     "deployments": [
-                        {"provider": "test/default", "name": "test-glm-5-2"}
+                        {"provider": "test/default", "name": "test-glm-5-3"}
                     ]
                 }
             }
@@ -155,44 +153,44 @@ def test_append_uses_shipped_stubs_without_losing_inherited_metadata(
     )
 
     assert isinstance(result, CatalogWriteResult) and result.changed
-    deployments = _written(path)["models"]["glm-5-2"]["deployments"]  # type: ignore[index]
+    deployments = _written(path)["models"]["glm-5-3"]["deployments"]  # type: ignore[index]
     assert deployments[0] == {"provider": "mistral/default"}
-    model = result.snapshot.catalog.models["glm-5-2"]
-    assert model.thinking == "high"
+    model = result.snapshot.catalog.models["glm-5-3"]
+    assert model.thinking == "medium"
     assert model.temperature == 0.2
-    assert model.deployments[0].auto_compact_threshold == 400000.0
+    assert model.deployments[0].auto_compact_threshold is None
 
 
-def test_tags_and_aliases_are_preserved_and_empty_tag_is_rejected(
-    tmp_path: Path,
-) -> None:
+def test_roles_are_patched_per_key(tmp_path: Path) -> None:
     path = tmp_path / "models.toml"
     store = CatalogStore(path)
     first = store.apply_changes(
         _changes(
             models={
-                "one": {
-                    "aliases": ["one-alias"],
-                    "deployments": [{"provider": "test/default", "name": "one"}],
-                },
+                "one": {"deployments": [{"provider": "test/default", "name": "one"}]},
                 "two": {"deployments": [{"provider": "test/default", "name": "two"}]},
             },
-            tags={"first": ("one",), "second": ("two",)},
+            roles={
+                "first": {"models": ["one"]},
+                "second": {"description": "", "models": ["two"]},
+            },
         )
     )
     assert isinstance(first, CatalogWriteResult)
-    repeated = store.apply_changes(_changes(tags={"first": ("one",)}))
+    repeated = store.apply_changes(_changes(roles={"first": {"models": ["one"]}}))
     assert isinstance(repeated, CatalogWriteResult) and not repeated.changed
     before = path.read_bytes()
 
-    result = store.apply_changes(_changes(tags={"first": ()}))
+    result = store.apply_changes(_changes(roles={"first": {"models": []}}))
 
     assert isinstance(result, CatalogValidationError)
-    assert "cannot be empty" in result.message
+    assert "at least 1 item" in result.message
     assert path.read_bytes() == before
     raw = _written(path)
-    assert raw["models"]["one"]["aliases"] == ["one-alias"]  # type: ignore[index]
-    assert raw["tags"] == {"first": ["one"], "second": ["two"]}
+    assert raw["roles"] == {
+        "first": {"models": ["one"]},
+        "second": {"description": "", "models": ["two"]},
+    }
 
 
 def test_zero_price_is_written_while_unknown_price_fields_are_omitted(

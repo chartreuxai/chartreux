@@ -5,6 +5,7 @@ from textual.geometry import Offset
 from textual.message import Message
 from textual.selection import Selection
 
+from chartreux.cli.autocompletion.completers import PathCompleter
 from chartreux.cli.textual_ui.widgets.chat_input import ChatInputContainer, ChatTextArea
 from chartreux.cli.textual_ui.widgets.messages import UserMessage
 from tests.conftest import build_test_chartreux_app
@@ -51,6 +52,23 @@ async def test_numeric_input_is_not_reserved_for_removed_feedback_ui() -> None:
         await pilot.pause()
 
         assert app.query_one(ChatInputContainer).value == "1023"
+
+
+@pytest.mark.asyncio
+async def test_tui_teardown_shuts_down_path_completer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shutdown_calls: list[PathCompleter] = []
+
+    def track_shutdown(completer: PathCompleter) -> None:
+        shutdown_calls.append(completer)
+
+    monkeypatch.setattr(PathCompleter, "shutdown", track_shutdown)
+    app = build_test_chartreux_app()
+    async with app.run_test():
+        pass
+
+    assert len(shutdown_calls) == 1
 
 
 @pytest.mark.asyncio

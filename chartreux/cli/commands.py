@@ -103,8 +103,8 @@ class CommandRegistry:
             ),
             "agents": Command(
                 aliases=frozenset(["/agents"]),
-                description="Toggle background agents sidebar",
-                handler="action_toggle_agent_sidebar",
+                description="Toggle background agents list",
+                handler="action_toggle_agent_browser",
                 side_channel=True,
             ),
             "compact": Command(

@@ -29,11 +29,11 @@ async def _build(*layers: object) -> ChartreuxConfigSchema:
 async def test_shipped_catalog_resolves_selection_to_wire_name_and_display_provider() -> (
     None
 ):
-    config = await _build(OverridesLayer(data={"active_model": "glm-5-2"}))
+    config = await _build(OverridesLayer(data={"active_model": "glm-5-3"}))
     model = config.get_active_model()
     assert (model.alias, model.name, model.provider) == (
-        "glm-5-2",
-        "glm-5-2",
+        "glm-5-3",
+        "zai-glm-5-3",
         "mistral/default",
     )
 
@@ -41,9 +41,9 @@ async def test_shipped_catalog_resolves_selection_to_wire_name_and_display_provi
 @pytest.mark.parametrize(
     ("user", "project", "environment", "expected"),
     [
-        ("glm-5-2", None, None, "glm-5-2"),
-        ("glm-5-2", "mistral-small", None, "mistral-small"),
-        ("glm-5-2", "mistral-small", "glm-5-2", "glm-5-2"),
+        ("glm-5-3", None, None, "glm-5-3"),
+        ("glm-5-3", "gpt-6-astra", None, "gpt-6-astra"),
+        ("glm-5-3", "gpt-6-astra", "glm-5-3", "glm-5-3"),
     ],
 )
 async def test_selection_precedence_across_user_project_and_environment(
@@ -73,16 +73,16 @@ async def test_selection_precedence_across_user_project_and_environment(
 
 async def test_untrusted_project_cannot_override_user_selection(tmp_path: Path) -> None:
     user = tmp_path / "user.toml"
-    user.write_text('active_model = "glm-5-2"\n')
+    user.write_text('active_model = "glm-5-3"\n')
     root = tmp_path / "project"
     project = root / ".chartreux" / "config.toml"
     project.parent.mkdir(parents=True)
-    project.write_text('active_model = "mistral-small"\n')
+    project.write_text('active_model = "gpt-6-astra"\n')
     config = await _build(
         UserConfigLayer(path=user),
         ProjectConfigLayer(path=root, trust_store=TrustedFoldersManager()),
     )
-    assert config.get_active_model().alias == "glm-5-2"
+    assert config.get_active_model().alias == "glm-5-3"
 
 
 @pytest.mark.parametrize("expression", ["missing", "@missing", "provider/missing"])
@@ -99,11 +99,11 @@ async def test_thinking_overrides_are_layer_merged_and_materialized_without_cata
     None
 ):
     config = await _build(
-        OverridesLayer(data={"thinking_overrides": {"glm-5-2": "low"}})
+        OverridesLayer(data={"thinking_overrides": {"glm-5-3": "low"}})
     )
     assert config.get_active_model().thinking == "low"
     assert config.catalog_snapshot is not None
-    assert config.catalog_snapshot.catalog.models["glm-5-2"].thinking == "high"
+    assert config.catalog_snapshot.catalog.models["glm-5-3"].thinking == "medium"
 
 
 @pytest.mark.parametrize(
@@ -111,11 +111,9 @@ async def test_thinking_overrides_are_layer_merged_and_materialized_without_cata
 )
 async def test_selection_fields_replace_instead_of_merging(field: str) -> None:
     lower = {
-        field: "glm-5-2" if field != "allowed_models" else ["glm-5-2", "mistral-small"]
+        field: "glm-5-3" if field != "allowed_models" else ["glm-5-3", "gpt-6-astra"]
     }
-    higher = {
-        field: "mistral-small" if field != "allowed_models" else ["mistral-small"]
-    }
+    higher = {field: "gpt-6-astra" if field != "allowed_models" else ["gpt-6-astra"]}
     config = await _build(
         OverridesLayer(data=lower, name="lower"),
         OverridesLayer(data=higher, name="higher"),
@@ -134,12 +132,12 @@ async def test_runtime_selection_patch_persists_only_selection_table(
         layers=[DefaultConfigLayer(schema=ChartreuxConfigSchema), user, session],
         default_layer_resolver=lambda: user,
     )
-    assert not await orch.set_field("/thinking_overrides/glm-5-2", "low")
-    assert not await orch.set_field("/active_model", "glm-5-2")
+    assert not await orch.set_field("/thinking_overrides/glm-5-3", "low")
+    assert not await orch.set_field("/active_model", "glm-5-3")
     persisted = tomllib.loads(path.read_text())
     assert persisted == {
-        "active_model": "glm-5-2",
-        "thinking_overrides": {"glm-5-2": "low"},
+        "active_model": "glm-5-3",
+        "thinking_overrides": {"glm-5-3": "low"},
     }
     assert orch.config.get_active_model().thinking == "low"
 
@@ -173,9 +171,9 @@ async def test_legacy_tables_fail_before_selection_layer_can_shadow_them(
     field: str, tmp_path: Path
 ) -> None:
     path = tmp_path / "config.toml"
-    path.write_text(f'{field} = []\nactive_model = "glm-5-2"\n')
+    path.write_text(f'{field} = []\nactive_model = "glm-5-3"\n')
     with pytest.raises(Exception, match="chartreux models migrate"):
         await _build(
             UserConfigLayer(path=path),
-            OverridesLayer(data={"active_model": "mistral-small"}),
+            OverridesLayer(data={"active_model": "gpt-6-astra"}),
         )

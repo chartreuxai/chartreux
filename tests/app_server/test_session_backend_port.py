@@ -24,12 +24,17 @@ from chartreux.app_server._session_backend_port import (
     SessionBackendHost,
 )
 from chartreux.app_server.client import AppServerClient
-from chartreux.app_server.events import HistoryEntryAdded, ServerWarning
+from chartreux.app_server.events import (
+    HistoryEntryAdded,
+    MCPAuthorizationRequiredEvent,
+    ServerWarning,
+)
 from chartreux.app_server.models import PublicError, TextContentBlock
 from chartreux.app_server.protocol import (
     ClientCapabilities,
     ClientInfo,
     ContextInjectParams,
+    MCPAuthRequiredParams,
     ProtocolErrorCode,
     ServerWarningParams,
     SessionOptions,
@@ -43,6 +48,7 @@ from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
 from chartreux.core.session.session_lease import SessionBusyError, SessionLease
 from chartreux.core.session.session_loader import SessionLoader
+from chartreux.core.tools.mcp.authorization import MCPAuthorizationRequired
 from tests.conftest import build_test_agent_loop
 from tests.stubs.app_server import build_test_app_server
 
@@ -313,6 +319,47 @@ async def test_legacy_backend_subscription_forwards_direct_events_and_closes() -
     await backend.shutdown()
     with pytest.raises(StopAsyncIteration):
         await next_event
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_backend_subscription_replays_pending_mcp_authorization() -> None:
+    client_transport, server_transport = memory_transport_pair()
+    server = build_test_app_server(build_test_agent_loop(), server_transport)
+    client = AppServerClient(client_transport, run_peer=server.serve)
+    session = await AppServerSession.start(
+        client,
+        client_info=ClientInfo(name="test", version="0"),
+        capabilities=ClientCapabilities(),
+    )
+    backend = server._require_root()
+    assert isinstance(backend, SessionBackendImpl)
+    event_task = server._backend_event_task
+    assert event_task is not None
+    event_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await event_task
+
+    await backend._publish_mcp_authorization_required(
+        "search",
+        MCPAuthorizationRequired(
+            reason="missing",
+            descriptor_revision="descriptor-1",
+            observed_connection_revision="connection-1",
+        ),
+    )
+    subscription = await backend.subscribe(
+        SessionReadParams(session_id=session.session_id)
+    )
+    envelope = await asyncio.wait_for(anext(subscription.events), timeout=1)
+
+    assert isinstance(envelope.event, MCPAuthorizationRequiredEvent)
+    assert envelope.method == "mcp_catalog/authRequired"
+    assert isinstance(envelope.params, MCPAuthRequiredParams)
+    assert envelope.params.session_id == session.session_id
+    assert envelope.params.name == "search"
+    assert envelope.params.descriptor_revision == "descriptor-1"
+    await backend.shutdown()
     await client.close()
 
 

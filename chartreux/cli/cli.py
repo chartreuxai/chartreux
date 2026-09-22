@@ -320,6 +320,7 @@ def run_cli(args: argparse.Namespace) -> None:
         or args.initial_prompt is not None
         or stdin_prompt is not None
     )
+    args.is_programmatic = is_programmatic
     bootstrap_config_files()
 
     if not is_programmatic:

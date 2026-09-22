@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from chartreux.app_server._agent_transcript import read_agent_transcript
+from chartreux.app_server._agent_transcript import (
+    read_agent_transcript,
+    read_live_agent_transcript,
+)
 from chartreux.app_server.protocol import AgentTranscriptState
+from chartreux.core.llm_models import LLMMessage
 
 
 def _write_session(path: Path, messages: list[dict[str, object]]) -> None:
@@ -21,7 +25,41 @@ def _messages(count: int) -> list[dict[str, object]]:
     ]
 
 
-def test_pages_backward_in_chronological_order_without_gaps(tmp_path: Path) -> None:
+def test_live_projection_matches_saved_view_with_system_and_tool_messages(
+    tmp_path: Path,
+) -> None:
+    messages = [
+        LLMMessage.model_validate({"role": "system", "content": "instructions"}),
+        LLMMessage.model_validate({
+            "role": "user",
+            "message_id": "user-1",
+            "content": "question",
+        }),
+        LLMMessage.model_validate({
+            "role": "assistant",
+            "message_id": "assistant-1",
+            "content": "working",
+        }),
+        LLMMessage.model_validate({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "tool_result": {"output": {"answer": "done"}},
+        }),
+    ]
+    _write_session(
+        tmp_path,
+        [
+            message.model_dump(exclude_none=True, mode="json")
+            for message in messages
+            if message.role.value != "system"
+        ],
+    )
+
+    saved = read_agent_transcript(tmp_path, lambda: True)
+    live = read_live_agent_transcript(messages)
+
+    assert live == saved
+
     _write_session(tmp_path, _messages(205))
 
     pages = []

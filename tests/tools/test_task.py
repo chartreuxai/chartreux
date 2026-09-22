@@ -48,11 +48,17 @@ class TestTaskArgs:
             Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/task.md"
         ).read_text()
 
-        assert (
-            "single model expression: canonical name, unique alias, or `@tag`" in prompt
-        )
+        assert "single model expression: canonical name or `@role`" in prompt
         assert "fallback array" not in prompt
         assert "tag or fallback" not in prompt
+
+    def test_task_prompt_documents_background_launch_acknowledgment(self) -> None:
+        prompt = (
+            Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/task.md"
+        ).read_text()
+
+        assert 'status: "launched"' in prompt
+        assert "not the subagent's terminal result" in prompt
 
     def test_task_prompt_documents_provider_failover_visibility(self) -> None:
         prompt = (
@@ -69,9 +75,9 @@ class TestTaskArgs:
         ).read_text()
 
         assert "fan_out" in prompt
-        assert "@tag" in prompt
+        assert "@role" in prompt
         assert "forbids `agent_id`" in prompt
-        assert "preflights every ordered tag member" in prompt
+        assert "preflights every ordered role member" in prompt
 
     def test_default_subagent_is_worker(self) -> None:
         args = TaskArgs(task="do something")
@@ -283,6 +289,26 @@ class TestTaskToolFormatterHandoff:
         return InvokeContext(
             tool_call_id="task-1", agent_manager=manager, subagent_runner=runner
         )
+
+    @pytest.mark.asyncio
+    async def test_json_string_config_decodes_at_invocation(
+        self, task_tool: Task, formatter_ctx: InvokeContext
+    ) -> None:
+        call = _resolve_task_call({
+            "task": "do something",
+            "config": '{"model": "strong"}',
+        })
+
+        assert call.args_dict == {"task": "do something", "config": {"model": "strong"}}
+        events = [
+            event async for event in task_tool.invoke(formatter_ctx, **call.args_dict)
+        ]
+
+        assert len(events) == 2
+        runner = cast(FakeSubagentRunner, formatter_ctx.subagent_runner)
+        args, _ = runner.calls[-1]
+        assert args.config is not None
+        assert args.config.model == "strong"
 
     @pytest.mark.asyncio
     async def test_sparse_config_preserves_omitted_fields_at_invocation(

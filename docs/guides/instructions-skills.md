@@ -53,7 +53,7 @@ The `name` must be lowercase letters, numbers, and hyphens. `description` tells 
 
 ### Discovery and precedence
 
-Chartreux searches configured `skill_paths`, then trusted project directories `.chartreux/skills/` and `.agents/skills/`, then `~/.chartreux/skills/` and `~/.agents/skills/`. The first discovered definition of a name wins; built-in skill names are reserved.
+Chartreux first loads Python built-in skills, whose names are reserved and cannot be overridden. It then searches configured `skill_paths`, skills shipped with Chartreux, trusted project directories `.chartreux/skills/` and `.agents/skills/`, and finally `~/.chartreux/skills/` and `~/.agents/skills/`. Configured, project, and user skills shadow a shipped skill; among those local directories, the first definition of a name wins.
 
 ```toml
 skill_paths = ["/work/shared/chartreux-skills"]

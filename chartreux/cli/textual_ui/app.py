@@ -105,8 +105,7 @@ from chartreux.cli.textual_ui.notifications import (
 )
 from chartreux.cli.textual_ui.quit_manager import QuitManager
 from chartreux.cli.textual_ui.scheduled_loop_runner import ScheduledLoopCommands
-from chartreux.cli.textual_ui.widgets.agent_bar import AgentBar
-from chartreux.cli.textual_ui.widgets.agent_sidebar import AgentSidebar
+from chartreux.cli.textual_ui.widgets.agent_bar import AgentBar, agent_state
 from chartreux.cli.textual_ui.widgets.agent_transcript import AgentTranscriptViewer
 from chartreux.cli.textual_ui.widgets.banner.banner import Banner
 from chartreux.cli.textual_ui.widgets.branch_created_message import BranchCreatedMessage
@@ -652,7 +651,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         ),
         Binding("ctrl+backslash", "toggle_debug_console", "Debug Console", show=False),
         Binding(
-            "ctrl+shift+a", "toggle_agent_sidebar", "Background Agents", show=False
+            "ctrl+shift+a", "toggle_agent_browser", "Background Agents", show=False
         ),
     ]
 
@@ -774,7 +773,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._cached_loading_area: Widget | None = None
         self._context_progress: ContextProgress | None = None
         self._agent_bar: AgentBar | None = None
-        self._agent_sidebar: AgentSidebar | None = None
         self._agent_summaries: list[AgentSummaryModel] = []
         self._agent_evictions: dict[str, AgentEvictionModel] = {}
         self._agent_transcript_viewer: AgentTranscriptViewer | None = None
@@ -2333,7 +2331,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if isinstance(event, AgentsUpdate):
             viewer = self._agent_transcript_viewer
             if viewer is not None and not any(
-                agent.agent_id == viewer._agent_id for agent in event.agents
+                agent.agent_id == viewer.agent_id for agent in event.agents
             ):
                 # Releases remove the agent from published summaries. Evictions
                 # remain tombstones in that list and therefore stay browsable.
@@ -2353,10 +2351,21 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 if agent_id in evicted_agent_ids
             }
             if self._agent_bar is not None:
-                self._agent_bar.update_agents(event.agents)
-            if self._agent_sidebar is not None:
-                self._agent_sidebar.update_agents(
+                self._agent_bar.update_agents(
                     event.agents, tuple(self._agent_evictions.values())
+                )
+            viewer = self._agent_transcript_viewer
+            if viewer is not None:
+                selected = next(
+                    (
+                        agent
+                        for agent in event.agents
+                        if agent.agent_id == viewer.agent_id
+                    ),
+                    None,
+                )
+                viewer.set_live(
+                    selected is not None and agent_state(selected) == "running"
                 )
             return
         if isinstance(event, TurnQueueUpdated):
@@ -2416,6 +2425,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     await self._resume_ui_ready.wait()
                     async with self._app_server_event_handler_lock:
                         if isinstance(event, TurnStarted):
+                            await self._prepare_main_turn_view()
                             # The in-flight turn surfaced: leave the pending state and
                             # wake any interrupt waiting for it.
                             self._clear_pending_turn()
@@ -2428,6 +2438,13 @@ class ChartreuxApp(App):  # noqa: PLR0904
         except AppServerConnectionClosed:
             if not self._shutdown_started:
                 raise
+
+    async def _prepare_main_turn_view(self) -> None:
+        """Return to the conversation before a newly started main turn streams."""
+        if self._agent_transcript_viewer is not None:
+            await self._close_agent_transcript_viewer(restore_focus=False)
+            if self._chat_input_container is not None:
+                self._chat_input_container.focus_input()
 
     def _turn_ui_lock(self) -> asyncio.Lock:
         if self._turn_ui_mutex is None:
@@ -4391,6 +4408,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if viewer := self._agent_transcript_viewer:
             viewer.action_close()
             return
+        if self._agent_bar is not None and self._agent_bar.expanded:
+            self._agent_bar.action_collapse()
+            return
         if self._app_server is None:
             return
         self._try_interrupt()
@@ -4521,29 +4541,32 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 hooks_count=self.app_server.resources.runtime.hooks_count,
             )
 
-    async def action_toggle_agent_sidebar(self, **kwargs: Any) -> None:
-        if self._agent_sidebar is not None:
-            await self._agent_sidebar.remove()
-            self._agent_sidebar = None
-            if (
-                self._agent_transcript_viewer is None
-                and self._chat_input_container
-                and (input_widget := self._chat_input_container.input_widget)
-            ):
-                input_widget.set_app_focus(True)
-        else:
-            self._agent_sidebar = AgentSidebar()
-            self._agent_sidebar.update_agents(
-                self._agent_summaries, tuple(self._agent_evictions.values())
-            )
-            await self.mount(self._agent_sidebar)
-            await asyncio.sleep(0)
-            self._agent_sidebar.focus_selection()
+    async def action_toggle_agent_browser(self, **kwargs: Any) -> None:
+        if self._agent_bar is None:
+            return
+        self._agent_bar.toggle()
+        if self._agent_bar.expanded:
+            self._agent_bar.focus()
+        elif self._chat_input_container is not None:
+            self._chat_input_container.focus_input()
 
-    async def on_agent_sidebar_transcript_open(
-        self, message: AgentSidebar.TranscriptOpen
+    async def on_agent_bar_selection_requested(
+        self, message: AgentBar.SelectionRequested
     ) -> None:
+        if message.agent_id is None:
+            await self._close_agent_transcript_viewer(restore_focus=True)
+            return
         if self._app_server is None:
+            return
+        agent = next(
+            (
+                item
+                for item in self._agent_summaries
+                if item.agent_id == message.agent_id
+            ),
+            None,
+        )
+        if agent is None:
             return
         await self._close_agent_transcript_viewer(restore_focus=False)
         self._agent_transcript_focus_target = self.screen.focused
@@ -4556,10 +4579,13 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 self._agent_transcript_epoch,
                 self._agent_transcript_parent_id,
             ),
-            message.agent_id,
+            agent.agent_id,
+            profile=agent.profile,
+            live=agent_state(agent) == "running",
         )
         self._agent_transcript_viewer = viewer
-        await self.mount(viewer)
+        self._chat_widget.display = False
+        await self.mount(viewer, before="#loading-area")
         await asyncio.sleep(0)
         viewer.focus()
 
@@ -4576,6 +4602,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._agent_transcript_parent_id = None
         if viewer is not None and viewer.is_mounted:
             await viewer.remove()
+        if self._cached_chat is not None:
+            self._cached_chat.display = True
         if not restore_focus:
             self._agent_transcript_focus_target = None
             return
@@ -4583,8 +4611,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._agent_transcript_focus_target = None
         if target is not None and target.is_mounted:
             self.call_after_refresh(target.focus)
-        elif self._agent_sidebar is not None and self._agent_sidebar.is_mounted:
-            self.call_after_refresh(self._agent_sidebar.focus_selection)
+        elif self._agent_bar is not None and self._agent_bar.expanded:
+            self.call_after_refresh(self._agent_bar.focus)
         elif self._chat_input_container is not None:
             if input_widget := self._chat_input_container.input_widget:
                 input_widget.set_app_focus(True)

@@ -432,7 +432,7 @@ class SkillSummary(ProtocolModel):
     description: str
     prompt: str
     user_invocable: bool = True
-    source: Literal["builtin", "local"] = "local"
+    source: Literal["builtin", "shipped", "local"] = "local"
     scope: Literal["builtin", "global", "project"] = "global"
 
 

@@ -263,3 +263,43 @@ async def test_escape_closes_locally_and_content_is_literal_and_bounded() -> Non
     assert isinstance(post_message.call_args.args[0], AgentTranscriptViewer.Closed)
     event.stop.assert_called_once()
     event.prevent_default.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_live_refresh_after_older_page_resumes_appends_and_scrolls_to_newest() -> (
+    None
+):
+    source = _FakeSource()
+    app = _ViewerApp(source)
+    app.viewer._live = True
+    async with app.run_test(size=(80, 12)) as pilot:
+        await pilot.pause()
+        source.respond(
+            0,
+            _available(
+                *(_entry(str(index), f"entry {index}") for index in range(60)),
+                has_more=True,
+            ),
+        )
+        await pilot.pause()
+        scroll = app.viewer._content_scroll
+        assert scroll is not None and scroll.max_scroll_y > 0
+        assert scroll.scroll_y == scroll.max_scroll_y
+        scroll_y_before_older_page = scroll.scroll_y
+
+        app.viewer.action_older_page()
+        await pilot.pause()
+        assert not app.viewer._on_newest_page
+        source.respond(1, _available(_entry("older", "older")))
+        await pilot.pause()
+        assert scroll.scroll_y == scroll_y_before_older_page
+
+        app.viewer.action_refresh()
+        await pilot.pause()
+        assert app.viewer._on_newest_page
+        source.respond(2, _available(_entry("latest", "latest")))
+        await pilot.pause()
+        app.viewer._append_live_output()
+        await pilot.pause()
+        assert source.requests[-1] == ("agent-1", None, 2)
+        assert scroll.scroll_y == scroll.max_scroll_y

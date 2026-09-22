@@ -87,6 +87,29 @@ def test_task_args_defaults_to_background() -> None:
     assert args.agent_id is None
 
 
+def test_task_args_launch_config_json_string_decodes_before_validation() -> None:
+    args = TaskArgs.model_validate({"task": "inspect", "config": '{"model": "strong"}'})
+
+    assert args.config is not None
+    assert args.config.model == "strong"
+    assert args.config.model_fields_set == {"model"}
+
+
+@pytest.mark.parametrize(
+    ("config", "error"),
+    [
+        ("not JSON", "config must be a valid JSON object"),
+        ("[]", "config JSON must decode to an object"),
+        ("42", "config JSON must decode to an object"),
+    ],
+)
+def test_task_args_rejects_invalid_json_string_launch_config(
+    config: str, error: str
+) -> None:
+    with pytest.raises(ValidationError, match=error):
+        TaskArgs.model_validate({"task": "inspect", "config": config})
+
+
 def test_task_args_launch_config_preserves_supplied_fields() -> None:
     args = TaskArgs.model_validate({
         "task": "inspect",
@@ -116,6 +139,7 @@ def test_task_args_launch_config_preserves_supplied_fields() -> None:
     [
         ({"task": "inspect", "unknown": True}, ("unknown",)),
         ({"task": "inspect", "config": {"hooks": {}}}, ("config", "hooks")),
+        ({"task": "inspect", "config": '{"hooks": {}}'}, ("config", "hooks")),
         (
             {"task": "inspect", "config": {"tools": {"bash": {"denylist": []}}}},
             ("config", "tools", "bash", "denylist"),
@@ -137,6 +161,7 @@ def test_task_args_rejects_unknown_launch_config_fields(
     ("data", "expected_config_fields", "config_supplied"),
     [
         ({"task": "inspect", "config": None}, None, False),
+        ({"task": "inspect", "config": "null"}, None, False),
         ({"task": "inspect", "config": {"model": None}}, set(), True),
     ],
 )

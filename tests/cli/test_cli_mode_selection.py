@@ -64,14 +64,34 @@ def test_piped_prompt_selects_programmatic_mode_before_credentials(
         lambda *, args, stdin_prompt: calls.append(("interactive", stdin_prompt)),
     )
 
-    cli_mod.run_cli(_make_args())
+    args = _make_args()
+    cli_mod.run_cli(args)
 
+    assert args.is_programmatic
     assert calls == [
         "dotenv",
         "bootstrap",
         ("credentials", False),
         ("programmatic", "hello from pipe"),
     ]
+
+
+def test_initial_prompt_reports_programmatic_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sys.stdin", _PipedStdin(""))
+    monkeypatch.setattr(cli_mod, "load_dotenv_values", lambda: None)
+    monkeypatch.setattr(cli_mod, "bootstrap_config_files", lambda: None)
+    monkeypatch.setattr(cli_mod, "load_config_orchestrator_or_exit", lambda: object())
+    monkeypatch.setattr(
+        cli_mod, "require_api_key_or_onboard", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(cli_mod, "_run_programmatic_mode", lambda **_kwargs: None)
+
+    args = _make_args(initial_prompt="initial prompt")
+    cli_mod.run_cli(args)
+
+    assert args.is_programmatic
 
 
 def test_empty_pipe_stays_interactive_after_mode_selection(

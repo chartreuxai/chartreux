@@ -74,16 +74,16 @@ async def test_models_toml_is_the_only_catalog_overlay_and_config_remains_select
 ) -> None:
     catalog_path = tmp_path / "models.toml"
     catalog_path.write_text("""
-[models.glm-5-2]
+[models.glm-5-3]
 thinking = "low"
-[models.glm-5-2.deployments]
+[models.glm-5-3.deployments]
 """)
     # A malformed overlay has a typed catalog error; config.toml is not consulted.
     with pytest.raises(CatalogLoadError):
         load_catalog(catalog_path)
     valid = tmp_path / "valid-models.toml"
-    valid.write_text('[models.glm-5-2]\nthinking = "low"\n')
-    assert load_catalog(valid).catalog.models["glm-5-2"].thinking == "low"
+    valid.write_text('[models.glm-5-3]\nthinking = "low"\n')
+    assert load_catalog(valid).catalog.models["glm-5-3"].thinking == "low"
 
 
 @pytest.mark.parametrize("field", ["models", "providers"])
@@ -160,7 +160,7 @@ async def test_project_discovery_write_keeps_selection_authority_at_discovered_f
         default_layer_resolver=lambda: project,
     )
     assert orch.config.theme == "ancestor"
-    assert not await orch.set_field("/active_model", "glm-5-2")
+    assert not await orch.set_field("/active_model", "glm-5-3")
     assert "active_model" in ancestor.read_text()
     assert not (child / ".chartreux").exists()
 

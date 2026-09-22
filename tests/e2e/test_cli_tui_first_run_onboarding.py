@@ -34,7 +34,7 @@ def _select_option_with_keyboard(
 ) -> None:
     """Select the named picker row without relying on catalog sort position."""
     wait_for_rendered_text(child, captured, "Labels identify deployments;", timeout=10)
-    child.send("\x1b[F")
+    child.send("k" * 9)
     drain_child_output(child, idle_sleep=0.03)
     assert option_text in strip_ansi(captured.getvalue())
     child.send("\r")
@@ -119,7 +119,7 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
         child.send("\x1b[Z")
         child.send("onboarding-mock-model")
         _send_and_wait_for_text(child, "\t\t\r", "Selected models")
-        _send_and_wait_for_text(child, "\t" * 7 + "\r", "Provider saved.")
+        _send_and_wait_for_text(child, "\t" * 6 + "\r", "Provider saved.")
         time.sleep(0.1)
         _send_and_wait_for_text(child, "\r", "Choose Active Model")
         time.sleep(0.1)

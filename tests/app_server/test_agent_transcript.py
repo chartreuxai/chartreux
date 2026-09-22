@@ -16,12 +16,16 @@ from chartreux.app_server._handler import (
     _read_authorized_agent_transcript,
 )
 from chartreux.app_server._session_resources import SessionResource
-from chartreux.app_server._sessions import TranscriptReadSnapshot
+from chartreux.app_server._sessions import (
+    ResidentTranscriptReadSnapshot,
+    TranscriptReadSnapshot,
+)
 from chartreux.app_server.protocol import (
     AgentTranscriptGetResponse,
     AgentTranscriptState,
     ProtocolErrorCode,
 )
+from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session.session_loader import (
     SessionFileContainmentError,
     SessionLoader,
@@ -140,6 +144,16 @@ class _TranscriptSessions:
         self.parent_identity = snapshot.parent_identity
         self.parent_runtime_token = snapshot.parent_runtime_token
         self.released = False
+        self.resident_snapshot: ResidentTranscriptReadSnapshot | None = None
+        self.resident_current = True
+
+    async def resolve_resident_transcript_read(
+        self, _agent_id: str
+    ) -> ResidentTranscriptReadSnapshot | None:
+        return self.resident_snapshot
+
+    async def resident_transcript_read_is_current(self, _snapshot: object) -> bool:
+        return self.resident_current
 
     async def resolve_transcript_read(self, agent_id: str) -> TranscriptReadSnapshot:
         assert agent_id == self.snapshot.agent_id
@@ -186,6 +200,55 @@ def _handler(sessions: _TranscriptSessions) -> CoreRequestHandler:
 
 async def _dispatch(handler: CoreRequestHandler):
     return await handler._dispatch_agent("agent/transcript/get", {"agentId": "agent-1"})
+
+
+@pytest.mark.asyncio
+async def test_transcript_dispatch_uses_current_resident_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sessions = _TranscriptSessions(_snapshot(tmp_path, tmp_path / "child"))
+    sessions.resident_snapshot = ResidentTranscriptReadSnapshot(
+        agent_id="agent-1",
+        child_session_id="child-1",
+        parent_identity=("parent-1", 1),
+        parent_runtime_token=1,
+        record_token=2,
+        runtime_token=3,
+        messages=[
+            LLMMessage(role=Role.system, content="instructions"),
+            LLMMessage(role=Role.assistant, content="live"),
+        ],
+    )
+    monkeypatch.setattr(
+        "chartreux.app_server._handler._read_authorized_agent_transcript",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("used disk source")),
+    )
+
+    result = await _dispatch(_handler(sessions))
+
+    response = cast(AgentTranscriptGetResponse, result.response)
+    assert [entry.display_text for entry in response.entries or []] == ["live"]
+
+
+@pytest.mark.asyncio
+async def test_transcript_dispatch_rejects_stale_resident_snapshot(
+    tmp_path: Path,
+) -> None:
+    sessions = _TranscriptSessions(_snapshot(tmp_path, tmp_path / "child"))
+    sessions.resident_snapshot = ResidentTranscriptReadSnapshot(
+        agent_id="agent-1",
+        child_session_id="child-1",
+        parent_identity=("parent-1", 1),
+        parent_runtime_token=1,
+        record_token=2,
+        runtime_token=3,
+        messages=[],
+    )
+    sessions.resident_current = False
+
+    with pytest.raises(RequestFailure) as exc_info:
+        await _dispatch(_handler(sessions))
+    assert exc_info.value.code is ProtocolErrorCode.CONFLICT
 
 
 @pytest.mark.asyncio

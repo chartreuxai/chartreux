@@ -43,7 +43,6 @@ class MatchOutcome:
 
     kind: Literal[
         "existing",
-        "alias_collision",
         "base_exists_other_provider",
         "occupied_slot",
         "new_model",
@@ -66,7 +65,7 @@ def match_discovered_model(
 ) -> MatchOutcome:
     """Classify one exact wire ID against the effective catalog.
 
-    Exact deployment matches take precedence over aliases.  A caller adding a new
+    Exact deployment matches take precedence. A caller adding a new provider may
     provider may supply its unsaved definition so new-model thinking defaults use
     that provider's backend and API style.
     """
@@ -82,14 +81,6 @@ def match_discovered_model(
         return MatchOutcome(
             "existing", wire_name, matches=matches, existing_base=matches[0].base_name
         )
-
-    alias_bases = tuple(
-        base_name
-        for base_name, definition in catalog.models.items()
-        if wire_name in definition.aliases
-    )
-    if alias_bases:
-        return MatchOutcome("alias_collision", wire_name, existing_base=alias_bases[0])
 
     existing_definition = catalog.models.get(wire_name)
     if existing_definition is not None:

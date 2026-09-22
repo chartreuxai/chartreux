@@ -12,8 +12,8 @@ from tests.conftest import build_test_vibe_config
 
 @pytest.mark.asyncio
 async def test_thinking_overrides_merge_and_materialize_shipped_model() -> None:
-    config = build_test_vibe_config(thinking_overrides={"glm-5-2": "high"})
-    assert config.thinking_overrides == {"glm-5-2": "high"}
+    config = build_test_vibe_config(thinking_overrides={"glm-5-3": "high"})
+    assert config.thinking_overrides == {"glm-5-3": "high"}
     assert config.get_active_model().thinking == "high"
 
 

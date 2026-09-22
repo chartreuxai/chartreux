@@ -365,11 +365,7 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     )
     semantic = _merge_semantic_overrides(accumulated_overrides, config)
     explicit_model = config is not None and "model" in config.model_fields_set
-    explicit_profile = (
-        retained_profile is None
-        and profile_name is not None
-        and "active_model" in profile.overrides
-    )
+    explicit_profile = retained_profile is None and profile.role is not None
     inputs = semantic.model_dump(exclude_unset=True, mode="python")
     # Persona is loop-owned rather than a mutable configuration-layer concern.
     inputs.pop("instructions", None)
@@ -385,7 +381,10 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
             "config", "Authoritative parent configuration assembly is unavailable"
         )
     profile_overrides = None if retained_profile is not None else profile.overrides
-    orchestrator = build_child_orchestrator(source, profile_overrides, inputs)
+    profile_role = None if retained_profile is not None else profile.role
+    orchestrator = build_child_orchestrator(
+        source, profile_overrides, inputs, profile_role=profile_role
+    )
     staged_config = orchestrator.config
     profile_prompt = staged_config.system_prompt_id
     if frozen_persona is not None:
@@ -431,7 +430,9 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     # The frozen persona, rather than changed parent/profile defaults, is the
     # prompt identity consumed by both the retained loop and staged renderer.
     inputs["system_prompt_id"] = persona.system_prompt_id
-    orchestrator = build_child_orchestrator(source, profile_overrides, inputs)
+    orchestrator = build_child_orchestrator(
+        source, profile_overrides, inputs, profile_role=profile_role
+    )
     staged_config = orchestrator.config
 
     selected_alias = staged_config.active_model
@@ -484,9 +485,11 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
         else assignment_candidate,
     )
     if selected_thinking is not None:
-        # Tags resolve at assignment; overrides are keyed by their resolved base.
+        # Roles resolve at assignment; overrides are keyed by their resolved base.
         inputs["thinking_overrides"] = {model.alias: selected_thinking}
-        orchestrator = build_child_orchestrator(source, profile_overrides, inputs)
+        orchestrator = build_child_orchestrator(
+            source, profile_overrides, inputs, profile_role=profile_role
+        )
         staged_config = orchestrator.config
         model, identity = _resolved_model(
             staged_config,

@@ -151,12 +151,17 @@ def test_system_prompt_builtin_ids_and_default_are_explicit() -> None:
         "explore",
         "tests",
         "minimal",
+        "worker",
+        "advisor",
+        "reviewer",
     }
     assert ChartreuxConfigSchema.model_fields["system_prompt_id"].annotation is str
     assert ChartreuxConfigSchema.model_fields["system_prompt_id"].default == "cli"
 
 
-@pytest.mark.parametrize("prompt_id", ["cli", "explore", "tests", "minimal"])
+@pytest.mark.parametrize(
+    "prompt_id", ["cli", "explore", "tests", "minimal", "worker", "advisor", "reviewer"]
+)
 def test_explicit_builtin_system_prompt_selection(
     mock_prompts_dirs: tuple[Path, Path], build_config: ConfigBuilder, prompt_id: str
 ) -> None:
@@ -182,8 +187,9 @@ def test_retired_and_utility_ids_are_not_builtin_system_prompts(
 
     assert exc_info.value.setting_name == "system_prompt_id"
     assert exc_info.value.prompt_id == prompt_id
-    assert 'available prompts ("cli", "explore", "tests", "minimal")' in str(
-        exc_info.value
+    assert (
+        'available prompts ("cli", "explore", "tests", "minimal", "worker", "advisor", "reviewer")'
+        in str(exc_info.value)
     )
 
 
@@ -204,6 +210,31 @@ def test_custom_system_prompt_selection_preserves_precedence(
         "  Project custom prompt\n", encoding="utf-8"
     )
     assert config.system_prompt == "Project custom prompt"
+
+
+@pytest.mark.parametrize("prompt_id", ["worker", "advisor", "reviewer"])
+def test_role_prompts_contain_subagent_contract(prompt_id: str) -> None:
+    prompt = load_system_prompt(prompt_id)
+
+    for clause in (
+        "Perform one bounded assignment",
+        "return a structured blocker",
+        "Do not spawn, delegate to, or coordinate nested subagents.",
+        "Never read, modify, create, or disclose `.env` files.",
+        "Preserve unrelated changes",
+        "Validate the result with available, relevant checks when practical.",
+        "Report the files changed, checks actually run and their outcomes",
+    ):
+        assert clause in prompt
+
+
+def test_user_prompt_overrides_builtin_role_prompt_by_id(
+    mock_prompts_dirs: tuple[Path, Path],
+) -> None:
+    _, user_prompts = mock_prompts_dirs
+    (user_prompts / "advisor.md").write_text("User advisor prompt", encoding="utf-8")
+
+    assert load_system_prompt("advisor") == "User advisor prompt"
 
 
 def test_bundled_file_alone_does_not_make_system_prompt_selectable(

@@ -111,6 +111,7 @@ class QueueController:
         self._ports = ports
         self._server_queue = PublicTurnQueue()
         self._merged: _MergedTurn | None = None
+        self._restored: list[_MergedTurn] = []
         # Optimistic prompts sent while idle: rendered as normal messages and
         # promoted immediately, so they own their own queue item and never merge.
         self._optimistic: dict[str, _Pending] = {}
@@ -134,14 +135,15 @@ class QueueController:
 
     @property
     def has_removable(self) -> bool:
-        return self._merged is not None and bool(self._merged.entries)
+        return any(block.entries for block in self._blocks())
 
     def __bool__(self) -> bool:
-        return self._merged is not None or bool(self._optimistic)
+        return bool(self._blocks()) or bool(self._optimistic)
 
     def __len__(self) -> int:
-        merged = len(self._merged.entries) if self._merged is not None else 0
-        return merged + len(self._optimistic)
+        return sum(len(block.entries) for block in self._blocks()) + len(
+            self._optimistic
+        )
 
     def pin_target(self, messages_area: Widget) -> Widget | None:
         target: Widget | None = self._header
@@ -199,8 +201,9 @@ class QueueController:
             # item does not mean the prompt was discarded. ``turn_started`` clears
             # a promoted block and ``clear_server_queue`` clears a reset one.
             known = set(self._optimistic)
-            if self._merged is not None and self._merged.item_id is not None:
-                known.add(self._merged.item_id)
+            known.update(
+                block.item_id for block in self._blocks() if block.item_id is not None
+            )
             for item in queue.items:
                 if item.id in known:
                     continue
@@ -223,10 +226,13 @@ class QueueController:
             widgets: list[UserMessage] = []
             if self._merged is not None:
                 widgets.extend(entry.widget for entry in self._merged.entries)
+            for restored in self._restored:
+                widgets.extend(entry.widget for entry in restored.entries)
             widgets.extend(pending.widget for pending in self._optimistic.values())
 
             self._server_queue = PublicTurnQueue()
             self._merged = None
+            self._restored.clear()
             self._optimistic.clear()
 
             removed: set[int] = set()
@@ -245,14 +251,15 @@ class QueueController:
 
     async def pop_last(self) -> bool:
         async with self._lock:
-            merged = self._merged
-            if merged is None or not merged.entries:
+            blocks = self._blocks()
+            if not blocks:
                 return False
+            merged = blocks[-1]
             if merged.item_id is not None and self._ports.turn_has_started(
                 merged.item_id
             ):
                 return False
-            return await self._drop_entry_locked(len(merged.entries) - 1)
+            return await self._drop_entry_locked(merged, len(merged.entries) - 1)
 
     async def steer_pending(self) -> bool:
         """Send the queued prompts into the active turn as steering.
@@ -334,16 +341,15 @@ class QueueController:
 
     async def pop_at(self, index: int) -> bool:
         async with self._lock:
-            merged = self._merged
-            if merged is None:
+            located = self._entry_at(index)
+            if located is None:
                 return False
-            if index < 0 or index >= len(merged.entries):
-                return False
+            merged, entry_index = located
             if merged.item_id is not None and self._ports.turn_has_started(
                 merged.item_id
             ):
                 return False
-            return await self._drop_entry_locked(index)
+            return await self._drop_entry_locked(merged, entry_index)
 
     async def update_prompt(
         self,
@@ -353,24 +359,23 @@ class QueueController:
         prepared_prompt: PreparedPrompt | None = None,
     ) -> bool:
         async with self._lock:
-            merged = self._merged
-            if merged is None:
+            located = self._entry_at(queue_index)
+            if located is None:
                 return False
-            if queue_index < 0 or queue_index >= len(merged.entries):
-                return False
+            merged, entry_index = located
             if merged.item_id is not None and self._ports.turn_has_started(
                 merged.item_id
             ):
                 await self._turn_started_locked(merged.item_id)
                 return False
-            entry = merged.entries[queue_index]
+            entry = merged.entries[entry_index]
             edited = _MergedEntry(
                 replace(entry.prompt, content=content, prepared_prompt=prepared_prompt),
                 entry.widget,
             )
             candidate = list(merged.entries)
-            candidate[queue_index] = edited
-            if not await self._replace_entries_locked(candidate):
+            candidate[entry_index] = edited
+            if not await self._replace_entries_locked(candidate, merged):
                 return False
             entry.widget.update_content(content)
             self._push_loading_queue_count()
@@ -385,8 +390,20 @@ class QueueController:
 
     # -- internal helpers (all run under ``self._lock``) -------------------
 
+    def _blocks(self) -> list[_MergedTurn]:
+        return [*([self._merged] if self._merged is not None else []), *self._restored]
+
     def _entries(self) -> list[_MergedEntry]:
-        return list(self._merged.entries) if self._merged is not None else []
+        return [entry for block in self._blocks() for entry in block.entries]
+
+    def _entry_at(self, index: int) -> tuple[_MergedTurn, int] | None:
+        if index < 0:
+            return None
+        for block in self._blocks():
+            if index < len(block.entries):
+                return block, index
+            index -= len(block.entries)
+        return None
 
     async def _enqueue_optimistic(self, prompt: _QueuedPrompt) -> None:
         images = (
@@ -512,27 +529,26 @@ class QueueController:
             await self._turn_started_locked(queued_turn.id)
         self._push_loading_queue_count()
 
-    async def _drop_entry_locked(self, index: int) -> bool:
-        merged = self._merged
-        if merged is None:
-            return False
+    async def _drop_entry_locked(self, merged: _MergedTurn, index: int) -> bool:
         entry = merged.entries[index]
         if len(merged.entries) == 1:
-            return await self._remove_merged_locked()
+            return await self._remove_merged_locked(merged)
         candidate = [e for i, e in enumerate(merged.entries) if i != index]
-        if not await self._replace_entries_locked(candidate):
+        if not await self._replace_entries_locked(candidate, merged):
             return False
         await entry.widget.remove()
         self._push_loading_queue_count()
         return True
 
-    async def _replace_entries_locked(self, entries: list[_MergedEntry]) -> bool:
-        merged = self._merged
+    async def _replace_entries_locked(
+        self, entries: list[_MergedEntry], merged: _MergedTurn | None = None
+    ) -> bool:
+        merged = merged or self._merged
         if merged is None:
             return False
         if merged.item_id is None:
             merged.entries = entries
-            self._relink_merged()
+            self._relink_merged(merged)
             return True
         queued_turn = await self._ports.replace_queued_turn(
             merged.item_id,
@@ -543,37 +559,34 @@ class QueueController:
         self._server_queue = self._ports.current_turn_queue().model_copy(deep=True)
         if queued_turn is not None:
             merged.entries = entries
-            self._relink_merged()
+            self._relink_merged(merged)
             return True
         # not_found: the item started or was removed.
         if self._ports.turn_has_started(merged.item_id):
             await self._turn_started_locked(merged.item_id)
         else:
-            await self._discard_merged()
+            await self._discard_merged(merged)
         self._push_loading_queue_count()
         return False
 
-    async def _remove_merged_locked(self) -> bool:
-        merged = self._merged
-        if merged is None:
-            return False
+    async def _remove_merged_locked(self, merged: _MergedTurn) -> bool:
         if merged.item_id is None:
-            await self._discard_merged()
+            await self._discard_merged(merged)
             self._push_loading_queue_count()
             return True
         removed = await self._ports.remove_queued_turn(merged.item_id)
         self._server_queue = self._ports.current_turn_queue().model_copy(deep=True)
         if not removed or self._ports.turn_has_started(merged.item_id):
             return False
-        await self._discard_merged()
+        await self._discard_merged(merged)
         self._push_loading_queue_count()
         return True
 
-    async def _discard_merged(self) -> None:
-        merged = self._merged
-        if merged is None:
-            return
-        self._merged = None
+    async def _discard_merged(self, merged: _MergedTurn) -> None:
+        if merged is self._merged:
+            self._merged = None
+        else:
+            self._restored.remove(merged)
         for entry in merged.entries:
             await entry.widget.remove()
         await self._remove_header_if_empty()
@@ -587,12 +600,17 @@ class QueueController:
             await self._reset_header_position()
             self._push_loading_queue_count()
             return
-        merged = self._merged
-        if merged is None or merged.item_id != queue_item_id:
+        merged = next(
+            (block for block in self._blocks() if block.item_id == queue_item_id), None
+        )
+        if merged is None:
             return
         for entry in merged.entries:
             await entry.widget.set_pending(False)
-        self._merged = None
+        if merged is self._merged:
+            self._merged = None
+        else:
+            self._restored.remove(merged)
         await self._reset_header_position()
         self._push_loading_queue_count()
 
@@ -625,9 +643,15 @@ class QueueController:
         )
         merged = self._merged
         if merged is not None:
-            await self._ports.mount_and_scroll(widget, after=self._last_widget())
-            merged.entries.append(_MergedEntry(prompt, widget))
-            self._relink_merged()
+            restored = _MergedTurn(
+                entries=[_MergedEntry(prompt, widget)],
+                message_entry_id=user_entry.entry_id or str(uuid4()),
+                item_id=queued_turn.id,
+            )
+            after = self._last_widget()
+            await self._ports.mount_and_scroll(widget, after=after)
+            self._restored.append(restored)
+            self._relink_merged(restored)
             return
 
         self._merged = _MergedTurn(
@@ -652,7 +676,7 @@ class QueueController:
             images=images or None,
         )
 
-    def _relink_merged(self) -> None:
+    def _relink_merged(self, merged: _MergedTurn | None = None) -> None:
         """Render the merged prompts as one visual block.
 
         Each queued prompt keeps its own widget, but consecutive prompts in the
@@ -661,14 +685,15 @@ class QueueController:
         legacy queued-prompt rendering) even though they stay individually
         selectable, editable, and removable.
         """
-        if self._merged is None:
+        merged = merged or self._merged
+        if merged is None:
             return
-        widgets = [entry.widget for entry in self._merged.entries]
+        widgets = [entry.widget for entry in merged.entries]
         last = len(widgets) - 1
         # The merged turn has one server history entry. Only the first widget
         # is rewindable; re-assign so popping the oldest prompt does not lose
         # the id (later widgets are mounted with history_entry_id=None).
-        rewind_id = self._merged.message_entry_id
+        rewind_id = merged.message_entry_id
         for index, widget in enumerate(widgets):
             widget.set_follows_previous(index > 0)
             widget.set_show_separator(index == last)
@@ -696,13 +721,15 @@ class QueueController:
         return images
 
     def _last_widget(self) -> UserMessage | QueueHeaderMessage | None:
-        if self._merged is not None and self._merged.entries:
-            return self._merged.entries[-1].widget
+        blocks = self._blocks()
+        if blocks and blocks[-1].entries:
+            return blocks[-1].entries[-1].widget
         return self._header
 
     def _first_pending_widget(self) -> UserMessage | None:
-        if self._merged is not None and self._merged.entries:
-            return self._merged.entries[0].widget
+        blocks = self._blocks()
+        if blocks and blocks[0].entries:
+            return blocks[0].entries[0].widget
         if self._optimistic:
             return next(iter(self._optimistic.values())).widget
         return None

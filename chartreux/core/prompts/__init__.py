@@ -25,6 +25,9 @@ class SystemPrompt(Prompt):
     EXPLORE = auto()
     TESTS = auto()
     MINIMAL = auto()
+    WORKER = auto()
+    ADVISOR = auto()
+    REVIEWER = auto()
 
 
 class UtilityPrompt(Prompt):

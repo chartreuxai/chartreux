@@ -13,15 +13,13 @@ def test_existing_deployment_reuses_its_base() -> None:
     assert outcome.matches[0].deployment.name == "zai-glm-5-3"
 
 
-def test_shipped_aliases_never_become_new_bases() -> None:
-    for wire_name, base_name in (
-        ("zai-glm-5-3", "glm-5-3"),
-        ("mistral-small-latest", "mistral-small"),
-    ):
+def test_former_alias_wire_names_become_new_model_proposals() -> None:
+    for wire_name in ("zai-glm-5", "zai-glm-latest"):
         outcome = match_discovered_model(SHIPPED_CATALOG, "new/default", wire_name)
 
-        assert outcome.kind == "alias_collision"
-        assert outcome.existing_base == base_name
+        assert outcome.kind == "new_model"
+        assert outcome.proposed is not None
+        assert outcome.proposed.base_name == wire_name
 
 
 def test_new_model_uses_conservative_defaults_and_off_when_allowed() -> None:
@@ -32,7 +30,6 @@ def test_new_model_uses_conservative_defaults_and_off_when_allowed() -> None:
     assert outcome.kind == "new_model"
     assert outcome.proposed is not None
     assert outcome.proposed.definition.thinking == "off"
-    assert outcome.proposed.definition.aliases == ()
     assert outcome.proposed.deployment.prices.input is None
     assert outcome.proposed.deployment.prices.output is None
     assert outcome.proposed.deployment.prices.cached_input is None

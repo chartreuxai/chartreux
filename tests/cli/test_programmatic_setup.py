@@ -427,7 +427,8 @@ def test_programmatic_worktree_is_not_cleaned_up(
     )
     worktree_path: list[Path] = []
 
-    def fake_run_cli(_args: argparse.Namespace, **_kwargs: object) -> None:
+    def fake_run_cli(reported_args: argparse.Namespace, **_kwargs: object) -> None:
+        reported_args.is_programmatic = True
         worktree_path.append(Path.cwd())
         raise SystemExit(0)
 

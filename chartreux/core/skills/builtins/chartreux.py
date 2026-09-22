@@ -31,7 +31,7 @@ agents, prompts, logs, and session data live here.
   trusted_folders.toml # Trust database for project folders
   agents/              # Custom agent profiles (*.toml)
   prompts/             # Custom prompts (*.md)
-  skills/              # User-level skills (each skill is a subdirectory with SKILL.md)
+  skills/              # User-level skills that shadow shipped skills (each skill is a subdirectory with SKILL.md)
   tools/               # Custom tools (<name>.py); descriptions & overrides in tools/prompts/<name>.md
   logs/
     chartreux.log           # Main log file
@@ -115,7 +115,7 @@ folders to see a different set. The explicit `--resume <SESSION_ID>` form is
 **not** folder-scoped: it resolves the session by id regardless of which folder
 it ran in.
 
-Each session commits the resolved base model and concrete provider deployment when it is assigned. On resume, Chartreux validates that stored identity and never re-selects a tag or deployment. An explicit re-task can reconfigure a retained child; `/clear` starts a new conversation that follows the current configuration. An explicit persistent model save changes only its selected user or project layer.
+Each session commits the resolved base model and concrete provider deployment when it is assigned. On resume, Chartreux validates that stored identity and never re-selects a role or deployment. An explicit re-task can reconfigure a retained child; `/clear` starts a new conversation that follows the current configuration. An explicit persistent model save changes only its selected user or project layer.
 
 ## Configuration (config.toml)
 
@@ -135,7 +135,7 @@ An untrusted project config is not loaded. Loading or inspecting persistence is 
 
 Catalog definitions (`models`, `providers`) come from the shipped catalog plus the
 user-owned `models.toml` overlay, not a `config.toml` layer. Project, environment,
-agent-profile, and session sources may select catalog aliases but cannot define
+agent-profile, and session sources may select canonical catalog models or roles but cannot define
 catalogs. `authorized_roots_by_project` is accepted only from an installed user
 layer. General `config/write` cannot grant or change roots; persistent roots must
 be saved explicitly in the user configuration. Session-only `policy/roots/read`
@@ -164,7 +164,7 @@ from `~/.chartreux/prompts/`, and finally from the built-in bundled prompts.
 
 ```toml
 # Model selection
-active_model = "glm-5-2"  # Model alias to select; omit or set "" to follow the catalog default
+active_model = "@orchestrator"  # Canonical model or @role; omit or set "" for the orchestrator role
 
 # UI preferences
 theme = "auto"  # Follow terminal background, then OS light/dark preference
@@ -188,7 +188,7 @@ show_thinking_nodes = false  # Show reasoning/thinking nodes in the UI
 # Behavior
 system_prompt_id = "cli"          # Built-in "cli" or custom .md filename
 compaction_prompt_id = "compact"  # Compaction prompt: built-in "compact" or custom .md filename
-compaction_model = ""             # Catalog alias; empty uses active model, same provider required
+compaction_model = ""             # Canonical model or @role; empty uses active model, same provider required
 enable_notifications = true
 enable_system_trust_store = false  # Use OS trust store for outbound HTTPS
 api_timeout = 720.0               # API request timeout in seconds
@@ -221,7 +221,7 @@ Chartreux does not create product analytics or OpenTelemetry spans, configure te
 
 ### Model Catalog
 
-Providers, models, and tags live in `~/.chartreux/models.toml` (or
+Providers, models, and roles live in `~/.chartreux/models.toml` (or
 `$CHARTREUX_HOME/models.toml`), a sparse user overlay on the shipped catalog.
 `config.toml` contains selections such as `active_model`; it cannot define catalog
 tables. If a legacy `config.toml` contains `providers` or `models` tables, run
@@ -666,9 +666,11 @@ scope checks remain enforced.
 
 ### Subagents
 
-- **worker**: General-purpose neutral subagent preset. It has no model, tool, or persona overrides and inherits the parent configuration.
+- **worker**: General-purpose subagent bound to `@small-worker` with the `worker` role prompt.
+- **advisor**: Independent, read-only advisor bound to `@advisor` with the `advisor` role prompt. Its tools are limited to `read_file`, `grep`, `web_search`, and `web_fetch`, and its TTL is `0`.
+- **reviewer**: Independent, read-only reviewer bound to `@medium-reviewer` with the `reviewer` role prompt.
 
-Use `task` to launch a subagent. Profiles are presets: the orchestrator can choose a configured model alias, predefined system prompt, inline instructions, tools, and thinking for an individual launch, but never beyond the parent authority ceiling. Per-call configuration is not written to `config.toml`; committed child launch state is retained in child-session metadata and revalidated fail-closed on resume. For a bounded design, feature, or review loop,
+Use `task` to launch a subagent. Profiles are presets: the orchestrator can choose a configured canonical model or role, predefined system prompt, inline instructions, tools, and thinking for an individual launch, but never beyond the parent authority ceiling. Per-call configuration is not written to `config.toml`; committed child launch state is retained in child-session metadata and revalidated fail-closed on resume. For a bounded design, feature, or review loop,
 keep the engagement cast — advisors, planner, implementors, and reviewers —
 resident while exchanging findings, requirements, and plan updates between them.
 Background launches return stable `agent_id` and per-invocation `run_id` handles.
@@ -710,8 +712,14 @@ subagents. Custom subagents are TOML files in `~/.chartreux/agents/NAME.toml`.
 - `/log-level` - Show the effective log-level chain (session, environment,
   configuration, effective).
 - `/debug` - Toggle debug console
-- `/agents` - Toggle the Background Agents sidebar showing retained background
-  subagents, their profiles, task summaries, availability, and run status
+- `/agents` - Toggle the expanded Background Agents list above the input. The
+  statusline summarizes agent states; the list shows retained subagents, their
+  profiles, task summaries, availability, run status, model, turns used, run ID,
+  and idle/TTL information. Select an agent to open its bordered transcript pane;
+  running agents refresh live about once per second. Use Up/Down and Enter or
+  mouse selection, PageUp for older pages, `r` to refresh, and Escape (or the
+  Main agent entry) to return to the conversation. `Ctrl+Shift+A` is the keyboard
+  shortcut for the same toggle.
 - `/compact` - Compact model context by summarizing. The session ID and visible
   conversation stay intact; the auto title is refreshed to reflect the
   compacted conversation (unless renamed manually).
@@ -867,11 +875,16 @@ Detailed instructions for the model...
 
 ### Skill Search Order (first match wins)
 
-1. `skill_paths` from config.toml
-2. `.chartreux/skills/` in trusted project directory
-3. `.agents/skills/` in trusted project directory
-4. `~/.chartreux/skills/` (user global)
-5. `~/.agents/skills/` (user global, Agent Skills standard)
+1. Python built-in skills (reserved names; cannot be overridden)
+2. `skill_paths` from config.toml
+3. Skills shipped with Chartreux
+4. `.chartreux/skills/` in trusted project directory
+5. `.agents/skills/` in trusted project directory
+6. `~/.chartreux/skills/` (user global)
+7. `~/.agents/skills/` (user global, Agent Skills standard)
+
+Configured, project, and user skills can shadow a shipped skill. Python built-in
+skill names remain reserved.
 
 ### Invoking Skills
 

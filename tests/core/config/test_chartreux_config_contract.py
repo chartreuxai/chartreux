@@ -12,7 +12,7 @@ from chartreux.core.config.layers.overrides import OverridesLayer
 async def test_shipped_catalog_is_attached_to_merged_config() -> None:
     config = (await build_default_orchestrator()).config
     assert config.catalog_snapshot is not None
-    assert config.get_active_model().alias == "glm-5-2"
+    assert config.get_active_model().alias == "glm-5-3"
 
 
 @pytest.mark.asyncio

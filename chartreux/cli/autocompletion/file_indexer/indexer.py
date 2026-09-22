@@ -94,7 +94,19 @@ class FileIndexer:
             return []
 
         if self._should_enable_watcher():
+            was_watching = self._watcher.is_watching
             self._watcher.start(resolved_root)
+            if not was_watching:
+                with self._lock:
+                    is_git_backed = self._store.is_git_backed
+                    if is_git_backed:
+                        # A filesystem event could have occurred before the watcher
+                        # started. Defer the expensive git catalog refresh until the
+                        # next index request rather than eagerly rebuilding here.
+                        self._store.mark_dirty()
+                if not is_git_backed:
+                    self._start_background_rebuild(resolved_root)
+                    self._wait_for_rebuild(resolved_root, should_cancel)
         else:
             self._watcher.stop()
 

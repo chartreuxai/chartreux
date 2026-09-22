@@ -82,7 +82,7 @@ class FlowHost(App[ProviderFlowResult | None]):
 def snapshot(
     *,
     models: dict[str, object] | None = None,
-    tags: dict[str, list[str]] | None = None,
+    roles: dict[str, object] | None = None,
     providers: dict[str, object] | None = None,
 ) -> CatalogSnapshot:
     catalog = ModelCatalog.model_validate({
@@ -96,7 +96,7 @@ def snapshot(
             },
         },
         "models": models or {},
-        "tags": tags or {},
+        "roles": roles or {},
     })
     return CatalogSnapshot(catalog, "test")
 
@@ -335,7 +335,7 @@ async def test_searchable_selection_filters_500_models_and_commits_filtered_wire
 
 
 @pytest.mark.asyncio
-async def test_optional_details_aliases_and_tag_membership_are_committed() -> None:
+async def test_optional_details_and_role_membership_are_committed() -> None:
     catalog = snapshot(
         models={
             "first": {
@@ -345,7 +345,12 @@ async def test_optional_details_aliases_and_tag_membership_are_committed() -> No
                 "deployments": [{"provider": "example/default", "name": "second"}]
             },
         },
-        tags={"preferred": ["first", "second"]},
+        roles={
+            "preferred": {
+                "description": "preferred models",
+                "models": ["first", "second"],
+            }
+        },
     )
     flow, services = make_flow(catalog=catalog)
     flow._apply_preset("mistral")
@@ -355,8 +360,7 @@ async def test_optional_details_aliases_and_tag_membership_are_committed() -> No
         flow._show("review")
         await pilot.pause()
         flow.query_one("#input-price", Input).value = "0"
-        flow.query_one("#aliases", Input).value = "third-alias"
-        flow.query_one("#tags", Input).value = "preferred"
+        flow.query_one("#roles", SelectionList).select("preferred")
         flow._save_details()
         await pilot.pause()
         flow._commit()
@@ -364,12 +368,12 @@ async def test_optional_details_aliases_and_tag_membership_are_committed() -> No
     changes = services.changes[0]
     deployment = changes.models["third"]["deployments"][0]  # type: ignore[index]
     assert deployment["prices"] == {"input": 0.0}
-    assert changes.models["third"]["aliases"] == ["third-alias"]
-    assert changes.tags is not None and changes.tags["preferred"] == (
-        "first",
-        "second",
-        "third",
-    )
+    assert changes.roles == {
+        "preferred": {
+            "description": "preferred models",
+            "models": ["first", "second", "third"],
+        }
+    }
 
 
 @pytest.mark.asyncio
@@ -385,12 +389,11 @@ async def test_masked_credentials_never_render_key_value() -> None:
         assert "never-visible-secret" not in str(flow.render())
 
 
-def test_match_state_rendering_covers_existing_alias_occupied_and_multiple() -> None:
+def test_match_state_rendering_covers_existing_occupied_and_multiple() -> None:
     catalog = snapshot(
         models={
             "configured": {
-                "aliases": ["zai-glm-5-3"],
-                "deployments": [{"provider": "example/default", "name": "existing"}],
+                "deployments": [{"provider": "example/default", "name": "existing"}]
             },
             "occupied": {
                 "deployments": [{"provider": "example/default", "name": "old-wire"}]
@@ -411,15 +414,12 @@ def test_match_state_rendering_covers_existing_alias_occupied_and_multiple() -> 
         "",
         None,
     )
-    assert (
-        flow._model_label(DiscoveryItem("existing")) == "existing\taliases: zai-glm-5-3"
-    )
-    assert flow._configured_base(DiscoveryItem("zai-glm-5-3")) == "configured"
+    assert flow._model_label(DiscoveryItem("existing")) == "existing\tconfigured"
+    assert flow._configured_base(DiscoveryItem("zai-glm-5-3")) is None
     assert flow._configured_base(DiscoveryItem("occupied")) is None
     assert flow._configured_base(DiscoveryItem("same")) is None
     flow.discovered = (
         DiscoveryItem("existing"),
-        DiscoveryItem("zai-glm-5-3"),
         DiscoveryItem("text-embedding-3-small"),
         DiscoveryItem("voxtral-mini"),
     )
@@ -432,15 +432,14 @@ async def test_final_picker_uses_expressions_and_shows_disabled_entries() -> Non
     catalog = snapshot(
         models={
             "usable": {
-                "aliases": ["u"],
-                "deployments": [{"provider": "example/default", "name": "wire"}],
+                "deployments": [{"provider": "example/default", "name": "wire"}]
             },
             "disabled": {
                 "disabled": True,
                 "deployments": [{"provider": "example/default", "name": "off"}],
             },
         },
-        tags={"preferred": ["usable"]},
+        roles={"preferred": {"description": "preferred models", "models": ["usable"]}},
     )
     flow, _ = make_flow(catalog=catalog)
     async with FlowHost(flow).run_test() as pilot:
@@ -492,3 +491,43 @@ async def test_mistral_shared_key_confirmation_preserves_entered_key() -> None:
     assert host.results == [
         ProviderFlowResult("completed", "mistral-wire", changed=True)
     ]
+
+
+@pytest.mark.asyncio
+async def test_multiple_match_collision_preserves_selected_base_role_memberships() -> (
+    None
+):
+    catalog = snapshot(
+        models={
+            "first": {
+                "deployments": [{"provider": "example/default", "name": "shared-wire"}]
+            },
+            "second": {
+                "deployments": [{"provider": "example/default", "name": "shared-wire"}]
+            },
+        },
+        roles={
+            "first-role": {"description": "first", "models": ["first"]},
+            "second-role": {"description": "second", "models": ["second"]},
+        },
+    )
+    flow, services = make_flow(catalog=catalog)
+    flow._overview_provider_id = "example/default"
+    flow._select_existing_provider()
+    flow.discovered = (DiscoveryItem("shared-wire"),)
+    async with FlowHost(flow).run_test() as pilot:
+        flow._show("models")
+        await wait_for(pilot, lambda: bool(flow.query("#models")))
+        flow.query_one("#models", SelectionList).select("shared-wire")
+        flow._save_model_selection()
+        await wait_for(pilot, lambda: bool(flow.query("#collision-choice")))
+        flow.query_one("#collision-choice", Select).value = "second"
+        await wait_for(
+            pilot,
+            lambda: flow.query_one("#roles", SelectionList).selected == ["second-role"],
+        )
+        assert flow.query_one("#roles", SelectionList).selected == ["second-role"]
+        flow._commit()
+        await wait_for(pilot, lambda: flow.step == "again")
+
+    assert services.changes[0].roles is None

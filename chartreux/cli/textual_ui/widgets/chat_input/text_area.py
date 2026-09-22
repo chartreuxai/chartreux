@@ -183,10 +183,10 @@ class ChatTextArea(TextArea):
             self.focus()
 
     def _agent_browser_has_focus(self) -> bool:
-        """Leave focus with the agent sidebar or transcript overlay."""
+        """Leave focus with the agent browser or transcript pane."""
         focused = self.app.screen.focused
         return focused is not None and focused.id in {
-            "agent-sidebar",
+            "agent-bar",
             "agent-transcript-viewer",
         }
 

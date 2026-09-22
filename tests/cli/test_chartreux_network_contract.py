@@ -51,7 +51,7 @@ def test_cli_real_provider_and_direct_mcp_without_product_services(
                     ]
                 }
             },
-            "tags": {},
+            "roles": {},
         }),
         encoding="utf-8",
     )

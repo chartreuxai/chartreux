@@ -146,6 +146,8 @@ _SHIPPED_RESOURCE_PATHS = {
     "chartreux/core/tools/builtins/prompts/write_file.md",
     "chartreux/core/skills/builtins/chartreux.py",
     "chartreux/core/skills/builtins/skill_creator.py",
+    "chartreux/skills/main-debugging/SKILL.md",
+    "chartreux/skills/workspace/SKILL.md",
     "chartreux/cli/textual_ui/app.tcss",
     "chartreux/setup/onboarding/onboarding.tcss",
     "chartreux/setup/trusted_folders/trust_folder_dialog.tcss",
@@ -881,8 +883,8 @@ assert source.parent.name == "chartreux"
 assert importlib.util.find_spec("vibe") is None
 assert all(not str(file).replace("\\\\", "/").startswith("vibe/") for file in (dist.files or ()))
 assert dist.metadata["Name"] == "chartreux"
-assert chartreux.__version__ == "0.1.0"
-assert dist.version == "0.1.0"
+assert chartreux.__version__ == "0.1.1"
+assert dist.version == "0.1.1"
 assert Path(dist._path).resolve().is_relative_to(prefix)
 assert all(
     not Path(entry).resolve().is_relative_to(source_root)
@@ -937,7 +939,7 @@ print({
     for executable in (cli, acp):
         version = _run(executable, ["--version"], cwd=root, env=env)
         assert version.returncode == 0, version.stderr
-        assert version.stdout.strip() == f"{executable.name} 0.1.0"
+        assert version.stdout.strip() == f"{executable.name} 0.1.1"
         _assert_no_secret_output(guard, version.stdout, version.stderr)
     negative_guard = root / "identity-negative-network-guard"
     negative_helper = root / "identity-negative-helper"

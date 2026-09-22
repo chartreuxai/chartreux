@@ -25,7 +25,6 @@ api_style = "openai"
 backend = "generic"
 
 [models."example-model"]
-aliases = ["example"]
 thinking = "medium"
 
 [[models."example-model".deployments]]
@@ -34,8 +33,9 @@ name = "example-model-v1"
 supports_images = false
 supported_thinking_levels = ["low", "medium", "high"]
 
-[tags]
-reviewers = ["example-model"]
+[roles.reviewers]
+description = "Models used for independent review"
+models = ["example-model"]
 ```
 
 Provider definitions may supply extra headers and mark an endpoint as not emitting a finish reason. A model definition has semantic defaults and one or more deployments. A deployment identifies the provider-specific wire name and can declare image support, supported thinking levels, compaction threshold, and prices. Disable a retained provider, model, or deployment with `disabled = true`.
@@ -48,17 +48,19 @@ Give one base model deployments at more than one provider to represent the same 
 
 Authentication, billing, quota, invalid-request, context, and cancellation failures do not fail over. Cooldowns are held in memory and respect longer retry hints. Automatic retry occurs only before any content, reasoning, or tool-call output is exposed; after partial output, use `/retry`.
 
-## Selecting models, tags, and roles
+## Selecting models and roles
 
-`active_model` and `compaction_model` accept a canonical base name, a unique alias, or a tag expression such as `@reviewers`:
+`active_model` and `compaction_model` accept a canonical base name or a role expression such as `@reviewers`. An empty `active_model` selects `@orchestrator`:
 
 ```toml
-active_model = "example"
-compaction_model = "@reviewers"
+active_model = "@reviewers"
+compaction_model = "example-model"
 allowed_models = ["example-model"]
 ```
 
-A tag is an ordered list of base models. It chooses an eligible member when assigned. For fan-out subagent work, `task(..., fan_out: true, config: {model: "@tag"})` requires an explicit tag, checks every member in advance, and returns results in member order without replacing or cancelling siblings. A session or retained child preserves its committed model/provider identity on resume instead of resolving the tag again. See [Subagents](subagents.md).
+A role is an ordered list of canonical base models with a description. Normal resolution chooses its first eligible member. For fan-out subagent work, `task(..., fan_out: true, config: {model: "@role"})` requires an explicit role, checks every member in advance, and returns results in member order without replacing or cancelling siblings. A session or retained child preserves its committed model/provider identity on resume instead of resolving the role again; changing a role does not change that committed identity when the agent is reused within a session; on cross-restart resume a role-bound agent re-resolves its role.
+
+Built-in roles ship with the catalog and can be patched one role at a time in `models.toml`. Custom roles are TOML-only: define `[roles.<name>]` with `description` and `models`; v1 has no role-creation UI. The model edit screen lists every role as a checkbox. Existing members keep their order, while a newly checked model is appended; unchecking and rechecking a model therefore appends it to the end. See [Subagents](subagents.md).
 
 ## Thinking levels
 

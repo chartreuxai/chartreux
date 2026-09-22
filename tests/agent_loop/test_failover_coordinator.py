@@ -63,7 +63,7 @@ def _snapshot(*, compaction: bool = False) -> CatalogSnapshot:
                 "test/second": {"api_base": "https://second.invalid"},
             },
             "models": models,
-            "tags": {},
+            "roles": {},
         }),
         "test-revision",
     )
@@ -109,7 +109,7 @@ def _thinking_agent() -> AgentLoop:
                     ]
                 },
             },
-            "tags": {},
+            "roles": {},
         }),
         "test-revision",
     )
@@ -165,7 +165,7 @@ def test_compaction_failover_uses_compactor_thinking_not_conversation_model() ->
                     "thinking": "off",
                 },
             },
-            "tags": {},
+            "roles": {},
         }),
         "test-revision",
     )
@@ -203,7 +203,7 @@ async def test_compaction_fallback_respects_deployment_thinking_narrowing() -> N
                     "thinking": "high",
                 },
             },
-            "tags": {},
+            "roles": {},
         }),
         "test-revision",
     )
@@ -242,7 +242,7 @@ def test_failover_projects_only_current_request_context_for_image_compatibility(
                     ]
                 }
             },
-            "tags": {},
+            "roles": {},
         }),
         "test-revision",
     )
@@ -296,7 +296,7 @@ def _image_compatibility_agent(*, vision_available: bool) -> AgentLoop:
                     ]
                 }
             },
-            "tags": {},
+            "roles": {},
         }),
         "test-revision",
     )

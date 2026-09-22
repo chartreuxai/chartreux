@@ -76,14 +76,12 @@ class ChatInputContainer(Vertical):
         self._queue_selected_index_getter = queue_selected_index_getter
         self._custom_border_label: str | None = None
 
+        self._path_completer = PathCompleter(
+            watcher_enabled_getter=self._file_watcher_for_autocomplete_getter
+        )
         self._completion_manager = MultiCompletionManager([
             SlashCommandController(CommandCompleter(self._get_slash_entries), self),
-            PathCompletionController(
-                PathCompleter(
-                    watcher_enabled_getter=self._file_watcher_for_autocomplete_getter
-                ),
-                self,
-            ),
+            PathCompletionController(self._path_completer, self),
             InlineSkillCompletionController(
                 self._skill_entries_getter or (lambda: []),
                 self,
@@ -128,6 +126,9 @@ class ChatInputContainer(Vertical):
         if self._body.input_widget:
             self._body.input_widget.set_completion_manager(self._completion_manager)
             self._body.focus_input()
+
+    def on_unmount(self) -> None:
+        self._path_completer.shutdown()
 
     def on_chat_input_body_completion_reset_requested(
         self, _event: ChatInputBody.CompletionResetRequested

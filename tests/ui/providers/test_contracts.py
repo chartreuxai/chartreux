@@ -33,8 +33,7 @@ def test_draft_preserves_untouched_and_cleared_optional_edits_when_serialized() 
                 "example-model",
                 ModelEdits(
                     input_price=OptionalEdit(),
-                    aliases=OptionalEdit.cleared(),
-                    tags=OptionalEdit.set(("preferred",)),
+                    role_memberships=OptionalEdit.set(("preferred",)),
                 ),
             ),
         ),
@@ -49,7 +48,7 @@ def test_draft_preserves_untouched_and_cleared_optional_edits_when_serialized() 
     assert isinstance(edits, dict)
 
     assert edits["input_price"] == {"state": "untouched", "value": None}
-    assert edits["aliases"] == {"state": "cleared", "value": None}
+    assert edits["role_memberships"] == {"state": "set", "value": ("preferred",)}
     provider = serialized["provider"]
     assert isinstance(provider, dict)
     assert "key" not in provider
@@ -69,7 +68,7 @@ def test_discovery_contract_types_construct_cleanly() -> None:
 
 def test_active_model_contract_accepts_only_v01_expression_shape() -> None:
     assert active_model_expression_is_valid("canonical")
-    assert active_model_expression_is_valid("alias")
+    assert active_model_expression_is_valid("canonical")
     assert active_model_expression_is_valid("@preferred")
     assert not active_model_expression_is_valid("provider/default/wire")
     assert not active_model_expression_is_valid("@")

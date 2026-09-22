@@ -50,7 +50,6 @@ from chartreux.app_server.protocol import (
 )
 from chartreux.app_server.server import AppServer
 from chartreux.app_server.session import AppServerSession
-from chartreux.cli.textual_ui.widgets.agent_sidebar import AgentSidebar
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config import SessionLoggingConfig
@@ -2014,9 +2013,6 @@ async def test_eviction_tombstone_contains_no_runtime_reference() -> None:
     assert "child_session_id" not in preserved_model.model_dump()
     assert "parent_identity" not in preserved_model.model_dump()
     assert not preserved_model.result_expired
-    sidebar = AgentSidebar()
-    sidebar.update_agents((preserved_model,))
-    assert "Evicted: result preserved" in str(sidebar.render())
 
     for index in range(32):
         stored_result = _stored_result(
@@ -2034,8 +2030,6 @@ async def test_eviction_tombstone_contains_no_runtime_reference() -> None:
     assert notification is not None
     expired_model = notification.args[0][0]
     assert expired_model.result_expired
-    sidebar.update_agents((expired_model,))
-    assert "Evicted: result expired" in str(sidebar.render())
     stored = result
     assert set(StoredRunResult.__dataclass_fields__) == {
         "agent_id",
@@ -2078,8 +2072,9 @@ async def test_release_agent_cleans_evicted_results_and_expiry_markers() -> None
     registry._expired_results.add((agent_id, "run-0"))
 
     registry._emit_agents_update = AsyncMock()
-    await registry.release_agent(agent_id)
+    outcome = await registry.release_agent(agent_id)
 
+    assert outcome.value == "evicted"
     assert agent_id not in registry._evicted_agents
     assert not [key for key in registry._result_store if key[0] == agent_id]
     assert not [key for key in registry._expired_results if key[0] == agent_id]
@@ -2260,6 +2255,55 @@ async def test_reaper_evicts_oldest_eligible_agents_with_agent_id_tie_break() ->
 
     assert set(registry._agent_records) == {"agent-c"}
     assert list(registry._evicted_agents) == ["agent-a", "agent-b"]
+
+
+@pytest.mark.asyncio
+async def test_eviction_injects_parent_notification() -> None:
+    clock = _ManualClock(10)
+    registry, root = _reaper_registry(clock, ttl=1)
+    root.turns.active_turn = MagicMock()
+    root.agent_loop._pending_injected_messages = []
+    record = _idle_record("agent-1", clock=clock)
+    record.parent_session_id = "root"
+    record.idle_since = 0
+    registry._agent_records[record.agent_id] = record
+
+    assert await registry._evict_agent(record.agent_id, "ttl")
+
+    messages = root.agent_loop._pending_injected_messages
+    assert len(messages) == 1
+    assert messages[0].content == (
+        "Background agent agent-1 evicted (ttl, idle 10s); "
+        "launch a new agent for further work."
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaper_batches_eviction_parent_notification() -> None:
+    clock = _ManualClock(10)
+    wakeup = _GatedWakeup()
+    registry, root = _reaper_registry(clock, cap=1, wakeup=wakeup)
+    root.turns.active_turn = MagicMock()
+    root.agent_loop._pending_injected_messages = []
+    for agent_id in ("agent-a", "agent-b", "agent-c"):
+        record = _idle_record(agent_id, clock=clock)
+        record.parent_session_id = "root"
+        record.idle_since = 0
+        registry._agent_records[agent_id] = record
+
+    await _rearm(registry)
+    await wakeup.arrivals.get()
+    wakeup.gates[0].set()
+    reaper_task = registry._reaper_task
+    assert reaper_task is not None
+    await asyncio.wait_for(reaper_task, timeout=1)
+
+    messages = root.agent_loop._pending_injected_messages
+    assert len(messages) == 1
+    assert messages[0].content == (
+        "Background agents evicted: agent-a (idle_cap, idle 10s); agent-b "
+        "(idle_cap, idle 10s); launch a new agent for further work."
+    )
 
 
 @pytest.mark.asyncio
@@ -2826,6 +2870,7 @@ async def test_committed_eviction_notification_survives_reaper_rearm() -> None:
     evictions = [task for task in registry._eviction_tasks]
     if evictions:
         await asyncio.gather(*evictions)
+    await asyncio.sleep(0)
 
     assert "first" in registry._evicted_agents
     notify_agents = cast(AsyncMock, registry._notify_agents)
@@ -3037,6 +3082,13 @@ async def test_post_commit_update_failure_does_not_cancel_busy_child(
         )
         assert acknowledgement.agent_id == "agent-1"
         assert acknowledgement.run_id is not None
+        assert acknowledgement.status == "launched"
+        assert acknowledgement.response == (
+            "Background agent launched and running; use check_agents to monitor, "
+            "get_agent_result or wait_for_agent to retrieve the result."
+        )
+        assert acknowledgement.turns_used == 0
+        assert acknowledgement.completed is True
         record = registry._agent_records[acknowledgement.agent_id]
         run = record.current_run
         assert run is not None and run.run_id == acknowledgement.run_id
@@ -3053,6 +3105,7 @@ async def test_post_commit_update_failure_does_not_cancel_busy_child(
         )
         assert result is not None
         assert result.completed is True
+        assert result.status is None
     finally:
         child_release.set()
         await session.close()
@@ -5327,7 +5380,7 @@ async def test_foreground_teardown_fd_count_does_not_grow_across_batches(
 
 
 def _fan_out_snapshot(
-    *, tag_members: list[str], disabled: set[str] | None = None
+    *, role_members: list[str], disabled: set[str] | None = None
 ) -> CatalogSnapshot:
     disabled = disabled or set()
     return CatalogSnapshot(
@@ -5340,6 +5393,9 @@ def _fan_out_snapshot(
                 },
             },
             "models": {
+                "glm-5-3": {
+                    "deployments": [{"provider": "test/first", "name": "glm-5-3-wire"}]
+                },
                 "small": {
                     "disabled": "small" in disabled,
                     "deployments": [
@@ -5359,7 +5415,10 @@ def _fan_out_snapshot(
                     "deployments": [{"provider": "test/second", "name": "other-wire"}],
                 },
             },
-            "tags": {"panel": tag_members},
+            "roles": {
+                "panel": {"models": role_members},
+                "small-worker": {"models": ["small"]},
+            },
         }),
         "fan-out-test",
     )
@@ -5368,15 +5427,15 @@ def _fan_out_snapshot(
 async def _fan_out_registry(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    tag_members: list[str] | None = None,
+    role_members: list[str] | None = None,
     disabled: set[str] | None = None,
     allowed_models: list[str] | None = None,
     failures: set[str] | None = None,
 ) -> tuple[SessionRuntimeRegistry, AgentLoop, InvokeContext]:
-    tag_members = tag_members or ["small", "large", "other"]
+    role_members = role_members or ["small", "large", "other"]
     disabled = disabled or set()
     failures = failures or set()
-    snapshot = _fan_out_snapshot(tag_members=tag_members, disabled=disabled)
+    snapshot = _fan_out_snapshot(role_members=role_members, disabled=disabled)
     config = (
         _dynamic_config()
         .model_copy(update={"allowed_models": allowed_models or []})
@@ -5404,7 +5463,7 @@ async def _fan_out_registry(
 
 
 @pytest.mark.asyncio
-async def test_fan_out_requires_explicit_tag_model_even_when_model_is_inferred(
+async def test_fan_out_requires_explicit_role_model_even_when_model_is_inferred(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(monkeypatch)
@@ -5468,7 +5527,7 @@ async def test_fan_out_preflights_all_members_before_launching_any(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small", "missing"], allowed_models=["small"]
+        monkeypatch, role_members=["small", "missing"], allowed_models=["small"]
     )
     try:
         with pytest.raises(LaunchConfigError, match="missing"):
@@ -5530,7 +5589,7 @@ async def test_fan_out_links_members_during_a_projected_parent_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small"]
+        monkeypatch, role_members=["small"]
     )
     root = registry._root
     assert root is not None
@@ -5571,7 +5630,7 @@ async def test_fan_out_completes_projected_member_effect_when_background_run_fin
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small"]
+        monkeypatch, role_members=["small"]
     )
     root = registry._root
     assert root is not None
@@ -5660,7 +5719,7 @@ async def test_fan_out_effect_is_registered_before_publication_can_be_cancelled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small"]
+        monkeypatch, role_members=["small"]
     )
     root = registry._root
     assert root is not None
@@ -5719,7 +5778,7 @@ async def test_fan_out_runtime_failure_does_not_cancel_siblings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small", "other"], failures={"test/second"}
+        monkeypatch, role_members=["small", "other"], failures={"test/second"}
     )
     try:
         result = await _background_result(
@@ -5752,7 +5811,7 @@ async def test_background_fan_out_reports_cancelled_member_as_cancelled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small"]
+        monkeypatch, role_members=["small"]
     )
     cancelled = asyncio.Event()
 
@@ -5806,7 +5865,7 @@ async def test_foreground_fan_out_reports_partial_cancelled_member_as_cancelled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small"]
+        monkeypatch, role_members=["small"]
     )
 
     async def cancelled_wait(
@@ -5853,7 +5912,7 @@ async def test_foreground_fan_out_preserves_member_completion_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small"]
+        monkeypatch, role_members=["small"]
     )
 
     async def completed_wait(
@@ -5898,7 +5957,7 @@ async def test_foreground_fan_out_waits_for_each_exact_handle_without_sibling_ca
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small", "large"]
+        monkeypatch, role_members=["small", "large"]
     )
     original_wait = registry.wait_for_agent
     waited: list[tuple[str, str | None]] = []
@@ -5933,11 +5992,13 @@ async def test_foreground_fan_out_waits_for_each_exact_handle_without_sibling_ca
         await parent.aclose()
 
 
-def test_single_tag_selection_uses_order_and_retained_assignment_is_committed() -> None:
-    selected = ModelResolver(_fan_out_snapshot(tag_members=["small", "large"])).resolve(
-        "@panel"
-    )
-    changed = ModelResolver(_fan_out_snapshot(tag_members=["large", "small"]))
+def test_single_role_selection_uses_order_and_retained_assignment_is_committed() -> (
+    None
+):
+    selected = ModelResolver(
+        _fan_out_snapshot(role_members=["small", "large"])
+    ).resolve("@panel")
+    changed = ModelResolver(_fan_out_snapshot(role_members=["large", "small"]))
 
     assert selected.base_model == "small"
     assert changed.resolve_committed(selected.identity).base_model == "small"
@@ -5948,6 +6009,7 @@ async def test_new_child_inherits_parent_failover_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, _context = await _fan_out_registry(monkeypatch)
+    parent.agent_manager._discovered[_DYNAMIC_PROFILE.name] = _DYNAMIC_PROFILE
     committed = CommittedModelIdentity(
         base_model="small",
         provider="test/second",
@@ -5959,7 +6021,7 @@ async def test_new_child_inherits_parent_failover_identity(
     try:
         candidate = registry._resolve_launch_candidate(
             registry._runtime(parent.session_id),
-            TaskArgs(task="child", agent="worker", background=True),
+            TaskArgs(task="child", agent="dynamic", background=True),
         )
 
         assert candidate.committed_model == committed
@@ -5974,7 +6036,7 @@ async def test_fan_out_propagates_launch_cancellation_without_launching_later_me
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small", "large"]
+        monkeypatch, role_members=["small", "large"]
     )
     launched: list[str] = []
 
@@ -6004,7 +6066,7 @@ async def test_fan_out_failed_launch_discards_pending_result_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small"]
+        monkeypatch, role_members=["small"]
     )
 
     async def failed_run(_args: TaskArgs, _ctx: InvokeContext):
@@ -6037,7 +6099,7 @@ async def test_fan_out_launch_cancellation_releases_already_started_members(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small", "large"]
+        monkeypatch, role_members=["small", "large"]
     )
     original_run = registry.run
 
@@ -6068,7 +6130,7 @@ async def test_foreground_fan_out_does_not_use_identity_mutated_after_completion
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small"]
+        monkeypatch, role_members=["small"]
     )
     original_wait = registry.wait_for_agent
 
@@ -6111,7 +6173,7 @@ async def test_background_fan_out_does_not_use_identity_mutated_after_completion
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small"]
+        monkeypatch, role_members=["small"]
     )
     original_wait = registry.wait_for_agent
     identity_updated = asyncio.Event()
@@ -6153,7 +6215,7 @@ async def test_fan_out_does_not_treat_idle_retention_cap_as_total_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small", "large"]
+        monkeypatch, role_members=["small", "large"]
     )
     registry._retention_policy = (3600, 1)
     try:
@@ -6175,7 +6237,7 @@ async def test_foreground_fan_out_cancellation_releases_every_started_member(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small", "large"]
+        monkeypatch, role_members=["small", "large"]
     )
     original_wait = registry.wait_for_agent
     original_release = registry.release_agent
@@ -6232,7 +6294,7 @@ async def test_foreground_fan_out_uses_terminal_identity_after_zero_retention_ev
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, tag_members=["small"]
+        monkeypatch, role_members=["small"]
     )
     registry._retention_policy = (0, 0)
     backend = BlockingBackend()
@@ -6291,6 +6353,67 @@ def _transcript_registry(tmp_path: Path) -> tuple[SessionRuntimeRegistry, AgentR
     record.root_generation = 7
     registry._agent_records[record.agent_id] = record
     return registry, record
+
+
+@pytest.mark.asyncio
+async def test_agent_summary_projects_live_frozen_and_absent_turn_counts() -> None:
+    registry = _retention_registry()
+    record = _idle_record("agent-1", clock=_ManualClock())
+    record.runtime.agent_loop.messages = MessageList([
+        LLMMessage(role=Role.user, content="task"),
+        LLMMessage(role=Role.assistant, content="first"),
+        LLMMessage(role=Role.assistant, content="second"),
+    ])
+    registry._agent_records[record.agent_id] = record
+
+    assert registry._agent_summaries()[0].turns_used is None
+    run = RunRecord(
+        "run-1",
+        "agent-1",
+        "worker",
+        RunStatus.RUNNING,
+        asyncio.get_running_loop().create_future(),
+        start_count=1,
+    )
+    record.state = _AgentState.RUNNING
+    record.current_run = run
+    assert registry._agent_summaries()[0].turns_used == 1
+
+    record.current_run = None
+    record.state = _AgentState.IDLE
+    run.result = TaskResult(response="done", turns_used=3, completed=True)
+    record.run_history.append(run)
+    assert registry._agent_summaries()[0].turns_used == 3
+
+
+@pytest.mark.asyncio
+async def test_resident_transcript_snapshot_is_current_only_while_runtime_is_resident(
+    tmp_path: Path,
+) -> None:
+    registry, record = _transcript_registry(tmp_path)
+    record.state = _AgentState.RUNNING
+    record.runtime.agent_loop.messages = MessageList([
+        LLMMessage(role=Role.system, content="instructions"),
+        LLMMessage(role=Role.assistant, content="live"),
+    ])
+    registry._children[record.session_id] = record.runtime
+
+    snapshot = await registry.resolve_resident_transcript_read(record.agent_id)
+
+    assert snapshot is not None
+    assert [message.content for message in snapshot.messages] == [
+        "instructions",
+        "live",
+    ]
+    assert await registry.resident_transcript_read_is_current(snapshot)
+    registry._generation_identity = ("parent", 8)
+    assert not await registry.resident_transcript_read_is_current(snapshot)
+
+    registry._generation_identity = ("parent", 7)
+    released = await registry.resolve_resident_transcript_read(record.agent_id)
+    assert released is not None
+    registry._children.pop(record.session_id)
+    assert not await registry.resident_transcript_read_is_current(released)
 
 
 @pytest.mark.asyncio

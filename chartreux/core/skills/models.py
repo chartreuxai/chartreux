@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, field_validator
 
 class SkillSource(StrEnum):
     BUILTIN = auto()
+    SHIPPED = auto()
     LOCAL = auto()
 
 

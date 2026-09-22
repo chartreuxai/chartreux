@@ -12,7 +12,7 @@ from tests.conftest import build_test_vibe_config
 def test_unpinned_configuration_uses_shipped_default() -> None:
     config = build_test_vibe_config()
     assert config.active_model == ""
-    assert config.get_active_model().alias == "glm-5-2"
+    assert config.get_active_model().alias == "glm-5-3"
 
 
 def test_default_compaction_prompt_is_compact() -> None:
@@ -29,7 +29,7 @@ def test_catalog_backed_unknown_active_model_fails_at_resolution() -> None:
 
 def test_catalog_backed_compaction_model_is_resolved() -> None:
     config = build_test_vibe_config(
-        compaction_model="glm-5-2", thinking_overrides={"glm-5-2": "low"}
+        compaction_model="glm-5-3", thinking_overrides={"glm-5-3": "low"}
     )
     assert config.get_compaction_model().thinking == "low"
 

@@ -10,6 +10,7 @@ from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.models import ModelConfig, ProviderConfig
 from chartreux.core.llm_models import Backend, LLMMessage, Role
+from chartreux.core.model_catalog.schema import RoleDefinition
 from chartreux.core.session_types import CommittedModelIdentity
 from chartreux.core.subagents import (
     ImmutableLaunchPersonaError,
@@ -95,26 +96,38 @@ def resolve(
     )
 
 
-def test_retained_resolution_preserves_captured_profile_selection(
+def _with_role(
+    config: ChartreuxConfigSchema, name: str, models: tuple[str, ...]
+) -> ChartreuxConfigSchema:
+    assert config.catalog_snapshot is not None
+    config.attach_catalog_snapshot(
+        config.catalog_snapshot.__class__(
+            config.catalog_snapshot.catalog.model_copy(
+                update={"roles": {name: RoleDefinition(models=models)}}
+            ),
+            config.catalog_snapshot.revision,
+        )
+    )
+    return config
+
+
+def test_retained_resolution_preserves_committed_model_over_profile_role(
     config: ChartreuxConfigSchema, profile: AgentProfile
 ) -> None:
+    config = _with_role(config, "specialist", ("small",))
     parent = config.model_copy(update={"active_model": "large"})
-    original = AgentProfile(**{
-        **profile.__dict__,
-        "overrides": {"active_model": "small"},
-    })
-    initial = resolve(parent, original)
+    initial = resolve(
+        parent, AgentProfile(**{**profile.__dict__, "role": "specialist"})
+    )
     retained = resolve_launch(
         profile_name=None,
         config=None,
         parent_orchestrator=initial.orchestrator,
         tool_inventory={"bash": object()},
-        retained_profile=AgentProfile(**{
-            **profile.__dict__,
-            "overrides": {"active_model": "large"},
-        }),
+        retained_profile=AgentProfile(**{**profile.__dict__, "role": "specialist"}),
         accumulated_overrides=initial.semantic_overrides,
         frozen_persona=initial.persona,
+        committed_model=initial.committed_model,
     )
     assert (initial.effective_model.alias, retained.effective_model.alias) == (
         "small",
@@ -327,9 +340,10 @@ def test_child_launch_inherits_parent_committed_deployment(
     assert candidate.effective_model.name == "large"
 
 
-def test_new_child_explicit_profile_model_beats_parent_committed_identity(
+def test_new_child_profile_role_beats_parent_committed_identity(
     config: ChartreuxConfigSchema, profile: AgentProfile
 ) -> None:
+    config = _with_role(config, "specialist", ("small",))
     parent_identity = CommittedModelIdentity(
         base_model="large",
         provider="provider/default",
@@ -339,7 +353,7 @@ def test_new_child_explicit_profile_model_beats_parent_committed_identity(
     selected = AgentProfile(**{
         **profile.__dict__,
         "name": "specialist",
-        "overrides": {"active_model": "small"},
+        "role": "specialist",
     })
 
     candidate = resolve_launch(
@@ -351,22 +365,41 @@ def test_new_child_explicit_profile_model_beats_parent_committed_identity(
         committed_model=parent_identity,
     )
 
+    assert candidate.orchestrator.config.active_model == "@specialist"
     assert candidate.effective_model.alias == "small"
     assert candidate.committed_model.base_model == "small"
 
 
-def test_tag_launch_thinking_uses_resolved_base_override(
+def test_default_profile_role_beats_parent_committed_identity(
     config: ChartreuxConfigSchema, profile: AgentProfile
 ) -> None:
-    assert config.catalog_snapshot is not None
-    config.attach_catalog_snapshot(
-        config.catalog_snapshot.__class__(
-            config.catalog_snapshot.catalog.model_copy(
-                update={"tags": {"panel": ("large",)}}
-            ),
-            config.catalog_snapshot.revision,
-        )
+    config = _with_role(config, "small-worker", ("small",))
+    parent_identity = CommittedModelIdentity(
+        base_model="large",
+        provider="provider/default",
+        wire_name="large",
+        catalog_revision="test-fixture",
     )
+    default_worker = AgentProfile(**{**profile.__dict__, "role": "small-worker"})
+
+    candidate = resolve_launch(
+        profile_name=None,
+        config=None,
+        parent_orchestrator=FakeConfigOrchestrator(config),
+        tool_inventory={"bash": object()},
+        profile_lookup=lambda _: default_worker,
+        committed_model=parent_identity,
+    )
+
+    assert candidate.orchestrator.config.active_model == "@small-worker"
+    assert candidate.effective_model.alias == "small"
+    assert candidate.committed_model.base_model == "small"
+
+
+def test_role_launch_thinking_uses_resolved_base_override(
+    config: ChartreuxConfigSchema, profile: AgentProfile
+) -> None:
+    config = _with_role(config, "panel", ("large",))
 
     candidate = resolve(config, profile, LaunchConfig(model="@panel", thinking="high"))
 

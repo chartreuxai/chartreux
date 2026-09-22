@@ -12,7 +12,10 @@ from typing import Any
 
 from pydantic import TypeAdapter
 
-from chartreux.app_server._agent_transcript import read_agent_transcript
+from chartreux.app_server._agent_transcript import (
+    read_agent_transcript,
+    read_live_agent_transcript,
+)
 from chartreux.app_server._dispatch import (
     DispatchResult,
     RequestFailure,
@@ -336,6 +339,34 @@ class CoreRequestHandler:
             self._agent_loop._session_generation,
         )
         self._require_attached(parent_identity[0])
+        try:
+            resident_snapshot = await self._sessions.resolve_resident_transcript_read(
+                params.agent_id
+            )
+        except UnknownAgentError as exc:
+            raise RequestFailure(
+                ProtocolErrorCode.NOT_FOUND, "Agent not found"
+            ) from exc
+        if resident_snapshot is not None:
+            if resident_snapshot.parent_identity != parent_identity:
+                raise RequestFailure(
+                    ProtocolErrorCode.CONFLICT,
+                    "Transcript parent changed while reading",
+                )
+            response = await asyncio.to_thread(
+                read_live_agent_transcript,
+                resident_snapshot.messages,
+                before=params.before,
+                limit=params.limit,
+            )
+            if not await self._sessions.resident_transcript_read_is_current(
+                resident_snapshot
+            ):
+                raise RequestFailure(
+                    ProtocolErrorCode.CONFLICT,
+                    "Transcript read is no longer authorized",
+                )
+            return DispatchResult(response)
         try:
             snapshot = await self._sessions.resolve_transcript_read(params.agent_id)
         except UnknownAgentError as exc:

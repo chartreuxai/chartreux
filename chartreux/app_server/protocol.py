@@ -235,6 +235,7 @@ class EventBatch(ProtocolModel):
 
 class CompletionConfig(ProtocolModel):
     type: str = "mistral"
+    # Wire-protocol default compared in unsupported_v01_fields, not a model-selection default.
     model: str = "glm-5-2"
 
 
@@ -605,12 +606,7 @@ class AgentTranscriptGetResponse(ProtocolModel):
 
 
 class AgentTranscriptSource(Protocol):
-    """WP6 viewer source contract, implemented by WP4's session-resources facade.
-
-    The facade method is ``read_agent_transcript``.  WP5 emits
-    ``AgentSidebar.TranscriptOpen`` and WP6 emits
-    ``AgentTranscriptViewer.Closed``; WP7 owns their lifecycle wiring.
-    """
+    """Transcript reader contract implemented by the session-resources facade."""
 
     async def read_agent_transcript(
         self, agent_id: str, *, before: str | None = None, limit: int = 50
@@ -1605,6 +1601,7 @@ class AgentSummaryModel(ProtocolModel):
     availability: str
     current_run_id: str | None = None
     current_run_status: str | None = None
+    turns_used: int | None = None
     last_run_status: str | None = None
     initial_task_summary: str | None = None
     current_task_summary: str | None = None

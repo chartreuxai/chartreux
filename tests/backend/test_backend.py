@@ -1601,11 +1601,6 @@ class TestMistralSdkReasoningEffortSerialization:
             ("mistral-small-latest", "medium", "high"),
             ("mistral-small-latest", "high", "high"),
             ("mistral-small-latest", "max", "high"),
-            ("glm-5-2", "off", "none"),
-            ("glm-5-2", "low", "high"),
-            ("glm-5-2", "medium", "high"),
-            ("glm-5-2", "high", "high"),
-            ("glm-5-2", "max", "max"),
             ("zai-glm-5-3", "low", "low"),
             ("zai-glm-5-3", "medium", "high"),
             ("zai-glm-5-3", "high", "high"),
@@ -1667,8 +1662,6 @@ class TestMistralSdkReasoningEffortSerialization:
         [
             ("mistral-small-latest", "low", "none"),
             ("mistral-small-latest", "medium", "high"),
-            ("glm-5-2", "off", "none"),
-            ("glm-5-2", "max", "max"),
             ("mistral-small-latest", None, None),
         ],
     )

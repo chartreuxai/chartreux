@@ -44,13 +44,6 @@ PROVIDER_THINKING_LEVELS: dict[ProviderKey, ThinkingLevels] = {
     ("generic", "anthropic"): ANTHROPIC_THINKING_LEVELS,
 }
 
-GLM_5_2_THINKING_LEVELS: dict[str, str | None] = {
-    "off": "none",
-    "low": "high",
-    "medium": "high",
-    "high": "high",
-    "max": "max",
-}
 GLM_5_3_THINKING_LEVELS: dict[str, str | None] = {
     "low": "low",
     "medium": "high",
@@ -61,8 +54,6 @@ GLM_5_3_THINKING_LEVELS: dict[str, str | None] = {
 # zai-glm-latest and zai-glm-5 are rolling aliases recorded as compatibility
 # snapshots on 2026-09-16; unknown future IDs use the provider table.
 MODEL_THINKING_LEVELS: dict[ModelKey, ThinkingLevels] = {
-    ("mistral", "glm-5-2"): GLM_5_2_THINKING_LEVELS,
-    ("mistral", "zai-glm-5-2"): GLM_5_2_THINKING_LEVELS,
     ("mistral", "zai-glm-5-3"): GLM_5_3_THINKING_LEVELS,
     ("mistral", "zai-glm-5"): GLM_5_3_THINKING_LEVELS,
     ("mistral", "zai-glm-latest"): GLM_5_3_THINKING_LEVELS,

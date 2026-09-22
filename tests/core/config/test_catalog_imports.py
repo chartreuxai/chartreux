@@ -9,7 +9,7 @@ from chartreux.core.config.default_orchestrator import build_default_orchestrato
 async def test_default_builder_attaches_shipped_catalog() -> None:
     orchestrator = await build_default_orchestrator()
     assert orchestrator.config.catalog_snapshot is not None
-    assert orchestrator.config.get_active_model().alias == "glm-5-2"
+    assert orchestrator.config.get_active_model().alias == "glm-5-3"
 
 
 def test_legacy_schema_compatibility_exports_are_removed() -> None:

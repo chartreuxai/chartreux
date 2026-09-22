@@ -23,6 +23,7 @@ from chartreux.core.model_catalog.schema import (
     DeploymentDefinition,
     ModelCatalog,
     ProviderDefinition,
+    RoleDefinition,
 )
 from chartreux.ui.providers.contracts import (
     CatalogChanges,
@@ -57,7 +58,17 @@ def _require_mapping(value: Any, location: str) -> dict[str, Any]:
 def _check_keys(raw: Mapping[str, Any], fields: set[str], location: str) -> None:
     unknown = set(raw) - fields
     if unknown:
-        raise ValueError(f"{location} has unknown fields: {sorted(unknown)!r}")
+        migration_hints = {
+            "tags": "replace [tags] with [roles]",
+            "aliases": "remove aliases; use canonical model names",
+        }
+        hints = [
+            migration_hints[field] for field in unknown if field in migration_hints
+        ]
+        message = f"{location} has unknown fields: {sorted(unknown)!r}"
+        if hints:
+            message = f"{message}; migration required: {'; '.join(hints)}"
+        raise ValueError(message)
 
 
 def _merge_deployments(
@@ -86,7 +97,7 @@ def merge_catalog_overlay(
     shipped: ModelCatalog, overlay: Mapping[str, Any]
 ) -> ModelCatalog:
     """Apply a sparse overlay without giving ordinary config layers authority."""
-    _check_keys(overlay, {"providers", "models", "tags"}, "catalog")
+    _check_keys(overlay, {"providers", "models", "roles"}, "catalog")
     result = shipped.model_dump(mode="python")
 
     if "providers" in overlay:
@@ -117,9 +128,13 @@ def merge_catalog_overlay(
                 )
             result["models"][base_name] = merged
 
-    if "tags" in overlay:
-        tags = _require_mapping(overlay["tags"], "tags")
-        result["tags"] = tags
+    if "roles" in overlay:
+        roles = _require_mapping(overlay["roles"], "roles")
+        for role_name, raw_patch in roles.items():
+            patch = _require_mapping(raw_patch, f"roles.{role_name}")
+            _check_keys(patch, set(RoleDefinition.model_fields), f"roles.{role_name}")
+            current = result["roles"].get(role_name, {})
+            result["roles"][role_name] = {**current, **patch}
 
     return ModelCatalog.model_validate(result)
 
@@ -282,17 +297,12 @@ def _apply_catalog_changes(
                     models, base_name, deployments, current.models.get(base_name)
                 )
 
-    if changes.tags is not None:
-        tags = {name: list(members) for name, members in current.tags.items()}
-        for tag_name, members in changes.tags.items():
-            if not members:
-                raise ValueError(
-                    f"tags.{tag_name} cannot be empty; remove the tag instead"
-                )
-            tags[tag_name] = list(members)
-        # Tags replace as a whole under the loader, so materialize untouched tags.
-        if candidate.get("tags") != tags:
-            candidate["tags"] = tags
+    if changes.roles is not None:
+        roles = _table(candidate, "roles")
+        for role_name, raw_patch in changes.roles.items():
+            if not isinstance(raw_patch, Mapping):
+                raise ValueError(f"roles.{role_name} must be a TOML table")
+            _patch_table(roles, role_name, raw_patch, "roles")
 
     for name in ("providers", "models"):
         if not candidate.get(name) and name not in overlay:

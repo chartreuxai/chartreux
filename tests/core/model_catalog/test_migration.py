@@ -94,13 +94,143 @@ def test_migration_apply_round_trip_writes_catalog_and_canonicalizes_selections(
     assert (
         migrated["providers"]["test/default"]["api_base"] == "https://example.test/v1"
     )
-    assert migrated["models"]["base"]["aliases"] == ["friendly"]
+    assert "aliases" not in migrated["models"]["base"]
     assert migrated["models"]["base"]["deployments"][0]["name"] == "base"
     cleaned = config.read_text()
     assert "providers" not in cleaned and "[[models]]" not in cleaned
     assert 'active_model = "base"' in cleaned
     assert 'compaction_model = "base"' in cleaned
     assert 'base = "low"' in cleaned
+
+
+def test_migration_canonicalizes_exact_aliases_in_allowed_models(
+    tmp_path: Path,
+) -> None:
+    config, catalog = _paths(tmp_path)
+    config.write_bytes(b'allowed_models = ["friendly"]\n' + _LEGACY)
+
+    apply_migration(plan_migration(config, catalog))
+
+    assert tomllib.loads(config.read_text())["allowed_models"] == ["base"]
+
+
+def test_migration_reports_alias_matching_allowlist_patterns(tmp_path: Path) -> None:
+    config, catalog = _paths(tmp_path)
+    config.write_bytes(b'allowed_models = ["friend*", "re:friendly"]\n' + _LEGACY)
+
+    plan = plan_migration(config, catalog)
+
+    assert tomllib.loads(plan.cleaned_config.decode())["allowed_models"] == [
+        "friend*",
+        "re:friendly",
+    ]
+    assert plan.warnings == (
+        "allowed_models pattern 'friend*' may reference removed aliases; use canonical names ['base'].",
+        "allowed_models pattern 're:friendly' may reference removed aliases; use canonical names ['base'].",
+    )
+
+
+def test_migration_tags_only_config_migrates_tags_to_roles(tmp_path: Path) -> None:
+    config, catalog = _paths(tmp_path)
+    config.write_text('[tags]\nworker = ["glm-5-2"]\n')
+
+    apply_migration(plan_migration(config, catalog))
+
+    assert tomllib.loads(catalog.read_text())["roles"]["worker"] == {
+        "description": "",
+        "models": ["glm-5-3"],
+    }
+    assert "tags" not in tomllib.loads(config.read_text())
+
+
+def test_migration_warns_about_retargeted_references_and_orphaned_preserved_tables(
+    tmp_path: Path,
+) -> None:
+    config, catalog = _paths(tmp_path)
+    config.write_text(
+        'active_model = "glm-5-2"\n'
+        "[tags]\n"
+        'worker = ["glm-5-2"]\n'
+        "[[providers]]\n"
+        'name = "mistral"\n'
+        'api_base = "https://api.mistral.ai/v1"\n'
+        "[[models]]\n"
+        'name = "glm-5-2"\n'
+        'provider = "mistral"\n'
+        'alias = "legacy-glm"\n'
+    )
+
+    plan = plan_migration(config, catalog)
+
+    assert plan.warnings == (
+        "active_model selection 'glm-5-2' was retargeted to 'glm-5-3'.",
+        "role 'worker' member 'glm-5-2' was retargeted to 'glm-5-3'.",
+        "Preserved user model table 'glm-5-2' is no longer referenced after canonicalization.",
+    )
+
+
+def test_migration_rejects_role_member_without_a_model_table(tmp_path: Path) -> None:
+    config, catalog = _paths(tmp_path)
+    config.write_text('[tags]\nworker = ["mistral-small"]\n')
+
+    with pytest.raises(MigrationError, match="unknown model"):
+        plan_migration(config, catalog)
+
+
+def test_migration_preserves_explicit_removed_shipped_model_but_canonicalizes_references(
+    tmp_path: Path,
+) -> None:
+    config, catalog = _paths(tmp_path)
+    config.write_text(
+        'active_model = "glm-5-2"\n'
+        'compaction_model = "glm-5-2"\n'
+        'allowed_models = ["glm-5-2"]\n'
+        "[thinking_overrides]\n"
+        'glm-5-2 = "high"\n'
+        "[tags]\n"
+        'worker = ["glm-5-2"]\n'
+        "[[providers]]\n"
+        'name = "mistral"\n'
+        'api_base = "https://api.mistral.ai/v1"\n'
+        "[[models]]\n"
+        'name = "glm-5-2"\n'
+        'provider = "mistral"\n'
+        'alias = "legacy-glm"\n'
+    )
+
+    apply_migration(plan_migration(config, catalog))
+
+    migrated = tomllib.loads(catalog.read_text())
+    assert "glm-5-2" in migrated["models"]
+    assert migrated["roles"]["worker"]["models"] == ["glm-5-3"]
+    cleaned = tomllib.loads(config.read_text())
+    assert cleaned["active_model"] == "glm-5-3"
+    assert cleaned["compaction_model"] == "glm-5-3"
+    assert cleaned["allowed_models"] == ["glm-5-3"]
+    assert cleaned["thinking_overrides"] == {"glm-5-3": "high"}
+
+
+def test_migration_preserves_explicit_removed_mistral_small_model(
+    tmp_path: Path,
+) -> None:
+    config, catalog = _paths(tmp_path)
+    config.write_text(
+        "[tags]\n"
+        'worker = ["mistral-small"]\n'
+        "[[providers]]\n"
+        'name = "mistral"\n'
+        'api_base = "https://api.mistral.ai/v1"\n'
+        "[[models]]\n"
+        'name = "mistral-small-latest"\n'
+        'provider = "mistral"\n'
+        'alias = "mistral-small"\n'
+    )
+
+    apply_migration(plan_migration(config, catalog))
+
+    migrated = tomllib.loads(catalog.read_text())
+    assert "mistral-small-latest" in migrated["models"]
+    assert migrated["roles"]["worker"]["models"] == ["mistral-small-latest"]
 
 
 def test_migration_main_generated_default_config_drops_empty_vertex_fields(
@@ -129,10 +259,7 @@ def test_migration_nonempty_legacy_project_id_is_actionable_conflict(
         plan_migration(config, catalog)
 
 
-@pytest.mark.parametrize(
-    ("wire_name", "base_name"),
-    (("mistral-small-latest", "mistral-small"), ("zai-glm-5-3", "glm-5-3")),
-)
+@pytest.mark.parametrize(("wire_name", "base_name"), (("zai-glm-5-3", "glm-5-3"),))
 def test_migration_reconciles_shipped_wire_name_and_preserves_overrides(
     tmp_path: Path, wire_name: str, base_name: str
 ) -> None:
@@ -158,8 +285,7 @@ def test_migration_reconciles_shipped_wire_name_and_preserves_overrides(
     assert wire_name not in migrated
     assert migrated[base_name]["thinking"] == "low"
     assert migrated[base_name]["temperature"] == 0.7
-    assert "custom" in migrated[base_name]["aliases"]
-    assert wire_name in migrated[base_name]["aliases"]
+    assert "aliases" not in migrated[base_name]
     assert migrated[base_name]["deployments"] == [
         {
             "provider": "mistral/default",
@@ -422,7 +548,6 @@ def test_migration_does_not_rename_unrelated_quoted_alias_key(tmp_path: Path) ->
 def test_migration_special_character_alias_round_trips_as_valid_toml(
     tmp_path: Path,
 ) -> None:
-    alias = 'friendly"\\path'
     config, catalog = _paths(tmp_path)
     config.write_text(
         'active_model = "friendly\\"\\\\path"\n'
@@ -439,7 +564,7 @@ def test_migration_special_character_alias_round_trips_as_valid_toml(
     cleaned = tomllib.loads(config.read_text())
     assert cleaned["active_model"] == "base"
     assert cleaned["thinking_overrides"] == {"base": "low"}
-    assert tomllib.loads(catalog.read_text())["models"]["base"]["aliases"] == [alias]
+    assert "aliases" not in tomllib.loads(catalog.read_text())["models"]["base"]
 
 
 def test_migration_concurrent_apply_rejects_second_process(tmp_path: Path) -> None:
@@ -609,9 +734,7 @@ def test_m3_reconciles_each_deployment_and_materializes_new_provider_slot(
     assert second["name"] == "glm-5-2" and second["supports_images"] is False
 
 
-def test_m4_alias_collision_reconciles_to_unambiguous_shipped_base(
-    tmp_path: Path,
-) -> None:
+def test_m4_former_alias_wire_name_migrates_as_new_base(tmp_path: Path) -> None:
     config, catalog = _paths(tmp_path)
     config.write_text(
         '[[providers]]\nname = "mistral"\napi_base = "https://api.mistral.ai/v1"\n'
@@ -620,17 +743,16 @@ def test_m4_alias_collision_reconciles_to_unambiguous_shipped_base(
 
     apply_migration(plan_migration(config, catalog))
 
-    assert "zai-glm-latest" not in tomllib.loads(catalog.read_text())["models"]
-    assert load_catalog(catalog).catalog.models["glm-5-3"]
+    assert load_catalog(catalog).catalog.models["zai-glm-latest"]
 
 
 def test_m5_sparse_main_model_override_merges_onto_shipped_base(tmp_path: Path) -> None:
     _, catalog = _paths(tmp_path)
-    catalog.write_text("[models.glm-5-2]\ntemperature = 0.7\n")
+    catalog.write_text("[models.glm-5-3]\ntemperature = 0.7\n")
 
-    definition = load_catalog(catalog).catalog.models["glm-5-2"]
+    definition = load_catalog(catalog).catalog.models["glm-5-3"]
     assert definition.temperature == 0.7
-    assert definition.deployments[0].name == "glm-5-2"
+    assert definition.deployments[0].name == "zai-glm-5-3"
 
 
 def test_m6_recovery_checks_config_digest_and_finishes_cleaned_empty_config(
@@ -656,7 +778,18 @@ def test_m6_recovery_checks_config_digest_and_finishes_cleaned_empty_config(
     assert config.read_bytes() == b"" and not marker.exists()
 
 
-def test_m2_custom_aliases_are_unioned_with_shipped_aliases(tmp_path: Path) -> None:
+def test_migration_converts_legacy_tags_to_roles(tmp_path: Path) -> None:
+    config, catalog = _paths(tmp_path)
+    config.write_bytes(_LEGACY + b'\n[tags]\npreferred = ["friendly"]\n')
+
+    apply_migration(plan_migration(config, catalog))
+
+    assert tomllib.loads(catalog.read_text())["roles"] == {
+        "preferred": {"description": "", "models": ["base"]}
+    }
+
+
+def test_m2_legacy_aliases_are_not_written_to_catalog(tmp_path: Path) -> None:
     config, catalog = _paths(tmp_path)
     config.write_text(
         '[[providers]]\nname = "mistral"\napi_base = "https://api.mistral.ai/v1"\n'
@@ -665,5 +798,4 @@ def test_m2_custom_aliases_are_unioned_with_shipped_aliases(tmp_path: Path) -> N
 
     apply_migration(plan_migration(config, catalog))
 
-    aliases = load_catalog(catalog).catalog.models["glm-5-3"].aliases
-    assert {"my-glm", "zai-glm-5", "zai-glm-latest"}.issubset(aliases)
+    assert "aliases" not in load_catalog(catalog).catalog.models["glm-5-3"].model_dump()

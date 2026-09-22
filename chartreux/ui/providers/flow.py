@@ -164,7 +164,6 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
     #provider-management .destructive-actions Button { color: $error; }
     #provider-management .field-help { color: $text-muted; }
     #provider-management .read-only-value { color: $text-muted; }
-    #provider-management .advanced-actions { height: auto; layout: grid; grid-size: 3; }
     #provider-management .error { color: $error; }
     #provider-management .muted { color: $text-muted; }
     #provider-management Input {
@@ -179,10 +178,10 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
     #provider-management #overview-provider:focus,
     #provider-management #active-model:focus { border: none; }
     #provider-management SelectionList { height: 1fr; }
-    #provider-management #models > .selection-list--button { color: $foreground-muted; background: $surface; }
-    #provider-management #models > .selection-list--button-highlighted { color: $foreground; background: $primary 20%; }
-    #provider-management #models > .selection-list--button-selected { color: $success; background: $success 20%; text-style: bold; }
-    #provider-management #models > .selection-list--button-selected-highlighted { color: $success; background: $success 35%; text-style: bold reverse; }
+    #provider-management SelectionList > .selection-list--button { color: $foreground-muted; background: $surface; }
+    #provider-management SelectionList > .selection-list--button-highlighted { color: $foreground; background: $primary 20%; }
+    #provider-management SelectionList > .selection-list--button-selected { color: $success; background: $success 20%; text-style: bold; }
+    #provider-management SelectionList > .selection-list--button-selected-highlighted { color: $success; background: $success 35%; text-style: bold reverse; }
     #provider-management #actions { height: auto; layout: grid; grid-size: 3; }
     """
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -221,8 +220,8 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         self._selected_models: dict[str, ModelSelectionDraft] = {}
         self._selected_wires: set[str] = set()
         self._detail_wire: str | None = None
-        self._tag_orders: dict[str, tuple[str, ...]] = dict(snapshot.catalog.tags)
         self._review_inputs: dict[str, dict[str, str]] = {}
+        self._reappended_roles: dict[str, set[str]] = {}
         self._overview_provider_id: str | None = None
         self._active_model_expression = initial_active_model
         self._invalid_inputs: set[str] = set()
@@ -503,40 +502,33 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 id="cached-price",
                 validate_on=["blur", "submitted"],
             )
-            yield Label("Aliases")
+            yield Label("Roles")
             yield Static(
-                "Alternative names you can use to select this model.",
+                "Assign this model to roles. Re-adding a model appends it after existing members.",
                 classes="field-help",
             )
-            yield Input(
-                self._review_value(
-                    selection, "aliases", self._edit_value(selection, "aliases")
-                ),
-                placeholder="Aliases, comma separated",
-                id="aliases",
-                validate_on=["blur", "submitted"],
-            )
-            yield Label("Tags")
-            yield Static(
-                "Groups that let you select related models together.",
-                classes="field-help",
-            )
-            yield Input(
-                self._review_value(
-                    selection, "tags", self._edit_value(selection, "tags")
-                ),
-                placeholder="Tags, comma separated",
-                id="tags",
-                validate_on=["blur", "submitted"],
+            yield ChatModelSelectionList(
+                *[
+                    (
+                        f"{role.replace('-', ' ').title()} — {definition.description}",
+                        role,
+                        selection is not None
+                        and (
+                            role in (selection.edits.role_memberships.value or ())
+                            if selection.edits.role_memberships.state == "set"
+                            else self._resolved_review_base(selection)
+                            in definition.models
+                        ),
+                    )
+                    for role, definition in sorted(self.catalog.roles.items())
+                ],
+                id="roles",
             )
             if self.error:
                 yield NoMarkupStatic(self.error, classes="error")
             yield from self._buttons(
                 ("save-details", "Save details"),
                 ("clear-prices", "Clear prices"),
-                ("clear-aliases", "Clear aliases"),
-                ("clear-tags", "Clear tags"),
-                ("bulk-tags", "Assign tags to all selected"),
                 ("continue", "Save / Continue"),
                 ("back", "Back"),
                 ("cancel", "Cancel"),
@@ -584,7 +576,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                     classes="muted",
                 )
             yield Static(
-                "Labels identify deployments; saved values are canonical names, aliases, or @tags.",
+                "Labels identify deployments; saved values are canonical names or @role expressions.",
                 classes="muted",
             )
             yield from self._buttons(("finish", "Finish"), ("cancel", "Cancel"))
@@ -677,6 +669,33 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         if self.step in {"form", "credential", "models", "review"}:
             self._continue()
 
+    def _resolved_review_base(self, selection: ModelSelectionDraft) -> str:
+        """Return the base selected for a collision, including its default choice."""
+        outcome = match_discovered_model(
+            self.catalog,
+            self.provider_id,
+            selection.wire_name,
+            provider=self._provider_definition(),
+        )
+        if outcome.kind == "occupied_slot":
+            return cast(str, outcome.existing_base)
+        if outcome.kind == "multiple_matches":
+            choice = (
+                self.query_one("#collision-choice", Select).value
+                if self.query("#collision-choice")
+                else (
+                    selection.base_name
+                    if any(
+                        match.base_name == selection.base_name
+                        for match in outcome.matches
+                    )
+                    else outcome.matches[0].base_name
+                )
+            )
+            if isinstance(choice, str):
+                return choice
+        return selection.base_name
+
     def _review_selection(self) -> ModelSelectionDraft | None:
         """Return the selected detail row, defaulting to insertion order."""
         if self._detail_wire is not None:
@@ -707,13 +726,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             return wire
         self._review_inputs[wire] = {
             field: self.query_one(f"#{field}", Input).value
-            for field in (
-                "input-price",
-                "output-price",
-                "cached-price",
-                "aliases",
-                "tags",
-            )
+            for field in ("input-price", "output-price", "cached-price")
         }
         return wire
 
@@ -746,10 +759,6 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 [(match.base_name, match.base_name) for match in outcome.matches],
                 value=outcome.matches[0].base_name,
                 id="collision-choice",
-            )
-        elif outcome.kind == "alias_collision":
-            yield NoMarkupStatic(
-                f"{selection.wire_name} is an alias of {outcome.existing_base}; it will be added to that base."
             )
 
     def _action_buttons(self) -> ComposeResult:
@@ -821,12 +830,8 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 yield Button("Save Models", id="continue")
                 yield Button("Back", id="back")
                 yield Button("Cancel", id="cancel")
-            with Horizontal(classes="advanced-actions"):
-                yield Button("Apply Tags To Selected", id="bulk-tags")
             with Horizontal(classes="destructive-actions"):
                 yield Button("Clear Prices", id="clear-prices")
-                yield Button("Clear Aliases", id="clear-aliases")
-                yield Button("Clear Tags", id="clear-tags")
             return
         elif self.step == "again":
             buttons = (
@@ -881,11 +886,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             item.wire_id,
             provider=self._provider_definition(),
         )
-        return (
-            outcome.existing_base
-            if outcome.kind in {"existing", "alias_collision"}
-            else None
-        )
+        return outcome.existing_base if outcome.kind == "existing" else None
 
     def _picker_items(self) -> tuple[DiscoveryItem, ...]:
         """Return one chat-capable row for each canonical configured or wire ID."""
@@ -919,12 +920,10 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         return self._configured_base(item) is not None
 
     def _model_label(self, item: DiscoveryItem) -> str:
-        """Render one canonical target with dim aliases as supporting metadata."""
+        """Render one canonical target with its canonical name as metadata."""
         base = self._configured_base(item)
         if base is not None:
-            aliases = self.catalog.models[base].aliases
-            metadata = f"aliases: {', '.join(aliases)}" if aliases else base
-            return f"{item.wire_id}\t{metadata}"
+            return f"{item.wire_id}\t{base}"
         return (
             f"{item.wire_id}\t{item.display_label}"
             if item.display_label and item.display_label != item.wire_id
@@ -1106,14 +1105,6 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         if button == "clear-prices":
             self._clear_prices()
             return
-        if button in {"clear-aliases", "clear-tags"}:
-            self._clear_detail_metadata(
-                "aliases" if button == "clear-aliases" else "tags"
-            )
-            return
-        if button == "bulk-tags":
-            self._assign_bulk_tags()
-            return
         if button == "picker":
             self._show("picker")
             return
@@ -1247,7 +1238,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             self._show("form")
             return
         self.snapshot = result.snapshot
-        self._tag_orders = dict(self.catalog.tags)
+        self._reappended_roles.clear()
         self._changed = self._changed or result.changed
         self.dismiss(
             ProviderFlowResult(
@@ -1361,6 +1352,20 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             self._overview_provider_id = (
                 event.value if isinstance(event.value, str) else None
             )
+            return
+        if event.select.id == "collision-choice" and self.step == "review":
+            selection = self._review_selection()
+            if selection is not None and isinstance(event.value, str):
+                self._selected_models[selection.wire_name] = replace(
+                    selection, base_name=event.value
+                )
+                if self.query("#roles"):
+                    roles = self.query_one("#roles", SelectionList)
+                    for role in roles.selected:
+                        roles.deselect(role)
+                    for role, definition in self.catalog.roles.items():
+                        if event.value in definition.models:
+                            roles.select(role)
             return
         if event.select.id == "detail-model" and self.step == "review":
             current = self._review_selection()
@@ -1595,11 +1600,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 wire,
                 provider=self._provider_definition(),
             )
-            base_name = (
-                outcome.existing_base
-                if outcome.kind in {"existing", "alias_collision"}
-                else wire
-            )
+            base_name = outcome.existing_base if outcome.kind == "existing" else wire
             assert base_name is not None
             retained[wire] = ModelSelectionDraft(wire, base_name)
         self._selected_models = retained
@@ -1633,8 +1634,26 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             self.error = "Prices must be non-negative numbers; blank means unknown."
             self._show("review")
             return False
-        aliases = self._csv("#aliases")
-        tags = self._csv("#tags")
+        roles = tuple(self.query_one("#roles", SelectionList).selected)
+        base = self._resolved_review_base(selection)
+        existing_roles = tuple(
+            role
+            for role, definition in self.catalog.roles.items()
+            if base in definition.models
+        )
+        previous_roles = set(selection.edits.role_memberships.value or ())
+        reappended_roles = self._reappended_roles.setdefault(wire, set())
+        reappended_roles.update(
+            role
+            for role in set(roles) - previous_roles
+            if selection.edits.role_memberships.state == "set"
+            and role in existing_roles
+        )
+        role_memberships = (
+            OptionalEdit.set(roles)
+            if set(roles) != set(existing_roles) or reappended_roles
+            else OptionalEdit()
+        )
         edits = ModelEdits(
             *(
                 self._optional_price(value, previous)
@@ -1648,19 +1667,8 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                     strict=True,
                 )
             ),
-            aliases=self._optional_csv(aliases, selection.edits.aliases),
-            tags=self._optional_csv(tags, selection.edits.tags),
+            role_memberships=role_memberships,
         )
-        base = selection.base_name
-        outcome = match_discovered_model(
-            self.catalog, self.provider_id, wire, provider=self._provider_definition()
-        )
-        if outcome.kind == "occupied_slot":
-            base = cast(str, outcome.existing_base)
-        elif outcome.kind == "multiple_matches":
-            choice = self.query_one("#collision-choice", Select).value
-            if isinstance(choice, str):
-                base = choice
         self._selected_models[wire] = ModelSelectionDraft(wire, base, edits)
         self.error = None
         if recompose:
@@ -1672,12 +1680,6 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         value: float | None, previous: OptionalEdit[float]
     ) -> OptionalEdit[float]:
         return OptionalEdit.set(value) if value is not None else previous
-
-    @staticmethod
-    def _optional_csv(
-        value: tuple[str, ...], previous: OptionalEdit[tuple[str, ...]]
-    ) -> OptionalEdit[tuple[str, ...]]:
-        return OptionalEdit.set(value) if value else previous
 
     def _clear_prices(self) -> None:
         """Explicitly clear all selected deployment prices back to unknown."""
@@ -1699,17 +1701,6 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         )
         self._show("review")
 
-    def _clear_detail_metadata(self, field: Literal["aliases", "tags"]) -> None:
-        selection = self._review_selection()
-        if selection is None:
-            return
-        self._capture_review_inputs(selection.wire_name)
-        self._selected_models[selection.wire_name] = replace(
-            selection, edits=replace(selection.edits, **{field: OptionalEdit.cleared()})
-        )
-        self._clear_review_input(selection, field)
-        self._show("review")
-
     def _price(self, selector: str) -> float | None:
         value = self.query_one(selector, Input).value.strip()
         if not value:
@@ -1719,39 +1710,18 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             raise ValueError
         return price
 
-    def _assign_bulk_tags(self) -> None:
-        """Apply the current ordered tags to every selected model, not prices or aliases."""
-        current = self._review_selection()
-        if current is not None:
-            self._capture_review_inputs(current.wire_name)
-        tags = self._csv("#tags")
-        if not tags:
-            self.error = "Enter at least one tag before bulk assignment."
-            self._show("review")
-            return
-        for wire, selection in self._selected_models.items():
-            self._selected_models[wire] = replace(
-                selection, edits=replace(selection.edits, tags=OptionalEdit.set(tags))
-            )
-            # Programmatic edits supersede captured tag text without discarding
-            # unrelated raw fields for the model currently being edited.
-            self._review_inputs.setdefault(wire, {})["tags"] = ", ".join(tags)
-        self.error = None
-        self._show("review")
-
-    def _csv(self, selector: str) -> tuple[str, ...]:
-        return tuple(
-            item.strip()
-            for item in self.query_one(selector, Input).value.split(",")
-            if item.strip()
-        )
-
     def _commit(self) -> None:
         assert self.provider is not None
         if not self._save_details(recompose=False):
             return
         patches: dict[str, dict[str, object]] = {}
-        tags: dict[str, tuple[str, ...]] = dict(self._tag_orders)
+        roles = {
+            name: {
+                "description": definition.description,
+                "models": list(definition.models),
+            }
+            for name, definition in self.catalog.roles.items()
+        }
         for selection in self._selected_models.values():
             outcome: MatchOutcome = match_discovered_model(
                 self.catalog,
@@ -1763,7 +1733,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 continue
             base_name = (
                 outcome.existing_base
-                if outcome.kind in {"existing", "alias_collision"}
+                if outcome.kind == "existing"
                 else selection.base_name
             )
             assert base_name is not None
@@ -1804,34 +1774,27 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                     name: value for name, value in prices.items() if value is not None
                 }
             deployments.append(deployment)
-            if selection.edits.aliases.state == "set":
-                patch["aliases"] = list(selection.edits.aliases.value or ())
-            if selection.edits.aliases.state == "cleared":
-                patch["aliases"] = []
-            if selection.edits.tags.state == "set":
-                for tag in selection.edits.tags.value or ():
-                    members = list(tags.get(tag, self.catalog.tags.get(tag, ())))
-                    if base_name not in members:
+            if selection.edits.role_memberships.state == "set":
+                selected_roles = set(selection.edits.role_memberships.value or ())
+                for role, definition in roles.items():
+                    members = definition["models"]
+                    assert isinstance(members, list)
+                    if role in selected_roles and (
+                        base_name not in members
+                        or role
+                        in self._reappended_roles.get(selection.wire_name, set())
+                    ):
+                        if base_name in members:
+                            members.remove(base_name)
                         members.append(base_name)
-                    tags[tag] = tuple(members)
-            if selection.edits.tags.state == "cleared":
-                for tag in self.catalog.tags.keys() | tags.keys():
-                    members = tags.get(tag, self.catalog.tags.get(tag, ()))
-                    if base_name in members:
-                        remaining = tuple(
-                            member for member in members if member != base_name
-                        )
-                        if not remaining:
+                    elif role not in selected_roles and base_name in members:
+                        members.remove(base_name)
+                        if not members:
                             self.error = (
-                                "Removing the final member of a tag is not supported."
+                                "Removing the final member of a role is not supported."
                             )
                             self._show("review")
                             return
-                        tags[tag] = remaining
-        if any(not members for members in tags.values()):
-            self.error = "Removing the final member of a tag is not supported."
-            self._show("review")
-            return
         current_provider = self.catalog.providers.get(self.provider.provider_id)
         provider_values = {
             "api_base": self.provider.api_base,
@@ -1850,22 +1813,32 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             }
         )
         self._apply_changes(
-            provider_patch, patches, tags if tags != dict(self.catalog.tags) else {}
+            provider_patch,
+            patches,
+            {
+                name: definition
+                for name, definition in roles.items()
+                if definition
+                != {
+                    "description": self.catalog.roles[name].description,
+                    "models": list(self.catalog.roles[name].models),
+                }
+            },
         )
 
     def _apply_changes(
         self,
         provider_patch: Mapping[str, object],
         patches: Mapping[str, Mapping[str, object]],
-        tags: Mapping[str, tuple[str, ...]],
+        roles: Mapping[str, Mapping[str, object]],
     ) -> None:
         """Persist a non-empty catalog change and advance on success."""
-        if not provider_patch and not patches and not tags:
+        if not provider_patch and not patches and not roles:
             self._show("again")
             return
         try:
             result = self.catalog_writer.apply_changes(
-                CatalogChanges(self.provider_id, provider_patch, patches, tags or None)
+                CatalogChanges(self.provider_id, provider_patch, patches, roles or None)
             )
         except CatalogLoadError as failure:
             self.error = str(failure)
@@ -1876,7 +1849,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
             self._show("review")
             return
         self.snapshot = result.snapshot
-        self._tag_orders = dict(self.catalog.tags)
+        self._reappended_roles.clear()
         self._changed = self._changed or result.changed
         self._show("again")
 
@@ -1904,7 +1877,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         )
 
     def _active_model_options(self) -> list[tuple[str, str]]:
-        """Return one selectable canonical row per model, plus usable tag expressions."""
+        """Return one selectable canonical row per model, plus usable role expressions."""
         options: list[tuple[str, str]] = []
         for base, definition in sorted(self.catalog.models.items()):
             if definition.disabled or not self._has_usable_deployment(base):
@@ -1920,20 +1893,17 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
                 if self._is_configured_provider(deployment.provider)
                 else "Available"
             )
-            aliases = (
-                f"aliases: {', '.join(definition.aliases)}; "
-                if definition.aliases
-                else ""
-            )
             options.append((
-                f"{deployment.provider}/{deployment.name} ({base})\t"
-                f"{aliases}{provider_status}",
+                f"{deployment.provider}/{deployment.name} ({base})\t{provider_status}",
                 base,
             ))
         options.extend(
-            (f"@{tag}\ttag expression", f"@{tag}")
-            for tag, members in sorted(self.catalog.tags.items())
-            if any(self._has_usable_deployment(member) for member in members)
+            (
+                f"Role: {role.replace('-', ' ').title()} — {definition.description}",
+                f"@{role}",
+            )
+            for role, definition in sorted(self.catalog.roles.items())
+            if any(self._has_usable_deployment(member) for member in definition.models)
         )
         return options
 
@@ -1943,7 +1913,10 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         if self._active_model_expression not in {value for _label, value in options}:
             current = self._active_model_expression or "catalog default"
             return [
-                (f"Default\t(currently {current})", DEFAULT_ACTIVE_MODEL_OPTION),
+                (
+                    f"Default (orchestrator role)\t(currently {current})",
+                    DEFAULT_ACTIVE_MODEL_OPTION,
+                ),
                 *options,
             ]
         return options
@@ -1971,7 +1944,7 @@ class ProviderManagementScreen(ModalScreen[ProviderFlowResult]):
         if expression != "" and (
             not isinstance(expression, str) or expression not in valid_expressions
         ):
-            self.error = "Choose a usable canonical name, alias, or @tag."
+            self.error = "Choose a usable canonical name or @role."
             self._show("picker")
             return
         if not self._validate_selection(expression, step="picker"):

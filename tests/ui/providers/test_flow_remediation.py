@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 from httpx import AsyncClient
 import pytest
 from textual.widgets import Button, Input, Label, Select, Static
@@ -9,8 +7,6 @@ from textual.widgets import Button, Input, Label, Select, Static
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.ui.providers.contracts import (
-    CatalogChanges,
-    CatalogWriteResult,
     DiscoveryItem,
     DiscoveryResult,
     ModelSelectionDraft,
@@ -94,32 +90,6 @@ async def test_discovery_drops_stale_credential_after_connection_identity_change
         assert calls[0][0].api_key_env_var == ""
 
 
-@dataclass
-class EvolvingServices(FakeServices):
-    """Fake writer whose snapshots include every prior committed change."""
-
-    changes: list[CatalogChanges] = field(default_factory=list)
-
-    def apply_changes(self, changes: CatalogChanges) -> CatalogWriteResult:
-        self.changes.append(changes)
-        document = self.snapshot.catalog.model_dump(mode="python")
-        providers = document["providers"]
-        assert isinstance(providers, dict)
-        providers.setdefault(changes.provider_id, {}).update(changes.provider)
-        models = document["models"]
-        assert isinstance(models, dict)
-        for base, patch in changes.models.items():
-            models.setdefault(base, {}).update(patch)
-        if changes.tags is not None:
-            document["tags"] = {
-                tag: list(members) for tag, members in changes.tags.items()
-            }
-        self.snapshot = CatalogSnapshot(
-            ModelCatalog.model_validate(document), "evolving"
-        )
-        return CatalogWriteResult(self.snapshot, changed=True)
-
-
 def _provider(provider_id: str) -> ProviderDraft:
     return ProviderDraft(
         "generic-openai",
@@ -130,44 +100,6 @@ def _provider(provider_id: str) -> ProviderDraft:
         "",
         None,
     )
-
-
-@pytest.mark.asyncio
-async def test_second_catalog_save_preserves_first_provider_tag_membership() -> None:
-    initial = snapshot(providers={"existing/default": {"api_base": "https://old/v1"}})
-    services = EvolvingServices([], initial)
-    flow, _ = make_flow(catalog=initial)
-    flow.catalog_writer = services
-    flow.provider = _provider("provider-a/default")
-    flow._selected_models = {"a-wire": ModelSelectionDraft("a-wire", "model-a")}
-    flow._detail_wire = "a-wire"
-
-    async with FlowHost(flow).run_test() as pilot:
-        flow._show("review")
-        await wait_for(pilot, lambda: bool(flow.query("#tags")))
-        flow.query_one("#tags", Input).value = "preferred"
-        flow._commit()
-        await wait_for(pilot, lambda: flow.step == "again")
-        assert services.changes[0].tags == {"preferred": ("model-a",)}
-
-        flow.provider = _provider("provider-b/default")
-        flow._selected_models = {"b-wire": ModelSelectionDraft("b-wire", "model-b")}
-        flow._detail_wire = "b-wire"
-        flow._show("review")
-        await wait_for(pilot, lambda: bool(flow.query("#tags")))
-        await pilot.pause()
-        assert flow._detail_wire == "b-wire"
-        flow.query_one("#tags", Input).value = "secondary"
-        flow._commit()
-        await pilot.pause()
-        assert flow.step == "again", flow.error
-        assert services.changes[1].tags == {
-            "preferred": ("model-a",),
-            "secondary": ("model-b",),
-        }
-
-    assert flow.catalog.tags["preferred"] == ("model-a",)
-    assert flow.catalog.tags["secondary"] == ("model-b",)
 
 
 def _review_flow() -> tuple[ProviderManagementScreen, FakeServices]:
@@ -222,46 +154,23 @@ async def test_review_model_switch_keeps_invalid_input_on_outgoing_model() -> No
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ("clear", "bulk"))
-async def test_review_tag_actions_preserve_unrelated_typed_inputs(action: str) -> None:
-    flow, _ = _review_flow()
-    flow._tag_orders = {"preferred": ("model-a", "other")}
-    async with FlowHost(flow).run_test() as pilot:
-        flow._show("review")
-        await wait_for(pilot, lambda: bool(flow.query("#tags")))
-        flow.query_one("#input-price", Input).value = "12.345"
-        flow.query_one("#aliases", Input).value = "exact-alias"
-        flow.query_one("#tags", Input).value = "preferred"
-        if action == "clear":
-            flow._clear_detail_metadata("tags")
-        else:
-            flow._assign_bulk_tags()
-        await pilot.pause()
-        assert flow.query_one("#input-price", Input).value == "12.345"
-        assert flow.query_one("#aliases", Input).value == "exact-alias"
-        assert flow.query_one("#tags", Input).value == (
-            "" if action == "clear" else "preferred"
-        )
-
-
-@pytest.mark.asyncio
 async def test_review_back_navigation_preserves_exact_typed_input() -> None:
     flow, _ = _review_flow()
     flow.discovered = (DiscoveryItem("model-a"),)
     flow._selected_wires = {"model-a"}
     async with FlowHost(flow).run_test() as pilot:
         flow._show("review")
-        await wait_for(pilot, lambda: bool(flow.query("#aliases")))
-        flow.query_one("#aliases", Input).value = "typed-before-back"
+        await wait_for(pilot, lambda: bool(flow.query("#input-price")))
+        flow.query_one("#input-price", Input).value = "1.25"
         flow.action_back()
         await wait_for(
             pilot, lambda: flow.step == "models" and bool(flow.query("#models"))
         )
         flow._save_model_selection()
         await wait_for(
-            pilot, lambda: flow.step == "review" and bool(flow.query("#aliases"))
+            pilot, lambda: flow.step == "review" and bool(flow.query("#input-price"))
         )
-        assert flow.query_one("#aliases", Input).value == "typed-before-back"
+        assert flow.query_one("#input-price", Input).value == "1.25"
 
 
 @pytest.mark.asyncio
@@ -303,7 +212,7 @@ async def test_overview_requires_selection_and_disables_empty_actions() -> None:
         assert flow.step == "overview"
 
     empty = CatalogSnapshot(
-        ModelCatalog.model_validate({"providers": {}, "models": {}, "tags": {}}),
+        ModelCatalog.model_validate({"providers": {}, "models": {}, "roles": {}}),
         "empty",
     )
     flow, _ = make_flow(catalog=empty, management=True)
@@ -512,10 +421,7 @@ async def test_overview_and_active_model_use_keyboard_option_lists_with_catalog_
             "custom/default": {"api_base": "https://custom.example/v1"},
         },
         models={
-            "canonical": {
-                "aliases": ["old-name", "latest"],
-                "deployments": [{"provider": "codex/local", "name": "wire"}],
-            }
+            "canonical": {"deployments": [{"provider": "codex/local", "name": "wire"}]}
         },
     )
     flow, _ = make_flow(catalog=catalog, management=True)
@@ -534,7 +440,6 @@ async def test_overview_and_active_model_use_keyboard_option_lists_with_catalog_
         assert active.has_focus
         labels = [label for label, _value in flow._active_model_options()]
         assert len(labels) == 1
-        assert "aliases: old-name, latest" in labels[0]
         assert "Available" in labels[0]
 
 

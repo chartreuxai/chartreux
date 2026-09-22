@@ -89,14 +89,9 @@ class ModelResolver:
 
     def __init__(self, snapshot: CatalogSnapshot) -> None:
         self.snapshot = snapshot
-        aliases: dict[str, list[str]] = {}
-        for base, definition in snapshot.catalog.models.items():
-            for alias in definition.aliases:
-                aliases.setdefault(alias, []).append(base)
-        self._aliases = aliases
 
     def canonicalize(self, expression: str) -> str:
-        """Return the one base represented by a non-tag expression."""
+        """Return the one base represented by a non-role expression."""
         if not isinstance(expression, str) or not expression:
             raise ModelResolutionError(
                 "invalid_expression", "Model expression must be a non-empty string"
@@ -104,25 +99,17 @@ class ModelResolver:
         if expression == "@" or expression.startswith("@"):
             if expression == "@":
                 raise ModelResolutionError(
-                    "reserved_at", "'@' is reserved for a named tag"
+                    "reserved_at", "'@' is reserved for a named role"
                 )
             raise ModelResolutionError(
-                "tag_not_scalar", "A tag expression selects an ordered model set"
+                "role_not_scalar", "A role expression selects an ordered model set"
             )
         if expression in self.snapshot.catalog.models:
             return expression
-        matches = self._aliases.get(expression, [])
-        if len(matches) > 1:
-            raise ModelResolutionError(
-                "ambiguous_alias",
-                f"Model alias {expression!r} is ambiguous: {matches!r}",
-            )
-        if matches:
-            return matches[0]
         if "/" in expression:
             raise ModelResolutionError(
                 "invalid_expression",
-                "Provider-qualified model expressions are unsupported; use a canonical base name or alias",
+                "Provider-qualified model expressions are unsupported; use a canonical base name",
             )
         raise ModelResolutionError(
             "unknown_model", f"Unknown model expression {expression!r}"
@@ -136,14 +123,16 @@ class ModelResolver:
                 "Model expression must be a bare string; fallback arrays are unsupported",
             )
         if expression == "@":
-            raise ModelResolutionError("reserved_at", "'@' is reserved for a named tag")
+            raise ModelResolutionError(
+                "reserved_at", "'@' is reserved for a named role"
+            )
         if expression.startswith("@"):
-            members = self.snapshot.catalog.tags.get(expression[1:])
-            if members is None:
+            definition = self.snapshot.catalog.roles.get(expression[1:])
+            if definition is None:
                 raise ModelResolutionError(
-                    "unknown_tag", f"Unknown model tag {expression!r}"
+                    "unknown_role", f"Unknown model role {expression!r}"
                 )
-            return members
+            return definition.models
         return (self.canonicalize(expression),)
 
     def resolve(
@@ -286,17 +275,13 @@ class ModelResolver:
     @staticmethod
     def _allowed(
         base: str,
-        definition: BaseModelDefinition,
+        _definition: BaseModelDefinition,
         deployment: DeploymentDefinition,
         patterns: Sequence[str],
     ) -> bool:
         if not patterns:
             return True
-        candidates = (
-            base,
-            *definition.aliases,
-            f"{deployment.provider}/{deployment.name}",
-        )
+        candidates = (base, f"{deployment.provider}/{deployment.name}")
         return any(name_matches(candidate, list(patterns)) for candidate in candidates)
 
 

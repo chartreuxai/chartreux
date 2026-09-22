@@ -18,11 +18,7 @@ from chartreux.core.model_catalog.loader import (
     merge_catalog_overlay,
 )
 from chartreux.core.model_catalog.resolver import ModelResolutionError, ModelResolver
-from chartreux.core.model_catalog.schema import (
-    BaseModelDefinition,
-    ModelCatalog,
-    Prices,
-)
+from chartreux.core.model_catalog.schema import ModelCatalog, Prices
 
 
 def _minimal() -> dict[str, object]:
@@ -31,7 +27,7 @@ def _minimal() -> dict[str, object]:
         "models": {
             "base": {"deployments": [{"provider": "test/provider", "name": "wire"}]}
         },
-        "tags": {},
+        "roles": {},
     }
 
 
@@ -70,19 +66,13 @@ def test_4_duplicate_deployment_provider_is_rejected() -> None:
         ModelCatalog.model_validate(raw)
 
 
-def test_5_duplicate_alias_and_reserved_at_are_rejected() -> None:
+def test_5_roles_and_reserved_at_are_validated() -> None:
     raw = _minimal()
-    raw["models"]["base"]["aliases"] = ["same", "same"]  # type: ignore[index]
-    with pytest.raises(ValidationError, match="Duplicate aliases"):
-        ModelCatalog.model_validate(raw)
-    raw["models"]["base"]["aliases"] = ["bad@alias"]  # type: ignore[index]
-    with pytest.raises(ValidationError, match="reserved"):
-        ModelCatalog.model_validate(raw)
     raw["models"] = {"bad@name": raw["models"]["base"]}  # type: ignore[index]
     with pytest.raises(ValidationError, match="reserved"):
         ModelCatalog.model_validate(raw)
     raw = _minimal()
-    raw["tags"] = {"bad@tag": ["base"]}
+    raw["roles"] = {"bad@role": {"models": ["base"]}}
     with pytest.raises(ValidationError, match="reserved"):
         ModelCatalog.model_validate(raw)
 
@@ -98,18 +88,18 @@ def test_6_provider_id_and_unknown_provider_are_rejected() -> None:
         ModelCatalog.model_validate(raw)
 
 
-def test_7_duplicate_tag_members_and_empty_lists_are_rejected() -> None:
+def test_7_duplicate_role_members_and_empty_lists_are_rejected() -> None:
     raw = _minimal()
-    raw["tags"] = {"tag": ["base", "base"]}
-    with pytest.raises(ValidationError, match="Duplicate tag"):
+    raw["roles"] = {"role": {"models": ["base", "base"]}}
+    with pytest.raises(ValidationError, match="Duplicate role"):
         ModelCatalog.model_validate(raw)
     raw = _minimal()
     raw["models"]["base"]["deployments"] = []  # type: ignore[index]
     with pytest.raises(ValidationError):
         ModelCatalog.model_validate(raw)
     raw = _minimal()
-    raw["tags"] = {"tag": []}
-    with pytest.raises(ValidationError, match="must not be empty"):
+    raw["roles"] = {"role": {"models": []}}
+    with pytest.raises(ValidationError, match="at least 1 item"):
         ModelCatalog.model_validate(raw)
 
 
@@ -143,15 +133,15 @@ def test_11_overlay_replaces_scalars_and_deployment_lists() -> None:
         SHIPPED_CATALOG,
         {
             "models": {
-                "glm-5-2": {
+                "glm-5-3": {
                     "thinking": "low",
-                    "deployments": [{"provider": "mistral/default", "name": "glm-5-2"}],
+                    "deployments": [{"provider": "mistral/default", "name": "glm-5-3"}],
                 }
             }
         },
     )
-    assert catalog.models["glm-5-2"].thinking == "low"
-    assert [item.name for item in catalog.models["glm-5-2"].deployments] == ["glm-5-2"]
+    assert catalog.models["glm-5-3"].thinking == "low"
+    assert [item.name for item in catalog.models["glm-5-3"].deployments] == ["glm-5-3"]
 
 
 def test_12_deployment_overlay_inherits_by_provider_and_adds_provider() -> None:
@@ -160,7 +150,7 @@ def test_12_deployment_overlay_inherits_by_provider_and_adds_provider() -> None:
         {
             "providers": {"test/second": {"api_base": "https://second.test"}},
             "models": {
-                "glm-5-2": {
+                "glm-5-3": {
                     "deployments": [
                         {"provider": "mistral/default", "supports_images": True},
                         {"provider": "test/second", "name": "glm-second"},
@@ -169,9 +159,9 @@ def test_12_deployment_overlay_inherits_by_provider_and_adds_provider() -> None:
             },
         },
     )
-    deployments = catalog.models["glm-5-2"].deployments
+    deployments = catalog.models["glm-5-3"].deployments
     assert [(item.provider, item.name) for item in deployments] == [
-        ("mistral/default", "glm-5-2"),
+        ("mistral/default", "zai-glm-5-3"),
         ("test/second", "glm-second"),
     ]
     assert deployments[0].supports_images is True
@@ -179,9 +169,9 @@ def test_12_deployment_overlay_inherits_by_provider_and_adds_provider() -> None:
 
 def test_13_overlay_can_disable_shipped_entries() -> None:
     catalog = merge_catalog_overlay(
-        SHIPPED_CATALOG, {"models": {"glm-5-2": {"disabled": True}}}
+        SHIPPED_CATALOG, {"models": {"glm-5-3": {"disabled": True}}}
     )
-    assert catalog.models["glm-5-2"].disabled is True
+    assert catalog.models["glm-5-3"].disabled is True
 
 
 def test_14_missing_models_toml_loads_shipped_defaults(tmp_path: Path) -> None:
@@ -203,19 +193,17 @@ def test_16_shipped_defaults_validate_and_have_verified_wire_names() -> None:
         for model in catalog.models.values()
         for deployment in model.deployments
     )
+    assert catalog.models["glm-5-3"].thinking == "medium"
+    assert catalog.models["gpt-6-astra"].thinking == "low"
+    assert catalog.models["gpt-5.6-luna"].thinking == "high"
+    assert catalog.models["gpt-5.6-sol"].thinking == "medium"
+    assert catalog.models["gpt-5.6-terra"].thinking == "medium"
+    assert catalog.roles["orchestrator"].models == ("glm-5-3",)
     assert {
         deployment.name
         for model in catalog.models.values()
         for deployment in model.deployments
-    } == {
-        "glm-5-2",
-        "zai-glm-5-3",
-        "mistral-small-latest",
-        "gpt-6-astra",
-        "gpt-5.6-luna",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-    }
+    } == {"zai-glm-5-3", "gpt-6-astra", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"}
 
 
 def test_shipped_catalog_json_dump_round_trips() -> None:
@@ -224,22 +212,18 @@ def test_shipped_catalog_json_dump_round_trips() -> None:
     assert ModelCatalog.model_validate_json(dumped) == SHIPPED_CATALOG
 
 
-def test_17_resolver_expands_scalar_aliases_and_tags_only() -> None:
+def test_17_resolver_expands_scalar_models_and_roles_only() -> None:
     raw = _minimal()
-    raw["models"]["base"]["aliases"] = ["alias"]  # type: ignore[index]
-    raw["tags"] = {"preferred": ["base"]}
+    raw["roles"] = {"preferred": {"models": ["base"]}}
     resolver = ModelResolver(CatalogSnapshot(ModelCatalog.model_validate(raw), "test"))
     assert resolver.expression_bases("base") == ("base",)
-    assert resolver.expression_bases("alias") == ("base",)
     assert resolver.expression_bases("@preferred") == ("base",)
     with pytest.raises(ModelResolutionError) as error:
-        resolver.expression_bases(cast(str, ["base", "alias"]))
+        resolver.expression_bases(cast(str, ["base"]))
     assert error.value.code == "invalid_expression"
-    assert "fallback arrays" in str(error.value)
     with pytest.raises(ModelResolutionError) as error:
-        resolver.expression_bases("provider/base")
-    assert error.value.code == "invalid_expression"
-    assert "Provider-qualified" in str(error.value)
+        resolver.expression_bases("alias")
+    assert error.value.code == "unknown_model"
     with pytest.raises(ModelResolutionError, match="reserved"):
         resolver.expression_bases("@")
 
@@ -264,21 +248,6 @@ def test_18_resolver_materializes_wire_name_and_filters_deployments() -> None:
     assert model.auto_compact_threshold == 123
     with pytest.raises(ModelResolutionError, match="permitted"):
         resolver.resolve("base", allowed_models=["none"])
-
-
-def test_resolver_reports_crafted_ambiguous_alias() -> None:
-    raw = _minimal()
-    catalog = ModelCatalog.model_validate(raw)
-    duplicate = BaseModelDefinition.model_construct(
-        aliases=("shared",), deployments=catalog.models["base"].deployments
-    )
-    first = duplicate.model_copy()
-    invalid = catalog.model_copy(update={"models": {"one": first, "two": duplicate}})
-    resolver = ModelResolver(CatalogSnapshot(invalid, "crafted"))
-
-    with pytest.raises(ModelResolutionError) as error:
-        resolver.resolve("shared")
-    assert error.value.code == "ambiguous_alias"
 
 
 def test_resolver_unknown_explicit_name_is_typed() -> None:
@@ -318,40 +287,30 @@ def test_deployment_priority_disabled_skip_and_all_disabled() -> None:
     assert error.value.code == "all_deployments_disabled"
 
 
-def test_thinking_override_aliases_canonicalize_and_conflict() -> None:
-    catalog = merge_catalog_overlay(
-        SHIPPED_CATALOG, {"models": {"glm-5-2": {"aliases": ["glm-alias"]}}}
-    )
-    resolver = ModelResolver(CatalogSnapshot(catalog, "test"))
-    assert resolver.canonicalize_thinking_overrides({"glm-alias": "low"}) == {
-        "glm-5-2": "low"
+def test_thinking_overrides_require_canonical_keys() -> None:
+    resolver = ModelResolver(CatalogSnapshot(SHIPPED_CATALOG, "test"))
+    assert resolver.canonicalize_thinking_overrides({"glm-5-3": "low"}) == {
+        "glm-5-3": "low"
     }
-    with pytest.raises(ModelResolutionError) as error:
-        resolver.canonicalize_thinking_overrides({
-            "glm-alias": "low",
-            "glm-5-2": "high",
-        })
-    assert error.value.code == "conflicting_thinking_override"
+    with pytest.raises(ModelResolutionError, match="Unknown model"):
+        resolver.canonicalize_thinking_overrides({"glm-alias": "low"})
 
 
-def test_real_config_consumer_materializes_wire_name_and_alias() -> None:
-    catalog = merge_catalog_overlay(
-        SHIPPED_CATALOG, {"models": {"glm-5-2": {"aliases": ["glm-alias"]}}}
-    )
-    snapshot = CatalogSnapshot(catalog, "revision")
+def test_real_config_consumer_materializes_wire_name_and_base_label() -> None:
+    snapshot = CatalogSnapshot(SHIPPED_CATALOG, "revision")
     config = ChartreuxConfigSchema.model_validate(
-        {"active_model": "glm-alias"}, context={"catalog_snapshot": snapshot}
+        {"active_model": "glm-5-3"}, context={"catalog_snapshot": snapshot}
     ).attach_catalog_snapshot(snapshot)
     model = config.get_active_model()
-    assert model.alias == "glm-5-2"
-    assert model.name == "glm-5-2"
+    assert model.alias == "glm-5-3"
+    assert model.name == "zai-glm-5-3"
     assert model.provider == "mistral/default"
 
 
-def test_glm_alias_keeps_exact_deployment_wire_name() -> None:
+def test_glm_canonical_name_keeps_exact_deployment_wire_name() -> None:
     snapshot = CatalogSnapshot(SHIPPED_CATALOG, "revision")
     config = ChartreuxConfigSchema.model_validate(
-        {"active_model": "zai-glm-latest"}, context={"catalog_snapshot": snapshot}
+        {"active_model": "glm-5-3"}, context={"catalog_snapshot": snapshot}
     ).attach_catalog_snapshot(snapshot)
     assert config.get_active_model().name == "zai-glm-5-3"
 
@@ -362,7 +321,7 @@ def test_catalog_snapshot_is_deeply_immutable() -> None:
     raw["models"]["base"]["deployments"][0]["supported_thinking_levels"] = [  # type: ignore[index]
         "low"
     ]
-    raw["tags"] = {"tag": ["base"]}
+    raw["roles"] = {"role": {"models": ["base"]}}
     catalog = ModelCatalog.model_validate(raw)
 
     with pytest.raises(TypeError):
@@ -370,7 +329,7 @@ def test_catalog_snapshot_is_deeply_immutable() -> None:
     with pytest.raises(TypeError):
         catalog.models["other"] = catalog.models["base"]  # type: ignore[index]
     with pytest.raises(TypeError):
-        catalog.tags["other"] = ("base",)  # type: ignore[index]
+        catalog.roles["other"] = catalog.roles["role"]  # type: ignore[index]
     with pytest.raises(TypeError):
         catalog.providers["test/provider"].extra_headers["Other"] = "value"  # type: ignore[index]
     with pytest.raises(TypeError):
@@ -378,7 +337,7 @@ def test_catalog_snapshot_is_deeply_immutable() -> None:
     with pytest.raises(TypeError):
         catalog.models["base"].deployments[0].supported_thinking_levels[0] = "high"  # type: ignore[index]
     with pytest.raises(TypeError):
-        catalog.tags["tag"][0] = "other"  # type: ignore[index]
+        catalog.roles["role"].models[0] = "other"  # type: ignore[index]
 
 
 @pytest.mark.parametrize(
@@ -437,3 +396,45 @@ async def test_orchestrator_copy_reattaches_supplied_and_source_catalog_snapshot
 
     assert source.copy().config.catalog_snapshot is source.config.catalog_snapshot
     assert source.copy(config=supplied).config.catalog_snapshot is supplied_snapshot
+
+
+def test_role_overlay_merges_per_key_and_rejects_legacy_names() -> None:
+    catalog = merge_catalog_overlay(
+        SHIPPED_CATALOG, {"roles": {"orchestrator": {"models": ["glm-5-3"]}}}
+    )
+    assert catalog.roles["orchestrator"].models == ("glm-5-3",)
+    assert (
+        catalog.roles["orchestrator"].description
+        == SHIPPED_CATALOG.roles["orchestrator"].description
+    )
+    assert catalog.roles["advisor"] == SHIPPED_CATALOG.roles["advisor"]
+    with pytest.raises(ValueError, match=r"migration required.*\[roles\]"):
+        merge_catalog_overlay(SHIPPED_CATALOG, {"tags": {}})
+    with pytest.raises(ValueError, match="remove aliases"):
+        merge_catalog_overlay(SHIPPED_CATALOG, {"models": {"glm-5-3": {"aliases": []}}})
+
+
+def test_role_priority_skips_disabled_first_member() -> None:
+    catalog = merge_catalog_overlay(
+        SHIPPED_CATALOG,
+        {
+            "models": {"glm-5-3": {"disabled": True}},
+            "roles": {"priority": {"models": ["glm-5-3", "gpt-6-astra"]}},
+        },
+    )
+    assert (
+        ModelResolver(CatalogSnapshot(catalog, "test")).resolve("@priority").base_model
+        == "gpt-6-astra"
+    )
+
+
+def test_role_priority_skips_allowlist_excluded_first_member() -> None:
+    catalog = merge_catalog_overlay(
+        SHIPPED_CATALOG, {"roles": {"priority": {"models": ["glm-5-3", "gpt-6-astra"]}}}
+    )
+    assert (
+        ModelResolver(CatalogSnapshot(catalog, "test"))
+        .resolve("@priority", allowed_models=["gpt-6-astra"])
+        .base_model
+        == "gpt-6-astra"
+    )
