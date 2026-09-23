@@ -61,6 +61,22 @@ def strip_ansi(text: str) -> str:
     return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07", "", text)
 
 
+def _rendered_text_failure_details(captured: str) -> str:
+    raw_tail = captured[-2000:]
+    stripped_tail = strip_ansi(captured)[-2000:]
+    if any(char.isprintable() for char in stripped_tail):
+        printable_tail = "".join(
+            char if char.isprintable() else repr(char)[1:-1] for char in stripped_tail
+        )
+    else:
+        printable_tail = "(no printable PTY output captured)"
+    return (
+        f"Raw captured tail ({len(raw_tail)} chars): {raw_tail!r}\n"
+        f"ANSI-stripped tail ({len(stripped_tail)} chars): {stripped_tail!r}\n"
+        f"Printable tail:\n{printable_tail}"
+    )
+
+
 def poll_until(predicate: Callable[[], bool], timeout: float, message: str) -> None:
     start = time.monotonic()
     while time.monotonic() - start < timeout:
@@ -154,17 +170,13 @@ def wait_for_rendered_text(
         if needle in strip_ansi(captured.getvalue()):
             return
         if drain_child_output(child, captured):
-            rendered_tail = strip_ansi(captured.getvalue())[-2000:]
-            if not rendered_tail:
-                rendered_tail = "(no printable PTY output captured)"
+            details = _rendered_text_failure_details(captured.getvalue())
             raise AssertionError(
-                f"Child exited while waiting for rendered text: {needle!r}\n\nRendered tail:\n{rendered_tail}"
+                f"Child exited while waiting for rendered text: {needle!r}\n\n{details}"
             )
-    rendered_tail = strip_ansi(captured.getvalue())[-2000:]
-    if not rendered_tail:
-        rendered_tail = "(no printable PTY output captured)"
+    details = _rendered_text_failure_details(captured.getvalue())
     raise AssertionError(
-        f"Timed out waiting for rendered text: {needle!r}\n\nRendered tail:\n{rendered_tail}"
+        f"Timed out waiting for rendered text: {needle!r}\n\n{details}"
     )
 
 

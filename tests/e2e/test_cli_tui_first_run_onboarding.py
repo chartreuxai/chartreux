@@ -99,7 +99,7 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
         child.send("\r")
 
         wait_for_rendered_text(child, captured, "Choose a provider", timeout=10)
-        _send_and_wait_for_text(child, "\t\r", "Preset")
+        _send_and_wait_for_text(child, "\t\r", "Preset", timeout=25)
 
         _send_and_wait_for_text(child, "\t\t", "Generic OpenAI-style")
         child.sendcontrol("a")

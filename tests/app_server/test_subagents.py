@@ -3245,6 +3245,11 @@ async def test_reused_projection_linkage_failure_never_prepares_a_turn(
 async def test_reused_start_failure_aborts_real_prepared_turn_and_allows_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # AgentRuntimeFactory creates a fresh child backend; it does not reuse the
+    # parent's injected FakeBackend, so keep the retry path offline explicitly.
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: FakeBackend()
+    )
     registry, parent, record, args, context = await _real_reused_background()
     root = registry._root
     assert root is not None
@@ -3303,6 +3308,10 @@ async def test_reused_start_failure_aborts_real_prepared_turn_and_allows_retry(
 async def test_monitor_creation_failure_aborts_prepared_turn_and_allows_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The child gets a fresh backend rather than the parent's injected FakeBackend.
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: FakeBackend()
+    )
     registry, parent, record, args, context = await _real_reused_background()
     root = registry._root
     assert root is not None
