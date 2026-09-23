@@ -153,13 +153,15 @@ class TestSessionLoggerInitialization:
     ) -> None:
         session_dir = temp_session_dir / "existing"
         session_dir.mkdir(mode=0o755)
+        session_dir.chmod(0o755)
+        initial_mode = session_dir.stat().st_mode & 0o777
         messages = session_dir / "messages.jsonl"
         messages.write_text("{}\n")
         messages.chmod(0o644)
 
         SessionLogger._persist_messages_sync([{"content": "more"}], session_dir)
 
-        assert session_dir.stat().st_mode & 0o777 == 0o755
+        assert session_dir.stat().st_mode & 0o777 == initial_mode
         assert messages.stat().st_mode & 0o777 == 0o644
 
     def test_private_modes_survive_permissive_umask(

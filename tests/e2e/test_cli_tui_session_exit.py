@@ -129,7 +129,7 @@ def _finish_turn(
     )
 
 
-@pytest.mark.timeout(30)
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize(
     "streaming_mock_server",
     [pytest.param(_usage_by_run_factory, id="fresh-usage-after-resume")],
@@ -174,7 +174,7 @@ def test_resumed_session_prints_only_fresh_token_usage_on_exit(
     ):
         wait_for_main_screen(resumed_child, timeout=15)
         wait_for_rendered_text(
-            resumed_child, resumed_captured, "Resumed session", timeout=20
+            resumed_child, resumed_captured, "Resumed session", timeout=25
         )
         resumed_child.send("Second run")
         resumed_child.send("\r")

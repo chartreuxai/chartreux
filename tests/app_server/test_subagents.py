@@ -3241,6 +3241,7 @@ async def test_reused_projection_linkage_failure_never_prepares_a_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_reused_start_failure_aborts_real_prepared_turn_and_allows_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3279,6 +3280,7 @@ async def test_reused_start_failure_aborts_real_prepared_turn_and_allows_retry(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_monitor_creation_failure_aborts_prepared_turn_and_allows_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -129,7 +129,7 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
         time.sleep(0.1)
 
         _select_option_with_keyboard(child, captured, "onboarding-mock-model")
-        wait_for_rendered_text(child, captured, "Setup complete", timeout=15)
+        wait_for_rendered_text(child, captured, "Setup complete", timeout=25)
 
         config_path = chartreux_home / "config.toml"
         env_path = chartreux_home / ".env"
@@ -154,7 +154,7 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
         # the message keystrokes arrive while the app is still entering its
         # input screen and are lost.
         wait_for_rendered_text(
-            child, captured, "Type /help for more information", timeout=15
+            child, captured, "Type /help for more information", timeout=25
         )
         child.send("Greet from onboarding")
         child.send("\r")

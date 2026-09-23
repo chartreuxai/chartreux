@@ -83,7 +83,24 @@ jobs:
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
 
+      - name: Provision installed-contract wheelhouse
+        run: |
+          wheelhouse="$RUNNER_TEMP/wheelhouse"
+          mkdir -p "$wheelhouse"
+          uv export --frozen --no-dev --no-emit-project --format requirements.txt \
+            --output-file "$RUNNER_TEMP/runtime-requirements.txt"
+          python -m pip download --only-binary=:all: \
+            --requirement "$RUNNER_TEMP/runtime-requirements.txt" \
+            --dest "$wheelhouse"
+          python -c 'import tomllib; from pathlib import Path; print(*tomllib.loads(Path("pyproject.toml").read_text())["build-system"]["requires"], sep="\n")' \
+            > "$RUNNER_TEMP/build-requirements.txt"
+          python -m pip download --only-binary=:all: \
+            --requirement "$RUNNER_TEMP/build-requirements.txt" \
+            --dest "$wheelhouse"
+
       - name: Run tests
+        env:
+          UV_FIND_LINKS: ${{ runner.temp }}/wheelhouse
         run: uv run --no-sync pytest --ignore tests/snapshots
 
   snapshot-tests:

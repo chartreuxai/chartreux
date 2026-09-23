@@ -805,6 +805,7 @@ async def _run_app_server_startup(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=4 * 1024 * 1024,
     )
     assert process.stdin is not None and process.stdout is not None
     stderr_task = asyncio.create_task(_drain_stderr(process))
@@ -1052,6 +1053,7 @@ async def _run_acp_lifecycle(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=4 * 1024 * 1024,
     )
     assert process.stdin is not None and process.stdout is not None
     captured_stdout = bytearray()
@@ -1167,6 +1169,7 @@ async def _run_app_server_lifecycle(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=4 * 1024 * 1024,
     )
     assert process.stdin is not None and process.stdout is not None
     stdin = process.stdin
