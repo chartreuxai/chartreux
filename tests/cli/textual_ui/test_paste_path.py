@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+import threading
 
 import pytest
 from textual import events
 from textual.screen import ModalScreen
-from textual.widgets import Static
+from textual.widgets import Static, TextArea
 
 from chartreux.cli.textual_ui.app import ChartreuxApp
+from chartreux.cli.textual_ui.widgets.chat_input import text_area as text_area_module
 from chartreux.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
 from chartreux.cli.textual_ui.widgets.chat_input.paste_path import (
     maybe_prepend_at_for_path,
@@ -64,10 +67,23 @@ def test_missing_image_path_is_left_untouched(tmp_path: Path) -> None:
 
 def test_unresolvable_tilde_user_does_not_crash() -> None:
     # `~a` raises RuntimeError from Path.expanduser() when user `a` does not
-    # exist; the rewrite hook must swallow it so every keystroke after `~`
-    # does not crash the TUI.
+    # exist; the rewrite hook must swallow it so every keystroke after `~` does
+    # not crash the TUI.
     assert maybe_prepend_at_for_path("~a") == "~a"
     assert rewrite_bare_image_paths_in_text("hello ~a world") == "hello ~a world"
+
+
+def test_path_stat_oserror_is_treated_as_non_match(tmp_path: Path, monkeypatch) -> None:
+    candidate = tmp_path / "shot.png"
+
+    def _raise_oserror(_path: Path) -> bool:
+        raise OSError("filesystem unavailable")
+
+    monkeypatch.setattr(Path, "is_file", _raise_oserror)
+    assert rewrite_bare_image_paths_in_text(f"see {candidate}") == f"see {candidate}"
+
+    monkeypatch.setattr(Path, "exists", _raise_oserror)
+    assert maybe_prepend_at_for_path(str(candidate)) == str(candidate)
 
 
 def test_multiline_path_list_gets_at_prefixes(tmp_path: Path) -> None:
@@ -110,6 +126,35 @@ async def test_paste_event_inserts_at_prefixed_path_into_chat_input(
         await pilot.pause()
 
         assert chat_input.value == f"@{img}"
+
+
+@pytest.mark.asyncio
+async def test_paste_path_existence_check_runs_off_ui_thread(
+    chartreux_app: ChartreuxApp, tmp_path: Path, monkeypatch
+) -> None:
+    img = tmp_path / "shot.png"
+    img.write_bytes(b"\x89PNG")
+    ui_thread = threading.get_ident()
+    check_threads: list[int] = []
+    original_exists = Path.exists
+
+    def _record_check(path: Path) -> bool:
+        if path == img:
+            check_threads.append(threading.get_ident())
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", _record_check)
+
+    async with chartreux_app.run_test() as pilot:
+        chat_input = chartreux_app.query_one(ChatInputContainer)
+        text_area = chat_input.query_one(ChatTextArea)
+        text_area.focus()
+        text_area.post_message(events.Paste(text=str(img)))
+        await pilot.pause(0.1)
+
+        assert chat_input.value == f"@{img}"
+        assert check_threads
+        assert all(thread_id != ui_thread for thread_id in check_threads)
 
 
 @pytest.mark.asyncio
@@ -185,6 +230,98 @@ def test_rewrite_bare_image_paths_fast_path_skips_stat_for_plain_text(
     rewrite_bare_image_paths_in_text("multi\nline\ntext\nwith no slash")
 
     assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_duplicate_text_change_does_not_schedule_duplicate_path_check(
+    chartreux_app: ChartreuxApp, tmp_path: Path, monkeypatch
+) -> None:
+    candidate = tmp_path / "missing.png"
+
+    async with chartreux_app.run_test() as pilot:
+        text_area = chartreux_app.query_one(ChatInputContainer).query_one(ChatTextArea)
+        original_run_worker = text_area.run_worker
+        worker_count = 0
+
+        def _count_worker(awaitable, **kwargs):
+            nonlocal worker_count
+            worker_count += 1
+            return original_run_worker(awaitable, **kwargs)
+
+        monkeypatch.setattr(text_area, "run_worker", _count_worker)
+        text_area.text = str(candidate)
+        text_area.on_text_area_changed(TextArea.Changed(text_area))
+        await pilot.pause(0.1)
+
+        assert worker_count == 1
+
+
+@pytest.mark.asyncio
+async def test_text_change_checks_image_path_off_ui_thread(
+    chartreux_app: ChartreuxApp, tmp_path: Path, monkeypatch
+) -> None:
+    img = tmp_path / "shot.png"
+    img.write_bytes(b"\x89PNG")
+    ui_thread = threading.get_ident()
+    check_threads: list[int] = []
+    original_is_file = Path.is_file
+
+    def _record_check(path: Path) -> bool:
+        if path == img:
+            check_threads.append(threading.get_ident())
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", _record_check)
+
+    async with chartreux_app.run_test() as pilot:
+        chat_input = chartreux_app.query_one(ChatInputContainer)
+        text_area = chat_input.query_one(ChatTextArea)
+        text_area.focus()
+        text_area.text = str(img)
+        await pilot.pause(0.1)
+
+        assert chat_input.value == f"@{img}"
+        assert check_threads
+        assert all(thread_id != ui_thread for thread_id in check_threads)
+
+
+@pytest.mark.asyncio
+async def test_delayed_path_rewrite_preserves_moved_caret(
+    chartreux_app: ChartreuxApp, tmp_path: Path, monkeypatch
+) -> None:
+    img = tmp_path / "shot.png"
+    img.write_bytes(b"\x89PNG")
+    started = threading.Event()
+    release = threading.Event()
+    original_rewrite = text_area_module.rewrite_bare_image_paths_in_text
+
+    def _slow_rewrite(text: str) -> str:
+        started.set()
+        release.wait(timeout=5)
+        return original_rewrite(text)
+
+    monkeypatch.setattr(
+        text_area_module, "rewrite_bare_image_paths_in_text", _slow_rewrite
+    )
+
+    try:
+        async with chartreux_app.run_test() as pilot:
+            text_area = chartreux_app.query_one(ChatInputContainer).query_one(
+                ChatTextArea
+            )
+            text_area.focus()
+            text_area.text = f"look {img}"
+            await pilot.pause(0.05)
+            assert await asyncio.to_thread(started.wait, 2)
+
+            text_area.move_cursor((0, 0))
+            release.set()
+            await pilot.pause(0.1)
+
+            assert text_area.text == f"look @{img}"
+            assert text_area.cursor_location == (0, 0)
+    finally:
+        release.set()
 
 
 @pytest.mark.asyncio

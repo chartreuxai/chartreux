@@ -9,6 +9,7 @@ import hashlib
 import inspect
 import os
 from pathlib import Path
+import sys
 import threading
 from typing import TYPE_CHECKING, Any, ClassVar, TextIO
 
@@ -35,13 +36,39 @@ from chartreux.core.tools.ui import ToolResultDisplay
 from chartreux.observability.logging import logger
 from chartreux.utils.http import ChartreuxAsyncHTTPClient, build_ssl_context
 from chartreux.utils.io import decode_console_safe
-from mcp import ClientSession
-from mcp.client.auth import OAuthFlowError
-from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamable_http_client
 
 if TYPE_CHECKING:
     from chartreux.core.events import ToolResultEvent
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters
+
+
+def _mcp_sdk_attribute(name: str) -> Any:
+    return getattr(sys.modules[__name__], name)
+
+
+def __getattr__(name: str) -> Any:
+    if name == "ClientSession":
+        from mcp import ClientSession
+
+        return ClientSession
+    if name == "OAuthFlowError":
+        from mcp.client.auth import OAuthFlowError
+
+        return OAuthFlowError
+    if name == "StdioServerParameters":
+        from mcp.client.stdio import StdioServerParameters
+
+        return StdioServerParameters
+    if name == "stdio_client":
+        from mcp.client.stdio import stdio_client
+
+        return stdio_client
+    if name == "streamable_http_client":
+        from mcp.client.streamable_http import streamable_http_client
+
+        return streamable_http_client
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # Mirrors MCP's default Streamable HTTP timeout values while avoiding an import from
@@ -173,6 +200,9 @@ async def list_tools_http(
     auth: httpx.Auth | None = None,
     startup_timeout_sec: float | None = None,
 ) -> list[RemoteTool]:
+    ClientSession = _mcp_sdk_attribute("ClientSession")
+    streamable_http_client = _mcp_sdk_attribute("streamable_http_client")
+
     timeout = timedelta(seconds=startup_timeout_sec) if startup_timeout_sec else None
     async with (
         asyncio.timeout(startup_timeout_sec or _MCP_DEFAULT_TIMEOUT),
@@ -200,6 +230,9 @@ async def call_tool_http(
     startup_timeout_sec: float | None = None,
     tool_timeout_sec: float | None = None,
 ) -> MCPToolResult:
+    ClientSession = _mcp_sdk_attribute("ClientSession")
+    streamable_http_client = _mcp_sdk_attribute("streamable_http_client")
+
     init_timeout = (
         timedelta(seconds=startup_timeout_sec) if startup_timeout_sec else None
     )
@@ -393,6 +426,8 @@ def authorization_required_result(
 
 
 def is_authorization_rejection(exc: BaseException) -> bool:
+    OAuthFlowError = _mcp_sdk_attribute("OAuthFlowError")
+
     if isinstance(exc, BaseExceptionGroup):
         return any(is_authorization_rejection(child) for child in exc.exceptions)
     if isinstance(exc, httpx.HTTPStatusError):
@@ -403,6 +438,8 @@ def is_authorization_rejection(exc: BaseException) -> bool:
 def build_stdio_params(
     command: list[str], *, env: dict[str, str] | None = None, cwd: str | None = None
 ) -> StdioServerParameters:
+    StdioServerParameters = _mcp_sdk_attribute("StdioServerParameters")
+
     return StdioServerParameters(command=command[0], args=command[1:], env=env, cwd=cwd)
 
 
@@ -418,6 +455,9 @@ async def enter_stdio_session(
     session. The one-shot helpers close the stack immediately; the connection pool
     keeps it open for the session lifetime.
     """
+    ClientSession = _mcp_sdk_attribute("ClientSession")
+    stdio_client = _mcp_sdk_attribute("stdio_client")
+
     errlog = await stack.enter_async_context(_mcp_stderr_capture())
     read, write = await stack.enter_async_context(stdio_client(params, errlog=errlog))
     session = await stack.enter_async_context(

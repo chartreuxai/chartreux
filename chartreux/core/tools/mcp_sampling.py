@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from mcp.client.session import ClientSession
-from mcp.shared.context import RequestContext
-from mcp.types import CreateMessageRequestParams, ErrorData
+if TYPE_CHECKING:
+    from mcp.client.session import ClientSession
+    from mcp.shared.context import RequestContext
+    from mcp.types import CreateMessageRequestParams, ErrorData
 
 
 class MCPSamplingHandler:
@@ -14,4 +15,6 @@ class MCPSamplingHandler:
         params: CreateMessageRequestParams,
     ) -> ErrorData:
         """Fail closed: MCP sampling is not supported."""
+        from mcp.types import ErrorData
+
         return ErrorData(code=-1, message="MCP sampling is not supported")

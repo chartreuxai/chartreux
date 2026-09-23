@@ -16,8 +16,6 @@ from chartreux.core.tools.mcp.tools import (
     enter_stdio_session,
 )
 from chartreux.observability.logging import logger
-from mcp.shared.exceptions import McpError
-from mcp.types import CONNECTION_CLOSED
 
 if TYPE_CHECKING:
     from mcp import ClientSession
@@ -40,6 +38,9 @@ _CLOSE_TIMEOUT_SEC = 5.0
 
 
 def _transport_failed(exc: BaseException) -> bool:
+    from mcp.shared.exceptions import McpError
+    from mcp.types import CONNECTION_CLOSED
+
     if isinstance(exc, BaseExceptionGroup):
         return any(_transport_failed(child) for child in exc.exceptions)
     return isinstance(exc, _TRANSPORT_ERRORS) or (

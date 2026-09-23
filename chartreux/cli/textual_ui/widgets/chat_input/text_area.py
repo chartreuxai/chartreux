@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import platform
 import re
 import time
@@ -166,6 +167,7 @@ class ChatTextArea(TextArea):
         self._drag_chain: int = 0
         self._drag_anchor: Location | None = None
         self._dragged: bool = False
+        self._last_bare_image_path_check: str | None = None
 
     # Workaround for an undo crash fixed upstream in
     # https://github.com/Textualize/textual/pull/6687 — remove this override
@@ -368,7 +370,7 @@ class ChatTextArea(TextArea):
         # second time and double-insert). TextArea._on_paste in the same
         # MRO still runs inside this dispatch cycle and performs the
         # single insertion using the mutated text.
-        event.text = maybe_prepend_at_for_path(event.text)
+        event.text = await asyncio.to_thread(maybe_prepend_at_for_path, event.text)
         # Empty paste = either truly empty clipboard, or clipboard holds
         # image bytes the terminal cannot deliver as text. The app handler
         # peeks the OS clipboard in a worker and, if it finds image bytes,
@@ -401,12 +403,17 @@ class ChatTextArea(TextArea):
         # rewrite it to @<path>. Idempotent: tokens already preceded by
         # `@` are skipped, so this is safe to run on every change.
         current = self.text
-        rewritten = rewrite_bare_image_paths_in_text(current)
-        if rewritten != current:
-            self.text = rewritten
-            last_line = rewritten.rsplit("\n", 1)[-1]
-            self.move_cursor((rewritten.count("\n"), len(last_line)))
-            return
+        if (
+            any(ch in current for ch in "/~'\"")
+            and current != self._last_bare_image_path_check
+        ):
+            self._last_bare_image_path_check = current
+            cursor_offset = self.get_cursor_offset()
+            self.run_worker(
+                self._rewrite_bare_image_paths(current, cursor_offset),
+                group="bare-image-path-rewrite",
+                exclusive=True,
+            )
 
         if (
             not self._navigating_history
@@ -432,6 +439,20 @@ class ChatTextArea(TextArea):
             self._completion_manager.on_text_changed(
                 self.get_full_text(), self._get_full_cursor_offset()
             )
+
+    async def _rewrite_bare_image_paths(self, current: str, cursor_offset: int) -> None:
+        rewritten = await asyncio.to_thread(rewrite_bare_image_paths_in_text, current)
+        if rewritten == current or self.text != current:
+            return
+        move_cursor_to_end = (
+            cursor_offset == len(current) and self.get_cursor_offset() == cursor_offset
+        )
+        self.text = rewritten
+        self._last_bare_image_path_check = rewritten
+        if not move_cursor_to_end:
+            return
+        last_line = rewritten.rsplit("\n", 1)[-1]
+        self.move_cursor((rewritten.count("\n"), len(last_line)))
 
     def watch_selection(self, previous: Selection, selection: Selection) -> None:
         # A pure caret move (arrow, word/line nav, home/end, …) leaves the text

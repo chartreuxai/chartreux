@@ -13,8 +13,6 @@ import time
 from uuid import uuid4
 import weakref
 
-from mcp.client.auth import OAuthFlowError
-
 from chartreux.app_server._session_backend_port import (
     MCPAuthorizationProvider,
     MCPAuthorizationRef,
@@ -329,6 +327,8 @@ class MCPAuthenticationService(MCPAuthorizationProvider):
         server: RemoteMCPServer,
         declared_headers: Mapping[str, str],
     ) -> MCPAuthorizationResult:
+        from mcp.client.auth import OAuthFlowError
+
         # Catalog revocation intentionally does not wait for auth I/O. Recheck
         # after every suspension before starting another credential operation or
         # publishing material. An already-started operation cannot be undone.
@@ -405,6 +405,8 @@ class MCPAuthenticationService(MCPAuthorizationProvider):
         return self._snapshot(reference, headers, expires_at)
 
     async def _refresh_oauth(self, server: RemoteMCPServer) -> None:
+        from mcp.client.auth import OAuthFlowError
+
         async def reject_redirect(_url: str) -> None:
             raise OAuthFlowError("Interactive MCP OAuth login is required")
 

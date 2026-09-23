@@ -4,8 +4,9 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 import errno
+from functools import cache
 import time
-from typing import Final
+from typing import TYPE_CHECKING, Any, Final
 import urllib.parse
 
 import anyio.to_thread
@@ -13,15 +14,15 @@ import httpx
 import keyring
 import keyring.backends.fail
 import keyring.errors
-from mcp.client.auth import (
-    OAuthClientProvider,
-    OAuthFlowError,
-    OAuthTokenError,
-    TokenStorage,
-)
-from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
-from mcp.types import LATEST_PROTOCOL_VERSION
 from pydantic import AnyUrl, BaseModel, ConfigDict
+
+if TYPE_CHECKING:
+    from mcp.client.auth import OAuthClientProvider, OAuthFlowError
+    from mcp.shared.auth import (
+        OAuthClientInformationFull,
+        OAuthClientMetadata,
+        OAuthToken,
+    )
 
 from chartreux import __version__
 from chartreux.core.config import MCPHttp, MCPOAuth
@@ -229,10 +230,12 @@ class StoredOAuthTokens(BaseModel):
         return cls(**token.model_dump(), expires_at=expires_at)
 
     def to_token(self) -> OAuthToken:
+        from mcp.shared.auth import OAuthToken
+
         return OAuthToken.model_validate(self.model_dump(exclude={"expires_at"}))
 
 
-class KeyringTokenStorage(TokenStorage):
+class KeyringTokenStorage:
     def __init__(
         self,
         alias: str,
@@ -270,6 +273,8 @@ class KeyringTokenStorage(TokenStorage):
         self.token_expiry_time = None
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
+        from mcp.shared.auth import OAuthClientInformationFull
+
         raw = await _kr_get(_kr_username(self._alias, "client_info"))
         if raw is None:
             return self._fallback_client_info
@@ -332,6 +337,8 @@ class _LoginTokenStorage(KeyringTokenStorage):
         self.token_expiry_time = None
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
+        from mcp.shared.auth import OAuthClientInformationFull
+
         raw = self._pending["client_info"]
         return (
             OAuthClientInformationFull.model_validate_json(raw)
@@ -707,6 +714,8 @@ def unwrap_oauth_refresh_error(
     exc: BaseException,
 ) -> MCPOAuthInvalidGrant | MCPOAuthTransientRefreshError | OAuthFlowError | None:
     """Find a known OAuth error inside a possibly-grouped exception (streamable_http wraps auth-flow errors in an ExceptionGroup)."""
+    from mcp.client.auth import OAuthFlowError
+
     if (invalid_grant := _first_of_type(exc, MCPOAuthInvalidGrant)) is not None:
         return invalid_grant
     if (transient := _first_of_type(exc, MCPOAuthTransientRefreshError)) is not None:
@@ -714,68 +723,109 @@ def unwrap_oauth_refresh_error(
     return _first_of_type(exc, OAuthFlowError)
 
 
-class RefreshAwareOAuthClientProvider(OAuthClientProvider):
-    """Like ``OAuthClientProvider`` but only clears tokens on a genuine ``invalid_grant``."""
+if TYPE_CHECKING:
 
-    def __init__(
-        self,
-        server_url: str,
-        client_metadata: OAuthClientMetadata,
-        storage: KeyringTokenStorage,
-        *,
-        server_alias: str,
-        redirect_handler: Callable[[str], Awaitable[None]] | None = None,
-        callback_handler: Callable[[], Awaitable[tuple[str, str | None]]] | None = None,
-        client_metadata_url: str | None = None,
-    ) -> None:
-        super().__init__(
-            server_url=server_url,
-            client_metadata=client_metadata,
-            storage=storage,
-            redirect_handler=redirect_handler,
-            callback_handler=callback_handler,
-            client_metadata_url=client_metadata_url,
-        )
-        self._server_alias = server_alias
-        self._storage = storage
+    class RefreshAwareOAuthClientProvider(OAuthClientProvider):
+        context: Any
+        _server_alias: str
+        _storage: KeyringTokenStorage
 
-    async def _initialize(self) -> None:
-        await super()._initialize()
-        self.context.token_expiry_time = self._storage.token_expiry_time
+        def __init__(
+            self,
+            server_url: str,
+            client_metadata: OAuthClientMetadata,
+            storage: KeyringTokenStorage,
+            *,
+            server_alias: str,
+            redirect_handler: Callable[[str], Awaitable[None]] | None = None,
+            callback_handler: Callable[[], Awaitable[tuple[str, str | None]]]
+            | None = None,
+            client_metadata_url: str | None = None,
+        ) -> None: ...
 
-    async def _handle_refresh_response(self, response: httpx.Response) -> bool:
-        """Two corrections over the base class implementation:
-        1. Only clear stored tokens on a genuine invalid_grant error.
-        2. Preserve the previous refresh_token if the server did not return one.
-        """
-        if response.status_code == httpx.codes.OK:
-            previous_refresh_token = (
-                self.context.current_tokens.refresh_token
-                if self.context.current_tokens
-                else None
+        async def _initialize(self) -> None: ...
+
+        async def _handle_refresh_response(self, response: httpx.Response) -> bool: ...
+
+
+@cache
+def _refresh_aware_oauth_client_provider_class() -> Callable[..., OAuthClientProvider]:
+    from mcp.client.auth import OAuthClientProvider
+
+    class RefreshAwareOAuthClientProvider(OAuthClientProvider):
+        """Like ``OAuthClientProvider`` but only clears tokens on a genuine ``invalid_grant``."""
+
+        def __init__(
+            self,
+            server_url: str,
+            client_metadata: OAuthClientMetadata,
+            storage: KeyringTokenStorage,
+            *,
+            server_alias: str,
+            redirect_handler: Callable[[str], Awaitable[None]] | None = None,
+            callback_handler: Callable[[], Awaitable[tuple[str, str | None]]]
+            | None = None,
+            client_metadata_url: str | None = None,
+        ) -> None:
+            super().__init__(
+                server_url=server_url,
+                client_metadata=client_metadata,
+                storage=storage,
+                redirect_handler=redirect_handler,
+                callback_handler=callback_handler,
+                client_metadata_url=client_metadata_url,
             )
-            refreshed = await super()._handle_refresh_response(response)
-            tokens = self.context.current_tokens
-            if (
-                not refreshed
-                or tokens is None
-                or tokens.refresh_token is not None
-                or previous_refresh_token is None
-            ):
-                return refreshed
-            tokens = tokens.model_copy(update={"refresh_token": previous_refresh_token})
-            self.context.current_tokens = tokens
-            await self.context.storage.set_tokens(tokens)
-            return True
-        reason, is_invalid_grant = await _classify_refresh_error(response)
-        if is_invalid_grant:
-            self.context.clear_tokens()
-            await self._storage.delete_tokens()
-            await self._storage.delete_client_info()
-            raise MCPOAuthInvalidGrant(server_alias=self._server_alias, reason=reason)
-        raise MCPOAuthTransientRefreshError(
-            server_alias=self._server_alias, reason=reason
-        )
+            self._server_alias = server_alias
+            self._storage = storage
+
+        async def _initialize(self) -> None:
+            await super()._initialize()
+            self.context.token_expiry_time = self._storage.token_expiry_time
+
+        async def _handle_refresh_response(self, response: httpx.Response) -> bool:
+            """Only clear invalid_grant and preserve a missing refresh_token."""
+            if response.status_code == httpx.codes.OK:
+                previous_refresh_token = (
+                    self.context.current_tokens.refresh_token
+                    if self.context.current_tokens
+                    else None
+                )
+                refreshed = await super()._handle_refresh_response(response)
+                tokens = self.context.current_tokens
+                if (
+                    not refreshed
+                    or tokens is None
+                    or tokens.refresh_token is not None
+                    or previous_refresh_token is None
+                ):
+                    return refreshed
+                tokens = tokens.model_copy(
+                    update={"refresh_token": previous_refresh_token}
+                )
+                self.context.current_tokens = tokens
+                await self.context.storage.set_tokens(tokens)
+                return True
+            reason, is_invalid_grant = await _classify_refresh_error(response)
+            if is_invalid_grant:
+                self.context.clear_tokens()
+                await self._storage.delete_tokens()
+                await self._storage.delete_client_info()
+                raise MCPOAuthInvalidGrant(
+                    server_alias=self._server_alias, reason=reason
+                )
+            raise MCPOAuthTransientRefreshError(
+                server_alias=self._server_alias, reason=reason
+            )
+
+    return RefreshAwareOAuthClientProvider
+
+
+def __getattr__(name: str) -> Any:
+    if name == "RefreshAwareOAuthClientProvider":
+        provider_class = _refresh_aware_oauth_client_provider_class()
+        globals()[name] = provider_class
+        return provider_class
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def build_oauth_provider(
@@ -791,6 +841,8 @@ def build_oauth_provider(
             "build_oauth_provider requires an OAuth-configured MCP server; "
             f"server {server.name!r} uses auth.type={type(auth).__name__}"
         )
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata
+
     redirect_uri = AnyUrl(f"http://127.0.0.1:{auth.redirect_port}/callback")
     scope = " ".join(s for s in auth.scopes if s) or None
     metadata = OAuthClientMetadata(
@@ -815,7 +867,8 @@ def build_oauth_provider(
             token_endpoint_auth_method="none",
             client_name=_CLIENT_NAME,
         )
-    return RefreshAwareOAuthClientProvider(
+    provider_class = _refresh_aware_oauth_client_provider_class()
+    return provider_class(
         server_url=server.url,
         client_metadata=metadata,
         storage=(_LoginTokenStorage if stage_login else KeyringTokenStorage)(
@@ -835,6 +888,8 @@ async def perform_oauth_login(
     headers: Mapping[str, str] | None = None,
     check_current: Callable[[], object] = lambda: None,
 ) -> None:
+    from mcp.client.auth import OAuthFlowError, OAuthTokenError
+
     auth = server.auth
     if not isinstance(auth, MCPOAuth):
         raise TypeError(
@@ -906,6 +961,8 @@ async def perform_oauth_login(
 
 
 def _initialize_message() -> dict[str, object]:
+    from mcp.types import LATEST_PROTOCOL_VERSION
+
     return {
         "jsonrpc": "2.0",
         "id": 1,

@@ -46,6 +46,47 @@ def test_removed_shell_builtins_are_not_discovered(tool_manager):
     assert set(specs["bash"].parameters["properties"]) == {"command", "timeout"}
 
 
+def test_available_tool_specs_cache_isolated_and_tracks_active_tools(vibe_config):
+    active_config = [vibe_config]
+    manager = ToolManager(lambda: active_config[0])
+
+    first = {spec.name: spec for spec in manager.available_tool_specs()}
+    first["bash"].parameters["properties"].clear()
+    second = {spec.name: spec for spec in manager.available_tool_specs()}
+    assert set(second["bash"].parameters["properties"]) == {"command", "timeout"}
+
+    active_config[0] = vibe_config.model_copy(update={"enabled_tools": ["bash"]})
+    assert {spec.name for spec in manager.available_tool_specs()} == {"bash"}
+
+
+def test_available_tool_specs_cache_tracks_mutated_mcp_schema():
+    remote = RemoteTool.model_validate({
+        "name": "search",
+        "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}},
+    })
+    proxy = create_mcp_stdio_proxy_tool_class(
+        command=["fake"], remote=remote, alias="demo"
+    )
+    server = MCPStdio(name="demo", transport="stdio", command="fake")
+    registry = FakeMCPRegistry()
+    registry.set_tools([server], {proxy.get_name(): proxy})
+    config = build_test_vibe_config(mcp_servers=[server])
+    manager = ToolManager(lambda: config, mcp_registry=registry)
+
+    first = {spec.name: spec for spec in manager.available_tool_specs()}
+    assert first["demo_search"].parameters["properties"] == {
+        "query": {"type": "string"}
+    }
+
+    remote.input_schema["properties"]["limit"] = {"type": "integer"}
+
+    second = {spec.name: spec for spec in manager.available_tool_specs()}
+    assert second["demo_search"].parameters["properties"] == {
+        "query": {"type": "string"},
+        "limit": {"type": "integer"},
+    }
+
+
 def test_merges_user_overrides_with_defaults():
     vibe_config = build_test_vibe_config(tools={"bash": {"permission": "always"}})
     manager = ToolManager(lambda: vibe_config)

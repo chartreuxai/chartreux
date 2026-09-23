@@ -2664,6 +2664,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._queue.notify_busy_changed()
             if not notify_complete:
                 return
+            if self.event_handler:
+                self.event_handler.clear_tool_call_anchors()
             await self._refresh_windowing_from_history()
             self._terminal_notifier.notify(NotificationContext.COMPLETE)
 
