@@ -92,7 +92,7 @@ def wait_for_request_count_while_draining_child_output(
     while time.monotonic() - start < timeout:
         if request_count_getter() >= expected_count:
             return
-        if drain_child_output(child):
+        if drain_child_output(child, captured):
             rendered_tail = strip_ansi(captured.getvalue())[-1200:]
             raise AssertionError(
                 "Child exited while waiting for "
@@ -109,7 +109,12 @@ def wait_for_main_screen(child: pexpect.spawn, timeout: float = 20.0) -> None:
     child.expect(ansi_tolerant_pattern("Chartreux v"), timeout=timeout)
 
 
-def drain_child_output(child: pexpect.spawn, *, idle_sleep: float = 0.05) -> bool:
+def drain_child_output(
+    child: pexpect.spawn,
+    captured: io.StringIO | None = None,
+    *,
+    idle_sleep: float = 0.05,
+) -> bool:
     """Read all currently-available child output into the capture log.
 
     ``pexpect.spawn.expect`` only reads until its pattern matches, so it leaves
@@ -120,12 +125,17 @@ def drain_child_output(child: pexpect.spawn, *, idle_sleep: float = 0.05) -> boo
     (``driver.close`` -> ``WriterThread.stop`` -> ``join``). Draining the PTY
     keeps the writer thread unblocked.
 
-    Returns ``True`` if the child reached EOF while draining.
+    Returns ``True`` if the child reached EOF while draining. When ``captured`` is
+    provided, output is retained there even if pexpect is not logging reads to it.
     """
     eof = False
     while True:
         try:
-            child.read_nonblocking(size=65536, timeout=0)
+            output = child.read_nonblocking(size=65536, timeout=0)
+            # pexpect logs direct reads to logfile_read. Avoid writing the same
+            # output twice when that logger is already the requested capture.
+            if captured is not None and child.logfile_read is not captured:
+                captured.write(output)
         except pexpect.TIMEOUT:
             break
         except pexpect.EOF:
@@ -143,12 +153,16 @@ def wait_for_rendered_text(
     while time.monotonic() - start < timeout:
         if needle in strip_ansi(captured.getvalue()):
             return
-        if drain_child_output(child):
-            rendered_tail = strip_ansi(captured.getvalue())[-1200:]
+        if drain_child_output(child, captured):
+            rendered_tail = strip_ansi(captured.getvalue())[-2000:]
+            if not rendered_tail:
+                rendered_tail = "(no printable PTY output captured)"
             raise AssertionError(
                 f"Child exited while waiting for rendered text: {needle!r}\n\nRendered tail:\n{rendered_tail}"
             )
-    rendered_tail = strip_ansi(captured.getvalue())[-1200:]
+    rendered_tail = strip_ansi(captured.getvalue())[-2000:]
+    if not rendered_tail:
+        rendered_tail = "(no printable PTY output captured)"
     raise AssertionError(
         f"Timed out waiting for rendered text: {needle!r}\n\nRendered tail:\n{rendered_tail}"
     )

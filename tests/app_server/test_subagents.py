@@ -3273,9 +3273,28 @@ async def test_reused_start_failure_aborts_real_prepared_turn_and_allows_retry(
         assert result.run_id is not None
         run = record.current_run
         assert run is not None
-        await run.completion_task
+        try:
+            await asyncio.wait_for(asyncio.shield(run.completion_task), timeout=20)
+        except TimeoutError as exc:
+            pending_tasks = [
+                f"{task.get_name()}: {task.get_coro()!r}"
+                for task in asyncio.all_tasks()
+                if not task.done() and task is not asyncio.current_task()
+            ]
+            init_thread = record.runtime.agent_loop._deferred_init_thread
+            thread_status = (
+                "not started"
+                if init_thread is None
+                else f"alive={init_thread.is_alive()}"
+            )
+            raise AssertionError(
+                "Retry completion timed out after 20 seconds.\n"
+                f"Pending asyncio tasks: {pending_tasks!r}\n"
+                f"Child deferred-init thread: {thread_status}"
+            ) from exc
     finally:
         await registry.drain_children()
+        await root.turns.close()
         await parent.aclose()
 
 
@@ -3285,6 +3304,8 @@ async def test_monitor_creation_failure_aborts_prepared_turn_and_allows_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, record, args, context = await _real_reused_background()
+    root = registry._root
+    assert root is not None
     original_create_task = asyncio.create_task
 
     def fail_background_monitor(
@@ -3312,10 +3333,30 @@ async def test_monitor_creation_failure_aborts_prepared_turn_and_allows_retry(
         assert result.run_id is not None
         run = record.current_run
         assert run is not None
-        await cast(asyncio.Future[Any], run.completion_task)
+        completion_task = cast(asyncio.Future[Any], run.completion_task)
+        try:
+            await asyncio.wait_for(asyncio.shield(completion_task), timeout=20)
+        except TimeoutError as exc:
+            pending_tasks = [
+                f"{task.get_name()}: {task.get_coro()!r}"
+                for task in asyncio.all_tasks()
+                if not task.done() and task is not asyncio.current_task()
+            ]
+            init_thread = record.runtime.agent_loop._deferred_init_thread
+            thread_status = (
+                "not started"
+                if init_thread is None
+                else f"alive={init_thread.is_alive()}"
+            )
+            raise AssertionError(
+                "Retry completion timed out after 20 seconds.\n"
+                f"Pending asyncio tasks: {pending_tasks!r}\n"
+                f"Child deferred-init thread: {thread_status}"
+            ) from exc
     finally:
         monkeypatch.setattr(asyncio, "create_task", original_create_task)
         await registry.drain_children()
+        await root.turns.close()
         await parent.aclose()
 
 
