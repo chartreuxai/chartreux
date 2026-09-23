@@ -1,8 +1,15 @@
 from __future__ import annotations
 
-import pytest
+from collections.abc import Awaitable, Callable
+from typing import cast
 
-from chartreux.cli.textual_ui.widgets.messages import StreamingMessageBase
+import pytest
+from textual.timer import Timer, TimerCallback
+
+from chartreux.cli.textual_ui.widgets.messages import (
+    STREAM_WRITE_FRAME_SECONDS,
+    StreamingMessageBase,
+)
 
 
 class FakeStream:
@@ -21,6 +28,18 @@ class FakeStream:
         return "".join(self.written)
 
 
+class FakeTimer:
+    def __init__(self, callback: Callable[[], Awaitable[None]]) -> None:
+        self.callback = callback
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    async def fire(self) -> None:
+        await self.callback()
+
+
 class MessageTestDouble(StreamingMessageBase):
     """Minimal test double for StreamingMessageBase that bypasses Textual internals."""
 
@@ -29,11 +48,31 @@ class MessageTestDouble(StreamingMessageBase):
         self._content = ""
         self._content_initialized = False
         self._to_write_buffer = ""
+        self._write_timer = None
         self._stream = None
         self._markdown = None
         self._at_bottom = at_bottom
         self._should_write = should_write
         self._fake_stream: FakeStream = FakeStream()
+        self._scheduled_delay: float | None = None
+        self._fake_timer: FakeTimer | None = None
+
+    def set_timer(
+        self,
+        delay: float,
+        callback: TimerCallback | None = None,
+        *,
+        name: str | None = None,
+        pause: bool = False,
+    ) -> Timer:
+        assert callback is not None
+        self._scheduled_delay = delay
+        self._fake_timer = FakeTimer(cast(Callable[[], Awaitable[None]], callback))
+        return cast(Timer, self._fake_timer)
+
+    async def fire_timer(self) -> None:
+        assert self._fake_timer is not None
+        await self._fake_timer.fire()
 
     # --- overrides used by the buffer logic ---
 
@@ -55,13 +94,28 @@ def make_msg(*, at_bottom: bool = True, should_write: bool = True) -> MessageTes
 
 class TestAppendContent:
     @pytest.mark.asyncio
-    async def test_at_bottom_writes_directly_no_buffer(self) -> None:
+    async def test_at_bottom_buffers_until_frame_timer(self) -> None:
         msg = make_msg(at_bottom=True)
 
         await msg.append_content("hello")
 
+        assert msg._fake_stream.all_written == ""
+        assert msg._to_write_buffer == "hello"
+        assert msg._scheduled_delay == STREAM_WRITE_FRAME_SECONDS
+
+        await msg.fire_timer()
+
         assert msg._fake_stream.all_written == "hello"
         assert msg._to_write_buffer == ""
+
+    @pytest.mark.asyncio
+    async def test_buffer_flushes_without_another_delta(self) -> None:
+        msg = make_msg()
+
+        await msg.append_content("short response")
+        await msg.fire_timer()
+
+        assert msg._fake_stream.all_written == "short response"
 
     @pytest.mark.asyncio
     async def test_scrolled_away_buffers_without_writing(self) -> None:
@@ -90,12 +144,14 @@ class TestAppendContent:
         msg._at_bottom = True
         await msg.append_content(" new")
 
-        # Both buffered and new chunk written together in one write call.
+        # Both buffered and new chunks flush together on the frame timer.
+        assert msg._fake_stream.all_written == ""
+        await msg.fire_timer()
         assert msg._fake_stream.all_written == "buffered new"
         assert msg._to_write_buffer == ""
 
     @pytest.mark.asyncio
-    async def test_scroll_back_subsequent_chunks_written_directly(self) -> None:
+    async def test_scroll_back_subsequent_chunks_share_frame_write(self) -> None:
         msg = make_msg(at_bottom=False)
         await msg.append_content("a")
         await msg.append_content("b")
@@ -103,8 +159,9 @@ class TestAppendContent:
         msg._at_bottom = True
         await msg.append_content("c")
         await msg.append_content("d")
+        await msg.fire_timer()
 
-        assert msg._fake_stream.all_written == "abc" + "d"
+        assert msg._fake_stream.written == ["abcd"]
         assert msg._to_write_buffer == ""
 
     @pytest.mark.asyncio
@@ -169,13 +226,24 @@ class TestStopStream:
         assert msg._to_write_buffer == ""
 
     @pytest.mark.asyncio
-    async def test_empty_buffer_no_extra_write(self) -> None:
+    async def test_stop_stream_flushes_pending_frame_once(self) -> None:
         msg = make_msg()
-        await msg.append_content("live")  # written directly, buffer stays empty
+        await msg.append_content("live")
 
         await msg.stop_stream()
 
-        # Only the original direct write, no spurious extra write from stop_stream.
+        # stop_stream flushes the pending frame exactly once.
+        assert msg._fake_stream.written == ["live"]
+        assert msg._fake_timer is not None and msg._fake_timer.stopped
+
+    @pytest.mark.asyncio
+    async def test_stale_timer_callback_after_stop_stream_does_not_write(self) -> None:
+        msg = make_msg()
+        await msg.append_content("live")
+
+        await msg.stop_stream()
+        await msg.fire_timer()
+
         assert msg._fake_stream.written == ["live"]
 
 
@@ -228,12 +296,13 @@ class TestWriteInitialContent:
 
     @pytest.mark.asyncio
     async def test_clears_buffer_after_writing(self) -> None:
-        msg = make_msg(at_bottom=False)
+        msg = make_msg()
         await msg.append_content("buffered chunk")
 
         await msg.write_initial_content()
 
         assert msg._to_write_buffer == ""
+        assert msg._fake_timer is not None and msg._fake_timer.stopped
 
 
 class TestNoDoubleWrite:
@@ -261,7 +330,7 @@ class TestNoDoubleWrite:
         Buffered content must be flushed exactly once by stop_stream.
 
         Note: calling write_initial_content AFTER live content has already been
-        written to the stream is not a supported usage — it would duplicate the
+        flushed to the stream is not a supported usage — it would duplicate the
         already-written portion because write_initial_content replays the full
         _content. In practice this never occurs because _mount_and_scroll calls
         write_initial_content immediately on mount, before streaming starts.
@@ -284,8 +353,8 @@ class TestNoDoubleWrite:
 
     @pytest.mark.asyncio
     async def test_write_initial_before_streaming_at_bottom_then_stop(self) -> None:
-        """write_initial_content at mount (no-op), streaming at bottom writes
-        directly, stop_stream has nothing extra to flush.
+        """write_initial_content at mount (no-op), streaming at bottom batches
+        chunks until stop_stream flushes them.
         """
         msg = make_msg(at_bottom=True)
 

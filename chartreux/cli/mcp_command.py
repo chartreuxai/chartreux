@@ -4,15 +4,11 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 import sys
+from typing import TYPE_CHECKING
 import webbrowser
 
 from pydantic import ValidationError
 
-from chartreux.app_server.mcp_catalog import (
-    SessionlessMCPCatalog,
-    create_sessionless_mcp_catalog,
-)
-from chartreux.core.auth import MCPOAuthError
 from chartreux.core.config import (
     MCPHttp,
     MCPOAuth,
@@ -30,6 +26,11 @@ from chartreux.core.config.mcp_servers import (
     PersistedMCPServerResult,
 )
 from chartreux.core.config.types import ConcurrencyConflictError
+
+if TYPE_CHECKING:
+    from chartreux.app_server.mcp_catalog import SessionlessMCPCatalog
+    from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+    from chartreux.core.config.orchestrator import ConfigOrchestrator
 
 
 class MCPCommandError(ValueError):
@@ -205,6 +206,8 @@ def _build_remote_add_command(args: argparse.Namespace) -> _MCPAddCommand:
 
 
 async def _add_mcp_server(command: _MCPAddCommand) -> str:
+    from chartreux.core.auth import MCPOAuthError
+
     catalog = _sessionless_catalog()
     server = command.server
 
@@ -243,7 +246,23 @@ async def _add_mcp_server(command: _MCPAddCommand) -> str:
 
 
 async def _remove_mcp_server(name: str) -> str:
-    result = await _sessionless_catalog().remove_server(name)
+    from chartreux.core.config.models import normalize_mcp_server_name
+
+    orchestrator = await build_user_config_orchestrator()
+    normalized_name = normalize_mcp_server_name(name)
+    if normalized_name and not any(
+        server.name == normalized_name for server in orchestrator.config.mcp_servers
+    ):
+        return f"MCP server `{normalized_name}` is not configured in the user config."
+
+    async def loaded_orchestrator() -> ConfigOrchestrator[ChartreuxConfigSchema]:
+        return orchestrator
+
+    from chartreux.app_server.mcp_catalog import create_sessionless_mcp_catalog
+
+    result = await create_sessionless_mcp_catalog(loaded_orchestrator).remove_server(
+        name
+    )
     if not result.removed:
         return f"MCP server `{result.name}` is not configured in the user config."
 
@@ -251,6 +270,8 @@ async def _remove_mcp_server(name: str) -> str:
 
 
 def _sessionless_catalog() -> SessionlessMCPCatalog:
+    from chartreux.app_server.mcp_catalog import create_sessionless_mcp_catalog
+
     return create_sessionless_mcp_catalog(build_user_config_orchestrator)
 
 

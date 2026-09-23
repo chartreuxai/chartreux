@@ -106,9 +106,11 @@ def test_decoy_messages_directory_and_unrelated_files_are_untouched(
 def test_fifo_transcript_marker_does_not_block_repair(tmp_path: Path) -> None:
     root = tmp_path / "sessions"
     session = root / "test_fifo"
-    session.mkdir(parents=True)
+    session.mkdir(parents=True, mode=0o755)
+    session.chmod(0o755)
     (session / "meta.json").write_text('{"session_id": "fifo"}')
     os.mkfifo(session / "messages.jsonl", mode=0o666)
+    initial_session_mode = _mode(session)
 
     process = multiprocessing.Process(target=_repair_in_child, args=(str(root),))
     process.start()
@@ -119,7 +121,7 @@ def test_fifo_transcript_marker_does_not_block_repair(tmp_path: Path) -> None:
         pytest.fail("permission repair blocked while opening a FIFO")
 
     assert process.exitcode == 0
-    assert _mode(session) & 0o077 != 0
+    assert _mode(session) == initial_session_mode
 
 
 def test_metadata_only_session_and_quarantine_are_repaired(tmp_path: Path) -> None:
@@ -156,11 +158,13 @@ def test_private_directory_leaves_parent_unchanged(tmp_path: Path) -> None:
     parent = tmp_path / "parent"
     child = parent / "home"
     parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    initial_parent_mode = _mode(parent)
     child.mkdir(mode=0o755)
 
     ensure_private_directory(child)
 
-    assert _mode(parent) == 0o755
+    assert _mode(parent) == initial_parent_mode
     assert _mode(child) == 0o700
 
 
@@ -177,12 +181,14 @@ def test_symlinked_root_or_ancestor_is_not_repaired(tmp_path: Path) -> None:
 def test_logger_does_not_chmod_target_of_explicit_symlink_root(tmp_path: Path) -> None:
     real = tmp_path / "real"
     real.mkdir(mode=0o775)
+    real.chmod(0o775)
+    initial_mode = _mode(real)
     link = tmp_path / "linked"
     link.symlink_to(real, target_is_directory=True)
 
     SessionLogger(_config(link), "new")
 
-    assert _mode(real) == 0o775
+    assert _mode(real) == initial_mode
 
 
 def test_permission_errors_are_nonfatal(tmp_path: Path) -> None:

@@ -232,6 +232,7 @@ def _disk_lines(state: FileState) -> list[str]:
     return (state.data or b"").decode("utf-8").splitlines()
 
 
+@pytest.mark.timeout(30)
 def test_manual_edits_during_review_stay_projectable() -> None:
     """A review session that interleaves decisions (persisted, like the manager's
     decide-then-write flow) with genuine manual disk edits.
