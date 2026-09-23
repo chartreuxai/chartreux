@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 import sys
 import tomllib
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import tomli_w
@@ -477,15 +477,42 @@ def test_mcp_remove_deletes_static_server(
     assert _persisted_servers(config_dir) == []
 
 
-def test_mcp_remove_is_idempotent_when_server_is_missing(
+def test_mcp_remove_matches_normalized_name_for_raw_configured_name(
     capsys: pytest.CaptureFixture[str], config_dir: Path
 ) -> None:
+    _write_persisted_servers(
+        config_dir,
+        [
+            {
+                "name": "docs.server!",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/mcp",
+            }
+        ],
+    )
+    assert _persisted_servers(config_dir)[0]["name"] == "docs.server!"
+
+    _run_mcp("remove", "docs_server")
+
+    assert capsys.readouterr().out == "Removed MCP server `docs_server`.\n"
+    assert _persisted_servers(config_dir) == []
+
+
+def test_mcp_remove_is_idempotent_when_server_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config_dir: Path,
+) -> None:
+    catalog_factory = Mock()
+    monkeypatch.setattr(mcp_catalog, "create_sessionless_mcp_catalog", catalog_factory)
+
     _run_mcp("remove", "missing")
 
     assert capsys.readouterr().out == (
         "MCP server `missing` is not configured in the user config.\n"
     )
     assert _persisted_servers(config_dir) == []
+    catalog_factory.assert_not_called()
 
 
 def test_mcp_remove_rejects_name_that_normalizes_to_empty(
@@ -581,8 +608,10 @@ def test_mcp_remove_reports_concurrency_conflict_cleanly(
     *Do*: Run the CLI remove command.
     *Assert*: Argparse reports a clean conflict without a traceback.
     """
-
     # Prepare
+    _run_mcp("add", "linear", "--url", "https://mcp.linear.app/mcp", "--no-login")
+    capsys.readouterr()
+
     async def conflict(*_args: object, **_kwargs: object) -> None:
         raise ConcurrencyConflictError("expected-fp", "actual-fp")
 
