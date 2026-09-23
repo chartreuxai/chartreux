@@ -14,6 +14,7 @@ from chartreux.observability.logging import logger
 from chartreux.utils.io import read_safe_async
 
 if TYPE_CHECKING:
+    from textual.timer import Timer
     from textual.widgets import Markdown
     from textual.widgets._markdown import MarkdownStream
 
@@ -39,6 +40,9 @@ from chartreux.cli.textual_ui.widgets.spinner import SpinnerMixin, SpinnerType
 from chartreux.cli.textual_ui.widgets.tool_widgets import clean_output
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic, NonSelectableStatic
+
+# Full-content MarkdownStream reparsing per delta dominated CPU; 50ms frames cut it ~40%.
+STREAM_WRITE_FRAME_SECONDS = 0.05
 
 
 class ExpandingBorder(NonSelectableStatic):
@@ -254,6 +258,7 @@ class StreamingMessageBase(Static):
         self._content = content
         self._markdown: Markdown | None = None
         self._stream: MarkdownStream | None = None
+        self._write_timer: Timer | None = None
         self._content_initialized = False
         self._to_write_buffer = ""
 
@@ -287,25 +292,43 @@ class StreamingMessageBase(Static):
         if not self._should_write_content():
             return
 
-        if self._is_chat_at_bottom():
-            to_write = self._to_write_buffer + content
-            self._to_write_buffer = ""
-            stream = self._ensure_stream()
-            await stream.write(to_write)
+        self._to_write_buffer += content
+        if self._is_chat_at_bottom() and self._write_timer is None:
+            self._write_timer = self.set_timer(
+                STREAM_WRITE_FRAME_SECONDS, self._flush_write_buffer
+            )
+
+    async def _flush_write_buffer(self) -> None:
+        self._write_timer = None
+        if (
+            not self._to_write_buffer
+            or not self._should_write_content()
+            or not self._is_chat_at_bottom()
+        ):
             return
 
-        self._to_write_buffer += content
+        to_write = self._to_write_buffer
+        self._to_write_buffer = ""
+        stream = self._ensure_stream()
+        await stream.write(to_write)
+
+    def _cancel_write_timer(self) -> None:
+        if self._write_timer is not None:
+            self._write_timer.stop()
+            self._write_timer = None
 
     async def write_initial_content(self) -> None:
         if self._content_initialized:
             return
         self._content_initialized = True
         if self._content and self._should_write_content():
+            self._cancel_write_timer()
             stream = self._ensure_stream()
             await stream.write(self._content)
             self._to_write_buffer = ""
 
     async def stop_stream(self) -> None:
+        self._cancel_write_timer()
         if self._to_write_buffer and self._should_write_content():
             stream = self._ensure_stream()
             await stream.write(self._to_write_buffer)
@@ -414,6 +437,7 @@ class ReasoningMessage(ClickWithoutDragMixin, SpinnerMixin, StreamingMessageBase
         if self._markdown:
             self._markdown.display = not collapsed
             if not collapsed and self._content:
+                self._cancel_write_timer()
                 if self._stream is not None:
                     await self._stream.stop()
                     self._stream = None
