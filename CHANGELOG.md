@@ -17,9 +17,16 @@ below describe Chartreux-specific differences rather than inherited capabilities
   and permission overrides, plus transcript browsing and an agent sidebar in
   the TUI.
 - Provider-configurable `web_search` and image-capable `read_image` tools.
+- Fan-out launches runnable role members and reports unavailable or forbidden
+  members as skipped.
 
 ### Changed
 
+- Updated the shipped catalog to the gpt-6 lineup with published prices and
+  compaction thresholds; raised glm-5-3's default thinking to high and removed
+  the former medium worker and reviewer roles.
+- Rebound the built-in reviewer profile to `small-reviewer` and reworked the
+  main-review tiers around a blocking parallel Deep review fan-out.
 - An independent, local-first harness: no sign-in/sign-out or provider accounts;
   provider API keys are supplied through `.env`, onboarding writes a default
   `config.toml`, and configuration is file-based rather than a settings UI.

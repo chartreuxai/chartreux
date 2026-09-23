@@ -5523,14 +5523,66 @@ async def test_fan_out_rejects_array_scalar_and_agent_reuse_inputs(
 
 
 @pytest.mark.asyncio
-async def test_fan_out_preflights_all_members_before_launching_any(
+@pytest.mark.parametrize("background", [True, False])
+@pytest.mark.parametrize(
+    ("role_members", "disabled", "allowed_models", "skipped_base", "reason"),
+    [
+        (["large", "small"], {"large"}, None, "large", "disabled"),
+        (["missing", "small"], set(), ["small"], "missing", "allowed_models"),
+    ],
+)
+async def test_fan_out_skips_unavailable_or_forbidden_members_and_launches_remaining(
+    monkeypatch: pytest.MonkeyPatch,
+    background: bool,
+    role_members: list[str],
+    disabled: set[str],
+    allowed_models: list[str] | None,
+    skipped_base: str,
+    reason: str,
+) -> None:
+    registry, parent, context = await _fan_out_registry(
+        monkeypatch,
+        role_members=role_members,
+        disabled=disabled,
+        allowed_models=allowed_models,
+    )
+    try:
+        result = await _background_result(
+            registry,
+            TaskArgs(
+                task="panel",
+                fan_out=True,
+                background=background,
+                config=LaunchConfig(model="@panel"),
+            ),
+            context,
+        )
+        assert result.completed
+        assert result.members is not None
+        assert [member.index for member in result.members] == [0, 1]
+        skipped, launched = result.members
+        assert skipped.base_model == skipped_base
+        assert skipped.status == "skipped"
+        assert skipped.error is not None
+        assert skipped.error["code"] == "preflight_rejected"
+        assert reason in skipped.error["message"]
+        assert launched.base_model == "small"
+        assert launched.status == ("running" if background else "completed")
+        assert len(registry._agent_records) == 1
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fan_out_rejects_when_all_members_are_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, context = await _fan_out_registry(
-        monkeypatch, role_members=["small", "missing"], allowed_models=["small"]
+        monkeypatch, role_members=["large", "other"], disabled={"large", "other"}
     )
     try:
-        with pytest.raises(LaunchConfigError, match="missing"):
+        with pytest.raises(LaunchConfigError, match="fan_out member 'large' rejected"):
             await _background_result(
                 registry,
                 TaskArgs(

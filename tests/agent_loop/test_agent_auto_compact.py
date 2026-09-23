@@ -520,7 +520,7 @@ async def test_compact_uses_fallback_when_primary_returns_tool_call() -> None:
     # The fallback (second call) runs without tools, with the summarizer prompt.
     assert backend.requested_tools[1] is None
     assert backend.requested_tool_choices[1] is None
-    assert backend.requested_models[1].thinking == "medium"
+    assert backend.requested_models[1].thinking == "high"
     fallback_messages = backend.requests_messages[1]
     assert fallback_messages[0].role == Role.system
     assert fallback_messages[0].content == UtilityPrompt.COMPACT_SYSTEM.read()
@@ -532,7 +532,7 @@ async def test_compact_catalog_selector_retains_shipped_thinking_without_mutatio
     None
 ):
     config = build_test_vibe_config(compaction_model="glm-5-3")
-    config.available_models()["glm-5-3"].thinking = "high"
+    config.available_models()["glm-5-3"].thinking = "low"
     backend = _ScriptedBackend([
         [_tool_call_chunk()],
         [mock_llm_chunk(content="<summary>recovered</summary>")],
@@ -541,15 +541,13 @@ async def test_compact_catalog_selector_retains_shipped_thinking_without_mutatio
     agent.messages.append(LLMMessage(role=Role.user, content="Hello"))
     assert await agent.compact() == "recovered"
     assert [m.alias for m in backend.requested_models] == ["glm-5-3"] * 2
-    assert [m.thinking for m in backend.requested_models] == ["medium", "medium"]
-    assert agent.config.available_models()["glm-5-3"].thinking == "medium"
+    assert [m.thinking for m in backend.requested_models] == ["high", "high"]
+    assert agent.config.available_models()["glm-5-3"].thinking == "high"
 
 
 @pytest.mark.asyncio
 async def test_compact_glm_5_3_fallback_retains_encodable_thinking() -> None:
     config = build_test_vibe_config(compaction_model="glm-5-3")
-    config.available_models()["glm-5-3"].name = "zai-glm-5-3"
-    config.available_models()["glm-5-3"].thinking = "low"
     backend = _ScriptedBackend([
         [mock_llm_chunk(content="")],
         [mock_llm_chunk(content="<summary>recovered</summary>")],
@@ -558,7 +556,7 @@ async def test_compact_glm_5_3_fallback_retains_encodable_thinking() -> None:
     agent.messages.append(LLMMessage(role=Role.user, content="Hello"))
 
     assert await agent.compact() == "recovered"
-    assert backend.requested_models[1].thinking == "medium"
+    assert backend.requested_models[1].thinking == "high"
 
 
 @pytest.mark.asyncio

@@ -1,8 +1,8 @@
 """Shipped model-catalog definitions.
 
 Wire names were verified against the Mistral models API on 2026-09-16 and the
-local Codex configuration/adapter. Prices are unknown unless independently
-verified; unknown is deliberately represented by ``None``, never ``0.0``.
+local Codex configuration/adapter. Prices are published list prices; genuinely
+unknown values are represented by ``None``, never ``0.0``.
 """
 
 from __future__ import annotations
@@ -27,13 +27,15 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
     },
     "models": {
         "glm-5-3": {
-            "thinking": "medium",
+            "thinking": "high",
             "temperature": 0.2,
             "deployments": [
                 {
                     "provider": "mistral/default",
                     "name": "zai-glm-5-3",
+                    "prices": {"input": 1.4, "output": 4.4, "cached_input": 0.14},
                     "supports_images": False,
+                    "auto_compact_threshold": 400000,
                 }
             ],
         },
@@ -43,37 +45,33 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
                 {
                     "provider": "codex/local",
                     "name": "gpt-6-astra",
+                    "prices": {"input": 10.0, "output": 50.0, "cached_input": 1.0},
                     "supports_images": True,
+                    "auto_compact_threshold": 500000,
                 }
             ],
         },
-        "gpt-5.6-luna": {
-            "thinking": "high",
+        "gpt-6-luna": {
+            "thinking": "max",
             "deployments": [
                 {
                     "provider": "codex/local",
-                    "name": "gpt-5.6-luna",
+                    "name": "gpt-6-luna",
+                    "prices": {"input": 0.1, "output": 0.50, "cached_input": 0.01},
                     "supports_images": True,
+                    "auto_compact_threshold": 200000,
                 }
             ],
         },
-        "gpt-5.6-sol": {
+        "gpt-6-sol": {
             "thinking": "medium",
             "deployments": [
                 {
                     "provider": "codex/local",
-                    "name": "gpt-5.6-sol",
+                    "name": "gpt-6-sol",
+                    "prices": {"input": 2.0, "output": 10.0, "cached_input": 0.2},
                     "supports_images": True,
-                }
-            ],
-        },
-        "gpt-5.6-terra": {
-            "thinking": "medium",
-            "deployments": [
-                {
-                    "provider": "codex/local",
-                    "name": "gpt-5.6-terra",
-                    "supports_images": True,
+                    "auto_compact_threshold": 500000,
                 }
             ],
         },
@@ -89,23 +87,15 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
         },
         "small-worker": {
             "description": "fast model for focused implementation tasks",
-            "models": ["gpt-5.6-luna"],
-        },
-        "medium-worker": {
-            "description": "capable model for general implementation tasks",
-            "models": ["gpt-5.6-terra"],
+            "models": ["gpt-6-luna"],
         },
         "large-worker": {
             "description": "strongest model for complex, high-stakes tasks",
-            "models": ["gpt-5.6-sol", "glm-5-3"],
+            "models": ["gpt-6-sol", "glm-5-3"],
         },
         "small-reviewer": {
             "description": "fast model for focused reviews",
-            "models": ["gpt-5.6-luna"],
-        },
-        "medium-reviewer": {
-            "description": "capable model for general reviews",
-            "models": ["gpt-5.6-terra"],
+            "models": ["gpt-6-luna"],
         },
         "deep-reviewer": {
             "description": "strongest model for complex, high-stakes reviews",

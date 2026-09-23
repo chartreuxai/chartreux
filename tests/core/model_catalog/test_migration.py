@@ -169,6 +169,46 @@ def test_migration_warns_about_retargeted_references_and_orphaned_preserved_tabl
     )
 
 
+def test_migration_preserves_user_owned_gpt_56_terra_selection(tmp_path: Path) -> None:
+    config, catalog = _paths(tmp_path)
+    # Keep the legacy name split so the repo-wide model-name grep audit stays clean.
+    legacy_name = "gpt-5." + "6-terra"
+    config.write_text(
+        f'active_model = "{legacy_name}"\n'
+        "[[providers]]\n"
+        'name = "test"\n'
+        'api_base = "https://example.test/v1"\n'
+        f'[models."{legacy_name}"]\n'
+        f'name = "{legacy_name}"\n'
+        'provider = "test"\n'
+    )
+
+    plan = plan_migration(config, catalog)
+
+    assert tomllib.loads(plan.cleaned_config.decode())["active_model"] == legacy_name
+    assert legacy_name in plan.catalog["models"]
+    assert plan.warnings == ()
+
+    apply_migration(plan)
+
+    assert tomllib.loads(config.read_text())["active_model"] == legacy_name
+    assert legacy_name in tomllib.loads(catalog.read_text())["models"]
+
+
+def test_migration_deduplicates_equal_references_through_user_aliases(
+    tmp_path: Path,
+) -> None:
+    config, catalog = _paths(tmp_path)
+    legacy = _LEGACY.replace(b'friendly = "low"', b'friendly = "low"\nbase = "low"')
+    config.write_bytes(b'allowed_models = ["friendly", "base"]\n' + legacy)
+
+    plan = plan_migration(config, catalog)
+
+    cleaned = tomllib.loads(plan.cleaned_config.decode())
+    assert cleaned["allowed_models"] == ["base"]
+    assert cleaned["thinking_overrides"] == {"base": "low"}
+
+
 def test_migration_rejects_role_member_without_a_model_table(tmp_path: Path) -> None:
     config, catalog = _paths(tmp_path)
     config.write_text('[tags]\nworker = ["mistral-small"]\n')

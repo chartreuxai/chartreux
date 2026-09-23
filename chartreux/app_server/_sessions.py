@@ -1678,7 +1678,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             ),
         }
 
-    async def _run_fan_out(  # noqa: PLR0912, PLR0915
+    async def _run_fan_out(  # noqa: PLR0912, PLR0914, PLR0915
         self, parent: SessionRuntime, args: TaskArgs, ctx: InvokeContext
     ) -> TaskResult:
         """Launch every explicit role member through the ordinary retained path."""
@@ -1709,25 +1709,58 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             )
         members = role.models
 
-        # Resolve every member before creating any child.  Passing its canonical base
-        # rather than the role also makes each child assignment-time concrete.
-        member_args: list[tuple[str, TaskArgs, LaunchCandidate]] = []
-        for base in members:
+        # Resolve every member before creating any child. Passing its canonical base
+        # rather than the role also makes each child assignment-time concrete. A
+        # member-local model rejection does not prevent runnable siblings from being
+        # launched, but the whole call still requires at least one runnable member.
+        member_args: list[tuple[int, str, TaskArgs, LaunchCandidate]] = []
+        skipped: dict[int, TaskMemberResult] = {}
+        first_rejection: tuple[str, LaunchConfigError] | None = None
+        for index, base in enumerate(members):
             member_config = args.config.model_copy(update={"model": base})
             member = args.model_copy(
                 update={"config": member_config, "fan_out": False, "background": True}
             )
             try:
                 candidate = self._resolve_launch_candidate(parent, member)
+            except InvalidLaunchModelError as exc:
+                if first_rejection is None:
+                    first_rejection = (base, exc)
+                definition = snapshot.catalog.models.get(base)
+                deployment = (
+                    definition.deployments[0]
+                    if definition is not None and definition.deployments
+                    else None
+                )
+                provider = deployment.provider if deployment is not None else ""
+                wire_name = deployment.name if deployment is not None else base
+                skipped[index] = TaskMemberResult(
+                    index=index,
+                    base_model=base,
+                    provider=provider,
+                    display_name=format_model_display_name(provider, wire_name),
+                    status="skipped",
+                    error={"code": "preflight_rejected", "message": str(exc)},
+                )
+                continue
             except LaunchConfigError as exc:
                 raise InvalidLaunchModelError(
                     "config.model", f"fan_out member {base!r} rejected: {exc}"
                 ) from exc
-            member_args.append((base, member, candidate))
+            member_args.append((index, base, member, candidate))
 
-        launched: list[tuple[str, LaunchCandidate, TaskResult | BaseException]] = []
+        if not member_args:
+            assert first_rejection is not None
+            base, exc = first_rejection
+            raise InvalidLaunchModelError(
+                "config.model", f"fan_out member {base!r} rejected: {exc}"
+            ) from exc
+
+        launched: list[
+            tuple[int, str, LaunchCandidate, TaskResult | BaseException]
+        ] = []
         started_member_effect_ids: list[str] = []
-        for index, (base, member, candidate) in enumerate(member_args):
+        for index, base, member, candidate in member_args:
             member_ctx = replace(
                 ctx, tool_call_id=f"{ctx.tool_call_id}:fan-out:{index}"
             )
@@ -1743,7 +1776,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     if isinstance(event, TaskResult):
                         ack = event
                 assert ack is not None
-                launched.append((base, candidate, ack))
+                launched.append((index, base, candidate, ack))
                 launch_succeeded = True
             except asyncio.CancelledError:
                 await asyncio.gather(
@@ -1761,7 +1794,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 await self._complete_fan_out_member_effect(
                     parent, member_ctx.tool_call_id, "failed", str(exc)
                 )
-                launched.append((base, candidate, exc))
+                launched.append((index, base, candidate, exc))
             finally:
                 if not launch_succeeded:
                     self._pending_fan_out_result_leases.discard(member_ctx.tool_call_id)
@@ -1769,14 +1802,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         collected_results: dict[tuple[str, str], TaskResult] = {}
 
         async def terminal(
-            item: tuple[str, LaunchCandidate, TaskResult | BaseException],
+            item: tuple[int, str, LaunchCandidate, TaskResult | BaseException],
         ) -> TaskMemberResult:
-            base, candidate, value = item
-            index = next(
-                i
-                for i, candidate_item in enumerate(member_args)
-                if candidate_item[0] == base
-            )
+            index, _base, candidate, value = item
             member_tool_call_id = f"{ctx.tool_call_id}:fan-out:{index}"
             common = {
                 "index": index,
@@ -1876,16 +1904,22 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
 
         # gather deliberately does not cancel siblings when one run fails.
         try:
-            results = await asyncio.gather(*(terminal(item) for item in launched))
+            terminal_results = await asyncio.gather(
+                *(terminal(item) for item in launched)
+            )
         except asyncio.CancelledError:
             await self._release_fan_out_members(started_member_effect_ids)
             raise
+        results_by_index = {member.index: member for member in terminal_results}
+        results_by_index.update(skipped)
+        results = [results_by_index[index] for index in range(len(members))]
         turns_used = sum(result.turns_used for result in collected_results.values())
         return TaskResult(
             response="",
             turns_used=turns_used,
             completed=all(
-                member.status in {"running", "completed"} for member in results
+                member.status in {"running", "completed", "skipped"}
+                for member in results
             ),
             members=results,
         )

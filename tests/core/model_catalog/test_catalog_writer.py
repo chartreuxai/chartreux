@@ -156,9 +156,9 @@ def test_append_uses_shipped_stubs_without_losing_inherited_metadata(
     deployments = _written(path)["models"]["glm-5-3"]["deployments"]  # type: ignore[index]
     assert deployments[0] == {"provider": "mistral/default"}
     model = result.snapshot.catalog.models["glm-5-3"]
-    assert model.thinking == "medium"
+    assert model.thinking == "high"
     assert model.temperature == 0.2
-    assert model.deployments[0].auto_compact_threshold is None
+    assert model.deployments[0].auto_compact_threshold == 400000
 
 
 def test_roles_are_patched_per_key(tmp_path: Path) -> None:

@@ -80,7 +80,7 @@ def load_dotenv_values(
 
 
 DEFAULT_ACTIVE_MODEL_CONFIG = ModelConfig(
-    name="zai-glm-5-3", provider="mistral/default", alias="glm-5-3", thinking="medium"
+    name="zai-glm-5-3", provider="mistral/default", alias="glm-5-3", thinking="high"
 )
 
 # The catalog is deliberately not a field of ChartreuxConfigSchema.  It is loaded

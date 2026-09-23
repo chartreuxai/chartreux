@@ -101,7 +101,7 @@ class TaskMemberResult(BaseModel):
     base_model: str
     provider: str
     display_name: str
-    status: Literal["running", "completed", "failed", "cancelled"]
+    status: Literal["running", "completed", "failed", "cancelled", "skipped"]
     agent_id: str | None = None
     run_id: str | None = None
     result: str | None = None

@@ -58,7 +58,9 @@ compaction_model = "example-model"
 allowed_models = ["example-model"]
 ```
 
-A role is an ordered list of canonical base models with a description. Normal resolution chooses its first eligible member. For fan-out subagent work, `task(..., fan_out: true, config: {model: "@role"})` requires an explicit role, checks every member in advance, and returns results in member order without replacing or cancelling siblings. A session or retained child preserves its committed model/provider identity on resume instead of resolving the role again; changing a role does not change that committed identity when the agent is reused within a session; on cross-restart resume a role-bound agent re-resolves its role.
+A role is an ordered list of canonical base models with a description. Normal resolution chooses its first eligible member. For fan-out subagent work, `task(..., fan_out: true, config: {model: "@role"})` requires an explicit role, checks every member in advance, and returns results in member order without replacing or cancelling siblings. Unavailable
+or forbidden members are skipped with a reported reason; the call is rejected only
+when no member can run. A session or retained child preserves its committed model/provider identity on resume instead of resolving the role again; changing a role does not change that committed identity when the agent is reused within a session; on cross-restart resume a role-bound agent re-resolves its role.
 
 Built-in roles ship with the catalog and can be patched one role at a time in `models.toml`. Custom roles are TOML-only: define `[roles.<name>]` with `description` and `models`; v1 has no role-creation UI. The model edit screen lists every role as a checkbox. Existing members keep their order, while a newly checked model is appended; unchecking and rechecking a model therefore appends it to the end. See [Subagents](subagents.md).
 

@@ -668,7 +668,7 @@ scope checks remain enforced.
 
 - **worker**: General-purpose subagent bound to `@small-worker` with the `worker` role prompt.
 - **advisor**: Independent, read-only advisor bound to `@advisor` with the `advisor` role prompt. Its tools are limited to `read_file`, `grep`, `web_search`, and `web_fetch`, and its TTL is `0`.
-- **reviewer**: Independent, read-only reviewer bound to `@medium-reviewer` with the `reviewer` role prompt.
+- **reviewer**: Independent, read-only reviewer bound to `@small-reviewer` with the `reviewer` role prompt.
 
 Use `task` to launch a subagent. Profiles are presets: the orchestrator can choose a configured canonical model or role, predefined system prompt, inline instructions, tools, and thinking for an individual launch, but never beyond the parent authority ceiling. Per-call configuration is not written to `config.toml`; committed child launch state is retained in child-session metadata and revalidated fail-closed on resume. For a bounded design, feature, or review loop,
 keep the engagement cast — advisors, planner, implementors, and reviewers —
@@ -794,7 +794,7 @@ the mention kind:
 Image attachments:
 
 - Require `supports_images = true` on the active deployment in `models.toml`.
-  Four shipped Codex deployments support images; non-vision deployments reject
+  Three shipped Codex deployments support images; non-vision deployments reject
   image messages with a clear error before adding them to the conversation.
 - Snapshotted into `<session_dir>/attachments/<sha1>.<ext>` so that
   resumed sessions stay reproducible even if the source file is moved.

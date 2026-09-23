@@ -322,13 +322,19 @@ def _migration_warnings(  # noqa: PLR0912
     for field in ("allowed_models",):
         values = data.get(field)
         if isinstance(values, list):
-            references.update(
-                _canonical_legacy_reference(value, aliases)
-                for value in values
-                if isinstance(value, str)
-                and not value.startswith("re:")
-                and not any(char in value for char in "*?[")
-            )
+            for value in values:
+                if (
+                    not isinstance(value, str)
+                    or value.startswith("re:")
+                    or any(char in value for char in "*?[")
+                ):
+                    continue
+                canonical = _canonical_legacy_reference(value, aliases)
+                references.add(canonical)
+                if value in _LEGACY_SHIPPED_MODEL_ALIASES:
+                    warnings.append(
+                        f"allowed_models entry {value!r} was retargeted to {canonical!r}."
+                    )
     overrides = data.get("thinking_overrides")
     if isinstance(overrides, dict):
         references.update(
@@ -392,11 +398,12 @@ def _canonicalize_selections(
             if isinstance(pattern, str) and (
                 pattern in aliases or pattern in _LEGACY_SHIPPED_MODEL_ALIASES
             ):
-                canonical_allowed_models.append(
-                    _canonical_legacy_reference(pattern, aliases)
-                )
+                canonical_pattern = _canonical_legacy_reference(pattern, aliases)
+                if canonical_pattern not in canonical_allowed_models:
+                    canonical_allowed_models.append(canonical_pattern)
                 continue
-            canonical_allowed_models.append(pattern)
+            if pattern not in canonical_allowed_models:
+                canonical_allowed_models.append(pattern)
             if not isinstance(pattern, str) or not (
                 pattern.startswith("re:") or any(char in pattern for char in "*?[")
             ):
@@ -422,9 +429,11 @@ def _canonicalize_selections(
                 raise MigrationError("Legacy thinking override keys must be strings.")
             canonical_key = _canonical_legacy_reference(key, aliases)
             if canonical_key in canonical_overrides:
-                raise MigrationConflictError(
-                    f"Ambiguous legacy identity {canonical_key!r}: multiple thinking overrides resolve to it; resolve manually."
-                )
+                if canonical_overrides[canonical_key] != value:
+                    raise MigrationConflictError(
+                        f"Ambiguous legacy identity {canonical_key!r}: multiple thinking overrides resolve to it; resolve manually."
+                    )
+                continue
             canonical_overrides[canonical_key] = value
         config["thinking_overrides"] = canonical_overrides
 

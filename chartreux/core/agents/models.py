@@ -59,8 +59,7 @@ WORKER = AgentProfile(
     description="General-purpose subagent for delegated tasks",
     safety=AgentSafety.NEUTRAL,
     agent_type=AgentType.SUBAGENT,
-    # Applied when the orchestrator explicitly escalates this profile to glm-5-3.
-    overrides={"system_prompt_id": "worker", "thinking_overrides": {"glm-5-3": "high"}},
+    overrides={"system_prompt_id": "worker"},
     instructions=None,
     role="small-worker",
 )
@@ -86,12 +85,9 @@ REVIEWER = AgentProfile(
     description="Independent read-only review of code and plans",
     safety=AgentSafety.NEUTRAL,
     agent_type=AgentType.SUBAGENT,
-    overrides={
-        "system_prompt_id": "reviewer",
-        "thinking_overrides": {"glm-5-3": "high"},
-    },
+    overrides={"system_prompt_id": "reviewer"},
     instructions=None,
-    role="medium-reviewer",
+    role="small-reviewer",
 )
 
 BUILTIN_SUBAGENTS: dict[str, AgentProfile] = {

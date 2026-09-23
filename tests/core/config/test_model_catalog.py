@@ -193,17 +193,43 @@ def test_16_shipped_defaults_validate_and_have_verified_wire_names() -> None:
         for model in catalog.models.values()
         for deployment in model.deployments
     )
-    assert catalog.models["glm-5-3"].thinking == "medium"
-    assert catalog.models["gpt-6-astra"].thinking == "low"
-    assert catalog.models["gpt-5.6-luna"].thinking == "high"
-    assert catalog.models["gpt-5.6-sol"].thinking == "medium"
-    assert catalog.models["gpt-5.6-terra"].thinking == "medium"
+    assert set(catalog.models) == {"glm-5-3", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol"}
+    assert {name: model.thinking for name, model in catalog.models.items()} == {
+        "glm-5-3": "high",
+        "gpt-6-astra": "low",
+        "gpt-6-luna": "max",
+        "gpt-6-sol": "medium",
+    }
     assert catalog.roles["orchestrator"].models == ("glm-5-3",)
+    assert {name: role.models for name, role in catalog.roles.items()} == {
+        "orchestrator": ("glm-5-3",),
+        "advisor": ("gpt-6-astra",),
+        "small-worker": ("gpt-6-luna",),
+        "large-worker": ("gpt-6-sol", "glm-5-3"),
+        "small-reviewer": ("gpt-6-luna",),
+        "deep-reviewer": ("gpt-6-astra", "glm-5-3"),
+    }
+    assert {
+        name: (
+            model.deployments[0].provider,
+            model.deployments[0].name,
+            model.deployments[0].prices.input,
+            model.deployments[0].prices.output,
+            model.deployments[0].prices.cached_input,
+            model.deployments[0].auto_compact_threshold,
+        )
+        for name, model in catalog.models.items()
+    } == {
+        "glm-5-3": ("mistral/default", "zai-glm-5-3", 1.4, 4.4, 0.14, 400000),
+        "gpt-6-astra": ("codex/local", "gpt-6-astra", 10.0, 50.0, 1.0, 500000),
+        "gpt-6-luna": ("codex/local", "gpt-6-luna", 0.1, 0.50, 0.01, 200000),
+        "gpt-6-sol": ("codex/local", "gpt-6-sol", 2.0, 10.0, 0.2, 500000),
+    }
     assert {
         deployment.name
         for model in catalog.models.values()
         for deployment in model.deployments
-    } == {"zai-glm-5-3", "gpt-6-astra", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"}
+    } == {"zai-glm-5-3", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol"}
 
 
 def test_shipped_catalog_json_dump_round_trips() -> None:

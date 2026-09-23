@@ -20,9 +20,9 @@ For a pull request, fetch its branch before delegating, then review the branch c
 
 ## Tiers
 
-- **Quick:** one `reviewer`-profile launch with `config.model` set to `@small-reviewer` (or a canonical quick model). Use for quick, fast, trivial, or rename-only reviews.
-- **Standard:** dispatch the `reviewer` profile with `config.model` set to `@medium-reviewer` by default. For broader coverage, add a second parallel `reviewer` launch with a different model for an independent perspective.
-- **Deep:** run the Standard spread first. Give its findings to a second phase using the `reviewer` profile with `config.model` set to `@deep-reviewer`. The second phase seeks new architectural, system-level, severity, and edge-case findings rather than duplicating the first phase.
+- **Quick:** one `reviewer`-profile launch with `config.model` set to `@small-reviewer`. Use for quick, fast, trivial, or rename-only reviews.
+- **Standard:** one `reviewer`-profile launch with `config.model` set to `@small-reviewer`. Use for most reviews; do not add a second reviewer by default.
+- **Deep:** dispatch the `reviewer` profile with `config.model` set to `@deep-reviewer` and `fan_out` enabled. This launches the astra and glm members in parallel; synthesize both reviews.
 - **Plans:** use the Deep procedure for plans, specifications, and designs.
 
 Use only the listed profiles and role expressions. Do not call the usage tool automatically. Keep each phase bounded to one dispatch per listed reviewer and at most two refinement rounds unless the user approves a larger budget.
@@ -34,10 +34,10 @@ If a listed reviewer fails or is unavailable, report the failure as a blocker in
 Each task string must be self-contained:
 
 ```text
-task(task="Review: <target>. Intent: <intent>. Tier: <tier>. Return a complete review report with findings, evidence, and verification status.", agent="reviewer", config={model="@medium-reviewer"})
+task(task="Review: <target>. Intent: <intent>. Tier: <tier>. Return a complete review report with findings, evidence, and verification status.", agent="reviewer", config={model="@small-reviewer"})
 ```
 
-Issue independent Standard calls in one parallel tool block. For Deep and Plans, wait for Standard results, extract consensus and notable divergent findings, and include them in the deep-reviewer task.
+For Deep and Plans, dispatch one `reviewer` task with `fan_out=true`, `background=false`, and `config.model` set to `@deep-reviewer`; astra and glm review in parallel. Foreground fan-out member results arrive inline in the task result; synthesize both reviews from that response. Include any bounded follow-up context in the task.
 
 ## Synthesis
 

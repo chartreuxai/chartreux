@@ -31,7 +31,7 @@ class TestAgentProfile:
             "thinking",
         ),
         [
-            (WORKER, "small-worker", "worker", None, None, {"glm-5-3": "high"}),
+            (WORKER, "small-worker", "worker", None, None, None),
             (
                 ADVISOR,
                 "advisor",
@@ -40,7 +40,7 @@ class TestAgentProfile:
                 0,
                 None,
             ),
-            (REVIEWER, "medium-reviewer", "reviewer", None, None, {"glm-5-3": "high"}),
+            (REVIEWER, "small-reviewer", "reviewer", None, None, None),
         ],
     )
     def test_builtin_profiles_have_role_prompt_and_tools(

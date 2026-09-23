@@ -44,7 +44,7 @@ The built-in profiles are presets for common delegated work:
 | --- | --- | --- | --- |
 | `worker` | `small-worker` | `worker` | General-purpose bounded implementation or miscellaneous work. |
 | `advisor` | `advisor` | `advisor` | Independent architectural guidance, second opinions, and risk analysis. |
-| `reviewer` | `medium-reviewer` | `reviewer` | Independent read-only reviews of code, documentation, specifications, and plans. |
+| `reviewer` | `small-reviewer` | `reviewer` | Independent read-only reviews of code, documentation, specifications, and plans. |
 
 `advisor` is restricted to the read-only tools `read_file`, `grep`,
 `web_search`, and `web_fetch`. It is configured with no idle-TTL eviction so it
@@ -61,7 +61,7 @@ profile discovery precedence. This lets users replace a profile or its prompt
 without changing Chartreux's shipped defaults.
 
 Use the profile's role binding for model selection, for example
-`config={model="@advisor"}` or `config={model="@medium-reviewer"}` when a
+`config={model="@advisor"}` or `config={model="@small-reviewer"}` when a
 specific role tier is required. Runtime configuration is an override for that
 launch; it does not change the profile or its role prompt.
 
@@ -74,8 +74,8 @@ profile-specific default:
 task(
   task="Review the authentication changes",
   config={
-    model="gpt-5.6-terra",
-    thinking="high",
+    model="gpt-6-luna",
+    thinking="max",
     instructions="Focus on authorization boundaries.",
     enabled_tools=["read_file", "grep"]
   }
@@ -119,7 +119,8 @@ unreferenced stored results. Release subagents when you are done.
 For an explicit model role, `fan_out: true` starts one retained subagent per role
 member. Each member has its own handle and outcome; the ordered member results
 identify the selected model and provider. Fan-out does not substitute a failed
-member or cancel its siblings. See the [configuration reference](../reference/configuration.md)
+member or cancel its siblings. Unavailable or forbidden members are skipped with a
+reported reason; the call is rejected only when no member can run. See the [configuration reference](../reference/configuration.md)
 for model roles.
 
 ## TUI monitoring
@@ -167,7 +168,7 @@ display_name = "Reviewer"
 description = "Read-only review work"
 agent_type = "subagent"
 instructions = "Report concrete findings with file and line references."
-role = "medium-reviewer"
+role = "small-reviewer"
 disabled_tools = ["edit", "write_file"]
 
 [tools.bash]

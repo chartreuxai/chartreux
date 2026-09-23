@@ -2159,7 +2159,7 @@ async def test_config_read_serves_the_catalogue_with_and_without_a_session(
         )
         assert passive.stripped_history_images == 0
         assert {model.alias for model in passive.config.models} >= {"medium", "small"}
-        assert passive.config.active_model.thinking == "medium"
+        assert passive.config.active_model.thinking == "high"
         assert layer_roots == [workspace]
 
         with pytest.raises(AppServerResponseError) as exc_info:

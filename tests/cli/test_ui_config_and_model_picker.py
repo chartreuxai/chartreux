@@ -86,9 +86,8 @@ async def test_model_picker_shows_all_models() -> None:
         assert [model.alias for model in picker._models] == [
             "glm-5-3",
             "gpt-6-astra",
-            "gpt-5.6-luna",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
+            "gpt-6-luna",
+            "gpt-6-sol",
             "alpha",
             "beta",
             "gamma",
@@ -117,20 +116,19 @@ async def test_model_picker_shows_display_name_but_persists_alias() -> None:
         assert [model.display_name for model in picker._models] == [
             "mistral/default/zai-glm-5-3",
             "codex/local/gpt-6-astra",
-            "codex/local/gpt-5.6-luna",
-            "codex/local/gpt-5.6-sol",
-            "codex/local/gpt-5.6-terra",
+            "codex/local/gpt-6-luna",
+            "codex/local/gpt-6-sol",
             "mistral/default/model-a",
             "mistral/default/custom-model",
         ]
         option_list = picker.query_one(OptionList)
         assert "mistral/default/custom-model" in str(
-            option_list.get_option_at_index(7).prompt
+            option_list.get_option_at_index(6).prompt
         )
 
         # Selecting it still persists the alias, not the label.
         await pilot.press(
-            "home", "down", "down", "down", "down", "down", "down", "down", "enter"
+            "home", "down", "down", "down", "down", "down", "down", "enter"
         )
         await wait_until(pilot, lambda: app.config.active_model.alias == "custom")
 
@@ -244,12 +242,12 @@ async def test_model_picker_offers_default_row() -> None:
 
         picker = app.query_one(ModelPickerApp)
         option_list = picker.query_one(OptionList)
-        # Default + five shipped and three explicitly configured models.
-        assert option_list.option_count == 9
+        # Default + four shipped and three explicitly configured models.
+        assert option_list.option_count == 8
         # A pinned model pre-highlights that model, not the Default row.
         assert picker._is_pinned is True
         assert (
-            option_list.highlighted == 6
+            option_list.highlighted == 5
         )  # "alpha", offset by Default and shipped models
 
 

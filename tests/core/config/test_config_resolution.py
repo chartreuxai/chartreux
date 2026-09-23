@@ -103,7 +103,7 @@ async def test_thinking_overrides_are_layer_merged_and_materialized_without_cata
     )
     assert config.get_active_model().thinking == "low"
     assert config.catalog_snapshot is not None
-    assert config.catalog_snapshot.catalog.models["glm-5-3"].thinking == "medium"
+    assert config.catalog_snapshot.catalog.models["glm-5-3"].thinking == "high"
 
 
 @pytest.mark.parametrize(

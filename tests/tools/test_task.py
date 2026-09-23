@@ -460,7 +460,15 @@ def test_fan_out_result_display_uses_member_status_for_launch_state() -> None:
                 status="running",
                 agent_id="agent-1",
                 run_id="run-1",
-            )
+            ),
+            TaskMemberResult(
+                index=1,
+                base_model="unavailable",
+                provider="provider",
+                display_name="provider/unavailable",
+                status="skipped",
+                error={"code": "preflight_rejected", "message": "model disabled"},
+            ),
         ],
     )
     event = ToolResultEvent(
@@ -470,4 +478,9 @@ def test_fan_out_result_display_uses_member_status_for_launch_state() -> None:
     display = Task.get_result_display(event)
 
     assert display.verb == "Launched"
-    assert display.message.startswith("1 agents")
+    assert display.message.startswith("1 agents, 1 skipped")
+    assert "Skipped unavailable: model disabled" in display.message
+    assert Task.project_result(result) == {
+        "models": ["provider/base"],
+        "skipped": ["Skipped unavailable: model disabled"],
+    }

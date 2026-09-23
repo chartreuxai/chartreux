@@ -9,6 +9,7 @@ import tomllib
 import pexpect
 import pytest
 
+from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from tests import TESTS_ROOT
 from tests.e2e.common import (
     ansi_tolerant_pattern,
@@ -32,11 +33,14 @@ def _send_and_wait_for_text(
 def _select_option_with_keyboard(
     child: pexpect.spawn, captured: io.StringIO, option_text: str
 ) -> None:
-    """Select the named picker row without relying on catalog sort position."""
+    """Select a newly added model from the fresh-home active-model picker."""
     wait_for_rendered_text(child, captured, "Labels identify deployments;", timeout=10)
-    child.send("k" * 9)
-    drain_child_output(child, idle_sleep=0.03)
     assert option_text in strip_ansi(captured.getvalue())
+    # A fresh home highlights Default first. Canonical model rows are sorted,
+    # followed by role rows, so derive this model's offset from the shipped set.
+    model_names = sorted((*SHIPPED_CATALOG.models, option_text))
+    child.send("j" * (model_names.index(option_text) + 1))
+    drain_child_output(child, idle_sleep=0.03)
     child.send("\r")
 
 
