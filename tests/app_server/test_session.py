@@ -2088,6 +2088,210 @@ async def test_tool_execution_has_no_approval_callback() -> None:
     assert isinstance(effect.state, CompletedEffectState)
 
 
+async def _open_wire_notification_session(agent_loop):
+    client_transport, server_transport = memory_transport_pair()
+    server = build_test_app_server(agent_loop, server_transport)
+    client = AppServerClient(client_transport, run_peer=server.serve)
+    client_info = ClientInfo(name="notification-validation-test", version="1")
+    await client.initialize(client_info)
+    await client.notify("initialized")
+    session = await AppServerSession.open(
+        client, client_info=client_info, capabilities=ClientCapabilities()
+    )
+    return session, client, server_transport, server
+
+
+@pytest.mark.asyncio
+async def test_malformed_projection_notification_resyncs_without_interrupting_rpc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = build_test_agent_loop()
+    session, client, server_transport, server = await _open_wire_notification_session(
+        agent_loop
+    )
+    request_entered = asyncio.Event()
+    release_request = asyncio.Event()
+    resynced = asyncio.Event()
+    original_dispatch = server._dispatch_request
+    original_resync = session._resync
+    read_count = 0
+
+    async def delay_first_read(method: str, raw_params: dict[str, Any]):
+        nonlocal read_count
+        if method == "session/read":
+            read_count += 1
+            if read_count == 1:
+                request_entered.set()
+                await release_request.wait()
+        return await original_dispatch(method, raw_params)
+
+    async def tracked_resync(resync_client) -> None:
+        await original_resync(resync_client)
+        resynced.set()
+
+    monkeypatch.setattr(server, "_dispatch_request", delay_first_read)
+    monkeypatch.setattr(session, "_resync", tracked_resync)
+    server._event_watermarks[session.session_id] = session.state.event_id + 3
+    expected_event_id = server._event_watermark(session.session_id)
+    in_flight = asyncio.create_task(
+        client.request("session/read", SessionReadParams(session_id=session.session_id))
+    )
+    try:
+        await asyncio.wait_for(request_entered.wait(), timeout=1)
+        await server_transport.send({
+            "jsonrpc": "2.0",
+            "method": "session/updated",
+            "params": {
+                "eventId": expected_event_id,
+                "sessionId": session.session_id,
+                "patch": "not-a-patch-list",
+                "emittedAt": 1,
+            },
+        })
+        await asyncio.wait_for(resynced.wait(), timeout=1)
+
+        assert session._connection.current is client
+        assert not in_flight.done()
+        assert session._state.projection.last_event_id == expected_event_id
+
+        release_request.set()
+        response = await asyncio.wait_for(in_flight, timeout=1)
+        assert response["state"]["session"]["id"] == session.session_id
+    finally:
+        release_request.set()
+        if not in_flight.done():
+            in_flight.cancel()
+        await asyncio.gather(in_flight, return_exceptions=True)
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_notification_resync_escalates_to_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = build_test_agent_loop()
+    session, client, server_transport, _server = await _open_wire_notification_session(
+        agent_loop
+    )
+    resync_started = asyncio.Event()
+    reconnect = AsyncMock(return_value=False)
+
+    async def fail_resync(_resync_client) -> None:
+        resync_started.set()
+        raise RuntimeError("session/read failed")
+
+    monkeypatch.setattr(session, "_resync", fail_resync)
+    monkeypatch.setattr(session._connection, "reconnect", reconnect)
+    try:
+        await server_transport.send({
+            "jsonrpc": "2.0",
+            "method": "session/updated",
+            "params": {"eventId": 1, "sessionId": session.session_id},
+        })
+        await asyncio.wait_for(resync_started.wait(), timeout=1)
+        async with asyncio.timeout(1):
+            while reconnect.await_count == 0:
+                await asyncio.sleep(0)
+        reconnect.assert_awaited_once_with(client)
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_malformed_ephemeral_notifications_are_dropped_without_resync(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent_loop = build_test_agent_loop()
+    session, client, server_transport, _server = await _open_wire_notification_session(
+        agent_loop
+    )
+    resync = AsyncMock()
+    reconnect = AsyncMock(return_value=False)
+    methods = (
+        "warning",
+        "error",
+        "turn/retrying",
+        "mcp_catalog/authRequired",
+        "mcp_catalog/authUrl",
+    )
+    monkeypatch.setattr(session, "_resync", resync)
+    monkeypatch.setattr(session._connection, "reconnect", reconnect)
+    try:
+        with caplog.at_level(logging.WARNING, logger="vibe"):
+            for index, method in enumerate(methods, start=1):
+                await server_transport.send({
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "params": {},
+                })
+                async with asyncio.timeout(1):
+                    while (
+                        sum(
+                            f"Dropping malformed app-server notification method {method}"
+                            in record.message
+                            for record in caplog.records
+                        )
+                        < 1
+                    ):
+                        await asyncio.sleep(0)
+                assert session._connection.current is client
+                assert session._message_task is not None
+                assert not session._message_task.done()
+                assert (
+                    len([
+                        record
+                        for record in caplog.records
+                        if "Dropping malformed app-server notification method"
+                        in record.message
+                    ])
+                    == index
+                )
+
+        resync.assert_not_awaited()
+        reconnect.assert_not_awaited()
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_malformed_runtime_update_resynchronizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = build_test_agent_loop()
+    session, client, server_transport, server = await _open_wire_notification_session(
+        agent_loop
+    )
+    original_resync = session._resync
+    resynced = asyncio.Event()
+    reconnect = AsyncMock(return_value=False)
+
+    async def tracked_resync(resync_client) -> None:
+        await original_resync(resync_client)
+        resynced.set()
+
+    monkeypatch.setattr(session, "_resync", tracked_resync)
+    monkeypatch.setattr(session._connection, "reconnect", reconnect)
+    server._event_watermarks[session.session_id] = session.state.event_id + 2
+    expected_event_id = server._event_watermark(session.session_id)
+    try:
+        await server_transport.send({
+            "jsonrpc": "2.0",
+            "method": "runtime/updated",
+            "params": {},
+        })
+        await asyncio.wait_for(resynced.wait(), timeout=1)
+
+        assert session._state.projection.last_event_id == expected_event_id
+        assert session._connection.current is client
+        reconnect.assert_not_awaited()
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+
+
 @pytest.mark.asyncio
 async def test_unknown_notification_does_not_interrupt_pump_or_in_flight_rpc(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch

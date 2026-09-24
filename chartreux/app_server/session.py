@@ -821,10 +821,7 @@ class AppServerSession:  # noqa: PLR0904
     async def _handle_notification(
         self, client: AppServerClient, notification: Notification
     ) -> None:
-        if await self.resources.consume_notification(notification):
-            return
-        if server_event := parse_server_event(notification):
-            await self._publish_event(server_event)
+        if await self._consume_non_projection_notification(client, notification):
             return
         try:
             event = self._state.projection.consume(notification)
@@ -836,7 +833,7 @@ class AppServerSession:  # noqa: PLR0904
                     notification.method,
                 )
             return
-        except EventSequenceError:
+        except (EventSequenceError, ValidationError):
             await self._resync(client)
             return
         if event is None:
@@ -863,6 +860,46 @@ class AppServerSession:  # noqa: PLR0904
         if await self.resources.consume_event(event):
             return
         await self._publish_event(event)
+
+    async def _consume_non_projection_notification(
+        self, client: AppServerClient, notification: Notification
+    ) -> bool:
+        try:
+            if await self.resources.consume_notification(notification):
+                return True
+        except ValidationError as exc:
+            if notification.method == "runtime/updated":
+                await self._resync(client)
+            elif notification.method == "mcp_catalog/authUrl":
+                logger.warning(
+                    "Dropping malformed app-server notification method %s: %s",
+                    notification.method,
+                    exc,
+                )
+            else:
+                raise
+            return True
+
+        try:
+            server_event = parse_server_event(notification)
+        except ValidationError as exc:
+            if notification.method not in {
+                "warning",
+                "error",
+                "turn/retrying",
+                "mcp_catalog/authRequired",
+            }:
+                raise
+            logger.warning(
+                "Dropping malformed app-server notification method %s: %s",
+                notification.method,
+                exc,
+            )
+            return True
+        if server_event is None:
+            return False
+        await self._publish_event(server_event)
+        return True
 
     async def _resync(self, client: AppServerClient) -> None:
         generation = self._state.projection.generation
