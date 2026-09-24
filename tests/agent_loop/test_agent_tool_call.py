@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
 import json
+from pathlib import Path
 from typing import cast
 
 import pytest
 
 from chartreux.core.agent_loop import AgentLoop
-from chartreux.core.config import ChartreuxConfigSchema
+from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
 from chartreux.core.events import (
     AssistantEvent,
     BaseEvent,
@@ -21,6 +22,7 @@ from chartreux.core.hooks.manager import HooksManager
 from chartreux.core.hooks.models import HookToolDenial, HookToolInputRewrite
 from chartreux.core.llm.format import ResolvedToolCall
 from chartreux.core.llm_models import FunctionCall, LLMMessage, Role, ToolCall
+from chartreux.core.session.session_logger import SessionLogger
 from chartreux.core.subagents import TaskArgs
 from chartreux.core.tools.base import ToolPermission
 from chartreux.core.tools.builtins.task import Task
@@ -110,6 +112,74 @@ def make_agent_loop(
         config=make_config(todo_permission=todo_permission), backend=backend
     )
     return agent_loop
+
+
+@pytest.mark.asyncio
+async def test_missing_tool_response_rewrites_repeated_boundary_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = build_test_vibe_config(
+        session_logging=SessionLoggingConfig(
+            save_dir=str(tmp_path), session_prefix="test", enabled=True
+        )
+    )
+    agent_loop = build_test_agent_loop(config=config)
+    logger = agent_loop.session_logger
+    assert isinstance(logger, SessionLogger)
+
+    repeated = LLMMessage(role=Role.user, content="repeated boundary")
+    agent_loop.messages.extend([
+        LLMMessage(role=Role.system, content="system"),
+        LLMMessage(
+            role=Role.assistant,
+            content="calling tool",
+            tool_calls=[make_todo_tool_call("missing_response")],
+        ),
+        repeated,
+        repeated,
+    ])
+    await logger.save_interaction(
+        agent_loop.messages,
+        agent_loop.stats,
+        agent_loop.config,
+        agent_loop.tool_manager,
+        None,
+    )
+    cursor = logger._transcript_cursor
+    assert cursor is not None
+    assert cursor.count == 3
+
+    original_overwrite = SessionLogger._overwrite_messages_sync
+    overwrite_calls: list[list[dict]] = []
+
+    def record_overwrite(messages: list[dict], session_dir: Path) -> None:
+        overwrite_calls.append(messages)
+        original_overwrite(messages, session_dir)
+
+    monkeypatch.setattr(
+        SessionLogger, "_overwrite_messages_sync", staticmethod(record_overwrite)
+    )
+    agent_loop._fill_missing_tool_responses()
+    assert logger._transcript_cursor is None
+
+    await logger.save_interaction(
+        agent_loop.messages,
+        agent_loop.stats,
+        agent_loop.config,
+        agent_loop.tool_manager,
+        None,
+    )
+
+    expected = [
+        message.model_dump(exclude_none=True, mode="json")
+        for message in agent_loop.messages
+        if message.role != Role.system
+    ]
+    records = [
+        json.loads(line) for line in logger.messages_filepath.read_text().splitlines()
+    ]
+    assert overwrite_calls == [expected]
+    assert records == expected
 
 
 @pytest.mark.parametrize(
@@ -605,6 +675,36 @@ async def test_fill_missing_tool_responses_inserts_placeholders() -> None:
         placeholder.content
         == "<user_cancellation>Tool execution interrupted - no response available</user_cancellation>"
     )
+
+
+def test_fill_missing_tool_responses_invalidates_interior_transcript_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = build_test_agent_loop(
+        config=make_config(), backend=FakeBackend(mock_llm_chunk(content="ok"))
+    )
+    call = make_todo_tool_call("missing", index=0)
+    agent_loop.messages.reset([
+        agent_loop.messages[0],
+        LLMMessage(role=Role.assistant, content="Calling tool", tool_calls=[call]),
+        LLMMessage(role=Role.user, content="later message"),
+    ])
+    invalidations: list[bool] = []
+    original_invalidate = agent_loop.session_logger.invalidate_transcript_cursor
+
+    def invalidate() -> None:
+        invalidations.append(True)
+        original_invalidate()
+
+    monkeypatch.setattr(
+        agent_loop.session_logger, "invalidate_transcript_cursor", invalidate
+    )
+
+    agent_loop._fill_missing_tool_responses()
+
+    assert invalidations == [True]
+    assert agent_loop.messages[2].role == Role.tool
+    assert agent_loop.messages[3].content == "later message"
 
 
 @pytest.mark.asyncio

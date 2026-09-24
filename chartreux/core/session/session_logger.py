@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 import contextlib
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import getpass
 import hashlib
@@ -46,7 +47,18 @@ if TYPE_CHECKING:
 
 
 TMP_CLEANUP_INTERVAL = timedelta(seconds=5)
+TRANSCRIPT_VERIFY_INTERVAL = 64
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _TranscriptCursor:
+    # A future MessageList.__setitem__ could bypass the boundary check; periodic
+    # full verification is the backstop for same-size interior edits.
+    count: int
+    boundary_digest: str | None
+    file_size: int
+    metadata_published: bool
 
 
 # Over the method limit, as AgentLoop and ChartreuxApp already are: most of thesethese
@@ -69,6 +81,9 @@ class SessionLogger:  # noqa: PLR0904
         self._last_tmp_cleanup_at: datetime | None = None
         self._tmp_cleanup_lock = Lock()
         self._persisted = False
+        self._transcript_cursor: _TranscriptCursor | None = None
+        self._transcript_saves_since_verify = 0
+        self._transcript_cursor_generation = 0
         self._launch_config_dirty = False
         self._launch_config_generation = 0
         # Serializes writes so concurrent saves cannot interleave appends to
@@ -117,6 +132,12 @@ class SessionLogger:  # noqa: PLR0904
     @property
     def persisted(self) -> bool:
         return self._persisted
+
+    def invalidate_transcript_cursor(self) -> None:
+        """Force the next interaction save to verify the full transcript."""
+        self._transcript_cursor_generation += 1
+        self._transcript_cursor = None
+        self._transcript_saves_since_verify = 0
 
     @property
     def active_model(self) -> str | None:
@@ -417,7 +438,7 @@ class SessionLogger:  # noqa: PLR0904
             raise cancellation
 
     @staticmethod
-    def _persist_messages_sync(messages: list[dict], session_dir: Path) -> None:
+    def _persist_messages_sync(messages: list[dict], session_dir: Path) -> int:
         messages_filepath = session_dir / "messages.jsonl"
         try:
             # Session logs hold raw tool results, so new files are owner-only.
@@ -434,6 +455,7 @@ class SessionLogger:  # noqa: PLR0904
                     f.write(json.dumps(message, ensure_ascii=False) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
+            return messages_filepath.stat().st_size
         except Exception as e:
             raise RuntimeError(
                 f"Failed to persist session messages to {messages_filepath}: {e}"
@@ -509,6 +531,9 @@ class SessionLogger:  # noqa: PLR0904
             session_metadata.config = config_snapshot
             launch_config_generation = self._launch_config_generation
             metadata_snapshot = session_metadata.model_copy(deep=True)
+            cursor_snapshot = self._transcript_cursor
+            saves_since_verify = self._transcript_saves_since_verify
+            cursor_generation_snapshot = self._transcript_cursor_generation
             persistence = asyncio.create_task(
                 asyncio.to_thread(
                     self._save_interaction_sync,
@@ -520,10 +545,12 @@ class SessionLogger:  # noqa: PLR0904
                     metadata_snapshot,
                     allow_empty,
                     self._launch_config_dirty,
+                    cursor_snapshot,
+                    saves_since_verify,
                 )
             )
             try:
-                await asyncio.shield(persistence)
+                save_result = await asyncio.shield(persistence)
             except asyncio.CancelledError as cancellation:
                 # ``to_thread`` keeps running after its awaiter is cancelled. Keep
                 # the save lock until that worker has finished so a subsequent
@@ -538,12 +565,29 @@ class SessionLogger:  # noqa: PLR0904
                         break
                 if not persistence.cancelled():
                     try:
-                        persistence.result()
+                        save_result = persistence.result()
                     except Exception:
                         # The caller's cancellation remains the observable outcome,
                         # but retrieving the exception avoids abandoning the task.
                         pass
+                    else:
+                        if (
+                            save_result is not None
+                            and self._transcript_cursor_generation
+                            == cursor_generation_snapshot
+                        ):
+                            (
+                                self._transcript_cursor,
+                                self._transcript_saves_since_verify,
+                            ) = save_result
                 raise cancellation
+            if (
+                save_result is not None
+                and self._transcript_cursor_generation == cursor_generation_snapshot
+            ):
+                self._transcript_cursor, self._transcript_saves_since_verify = (
+                    save_result
+                )
             self._persisted = True
             if self._launch_config_generation == launch_config_generation:
                 self._launch_config_dirty = False
@@ -590,6 +634,69 @@ class SessionLogger:  # noqa: PLR0904
             return [], False
         return persisted_messages, True
 
+    @staticmethod
+    def _transcript_line_digest(message_data: dict[str, Any]) -> str:
+        line = json.dumps(message_data, ensure_ascii=False)
+        return hashlib.sha256(line.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _cursor_for_messages(
+        cls, messages: list[dict[str, Any]], messages_path: Path
+    ) -> _TranscriptCursor:
+        file_size = messages_path.stat().st_size if messages_path.exists() else 0
+        boundary_digest = (
+            cls._transcript_line_digest(messages[-1]) if messages else None
+        )
+        return _TranscriptCursor(
+            count=len(messages),
+            boundary_digest=boundary_digest,
+            file_size=file_size,
+            metadata_published=True,
+        )
+
+    def _interaction_metadata_dump(
+        self,
+        messages: list[LLMMessage],
+        non_system_messages: list[LLMMessage],
+        stats: AgentStats,
+        tool_manager: ToolManager,
+        agent_profile: AgentProfile | None,
+        session_metadata: SessionMetadata,
+    ) -> dict[str, Any]:
+        tools_available = [
+            {"type": "function", "function": fn.model_dump()}
+            for fn in tool_manager.available_tool_specs()
+        ]
+        system_prompt = (
+            messages[0].model_dump()
+            if messages and messages[0].role == Role.system
+            else None
+        )
+        last_message_fingerprint = (
+            self._message_fingerprint(non_system_messages[-1])
+            if non_system_messages
+            else None
+        )
+        metadata_dump = {
+            **session_metadata.model_dump(exclude={"launch_config"}),
+            "end_time": utc_now().isoformat(),
+            "stats": stats.model_dump(),
+            "total_messages": len(non_system_messages),
+            "last_message_fingerprint": last_message_fingerprint,
+            "tools_available": tools_available,
+            "agent_profile": (
+                {"name": agent_profile.name, "overrides": agent_profile.overrides}
+                if agent_profile is not None
+                else None
+            ),
+            "system_prompt": system_prompt,
+        }
+        if session_metadata.launch_config is not None:
+            metadata_dump["launch_config"] = session_metadata.launch_config.model_dump(
+                mode="json"
+            )
+        return metadata_dump
+
     def _save_interaction_sync(
         self,
         messages: list[LLMMessage],
@@ -600,7 +707,121 @@ class SessionLogger:  # noqa: PLR0904
         session_metadata: SessionMetadata,
         allow_empty: bool,
         launch_config_dirty: bool,
-    ) -> None:
+        cursor: _TranscriptCursor | None,
+        saves_since_verify: int,
+    ) -> tuple[_TranscriptCursor | None, int]:
+        non_system_messages = [
+            message for message in messages if message.role != Role.system
+        ]
+        if not non_system_messages and not allow_empty:
+            return cursor, saves_since_verify
+
+        if (
+            cursor is None
+            or allow_empty
+            or saves_since_verify + 1 >= TRANSCRIPT_VERIFY_INTERVAL
+        ):
+            verified_cursor = self._save_full_verify(
+                messages,
+                stats,
+                tool_manager,
+                agent_profile,
+                session_dir,
+                session_metadata,
+                launch_config_dirty,
+            )
+            return verified_cursor, 0
+
+        messages_path = session_dir / MESSAGES_FILENAME
+        try:
+            file_size = messages_path.stat().st_size
+        except OSError:
+            file_size = -1
+        if (
+            file_size != cursor.file_size
+            or cursor.count < 0
+            or len(non_system_messages) < cursor.count
+            or (cursor.count == 0 and cursor.boundary_digest is not None)
+        ):
+            verified_cursor = self._save_full_verify(
+                messages,
+                stats,
+                tool_manager,
+                agent_profile,
+                session_dir,
+                session_metadata,
+                launch_config_dirty,
+            )
+            return verified_cursor, 0
+
+        if cursor.count:
+            boundary_data = non_system_messages[cursor.count - 1].model_dump(
+                exclude_none=True, mode="json"
+            )
+            if (
+                cursor.boundary_digest is None
+                or self._transcript_line_digest(boundary_data) != cursor.boundary_digest
+            ):
+                verified_cursor = self._save_full_verify(
+                    messages,
+                    stats,
+                    tool_manager,
+                    agent_profile,
+                    session_dir,
+                    session_metadata,
+                    launch_config_dirty,
+                )
+                return verified_cursor, 0
+
+        tail = [
+            message.model_dump(exclude_none=True, mode="json")
+            for message in non_system_messages[cursor.count :]
+        ]
+        updated_cursor = cursor
+        try:
+            if tail:
+                file_size = SessionLogger._persist_messages_sync(tail, session_dir)
+                updated_cursor = _TranscriptCursor(
+                    count=len(non_system_messages),
+                    boundary_digest=self._transcript_line_digest(tail[-1]),
+                    file_size=file_size,
+                    metadata_published=False,
+                )
+
+            if tail or not (cursor.metadata_published and not launch_config_dirty):
+                metadata_dump = self._interaction_metadata_dump(
+                    messages,
+                    non_system_messages,
+                    stats,
+                    tool_manager,
+                    agent_profile,
+                    session_metadata,
+                )
+                SessionLogger._persist_metadata_sync(metadata_dump, session_dir)
+                updated_cursor = _TranscriptCursor(
+                    count=updated_cursor.count,
+                    boundary_digest=updated_cursor.boundary_digest,
+                    file_size=updated_cursor.file_size,
+                    metadata_published=True,
+                )
+            else:
+                return updated_cursor, saves_since_verify + 1
+        except Exception as e:
+            raise RuntimeError(f"Failed to save session to {session_dir}: {e}") from e
+        finally:
+            self.maybe_cleanup_tmp_files()
+        return updated_cursor, saves_since_verify + 1
+
+    def _save_full_verify(
+        self,
+        messages: list[LLMMessage],
+        stats: AgentStats,
+        tool_manager: ToolManager,
+        agent_profile: AgentProfile | None,
+        session_dir: Path,
+        session_metadata: SessionMetadata,
+        launch_config_dirty: bool,
+    ) -> _TranscriptCursor:
         # If the session directory does not exist, create it owner-only. The
         # mode applies to the leaf directory; mkdir(parents=True) does not
         # apply it to every ancestor. Existing directories retain their mode.
@@ -619,9 +840,6 @@ class SessionLogger:  # noqa: PLR0904
         )
 
         non_system_messages = [m for m in messages if m.role != Role.system]
-
-        if not non_system_messages and not allow_empty:
-            return
 
         if not transcript_valid and messages_path.exists():
             self._quarantine_corrupt_transcript(messages_path)
@@ -657,7 +875,7 @@ class SessionLogger:  # noqa: PLR0904
                     if non_system_messages
                     else None
                 ):
-                    return
+                    return self._cursor_for_messages(current_data, messages_path)
             except (OSError, json.JSONDecodeError):
                 pass
 
@@ -677,47 +895,20 @@ class SessionLogger:  # noqa: PLR0904
             ):
                 SessionLogger._overwrite_messages_sync(current_data, session_dir)
 
-            # If message update succeeded, write metadata. This is intentionally
-            tools_available = [
-                {"type": "function", "function": fn.model_dump()}
-                for fn in tool_manager.available_tool_specs()
-            ]
-
-            system_prompt = (
-                messages[0].model_dump()
-                if len(messages) > 0 and messages[0].role == Role.system
-                else None
+            metadata_dump = self._interaction_metadata_dump(
+                messages,
+                non_system_messages,
+                stats,
+                tool_manager,
+                agent_profile,
+                session_metadata,
             )
-            last_message_fingerprint = (
-                self._message_fingerprint(non_system_messages[-1])
-                if non_system_messages
-                else None
-            )
-
-            metadata_dump = {
-                **session_metadata.model_dump(exclude={"launch_config"}),
-                "end_time": utc_now().isoformat(),
-                "stats": stats.model_dump(),
-                "total_messages": len(non_system_messages),
-                "last_message_fingerprint": last_message_fingerprint,
-                "tools_available": tools_available,
-                "agent_profile": (
-                    {"name": agent_profile.name, "overrides": agent_profile.overrides}
-                    if agent_profile is not None
-                    else None
-                ),
-                "system_prompt": system_prompt,
-            }
-            if session_metadata.launch_config is not None:
-                metadata_dump["launch_config"] = (
-                    session_metadata.launch_config.model_dump(mode="json")
-                )
-
             SessionLogger._persist_metadata_sync(metadata_dump, session_dir)
         except Exception as e:
             raise RuntimeError(f"Failed to save session to {session_dir}: {e}") from e
         finally:
             self.maybe_cleanup_tmp_files()
+        return self._cursor_for_messages(current_data, messages_path)
 
     def install_launch_config(self, launch_config: LaunchMetadata) -> int:
         """Synchronously make an accepted envelope authoritative for later saves."""
@@ -897,6 +1088,8 @@ class SessionLogger:  # noqa: PLR0904
         self.session_dir = self.save_folder
         self.session_metadata = self._initialize_session_metadata()
         self._persisted = False
+        self._transcript_cursor = None
+        self._transcript_saves_since_verify = 0
         if parent_session_id is not None:
             self.session_metadata.parent_session_id = parent_session_id
 
@@ -923,6 +1116,8 @@ class SessionLogger:  # noqa: PLR0904
         self.session_metadata = metadata
         self._title = metadata.title
         self._persisted = True
+        self._transcript_cursor = None
+        self._transcript_saves_since_verify = 0
 
         if metadata.start_time:
             self.session_start_time = metadata.start_time

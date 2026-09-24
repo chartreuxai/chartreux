@@ -2906,6 +2906,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                                 ),
                             )
 
+                            if insertion_point < len(self.messages):
+                                # An interior insertion invalidates the cursor's
+                                # boundary proof, even if repeated records make the
+                                # shifted boundary slot look unchanged.
+                                self.session_logger.invalidate_transcript_cursor()
                             self.messages.insert(insertion_point, empty_response)
                             insertion_point += 1
 
