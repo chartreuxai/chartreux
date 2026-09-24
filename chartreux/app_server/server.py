@@ -92,6 +92,7 @@ from chartreux.app_server.protocol import (
     redact_validation_path,
     validate_callback_acknowledgement,
     validate_json_rpc_envelope,
+    validate_notification_method,
 )
 from chartreux.app_server.transport import JsonRpcTransport
 from chartreux.core.config.harness_files import HarnessFilesManager
@@ -1189,6 +1190,7 @@ class AppServer:
             pending.future.set_result(result)
 
     async def _notify(self, method: str, params: ProtocolModel) -> None:
+        validate_notification_method(method, params)
         params = self._sequence_notification(params)
         root = self._root
         if root is not None and await root.publish_notification(method, params):
@@ -1196,6 +1198,7 @@ class AppServer:
         await self._route_notification(method, params)
 
     async def _route_notification(self, method: str, params: ProtocolModel) -> None:
+        validate_notification_method(method, params)
         if (
             method in self._client_capabilities.disabled_notifications
             and not isinstance(params, EventNotificationParams)

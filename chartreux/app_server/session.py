@@ -29,6 +29,7 @@ from chartreux.app_server.events import (
     SessionUpdated,
     StatsUpdated,
     TurnCompleted,
+    UnknownNotificationError,
     parse_server_event,
     reconcile_snapshot,
 )
@@ -177,6 +178,7 @@ class AppServerSession:  # noqa: PLR0904
             maxsize=_EVENT_QUEUE_MAX_SIZE
         )
         self._message_task: asyncio.Task[None] | None = None
+        self._dropped_notification_methods: set[str] = set()
         self._closing = False
         self._client_tool_handler = client_tool_handler
         self._client_request_tasks: set[asyncio.Task[None]] = set()
@@ -826,6 +828,14 @@ class AppServerSession:  # noqa: PLR0904
             return
         try:
             event = self._state.projection.consume(notification)
+        except UnknownNotificationError:
+            if notification.method not in self._dropped_notification_methods:
+                self._dropped_notification_methods.add(notification.method)
+                logger.warning(
+                    "Dropping unknown app-server notification method %s",
+                    notification.method,
+                )
+            return
         except EventSequenceError:
             await self._resync(client)
             return

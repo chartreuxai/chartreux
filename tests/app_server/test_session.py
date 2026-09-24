@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
 import json
+import logging
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -33,6 +34,7 @@ from chartreux.app_server.events import (
     HistoryEntryAdded,
     HistoryEntryUpdated,
     SessionSnapshot,
+    SessionUpdated,
     StatsUpdated,
     TurnCompleted,
     TurnQueueUpdated,
@@ -2084,6 +2086,101 @@ async def test_tool_execution_has_no_approval_callback() -> None:
         entry for entry in session.history if isinstance(entry, PublicEffectEntry)
     )
     assert isinstance(effect.state, CompletedEffectState)
+
+
+@pytest.mark.asyncio
+async def test_unknown_notification_does_not_interrupt_pump_or_in_flight_rpc(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent_loop = build_test_agent_loop()
+    client_transport, server_transport = memory_transport_pair()
+    server = build_test_app_server(agent_loop, server_transport)
+    client = AppServerClient(client_transport, run_peer=server.serve)
+    client_info = ClientInfo(name="unknown-notification-test", version="1")
+    await client.initialize(client_info)
+    await client.notify("initialized")
+    session = await AppServerSession.open(
+        client, client_info=client_info, capabilities=ClientCapabilities()
+    )
+    request_entered = asyncio.Event()
+    release_request = asyncio.Event()
+    original_dispatch = server._dispatch_request
+
+    async def delay_read(method: str, raw_params: dict[str, Any]):
+        if method == "session/read":
+            request_entered.set()
+            await release_request.wait()
+        return await original_dispatch(method, raw_params)
+
+    monkeypatch.setattr(server, "_dispatch_request", delay_read)
+    stream = session.events()
+    projected_event = asyncio.create_task(_next_event(stream, SessionUpdated))
+    in_flight = asyncio.create_task(
+        client.request("session/read", SessionReadParams(session_id=session.session_id))
+    )
+    try:
+        await asyncio.wait_for(request_entered.wait(), timeout=1)
+        unknown = {
+            "jsonrpc": "2.0",
+            "method": "future/resourceUpdated",
+            "params": {"revision": 1},
+        }
+        with caplog.at_level(logging.WARNING, logger="vibe"):
+            await server_transport.send(unknown)
+            await server_transport.send(unknown)
+            async with asyncio.timeout(1):
+                while (
+                    "future/resourceUpdated"
+                    not in session._dropped_notification_methods
+                ):
+                    await asyncio.sleep(0)
+
+            assert not in_flight.done()
+            current_client = session._connection.current
+            assert current_client is client
+            event_id = session._state.projection.last_event_id + 1
+            await server_transport.send({
+                "jsonrpc": "2.0",
+                "method": "session/updated",
+                "params": {
+                    "eventId": event_id,
+                    "sessionId": session.session_id,
+                    "patch": [
+                        {
+                            "op": "replace",
+                            "path": "/title",
+                            "value": "known event survived",
+                        }
+                    ],
+                    "emittedAt": 1,
+                },
+            })
+            event = await asyncio.wait_for(projected_event, timeout=1)
+
+        assert event.session.title == "known event survived"
+        assert session._connection.current is client
+        assert (
+            sum(
+                "Dropping unknown app-server notification method future/resourceUpdated"
+                in record.message
+                for record in caplog.records
+            )
+            == 1
+        )
+
+        release_request.set()
+        response = await asyncio.wait_for(in_flight, timeout=1)
+        assert response["state"]["session"]["id"] == session.session_id
+    finally:
+        release_request.set()
+        if not projected_event.done():
+            projected_event.cancel()
+        if not in_flight.done():
+            in_flight.cancel()
+        await asyncio.gather(projected_event, in_flight, return_exceptions=True)
+        await stream.aclose()
+        await session.close()
+        await agent_loop.aclose()
 
 
 @pytest.mark.asyncio

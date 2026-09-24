@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import StrEnum, auto
 from functools import cache
-from typing import Annotated, Any, Literal, Protocol, Self, get_origin
+from typing import Annotated, Any, ClassVar, Literal, Protocol, Self, get_origin
 
 from pydantic import (
     Field,
@@ -970,21 +970,29 @@ class RuntimeMutationResponse(ProtocolModel):
 
 
 class RuntimeUpdatedParams(ProtocolModel):
+    NOTIFICATION_METHOD: ClassVar[str] = "runtime/updated"
+
     session_id: str
     runtime: RuntimeSnapshot
 
 
 class TurnRetryingParams(ProtocolModel):
+    NOTIFICATION_METHOD: ClassVar[str] = "turn/retrying"
+
     session_id: str
     category: PublicRetryCategory
     detail: str
 
 
 class ServerWarningParams(ProtocolModel):
+    NOTIFICATION_METHOD: ClassVar[str] = "warning"
+
     warning: PublicError
 
 
 class ServerErrorParams(ProtocolModel):
+    NOTIFICATION_METHOD: ClassVar[str] = "error"
+
     error: PublicError
 
 
@@ -1189,11 +1197,15 @@ class MCPLoginParams(ProtocolModel):
 
 
 class MCPAuthUrlParams(ProtocolModel):
+    NOTIFICATION_METHOD: ClassVar[str] = "mcp_catalog/authUrl"
+
     name: str
     url: str
 
 
 class MCPAuthRequiredParams(ProtocolModel):
+    NOTIFICATION_METHOD: ClassVar[str] = "mcp_catalog/authRequired"
+
     session_id: str
     name: str
     descriptor_revision: str
@@ -1622,17 +1634,23 @@ class EventNotificationParams(ProtocolModel):
 
 
 class HistoryEntryAddedParams(EventNotificationParams):
+    NOTIFICATION_METHOD: ClassVar[str] = "history/entryAdded"
+
     turn_id: str | None = None
     entry: PublicHistoryEntry
 
 
 class HistoryEntryUpdatedParams(EventNotificationParams):
+    NOTIFICATION_METHOD: ClassVar[str] = "history/entryUpdated"
+
     turn_id: str | None = None
     entry_id: str
     patch: list[JsonPatchOperation]
 
 
 class SessionSnapshotParams(EventNotificationParams):
+    NOTIFICATION_METHOD: ClassVar[str] = "session/snapshot"
+
     state: PublicSessionState
 
 
@@ -1643,26 +1661,38 @@ class SessionHandoffParams(EventNotificationParams):
 
 
 class SessionCompactedParams(SessionHandoffParams):
+    NOTIFICATION_METHOD: ClassVar[str] = "session/compacted"
+
     summary_length: int = Field(ge=0)
 
 
 class SessionContextClearedParams(SessionHandoffParams):
+    NOTIFICATION_METHOD: ClassVar[str] = "session/contextCleared"
+
     plan_file_path: str | None = None
 
 
 class SessionUpdatedParams(EventNotificationParams):
+    NOTIFICATION_METHOD: ClassVar[str] = "session/updated"
+
     patch: list[JsonPatchOperation]
 
 
 class TurnQueueUpdatedParams(EventNotificationParams):
+    NOTIFICATION_METHOD: ClassVar[str] = "turn_queue_updated"
+
     queue: PublicTurnQueue
 
 
 class TurnStartedParams(EventNotificationParams):
+    NOTIFICATION_METHOD: ClassVar[str] = "turn/started"
+
     turn: PublicTurn
 
 
 class TurnCompletedParams(EventNotificationParams):
+    NOTIFICATION_METHOD: ClassVar[str] = "turn/completed"
+
     turn: PublicTurn
 
 
@@ -1694,11 +1724,15 @@ class AgentEvictionModel(ProtocolModel):
 
 
 class AgentsUpdateParams(EventNotificationParams):
+    NOTIFICATION_METHOD: ClassVar[str] = "agents/update"
+
     agents: list[AgentSummaryModel]
     evictions: list[AgentEvictionModel] = Field(default_factory=list)
 
 
 class StatsUpdatedParams(EventNotificationParams):
+    NOTIFICATION_METHOD: ClassVar[str] = "session/statsUpdated"
+
     stats: AgentStatsSnapshot
     context_window: int
 
@@ -1894,3 +1928,40 @@ def validate_callback_acknowledgement(
     if callback_id != response.callback_id:
         raise ValueError("Callback acknowledgement does not match the request")
     return response
+
+
+def server_notification_registry() -> dict[str, type[ProtocolModel]]:
+    """Return every app-server notification method declared by its params model."""
+    registry: dict[str, type[ProtocolModel]] = {}
+    pending = list(ProtocolModel.__subclasses__())
+    while pending:
+        model = pending.pop()
+        pending.extend(model.__subclasses__())
+        if not model.__module__.startswith("chartreux.app_server"):
+            continue
+        method = model.__dict__.get("NOTIFICATION_METHOD")
+        if not isinstance(method, str):
+            continue
+        if existing := registry.get(method):
+            raise RuntimeError(
+                f"Duplicate notification method {method!r}: "
+                f"{existing.__name__} and {model.__name__}"
+            )
+        registry[method] = model
+    return registry
+
+
+def validate_notification_method(method: str, params: ProtocolModel) -> None:
+    """Require a notification's method to be declared by its params model."""
+    declared_method = getattr(type(params), "NOTIFICATION_METHOD", None)
+    if not isinstance(declared_method, str):
+        raise ValueError(
+            f"Notification method {method!r} does not match "
+            f"{type(params).__name__}.undeclared"
+        )
+    registered_model = server_notification_registry().get(declared_method)
+    if registered_model is not type(params) or declared_method != method:
+        raise ValueError(
+            f"Notification method {method!r} does not match "
+            f"{type(params).__name__}.{declared_method}"
+        )
