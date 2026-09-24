@@ -259,6 +259,13 @@ class ToolGroup(Vertical):
         if indicator := self._timeline_status.indicator:
             self.settle_indicator(indicator)
 
+    def forget_effect(self, timeline_index: int) -> None:
+        """Forget an effect removed from the retained transcript window."""
+        self._timeline_status.forget_effect(timeline_index)
+        self.settle_indicator(self._timeline_status.indicator or GroupIndicator.SUCCESS)
+        if not self._header._is_spinning:
+            self._header.stop_spinning()
+
     def failure_is_muted(self, timeline_index: int) -> bool:
         """Whether this call's error is resolved by a later successful call."""
         return self._timeline_status.failure_is_muted(timeline_index)

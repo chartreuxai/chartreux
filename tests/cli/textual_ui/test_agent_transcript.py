@@ -33,6 +33,7 @@ from chartreux.cli.textual_ui.widgets.messages import (
     ReasoningMessage,
     UserMessage,
 )
+from chartreux.cli.textual_ui.widgets.tool_grouping import GroupIndicator
 from chartreux.cli.textual_ui.widgets.tools import (
     ToolCallMessage,
     ToolGroup,
@@ -583,6 +584,97 @@ async def test_page_up_at_mount_cap_keeps_older_entries_mounted(
         assert [
             message.history_entry_id for message in app.viewer.query(UserMessage)
         ] == (mounted_ids)
+
+
+@pytest.mark.asyncio
+async def test_live_poll_at_mount_cap_keeps_new_assistant_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chartreux.cli.textual_ui.widgets import agent_transcript
+
+    monkeypatch.setattr(agent_transcript, "MAX_MOUNTED_TRANSCRIPT_ENTRIES", 2)
+    source = _FakeSource()
+    app = _ViewerApp(source, live=True, page_size=10)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        first = _entry("entry-0", "text 0", created_at=0)
+        second = _entry("entry-1", "text 1", created_at=1)
+        source.respond(0, _available(first, second))
+        await pilot.pause()
+
+        app.viewer._append_live_output()
+        await pilot.pause()
+        assistant = _entry(
+            "assistant-final",
+            "The final answer.",
+            kind=AgentTranscriptEntryKind.ASSISTANT_TEXT,
+            created_at=2,
+        )
+        source.respond(1, _available(first, second, assistant))
+        await pilot.pause()
+
+        assert [unit.entry_ids[0] for unit in app.viewer._units] == [
+            "entry-1",
+            "assistant-final",
+        ]
+        assert app.viewer.query_one(AssistantMessage).get_content() == (
+            "The final answer."
+        )
+        assert "assistant-final" in app.viewer._known_entries
+
+
+@pytest.mark.asyncio
+async def test_page_up_cap_eviction_recomputes_group_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chartreux.cli.textual_ui.widgets import agent_transcript
+
+    monkeypatch.setattr(agent_transcript, "MAX_MOUNTED_TRANSCRIPT_ENTRIES", 3)
+    source = _FakeSource()
+    app = _ViewerApp(source, page_size=3, tools_collapsed=False)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        first = _entry(
+            "effect-1", "{}", kind=AgentTranscriptEntryKind.TOOL_CALL, created_at=1
+        )
+        second = _entry(
+            "effect-2", "{}", kind=AgentTranscriptEntryKind.TOOL_CALL, created_at=2
+        )
+        failed_newest = _entry(
+            "effect-3", "{}", kind=AgentTranscriptEntryKind.TOOL_CALL, created_at=3
+        ).model_copy(
+            update={
+                "status": AgentTranscriptToolStatus.FAILED,
+                "state": FailedEffectState(
+                    error={"message": "failed"},  # type: ignore[arg-type]
+                    display=EffectResultDisplay(
+                        success=False, verb="Read", message="failed"
+                    ),
+                ),
+            }
+        )
+        source.respond(
+            0,
+            _available(
+                first, second, failed_newest, cursor="before-effect-1", has_more=True
+            ),
+        )
+        await pilot.pause()
+        group = app.viewer.query_one(ToolGroup)
+        assert group.header._last_state.value == GroupIndicator.ERROR.value
+
+        app.viewer.action_older_page()
+        await pilot.pause()
+        oldest = _entry(
+            "effect-0", "{}", kind=AgentTranscriptEntryKind.TOOL_CALL, created_at=0
+        )
+        source.respond(1, _available(oldest, cursor="before-effect-0"))
+        await pilot.pause()
+
+        assert app.viewer.query_one(ToolGroup) is group
+        assert app.viewer._units[0].entry_ids == ["effect-0", "effect-1", "effect-2"]
+        assert group._timeline_status.indicator is GroupIndicator.SUCCESS
+        assert group.header._last_state.value == GroupIndicator.SUCCESS.value
 
 
 @pytest.mark.asyncio

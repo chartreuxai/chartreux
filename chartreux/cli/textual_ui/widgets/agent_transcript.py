@@ -369,7 +369,8 @@ class AgentTranscriptViewer(Vertical):
         elif not self._units and (has_entries or replace):
             await self._show_status("Saved transcript is empty.")
         await self._enforce_mount_cap(
-            prefer_newest=before is not None or (timeline_insert and not replace)
+            preserve_entry_ids={entry.entry_id for entry in batch_entries},
+            evict_newest=before is not None,
         )
         self._scroll_to_newest_if_needed()
 
@@ -893,29 +894,65 @@ class AgentTranscriptViewer(Vertical):
         self._units[position : position + 1] = replacement
         self._reindex_mounted_entries()
 
-    async def _enforce_mount_cap(self, *, prefer_newest: bool = False) -> None:
+    async def _enforce_mount_cap(
+        self, *, preserve_entry_ids: set[str] | None = None, evict_newest: bool = False
+    ) -> None:
+        preserved_ids = preserve_entry_ids or set()
         mounted_count = sum(len(unit.entry_ids) for unit in self._units)
         while mounted_count > MAX_MOUNTED_TRANSCRIPT_ENTRIES and self._units:
-            unit_index = -1 if prefer_newest else 0
-            unit = self._units[unit_index]
             excess = mounted_count - MAX_MOUNTED_TRANSCRIPT_ENTRIES
-            if unit.group is not None and len(unit.entry_ids) > excess:
-                removed_ids = (
-                    unit.entry_ids[-excess:]
-                    if prefer_newest
-                    else unit.entry_ids[:excess]
-                )
+            unit_indices = (
+                range(len(self._units) - 1, -1, -1)
+                if evict_newest
+                else range(len(self._units))
+            )
+            eviction: tuple[int, list[str]] | None = None
+            for preserve in (True, False):
+                for unit_index in unit_indices:
+                    unit = self._units[unit_index]
+                    entry_ids = (
+                        reversed(unit.entry_ids) if evict_newest else unit.entry_ids
+                    )
+                    removable = [
+                        entry_id
+                        for entry_id in entry_ids
+                        if not preserve or entry_id not in preserved_ids
+                    ]
+                    if removable:
+                        eviction = (unit_index, removable[:excess])
+                        break
+                if eviction is not None:
+                    break
+            if eviction is None:
+                break
+
+            unit_index, removed_ids = eviction
+            unit = self._units[unit_index]
+            if len(unit.entry_ids) > len(removed_ids):
                 for entry_id in removed_ids:
+                    history_entry = unit.entries.pop(entry_id, None)
+                    if unit.group is not None and isinstance(
+                        history_entry, PublicEffectEntry
+                    ):
+                        unit.group.forget_effect(history_entry.created_at)
                     for widget in unit.entry_widgets.pop(entry_id, []):
                         await widget.remove()
-                    unit.entries.pop(entry_id, None)
                     self._entry_units.pop(entry_id, None)
-                if prefer_newest:
-                    del unit.entry_ids[-excess:]
-                else:
-                    del unit.entry_ids[:excess]
-                mounted_count -= excess
+                removed_id_set = set(removed_ids)
+                unit.entry_ids = [
+                    entry_id
+                    for entry_id in unit.entry_ids
+                    if entry_id not in removed_id_set
+                ]
+                if unit.group is None:
+                    unit.widgets = [
+                        widget
+                        for entry_id in unit.entry_ids
+                        for widget in unit.entry_widgets[entry_id]
+                    ]
+                mounted_count -= len(removed_ids)
                 continue
+
             self._units.pop(unit_index)
             for entry_id in unit.entry_ids:
                 self._entry_units.pop(entry_id, None)

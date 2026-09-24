@@ -2299,6 +2299,12 @@ async def test_malformed_runtime_update_resynchronizes(
     original_resync = session._resync
     resynced = asyncio.Event()
     reconnect = AsyncMock(return_value=False)
+    await agent_loop.config_orchestrator.set_field(
+        "/theme",
+        "server-runtime-after-malformed-update",
+        target_layer=OverridesLayer.NAME,
+    )
+    cached_theme = session.resources.config.current.theme
 
     async def tracked_resync(resync_client) -> None:
         await original_resync(resync_client)
@@ -2315,10 +2321,107 @@ async def test_malformed_runtime_update_resynchronizes(
             "params": {},
         })
         await asyncio.wait_for(resynced.wait(), timeout=1)
+        async with asyncio.timeout(1):
+            while (
+                session.resources.config.current.theme
+                != "server-runtime-after-malformed-update"
+            ):
+                await asyncio.sleep(0)
 
+        assert cached_theme != session.resources.config.current.theme
         assert session._state.projection.last_event_id == expected_event_id
         assert session._connection.current is client
         reconnect.assert_not_awaited()
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_malformed_notification_coalesced_resync_runs_after_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = build_test_agent_loop()
+    session, _client, server_transport, server = await _open_wire_notification_session(
+        agent_loop
+    )
+    now = [10.0]
+    read_count = 0
+    original_dispatch = server._dispatch_request
+    sleep_delays: list[float] = []
+
+    async def count_reads(method: str, raw_params: dict[str, Any]):
+        nonlocal read_count
+        if method == "session/read":
+            read_count += 1
+        return await original_dispatch(method, raw_params)
+
+    async def advance_clock(delay: float) -> None:
+        sleep_delays.append(delay)
+        now[0] += delay
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(server, "_dispatch_request", count_reads)
+    session._resync_clock = lambda: now[0]
+    session._resync_sleep = advance_clock
+
+    async def send_malformed() -> None:
+        await server_transport.send({
+            "jsonrpc": "2.0",
+            "method": "session/updated",
+            "params": {
+                "eventId": 1,
+                "sessionId": session.session_id,
+                "patch": "not-a-patch-list",
+                "emittedAt": 1,
+            },
+        })
+
+    try:
+        await send_malformed()
+        async with asyncio.timeout(1):
+            while read_count < 1 or session._resync_in_flight:
+                await asyncio.sleep(0)
+
+        now[0] += 0.1
+        await send_malformed()
+        async with asyncio.timeout(1):
+            while read_count < 2 or session._resync_in_flight:
+                await asyncio.sleep(0)
+
+        assert sleep_delays == pytest.approx([0.4])
+        assert session._resync_pending is False
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_malformed_notification_log_does_not_include_payload_value(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    agent_loop = build_test_agent_loop()
+    session, _client, server_transport, _server = await _open_wire_notification_session(
+        agent_loop
+    )
+    sentinel = "private-notification-sentinel"
+    try:
+        with caplog.at_level(logging.WARNING, logger="vibe"):
+            await server_transport.send({
+                "jsonrpc": "2.0",
+                "method": "warning",
+                "params": {"warning": sentinel},
+            })
+            async with asyncio.timeout(1):
+                while not any(
+                    "Dropping malformed app-server notification method warning"
+                    in record.message
+                    for record in caplog.records
+                ):
+                    await asyncio.sleep(0)
+
+        assert all(sentinel not in record.message for record in caplog.records)
+        assert all(sentinel not in str(record.args) for record in caplog.records)
     finally:
         await session.close()
         await agent_loop.aclose()
@@ -2510,6 +2613,44 @@ async def test_unknown_notification_does_not_interrupt_pump_or_in_flight_rpc(
 
 
 @pytest.mark.asyncio
+async def test_pump_read_failures_use_increasing_reconnect_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = build_test_agent_loop()
+    session, _server = await _create_reconnectable_session_with_server(agent_loop)
+    existing_pump = session._message_task
+    if existing_pump is not None:
+        existing_pump.cancel()
+        await asyncio.gather(existing_pump, return_exceptions=True)
+    session._message_task = None
+    client = session._connection.current
+    assert client is not None
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async def read_failure(_client) -> Exception:
+        return RuntimeError("read failed")
+
+    reconnect = AsyncMock(side_effect=[True, True, False])
+    monkeypatch.setattr(session, "_reconnect_sleep", record_sleep)
+    monkeypatch.setattr(session, "_receive_messages", read_failure)
+    monkeypatch.setattr(session._connection, "reconnect", reconnect)
+    monkeypatch.setattr(session, "_attach_with_backoff", AsyncMock(return_value=client))
+
+    try:
+        session._message_task = asyncio.create_task(session._pump_messages())
+        await asyncio.wait_for(session._message_task, timeout=1)
+
+        assert delays == [0.25, 0.5, 1.0]
+        assert reconnect.await_count == 3
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_reconnect_backoff_is_bounded_and_close_interrupts_wait() -> None:
     agent_loop = build_test_agent_loop()
     session, server = await _create_reconnectable_session_with_server(agent_loop)
@@ -2577,6 +2718,9 @@ async def test_event_stream_recovers_after_attach_failure() -> None:
         delay, gate = await asyncio.wait_for(sleeps.get(), timeout=1)
         assert delay == 0.25
         gate.set()
+        delay, gate = await asyncio.wait_for(sleeps.get(), timeout=1)
+        assert delay == 0.5
+        gate.set()
 
         event = await asyncio.wait_for(next_event, timeout=1)
         assert isinstance(event, SessionSnapshot)
@@ -2593,7 +2737,7 @@ async def test_event_stream_recovers_after_attach_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reconnect_backoff_resets_after_successful_attach() -> None:
+async def test_reconnect_backoff_resets_after_successful_message_flow() -> None:
     agent_loop = build_test_agent_loop()
     session, server = await _create_reconnectable_session_with_server(agent_loop)
     sleeps: asyncio.Queue[tuple[float, asyncio.Event]] = asyncio.Queue()
@@ -2628,15 +2772,31 @@ async def test_reconnect_backoff_resets_after_successful_attach() -> None:
         delay, gate = await asyncio.wait_for(sleeps.get(), timeout=1)
         assert delay == 0.5
         gate.set()
+        delay, gate = await asyncio.wait_for(sleeps.get(), timeout=1)
+        assert delay == 1.0
+        gate.set()
 
         event = await asyncio.wait_for(next_event, timeout=1)
         assert isinstance(event, SessionSnapshot)
         recovered_client = session._connection.current
         assert recovered_client is not None
+        root = server._root
+        assert root is not None
+        await server._notify("runtime/updated", root.runtime_updated_params())
+        async with asyncio.timeout(1):
+            while (
+                session._reconnect_backoff_seconds != 0.25
+                or session._message_task is None
+            ):
+                await asyncio.sleep(0)
         await recovered_client.close()
 
-        delay, _gate = await asyncio.wait_for(sleeps.get(), timeout=1)
+        delay, gate = await asyncio.wait_for(sleeps.get(), timeout=1)
         assert delay == 0.25
+        gate.set()
+        async with asyncio.timeout(1):
+            while resume_calls < 4:
+                await asyncio.sleep(0)
         assert resume_calls == 4
     finally:
         if not next_event.done():

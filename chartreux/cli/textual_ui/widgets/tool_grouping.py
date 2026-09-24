@@ -156,6 +156,10 @@ class TimelineStatus:
         else:
             self._settled.pop(timeline_index, None)
 
+    def forget_effect(self, timeline_index: int) -> None:
+        """Remove an outcome whose timeline entry is no longer retained."""
+        self._settled.pop(timeline_index, None)
+
     @property
     def indicator(self) -> GroupIndicator | None:
         """The latest terminal call's indicator, or ``None`` while none settled."""

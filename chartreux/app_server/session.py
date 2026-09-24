@@ -183,7 +183,11 @@ class AppServerSession:  # noqa: PLR0904
         )
         self._message_task: asyncio.Task[None] | None = None
         self._reconnect_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+        self._reconnect_backoff_seconds = _RECONNECT_BACKOFF_INITIAL_SECONDS
         self._resync_clock: Callable[[], float] = time.monotonic
+        self._resync_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+        self._deferred_resync_task: asyncio.Task[None] | None = None
+        self._resync_pending = False
         self._pump_stop = asyncio.Event()
         self._dropped_notification_methods: set[str] = set()
         self._unknown_notification_warnings_suppressed = False
@@ -762,6 +766,10 @@ class AppServerSession:  # noqa: PLR0904
     async def close(self) -> None:
         self._closing = True
         self._pump_stop.set()
+        if self._deferred_resync_task is not None:
+            self._deferred_resync_task.cancel()
+            await asyncio.gather(self._deferred_resync_task, return_exceptions=True)
+            self._deferred_resync_task = None
         client = self._connection.current
         if client is not None:
             with suppress(Exception):
@@ -805,6 +813,12 @@ class AppServerSession:  # noqa: PLR0904
                 if self._closing:
                     self._close_event_streams(error)
                     return
+                if not await self._wait_for_reconnect(self._reconnect_backoff_seconds):
+                    self._close_event_streams()
+                    break
+                self._reconnect_backoff_seconds = min(
+                    self._reconnect_backoff_seconds * 2, _RECONNECT_BACKOFF_MAX_SECONDS
+                )
                 if not await self._connection.reconnect(client):
                     self._close_event_streams(error)
                     return
@@ -822,7 +836,6 @@ class AppServerSession:  # noqa: PLR0904
                 self._message_task = None
 
     async def _attach_with_backoff(self) -> AppServerClient | None:
-        backoff = _RECONNECT_BACKOFF_INITIAL_SECONDS
         while not self._closing:
             client = self._connection.current
             if client is None:
@@ -839,10 +852,12 @@ class AppServerSession:  # noqa: PLR0904
                     "App-server client attach failed; retrying",
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
-                if not await self._wait_for_reconnect(backoff):
+                if not await self._wait_for_reconnect(self._reconnect_backoff_seconds):
                     self._close_event_streams()
                     return None
-                backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX_SECONDS)
+                self._reconnect_backoff_seconds = min(
+                    self._reconnect_backoff_seconds * 2, _RECONNECT_BACKOFF_MAX_SECONDS
+                )
                 if not await self._connection.reconnect(client, preserve_attached=True):
                     self._close_event_streams(exc)
                     return None
@@ -856,13 +871,22 @@ class AppServerSession:  # noqa: PLR0904
                 match message:
                     case Notification():
                         await self._handle_notification(client, message)
+                        self._reconnect_backoff_seconds = (
+                            _RECONNECT_BACKOFF_INITIAL_SECONDS
+                        )
                     case ServerRequest():
                         if message.method == "callback/call":
                             await self._handle_request(message)
+                            self._reconnect_backoff_seconds = (
+                                _RECONNECT_BACKOFF_INITIAL_SECONDS
+                            )
                             continue
                         task = asyncio.create_task(self._handle_request(message))
                         self._client_request_tasks.add(task)
                         task.add_done_callback(self._client_request_finished)
+                        self._reconnect_backoff_seconds = (
+                            _RECONNECT_BACKOFF_INITIAL_SECONDS
+                        )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -952,14 +976,14 @@ class AppServerSession:  # noqa: PLR0904
         try:
             if await self.resources.consume_notification(notification):
                 return True
-        except ValidationError as exc:
+        except ValidationError:
             if notification.method == "runtime/updated":
                 await self._resync(client)
+                await self.resources.runtime.refresh()
             elif notification.method == "mcp_catalog/authUrl":
                 logger.warning(
-                    "Dropping malformed app-server notification method %s: %s",
+                    "Dropping malformed app-server notification method %s",
                     notification.method,
-                    exc,
                 )
             else:
                 # Both resources return False for unhandled methods, so this is defensive.
@@ -968,7 +992,7 @@ class AppServerSession:  # noqa: PLR0904
 
         try:
             server_event = parse_server_event(notification)
-        except ValidationError as exc:
+        except ValidationError:
             if notification.method not in {
                 "warning",
                 "error",
@@ -977,9 +1001,8 @@ class AppServerSession:  # noqa: PLR0904
             }:
                 raise
             logger.warning(
-                "Dropping malformed app-server notification method %s: %s",
+                "Dropping malformed app-server notification method %s",
                 notification.method,
-                exc,
             )
             return True
         if server_event is None:
@@ -991,11 +1014,16 @@ class AppServerSession:  # noqa: PLR0904
         now = self._resync_clock()
         # The pump processes notifications sequentially; the in-flight flag is
         # defensive, while the 0.5s post-completion window does the coalescing.
-        if self._resync_in_flight or (
+        if self._resync_in_flight:
+            return
+        if (
             self._last_resync_completed_at is not None
             and now - self._last_resync_completed_at < _RESYNC_COALESCE_WINDOW_SECONDS
         ):
+            self._resync_pending = True
+            self._schedule_deferred_resync(client)
             return
+        self._resync_pending = False
         self._resync_in_flight = True
         try:
             await self._read_resync_snapshot(client)
@@ -1004,6 +1032,51 @@ class AppServerSession:  # noqa: PLR0904
             raise
         self._resync_in_flight = False
         self._last_resync_completed_at = self._resync_clock()
+        if self._resync_pending:
+            self._schedule_deferred_resync(client)
+
+    def _schedule_deferred_resync(self, client: AppServerClient) -> None:
+        task = self._deferred_resync_task
+        if task is None or task.done():
+            self._deferred_resync_task = asyncio.create_task(
+                self._retry_pending_resync(client)
+            )
+
+    async def _retry_pending_resync(self, client: AppServerClient) -> None:
+        try:
+            while self._resync_pending and not self._closing:
+                last_completed = self._last_resync_completed_at
+                delay = (
+                    max(
+                        0.0,
+                        last_completed
+                        + _RESYNC_COALESCE_WINDOW_SECONDS
+                        - self._resync_clock(),
+                    )
+                    if last_completed is not None
+                    else 0.0
+                )
+                if delay > 0:
+                    await self._resync_sleep(delay)
+                    continue
+                if self._resync_in_flight:
+                    await self._resync_sleep(_RESYNC_COALESCE_WINDOW_SECONDS)
+                    continue
+                current_client = self._connection.current or client
+                try:
+                    await self._resync(current_client)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug(
+                        "Deferred app-server notification resync failed; reconnecting"
+                    )
+                    if not self._closing:
+                        await current_client.close()
+                    return
+        finally:
+            if self._deferred_resync_task is asyncio.current_task():
+                self._deferred_resync_task = None
 
     async def _read_resync_snapshot(self, client: AppServerClient) -> None:
         generation = self._state.projection.generation

@@ -47,6 +47,8 @@ def _session_for_close(client: _EofClient) -> AppServerSession:
     session._connection = _Connection(client)  # type: ignore[assignment]
     session._closing = False
     session._message_task = None
+    session._reconnect_sleep = asyncio.sleep
+    session._reconnect_backoff_seconds = 0.25
     session._pump_stop = asyncio.Event()
     session._events = asyncio.Queue()
     session._unsolicited_events = asyncio.Queue()
