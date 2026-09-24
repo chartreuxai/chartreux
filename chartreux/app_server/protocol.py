@@ -40,6 +40,8 @@ from chartreux.app_server.models import (
     ConfigIssue,
     ContentBlock,
     DebugLogPage,
+    EffectDetail,
+    EffectState,
     IdentityView,
     JsonPatchOperation,
     MCPState,
@@ -47,6 +49,7 @@ from chartreux.app_server.models import (
     MessageAnnotations as MessageAnnotations,
     PreparedPrompt,
     PublicCallbackEntry,
+    PublicEntryGenerationStatus,
     PublicError,
     PublicHistoryEntry,
     PublicRetryCategory,
@@ -81,6 +84,10 @@ from chartreux.app_server.review import (
     ReviewTarget,
 )
 from chartreux.utils.mcp import MCPAddTransport
+from chartreux.utils.tool_presentation import (
+    ToolCallPresentation,
+    ToolResultPresentation,
+)
 
 SERVER_METHODS: tuple[str, ...] = (
     "agent/transcript/get",
@@ -507,8 +514,16 @@ MAX_AGENT_TRANSCRIPT_DISPLAY_TEXT_LENGTH = 8 * 1024
 class AgentTranscriptEntryKind(StrEnum):
     USER_TEXT = "user_text"
     ASSISTANT_TEXT = "assistant_text"
+    REASONING = "reasoning"
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
+
+
+class AgentTranscriptToolStatus(StrEnum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class AgentTranscriptTruncation(StrEnum):
@@ -516,34 +531,90 @@ class AgentTranscriptTruncation(StrEnum):
 
 
 class AgentTranscriptEntry(ProtocolModel):
-    """One chronological, text-only entry in an agent transcript viewer page."""
+    """One chronological, widget-ready projection entry.
+
+    ``created_at`` and ``updated_at`` are synthetic transcript-order ordinals,
+    not wall-clock timestamps: stored LLM messages do not record entry times.
+    ``generation_status`` is synthesized as completed because LLM messages have
+    no lifecycle marker. ``title`` is a synthesized role/tool label. ``digest``
+    is the content-revision hash used by paging; tool-call digests include their
+    matched result because it contributes to the projected effect state.
+    Attachment metadata includes names and counts only, never image sources.
+    """
 
     entry_id: str = Field(min_length=1, max_length=MAX_AGENT_TRANSCRIPT_ID_LENGTH)
     kind: AgentTranscriptEntryKind
     display_text: str = Field(max_length=MAX_AGENT_TRANSCRIPT_DISPLAY_TEXT_LENGTH)
+    digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    created_at: int = Field(ge=0)
+    updated_at: int = Field(ge=0)
+    generation_status: PublicEntryGenerationStatus
+    title: str = Field(max_length=MAX_AGENT_TRANSCRIPT_ID_LENGTH)
     tool_name: str | None = Field(
-        default=None, max_length=MAX_AGENT_TRANSCRIPT_ID_LENGTH
+        default=None,
+        max_length=MAX_AGENT_TRANSCRIPT_ID_LENGTH,
+        exclude_if=lambda value: value is None,
     )
     tool_call_id: str | None = Field(
-        default=None, max_length=MAX_AGENT_TRANSCRIPT_ID_LENGTH
+        default=None,
+        max_length=MAX_AGENT_TRANSCRIPT_ID_LENGTH,
+        exclude_if=lambda value: value is None,
     )
+    arguments: JsonValue = Field(default=None, exclude_if=lambda value: value is None)
+    result: dict[str, JsonValue] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    output_text: str | None = Field(
+        default=None,
+        max_length=MAX_AGENT_TRANSCRIPT_DISPLAY_TEXT_LENGTH,
+        exclude_if=lambda value: value is None,
+    )
+    status: AgentTranscriptToolStatus | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    call_presentation: ToolCallPresentation | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    result_presentation: ToolResultPresentation | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    detail: EffectDetail | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    state: EffectState | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    attachment_names: list[str] = Field(
+        default_factory=list, exclude_if=lambda value: not value
+    )
+    attachment_count: int = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
     truncated: bool = False
     truncation: AgentTranscriptTruncation | None = None
 
     @model_validator(mode="after")
-    def validate_tool_identity_and_truncation(self) -> Self:
+    def validate_entry_payload(self) -> Self:
         if self.kind in {
             AgentTranscriptEntryKind.USER_TEXT,
             AgentTranscriptEntryKind.ASSISTANT_TEXT,
+            AgentTranscriptEntryKind.REASONING,
         } and (self.tool_name is not None or self.tool_call_id is not None):
             raise ValueError("text entries must not carry tool identity")
-        if self.kind is AgentTranscriptEntryKind.TOOL_CALL and self.tool_name is None:
-            raise ValueError("tool call entries require tool_name")
-        if (
-            self.kind is AgentTranscriptEntryKind.TOOL_RESULT
-            and self.tool_call_id is None
-        ):
-            raise ValueError("tool result entries require tool_call_id")
+        if self.kind is AgentTranscriptEntryKind.TOOL_CALL:
+            if self.tool_name is None:
+                raise ValueError("tool call entries require tool_name")
+            if self.detail is None or self.state is None or self.status is None:
+                raise ValueError("tool call entries require effect payload and status")
+        if self.kind is AgentTranscriptEntryKind.TOOL_RESULT:
+            if self.tool_call_id is None:
+                raise ValueError("tool result entries require tool_call_id")
+            if self.tool_name is None:
+                raise ValueError("tool result entries require tool_name")
+            if self.detail is None or self.state is None or self.status is None:
+                raise ValueError(
+                    "tool result entries require effect payload and status"
+                )
+        if self.attachment_count < len(self.attachment_names):
+            raise ValueError("attachment_count cannot be less than attachment_names")
         if self.truncated != (self.truncation is not None):
             raise ValueError("truncated and truncation must agree")
         return self

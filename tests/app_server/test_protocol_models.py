@@ -11,6 +11,7 @@ from chartreux.app_server._model import validate_wire
 from chartreux.app_server.models import (
     IdleSessionStatus,
     MCPSourceSummary,
+    PublicEntryGenerationStatus,
     PublicQueuedTurn,
     PublicRetryCategory,
     PublicRetryState,
@@ -104,10 +105,13 @@ def test_agent_transcript_get_wire_contract() -> None:
         entries=[
             AgentTranscriptEntry(
                 entry_id="entry-1",
-                kind=AgentTranscriptEntryKind.TOOL_CALL,
-                display_text="read_file",
-                tool_name="read_file",
-                tool_call_id="call-1",
+                kind=AgentTranscriptEntryKind.REASONING,
+                display_text="thinking",
+                digest="a" * 64,
+                created_at=0,
+                updated_at=0,
+                generation_status=PublicEntryGenerationStatus.COMPLETED,
+                title="Reasoning",
                 truncated=True,
                 truncation=AgentTranscriptTruncation.DISPLAY_TEXT_LIMIT,
             )
@@ -116,6 +120,7 @@ def test_agent_transcript_get_wire_contract() -> None:
         has_more=True,
     )
 
+    assert response.entries is not None
     assert "agent/transcript/get" in SERVER_METHODS
     assert params.model_dump(mode="json") == {
         "agentId": "agent-1",
@@ -127,10 +132,13 @@ def test_agent_transcript_get_wire_contract() -> None:
         "entries": [
             {
                 "entryId": "entry-1",
-                "kind": "tool_call",
-                "displayText": "read_file",
-                "toolName": "read_file",
-                "toolCallId": "call-1",
+                "kind": "reasoning",
+                "displayText": "thinking",
+                "digest": "a" * 64,
+                "createdAt": 0,
+                "updatedAt": 0,
+                "generationStatus": "completed",
+                "title": "Reasoning",
                 "truncated": True,
                 "truncation": "display_text_limit",
             }
@@ -138,6 +146,10 @@ def test_agent_transcript_get_wire_contract() -> None:
         "oldestCursor": "cursor-1",
         "hasMore": True,
     }
+    with pytest.raises(ValidationError):
+        AgentTranscriptEntry.model_validate(
+            response.entries[0].model_dump(mode="json") | {"toolName": "tool"}
+        )
     with pytest.raises(ValidationError):
         validate_wire(AgentTranscriptGetParams, {"agent_id": "agent-1"})
 
