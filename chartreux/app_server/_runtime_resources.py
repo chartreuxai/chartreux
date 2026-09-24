@@ -63,6 +63,8 @@ from chartreux.app_server.protocol import (
     SessionReadyWaitResponse,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _escape_json_pointer_token(value: str) -> str:
     return value.replace("~", "~0").replace("/", "~1")
@@ -454,6 +456,15 @@ class RuntimeResource:
             return False
         params = validate_wire(RuntimeUpdatedParams, notification.params)
         if params.session_id != self._state.session_id:
-            return False
+            logger.debug(
+                "Discarding runtime/updated for session_id=%s; current session_id=%s",
+                params.session_id,
+                self._state.session_id,
+            )
+            # The initialization of a fresh session can finish after an in-place
+            # resume has adopted another session. It is still a handled runtime
+            # notification; letting it fall through to the event projection
+            # makes the client treat the old-session update as an unknown event.
+            return True
         self._state.apply_runtime(params.runtime)
         return True

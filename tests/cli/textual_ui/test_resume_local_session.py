@@ -417,6 +417,35 @@ async def test_session_ready_set_on_warm_start(chartreux_app: ChartreuxApp) -> N
 
 
 @pytest.mark.asyncio
+async def test_auto_resume_failure_is_rendered_when_transcript_rebuild_fails(
+    chartreux_app: ChartreuxApp,
+) -> None:
+    async with chartreux_app.run_test(size=(120, 40)):
+        chartreux_app._resume_session_id = "abcd1234"
+        with (
+            patch.object(
+                chartreux_app,
+                "_resume_local_session",
+                AsyncMock(side_effect=RuntimeError("connection closed")),
+            ),
+            patch.object(
+                chartreux_app,
+                "_rebuild_transcript_from_current_session",
+                AsyncMock(side_effect=RuntimeError("transcript unavailable")),
+            ),
+            patch.object(
+                chartreux_app, "_process_startup_prompt_when_available", AsyncMock()
+            ),
+        ):
+            await chartreux_app._auto_resume_on_startup()
+
+        assert any(
+            "Failed to resume session: connection closed" in str(error._error)
+            for error in chartreux_app.query(ErrorMessage)
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("resume_session_id", "continue_latest", "continue_target"),
     [("abcd1234", False, "abcd1234"), (None, True, "abcd1234"), (None, True, None)],

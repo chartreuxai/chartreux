@@ -846,6 +846,7 @@ class CoreRequestHandler:
         )
 
     async def _finish_resume(self, agent_loop: AgentLoop, session_id: str) -> None:
+        session_id = agent_loop.session_id
         await self._runtime_factory.finish_resume_root(agent_loop, session_id)
         try:
             await self._notify(

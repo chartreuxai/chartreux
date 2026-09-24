@@ -6,6 +6,7 @@ import pytest
 
 from chartreux.app_server import AppServerSession
 from chartreux.cli.textual_ui.app import run_textual_ui
+from chartreux.cli.textual_ui.widgets.messages import ErrorMessage
 from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
 from chartreux.config_values import AUTO_THEME
 from tests.conftest import build_test_chartreux_app
@@ -80,6 +81,37 @@ async def test_failed_resume_restores_transcript_when_previewing(
     reset_ui.assert_called_once_with()
     resume_history.assert_awaited_once_with()
     assert mount.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_failed_resume_mounts_error_when_transcript_rebuild_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = build_test_chartreux_app()
+    await app.prepare()
+    app._picker.previewing = True
+    mount = AsyncMock()
+    monkeypatch.setattr(app, "_switch_to_input_app", AsyncMock())
+    monkeypatch.setattr(
+        app, "_resume_local_session", AsyncMock(side_effect=RuntimeError("resume boom"))
+    )
+    monkeypatch.setattr(
+        app,
+        "_rebuild_transcript_from_current_session",
+        AsyncMock(side_effect=RuntimeError("rebuild boom")),
+    )
+    monkeypatch.setattr(app, "_mount_and_scroll", mount)
+
+    await app.on_session_picker_app_session_selected(
+        SessionPickerApp.SessionSelected("local:session-1", "session-1")
+    )
+
+    errors = [call.args[0] for call in mount.await_args_list]
+    assert any(
+        isinstance(error, ErrorMessage)
+        and "Failed to load session: resume boom" in str(error._error)
+        for error in errors
+    )
 
 
 @pytest.mark.asyncio
