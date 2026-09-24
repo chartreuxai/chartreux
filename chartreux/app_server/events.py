@@ -256,24 +256,70 @@ class UnknownNotificationError(RuntimeError):
     pass
 
 
+_PROJECTION_EVENT_PARAMS: dict[str, type[_KnownEventParams]] = {
+    "session/snapshot": SessionSnapshotParams,
+    "session/compacted": SessionCompactedParams,
+    "session/contextCleared": SessionContextClearedParams,
+    "session/updated": SessionUpdatedParams,
+    "history/entryAdded": HistoryEntryAddedParams,
+    "history/entryUpdated": HistoryEntryUpdatedParams,
+    "turn/started": TurnStartedParams,
+    "turn/completed": TurnCompletedParams,
+    "agents/update": AgentsUpdateParams,
+    "turn_queue_updated": TurnQueueUpdatedParams,
+    "session/statsUpdated": StatsUpdatedParams,
+}
+
+
+def projection_notification_methods() -> frozenset[str]:
+    return frozenset(_PROJECTION_EVENT_PARAMS)
+
+
+def _parse_server_warning(notification: Notification) -> ServerWarning:
+    return ServerWarning(validate_wire(ServerWarningParams, notification.params))
+
+
+def _parse_server_error(notification: Notification) -> ServerError:
+    return ServerError(validate_wire(ServerErrorParams, notification.params))
+
+
+def _parse_turn_retrying(notification: Notification) -> TurnRetrying:
+    return TurnRetrying(validate_wire(TurnRetryingParams, notification.params))
+
+
+def _parse_mcp_auth_required(
+    notification: Notification,
+) -> MCPAuthorizationRequiredEvent:
+    return MCPAuthorizationRequiredEvent(
+        validate_wire(MCPAuthRequiredParams, notification.params)
+    )
+
+
+_SERVER_EVENT_DISPATCH: dict[
+    str,
+    Callable[
+        [Notification],
+        ServerWarning | ServerError | TurnRetrying | MCPAuthorizationRequiredEvent,
+    ],
+] = {
+    "warning": _parse_server_warning,
+    "error": _parse_server_error,
+    "turn/retrying": _parse_turn_retrying,
+    "mcp_catalog/authRequired": _parse_mcp_auth_required,
+}
+
+
+def server_event_notification_methods() -> frozenset[str]:
+    return frozenset(_SERVER_EVENT_DISPATCH)
+
+
 def parse_server_event(
     notification: Notification,
 ) -> ServerWarning | ServerError | TurnRetrying | MCPAuthorizationRequiredEvent | None:
-    match notification.method:
-        case "warning":
-            return ServerWarning(
-                validate_wire(ServerWarningParams, notification.params)
-            )
-        case "error":
-            return ServerError(validate_wire(ServerErrorParams, notification.params))
-        case "turn/retrying":
-            return TurnRetrying(validate_wire(TurnRetryingParams, notification.params))
-        case "mcp_catalog/authRequired":
-            return MCPAuthorizationRequiredEvent(
-                validate_wire(MCPAuthRequiredParams, notification.params)
-            )
-        case _:
-            return None
+    parser = _SERVER_EVENT_DISPATCH.get(notification.method)
+    if parser is None:
+        return None
+    return parser(notification)
 
 
 class ClientProjection:
@@ -604,31 +650,9 @@ class ClientProjection:
 
 
 def _parse_event_params(notification: Notification) -> _KnownEventParams:
-    match notification.method:
-        case "session/snapshot":
-            params = validate_wire(SessionSnapshotParams, notification.params)
-        case "session/compacted":
-            params = validate_wire(SessionCompactedParams, notification.params)
-        case "session/contextCleared":
-            params = validate_wire(SessionContextClearedParams, notification.params)
-        case "session/updated":
-            params = validate_wire(SessionUpdatedParams, notification.params)
-        case "history/entryAdded":
-            params = validate_wire(HistoryEntryAddedParams, notification.params)
-        case "history/entryUpdated":
-            params = validate_wire(HistoryEntryUpdatedParams, notification.params)
-        case "turn/started":
-            params = validate_wire(TurnStartedParams, notification.params)
-        case "turn/completed":
-            params = validate_wire(TurnCompletedParams, notification.params)
-        case "agents/update":
-            params = validate_wire(AgentsUpdateParams, notification.params)
-        case "turn_queue_updated":
-            params = validate_wire(TurnQueueUpdatedParams, notification.params)
-        case "session/statsUpdated":
-            params = validate_wire(StatsUpdatedParams, notification.params)
-        case _:
-            raise UnknownNotificationError(
-                f"Unknown app-server notification: {notification.method}"
-            )
-    return params
+    params_type = _PROJECTION_EVENT_PARAMS.get(notification.method)
+    if params_type is None:
+        raise UnknownNotificationError(
+            f"Unknown app-server notification: {notification.method}"
+        )
+    return validate_wire(params_type, notification.params)

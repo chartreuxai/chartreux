@@ -129,6 +129,8 @@ _EVENT_QUEUE_MAX_SIZE = 256
 _RECONNECT_BACKOFF_INITIAL_SECONDS = 0.25
 _RECONNECT_BACKOFF_MAX_SECONDS = 5.0
 _EXPECTED_CLOSE_ERRORS = (ConnectionError, EOFError, AppServerConnectionClosed)
+_DROPPED_NOTIFICATION_METHODS_MAX = 64
+_RESYNC_COALESCE_WINDOW_SECONDS = 0.5
 
 
 class AppServerTurnError(RuntimeError):
@@ -181,8 +183,12 @@ class AppServerSession:  # noqa: PLR0904
         )
         self._message_task: asyncio.Task[None] | None = None
         self._reconnect_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+        self._resync_clock: Callable[[], float] = time.monotonic
         self._pump_stop = asyncio.Event()
         self._dropped_notification_methods: set[str] = set()
+        self._unknown_notification_warnings_suppressed = False
+        self._resync_in_flight = False
+        self._last_resync_completed_at: float | None = None
         self._closing = False
         self._client_tool_handler = client_tool_handler
         self._client_request_tasks: set[asyncio.Task[None]] = set()
@@ -806,6 +812,9 @@ class AppServerSession:  # noqa: PLR0904
                     self._close_event_streams()
                     return
                 client = await self._attach_with_backoff()
+                if self._closing:
+                    self._close_event_streams()
+                    return
                 if client is None:
                     return
         finally:
@@ -888,12 +897,26 @@ class AppServerSession:  # noqa: PLR0904
         try:
             event = self._state.projection.consume(notification)
         except UnknownNotificationError:
-            if notification.method not in self._dropped_notification_methods:
+            if (
+                notification.method not in self._dropped_notification_methods
+                and len(self._dropped_notification_methods)
+                < _DROPPED_NOTIFICATION_METHODS_MAX
+            ):
                 self._dropped_notification_methods.add(notification.method)
                 logger.warning(
                     "Dropping unknown app-server notification method %s",
                     notification.method,
                 )
+                if (
+                    len(self._dropped_notification_methods)
+                    == _DROPPED_NOTIFICATION_METHODS_MAX
+                    and not self._unknown_notification_warnings_suppressed
+                ):
+                    self._unknown_notification_warnings_suppressed = True
+                    logger.warning(
+                        "Reached the unknown notification method limit; "
+                        "suppressing further unknown-method warnings"
+                    )
             return
         except (EventSequenceError, ValidationError):
             await self._resync(client)
@@ -939,6 +962,7 @@ class AppServerSession:  # noqa: PLR0904
                     exc,
                 )
             else:
+                # Both resources return False for unhandled methods, so this is defensive.
                 raise
             return True
 
@@ -964,6 +988,24 @@ class AppServerSession:  # noqa: PLR0904
         return True
 
     async def _resync(self, client: AppServerClient) -> None:
+        now = self._resync_clock()
+        # The pump processes notifications sequentially; the in-flight flag is
+        # defensive, while the 0.5s post-completion window does the coalescing.
+        if self._resync_in_flight or (
+            self._last_resync_completed_at is not None
+            and now - self._last_resync_completed_at < _RESYNC_COALESCE_WINDOW_SECONDS
+        ):
+            return
+        self._resync_in_flight = True
+        try:
+            await self._read_resync_snapshot(client)
+        except BaseException:
+            self._resync_in_flight = False
+            raise
+        self._resync_in_flight = False
+        self._last_resync_completed_at = self._resync_clock()
+
+    async def _read_resync_snapshot(self, client: AppServerClient) -> None:
         generation = self._state.projection.generation
         state = validate_wire(
             SessionReadResponse,

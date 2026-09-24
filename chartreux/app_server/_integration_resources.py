@@ -59,6 +59,12 @@ class SkillsResource:
 
 
 class MCPResource:
+    _NOTIFICATION_METHODS = frozenset({"mcp_catalog/authUrl"})
+
+    @classmethod
+    def notification_methods(cls) -> frozenset[str]:
+        return cls._NOTIFICATION_METHODS
+
     def __init__(
         self, connection: AppServerResourceConnection, state: ClientSessionState
     ) -> None:
@@ -175,7 +181,7 @@ class MCPResource:
             self._login_events.pop(name, None)
 
     async def consume_notification(self, notification: Notification) -> bool:
-        if notification.method != "mcp_catalog/authUrl":
+        if notification.method not in self.notification_methods():
             return False
         params = validate_wire(MCPAuthUrlParams, notification.params)
         if events := self._login_events.get(params.name):

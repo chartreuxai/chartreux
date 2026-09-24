@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum, auto
 from functools import cache
+from types import MappingProxyType
 from typing import Annotated, Any, ClassVar, Literal, Protocol, Self, get_origin
 
 from pydantic import (
@@ -1930,8 +1932,14 @@ def validate_callback_acknowledgement(
     return response
 
 
-def server_notification_registry() -> dict[str, type[ProtocolModel]]:
-    """Return every app-server notification method declared by its params model."""
+@cache
+def server_notification_registry() -> Mapping[str, type[ProtocolModel]]:
+    """Return declared app-server notification methods and their params models.
+
+    Notification params models are protocol declarations loaded at import time,
+    so the registry is closed before its first use and needs no invalidation.
+    Dynamically defining notification models after this call is unsupported.
+    """
     registry: dict[str, type[ProtocolModel]] = {}
     pending = list(ProtocolModel.__subclasses__())
     while pending:
@@ -1948,7 +1956,7 @@ def server_notification_registry() -> dict[str, type[ProtocolModel]]:
                 f"{existing.__name__} and {model.__name__}"
             )
         registry[method] = model
-    return registry
+    return MappingProxyType(registry)
 
 
 def validate_notification_method(method: str, params: ProtocolModel) -> None:

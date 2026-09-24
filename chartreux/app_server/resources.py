@@ -38,6 +38,12 @@ class AppServerResources:
         self.loops = LoopsResource(connection, state)
         self.narration = NarrationResource(connection, state)
 
+    @classmethod
+    def notification_methods(cls) -> frozenset[str]:
+        return (
+            RuntimeResource.notification_methods() | MCPResource.notification_methods()
+        )
+
     async def refresh(self) -> None:
         await self.runtime.refresh()
 

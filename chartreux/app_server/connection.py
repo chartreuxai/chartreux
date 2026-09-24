@@ -44,6 +44,7 @@ class AppServerConnection:
         self._attached_session_id: str | None = None
         self._snapshot: ConnectionSnapshot | None = None
         self._lock = asyncio.Lock()
+        self._closed = False
 
     @property
     def current(self) -> AppServerClient | None:
@@ -100,6 +101,8 @@ class AppServerConnection:
         self, failed_client: AppServerClient, *, preserve_attached: bool = False
     ) -> bool:
         async with self._lock:
+            if self._closed:
+                return False
             if (
                 preserve_attached
                 and self._client is failed_client
@@ -111,6 +114,8 @@ class AppServerConnection:
             if self._client is failed_client:
                 with suppress(Exception):
                     await failed_client.close()
+                if self._closed or self._client is not failed_client:
+                    return False
             if self._client_factory is None:
                 self._client = None
                 return False
@@ -120,10 +125,11 @@ class AppServerConnection:
             return True
 
     async def close(self) -> None:
-        if self._client is None:
-            return
-        await self._client.close()
+        self._closed = True
+        client = self._client
         self._client = None
+        if client is not None:
+            await client.close()
 
 
 class AppServerResourceConnection:

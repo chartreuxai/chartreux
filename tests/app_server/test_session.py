@@ -2200,6 +2200,38 @@ async def test_failed_notification_resync_escalates_to_reconnect(
 
 
 @pytest.mark.asyncio
+async def test_failed_resync_does_not_start_coalesce_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = build_test_agent_loop()
+    session, client, _server_transport, _server = await _open_wire_notification_session(
+        agent_loop
+    )
+    read_count = 0
+
+    async def fail_once(_resync_client) -> None:
+        nonlocal read_count
+        read_count += 1
+        if read_count == 1:
+            raise RuntimeError("session/read failed")
+
+    monkeypatch.setattr(session, "_read_resync_snapshot", fail_once)
+    try:
+        with pytest.raises(RuntimeError, match="session/read failed"):
+            await session._resync(client)
+        assert session._resync_in_flight is False
+        assert session._last_resync_completed_at is None
+
+        await session._resync(client)
+
+        assert read_count == 2
+        assert session._last_resync_completed_at is not None
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_malformed_ephemeral_notifications_are_dropped_without_resync(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2287,6 +2319,96 @@ async def test_malformed_runtime_update_resynchronizes(
         assert session._state.projection.last_event_id == expected_event_id
         assert session._connection.current is client
         reconnect.assert_not_awaited()
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_notification_resync_storm_uses_one_session_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = build_test_agent_loop()
+    session, _client, server_transport, server = await _open_wire_notification_session(
+        agent_loop
+    )
+    first_read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    read_count = 0
+    original_dispatch = server._dispatch_request
+
+    async def delay_first_read(method: str, raw_params: dict[str, Any]):
+        nonlocal read_count
+        if method == "session/read":
+            read_count += 1
+            if read_count == 1:
+                first_read_started.set()
+                await release_read.wait()
+        return await original_dispatch(method, raw_params)
+
+    monkeypatch.setattr(server, "_dispatch_request", delay_first_read)
+    try:
+        for _ in range(32):
+            await server_transport.send({
+                "jsonrpc": "2.0",
+                "method": "session/updated",
+                "params": {
+                    "eventId": 1,
+                    "sessionId": session.session_id,
+                    "patch": "not-a-patch-list",
+                    "emittedAt": 1,
+                },
+            })
+        await server_transport.send({
+            "jsonrpc": "2.0",
+            "method": "storm/complete",
+            "params": {},
+        })
+        await asyncio.wait_for(first_read_started.wait(), timeout=1)
+        release_read.set()
+
+        async with asyncio.timeout(1):
+            while "storm/complete" not in session._dropped_notification_methods:
+                await asyncio.sleep(0)
+
+        assert read_count == 1
+    finally:
+        release_read.set()
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unknown_notification_methods_are_bounded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    agent_loop = build_test_agent_loop()
+    session, client, _server_transport, _server = await _open_wire_notification_session(
+        agent_loop
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="vibe"):
+            for index in range(100):
+                await session._handle_notification(
+                    client, Notification(method=f"future/method-{index}", params={})
+                )
+
+        assert len(session._dropped_notification_methods) == 64
+        assert (
+            len([
+                record
+                for record in caplog.records
+                if "Dropping unknown app-server notification method" in record.message
+            ])
+            == 64
+        )
+        assert (
+            sum(
+                "suppressing further unknown-method warnings" in record.message
+                for record in caplog.records
+            )
+            == 1
+        )
     finally:
         await session.close()
         await agent_loop.aclose()

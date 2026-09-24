@@ -358,6 +358,12 @@ class IdentityResource:
 
 
 class RuntimeResource:
+    _NOTIFICATION_METHODS = frozenset({"runtime/updated"})
+
+    @classmethod
+    def notification_methods(cls) -> frozenset[str]:
+        return cls._NOTIFICATION_METHODS
+
     def __init__(
         self, connection: AppServerResourceConnection, state: ClientSessionState
     ) -> None:
@@ -452,7 +458,7 @@ class RuntimeResource:
         self._state.apply_runtime_read(response)
 
     async def consume_notification(self, notification: Notification) -> bool:
-        if notification.method != "runtime/updated":
+        if notification.method not in self.notification_methods():
             return False
         params = validate_wire(RuntimeUpdatedParams, notification.params)
         if params.session_id != self._state.session_id:
