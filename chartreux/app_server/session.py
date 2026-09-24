@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 import time
@@ -126,6 +126,8 @@ class _PublishedEvent:
 type _QueuedEvent = _PublishedEvent | _StreamClosed
 
 _EVENT_QUEUE_MAX_SIZE = 256
+_RECONNECT_BACKOFF_INITIAL_SECONDS = 0.25
+_RECONNECT_BACKOFF_MAX_SECONDS = 5.0
 _EXPECTED_CLOSE_ERRORS = (ConnectionError, EOFError, AppServerConnectionClosed)
 
 
@@ -178,6 +180,8 @@ class AppServerSession:  # noqa: PLR0904
             maxsize=_EVENT_QUEUE_MAX_SIZE
         )
         self._message_task: asyncio.Task[None] | None = None
+        self._reconnect_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+        self._pump_stop = asyncio.Event()
         self._dropped_notification_methods: set[str] = set()
         self._closing = False
         self._client_tool_handler = client_tool_handler
@@ -747,9 +751,11 @@ class AppServerSession:  # noqa: PLR0904
         otherwise surface as a fatal error on the event stream). Idempotent.
         """
         self._closing = True
+        self._pump_stop.set()
 
     async def close(self) -> None:
         self._closing = True
+        self._pump_stop.set()
         client = self._connection.current
         if client is not None:
             with suppress(Exception):
@@ -781,42 +787,98 @@ class AppServerSession:  # noqa: PLR0904
         return client
 
     async def _pump_messages(self) -> None:
-        while client := self._connection.current:
-            error: Exception = AppServerConnectionClosed("App-server connection closed")
+        try:
+            client = self._connection.current
+            if client is None:
+                self._close_event_streams(
+                    AppServerConnectionClosed("App-server connection closed")
+                )
+                return
+            while True:
+                error = await self._receive_messages(client)
+                if self._closing:
+                    self._close_event_streams(error)
+                    return
+                if not await self._connection.reconnect(client):
+                    self._close_event_streams(error)
+                    return
+                if self._closing:
+                    self._close_event_streams()
+                    return
+                client = await self._attach_with_backoff()
+                if client is None:
+                    return
+        finally:
+            if self._message_task is asyncio.current_task():
+                self._message_task = None
+
+    async def _attach_with_backoff(self) -> AppServerClient | None:
+        backoff = _RECONNECT_BACKOFF_INITIAL_SECONDS
+        while not self._closing:
+            client = self._connection.current
+            if client is None:
+                self._close_event_streams(
+                    AppServerConnectionClosed("App-server connection closed")
+                )
+                return None
             try:
-                async for message in client.incoming():
-                    match message:
-                        case Notification():
-                            await self._handle_notification(client, message)
-                        case ServerRequest():
-                            if message.method == "callback/call":
-                                await self._handle_request(message)
-                                continue
-                            task = asyncio.create_task(self._handle_request(message))
-                            self._client_request_tasks.add(task)
-                            task.add_done_callback(self._client_request_finished)
+                return await self._ensure_attached()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                error = exc
                 logger.debug(
-                    "App-server client event pump failed; reconnecting",
+                    "App-server client attach failed; retrying",
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
-            if self._closing:
-                self._close_event_streams(error)
-                return
-            if not await self._connection.reconnect(client):
-                self._close_event_streams(error)
-                return
-            if self._closing:
-                self._close_event_streams()
-                return
-            try:
-                await self._ensure_attached()
-            except Exception as exc:
-                self._close_event_streams(exc)
-                return
+                if not await self._wait_for_reconnect(backoff):
+                    self._close_event_streams()
+                    return None
+                backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX_SECONDS)
+                if not await self._connection.reconnect(client, preserve_attached=True):
+                    self._close_event_streams(exc)
+                    return None
+        self._close_event_streams()
+        return None
+
+    async def _receive_messages(self, client: AppServerClient) -> Exception:
+        error: Exception = AppServerConnectionClosed("App-server connection closed")
+        try:
+            async for message in client.incoming():
+                match message:
+                    case Notification():
+                        await self._handle_notification(client, message)
+                    case ServerRequest():
+                        if message.method == "callback/call":
+                            await self._handle_request(message)
+                            continue
+                        task = asyncio.create_task(self._handle_request(message))
+                        self._client_request_tasks.add(task)
+                        task.add_done_callback(self._client_request_finished)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = exc
+            logger.debug(
+                "App-server client event pump failed; reconnecting",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+        return error
+
+    async def _wait_for_reconnect(self, delay: float) -> bool:
+        sleep_task = asyncio.ensure_future(self._reconnect_sleep(delay))
+        stop_task = asyncio.create_task(self._pump_stop.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (sleep_task, stop_task), return_when=asyncio.FIRST_COMPLETED
+            )
+            if sleep_task in done:
+                await sleep_task
+            return sleep_task in done and not self._closing
+        finally:
+            for task in (sleep_task, stop_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sleep_task, stop_task, return_exceptions=True)
 
     async def _handle_notification(
         self, client: AppServerClient, notification: Notification

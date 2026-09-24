@@ -2388,6 +2388,144 @@ async def test_unknown_notification_does_not_interrupt_pump_or_in_flight_rpc(
 
 
 @pytest.mark.asyncio
+async def test_reconnect_backoff_is_bounded_and_close_interrupts_wait() -> None:
+    agent_loop = build_test_agent_loop()
+    session, server = await _create_reconnectable_session_with_server(agent_loop)
+    sleeps: asyncio.Queue[tuple[float, asyncio.Event]] = asyncio.Queue()
+
+    async def controlled_sleep(delay: float) -> None:
+        gate = asyncio.Event()
+        sleeps.put_nowait((delay, gate))
+        await gate.wait()
+
+    async def fail_resume(_params: SessionResumeParams):
+        raise RuntimeError("backend unavailable")
+
+    server._session_backend_host.resume = fail_resume  # type: ignore[method-assign]
+    session._reconnect_sleep = controlled_sleep
+    client = session._connection.current
+    assert client is not None
+
+    try:
+        await client.close()
+        expected_delays = (0.25, 0.5, 1.0, 2.0, 4.0, 5.0, 5.0)
+        for index, expected in enumerate(expected_delays):
+            delay, gate = await asyncio.wait_for(sleeps.get(), timeout=1)
+            assert delay == expected
+            if index < len(expected_delays) - 1:
+                gate.set()
+
+        await asyncio.wait_for(session.close(), timeout=1)
+        assert session._message_task is None
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_event_stream_recovers_after_attach_failure() -> None:
+    agent_loop = build_test_agent_loop()
+    session, server = await _create_reconnectable_session_with_server(agent_loop)
+    sleeps: asyncio.Queue[tuple[float, asyncio.Event]] = asyncio.Queue()
+    resume_calls = 0
+    original_resume = server._session_backend_host.resume
+
+    async def fail_once(params: SessionResumeParams):
+        nonlocal resume_calls
+        resume_calls += 1
+        if resume_calls == 1:
+            raise RuntimeError("backend temporarily unavailable")
+        return await original_resume(params)
+
+    async def controlled_sleep(delay: float) -> None:
+        gate = asyncio.Event()
+        sleeps.put_nowait((delay, gate))
+        await gate.wait()
+
+    server._session_backend_host.resume = fail_once  # type: ignore[method-assign]
+    session._reconnect_sleep = controlled_sleep
+    stream = session.events()
+    next_event = asyncio.create_task(anext(stream))
+    client = session._connection.current
+    assert client is not None
+
+    try:
+        await asyncio.sleep(0)
+        await client.close()
+        delay, gate = await asyncio.wait_for(sleeps.get(), timeout=1)
+        assert delay == 0.25
+        gate.set()
+
+        event = await asyncio.wait_for(next_event, timeout=1)
+        assert isinstance(event, SessionSnapshot)
+        assert resume_calls >= 2
+        assert session._message_task is not None
+        assert not session._message_task.done()
+    finally:
+        if not next_event.done():
+            next_event.cancel()
+        await asyncio.gather(next_event, return_exceptions=True)
+        await stream.aclose()
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_backoff_resets_after_successful_attach() -> None:
+    agent_loop = build_test_agent_loop()
+    session, server = await _create_reconnectable_session_with_server(agent_loop)
+    sleeps: asyncio.Queue[tuple[float, asyncio.Event]] = asyncio.Queue()
+    resume_calls = 0
+    original_resume = server._session_backend_host.resume
+
+    async def fail_twice_then_again(params: SessionResumeParams):
+        nonlocal resume_calls
+        resume_calls += 1
+        if resume_calls in {1, 2, 4}:
+            raise RuntimeError("backend temporarily unavailable")
+        return await original_resume(params)
+
+    async def controlled_sleep(delay: float) -> None:
+        gate = asyncio.Event()
+        sleeps.put_nowait((delay, gate))
+        await gate.wait()
+
+    server._session_backend_host.resume = fail_twice_then_again  # type: ignore[method-assign]
+    session._reconnect_sleep = controlled_sleep
+    stream = session.events()
+    next_event = asyncio.create_task(anext(stream))
+    client = session._connection.current
+    assert client is not None
+
+    try:
+        await asyncio.sleep(0)
+        await client.close()
+        delay, gate = await asyncio.wait_for(sleeps.get(), timeout=1)
+        assert delay == 0.25
+        gate.set()
+        delay, gate = await asyncio.wait_for(sleeps.get(), timeout=1)
+        assert delay == 0.5
+        gate.set()
+
+        event = await asyncio.wait_for(next_event, timeout=1)
+        assert isinstance(event, SessionSnapshot)
+        recovered_client = session._connection.current
+        assert recovered_client is not None
+        await recovered_client.close()
+
+        delay, _gate = await asyncio.wait_for(sleeps.get(), timeout=1)
+        assert delay == 0.25
+        assert resume_calls == 4
+    finally:
+        if not next_event.done():
+            next_event.cancel()
+        await asyncio.gather(next_event, return_exceptions=True)
+        await stream.aclose()
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_reconnect_resumes_live_turn_and_redelivers_open_callback() -> None:
     tool_call = _question_tool_call()
     backend = FakeBackend([
@@ -4256,6 +4394,35 @@ async def _create_reconnectable_session(
         session_options=session_options,
         client_factory=reconnect,
     )
+
+
+async def _create_reconnectable_session_with_server(
+    agent_loop,
+) -> tuple[AppServerSession, AppServer]:
+    client_transport, server_transport = memory_transport_pair()
+    server = build_test_app_server(agent_loop, server_transport)
+
+    async def serve_initial_connection() -> None:
+        await server.serve_connection(server_transport, close_on_disconnect=False)
+
+    def reconnect() -> AppServerClient:
+        next_client_transport, next_server_transport = memory_transport_pair()
+
+        async def serve_connection() -> None:
+            await server.serve_connection(
+                next_server_transport, close_on_disconnect=False
+            )
+
+        return AppServerClient(next_client_transport, run_peer=serve_connection)
+
+    client = AppServerClient(client_transport, run_peer=serve_initial_connection)
+    session = await AppServerSession.start(
+        client,
+        client_info=ClientInfo(name="retry-test-client", version="1"),
+        capabilities=ClientCapabilities(),
+        client_factory=reconnect,
+    )
+    return session, server
 
 
 @pytest.mark.asyncio

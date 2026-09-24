@@ -96,12 +96,21 @@ class AppServerConnection:
         self._snapshot = None
         return snapshot
 
-    async def reconnect(self, failed_client: AppServerClient) -> bool:
+    async def reconnect(
+        self, failed_client: AppServerClient, *, preserve_attached: bool = False
+    ) -> bool:
         async with self._lock:
-            if self._client is not failed_client:
-                return self._client is not None
-            with suppress(Exception):
-                await failed_client.close()
+            if (
+                preserve_attached
+                and self._client is failed_client
+                and self._attached_session_id == self._state.session_id
+            ):
+                return True
+            if self._client is not failed_client and self._client is not None:
+                return True
+            if self._client is failed_client:
+                with suppress(Exception):
+                    await failed_client.close()
             if self._client_factory is None:
                 self._client = None
                 return False
