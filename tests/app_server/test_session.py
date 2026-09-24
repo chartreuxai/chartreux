@@ -76,6 +76,7 @@ from chartreux.app_server.protocol import (
     PageRequest,
     ProtocolError,
     ProtocolErrorCode,
+    RuntimeSnapshot,
     RuntimeUpdatedParams,
     ServerRequest,
     SessionHistoryClearParams,
@@ -450,6 +451,44 @@ async def test_completed_turn_refreshes_runtime_projection() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stale_runtime_update_after_resume_does_not_close_connection() -> None:
+    agent_loop = build_test_agent_loop()
+    session = await create_test_app_server_session(agent_loop)
+    runtime = session.resources.runtime
+    current_context_window = runtime.context_window
+    stale_update = RuntimeUpdatedParams(
+        session_id=f"stale-{session.session_id}",
+        runtime=RuntimeSnapshot(
+            config=session.resources.config.current,
+            skills=runtime.skills,
+            tools=runtime.tools,
+            stats=runtime.stats,
+            context_window=current_context_window + 1,
+            issues=runtime.issues,
+            hooks_count=runtime.hooks_count,
+            mcp=runtime.mcp,
+        ),
+    )
+
+    try:
+        await session.connect()
+        client = session._connection.current
+        assert client is not None
+        await session._handle_notification(
+            client,
+            Notification(
+                method="runtime/updated",
+                params=stale_update.model_dump(mode="json", by_alias=True),
+            ),
+        )
+        assert runtime.context_window == current_context_window
+        await runtime.refresh()
+    finally:
+        await session.close()
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_persisted_session_resume_appends_checkpoint(tmp_path: Path) -> None:
     config = build_test_vibe_config(
         session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path))
@@ -498,7 +537,8 @@ async def test_in_place_resume_clears_previous_turn_state(tmp_path: Path) -> Non
         await _consume(session.act("first question"))
         # Resuming a different session rebinds the loop in place; the reused turn
         # controller must be reset so the previous session's turns do not leak.
-        await session.resume(saved_session_id)
+        await session.resume(saved_session_id[:8])
+        await session.read_turn_queue()
         result = await client.request(
             "session/turns/list",
             SessionTurnsListParams(

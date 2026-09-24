@@ -175,7 +175,7 @@ async def test_blur_does_not_clear_other_widget_selection() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("left_key", "right_key"),
-    zip(OPTION_WORD_LEFT_KEYS, OPTION_WORD_RIGHT_KEYS, strict=True),
+    list(zip(OPTION_WORD_LEFT_KEYS, OPTION_WORD_RIGHT_KEYS, strict=True)),
 )
 async def test_option_left_and_option_right_move_by_word(
     left_key: str, right_key: str

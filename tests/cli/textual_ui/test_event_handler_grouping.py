@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 from weakref import WeakKeyDictionary
 
 import pytest
+from textual.widget import Widget
 
 from chartreux.app_server._shell import shell_effect_detail
 from chartreux.app_server.models import (
@@ -394,3 +395,26 @@ async def test_restored_group_supports_local_expansion_and_ctrl_o() -> None:
         await app.action_toggle_tool()
         assert restored_group.is_collapsed
         assert app._tools_collapsed
+
+
+@pytest.mark.asyncio
+async def test_tool_call_anchors_live_until_turn_completion() -> None:
+    app = build_test_chartreux_app(config=build_test_vibe_config())
+
+    async with app.run_test():
+        handler = app.event_handler
+        assert handler is not None
+        handler._tool_call_anchors["call"] = Widget()
+
+        # Stream finalization also occurs between tool activity and must not
+        # release anchors needed by later tool-hook events in the same turn.
+        await handler.finalize_streaming()
+        assert "call" in handler._tool_call_anchors
+
+        handler.offer_retry()
+        assert handler.begin_retry()
+        await app._finalize_turn_ui(notify_complete=False)
+        assert "call" in handler._tool_call_anchors
+
+        await app._finalize_turn_ui()
+        assert not handler._tool_call_anchors

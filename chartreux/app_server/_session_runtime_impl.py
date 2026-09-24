@@ -421,7 +421,7 @@ class SessionRuntimeControllerImpl:
                 # projection before the next await so cancellation cannot leave
                 # the coordinator pointing at the old session.
                 self._root_session.replace_from_core()
-                self._root_session.attach(session_id)
+                self._root_session.attach(agent_loop.session_id)
                 try:
                     await previous.session.turns.reset()
                 except Exception:

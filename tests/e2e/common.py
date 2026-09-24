@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 import io
+import os
 from pathlib import Path
 import re
 import time
@@ -75,6 +76,21 @@ def _rendered_text_failure_details(captured: str) -> str:
         f"ANSI-stripped tail ({len(stripped_tail)} chars): {stripped_tail!r}\n"
         f"Printable tail:\n{printable_tail}"
     )
+
+
+def _app_log_tail() -> str | None:
+    home = os.environ.get("CHARTREUX_HOME")
+    if home is None:
+        return None
+    try:
+        lines = (
+            (Path(home) / "logs" / "chartreux.log")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+    except (OSError, UnicodeError):
+        return None
+    return "\n".join(lines[-50:]) or None
 
 
 def poll_until(predicate: Callable[[], bool], timeout: float, message: str) -> None:
@@ -171,10 +187,14 @@ def wait_for_rendered_text(
             return
         if drain_child_output(child, captured):
             details = _rendered_text_failure_details(captured.getvalue())
+            if app_log_tail := _app_log_tail():
+                details = f"{details}\n\nApp log tail (last 50 lines):\n{app_log_tail}"
             raise AssertionError(
                 f"Child exited while waiting for rendered text: {needle!r}\n\n{details}"
             )
     details = _rendered_text_failure_details(captured.getvalue())
+    if app_log_tail := _app_log_tail():
+        details = f"{details}\n\nApp log tail (last 50 lines):\n{app_log_tail}"
     raise AssertionError(
         f"Timed out waiting for rendered text: {needle!r}\n\n{details}"
     )

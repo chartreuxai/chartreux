@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import cast
+import warnings
 
 from pydantic import ValidationError
 import pytest
@@ -18,7 +19,7 @@ from chartreux.core.model_catalog.loader import (
     merge_catalog_overlay,
 )
 from chartreux.core.model_catalog.resolver import ModelResolutionError, ModelResolver
-from chartreux.core.model_catalog.schema import ModelCatalog, Prices
+from chartreux.core.model_catalog.schema import ModelCatalog, Prices, ProviderDefinition
 
 
 def _minimal() -> dict[str, object]:
@@ -236,6 +237,21 @@ def test_shipped_catalog_json_dump_round_trips() -> None:
     dumped = SHIPPED_CATALOG.model_dump_json()
 
     assert ModelCatalog.model_validate_json(dumped) == SHIPPED_CATALOG
+
+
+def test_provider_definition_extra_headers_serialize_without_warnings() -> None:
+    provider = ProviderDefinition(
+        api_base="https://example.test", extra_headers={"Authorization": "test"}
+    )
+
+    with warnings.catch_warnings(record=True) as captured_warnings:
+        warnings.simplefilter("always")
+        dumped = provider.model_dump()
+        dumped_json = provider.model_dump_json()
+
+    assert not captured_warnings
+    assert dumped["extra_headers"] == {"Authorization": "test"}
+    assert ProviderDefinition.model_validate_json(dumped_json) == provider
 
 
 def test_17_resolver_expands_scalar_models_and_roles_only() -> None:

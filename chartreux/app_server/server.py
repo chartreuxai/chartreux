@@ -315,6 +315,10 @@ class AppServer:
         error = task.exception()
         if error is None or self._closed:
             return
+        logger.error(
+            "App-server backend event task failed",
+            exc_info=(type(error), error, error.__traceback__),
+        )
         self._request_error = error
         if self._serve_task is not None:
             self._serve_task.cancel()
@@ -489,6 +493,10 @@ class AppServer:
         error = task.exception()
         if error is None or self._closed:
             return
+        logger.error(
+            "App-server request task failed",
+            exc_info=(type(error), error, error.__traceback__),
+        )
         self._request_error = error
         if self._serve_task is not None:
             self._serve_task.cancel()

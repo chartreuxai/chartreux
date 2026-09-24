@@ -107,6 +107,7 @@ from chartreux.app_server.protocol import (
     TurnUserInputEntry,
 )
 from chartreux.app_server.resources import AppServerResources
+from chartreux.observability.logging import logger
 from chartreux.user_content import UserResource
 
 
@@ -796,6 +797,10 @@ class AppServerSession:  # noqa: PLR0904
                 raise
             except Exception as exc:
                 error = exc
+                logger.debug(
+                    "App-server client event pump failed; reconnecting",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
             if self._closing:
                 self._close_event_streams(error)
                 return

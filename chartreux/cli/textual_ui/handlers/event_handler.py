@@ -518,6 +518,9 @@ class EventHandler:
             await self.current_streaming_message.stop_stream()
             self.current_streaming_message = None
 
+    def clear_tool_call_anchors(self) -> None:
+        self._tool_call_anchors.clear()
+
     def stop_current_tool_call(
         self, success: bool = True, *, cancelled: bool = False
     ) -> None:
@@ -527,7 +530,7 @@ class EventHandler:
             else:
                 tool_call.stop_spinning(success=success)
         self.tool_calls.clear()
-        self._tool_call_anchors.clear()
+        self.clear_tool_call_anchors()
         self._tool_group_call_positions.clear()
         self._hook_containers.clear()
         self._finalize_tool_group()

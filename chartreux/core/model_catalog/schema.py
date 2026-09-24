@@ -9,7 +9,14 @@ from types import MappingProxyType
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from chartreux.core.llm.thinking_levels import (
     ANTHROPIC_THINKING_LEVELS,
@@ -85,6 +92,11 @@ class ProviderDefinition(_FrozenCatalogModel):
     @classmethod
     def freeze_extra_headers(cls, value: Mapping[str, str]) -> Mapping[str, str]:
         return MappingProxyType(dict(value))
+
+    @field_serializer("extra_headers")
+    @classmethod
+    def serialize_extra_headers(cls, value: Mapping[str, str]) -> dict[str, str]:
+        return dict(value)
 
 
 class Prices(_FrozenCatalogModel):

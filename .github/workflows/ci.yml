@@ -83,24 +83,43 @@ jobs:
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
 
+      - name: Restore installed-contract wheelhouse
+        id: wheelhouse-cache
+        uses: actions/cache/restore@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        with:
+          path: .wheelhouse
+          key: wheelhouse-${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-${{ hashFiles('uv.lock') }}-${{ hashFiles('pyproject.toml') }}
+
       - name: Provision installed-contract wheelhouse
         run: |
-          wheelhouse="$RUNNER_TEMP/wheelhouse"
+          wheelhouse=".wheelhouse"
           mkdir -p "$wheelhouse"
           uv export --frozen --no-dev --no-emit-project --format requirements.txt \
             --output-file "$RUNNER_TEMP/runtime-requirements.txt"
-          python -m pip download --only-binary=:all: \
-            --requirement "$RUNNER_TEMP/runtime-requirements.txt" \
-            --dest "$wheelhouse"
-          python -c 'import tomllib; from pathlib import Path; print(*tomllib.loads(Path("pyproject.toml").read_text())["build-system"]["requires"], sep="\n")' \
-            > "$RUNNER_TEMP/build-requirements.txt"
-          python -m pip download --only-binary=:all: \
-            --requirement "$RUNNER_TEMP/build-requirements.txt" \
-            --dest "$wheelhouse"
+          wheel_count=$(find "$wheelhouse" -maxdepth 1 -type f -name '*.whl' | wc -l)
+          if [ "$wheel_count" -gt 0 ]; then
+            echo "Using cached wheelhouse ($wheel_count wheels)."
+          else
+            python -m pip download --only-binary=:all: \
+              --requirement "$RUNNER_TEMP/runtime-requirements.txt" \
+              --dest "$wheelhouse"
+            python -c 'import tomllib; from pathlib import Path; print(*tomllib.loads(Path("pyproject.toml").read_text())["build-system"]["requires"], sep="\n")' \
+              > "$RUNNER_TEMP/build-requirements.txt"
+            python -m pip download --only-binary=:all: \
+              --requirement "$RUNNER_TEMP/build-requirements.txt" \
+              --dest "$wheelhouse"
+          fi
+
+      - name: Save installed-contract wheelhouse
+        if: steps.wheelhouse-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        with:
+          path: .wheelhouse
+          key: wheelhouse-${{ runner.os }}-python-${{ env.PYTHON_VERSION }}-${{ hashFiles('uv.lock') }}-${{ hashFiles('pyproject.toml') }}
 
       - name: Run tests
         env:
-          UV_FIND_LINKS: ${{ runner.temp }}/wheelhouse
+          UV_FIND_LINKS: ${{ github.workspace }}/.wheelhouse
         run: uv run --no-sync pytest --ignore tests/snapshots
 
   snapshot-tests:

@@ -8,6 +8,7 @@ import json
 import socket
 import time
 from types import TracebackType
+from typing import cast
 from unittest.mock import AsyncMock, patch
 import urllib.parse
 
@@ -16,7 +17,7 @@ import keyring
 from keyring.backend import KeyringBackend
 import keyring.backends.fail
 import keyring.errors
-from mcp.client.auth import OAuthFlowError
+from mcp.client.auth import OAuthClientProvider, OAuthFlowError
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyUrl
 import pytest
@@ -706,12 +707,14 @@ class TestRefreshAwareProviderThroughHttpxFlow:
             access_token="EXPIRED", token_type="Bearer", refresh_token="REFRESH"
         )
         provider.context.token_expiry_time = time.time() - 60
-        provider._initialized = True
+        cast(OAuthClientProvider, provider)._initialized = True
         return provider
 
     async def _drive_refresh(self, provider: RefreshAwareOAuthClientProvider) -> None:
         async with httpx.AsyncClient() as client:
-            await client.get("https://mcp.sentry.dev/mcp", auth=provider)
+            await client.get(
+                "https://mcp.sentry.dev/mcp", auth=cast(OAuthClientProvider, provider)
+            )
 
     @respx.mock
     @pytest.mark.asyncio
@@ -732,7 +735,7 @@ class TestRefreshAwareProviderThroughHttpxFlow:
         provider.context.current_tokens = None
         provider.context.client_info = None
         provider.context.token_expiry_time = None
-        provider._initialized = False
+        cast(OAuthClientProvider, provider)._initialized = False
         refresh = respx.post("https://mcp.sentry.dev/token").mock(
             return_value=httpx.Response(
                 200,

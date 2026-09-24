@@ -2145,11 +2145,15 @@ class ChartreuxApp(App):  # noqa: PLR0904
         await self._show_custom_tools_deprecation_warning()
 
     async def _deferred_resume_and_start(self) -> None:
+        logger.debug("Startup resume stage=initial-history-started")
         try:
             await self._resume_history_from_messages()
+            logger.debug("Startup resume stage=initial-transcript-rebuilt")
             await self._queue.sync_server_queue(self.app_server.turn_queue)
+            logger.debug("Startup resume stage=initial-queue-synced")
         finally:
             self._initial_history_loaded.set()
+            logger.debug("Startup resume stage=initial-history-ready")
         self._app_server_events_worker = self.run_worker(
             self._listen_app_server_events(), exclusive=False
         )
@@ -2664,6 +2668,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._queue.notify_busy_changed()
             if not notify_complete:
                 return
+            if self.event_handler:
+                self.event_handler.clear_tool_call_anchors()
             await self._refresh_windowing_from_history()
             self._terminal_notifier.notify(NotificationContext.COMPLETE)
 
@@ -3336,7 +3342,12 @@ class ChartreuxApp(App):  # noqa: PLR0904
             # Resume failed before rebinding, so the session is unchanged; drop a
             # stale preview so it isn't left on screen desynced from session_id.
             if was_previewing:
-                await self._rebuild_transcript_from_current_session()
+                try:
+                    await self._rebuild_transcript_from_current_session()
+                except Exception:
+                    logger.exception(
+                        "Failed to rebuild transcript after resume failure"
+                    )
             else:
                 self.run_worker(
                     self._show_custom_tools_deprecation_warning_after_initial_history(),
@@ -3430,7 +3441,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._resume_ui_ready.clear()
         try:
             await self.app_server.resume(session_id)
+            logger.debug("Resume stage=rpc-returned session_id=%s", session_id)
             await self._reset_presentation_after_resume()
+            logger.debug("Resume stage=presentation-reset session_id=%s", session_id)
         finally:
             # A failed resume leaves the attached session and its presentation
             # untouched. Either way, release events that arrived during the RPC.
@@ -3443,10 +3456,13 @@ class ChartreuxApp(App):  # noqa: PLR0904
         # picker preview, which may have been skipped, may have failed, or may show
         # a different session than the one that was confirmed.
         await self._rebuild_transcript_from_current_session()
+        logger.debug("Resume stage=transcript-rebuilt session_id=%s", session_id)
         await self._queue.sync_server_queue(self.app_server.turn_queue)
+        logger.debug("Resume stage=queue-synced session_id=%s", session_id)
         await self._mount_and_scroll(
             UserCommandMessage(f"Resumed session `{session_id[:8]}`")
         )
+        logger.debug("Resume stage=mounted session_id=%s", session_id)
         # Fast resume returns from the resume RPC before MCP init
         # finishes, so defer post-init notices to the background until the
         # resumed runtime settles instead of racing incomplete state here.
@@ -3542,7 +3558,13 @@ class ChartreuxApp(App):  # noqa: PLR0904
             logger.exception(
                 "Failed to auto-resume session %s", session_id or "<unknown>"
             )
-            await self._rebuild_transcript_from_current_session()
+            try:
+                await self._rebuild_transcript_from_current_session()
+            except Exception:
+                # Rebuilding can itself fail when the resume lost its connection
+                # or the UI is reconciling queued events. Always mount the resume
+                # failure so startup cannot leave an empty chat screen.
+                logger.exception("Failed to rebuild transcript after resume failure")
             await self._mount_and_scroll(
                 ErrorMessage(
                     f"Failed to resume session: {e}", collapsed=self._tools_collapsed

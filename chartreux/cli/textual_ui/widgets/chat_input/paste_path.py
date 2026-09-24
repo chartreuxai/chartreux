@@ -54,14 +54,14 @@ def rewrite_bare_image_paths_in_text(text: str) -> str:
 def _is_image_file(candidate: str) -> bool:
     try:
         resolved = Path(candidate).expanduser()
-    except RuntimeError:
-        # `~unknownuser/...` raises when the user cannot be resolved.
+        return (
+            resolved.is_absolute()
+            and resolved.suffix.lower() in IMAGE_EXTENSIONS
+            and resolved.is_file()
+        )
+    except (OSError, RuntimeError):
+        # Filesystem errors and `~unknownuser/...` are not attachment candidates.
         return False
-    return (
-        resolved.is_absolute()
-        and resolved.suffix.lower() in IMAGE_EXTENSIONS
-        and resolved.is_file()
-    )
 
 
 def _path_mention(text: str) -> str | None:
@@ -72,9 +72,9 @@ def _path_mention(text: str) -> str | None:
         return None
     try:
         path = Path(candidate).expanduser()
-    except RuntimeError:
-        return None
-    if not path.is_absolute() or not path.exists():
+        if not path.is_absolute() or not path.exists():
+            return None
+    except (OSError, RuntimeError):
         return None
     return f"@{_quote_if_needed(candidate)}"
 

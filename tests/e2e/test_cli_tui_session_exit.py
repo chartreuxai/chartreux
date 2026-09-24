@@ -140,7 +140,9 @@ def test_resumed_session_prints_only_fresh_token_usage_on_exit(
     setup_e2e_env: None,
     e2e_workdir: Path,
     spawned_vibe_process: SpawnedChartreuxProcessFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("DEBUG_MODE", "true")
     with spawned_vibe_process(e2e_workdir) as (child, captured):
         wait_for_main_screen(child, timeout=15)
         child.send("First run")

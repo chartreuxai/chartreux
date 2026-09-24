@@ -99,7 +99,12 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
         child.send("\r")
 
         wait_for_rendered_text(child, captured, "Choose a provider", timeout=10)
-        _send_and_wait_for_text(child, "\t\r", "Preset", timeout=25)
+        # Let the provider screen finish mounting/focusing before navigating.
+        # Sending Tab and Enter in one PTY write can race the screen transition.
+        drain_child_output(child, captured, idle_sleep=0.1)
+        child.send("\t")
+        drain_child_output(child, captured, idle_sleep=0.1)
+        _send_and_wait_for_text(child, "\r", "Preset", timeout=25)
 
         _send_and_wait_for_text(child, "\t\t", "Generic OpenAI-style")
         child.sendcontrol("a")

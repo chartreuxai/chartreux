@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterator
 import hashlib
 import importlib.util
 import inspect
+import json
 from pathlib import Path
 import re
 import sys
@@ -121,6 +122,11 @@ class ToolManager:
         self._authority_retired = False
         self._search_paths: list[Path] = self._compute_search_paths(self._config)
         self._lock = threading.Lock()
+        self._available_tool_specs_cache_lock = threading.Lock()
+        self._available_tool_specs_cache_key: (
+            frozenset[tuple[str, type[BaseTool], type[Any], str, str | None]] | None
+        ) = None
+        self._available_tool_specs_cache: dict[str, str] = {}
         self._mcp_integrated = False
 
         self._tool_variants_by_name: dict[str, list[type[BaseTool]]] = {}
@@ -704,21 +710,54 @@ class ToolManager:
         """Model-facing definitions for every available tool: name, resolved
         description, and parameters.
 
-        The description comes from a ``<tools-dir>/prompts/<name>.md`` file when
-        present (builtin defaults, custom-tool descriptions, and user/project
-        overrides all live there), falling back to the tool's own description
-        (e.g. MCP/connector tools set it inline). Both the LLM tool formatter and
-        the session logger consume this so a tool always looks the same to the
-        model and in the logs.
+        Cache JSON schemas by the currently available tool classes, their argument
+        models, resolved descriptions, and (for MCP tools) live input schemas. The
+        active set is recomputed first, so configuration filters, MCP changes, and
+        parent authority changes remain visible. Copy schemas on return because
+        consumers may mutate them. The key captures tool names, classes,
+        argument-model classes, descriptions, and live remote parameter-schema
+        content; future ``get_parameters`` dependencies on other mutable state must
+        extend the key to avoid serving stale schemas.
         """
+        tool_inputs = {
+            name: (
+                cls,
+                cls._get_tool_args_results()[0],
+                self._tool_descriptions.get(name) or cls.get_full_description(),
+                (
+                    json.dumps(
+                        cls.get_parameters(), sort_keys=True, separators=(",", ":")
+                    )
+                    if self._is_remote_tool_class(cls)
+                    else None
+                ),
+            )
+            for name, cls in self.available_tools.items()
+        }
+        cache_key = frozenset(
+            (name, cls, args_model, description, schema_state)
+            for name, (
+                cls,
+                args_model,
+                description,
+                schema_state,
+            ) in tool_inputs.items()
+        )
+        with self._available_tool_specs_cache_lock:
+            if cache_key != self._available_tool_specs_cache_key:
+                self._available_tool_specs_cache = {
+                    name: json.dumps(cls.get_parameters(), separators=(",", ":"))
+                    for name, (cls, _, _, _) in tool_inputs.items()
+                }
+                self._available_tool_specs_cache_key = cache_key
+            cached_specs = self._available_tool_specs_cache
         return [
             AvailableFunction(
                 name=name,
-                description=self._tool_descriptions.get(name)
-                or cls.get_full_description(),
-                parameters=cls.get_parameters(),
+                description=description,
+                parameters=json.loads(cached_specs[name]),
             )
-            for name, cls in self.available_tools.items()
+            for name, (_, _, description, _) in tool_inputs.items()
         ]
 
     def get_tool_config(self, tool_name: str) -> BaseToolConfig:
