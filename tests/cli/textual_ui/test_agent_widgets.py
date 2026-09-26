@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 from unittest.mock import patch
 
@@ -96,6 +97,30 @@ async def test_expanded_list_filters_released_and_keeps_evicted_metadata() -> No
             and "result expired" in rendered
             and "evicted: ttl" in rendered
         )
+
+
+@pytest.mark.asyncio
+async def test_browser_click_markers_distinguish_expand_and_selection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    app = _BrowserApp()
+    with caplog.at_level(logging.DEBUG, logger="vibe"):
+        async with app.run_test() as pilot:
+            app.bar.update_agents((_agent("one"),))
+            await pilot.pause()
+            await pilot.click(app.bar, offset=(1, 0))
+            await pilot.pause()
+            await pilot.click(app.bar, offset=(1, 2))
+            await pilot.pause()
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("phase=expand-start" in text for text in messages)
+    assert any("phase=expand-done" in text for text in messages)
+    assert any(
+        "phase=row-select-start" in text and "target=one" in text for text in messages
+    )
+    assert any(
+        "phase=row-select-posted" in text and "target=one" in text for text in messages
+    )
 
 
 class _BrowserApp(App[None]):

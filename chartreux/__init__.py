@@ -9,4 +9,4 @@ from pathlib import Path
 os.environ.setdefault("PYDANTIC_ERRORS_INCLUDE_URL", "0")
 
 CHARTREUX_ROOT = Path(__file__).parent
-__version__ = "0.1.1"
+__version__ = "0.2.0"

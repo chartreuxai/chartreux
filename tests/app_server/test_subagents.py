@@ -4286,6 +4286,11 @@ async def test_direct_runner_enforces_effective_task_admission(
         tools["task"] = {"permission": ToolPermission.NEVER.value}
         denied_config = parent.tool_manager._config.model_copy(update={"tools": tools})
     monkeypatch.setattr(parent.tool_manager, "_config_getter", lambda: denied_config)
+    # The mocked policy replacement must also advance the accepted authority signal.
+    accepted_revision = object()
+    monkeypatch.setattr(
+        parent.tool_manager, "_accepted_token_getter", lambda: accepted_revision
+    )
     try:
         with pytest.raises(ToolPermissionError, match=f"Task tool .*{admission}"):
             await _background_result(

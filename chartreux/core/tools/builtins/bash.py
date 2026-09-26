@@ -696,6 +696,24 @@ def completed_shell_result(
     )
 
 
+def _shell_output_byte_limit(max_chars: int) -> int:
+    # UTF-32 can use four bytes per displayed character; retain the BOM too.
+    return max(0, max_chars) * 4 + 4
+
+
+async def _drain_shell_stream(
+    stream: asyncio.StreamReader | None, max_chars: int
+) -> bytes:
+    if stream is None:
+        return b""
+    limit = _shell_output_byte_limit(max_chars)
+    collected = bytearray()
+    while chunk := await stream.read(64 * 1024):
+        if len(collected) < limit:
+            collected.extend(chunk[: limit - len(collected)])
+    return bytes(collected)
+
+
 class Bash(
     BaseTool[BashArgs, CapturedShellResult, BashToolConfig, BaseToolState],
     ToolUIData[BashArgs, CapturedShellResult],
@@ -1091,19 +1109,24 @@ class Bash(
             proc = await spawn_shell_command(args.command, cwd=self.cwd)
 
             try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
+                stdout_bytes, stderr_bytes, _ = await asyncio.wait_for(
+                    asyncio.gather(
+                        _drain_shell_stream(proc.stdout, max_bytes),
+                        _drain_shell_stream(proc.stderr, max_bytes),
+                        proc.wait(),
+                    ),
+                    timeout=timeout,
                 )
             except TimeoutError:
                 await kill_async_subprocess(proc)
                 raise self._build_timeout_error(args.command, timeout)
 
-            stdout = (
-                decode_console_safe(stdout_bytes)[:max_bytes] if stdout_bytes else ""
+            stdout, stderr = await asyncio.gather(
+                asyncio.to_thread(decode_console_safe, stdout_bytes),
+                asyncio.to_thread(decode_console_safe, stderr_bytes),
             )
-            stderr = (
-                decode_console_safe(stderr_bytes)[:max_bytes] if stderr_bytes else ""
-            )
+            stdout = stdout[:max_bytes]
+            stderr = stderr[:max_bytes]
 
             yield completed_shell_result(
                 command=args.command,

@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 
 from chartreux.core.config import MCPStdio
-from chartreux.core.tools.base import BaseToolConfig, ToolPermission
+from chartreux.core.config._restrictions import SourceRestrictions, ToolRestriction
+from chartreux.core.tools.base import (
+    BaseToolConfig,
+    ToolPermission,
+    ToolPermissionError,
+)
 from chartreux.core.tools.manager import NoSuchToolError, ToolManager
 from chartreux.core.tools.mcp.tools import RemoteTool, create_mcp_stdio_proxy_tool_class
 from tests.conftest import build_test_vibe_config
@@ -617,3 +622,285 @@ async def test_mcp_collisions_use_variant_precedence_and_preserve_builtins():
     assert "web_search" not in manager._instances
     assert manager._tool_variants_by_name["web_search"] == [WebSearch]
     assert manager._tool_variants_by_name["read_image"] == [ReadImage]
+
+
+@pytest.mark.asyncio
+async def test_versioned_registry_reconfiguration_withdraws_cached_selection():
+    server = MCPStdio(name="demo", transport="stdio", command="echo")
+    proxy = create_mcp_stdio_proxy_tool_class(
+        command=["echo"], remote=RemoteTool(name="search"), alias="demo"
+    )
+    registry = _CollidingMCPRegistry({"demo_search": proxy})
+    config = build_test_vibe_config(mcp_servers=[server])
+    manager = ToolManager(
+        lambda: config,
+        mcp_registry=registry,
+        defer_mcp=True,
+        accepted_token_getter=lambda: "unchanged",
+    )
+    await manager._integrate_mcp_async()
+    assert manager._available_tool("demo_search") is proxy
+    assert manager._available_tool("demo_search") is proxy
+    registry.tools = {}
+    await manager.reconfigure_mcp_async()
+    assert manager._available_tool("demo_search") is None
+
+
+def _restriction(name: str, *, denied: bool = False) -> SourceRestrictions:
+    return SourceRestrictions(
+        layer_name="user",
+        locator="test",
+        kind="source",
+        content_fingerprint=name,
+        store_fingerprint=None,
+        tools=(ToolRestriction("grep", denied, (name,), ()),),
+    )
+
+
+def test_versioned_authority_inputs_invalidate_without_aliasing(tmp_path: Path):
+    config = [build_test_vibe_config(tools={"grep": {"permission": "always"}})]
+    accepted = [object()]
+    restrictions = [(_restriction("*first*"),)]
+    calls = [0]
+
+    def get_config():
+        calls[0] += 1
+        return config[0]
+
+    manager = ToolManager(
+        get_config,
+        cwd=tmp_path,
+        restriction_getter=lambda: restrictions[0],
+        accepted_token_getter=lambda: accepted[0],
+    )
+    grep = manager.get("grep")
+    first = grep.config
+    calls[0] = 0
+    first.denylist.clear()
+    assert grep.config.denylist == ["*first*"]
+    assert calls[0] == 0
+    first_workspace = manager.workspace
+    assert manager.workspace is first_workspace
+
+    # A restriction-only publication changes the revision even when config does not.
+    restrictions[0] = (_restriction("*second*"),)
+    accepted[0] = object()
+    assert grep.config.denylist == ["*second*"]
+    assert calls[0] > 0
+    config[0] = build_test_vibe_config(tools={"grep": {"permission": "never"}})
+    accepted[0] = object()
+    assert grep.config.permission == ToolPermission.NEVER
+    assert manager.workspace is not first_workspace
+    manager.set_scratchpad_dir(tmp_path / "scratch")
+    assert grep.scratchpad_dir == tmp_path / "scratch"
+    assert manager._effective_authority_token() != accepted[0]
+    manager._retire_authority()
+    with pytest.raises(ToolPermissionError):
+        _ = grep.config
+
+
+def test_ancestor_token_and_replacement_invalidate_child_cache(tmp_path: Path):
+    config = build_test_vibe_config(tools={"grep": {"permission": "always"}})
+    tokens = [[object()] for _ in range(3)]
+    roots = [
+        ToolManager(
+            lambda: config, cwd=tmp_path, accepted_token_getter=lambda i=i: tokens[i][0]
+        )
+        for i in range(3)
+    ]
+    # A three-level chain; replacement must be observed without refreshing descendants.
+    roots[1]._parent_authority_getter = lambda: roots[0]
+    roots[2]._parent_authority_getter = lambda: roots[1]
+    child = roots[2]
+    assert child.get_tool_config("grep").permission == ToolPermission.ALWAYS
+    roots[0]._inherited_restrictions = (_restriction("*ancestor*", denied=True),)
+    tokens[0][0] = object()
+    assert child.get_tool_config("grep").permission == ToolPermission.NEVER
+    replacement = ToolManager(
+        lambda: config, cwd=tmp_path, accepted_token_getter=lambda: object_token[0]
+    )
+    object_token = [object()]
+    roots[0] = replacement
+    assert child.get_tool_config("grep").permission == ToolPermission.ALWAYS
+    replacement._retire_authority()
+    assert child.get_tool_config("grep").permission == ToolPermission.NEVER
+    roots.clear()
+    assert child._effective_authority_token() is None
+
+
+def test_failed_revision_signal_never_serves_cached_allow(tmp_path: Path):
+    config = build_test_vibe_config(tools={"grep": {"permission": "always"}})
+    token = [object()]
+
+    def revision():
+        if token[0] is None:
+            raise RuntimeError("revision unavailable")
+        return token[0]
+
+    parent = [ToolManager(lambda: config, cwd=tmp_path, accepted_token_getter=revision)]
+    manager = ToolManager(
+        lambda: config,
+        cwd=tmp_path,
+        accepted_token_getter=lambda: 1,
+        parent_authority_getter=lambda: parent[0],
+    )
+    assert manager._available_tool("grep") is not None
+    token[0] = None
+    parent[0]._retire_authority()
+    assert manager._available_tool("grep") is None
+    assert manager.get_tool_config("grep").permission == ToolPermission.NEVER
+    parent.clear()
+    assert manager._available_tool("grep") is None
+
+
+def test_unversioned_availability_predicate_stays_live(tmp_path: Path):
+    from chartreux.core.tools.builtins.grep import Grep
+
+    enabled = [True]
+
+    class ConditionalGrep(Grep):
+        @classmethod
+        def is_available(cls, config=None):
+            return enabled[0]
+
+    manager = ToolManager(
+        lambda: build_test_vibe_config(),
+        cwd=tmp_path,
+        accepted_token_getter=lambda: "stable",
+    )
+    with manager._lock:
+        manager._tool_variants_by_name["grep"] = [ConditionalGrep]
+        manager._all_tools["grep"] = ConditionalGrep
+        manager._registry_generation += 1
+    assert manager._available_tool("grep") is ConditionalGrep
+    enabled[0] = False
+    assert manager._available_tool("grep") is None
+
+
+def test_single_name_resolution_never_enumerates_registry(monkeypatch, tmp_path: Path):
+    from chartreux.core.tools.builtins.grep import Grep, GrepArgs
+
+    config = build_test_vibe_config(tools={"grep": {"permission": "always"}})
+    parent = ToolManager(lambda: config, cwd=tmp_path)
+    child = ToolManager(
+        lambda: config, cwd=tmp_path, parent_authority_getter=lambda: parent
+    )
+
+    def no_registry(_self):
+        raise AssertionError("whole registry enumerated for one tool")
+
+    monkeypatch.setattr(ToolManager, "available_tools", property(no_registry))
+    tool = child.get("grep")
+    assert type(tool) is Grep
+    assert child.get_tool_config("grep").permission == ToolPermission.ALWAYS
+    assert (
+        tool.resolve_permission(GrepArgs(pattern="x", path=str(tmp_path))) is not None
+    )
+
+
+def test_cached_and_uncached_policy_agree_across_paths_and_ancestors(tmp_path: Path):
+    from chartreux.core.tools.builtins.grep import GrepArgs
+    from chartreux.core.workspace import Workspace
+
+    config = build_test_vibe_config(
+        tools={
+            "grep": {
+                "permission": "always",
+                "allowlist": ["*"],
+                "denylist": ["*blocked*"],
+                "sensitive_patterns": ["*secret*"],
+            }
+        }
+    )
+    parent_config = build_test_vibe_config(
+        tools={
+            "grep": {
+                "permission": "always",
+                "denylist": ["*parent*"],
+                "sensitive_patterns": ["*private*"],
+            }
+        }
+    )
+    ceiling = Workspace.for_session(tmp_path)
+    accepted_parent = ToolManager(
+        lambda: parent_config, cwd=tmp_path, accepted_token_getter=lambda: "parent"
+    )
+    uncached_parent = ToolManager(lambda: parent_config, cwd=tmp_path)
+    cached = ToolManager(
+        lambda: config,
+        cwd=tmp_path,
+        inherited_workspace=ceiling,
+        accepted_token_getter=lambda: "child",
+        parent_authority_getter=lambda: accepted_parent,
+    )
+    uncached = ToolManager(
+        lambda: config,
+        cwd=tmp_path,
+        inherited_workspace=ceiling,
+        parent_authority_getter=lambda: uncached_parent,
+    )
+    tool = cached.get("grep")
+    baseline = uncached.get("grep")
+    for path in (
+        "ok.txt",
+        "blocked.txt",
+        "parent.txt",
+        "secret.txt",
+        "private.txt",
+        "../outside.txt",
+    ):
+        args = GrepArgs(pattern="x", path=str(tmp_path / path))
+        for _ in range(2):
+            left, right = (
+                tool.resolve_permission(args),
+                baseline.resolve_permission(args),
+            )
+            assert left is not None and right is not None
+            assert left.permission == right.permission
+    # No path decision is memoized: filesystem state is checked on each call.
+    assert cached.workspace is cached.workspace
+    cached._inherited_workspace = Workspace.for_session(tmp_path / "narrow")
+    assert cached.workspace.ceiling == cached._inherited_workspace
+    assert cached.workspace is not uncached.workspace
+
+
+def test_revision_failure_recomputes_live_inputs(tmp_path: Path):
+    config = [build_test_vibe_config(tools={"grep": {"permission": "always"}})]
+    revision = [object()]
+
+    def get_revision():
+        if revision[0] is None:
+            raise RuntimeError("unavailable")
+        return revision[0]
+
+    manager = ToolManager(
+        lambda: config[0], cwd=tmp_path, accepted_token_getter=get_revision
+    )
+    assert manager.get_tool_config("grep").permission == ToolPermission.ALWAYS
+    config[0] = build_test_vibe_config(tools={"grep": {"permission": "never"}})
+    revision[0] = None
+    assert manager.get_tool_config("grep").permission == ToolPermission.NEVER
+
+
+def test_snapshot_never_publishes_mixed_generations(tmp_path: Path):
+    config = build_test_vibe_config(tools={"grep": {"permission": "always"}})
+    token = [object()]
+    change = [False]
+
+    def get_config():
+        if change[0]:
+            token[0] = object()
+        return config
+
+    manager = ToolManager(
+        get_config, cwd=tmp_path, accepted_token_getter=lambda: token[0]
+    )
+    assert manager.get_tool_config("grep").permission == ToolPermission.ALWAYS
+    token[0] = object()
+    change[0] = True
+    with pytest.raises(NoSuchToolError, match="authority changed"):
+        manager.get_tool_config("grep")
+    change[0] = False
+    config.tools["grep"]["permission"] = "never"
+    token[0] = object()
+    assert manager.get_tool_config("grep").permission == ToolPermission.NEVER

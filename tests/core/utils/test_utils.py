@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -244,6 +245,27 @@ class TestReadSafeResultEncoding:
 
 
 class TestReadSafeAsync:
+    @pytest.mark.asyncio
+    async def test_decode_runs_off_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "large.txt"
+        path.write_bytes(b"a\r\n" * (1024 * 1024))
+        loop_thread = threading.get_ident()
+        original = io_utils.decode_safe
+        decode_threads: list[int] = []
+
+        def checked_decode(raw: bytes, *, raise_on_error: bool = False):
+            decode_threads.append(threading.get_ident())
+            return original(raw, raise_on_error=raise_on_error)
+
+        monkeypatch.setattr(io_utils, "decode_safe", checked_decode)
+        result = await read_safe_async(path, raise_on_error=True)
+
+        assert result.newline == "\r\n"
+        assert result.text.startswith("a\n")
+        assert decode_threads and all(t != loop_thread for t in decode_threads)
+
     @pytest.mark.asyncio
     async def test_raise_on_error_final_utf8_strict_or_replace(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

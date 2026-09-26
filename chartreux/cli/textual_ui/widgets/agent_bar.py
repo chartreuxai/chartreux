@@ -15,6 +15,7 @@ from textual.timer import Timer
 from chartreux.app_server.protocol import AgentEvictionModel, AgentSummaryModel
 from chartreux.cli.textual_ui.widgets.spinner import create_spinner
 from chartreux.model_display import format_model_display_name
+from chartreux.observability.logging import logger
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
 
@@ -168,16 +169,29 @@ class AgentBar(VerticalScroll):
 
     def on_click(self, event: events.Click) -> None:
         if not self._expanded:
+            logger.debug("Agent bar click phase=expand-start row=%d", event.y)
             self.open_browser()
+            logger.debug("Agent bar click phase=expand-done row=%d", event.y)
             return
         row = event.y
         if row <= 0:
+            logger.debug("Agent bar click phase=header row=%d", row)
             return
         ids = (None, *(agent.agent_id for agent in self.agents))
         if row - 1 < len(ids):
+            logger.debug(
+                "Agent bar click phase=row-select-start row=%d target=%s",
+                row,
+                ids[row - 1],
+            )
             self._selected_agent_id = ids[row - 1]
             self._render_agents()
             self.action_select()
+            logger.debug(
+                "Agent bar click phase=row-select-posted row=%d target=%s",
+                row,
+                self._selected_agent_id,
+            )
 
     def _move_selection(self, offset: int) -> None:
         ids = (None, *(agent.agent_id for agent in self.agents))

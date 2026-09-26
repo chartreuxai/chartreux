@@ -28,6 +28,7 @@ from textual.dom import NoScreen
 from textual.driver import Driver
 from textual.events import AppBlur, AppFocus, MouseScrollDown, MouseScrollUp, MouseUp
 from textual.screen import Screen
+from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Static
 from textual.worker import Worker, WorkerError, WorkerFailed, WorkerState
@@ -177,6 +178,7 @@ from chartreux.cli.textual_ui.windowing import (
 from chartreux.cli.textual_ui.windowing.transcript import TranscriptWindow
 from chartreux.config_values import FALLBACK_THEME
 from chartreux.observability.logging import (
+    get_effective_log_level,
     get_log_level_chain,
     logger,
     set_config_log_level,
@@ -215,6 +217,7 @@ _RETRYABLE_TURN_ERROR_CODES = {
 _MAX_INCOMPLETE_STREAM_RETRIES = 2
 _INTERRUPT_WAIT_TIMEOUT = 2.0
 _INTERRUPT_SETTLE_TIMEOUT = 30.0
+_DIAGNOSTIC_HEARTBEAT_DRIFT_WARNING_SECONDS = 0.25
 _INTERRUPT_STILL_STOPPING_WARNING = (
     "The turn is still stopping. New turns will wait until it has fully stopped."
 )
@@ -832,6 +835,13 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._agent_transcript_viewer: AgentTranscriptViewer | None = None
         self._agent_transcript_focus_target: Widget | None = None
         self._agent_transcript_epoch = 0
+        self._agent_selection_target: str | None = None
+        self._agent_selection_generation = 0
+        self._agent_transition_task: asyncio.Task[None] | None = None
+        self._agent_close_restore_focus = True
+        self._diagnostic_heartbeat_timer: Timer | None = None
+        self._diagnostic_last_heartbeat = 0.0
+        self._diagnostic_max_heartbeat_drift = 0.0
         self._agent_transcript_parent_id: str | None = None
         self._debug_console: DebugConsole | None = None
         self._rewind_mode = False
@@ -1144,6 +1154,13 @@ class ChartreuxApp(App):  # noqa: PLR0904
         return self._cached_loading_area
 
     async def on_mount(self) -> None:
+        # /log-level changes after mount affect the handler immediately, but
+        # heartbeat creation is mount-time only; remount to change timer state.
+        if get_effective_log_level() == "DEBUG":
+            self._diagnostic_last_heartbeat = time.monotonic()
+            self._diagnostic_heartbeat_timer = self.set_interval(
+                0.5, self._record_diagnostic_heartbeat
+            )
         if self._app_server is None and self._start_app_server is not None:
             init = self._initial_config_response
             initial_theme = init.config.theme if init is not None else FALLBACK_THEME
@@ -1155,6 +1172,29 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 self._start_bootstrap_session()
             return
         await self._mount_after_session_ready()
+
+    def _record_diagnostic_heartbeat(self) -> None:
+        now = time.monotonic()
+        drift = now - self._diagnostic_last_heartbeat - 0.5
+        self._diagnostic_last_heartbeat = now
+        self._diagnostic_max_heartbeat_drift = max(
+            self._diagnostic_max_heartbeat_drift, drift
+        )
+        if drift > _DIAGNOSTIC_HEARTBEAT_DRIFT_WARNING_SECONDS:
+            logger.debug(
+                "App heartbeat drift: %.3fs selection_generation=%d target=%s",
+                drift,
+                self._agent_selection_generation,
+                self._agent_selection_target,
+            )
+
+    def on_unmount(self) -> None:
+        if self._diagnostic_heartbeat_timer is not None:
+            self._diagnostic_heartbeat_timer.stop()
+            self._diagnostic_heartbeat_timer = None
+            logger.debug(
+                "App max heartbeat drift: %.3fs", self._diagnostic_max_heartbeat_drift
+            )
 
     def _start_bootstrap_session(self) -> None:
         self.run_worker(self._bootstrap_session(), exclusive=False)
@@ -2645,12 +2685,15 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def _handle_turn_event(self, event: AppServerEvent) -> None:
         if isinstance(event, AgentsUpdate):
             viewer = self._agent_transcript_viewer
-            if viewer is not None and not any(
-                agent.agent_id == viewer.agent_id for agent in event.agents
+            selected_id = self._agent_selection_target or (
+                viewer.agent_id if viewer is not None else None
+            )
+            if selected_id is not None and not any(
+                agent.agent_id == selected_id for agent in event.agents
             ):
                 # Releases remove the agent from published summaries. Evictions
                 # remain tombstones in that list and therefore stay browsable.
-                await self._close_agent_transcript_viewer(restore_focus=True)
+                await self._request_agent_transcript_close(restore_focus=True)
             self._agent_summaries = event.agents
             self._agent_evictions.update({
                 eviction.agent_id: eviction for eviction in event.evictions
@@ -2764,8 +2807,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     async def _prepare_main_turn_view(self) -> None:
         """Return to the conversation before a newly started main turn streams."""
-        if self._agent_transcript_viewer is not None:
-            await self._close_agent_transcript_viewer(restore_focus=False)
+        if (
+            self._agent_transcript_viewer is not None
+            or self._agent_selection_target is not None
+        ):
+            await self._request_agent_transcript_close(restore_focus=False)
             if self._chat_input_container is not None:
                 self._chat_input_container.focus_input()
 
@@ -3790,7 +3836,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     async def _resume_local_session(self, session_id: str) -> None:
         self._exit_picker_preview()
-        await self._close_agent_transcript_viewer(restore_focus=False)
+        await self._request_agent_transcript_close(restore_focus=False)
         self._resume_ui_ready.clear()
         try:
             await self.app_server.resume(session_id)
@@ -4126,7 +4172,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         await self._messages_area.remove_children()
 
     async def _clear_history(self, cmd_args: str = "", **kwargs: Any) -> None:
-        await self._close_agent_transcript_viewer(restore_focus=False)
+        await self._request_agent_transcript_close(restore_focus=False)
         old_session_id = self.app_server.session_id
         session_log = self.app_server.resources.runtime.session_log
         resumable = session_log.enabled and session_log.persisted
@@ -4716,7 +4762,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return
 
         old_session_id = self.app_server.session_id
-        await self._close_agent_transcript_viewer(restore_focus=False)
+        await self._request_agent_transcript_close(restore_focus=False)
         try:
             result = await self.app_server.resources.sessions.rewind(
                 entry_id, restore_files=restore_files, inplace=inplace
@@ -5105,59 +5151,180 @@ class ChartreuxApp(App):  # noqa: PLR0904
         elif self._chat_input_container is not None:
             self._chat_input_container.focus_input()
 
-    async def on_agent_bar_selection_requested(
+    def on_agent_bar_selection_requested(
         self, message: AgentBar.SelectionRequested
     ) -> None:
-        if message.agent_id is None:
-            await self._close_agent_transcript_viewer(restore_focus=True)
-            return
-        if self._app_server is None:
-            return
-        agent = next(
-            (
-                item
-                for item in self._agent_summaries
-                if item.agent_id == message.agent_id
-            ),
-            None,
+        self._submit_agent_selection(message.agent_id)
+
+    def _submit_agent_selection(self, agent_id: str | None) -> None:
+        self._agent_selection_generation += 1
+        self._agent_selection_target = agent_id
+        logger.debug(
+            "Agent selection phase=submitted generation=%d target=%s",
+            self._agent_selection_generation,
+            agent_id,
         )
-        if agent is None:
-            return
-        await self._close_agent_transcript_viewer(restore_focus=False)
-        self._agent_transcript_focus_target = self.screen.focused
-        self._agent_transcript_epoch += 1
-        self._agent_transcript_parent_id = self.app_server.session_id
-        viewer = AgentTranscriptViewer(
-            _AgentTranscriptSource(
-                self,
-                self.app_server.resources.sessions,
-                self._agent_transcript_epoch,
-                self._agent_transcript_parent_id,
-            ),
-            agent.agent_id,
-            profile=agent.profile,
-            live=agent_state(agent) == "running",
+        self._ensure_agent_transition()
+
+    def _ensure_agent_transition(self) -> None:
+        if self._agent_transition_task is None or self._agent_transition_task.done():
+            self._agent_transition_task = asyncio.create_task(
+                self._converge_agent_selection()
+            )
+
+    async def _converge_agent_selection(self) -> None:
+        while True:
+            generation = self._agent_selection_generation
+            target = self._agent_selection_target
+            logger.debug(
+                "Agent selection phase=transition-start generation=%d target=%s",
+                generation,
+                target,
+            )
+            try:
+                if target is None:
+                    await self._close_agent_transcript_viewer(
+                        restore_focus=self._agent_close_restore_focus, show_chat=True
+                    )
+                    if generation != self._agent_selection_generation:
+                        continue
+                    logger.debug(
+                        "Agent selection phase=closed generation=%d", generation
+                    )
+                    return
+                if self._app_server is None or not self.is_running:
+                    return
+                current = self._agent_transcript_viewer
+                if (
+                    current is not None
+                    and current.agent_id == target
+                    and current.is_mounted
+                ):
+                    break
+                agent = next(
+                    (item for item in self._agent_summaries if item.agent_id == target),
+                    None,
+                )
+                if agent is None:
+                    return
+                debug_timings = get_effective_log_level() == "DEBUG"
+                await self._close_agent_transcript_viewer(
+                    restore_focus=False, show_chat=False
+                )
+                if (
+                    generation != self._agent_selection_generation
+                    or not self.is_running
+                ):
+                    continue
+                self._agent_transcript_focus_target = self.screen.focused
+                self._agent_transcript_epoch += 1
+                self._agent_transcript_parent_id = self.app_server.session_id
+                viewer = AgentTranscriptViewer(
+                    _AgentTranscriptSource(
+                        self,
+                        self.app_server.resources.sessions,
+                        self._agent_transcript_epoch,
+                        self._agent_transcript_parent_id,
+                    ),
+                    agent.agent_id,
+                    profile=agent.profile,
+                    live=agent_state(agent) == "running",
+                )
+                self._agent_transcript_viewer = viewer
+                self._chat_widget.display = False
+                try:
+                    logger.debug(
+                        "Agent selection phase=mount-start generation=%d target=%s",
+                        generation,
+                        target,
+                    )
+                    mount_start = time.perf_counter() if debug_timings else 0.0
+                    await self.mount(viewer, before="#loading-area")
+                    if debug_timings:
+                        logger.debug(
+                            "Agent transcript mount took %.3fs generation=%d target=%s",
+                            time.perf_counter() - mount_start,
+                            generation,
+                            target,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to mount agent transcript viewer", exc_info=exc
+                    )
+                    self._agent_transcript_viewer = None
+                    self._agent_transcript_epoch += 1
+                    self._agent_transcript_parent_id = None
+                    if self._cached_chat is not None:
+                        self._cached_chat.display = True
+                    if generation != self._agent_selection_generation:
+                        continue
+                    return
+                await asyncio.sleep(0)
+                if generation != self._agent_selection_generation:
+                    continue
+                viewer.focus()
+                logger.debug(
+                    "Agent selection phase=ready generation=%d target=%s",
+                    generation,
+                    target,
+                )
+                return
+            except Exception as exc:
+                logger.warning("Agent selection transition failed", exc_info=exc)
+                if generation != self._agent_selection_generation:
+                    continue
+                return
+
+    async def _request_agent_transcript_close(
+        self, *, restore_focus: bool = True
+    ) -> None:
+        self._agent_selection_generation += 1
+        self._agent_selection_target = None
+        logger.debug(
+            "Agent selection phase=close-requested generation=%d",
+            self._agent_selection_generation,
         )
-        self._agent_transcript_viewer = viewer
-        self._chat_widget.display = False
-        await self.mount(viewer, before="#loading-area")
-        await asyncio.sleep(0)
-        viewer.focus()
+        self._agent_close_restore_focus = restore_focus
+        self._ensure_agent_transition()
+        task = self._agent_transition_task
+        if task is not None and task is not asyncio.current_task():
+            await task
 
     async def on_agent_transcript_viewer_closed(
         self, message: AgentTranscriptViewer.Closed
     ) -> None:
         if message.viewer is self._agent_transcript_viewer:
-            await self._close_agent_transcript_viewer(restore_focus=True)
+            await self._request_agent_transcript_close(restore_focus=True)
 
-    async def _close_agent_transcript_viewer(self, *, restore_focus: bool) -> None:
+    async def _close_agent_transcript_viewer(
+        self, *, restore_focus: bool, show_chat: bool = True
+    ) -> None:
         viewer = self._agent_transcript_viewer
         self._agent_transcript_epoch += 1
         self._agent_transcript_viewer = None
         self._agent_transcript_parent_id = None
         if viewer is not None and viewer.is_mounted:
-            await viewer.remove()
-        if self._cached_chat is not None:
+            debug = get_effective_log_level() == "DEBUG"
+            start = time.perf_counter() if debug else 0.0
+            if debug:
+                logger.debug(
+                    "Agent transcript teardown phase=start generation=%d agent=%s",
+                    self._agent_selection_generation,
+                    viewer.agent_id,
+                )
+            try:
+                await viewer.dispose()
+                if viewer.is_mounted:
+                    await viewer.remove()
+            finally:
+                if debug:
+                    logger.debug(
+                        "Agent transcript teardown took %.3fs generation=%d agent=%s",
+                        time.perf_counter() - start,
+                        self._agent_selection_generation,
+                        viewer.agent_id,
+                    )
+        if show_chat and self._cached_chat is not None:
             self._cached_chat.display = True
         if not restore_focus:
             self._agent_transcript_focus_target = None
@@ -5238,7 +5405,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     async def _begin_shutdown(self) -> None:
         self._shutdown_started = True
-        await self._close_agent_transcript_viewer(restore_focus=False)
+        await self._request_agent_transcript_close(restore_focus=False)
         if self._app_server is not None:
             # Signal shutdown before waiting for or cancelling UI work, so a
             # pending attach or runtime refresh treats a dropped connection as

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import shlex
+import threading
+from time import monotonic
 
 from pydantic import ValidationError
 import pytest
@@ -95,6 +98,66 @@ async def test_truncates_output_to_max_bytes(bash):
     assert result.stdout == "abcde"
     assert result.stderr == ""
     assert result.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_drains_both_streams_after_capture_cap(bash, monkeypatch):
+    config = BashToolConfig(max_output_bytes=7)
+    tool = Bash(config_getter=lambda: config, state=BaseToolState())
+    original = bash_module._drain_shell_stream
+    retained: list[int] = []
+
+    async def measured_drain(stream, max_chars):
+        captured = await original(stream, max_chars)
+        retained.append(len(captured))
+        return captured
+
+    monkeypatch.setattr(bash_module, "_drain_shell_stream", measured_drain)
+    command = "(yes O | head -c 1048576) & (yes E | head -c 1048576 >&2) & wait"
+    start = monotonic()
+    result = await asyncio.wait_for(
+        collect_result(tool.run(BashArgs(command=command, timeout=20))), timeout=5
+    )
+
+    assert monotonic() - start < 5
+    assert result.exit_code == 0
+    assert result.stdout == "O\nO\nO\nO"
+    assert result.stderr == "E\nE\nE\nE"
+    assert sorted(retained) == [32, 32]
+
+
+@pytest.mark.asyncio
+async def test_shell_output_decoding_runs_off_loop(bash, monkeypatch):
+    loop_thread = threading.get_ident()
+    original = bash_module.decode_console_safe
+    decode_threads: list[int] = []
+
+    def checked_decode(raw, *, raise_on_error=False):
+        decode_threads.append(threading.get_ident())
+        return original(raw, raise_on_error=raise_on_error)
+
+    monkeypatch.setattr(bash_module, "decode_console_safe", checked_decode)
+    result = await collect_result(
+        bash.run(BashArgs(command="printf hello; printf error >&2"))
+    )
+
+    assert result.stdout == "hello"
+    assert result.stderr == "error"
+    assert len(decode_threads) == 2
+    assert all(thread != loop_thread for thread in decode_threads)
+
+
+@pytest.mark.asyncio
+async def test_bounded_shell_output_preserves_utf32_char_cap(tmp_path):
+    source = tmp_path / "utf32.txt"
+    source.write_bytes("ééééé".encode("utf-32"))
+    config = BashToolConfig(max_output_bytes=3)
+    tool = Bash(config_getter=lambda: config, state=BaseToolState(), cwd=tmp_path)
+
+    result = await collect_result(tool.run(BashArgs(command="cat utf32.txt")))
+
+    assert result.stdout == "ééé"
+    assert result.stderr == ""
 
 
 @pytest.mark.asyncio

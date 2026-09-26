@@ -237,12 +237,14 @@ class _SwappableConfigSource:
 
     def __init__(self, getter: Callable[[], ChartreuxConfigSchema]) -> None:
         self._getter = getter
+        self.live = False
 
     def get(self) -> ChartreuxConfigSchema:
         return self._getter()
 
     def point_to(self, getter: Callable[[], ChartreuxConfigSchema]) -> None:
         self._getter = getter
+        self.live = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,6 +486,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             mcp_registry=self.mcp_registry,
             defer_mcp=True,
             restriction_getter=lambda: self.config_orchestrator.restrictions,
+            accepted_token_getter=lambda: self.config_orchestrator.accepted_token,
             inherited_restrictions=self._inherited_restrictions,
             inherited_workspace=self._inherited_workspace,
             inherited_plan_write_scopes=self._inherited_plan_write_scopes,
@@ -1106,6 +1109,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 defer_mcp=True,
                 discovery_source=self.tool_manager,
                 restriction_getter=lambda: self.config_orchestrator.restrictions,
+                accepted_token_getter=lambda: (
+                    self.config_orchestrator.accepted_token
+                    if config_source.live
+                    else None
+                ),
                 inherited_restrictions=self._inherited_restrictions,
                 inherited_workspace=self._inherited_workspace,
                 inherited_plan_write_scopes=self._inherited_plan_write_scopes,
@@ -3661,6 +3669,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             defer_mcp=True,
             discovery_source=previous_manager,
             restriction_getter=lambda: authority().restrictions,
+            accepted_token_getter=lambda: authority().accepted_token,
             inherited_restrictions=inherited,
             inherited_workspace=inherited_workspace,
             inherited_plan_write_scopes=self._inherited_plan_write_scopes,
@@ -3761,6 +3770,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             defer_mcp=discovery_source is not None,
             discovery_source=discovery_source,
             restriction_getter=lambda: self.config_orchestrator.restrictions,
+            accepted_token_getter=lambda: (
+                self.config_orchestrator.accepted_token if config_source.live else None
+            ),
             inherited_restrictions=self._inherited_restrictions,
             inherited_workspace=self._inherited_workspace,
             inherited_plan_write_scopes=self._inherited_plan_write_scopes,

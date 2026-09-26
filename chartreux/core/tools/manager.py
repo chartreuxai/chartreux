@@ -101,6 +101,7 @@ class ToolManager:
         inherited_plan_write_scopes: tuple[tuple[Path, Path | None], ...] = (),
         parent_authority_getter: Callable[[], ToolManager] | None = None,
         parent_authority_revision_getter: Callable[[], int] | None = None,
+        accepted_token_getter: Callable[[], object] | None = None,
     ) -> None:
         self._config_getter = config_getter
         self._cwd = (cwd or Path.cwd()).resolve()
@@ -117,6 +118,17 @@ class ToolManager:
         # manager after the parent refreshes or tightens policy.
         self._parent_authority_getter = parent_authority_getter
         self._parent_authority_revision_getter = parent_authority_revision_getter
+        # Managers without an accepted-revision signal retain live, uncached getters.
+        self._accepted_token_getter = accepted_token_getter
+        self._authority_generation = 0
+        self._registry_generation = 0
+        self._authority_cache: dict[
+            str, tuple[tuple[object, ...], type[BaseToolConfig], str]
+        ] = {}
+        self._selection_cache: dict[
+            str, tuple[tuple[object, ...], type[BaseTool] | None]
+        ] = {}
+        self._workspace_cache: tuple[tuple[object, ...], Workspace] | None = None
         self._mcp_registry = mcp_registry
         self._instances: dict[str, BaseTool] = {}
         self._authority_retired = False
@@ -162,6 +174,7 @@ class ToolManager:
 
     def set_mcp_registry(self, mcp_registry: MCPRegistry | None) -> None:
         self._mcp_registry = mcp_registry
+        self._registry_generation += 1
 
     def _get_mcp_registry(self) -> MCPRegistry:
         if self._mcp_registry is None:
@@ -323,6 +336,7 @@ class ToolManager:
         self._tool_variants_by_name.setdefault(name, []).append(tool_class)
         self._custom_tool_variants_by_name.setdefault(name, []).append(is_custom)
         self._all_tools[name] = tool_class
+        self._registry_generation += 1
 
     @property
     def registered_tools(self) -> dict[str, type[BaseTool]]:
@@ -352,12 +366,112 @@ class ToolManager:
         except Exception:
             return None
 
+    def _effective_authority_token(  # noqa: PLR0911 - each missing signal fails closed
+        self, seen: set[int] | None = None
+    ) -> tuple[object, ...] | None:
+        """A revision for accepted inputs along the *entire* authority chain.
+
+        An unavailable parent or revision signal disables caching; never reuse an
+        entry obtained while the chain was healthy.
+        """
+        if self._authority_retired or self._accepted_token_getter is None:
+            return None
+        seen = set() if seen is None else seen
+        if id(self) in seen:
+            return None
+        seen.add(id(self))
+        try:
+            accepted = self._accepted_token_getter()
+            if accepted is None:
+                return None
+            parent_token = None
+            parent_identity = None
+            if self._parent_authority_getter is not None:
+                parent = self._parent_authority()
+                if parent is None:
+                    return None
+                parent_identity = id(parent)
+                parent_token = parent._effective_authority_token(seen)
+                if parent_token is None:
+                    return None
+            return (
+                id(self),
+                self._authority_generation,
+                accepted,
+                self._inherited_restrictions,
+                self._inherited_workspace,
+                self._cwd,
+                self._registry_generation,
+                parent_identity,
+                parent_token,
+            )
+        except Exception:
+            return None
+        finally:
+            seen.remove(id(self))
+
+    def _name_versionable(self, name: str, seen: set[int] | None = None) -> bool:
+        seen = set() if seen is None else seen
+        if id(self) in seen:
+            return False
+        seen.add(id(self))
+        with self._lock:
+            variants = tuple(self._tool_variants_by_name.get(name, ()))
+        if any(
+            getattr(cls.is_available, "__func__", None)
+            is not BaseTool.is_available.__func__
+            for cls in variants
+        ):
+            return False
+        if self._parent_authority_getter is None:
+            return True
+        parent = self._parent_authority()
+        return parent is not None and parent._name_versionable(name, seen)
+
+    def _available_tool(self, name: str) -> type[BaseTool] | None:
+        """Resolve only one name; custom availability callbacks remain live."""
+        if self._authority_retired:
+            return None
+        token = self._effective_authority_token()
+        with self._lock:
+            fallback = self._all_tools.get(name)
+        versionable = self._name_versionable(name)
+        if token is not None and versionable:
+            cached = self._selection_cache.get(name)
+            if cached is not None and cached[0] == token:
+                return cached[1]
+        with self._lock:
+            selected = (
+                self._select_available_variant(name, fallback)
+                if fallback is not None
+                else None
+            )
+        if selected is not None:
+            config = self._config
+            disabled, per_source = self._build_source_disable_index(config)
+            if (
+                self._is_source_disabled(selected, disabled, per_source)  # noqa: PLR0916
+                or (
+                    config.enabled_tools
+                    and not name_matches(name, config.enabled_tools)
+                )
+                or (config.disabled_tools and name_matches(name, config.disabled_tools))
+                or not self._parent_allows_tool(name)
+            ):
+                selected = None
+        if token is not None:
+            if self._effective_authority_token() != token:
+                return None
+            if versionable:
+                self._selection_cache[name] = (token, selected)
+        return selected
+
     def _parent_allows_tool(self, tool_name: str) -> bool:
         parent = self._parent_authority()
         return (
             parent is None
             if self._parent_authority_getter is None
-            else (parent is not None and tool_name in parent.available_tools)
+            else (parent is not None and parent._available_tool(tool_name) is not None)
         )
 
     def _parent_permission(self, tool_name: str, args: Any) -> Any:
@@ -367,7 +481,7 @@ class ToolManager:
         if self._parent_authority_getter is None:
             return None
         parent = self._parent_authority()
-        if parent is None or tool_name not in parent.available_tools:
+        if parent is None or parent._available_tool(tool_name) is None:
             return PermissionContext(
                 permission=ToolPermission.NEVER,
                 reason="Tool is unavailable under parent authority",
@@ -527,12 +641,14 @@ class ToolManager:
             if not self._is_source_disabled(cls, disabled_sources, per_source_disabled)
         }
 
-    def _build_source_disable_index(self) -> tuple[set[str], dict[str, set[str]]]:
+    def _build_source_disable_index(
+        self, config: ChartreuxConfigSchema | None = None
+    ) -> tuple[set[str], dict[str, set[str]]]:
         """Return (fully_disabled, per_tool_disabled) keyed by source name."""
         disabled_sources: set[str] = set()
         per_source_disabled: dict[str, set[str]] = {}
 
-        for srv in self._config.mcp_servers:
+        for srv in (config if config is not None else self._config).mcp_servers:
             key = srv.name
             if srv.disabled:
                 disabled_sources.add(key)
@@ -595,13 +711,15 @@ class ToolManager:
                 # Preserve the discovered fallback so an MCP collision can be
                 # selected alongside it and safely withdrawn on reconfiguration.
                 self._all_tools.setdefault(name, tool_class)
+            self._registry_generation += 1
         self._mcp_integrated = True
         logger.info(
             "MCP integration registered %d tools (via registry)", len(mcp_tools)
         )
 
     def _purge_mcp_state(self) -> None:
-        """Remove stale MCP tool classes and cached instances."""
+        """Remove stale MCP tool classes and cached instances (under _lock)."""
+        self._registry_generation += 1
         for name, variants in tuple(self._tool_variants_by_name.items()):
             origins = self._custom_tool_variants_by_name[name]
             retained = [
@@ -651,6 +769,7 @@ class ToolManager:
     def suspend_mcp(self, name: str, tool_name: str | None = None) -> None:
         """Withdraw one source or remote tool before reducing its authority."""
         with self._lock:
+            self._registry_generation += 1
             for key, variants in tuple(self._tool_variants_by_name.items()):
                 origins = self._custom_tool_variants_by_name[key]
                 retained = [
@@ -760,7 +879,18 @@ class ToolManager:
             for name, (_, _, description, _) in tool_inputs.items()
         ]
 
-    def get_tool_config(self, tool_name: str) -> BaseToolConfig:
+    def get_tool_config(  # noqa: PLR0912 - restriction sources and cache guards
+        self, tool_name: str
+    ) -> BaseToolConfig:
+        if self._authority_retired:
+            raise NoSuchToolError("Tool manager authority retired")
+        token = self._effective_authority_token()
+        # Unversioned availability predicates must be consulted on every lookup.
+        versionable = self._name_versionable(tool_name)
+        if token is not None and versionable:
+            cached = self._authority_cache.get(tool_name)
+            if cached is not None and cached[0] == token:
+                return cached[1].model_validate_json(cached[2])
         with self._lock:
             tool_class = self._tool_class_for_config(tool_name)
 
@@ -780,10 +910,15 @@ class ToolManager:
         )
         parent = self._parent_authority()
         if self._parent_authority_getter is not None:
-            if (
-                parent is None
-                or parent.get_tool_config(tool_name).permission == ToolPermission.NEVER
-            ):
+            try:
+                parent_denied = (
+                    parent is None
+                    or parent.get_tool_config(tool_name).permission
+                    == ToolPermission.NEVER
+                )
+            except Exception:
+                parent_denied = True
+            if parent_denied:
                 config.permission = ToolPermission.NEVER
         sources = self._inherited_restrictions + (
             self._restriction_getter() if self._restriction_getter else ()
@@ -804,19 +939,41 @@ class ToolManager:
                     for pattern in restriction.sensitive_patterns
                     if pattern not in config.sensitive_patterns
                 )
-        return config_class.model_validate(config.model_dump())
+        resolved = config_class.model_validate(config.model_dump())
+        if token is not None:
+            if self._effective_authority_token() != token:
+                raise NoSuchToolError("Tool authority changed during resolution")
+            if versionable:
+                # A custom config may contain non-JSON extras; those retain the
+                # live resolver instead of changing its validation semantics.
+                try:
+                    frozen = resolved.model_dump_json()
+                except Exception:
+                    pass
+                else:
+                    self._authority_cache[tool_name] = (token, config_class, frozen)
+        return resolved
 
     @property
     def workspace(self) -> Workspace:
         """Current accepted file authority, independent of effective/discovery data."""
         if self._authority_retired:
             raise NoSuchToolError("Tool manager authority retired")
-        return Workspace.from_restrictions(
+        token = self._effective_authority_token()
+        if token is not None and self._workspace_cache is not None:
+            if self._workspace_cache[0] == token:
+                return self._workspace_cache[1]
+        workspace = Workspace.from_restrictions(
             self._cwd,
             self._inherited_restrictions
             + (self._restriction_getter() if self._restriction_getter else ()),
             ceiling=self._inherited_workspace,
         )
+        if token is not None:
+            if self._effective_authority_token() != token:
+                raise NoSuchToolError("Tool authority changed during resolution")
+            self._workspace_cache = (token, workspace)
+        return workspace
 
     def get(self, tool_name: str) -> BaseTool:
         """Get a tool instance, creating it lazily on first call.
@@ -826,13 +983,9 @@ class ToolManager:
         """
         if self._authority_retired:
             raise NoSuchToolError("Tool manager authority retired")
-        available = self.available_tools
-        if tool_name not in available:
-            raise NoSuchToolError(
-                f"Unknown or disabled tool: {tool_name}. "
-                f"Available: {list(available.keys())}"
-            )
-        tool_class = available[tool_name]
+        tool_class = self._available_tool(tool_name)
+        if tool_class is None:
+            raise NoSuchToolError(f"Unknown or disabled tool: {tool_name}")
         cached = self._instances.get(tool_name)
         if cached is not None and type(cached) is tool_class:
             return cached
@@ -853,10 +1006,13 @@ class ToolManager:
         instance._bind_authority(
             lambda: (
                 not self._authority_retired
-                and self.available_tools.get(tool_name) is tool_class
+                and self._available_tool(tool_name) is tool_class
             ),
             lambda args: self._parent_permission(tool_name, args),
         )
+        if tool_name == "grep":
+            # Optional per-invocation snapshot hook for the builtin grep tool.
+            setattr(instance, "_grep_authority_manager", self)  # noqa: B010 - optional hook
         self._instances[tool_name] = instance
         return instance
 
@@ -869,6 +1025,7 @@ class ToolManager:
     def set_scratchpad_dir(self, scratchpad_dir: Path | None) -> None:
         """Replace session scratch authority for both cached and future tools."""
         self._scratchpad_dir = scratchpad_dir
+        self._authority_generation += 1
         for instance in self._instances.values():
             instance.scratchpad_dir = scratchpad_dir
 

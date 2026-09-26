@@ -870,9 +870,11 @@ import importlib.util
 import os
 from pathlib import Path
 import sys
+import tomllib
 import chartreux
 
 source_root = Path(os.environ["CHARTREUX_SOURCE_ROOT"]).resolve()
+expected_version = tomllib.loads((source_root / "pyproject.toml").read_text())["project"]["version"]
 dist = metadata.distribution("chartreux")
 source = Path(chartreux.__file__).resolve()
 prefix = Path(sys.prefix).resolve()
@@ -884,8 +886,8 @@ assert source.parent.name == "chartreux"
 assert importlib.util.find_spec("vibe") is None
 assert all(not str(file).replace("\\\\", "/").startswith("vibe/") for file in (dist.files or ()))
 assert dist.metadata["Name"] == "chartreux"
-assert chartreux.__version__ == "0.1.1"
-assert dist.version == "0.1.1"
+assert chartreux.__version__ == expected_version
+assert dist.version == expected_version
 assert Path(dist._path).resolve().is_relative_to(prefix)
 assert all(
     not Path(entry).resolve().is_relative_to(source_root)
@@ -940,7 +942,7 @@ print({
     for executable in (cli, acp):
         version = _run(executable, ["--version"], cwd=root, env=env)
         assert version.returncode == 0, version.stderr
-        assert version.stdout.strip() == f"{executable.name} 0.1.1"
+        assert version.stdout.strip() == f"{executable.name} 0.2.0"
         _assert_no_secret_output(guard, version.stdout, version.stderr)
     negative_guard = root / "identity-negative-network-guard"
     negative_helper = root / "identity-negative-helper"

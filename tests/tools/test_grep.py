@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import shutil
+import threading
 
 import pytest
 
-from chartreux.core.tools.base import BaseToolState, ToolError
+from chartreux.core.tools.base import BaseToolState, ToolError, ToolPermission
+from chartreux.core.tools.builtins import grep as grep_module
 from chartreux.core.tools.builtins.grep import (
     Grep,
     GrepArgs,
@@ -14,7 +16,10 @@ from chartreux.core.tools.builtins.grep import (
     GrepResult,
     GrepToolConfig,
 )
+from chartreux.core.tools.manager import ToolManager
+from chartreux.core.tools.permissions import PermissionContext
 from chartreux.utils import io as io_utils
+from tests.conftest import build_test_vibe_config
 from tests.mock.utils import collect_result
 
 
@@ -436,6 +441,421 @@ class TestDropSensitiveMatches:
         grep = self._grep(tmp_path, monkeypatch, sensitive_patterns=[])
         lines = ["app.py:1:x", ".env:1:SECRET=1"]
         assert grep._drop_sensitive_matches(lines) == lines
+
+
+@pytest.mark.parametrize(
+    ("lines", "expected", "checks", "truncated"),
+    [
+        (["a.py:1:a", "bad line", ".env:1:secret"], ["a.py:1:a"], 2, False),
+        (
+            [".env:1:secret", "bad line", "b.py:2:b", "a.py:1:a", ".env:2:secret"],
+            ["b.py:2:b", "a.py:1:a"],
+            4,
+            False,
+        ),
+        (
+            [
+                ".env:1:secret",
+                "bad line",
+                "b.py:2:b",
+                "a.py:1:a",
+                ".env:2:secret",
+                "c.py:3:c",
+                ".env:3:unchecked",
+                "d.py:4:unchecked",
+            ],
+            ["b.py:2:b", "a.py:1:a"],
+            5,
+            True,
+        ),
+    ],
+    ids=["n-minus-one-denied-tail", "exact-n-denied-tail", "n-plus-one-early-stop"],
+)
+def test_output_authorizes_through_allowed_lookahead(
+    grep, monkeypatch, lines, expected, checks, truncated
+):
+    seen = []
+
+    def can_read(path):
+        seen.append(path.name)
+        return path.name != ".env"
+
+    monkeypatch.setattr(grep, "_can_read", can_read)
+    result = grep._parse_output("\n".join(lines), max_matches=2)
+
+    assert result.matches == "\n".join(expected)
+    assert result.match_count == len(expected)
+    assert result.was_truncated is truncated
+    assert len(seen) == checks
+    assert seen == [line.split(":", 1)[0] for line in lines if ":" in line][:checks]
+
+
+def test_output_size_cap_counts_characters_after_match_selection(grep, monkeypatch):
+    monkeypatch.setattr(grep.config, "max_output_bytes", 10)
+    result = grep._parse_output("a.py:1:ééé\nb.py:2:ok", max_matches=2)
+
+    assert result.matches == "a.py:1:ééé"
+    assert len(result.matches.encode()) > 10
+    assert result.match_count == 2
+    assert result.was_truncated
+
+
+def test_output_size_cap_does_not_truncate_at_exact_character_length(grep, monkeypatch):
+    monkeypatch.setattr(grep.config, "max_output_bytes", len("a.py:1:é"))
+    result = grep._parse_output("a.py:1:é", max_matches=1)
+
+    assert result.matches == "a.py:1:é"
+    assert result.match_count == 1
+    assert not result.was_truncated
+
+
+@pytest.mark.parametrize(
+    "fixture_name, executable", [("grep", "rg"), ("grep_gnu_only", "grep")]
+)
+@pytest.mark.parametrize("limit", [None, 0, -1, 1, 2, 3])
+@pytest.mark.asyncio
+async def test_match_limit_on_both_backends(
+    request, fixture_name, executable, limit, tmp_path
+):
+    if not shutil.which(executable):
+        pytest.skip(f"{executable} not available")
+    tool = request.getfixturevalue(fixture_name)
+    (tmp_path / "test.py").write_text("hit one\nhit two\nhit three\n")
+    tool.config.default_max_matches = 2
+
+    result = await collect_result(tool.run(GrepArgs(pattern="hit", max_matches=limit)))
+
+    expected_count = 1 if limit == 1 else 3 if limit == 3 else 2
+    assert result.matches.splitlines() == [
+        f"{tmp_path / 'test.py'}:{index}:hit {word}"
+        for index, word in enumerate(("one", "two", "three")[:expected_count], 1)
+    ]
+    assert result.match_count == expected_count
+    assert result.was_truncated is (expected_count < 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["_collect_paths", "_parse_frozen", "_prepare_batch"])
+async def test_worker_stage_yields_loop_and_runs_on_other_thread(
+    grep, tmp_path, monkeypatch, stage
+):
+    (tmp_path / "file.py").write_text("hit\n")
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
+    seen = []
+    original = getattr(grep_module, stage)
+
+    def gated(*args):
+        seen.append(threading.get_ident())
+        entered.set()
+        assert release.wait(5)
+        return original(*args)
+
+    monkeypatch.setattr(grep_module, stage, gated)
+    task = asyncio.create_task(collect_result(grep.run(GrepArgs(pattern="hit"))))
+    try:
+        await asyncio.wait_for(asyncio.to_thread(entered.wait, 5), 6)
+        progressed = asyncio.Event()
+        asyncio.get_running_loop().call_soon(progressed.set)
+        await asyncio.wait_for(progressed.wait(), 1)
+        assert seen == [seen[0]] and seen[0] != loop_thread
+    finally:
+        release.set()
+    assert (await task).match_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["_collect_paths", "_parse_frozen"])
+async def test_cancellation_during_worker_never_publishes_or_spawns_later(
+    grep, tmp_path, monkeypatch, stage
+):
+    (tmp_path / "file.py").write_text("hit\n")
+    entered = threading.Event()
+    release = threading.Event()
+    original = getattr(grep_module, stage)
+    spawns = []
+    execute = grep._execute_search
+
+    async def record(cmd):
+        spawns.append(cmd)
+        return await execute(cmd)
+
+    def gated(*args):
+        entered.set()
+        assert release.wait(5)
+        return original(*args)
+
+    monkeypatch.setattr(grep, "_execute_search", record)
+    monkeypatch.setattr(grep_module, stage, gated)
+    task = asyncio.create_task(collect_result(grep.run(GrepArgs(pattern="hit"))))
+    try:
+        await asyncio.wait_for(asyncio.to_thread(entered.wait, 5), 6)
+        count = len(spawns)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+    await asyncio.sleep(0)
+    assert len(spawns) == count
+
+
+@pytest.mark.asyncio
+async def test_authority_changes_at_publication_restart_instead_of_underfilling(
+    grep, tmp_path, monkeypatch
+):
+    (tmp_path / "first.py").write_text("hit\n")
+    (tmp_path / "second.py").write_text("hit\n")
+    original = grep._verify_paths
+    calls = 0
+    config = grep.config
+
+    async def flip(paths, token, *, regular=False):
+        nonlocal calls
+        calls += 1
+        if not regular and calls == 2:
+            config.denylist.append(str(tmp_path / "first.py"))
+        return await original(paths, token, regular=regular)
+
+    monkeypatch.setattr(grep, "_verify_paths", flip)
+    result = await collect_result(grep.run(GrepArgs(pattern="hit", max_matches=1)))
+    assert "first.py" not in result.matches
+    assert "second.py" in result.matches
+    assert calls >= 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["verification", "spawn", "parsing"])
+async def test_authority_change_discards_stale_run_at_boundaries(
+    grep, tmp_path, monkeypatch, boundary
+):
+    (tmp_path / "first.py").write_text("hit\n")
+    (tmp_path / "second.py").write_text("hit\n")
+    config = grep.config
+    original_verify = grep._verify_paths
+    original_current = grep._ensure_current
+    original_parse = grep_module._parse_frozen
+    changed = False
+
+    def deny_first():
+        nonlocal changed
+        if not changed:
+            changed = True
+            config.denylist.append(str(tmp_path / "first.py"))
+
+    async def verify(paths, token, *, regular=False):
+        if boundary == "verification" and regular and not changed:
+            # Change across a cooperative verification yield.
+            asyncio.get_running_loop().call_soon(deny_first)
+            await asyncio.sleep(0)
+        return await original_verify(paths, token, regular=regular)
+
+    def current(token):
+        if boundary == "spawn" and not changed and getattr(grep, "_after_batch", False):
+            deny_first()
+        return original_current(token)
+
+    if boundary == "spawn":
+
+        async def mark_batch(paths, token, *, regular=False):
+            result = await verify(paths, token, regular=regular)
+            if regular:
+                grep._after_batch = True
+            return result
+
+        monkeypatch.setattr(grep, "_verify_paths", mark_batch)
+        monkeypatch.setattr(grep, "_ensure_current", current)
+    elif boundary == "parsing":
+        # Signal on the loop as the parse stage returns, before publication.
+        original_stage = grep._stage
+
+        async def stage(fn, *values, stop):
+            result = await original_stage(fn, *values, stop=stop)
+            if fn is original_parse and not changed:
+                deny_first()
+            return result
+
+        monkeypatch.setattr(grep, "_stage", stage)
+    else:
+        monkeypatch.setattr(grep, "_verify_paths", verify)
+    result = await collect_result(grep.run(GrepArgs(pattern="hit", max_matches=1)))
+    assert changed
+    assert "first.py" not in result.matches
+    assert "second.py" in result.matches
+
+
+@pytest.mark.asyncio
+async def test_run_cancellation_during_subprocess_prevents_next_spawn_and_publication(
+    grep, tmp_path, monkeypatch
+):
+    (tmp_path / "one.py").write_text("hit\n")
+    started = asyncio.Event()
+    cleanup = []
+    spawns = []
+
+    class SlowProcess:
+        returncode = None
+
+        async def communicate(self):
+            started.set()
+            await asyncio.Event().wait()
+
+    async def spawn(*args, **kwargs):
+        spawns.append(args)
+        return SlowProcess()
+
+    async def kill(proc, *, kill_process_group):
+        cleanup.append(proc)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(grep_module, "kill_async_subprocess", kill)
+    task = asyncio.create_task(collect_result(grep.run(GrepArgs(pattern="hit"))))
+    await asyncio.wait_for(started.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+    assert len(spawns) == 1
+    assert len(cleanup) == 1
+
+
+@pytest.mark.asyncio
+async def test_authority_change_while_worker_parses_restarts(
+    tmp_path, grep, monkeypatch
+):
+    (tmp_path / "first.py").write_text("hit\n")
+    (tmp_path / "second.py").write_text("hit\n")
+    entered = threading.Event()
+    release = threading.Event()
+    original = grep_module._parse_frozen
+    calls = 0
+
+    def gated(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(5)
+        return original(*args)
+
+    monkeypatch.setattr(grep_module, "_parse_frozen", gated)
+    task = asyncio.create_task(
+        collect_result(grep.run(GrepArgs(pattern="hit", max_matches=1)))
+    )
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 5), 6)
+        grep.config.denylist.append(str(tmp_path / "first.py"))
+    finally:
+        release.set()
+    result = await task
+    assert calls == 2
+    assert "second.py" in result.matches
+    assert "first.py" not in result.matches
+
+
+@pytest.mark.asyncio
+async def test_custom_resolver_uses_live_fallback_not_generic_grep(tmp_path):
+    (tmp_path / "blocked.py").write_text("hit\n")
+    (tmp_path / "allowed.py").write_text("hit\n")
+
+    class CustomGrep(Grep):
+        def resolve_permission(self, args):
+            if str(args.path).endswith("blocked.py"):
+                return PermissionContext(permission=ToolPermission.NEVER)
+            return super().resolve_permission(args)
+
+    tool = CustomGrep(config_getter=GrepToolConfig, state=BaseToolState(), cwd=tmp_path)
+    token, frozen, _ = tool._snapshot()
+    assert token is None and frozen is None
+    result = await collect_result(tool.run(GrepArgs(pattern="hit")))
+    assert "allowed.py" in result.matches
+    assert "blocked.py" not in result.matches
+
+
+@pytest.mark.asyncio
+async def test_custom_ancestor_resolver_is_never_replaced_by_generic_snapshot(tmp_path):
+    blocked = tmp_path / "guarded.py"
+    allowed = tmp_path / "allowed.py"
+    blocked.write_text("hit\n")
+    allowed.write_text("hit\n")
+
+    class GuardedGrep(Grep):
+        selection_priority = 10
+
+        @classmethod
+        def get_name(cls):
+            return "grep"
+
+        def resolve_permission(self, args):
+            if str(args.path).endswith("guarded.py"):
+                return PermissionContext(permission=ToolPermission.NEVER)
+            return super().resolve_permission(args)
+
+    config = build_test_vibe_config()
+    grandparent = ToolManager(
+        lambda: config,
+        cwd=tmp_path,
+        defer_mcp=True,
+        accepted_token_getter=lambda: "accepted",
+    )
+    grandparent._register_discovered_tool_variant(GuardedGrep, is_custom=True)
+    parent = ToolManager(
+        lambda: config,
+        cwd=tmp_path,
+        defer_mcp=True,
+        accepted_token_getter=lambda: "accepted",
+        parent_authority_getter=lambda: grandparent,
+    )
+    child = ToolManager(
+        lambda: config,
+        cwd=tmp_path,
+        defer_mcp=True,
+        accepted_token_getter=lambda: "accepted",
+        parent_authority_getter=lambda: parent,
+    )
+    tool = child.get("grep")
+    assert isinstance(tool, Grep)
+    _, frozen, _ = tool._snapshot()
+    assert frozen is None
+    result = await collect_result(tool.run(GrepArgs(pattern="hit")))
+    assert "allowed.py" in result.matches
+    assert "guarded.py" not in result.matches
+
+
+@pytest.mark.asyncio
+async def test_frozen_authority_preserves_two_ancestor_denials(tmp_path):
+    denied_parent = tmp_path / "parent.py"
+    denied_grandparent = tmp_path / "grandparent.py"
+    allowed = tmp_path / "allowed.py"
+    for path in (denied_parent, denied_grandparent, allowed):
+        path.write_text("hit\n")
+
+    def manager(denied=(), parent=None):
+        config = build_test_vibe_config(
+            tools={"grep": {"denylist": [str(p) for p in denied]}}
+        )
+        return ToolManager(
+            lambda: config,
+            cwd=tmp_path,
+            defer_mcp=True,
+            accepted_token_getter=lambda: "accepted",
+            parent_authority_getter=(lambda: parent) if parent else None,
+        )
+
+    grandparent = manager((denied_grandparent,))
+    parent = manager((denied_parent,), grandparent)
+    child = manager(parent=parent)
+    tool = child.get("grep")
+    assert isinstance(tool, Grep)
+    token, frozen, _ = tool._snapshot()
+    assert token is not None and frozen is not None
+    assert not frozen(denied_parent)
+    assert not frozen(denied_grandparent)
+    assert frozen(allowed)
+    result = await collect_result(tool.run(GrepArgs(pattern="hit")))
+    assert result.match_count == 1
+    assert "allowed.py" in result.matches
 
 
 @pytest.mark.skipif(not shutil.which("grep"), reason="GNU grep not available")
