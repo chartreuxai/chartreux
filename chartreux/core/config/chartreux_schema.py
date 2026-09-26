@@ -59,6 +59,7 @@ from chartreux.core.prompts import (
     load_system_prompt,
 )
 from chartreux.utils.api_keys import resolve_api_key
+from chartreux.utils.private_paths import restrict_private_file
 
 
 def load_dotenv_values(
@@ -68,6 +69,10 @@ def load_dotenv_values(
     # We allow FIFO path to support some environment management solutions (e.g. https://developer.1password.com/docs/environments/local-env-file/)
     if not env_path.is_file() and not env_path.is_fifo():
         return
+
+    # A pre-existing file may have been created with a permissive mode by an
+    # older version; re-restrict it to owner-only on every load.
+    restrict_private_file(env_path)
 
     env_vars = dotenv_values(env_path)
     for key, value in env_vars.items():
@@ -290,6 +295,16 @@ class ChartreuxConfigSchema(ConfigSchema):
         description=(
             "A list of tool names/patterns to disable after 'enabled_tools' filtering. "
             "Supports glob patterns and regex with 're:' prefix."
+        ),
+    )
+    credential_env_passthrough: Annotated[list[str], WithReplaceMerge()] = Field(
+        default_factory=list,
+        description=(
+            "Environment variable names exempt from credential scrubbing in child"
+            " processes (shell commands, MCP stdio servers, hooks, client terminals)."
+            " Chartreux removes its own credential variables from child environments"
+            " by default; list names in the user config file to pass specific ones"
+            " through. Project, environment, and session layers cannot set this field."
         ),
     )
     mcp_servers: Annotated[

@@ -74,7 +74,7 @@ profile-specific default:
 task(
   task="Review the authentication changes",
   config={
-    model="gpt-6-luna",
+    model="example-model",
     thinking="max",
     instructions="Focus on authorization boundaries.",
     enabled_tools=["read_file", "grep"]

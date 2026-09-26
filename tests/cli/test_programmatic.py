@@ -19,6 +19,7 @@ from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.config.layers.default import DefaultConfigLayer
 from chartreux.core.config.layers.overrides import OverridesLayer
+from chartreux.core.config.layers.user import UserConfigLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.llm_models import Backend
 from tests.conftest import build_test_vibe_config
@@ -44,15 +45,26 @@ def _options() -> LocalHarnessOptions:
 
 
 def _use_runtime_config(
-    monkeypatch: pytest.MonkeyPatch, config: ChartreuxConfigSchema
+    monkeypatch: pytest.MonkeyPatch, config: ChartreuxConfigSchema, tmp_path: Path
 ) -> None:
     async def build_orchestrator(
         data: dict[str, object] | None = None, *, harness_files: HarnessFilesManager
     ) -> ConfigOrchestrator[ChartreuxConfigSchema]:
         del harness_files
+        user_path = tmp_path / "user.toml"
+        user_path.write_text(
+            "credential_env_passthrough = "
+            f"{json.dumps(config.credential_env_passthrough)}\n",
+            encoding="utf-8",
+        )
+        user = UserConfigLayer(path=user_path)
         base = OverridesLayer(
             data=config.model_dump(
-                mode="json", exclude=_ORDINARY_OVERRIDE_EXCLUDED_FIELDS
+                mode="json",
+                exclude={
+                    *_ORDINARY_OVERRIDE_EXCLUDED_FIELDS,
+                    "credential_env_passthrough",
+                },
             ),
             name="base",
         )
@@ -60,7 +72,7 @@ def _use_runtime_config(
         session = OverridesLayer(data=data or {})
         return await ConfigOrchestrator.create(
             schema=ChartreuxConfigSchema,
-            layers=[default, base, session],
+            layers=[default, user, base, session],
             default_layer_resolver=lambda: base,
         )
 
@@ -70,12 +82,12 @@ def _use_runtime_config(
 
 
 def test_streaming_output_uses_public_history_entries(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config = build_test_vibe_config(
         include_model_info=False, include_commit_signature=False
     )
-    _use_runtime_config(monkeypatch, config)
+    _use_runtime_config(monkeypatch, config, tmp_path)
 
     with mock_backend_factory(
         Backend.MISTRAL,
@@ -100,12 +112,12 @@ def test_streaming_output_uses_public_history_entries(
 
 
 def test_text_output_returns_last_assistant_message(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = build_test_vibe_config(
         include_model_info=False, include_commit_signature=False
     )
-    _use_runtime_config(monkeypatch, config)
+    _use_runtime_config(monkeypatch, config, tmp_path)
 
     with mock_backend_factory(
         Backend.MISTRAL,
@@ -138,7 +150,7 @@ def test_untrusted_workspace_warning_comes_from_app_server(
     config = build_test_vibe_config(
         include_model_info=False, include_commit_signature=False
     )
-    _use_runtime_config(monkeypatch, config)
+    _use_runtime_config(monkeypatch, config, tmp_path)
 
     with mock_backend_factory(
         Backend.MISTRAL,
@@ -153,12 +165,12 @@ def test_untrusted_workspace_warning_comes_from_app_server(
 
 
 def test_conversation_limits_cross_the_public_turn_boundary(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = build_test_vibe_config(
         include_model_info=False, include_commit_signature=False
     )
-    _use_runtime_config(monkeypatch, config)
+    _use_runtime_config(monkeypatch, config, tmp_path)
     options = _options()
     options = replace(
         options,
@@ -172,11 +184,13 @@ def test_conversation_limits_cross_the_public_turn_boundary(
             run_programmatic(harness_options=options, prompt="Continue")
 
 
-def test_plain_prompt_runs_normal_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_plain_prompt_runs_normal_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = build_test_vibe_config(
         include_model_info=False, include_commit_signature=False
     )
-    _use_runtime_config(monkeypatch, config)
+    _use_runtime_config(monkeypatch, config, tmp_path)
 
     with mock_backend_factory(
         Backend.MISTRAL,

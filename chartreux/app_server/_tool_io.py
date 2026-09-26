@@ -23,6 +23,7 @@ from chartreux.core.tools.io_port import (
     ShellCommandResult,
     ToolIOPort,
 )
+from chartreux.core.tools.secret_redaction import child_env_scrub_list
 from chartreux.observability.logging import logger
 from chartreux.utils.io import BoundedReadResult, ReadSafeResult, normalize_newlines
 
@@ -118,6 +119,9 @@ class ClientToolIO(ToolIOPort):
 
     async def run_shell(self, request: ShellCommandRequest) -> ShellCommandResult:
         root_session_id = self._client_bridge.current_session_id()
+        # The client owns the terminal spawn and inherits its own environment;
+        # ask it to drop chartreux's credential variables by name.
+        scrub = child_env_scrub_list()
         created = await asyncio.wait_for(
             self._client_bridge.request_client_result(
                 ClientToolMethod.TERMINAL_CREATE,
@@ -126,6 +130,7 @@ class ClientToolIO(ToolIOPort):
                     command=request.command,
                     args=request.args,
                     env=request.env,
+                    env_scrub=scrub or None,
                     cwd=str(request.cwd),
                     output_byte_limit=request.max_output_bytes,
                     tool_call_id=(

@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 import functools
+import re
 from typing import TYPE_CHECKING, final
 from urllib.parse import urljoin, urlparse
 
@@ -19,14 +20,11 @@ from chartreux.core.tools.base import (
     ToolError,
     ToolPermission,
 )
-from chartreux.core.tools.permissions import (
-    PermissionContext,
-    PermissionScope,
-    RequiredPermission,
-)
+from chartreux.core.tools.permissions import PermissionContext
 from chartreux.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from chartreux.utils.http import ChartreuxAsyncHTTPClient, build_ssl_context
 from chartreux.utils.tool_presentation import ToolEffectKind
+from chartreux.utils.untrusted_content import frame_untrusted_content
 
 if TYPE_CHECKING:
     from chartreux.core.events import ToolCallEvent, ToolResultEvent
@@ -34,6 +32,14 @@ if TYPE_CHECKING:
 
 _HONEST_USER_AGENT = "chartreux-cli"
 _HTTP_FORBIDDEN = 403
+_MEDIA_TYPE = re.compile(r"[!#$%&'*+.^_`|~0-9a-z-]+/[!#$%&'*+.^_`|~0-9a-z-]+\Z")
+
+
+def _normalize_content_type(value: str) -> str:
+    media_type = value.split(";", 1)[0].strip().lower()
+    return (
+        media_type if _MEDIA_TYPE.fullmatch(media_type) else "application/octet-stream"
+    )
 
 
 @functools.cache
@@ -105,22 +111,11 @@ class WebFetch(
         if self.config.permission in {ToolPermission.ALWAYS, ToolPermission.NEVER}:
             return PermissionContext(permission=self.config.permission)
 
-        parsed = urlparse(self._normalize_url(args.url))
-        domain = parsed.netloc or parsed.path.split("/")[0]
-        if not domain:
-            return None
-
-        return PermissionContext(
-            permission=ToolPermission.ASK,
-            required_permissions=[
-                RequiredPermission(
-                    scope=PermissionScope.URL_PATTERN,
-                    invocation_pattern=domain,
-                    session_pattern=domain,
-                    label=f"fetching from {domain}",
-                )
-            ],
-        )
+        # Accepted design decision: web tools do no per-domain approval
+        # prompting; ASK auto-executes. Redaction removes Chartreux's own loaded
+        # credential values from tool output; it is not a general exfiltration or
+        # injection boundary. Fetched web content is framed as untrusted data.
+        return PermissionContext(permission=ToolPermission.ASK)
 
     @final
     async def run(
@@ -133,7 +128,7 @@ class WebFetch(
 
         content, content_type, was_truncated = await self._fetch_url(url, timeout)
 
-        if "text/html" in content_type:
+        if content_type == "text/html":
             content = _html_to_markdown(content)
 
         content_bytes = content.encode("utf-8")
@@ -145,8 +140,10 @@ class WebFetch(
         if was_truncated:
             content += "\n\n[Content truncated due to size limit]"
 
+        content = frame_untrusted_content(f"URL: {url}\n{content}", "web")
+
         yield WebFetchResult(
-            url=url,
+            url=frame_untrusted_content(url, "web"),
             content=content,
             content_type=content_type,
             was_truncated=was_truncated,
@@ -192,12 +189,14 @@ class WebFetch(
             ):
                 if response.is_error:
                     raise ToolError(
-                        f"HTTP error {response.status_code}: {response.reason_phrase}"
+                        f"HTTP error {response.status_code}: request failed"
                     )
                 content, was_truncated = await self._read_content(response)
                 return (
                     content.decode(response.encoding or "utf-8", errors="replace"),
-                    response.headers.get("Content-Type", "text/plain"),
+                    _normalize_content_type(
+                        response.headers.get("Content-Type", "text/plain")
+                    ),
                     was_truncated,
                 )
         except (TimeoutError, httpx.TimeoutException):

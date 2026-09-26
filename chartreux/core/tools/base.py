@@ -469,8 +469,8 @@ class BaseTool[
         config-level ASK/ALWAYS.
 
         Returns:
-            PermissionContext with granular required_permissions and a permission
-            level (ALWAYS/NEVER/ASK), or None to fall through to config permission.
+            PermissionContext with a permission level (ALWAYS/NEVER/ASK), or
+            None to fall through to config permission.
 
         Override in subclasses for domain-specific rules (e.g. workdir checks).
         """

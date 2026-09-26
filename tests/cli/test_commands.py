@@ -37,7 +37,7 @@ class TestCommandRegistry:
     def test_get_command_name_returns_canonical_name_for_alias(self) -> None:
         registry = CommandRegistry()
         assert registry.get_command_name("/help") == "help"
-        assert registry.get_command_name("/config") is None
+        assert registry.get_command_name("/config") == "config"
         assert registry.get_command_name("/model") == "model"
         assert registry.get_command_name("/connectors") is None
         assert registry.get_command_name("/clear") == "clear"
@@ -224,6 +224,18 @@ class TestCommandRegistry:
         registry = CommandRegistry()
 
         assert registry.commands[command_name].side_channel is False
+
+    def test_config_command_registration(self) -> None:
+        registry = CommandRegistry()
+        assert registry.get_command_name("/config") == "config"
+        result = registry.parse_command("/config")
+        assert result is not None
+        cmd_name, cmd, cmd_args = result
+        assert cmd_name == "config"
+        assert cmd.handler == "_config_command"
+        assert cmd.side_channel is False
+        assert cmd.exits is False
+        assert cmd_args == ""
 
     def test_exit_command_accepts_bare_synonyms(self) -> None:
         registry = CommandRegistry()

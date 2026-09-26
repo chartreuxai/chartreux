@@ -9,6 +9,7 @@ from textual.widget import Widget
 from textual.worker import WorkerState
 
 from chartreux.cli.textual_ui.handlers.event_handler import EventHandler
+from chartreux.cli.textual_ui.widgets.diff_rendering import DiffView
 from chartreux.cli.textual_ui.widgets.tool_widgets import EditResultWidget
 from chartreux.core.events import ToolCallEvent, ToolResultEvent
 from chartreux.core.tools.builtins.edit import Edit, EditArgs, EditResult
@@ -113,6 +114,24 @@ async def _populated_edit(pilot: Pilot) -> None:
     widget = pilot.app.query_one(EditResultWidget)
     assert widget._render_worker is not None
     assert widget._render_worker.state == WorkerState.SUCCESS
+    # The worker finishing does not mean the grown diff has been laid out
+    # yet; wait for the layout to catch up so the screenshot cannot capture
+    # a stale one-row clipping of the diff.
+    diff_view = widget.query_one(DiffView)
+    for _ in range(100):
+        if diff_view.size.height >= len(diff_view._lines):
+            break
+        # Re-request the layout each round: the refresh requested by the
+        # render itself can be lost to the idle/timer scheduling race, and
+        # a fresh request reliably drives a new layout pass.
+        diff_view.refresh(layout=True)
+        await pilot.pause(0.05)
+    else:
+        raise AssertionError(
+            f"diff view layout never settled:"
+            f" height={diff_view.size.height} lines={len(diff_view._lines)}"
+        )
+    await pilot.pause()
 
 
 def test_snapshot_edit_result(snap_compare: SnapCompare) -> None:

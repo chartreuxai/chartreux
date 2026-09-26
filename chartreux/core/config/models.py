@@ -348,6 +348,8 @@ class MCPStdio(_MCPBase):
     transport: Literal["stdio"]
     command: str | list[str]
     args: list[str] = Field(default_factory=list)
+    # Explicit MCP stdio env entries are user-configured per-server overrides;
+    # they are not inherited credential_env_passthrough policy.
     env: dict[str, str] = Field(
         default_factory=dict,
         description="Environment variables to set for the MCP server process.",

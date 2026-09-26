@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import stat
+
 import pytest
 
 from chartreux.core.paths import GLOBAL_ENV_FILE
@@ -254,3 +256,18 @@ class TestUnsetProxyVar:
 
         result = get_current_proxy_settings()
         assert result[key] is None
+
+
+class TestEnvFilePermissions:
+    def test_set_proxy_var_restricts_env_file_to_owner_only(self) -> None:
+        set_proxy_var("HTTP_PROXY", "http://proxy:8080")
+
+        assert stat.S_IMODE(GLOBAL_ENV_FILE.path.stat().st_mode) == 0o600
+
+    def test_unset_proxy_var_restricts_preexisting_permissive_env_file(self) -> None:
+        set_proxy_var("HTTPS_PROXY", "https://proxy:8443")
+        GLOBAL_ENV_FILE.path.chmod(0o644)
+
+        unset_proxy_var("HTTPS_PROXY")
+
+        assert stat.S_IMODE(GLOBAL_ENV_FILE.path.stat().st_mode) == 0o600

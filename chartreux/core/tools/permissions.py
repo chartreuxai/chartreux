@@ -5,7 +5,6 @@ import fnmatch
 from chartreux.core.tools.models import (
     PermissionContext as PermissionContext,
     PermissionScope as PermissionScope,
-    RequiredPermission as RequiredPermission,
 )
 
 

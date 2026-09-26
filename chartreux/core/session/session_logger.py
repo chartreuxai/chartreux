@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import contextlib
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import errno
 import getpass
 import hashlib
 import json
@@ -35,6 +36,7 @@ from chartreux.core.session_types import (
     SessionMetadata,
     WorktreeContext,
 )
+from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils import utc_now
 from chartreux.utils.io import read_safe, read_safe_async
 from chartreux.utils.platform import resolve_git_executable
@@ -48,7 +50,32 @@ if TYPE_CHECKING:
 
 TMP_CLEANUP_INTERVAL = timedelta(seconds=5)
 TRANSCRIPT_VERIFY_INTERVAL = 64
+# Disk-full save failures are logged at most this often while the condition
+# persists; a successful save resets the rate limit so the next occurrence is
+# reported immediately.
+DISK_FULL_LOG_INTERVAL = timedelta(seconds=60)
 logger = logging.getLogger(__name__)
+
+
+class SessionDiskFullError(RuntimeError):
+    """A session persistence write failed with ENOSPC: the disk is full."""
+
+    code = "session_disk_full"
+
+    def __init__(self, path: Path, operation: str) -> None:
+        self.path = path
+        self.operation = operation
+        super().__init__(
+            f"Disk is full: failed to {operation} at {path}. "
+            "The session continues in memory; persistence retries on the next save."
+        )
+
+
+def _is_enospc(exc: BaseException) -> bool:
+    """Detect ENOSPC (disk full), unwrapping exception groups."""
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_is_enospc(child) for child in exc.exceptions)
+    return isinstance(exc, OSError) and exc.errno == errno.ENOSPC
 
 
 @dataclass(frozen=True)
@@ -86,6 +113,8 @@ class SessionLogger:  # noqa: PLR0904
         self._transcript_cursor_generation = 0
         self._launch_config_dirty = False
         self._launch_config_generation = 0
+        # Rate-limits repeated disk-full warnings so saves cannot spam the log.
+        self._disk_full_last_logged_at: datetime | None = None
         # Serializes writes so concurrent saves cannot interleave appends to
         # messages.jsonl or race on the metadata read-modify-write.
         self._save_lock = asyncio.Lock()
@@ -187,6 +216,7 @@ class SessionLogger:  # noqa: PLR0904
                 errors="replace",
                 timeout=5.0,
                 cwd=self.cwd,
+                env=scrub_child_env(os.environ),
             )
             if result.returncode == 0 and result.stdout:
                 lines = result.stdout.strip().splitlines()
@@ -402,6 +432,10 @@ class SessionLogger:  # noqa: PLR0904
 
             os.replace(temp_metadata_filepath, str(metadata_filepath))
         except Exception as e:
+            if _is_enospc(e):
+                raise SessionDiskFullError(
+                    metadata_filepath, "persist session metadata"
+                ) from e
             raise RuntimeError(
                 f"Failed to persist session metadata to {metadata_filepath}: {e}"
             ) from e
@@ -457,6 +491,10 @@ class SessionLogger:  # noqa: PLR0904
                 os.fsync(f.fileno())
             return messages_filepath.stat().st_size
         except Exception as e:
+            if _is_enospc(e):
+                raise SessionDiskFullError(
+                    messages_filepath, "persist session messages"
+                ) from e
             raise RuntimeError(
                 f"Failed to persist session messages to {messages_filepath}: {e}"
             ) from e
@@ -487,6 +525,10 @@ class SessionLogger:  # noqa: PLR0904
 
             os.replace(temp_filepath, str(messages_filepath))
         except Exception as e:
+            if _is_enospc(e):
+                raise SessionDiskFullError(
+                    messages_filepath, "overwrite session messages"
+                ) from e
             raise RuntimeError(
                 f"Failed to overwrite session messages at {messages_filepath}: {e}"
             ) from e
@@ -551,6 +593,12 @@ class SessionLogger:  # noqa: PLR0904
             )
             try:
                 save_result = await asyncio.shield(persistence)
+            except SessionDiskFullError as disk_full:
+                # Fail soft: a full disk must not crash the agent loop. The
+                # session stays authoritative in memory and the next save
+                # retries persistence.
+                self._note_disk_full(disk_full)
+                return
             except asyncio.CancelledError as cancellation:
                 # ``to_thread`` keeps running after its awaiter is cancelled. Keep
                 # the save lock until that worker has finished so a subsequent
@@ -566,6 +614,8 @@ class SessionLogger:  # noqa: PLR0904
                 if not persistence.cancelled():
                     try:
                         save_result = persistence.result()
+                    except SessionDiskFullError as disk_full:
+                        self._note_disk_full(disk_full)
                     except Exception:
                         # The caller's cancellation remains the observable outcome,
                         # but retrieving the exception avoids abandoning the task.
@@ -589,8 +639,24 @@ class SessionLogger:  # noqa: PLR0904
                     save_result
                 )
             self._persisted = True
+            # A successful save is a state change: report the next disk-full
+            # occurrence immediately instead of staying rate-limited.
+            self._disk_full_last_logged_at = None
             if self._launch_config_generation == launch_config_generation:
                 self._launch_config_dirty = False
+
+    def _note_disk_full(self, disk_full: SessionDiskFullError) -> None:
+        """Record a disk-full save failure, logging it at a bounded rate."""
+        now = utc_now()
+        last = self._disk_full_last_logged_at
+        if last is not None and now - last < DISK_FULL_LOG_INTERVAL:
+            return
+        self._disk_full_last_logged_at = now
+        logger.warning(
+            "Session persistence failed: the disk is full (%s). The session "
+            "continues in memory; persistence retries on the next save.",
+            disk_full.path,
+        )
 
     @staticmethod
     def _quarantine_corrupt_transcript(messages_path: Path) -> Path:
@@ -607,6 +673,18 @@ class SessionLogger:  # noqa: PLR0904
             os.replace(messages_path, quarantine_path)
             restrict_private_file(quarantine_path)
         except OSError as exc:
+            if _is_enospc(exc):
+                # The corruption itself must still be reported: the quarantine
+                # failing on a full disk must not mask why it was attempted.
+                logger.warning(
+                    "Session transcript was corrupted at %s and could not be "
+                    "quarantined because the disk is full; a new transcript "
+                    "will be written.",
+                    messages_path,
+                )
+                raise SessionDiskFullError(
+                    messages_path, "quarantine corrupted session transcript"
+                ) from exc
             raise RuntimeError(
                 f"Failed to quarantine corrupted session transcript at {messages_path}: {exc}"
             ) from exc
@@ -806,6 +884,8 @@ class SessionLogger:  # noqa: PLR0904
                 )
             else:
                 return updated_cursor, saves_since_verify + 1
+        except SessionDiskFullError:
+            raise
         except Exception as e:
             raise RuntimeError(f"Failed to save session to {session_dir}: {e}") from e
         finally:
@@ -904,6 +984,8 @@ class SessionLogger:  # noqa: PLR0904
                 session_metadata,
             )
             SessionLogger._persist_metadata_sync(metadata_dump, session_dir)
+        except SessionDiskFullError:
+            raise
         except Exception as e:
             raise RuntimeError(f"Failed to save session to {session_dir}: {e}") from e
         finally:

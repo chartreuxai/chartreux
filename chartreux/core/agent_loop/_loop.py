@@ -141,6 +141,7 @@ from chartreux.core.subagents import (
     SubagentRunnerPort,
 )
 from chartreux.core.system_prompt import get_universal_system_prompt
+from chartreux.core.tools import secret_redaction
 from chartreux.core.tools.base import (
     BaseTool,
     CancellableToolResult,
@@ -330,23 +331,29 @@ def requires_init(fn: Callable[..., Any]) -> Callable[..., Any]:
 
         @wraps(fn)
         async def gen_wrapper(self: AgentLoop, *args: Any, **kwargs: Any) -> Any:
-            await self.wait_until_ready()
+            with secret_redaction.bind_policy(self.scrub_policy):
+                await self.wait_until_ready()
             agen = fn(self, *args, **kwargs)
             sent: Any = None
             try:
                 while True:
-                    sent = yield await agen.asend(sent)
-            except StopAsyncIteration:
-                return
+                    with secret_redaction.bind_policy(self.scrub_policy):
+                        try:
+                            event = await agen.asend(sent)
+                        except StopAsyncIteration:
+                            return
+                    sent = yield event
             finally:
-                await agen.aclose()
+                with secret_redaction.bind_policy(self.scrub_policy):
+                    await agen.aclose()
 
         return gen_wrapper
 
     @wraps(fn)
     async def wrapper(self: AgentLoop, *args: Any, **kwargs: Any) -> Any:
-        await self.wait_until_ready()
-        return await fn(self, *args, **kwargs)
+        with secret_redaction.bind_policy(self.scrub_policy):
+            await self.wait_until_ready()
+            return await fn(self, *args, **kwargs)
 
     return wrapper
 
@@ -452,6 +459,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             if defer_heavy_init
             else mcp_registry or self._create_mcp_registry()
         )
+        self.scrub_policy = secret_redaction.ScrubPolicy.from_config(self.config)
+        secret_redaction.register_session_policy(self, self.scrub_policy)
         self._retired_mcp_pools: list[MCPConnectionPool] = []
         self._mcp_pool: MCPConnectionPool | None = (
             None if defer_heavy_init else self._create_mcp_pool()
@@ -510,6 +519,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
         self.stats = AgentStats()
         self._tool_event_queue: asyncio.Queue[BaseEvent | None] | None = None
+        # Retain admission names and resolved values only until outward emission.
+        self._admitted_tool_policies: dict[str, secret_redaction.ScrubPolicy] = {}
+        # Tool-response ordering: while a tool batch is active, response
+        # messages are staged and appended in tool-call index order even
+        # though their events keep streaming in completion order.
+        self._tool_response_order: dict[str, int] | None = None
+        self._staged_tool_responses: dict[int, list[LLMMessage]] = {}
+        self._next_tool_response_index = 0
         self._request_broker = InteractionRequestBroker()
         self._active_turn: _ActiveTurn | None = None
         # Operations that are not turns but still hold the session: anything
@@ -629,9 +646,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             if self._closing:
                 return
         try:
-            self._ensure_remote_registries()
-            self.tool_manager.integrate_all(raise_on_mcp_failure=True)
-            self.messages.update_system_prompt(self._build_system_prompt())
+            with secret_redaction.bind_policy(self.scrub_policy):
+                self._ensure_remote_registries()
+                self.tool_manager.integrate_all(raise_on_mcp_failure=True)
+                self.messages.update_system_prompt(self._build_system_prompt())
         except Exception as exc:
             self._init_error = exc
 
@@ -824,6 +842,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
     async def refresh_config(self) -> None:
         await self._config_orchestrator.reload()
+        self.scrub_policy = secret_redaction.ScrubPolicy.from_config(self.config)
+        secret_redaction.register_session_policy(self, self.scrub_policy)
+        secret_redaction.reset_cache()
         self._retire_mcp_pool()
         self._ensure_remote_registries()
         if self.mcp_registry is not None:
@@ -868,6 +889,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             self._close_task = task
             task.add_done_callback(self._observe_close_outcome)
         await asyncio.shield(task)
+        secret_redaction.unregister_session_policy(self)
 
     def _observe_close_outcome(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
@@ -929,18 +951,17 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
         return MCPRegistry()
 
-    @staticmethod
-    def _create_mcp_pool() -> MCPConnectionPool:
+    def _create_mcp_pool(self) -> MCPConnectionPool:
         from chartreux.core.tools.mcp.pool import MCPConnectionPool
 
-        return MCPConnectionPool()
+        return MCPConnectionPool(policy=self.scrub_policy)
 
     def _retire_mcp_pool(self) -> None:
         self._retired_mcp_pools = [
             pool for pool in self._retired_mcp_pools if not pool.cleanup_complete
         ]
         if self._mcp_pool is not None:
-            self._mcp_pool.retire()
+            self._mcp_pool.retire(drain_active=True)
             self._retired_mcp_pools.append(self._mcp_pool)
             self._mcp_pool = None
 
@@ -1166,6 +1187,20 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.committed_model = prepared.previous_committed_model
         self.config.attach_committed_model(self.committed_model)
 
+    def _model_choice_pending(self) -> bool:
+        """True while a recovered session awaits an explicit model selection.
+
+        Mirrors ``committed_model_recovery_issue`` in the app-server
+        projection: the stored launch envelope still commits a model while
+        the loop no longer carries one, so resolving a default here would
+        silently re-pin the session and dissolve the pending-choice issue.
+        """
+        if self.committed_model is not None:
+            return False
+        metadata = self.session_logger.session_metadata
+        envelope = metadata.launch_config if metadata is not None else None
+        return isinstance(envelope, LaunchMetadataV2)
+
     def _launch_metadata(self) -> LaunchMetadataV2 | None:
         if self.committed_model is None:
             return None
@@ -1354,6 +1389,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             self.config_orchestrator.availability_registry.reset_base(
                 self.committed_model.base_model
             )
+        self._admitted_tool_policies.clear()
         self._active_turn = _ActiveTurn(
             subagent_runner=subagent_runner,
             tool_io=tool_io,
@@ -1375,13 +1411,127 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                         injected=options.injected,
                     )
                 ) as conversation:
-                    async for event in conversation:
+                    async for event in self._sanitize_outward_events(conversation):
                         yield event
             finally:
                 self.checkpoint_recorder.seal_turn()
         finally:
+            self._admitted_tool_policies.clear()
             self._active_turn = None
             self._backend_lifetime.drain(whole_turn_active=False)
+
+    async def _sanitize_outward_events(
+        self, events: AsyncGenerator[BaseEvent]
+    ) -> AsyncGenerator[BaseEvent]:
+        # Hold events behind the earliest unfinished stream so concurrent tool
+        # completions cannot reorder the events seen by consumers.
+        marker = "[Unchecked tool stream remainder suppressed]"
+        pending: list[BaseEvent] = []
+        streams: dict[str, list[ToolStreamEvent]] = {}
+        stream_sizes: dict[str, int] = {}
+        truncated: set[str] = set()
+        async for event in events:
+            ready: list[BaseEvent] = []
+            with secret_redaction.bind_policy(
+                secret_redaction.ScrubPolicy.for_redaction(
+                    self._admitted_tool_policies.values(), self.scrub_policy
+                )
+            ):
+                if isinstance(event, ToolStreamEvent):
+                    call_id = event.tool_call_id
+                    is_first = call_id not in streams
+                    used = stream_sizes.get(call_id, 0)
+                    remaining = max(0, 8192 * 128 - used)
+                    if len(event.message) > remaining:
+                        truncated.add(call_id)
+                    if remaining and event.message:
+                        streams.setdefault(call_id, []).append(
+                            event.model_copy(
+                                update={"message": event.message[:remaining]}
+                            )
+                        )
+                    elif call_id not in streams:
+                        streams[call_id] = [event.model_copy(update={"message": ""})]
+                    stream_sizes[call_id] = used + min(len(event.message), remaining)
+                    if is_first:
+                        pending.append(streams[call_id][0])
+                elif isinstance(event, ToolResultEvent):
+                    chunks = streams.pop(event.tool_call_id, [])
+                    stream_sizes.pop(event.tool_call_id, None)
+                    if chunks:
+                        replacement = self._sanitize_stream(
+                            chunks, marker, event.tool_call_id in truncated
+                        )
+                        first = pending.index(chunks[0])
+                        pending[first] = replacement
+                    truncated.discard(event.tool_call_id)
+                    pending.append(self._sanitize_outward_event(event))
+                    self._admitted_tool_policies.pop(event.tool_call_id, None)
+                else:
+                    pending.append(self._sanitize_outward_event(event))
+                while pending and not (
+                    isinstance(pending[0], ToolStreamEvent)
+                    and pending[0].tool_call_id in streams
+                ):
+                    ready.append(pending.pop(0))
+            for item in ready:
+                yield item
+        # A stream with no result is still output; never expose its unchecked
+        # remainder if the source generator ended unexpectedly.
+        for item in pending:
+            if isinstance(item, ToolStreamEvent) and item.tool_call_id in streams:
+                with secret_redaction.bind_policy(
+                    secret_redaction.ScrubPolicy.for_redaction(
+                        self._admitted_tool_policies.values(), self.scrub_policy
+                    )
+                ):
+                    item = item.model_copy(
+                        update={
+                            "message": marker,
+                            "tool_name": secret_redaction.redact(item.tool_name),
+                            "tool_call_id": secret_redaction.redact(item.tool_call_id),
+                        }
+                    )
+            yield item
+
+    @staticmethod
+    def _sanitize_stream(
+        chunks: list[ToolStreamEvent], marker: str, truncated: bool
+    ) -> ToolStreamEvent:
+        body = "".join(chunk.message for chunk in chunks)
+        # Streams are buffered, so scan the entire retained body once. A window
+        # cannot prove that a credential crossing its edge was checked (even at
+        # the documented 16 KiB maximum); never emit independently checked
+        # windows. The 1 MiB retention cap still bounds this whole-body scan.
+        sanitized = secret_redaction.redact(body)
+        if truncated:
+            sanitized += marker
+        return chunks[0].model_copy(
+            update={
+                "message": sanitized,
+                "tool_name": secret_redaction.redact(chunks[0].tool_name),
+                "tool_call_id": secret_redaction.redact(chunks[0].tool_call_id),
+            }
+        )
+
+    def _sanitize_outward_event(self, event: BaseEvent) -> BaseEvent:
+        """Sanitize tool and hook payloads before UI/ACP consumers see them."""
+        if not isinstance(event, (ToolResultEvent, HookEvent)):
+            return event
+        try:
+            return secret_redaction.redact_model(event)
+        except Exception:
+            logger.warning(
+                "Tool event sanitation failed; suppressing payload", exc_info=True
+            )
+            if isinstance(event, ToolResultEvent):
+                return ToolResultEvent(
+                    tool_name="tool",
+                    tool_class=None,
+                    tool_call_id=secret_redaction.redact(event.tool_call_id),
+                    error="Tool result unavailable",
+                )
+            return HookEvent()
 
     def _last_user_message(self) -> LLMMessage | None:
         return AgentLoop._last_user_message_from(select_model_context(self.messages))
@@ -1993,15 +2143,21 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
     async def _handle_tool_calls(
         self, resolved: ResolvedMessage
     ) -> AsyncGenerator[BaseEvent]:
-        async for event in self._emit_failed_tool_events(resolved.failed_calls):
-            yield event
-        if not resolved.tool_calls:
-            return
+        self._begin_tool_response_ordering()
+        try:
+            async for event in self._emit_failed_tool_events(resolved.failed_calls):
+                yield event
+            if not resolved.tool_calls:
+                return
 
-        for batch in [resolved.tool_calls]:
-            async with contextlib.aclosing(self._handle_tool_batch(batch)) as events:
-                async for event in events:
-                    yield event
+            for batch in [resolved.tool_calls]:
+                async with contextlib.aclosing(
+                    self._handle_tool_batch(batch)
+                ) as events:
+                    async for event in events:
+                        yield event
+        finally:
+            self._end_tool_response_ordering()
 
     async def _handle_tool_batch(
         self, tool_calls: list[ResolvedToolCall]
@@ -2050,10 +2206,15 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 tool_call_id=failed.call_id,
             )
             self.stats.tool_calls_failed += 1
-            self.messages.append(
+            # Same choke point as successful responses: pydantic validation
+            # errors echo model-supplied argument values, so the failure text
+            # can carry a secret and must be redacted before it joins the
+            # message list.
+            self._append_tool_response(
+                failed.call_id,
                 self.format_handler.create_failed_tool_response_message(
-                    failed, error_msg
-                )
+                    failed, secret_redaction.redact(error_msg)
+                ),
             )
 
     async def _run_tools_concurrently(
@@ -2066,8 +2227,15 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._tool_event_queue = queue
         self._request_broker.bind(queue)
 
+        # Execution retains only names/passthrough; the value snapshot is never
+        # bound in a tool task or placed in a queue/event.
+        admitted = self.scrub_policy
+        redaction_snapshot = admitted.capture_for_redaction()
+        self._admitted_tool_policies.update(
+            (tc.call_id, redaction_snapshot) for tc in tool_calls
+        )
         tasks = [
-            asyncio.create_task(self._execute_tool_to_queue(tc, queue))
+            asyncio.create_task(self._execute_tool_to_queue(tc, queue, admitted))
             for tc in tool_calls
         ]
 
@@ -2090,7 +2258,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                         type(result).__name__,
                     )
                     self.stats.tool_calls_failed += 1
-                    await queue.put(self._tool_failure_event(tool_call, error_msg))
+                    with secret_redaction.bind_policy(admitted):
+                        await queue.put(self._tool_failure_event(tool_call, error_msg))
             finally:
                 await queue.put(None)
 
@@ -2117,12 +2286,16 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     await monitor
 
     async def _execute_tool_to_queue(
-        self, tc: ResolvedToolCall, queue: asyncio.Queue[BaseEvent | None]
+        self,
+        tc: ResolvedToolCall,
+        queue: asyncio.Queue[BaseEvent | None],
+        admitted: secret_redaction.ScrubPolicy,
     ) -> None:
-        """Run a single tool call, sending events to the queue."""
-        async with contextlib.aclosing(self._process_one_tool_call(tc)) as events:
-            async for event in events:
-                await queue.put(event)
+        """Run a single tool call under its admission policy, sending events to the queue."""
+        with secret_redaction.bind_policy(admitted):
+            async with contextlib.aclosing(self._process_one_tool_call(tc)) as events:
+                async for event in events:
+                    await queue.put(event)
 
     async def _process_one_tool_call(
         self, tool_call: ResolvedToolCall
@@ -2380,6 +2553,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         persisted_result: PersistedToolResult | None = None,
         images: list[ImageAttachment] | None = None,
     ) -> None:
+        # Single choke point for every tool response entering the message list:
+        # redacting here covers both model input and the persisted session log,
+        # including the structured tool_result payload carried alongside.
+        text = secret_redaction.redact(text)
+        if persisted_result is not None:
+            persisted_result = secret_redaction.redact_persisted_result(
+                persisted_result
+            )
         message = LLMMessage.model_validate(
             self.format_handler.create_tool_response_message(tool_call, text)
         )
@@ -2388,7 +2569,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             updates["tool_result"] = persisted_result
         if images is not None:
             updates["images"] = images
-        self.messages.append(message.model_copy(update=updates) if updates else message)
+        self._append_tool_response(
+            tool_call.call_id,
+            message.model_copy(update=updates) if updates else message,
+        )
 
     def _tool_failure_event(
         self, tool_call: ResolvedToolCall, error_msg: str, cancelled: bool = False
@@ -2402,6 +2586,64 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             cancelled=cancelled,
             tool_call_id=tool_call.call_id,
         )
+
+    def _begin_tool_response_ordering(self) -> None:
+        """Stage tool-response messages so they append in tool-call order.
+
+        Providers require ``tool_response`` messages to follow the order of
+        the ``tool_calls`` that produced them, but batched tools complete out
+        of order and their events must keep streaming in completion order.
+        While ordering is active, ``_append_tool_response`` buffers each
+        message and appends index ``i`` only once index ``i - 1`` has
+        appended, so streaming stays responsive and the message list stays
+        deterministic.
+        """
+        ordered_calls: list[ToolCall] = []
+        for message in reversed(self.messages):
+            if message.role == Role.assistant and message.tool_calls:
+                ordered_calls = list(message.tool_calls)
+                break
+        order: dict[str, int] = {}
+        for index, tool_call in enumerate(ordered_calls):
+            if tool_call.id and tool_call.id not in order:
+                order[tool_call.id] = index
+        self._tool_response_order = order
+        self._staged_tool_responses = {}
+        self._next_tool_response_index = 0
+
+    def _append_tool_response(self, call_id: str, message: LLMMessage) -> None:
+        """Append a tool-response message, in call order during a batch."""
+        order = self._tool_response_order
+        index = order.get(call_id) if order is not None else None
+        if index is None:
+            # No active batch (or a call outside it): append directly.
+            self.messages.append(message)
+            return
+        self._staged_tool_responses.setdefault(index, []).append(message)
+        while (
+            staged := self._staged_tool_responses.pop(
+                self._next_tool_response_index, None
+            )
+        ) is not None:
+            self.messages.extend(staged)
+            self._next_tool_response_index += 1
+
+    def _end_tool_response_ordering(self) -> None:
+        """Flush staged responses and close the ordering window.
+
+        A call aborted before producing any response leaves a gap here;
+        ``_fill_missing_tool_responses`` backfills it before the next
+        completion, exactly as it did before ordering existed.
+        """
+        order = self._tool_response_order
+        staged = self._staged_tool_responses
+        self._tool_response_order = None
+        self._staged_tool_responses = {}
+        self._next_tool_response_index = 0
+        if order is None:
+            return
+        for index in sorted(staged):
+            self.messages.extend(staged[index])
 
     def _completion_inputs(
         self,
@@ -3566,20 +3808,30 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         from chartreux.core.model_catalog.resolver import resolver_for
 
         resolver = resolver_for(prepared.config)
+        identity: CommittedModelIdentity | None
         if (
             self.committed_model is not None
             and prepared.config.active_model == self._committed_selection
         ):
-            resolved = resolver.resolve_committed(
+            identity = resolver.resolve_committed(
                 self.committed_model, allowed_models=prepared.config.allowed_models
-            )
+            ).identity
+        elif (
+            self.committed_model is None
+            and self._model_choice_pending()
+            and not prepared.config.active_model
+        ):
+            # Committed-model recovery: an unrelated config write must not
+            # silently commit the default. Stay unpinned; only an explicit
+            # active_model selection (the branch below) opens the gate.
+            identity = None
         else:
-            resolved = resolver.resolve(
+            identity = resolver.resolve(
                 prepared.config.active_model
                 or prepared.config.resolve_default_model_alias(),
                 allowed_models=prepared.config.allowed_models,
-            )
-        prepared.config.attach_committed_model(resolved.identity)
+            ).identity
+        prepared.config.attach_committed_model(identity)
         # Finish fallible rendering and hook construction before retiring authority
         # or replacing any runtime object. A failed candidate leaves the old loop live.
         adopt_skills = prepared.skills_adopted == self._skills_adopted
@@ -3613,7 +3865,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         previous_selection = self._committed_selection
         publication = self._backend_lifetime.publish_reversible(prepared.backend)
         try:
-            self.committed_model = resolved.identity
+            self.committed_model = identity
             self._committed_selection = prepared.config.active_model
             self.config.attach_committed_model(self.committed_model)
             self.install_launch_metadata()
@@ -3631,6 +3883,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.tool_manager._retire_authority()
         self.tool_manager = prepared.tool_manager
         self._authority_revision += 1
+        self.scrub_policy = secret_redaction.ScrubPolicy.from_config(prepared.config)
+        secret_redaction.register_session_policy(self, self.scrub_policy)
         if prepared.config.mcp_servers:
             self._mcp_pool = self._create_mcp_pool()
         if adopt_skills:
@@ -3663,3 +3917,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             pass
 
         self.middleware_pipeline = middleware
+        # The value cache remains process-wide; reload invalidates stored/keyring
+        # values. Already inherited child environments require pool retirement.
+        secret_redaction.reset_cache()

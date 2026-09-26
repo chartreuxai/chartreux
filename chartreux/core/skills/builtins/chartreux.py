@@ -707,6 +707,10 @@ subagents. Custom subagents are TOML files in `~/.chartreux/agents/NAME.toml`.
   session override, not `config.toml`)
 - `/theme` - Select Textual UI theme; `auto` follows terminal/OS appearance (persisted in config)
 - `/reload` - Reload configuration, agent instructions, and skills from disk
+- `/config` - Open the user `~/.chartreux/config.toml` in the user's editor
+  (`$VISUAL`/`$EDITOR`, falling back to `nano`); creates the file with a
+  commented template when absent and reloads configuration after editing if the
+  file changed
 - `/clear`, `/new` - Start a new conversation. Optionally pass a prompt to seed it
 - `/log` - Show path to current interaction log file
 - `/log-level` - Show the effective log-level chain (session, environment,

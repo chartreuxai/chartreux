@@ -8,6 +8,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_settings.sources import EnvSettingsSource
 
 from chartreux.core.config._catalog import validate_catalog_scope
+from chartreux.core.config._credential_authority import (
+    CREDENTIAL_ENV_FIELD,
+    validate_credential_env_source,
+)
 from chartreux.core.config._root_authority import ROOTS_FIELD, validate_root_source
 from chartreux.core.config._source_validation import (
     _environment_source_error,
@@ -62,6 +66,13 @@ class EnvironmentLayer(ConfigLayer[RawConfig]):
             for name in os.environ
         ):
             validate_root_source({ROOTS_FIELD: None}, layer=self)
+        if any(
+            name.upper().startswith("CHARTREUX_")
+            and name[len("CHARTREUX_") :].split("__", 1)[0].lower()
+            == CREDENTIAL_ENV_FIELD
+            for name in os.environ
+        ):
+            validate_credential_env_source({CREDENTIAL_ENV_FIELD: None}, layer=self)
         validate_catalog_scope(
             schema,
             (

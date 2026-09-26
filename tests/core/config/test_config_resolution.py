@@ -14,16 +14,43 @@ from chartreux.core.config.layers.project import ProjectConfigLayer
 from chartreux.core.config.layers.user import UserConfigLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.config.patch import AddOperationPatch
-from chartreux.core.model_catalog.loader import load_catalog
+from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
+from chartreux.core.model_catalog.loader import (
+    CatalogSnapshot,
+    load_catalog,
+    merge_catalog_overlay,
+)
 from chartreux.core.trusted_folders import TrustedFoldersManager
 
 pytestmark = pytest.mark.asyncio
 
 
-async def _build(*layers: object) -> ChartreuxConfigSchema:
-    builder = ConfigBuilder(ChartreuxConfigSchema, catalog_snapshot=load_catalog())
+async def _build(
+    *layers: object, snapshot: CatalogSnapshot | None = None
+) -> ChartreuxConfigSchema:
+    builder = ConfigBuilder(
+        ChartreuxConfigSchema, catalog_snapshot=snapshot or load_catalog()
+    )
     builder.add_layers([DefaultConfigLayer(schema=ChartreuxConfigSchema), *layers])  # type: ignore[arg-type]
     return await builder.build()
+
+
+def _two_model_snapshot() -> CatalogSnapshot:
+    """A snapshot with a second resolvable model; the shipped catalog has one."""
+    catalog = merge_catalog_overlay(
+        SHIPPED_CATALOG,
+        {
+            "providers": {"second/default": {"api_base": "https://second.test/v1"}},
+            "models": {
+                "second-model": {
+                    "deployments": [
+                        {"provider": "second/default", "name": "second-model"}
+                    ]
+                }
+            },
+        },
+    )
+    return CatalogSnapshot(catalog, "test-two-models")
 
 
 async def test_shipped_catalog_resolves_selection_to_wire_name_and_display_provider() -> (
@@ -42,8 +69,8 @@ async def test_shipped_catalog_resolves_selection_to_wire_name_and_display_provi
     ("user", "project", "environment", "expected"),
     [
         ("glm-5-3", None, None, "glm-5-3"),
-        ("glm-5-3", "gpt-6-astra", None, "gpt-6-astra"),
-        ("glm-5-3", "gpt-6-astra", "glm-5-3", "glm-5-3"),
+        ("glm-5-3", "second-model", None, "second-model"),
+        ("glm-5-3", "second-model", "glm-5-3", "glm-5-3"),
     ],
 )
 async def test_selection_precedence_across_user_project_and_environment(
@@ -68,7 +95,8 @@ async def test_selection_precedence_across_user_project_and_environment(
     if environment is not None:
         monkeypatch.setenv("CHARTREUX_ACTIVE_MODEL", environment)
         layers.append(EnvironmentLayer(schema=ChartreuxConfigSchema))
-    assert (await _build(*layers)).get_active_model().alias == expected
+    config = await _build(*layers, snapshot=_two_model_snapshot())
+    assert config.get_active_model().alias == expected
 
 
 async def test_untrusted_project_cannot_override_user_selection(tmp_path: Path) -> None:
@@ -77,7 +105,7 @@ async def test_untrusted_project_cannot_override_user_selection(tmp_path: Path) 
     root = tmp_path / "project"
     project = root / ".chartreux" / "config.toml"
     project.parent.mkdir(parents=True)
-    project.write_text('active_model = "gpt-6-astra"\n')
+    project.write_text('active_model = "untrusted-model"\n')
     config = await _build(
         UserConfigLayer(path=user),
         ProjectConfigLayer(path=root, trust_store=TrustedFoldersManager()),
@@ -111,9 +139,9 @@ async def test_thinking_overrides_are_layer_merged_and_materialized_without_cata
 )
 async def test_selection_fields_replace_instead_of_merging(field: str) -> None:
     lower = {
-        field: "glm-5-3" if field != "allowed_models" else ["glm-5-3", "gpt-6-astra"]
+        field: "glm-5-3" if field != "allowed_models" else ["glm-5-3", "other-model"]
     }
-    higher = {field: "gpt-6-astra" if field != "allowed_models" else ["gpt-6-astra"]}
+    higher = {field: "other-model" if field != "allowed_models" else ["other-model"]}
     config = await _build(
         OverridesLayer(data=lower, name="lower"),
         OverridesLayer(data=higher, name="higher"),
@@ -175,5 +203,5 @@ async def test_legacy_tables_fail_before_selection_layer_can_shadow_them(
     with pytest.raises(Exception, match="chartreux models migrate"):
         await _build(
             UserConfigLayer(path=path),
-            OverridesLayer(data={"active_model": "gpt-6-astra"}),
+            OverridesLayer(data={"active_model": "other-model"}),
         )

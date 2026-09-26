@@ -16,6 +16,10 @@ from chartreux.core.config._catalog import (
     CATALOG_DEFINITION_FIELDS,
     validate_catalog_scope,
 )
+from chartreux.core.config._credential_authority import (
+    CREDENTIAL_ENV_FIELD,
+    validate_credential_env_source,
+)
 from chartreux.core.config._restrictions import ConfigCandidate, SourceRestrictions
 from chartreux.core.config._root_authority import ROOTS_FIELD, validate_root_source
 from chartreux.core.config._source_validation import validate_source
@@ -935,6 +939,13 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
                 value = operation.to_json_patch().get("value")
                 if isinstance(value, dict):
                     fields.update(value)
+            if CREDENTIAL_ENV_FIELD in fields:
+                # Generic patches (including client config_write with a user target)
+                # cannot prove user intent. Edit the user file directly instead.
+                raise ConfigPatchValidationError(
+                    f"Field '{CREDENTIAL_ENV_FIELD}' requires an actual user source "
+                    "edited outside generic config writes"
+                )
             if ROOTS_FIELD in fields:
                 source_label = "user" if type(layer) is UserConfigLayer else "non-user"
                 raise ConfigPatchValidationError(
@@ -1008,6 +1019,8 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
                 )
                 overrides[layer_name] = layer.validate_output(patched)
                 if isinstance(self.config, ChartreuxConfigSchema):
+                    validate_credential_env_source(raw, layer=layer)
+                    validate_credential_env_source(patched, layer=layer)
                     validate_root_source(raw, layer=layer)
                     validate_root_source(patched, layer=layer)
                     validate_source(

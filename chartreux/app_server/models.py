@@ -315,6 +315,7 @@ class TurnErrorCode(StrEnum):
     BACKEND_ERROR = auto()
     INVALID_MODEL = auto()
     INVALID_API_KEY = auto()
+    ALL_DEPLOYMENTS_UNAVAILABLE = auto()
     INTERNAL_ERROR = auto()
 
 
@@ -401,6 +402,11 @@ class AgentStatsSnapshot(ProtocolModel):
 class ConfigIssue(ProtocolModel):
     file: str
     message: str
+
+
+# Marker for the runtime issue that surfaces a session resumed after its
+# committed model left the catalog; clients use it to route to model selection.
+COMMITTED_MODEL_RECOVERY_ISSUE_FILE = "committed-model"
 
 
 class DebugLogEntry(ProtocolModel):

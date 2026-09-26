@@ -82,6 +82,8 @@ _COMPOUND_NODES = {
     "if_statement": "if statement",
     "subshell": "subshell",
     "test_command": "test expression",
+    # The parser does not emit a regular command node for this builtin.
+    "unset_command": "unsetting shell environment variables cannot be safely inspected",
     "while_statement": "while loop",
 }
 
@@ -214,30 +216,92 @@ def _redirect_reason(node: Node) -> str | None:
     return None
 
 
-def _command_name(node: Node) -> str | None:
+def _executable_parts(node: Node) -> list[str]:
     if node.type != "command":
-        return None
+        return []
     parts = [
         token for child in node.children if (token := _literal_token(child)) is not None
     ]
+    # Unwrap each executable position, including repeated command/builtin
+    # prefixes. Arguments of the final executable are never reinterpreted.
+    while parts and (command := parts[0].rsplit("/", 1)[-1]) in {
+        "command",
+        "builtin",
+        "exec",
+    }:
+        index = 1
+        while index < len(parts):
+            if parts[index] == "--":
+                index += 1
+                break
+            if command == "exec" and parts[index] == "-a":
+                index += 2
+                continue
+            if parts[index].startswith("-"):
+                index += 1
+                continue
+            break
+        parts = parts[index:]
+    return parts
+
+
+def _command_name(node: Node) -> str | None:
+    parts = _executable_parts(node)
+    return parts[0].rsplit("/", 1)[-1] if parts else None
+
+
+_COMMAND_LOOKUP_MUTATORS = frozenset({
+    "hash",
+    "alias",
+    "unalias",
+    "enable",
+    "shopt",
+    "set",
+    "source",
+    ".",
+})
+
+
+def _lookup_mutation_reason(node: Node, nested_source: bool) -> str | None:
+    parts = _executable_parts(node)
     if not parts:
         return None
-    command = parts[0].rsplit("/", 1)[-1]
-    if command not in {"command", "builtin", "exec"}:
-        return command
-    index = 1
-    while index < len(parts):
-        if parts[index] == "--":
-            index += 1
-            break
-        if command == "exec" and parts[index] == "-a":
-            index += 2
-            continue
-        if parts[index].startswith("-"):
-            index += 1
-            continue
-        break
-    return parts[index].rsplit("/", 1)[-1] if index < len(parts) else None
+    name = parts[0].rsplit("/", 1)[-1]
+    if name in {"export", "declare", "typeset", "readonly"}:
+        assignments = parts[1:] + [
+            child.text.decode("utf-8")
+            for child in node.children
+            if child.type == "concatenation" and child.text is not None
+        ]
+        for arg in assignments:
+            variable, separator, _ = arg.partition("=")
+            if separator and (
+                variable in DANGEROUS_ENV_NAMES
+                or variable.startswith(_DANGEROUS_ENV_PREFIXES)
+            ):
+                return f"dangerous environment assignment ({variable})"
+    # A top-level hash -p or alias definition affects later command resolution;
+    # nested shells can also change lookup via the remaining builtins.
+    mutates_lookup = (
+        (nested_source and name in _COMMAND_LOOKUP_MUTATORS)
+        or (
+            name == "hash"
+            and any(option == "-p" or option.startswith("-p") for option in parts[1:])
+        )
+        or (name == "alias" and any("=" in value for value in parts[1:]))
+        or (
+            name == "alias"
+            and any(
+                child.type == "concatenation"
+                and child.text is not None
+                and b"=" in child.text
+                for child in node.children
+            )
+        )
+    )
+    if mutates_lookup:
+        return f"unsupported command lookup modification ({name})"
+    return None
 
 
 @dataclass(frozen=True)
@@ -260,7 +324,9 @@ def _get_parser() -> Parser:
     return Parser(Language(tsbash.language()))
 
 
-def _analyze_shell_command(command: str) -> ShellPermissionAnalysis:
+def _analyze_shell_command(
+    command: str, *, nested_source: bool = False
+) -> ShellPermissionAnalysis:
     """Extract commands and fail closed on syntax the policy cannot model."""
     if "\0" in command:
         raise ValueError("shell command contains a NUL byte")
@@ -275,7 +341,9 @@ def _analyze_shell_command(command: str) -> ShellPermissionAnalysis:
     all_nodes = (tree.root_node, *tuple(_descendants(tree.root_node)))
     has_file_redirect = any(node.type == "file_redirect" for node in all_nodes)
     has_command = any(_command_name(node) is not None for node in all_nodes)
-    has_cd = any(_command_name(node) == "cd" for node in all_nodes)
+    has_cwd_change = any(
+        _command_name(node) in {"cd", "pushd", "popd"} for node in all_nodes
+    )
     if has_file_redirect and not has_command:
         approval_reasons.add("redirect-only statements are not permitted")
     if (
@@ -283,10 +351,14 @@ def _analyze_shell_command(command: str) -> ShellPermissionAnalysis:
         and not has_command
     ):
         approval_reasons.add("assignment-only statements are not permitted")
-    if has_file_redirect and has_cd:
-        approval_reasons.add("redirection in a command chain containing cd")
+    if has_file_redirect and has_cwd_change:
+        approval_reasons.add(
+            "redirection in a command chain containing cd"
+            if any(_command_name(node) == "cd" for node in all_nodes)
+            else "redirection in a command chain changing the working directory"
+        )
 
-    def find_commands(node: Node) -> None:
+    def find_commands(node: Node) -> None:  # noqa: PLR0912
         if node.type == "variable_assignment":
             if reason := _assignment_reason(node):
                 approval_reasons.add(reason)
@@ -297,6 +369,8 @@ def _analyze_shell_command(command: str) -> ShellPermissionAnalysis:
             approval_reasons.add(reason)
 
         if node.type == "command":
+            if reason := _lookup_mutation_reason(node, nested_source):
+                approval_reasons.add(reason)
             parts: list[str] = []
             for child in node.children:
                 if part := _supported_command_part(child):
@@ -338,10 +412,12 @@ def _analyze_shell_command(command: str) -> ShellPermissionAnalysis:
     )
 
 
-def analyze_shell_command(command: str) -> ShellPermissionAnalysis:
+def analyze_shell_command(
+    command: str, *, nested_source: bool = False
+) -> ShellPermissionAnalysis:
     """Analyze a command, denying safely when parsing or traversal fails."""
     try:
-        return _analyze_shell_command(command)
+        return _analyze_shell_command(command, nested_source=nested_source)
     except Exception:
         return ShellPermissionAnalysis(
             command_parts=(), approval_reasons=("shell analysis failed",)

@@ -20,6 +20,7 @@ class ExternalEditor:
     def edit_file(cls, file_path: Path, *, check: bool = False) -> None:
         editor = cls.get_editor()
         parts = shlex.split(editor)
+        # Trusted user-operated editor: intentionally retains the user's environment.
         subprocess.run([*parts, str(file_path)], check=check)
 
     def edit(self, initial_content: str = "") -> str | None:
@@ -32,7 +33,7 @@ class ExternalEditor:
 
             content = read_safe(Path(filepath)).text.rstrip()
             return content if content != initial_content else None
-        except (OSError, subprocess.CalledProcessError):
+        except (OSError, ValueError, subprocess.CalledProcessError):
             return
         finally:
             Path(filepath).unlink(missing_ok=True)

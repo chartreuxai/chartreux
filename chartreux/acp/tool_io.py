@@ -57,6 +57,14 @@ class AcpClientToolHandler(ClientToolHandler):
     async def create_terminal(
         self, params: ClientToolTerminalCreateParams
     ) -> ClientToolTerminalCreateResponse:
+        # ACP's create_terminal only carries variables to set, not names to
+        # remove, so the scrub list travels through the reserved ``_meta``
+        # extensibility field. Cooperative clients drop the listed names from
+        # the terminal's inherited environment; chartreux additionally
+        # redacts known secret values from the returned output.
+        meta: dict[str, list[str]] | None = (
+            {"env_scrub": params.env_scrub} if params.env_scrub else None
+        )
         response = await self._client.create_terminal(
             session_id=self._require_session_id(),
             command=params.command,
@@ -71,6 +79,7 @@ class AcpClientToolHandler(ClientToolHandler):
             ),
             cwd=params.cwd,
             output_byte_limit=params.output_byte_limit,
+            **(meta or {}),
         )
         if params.tool_call_id is not None:
             await self._client.session_update(

@@ -11,17 +11,21 @@ from chartreux.core.model_catalog.loader import CatalogLoadError, CatalogStore
 from chartreux.core.paths import GLOBAL_ENV_FILE
 from chartreux.core.utils.concurrency import run_sync
 from chartreux.observability.logging import logger
+from chartreux.utils.private_paths import restrict_private_file
 
 
 def _save_api_key_to_env_file(env_key: str, api_key: str) -> None:
     GLOBAL_ENV_FILE.path.parent.mkdir(parents=True, exist_ok=True)
     set_key(GLOBAL_ENV_FILE.path, env_key, api_key)
+    # dotenv honors the process umask, so tighten the key file to owner-only.
+    restrict_private_file(GLOBAL_ENV_FILE.path)
 
 
 def _remove_api_key_from_env_file(env_key: str) -> None:
     if not GLOBAL_ENV_FILE.path.exists():
         return
     unset_key(GLOBAL_ENV_FILE.path, env_key)
+    restrict_private_file(GLOBAL_ENV_FILE.path)
 
 
 def _load_onboarding_provider() -> ProviderConfig:

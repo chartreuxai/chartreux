@@ -53,9 +53,9 @@ async def test_bash_captures_stdout(mistral_api: MistralAPI) -> None:
 
 @pytest.mark.asyncio
 async def test_bash_captures_stderr(mistral_api: MistralAPI) -> None:
-    result = await _run_bash(
-        mistral_api, "python -c \"import sys; sys.stderr.write('oops')\""
-    )
+    # `more` reports the missing file on stderr while still exiting 0;
+    # `python -c` and `1>&2` style redirects are denied by the shell policy.
+    result = await _run_bash(mistral_api, "more nonexistent-oops-file")
 
     bash_result = cast(CapturedShellResult, result.result)
     assert "oops" in bash_result.stderr

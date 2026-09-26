@@ -285,7 +285,6 @@ class TestSkillPermission:
 
         assert perm is not None
         assert perm.permission == ToolPermission.ALWAYS
-        assert perm.required_permissions == []
 
     def test_non_builtin_skill_is_still_always_allowed(self, skill_tool: Skill) -> None:
         perm = skill_tool.resolve_permission(SkillArgs(name="custom-skill"))

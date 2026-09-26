@@ -4,6 +4,8 @@ import asyncio
 import os
 from pathlib import Path
 
+from chartreux.core.tools.secret_redaction import scrub_child_env
+
 
 async def spawn_shell_command(
     command: str, *, cwd: Path | None = None
@@ -23,7 +25,14 @@ async def spawn_shell_command(
 
 
 def _shell_environment() -> dict[str, str]:
-    env = {**os.environ, "CI": "true", "NONINTERACTIVE": "1", "NO_TTY": "1"}
+    # Chartreux's credential variables never reach shell children unless the
+    # user opted specific names back in via credential_env_passthrough.
+    env = {
+        **scrub_child_env(os.environ),
+        "CI": "true",
+        "NONINTERACTIVE": "1",
+        "NO_TTY": "1",
+    }
     # LC_ALL overrides every LC_* category, so a user-set LC_ALL=C (common in
     # CI/containers) would defeat LC_CTYPE below and yield non-UTF-8 output.
     env.pop("LC_ALL", None)

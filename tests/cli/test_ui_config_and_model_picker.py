@@ -85,9 +85,6 @@ async def test_model_picker_shows_all_models() -> None:
         picker = app.query_one(ModelPickerApp)
         assert [model.alias for model in picker._models] == [
             "glm-5-3",
-            "gpt-6-astra",
-            "gpt-6-luna",
-            "gpt-6-sol",
             "alpha",
             "beta",
             "gamma",
@@ -115,21 +112,16 @@ async def test_model_picker_shows_display_name_but_persists_alias() -> None:
         picker = app.query_one(ModelPickerApp)
         assert [model.display_name for model in picker._models] == [
             "mistral/default/zai-glm-5-3",
-            "codex/local/gpt-6-astra",
-            "codex/local/gpt-6-luna",
-            "codex/local/gpt-6-sol",
             "mistral/default/model-a",
             "mistral/default/custom-model",
         ]
         option_list = picker.query_one(OptionList)
         assert "mistral/default/custom-model" in str(
-            option_list.get_option_at_index(6).prompt
+            option_list.get_option_at_index(3).prompt
         )
 
         # Selecting it still persists the alias, not the label.
-        await pilot.press(
-            "home", "down", "down", "down", "down", "down", "down", "enter"
-        )
+        await pilot.press("home", "down", "down", "down", "enter")
         await wait_until(pilot, lambda: app.config.active_model.alias == "custom")
 
         assert app.config.active_model.alias == "custom"
@@ -242,12 +234,12 @@ async def test_model_picker_offers_default_row() -> None:
 
         picker = app.query_one(ModelPickerApp)
         option_list = picker.query_one(OptionList)
-        # Default + four shipped and three explicitly configured models.
-        assert option_list.option_count == 8
+        # Default + one shipped and three explicitly configured models.
+        assert option_list.option_count == 5
         # A pinned model pre-highlights that model, not the Default row.
         assert picker._is_pinned is True
         assert (
-            option_list.highlighted == 5
+            option_list.highlighted == 2
         )  # "alpha", offset by Default and shipped models
 
 

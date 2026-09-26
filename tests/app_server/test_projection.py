@@ -281,12 +281,31 @@ def test_config_view_hydrates_display_name_from_alias() -> None:
     assert config.model_display_name("unknown") == "unknown"
 
 
+_OTHER_PROVIDER: dict[str, object] = {"api_base": "https://other.test/v1"}
+_OTHER_MODEL: dict[str, object] = {
+    "deployments": [{"provider": "other/openai", "name": "other-model"}]
+}
+
+
 @pytest.mark.parametrize(
     ("overlay", "allowed_models"),
     [
-        pytest.param({}, ["gpt-6-astra"], id="default-excluded-by-allowlist"),
         pytest.param(
-            {"providers": {"mistral/default": {"disabled": True}}},
+            {
+                "providers": {"other/openai": _OTHER_PROVIDER},
+                "models": {"other-model": _OTHER_MODEL},
+            },
+            ["other-model"],
+            id="default-excluded-by-allowlist",
+        ),
+        pytest.param(
+            {
+                "providers": {
+                    "other/openai": _OTHER_PROVIDER,
+                    "mistral/default": {"disabled": True},
+                },
+                "models": {"other-model": _OTHER_MODEL},
+            },
             [],
             id="default-provider-disabled",
         ),
@@ -298,14 +317,14 @@ def test_config_view_keeps_active_model_when_default_is_unavailable(
     catalog = merge_catalog_overlay(SHIPPED_CATALOG, overlay)
     snapshot = CatalogSnapshot(catalog, "test")
     schema = ChartreuxConfigSchema.model_validate(
-        {"active_model": "gpt-6-astra", "allowed_models": allowed_models},
+        {"active_model": "other-model", "allowed_models": allowed_models},
         context={"catalog_snapshot": snapshot},
     ).attach_catalog_snapshot(snapshot)
 
     config = project_config_view(schema)
 
-    assert config.active_model.alias == "gpt-6-astra"
-    assert "gpt-6-astra" in [model.alias for model in config.models]
+    assert config.active_model.alias == "other-model"
+    assert "other-model" in [model.alias for model in config.models]
     assert config.default_model_alias == "none"
     assert config.default_model_display_name == "none"
 

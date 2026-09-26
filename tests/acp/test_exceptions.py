@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from chartreux.acp.exceptions import (
+    ALL_DEPLOYMENTS_UNAVAILABLE,
     COMPACTION_FAILED,
     IMAGES_NOT_SUPPORTED,
     UNAUTHENTICATED,
+    AllDeploymentsUnavailableError,
     CompactionError,
     ImagesNotSupportedError,
     UnauthenticatedError,
@@ -67,3 +69,39 @@ def test_public_images_not_supported_maps_to_acp_error() -> None:
 
     assert isinstance(error, ImagesNotSupportedError)
     assert error.code == IMAGES_NOT_SUPPORTED
+
+
+def test_public_all_deployments_unavailable_maps_to_dedicated_acp_code() -> None:
+    error = from_public_error(
+        PublicError(
+            code=TurnErrorCode.ALL_DEPLOYMENTS_UNAVAILABLE,
+            message="All deployments for model 'base' are unavailable",
+            details={
+                "base_model": "base",
+                "exclusions": [
+                    {
+                        "provider": "test/first",
+                        "wire_name": "first",
+                        "reason": "cooldown",
+                    },
+                    {
+                        "provider": "test/second",
+                        "wire_name": "second",
+                        "reason": "cooldown",
+                    },
+                ],
+            },
+        )
+    )
+
+    # ACP clients keep the dedicated application code instead of a generic
+    # internal error, with the per-deployment exclusion reasons preserved.
+    assert isinstance(error, AllDeploymentsUnavailableError)
+    assert error.code == ALL_DEPLOYMENTS_UNAVAILABLE
+    assert error.data == {
+        "base_model": "base",
+        "exclusions": [
+            {"provider": "test/first", "wire_name": "first", "reason": "cooldown"},
+            {"provider": "test/second", "wire_name": "second", "reason": "cooldown"},
+        ],
+    }

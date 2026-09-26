@@ -93,12 +93,26 @@ def _app_log_tail() -> str | None:
     return "\n".join(lines[-50:]) or None
 
 
+# Adaptive polling cadence for the shared e2e wait helpers: start with a short
+# sleep so quickly-satisfied waits return fast, then double toward the previous
+# fixed 0.05s cadence on consecutive empty polls. Timeout budgets are unchanged;
+# only the sleep cadence between polls adapts.
+POLL_SLEEP_MIN_S = 0.01
+POLL_SLEEP_MAX_S = 0.05
+
+
+def _next_poll_sleep(current: float) -> float:
+    return min(current * 2.0, POLL_SLEEP_MAX_S)
+
+
 def poll_until(predicate: Callable[[], bool], timeout: float, message: str) -> None:
     start = time.monotonic()
+    sleep_s = POLL_SLEEP_MIN_S
     while time.monotonic() - start < timeout:
         if predicate():
             return
-        time.sleep(0.05)
+        time.sleep(sleep_s)
+        sleep_s = _next_poll_sleep(sleep_s)
     raise AssertionError(message)
 
 
@@ -121,15 +135,17 @@ def wait_for_request_count_while_draining_child_output(
     timeout: float,
 ) -> None:
     start = time.monotonic()
+    idle_sleep = POLL_SLEEP_MIN_S
     while time.monotonic() - start < timeout:
         if request_count_getter() >= expected_count:
             return
-        if drain_child_output(child, captured):
+        if drain_child_output(child, captured, idle_sleep=idle_sleep):
             rendered_tail = strip_ansi(captured.getvalue())[-1200:]
             raise AssertionError(
                 "Child exited while waiting for "
                 f"{expected_count} backend request(s).\n\nRendered tail:\n{rendered_tail}"
             )
+        idle_sleep = _next_poll_sleep(idle_sleep)
     rendered_tail = strip_ansi(captured.getvalue())[-1200:]
     raise AssertionError(
         f"Timed out waiting for {expected_count} backend request(s).\n\n"
@@ -182,6 +198,9 @@ def wait_for_rendered_text(
     child: pexpect.spawn, captured: io.StringIO, needle: str, timeout: float
 ) -> None:
     start = time.monotonic()
+    # Fixed cadence (no adaptive backoff): several onboarding screens race
+    # keystrokes against screen transitions, and returning earlier here was
+    # measurably shown to flake the first-run onboarding e2e under load.
     while time.monotonic() - start < timeout:
         if needle in strip_ansi(captured.getvalue()):
             return

@@ -60,6 +60,14 @@ class CommandRegistry:
                 description="Reload configuration, agent instructions, and skills from disk",
                 handler="_reload_config",
             ),
+            "config": Command(
+                aliases=frozenset(["/config"]),
+                description=(
+                    "Open the user config file in your editor and reload "
+                    "configuration after editing"
+                ),
+                handler="_config_command",
+            ),
             "clear": Command(
                 aliases=frozenset(["/clear", "/new"]),
                 description=(

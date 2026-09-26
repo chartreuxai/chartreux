@@ -175,6 +175,19 @@ def resolve_git_executable(*, cwd: Path | None = None) -> str | None:
     return _search_trusted_path("git", cwd=project_dir)
 
 
+def resolve_ssh_executable(*, cwd: Path | None = None) -> str | None:
+    """Return an absolute SSH client that is not a project-local binary.
+
+    Automatic discovery never searches relative PATH entries or selects an
+    executable from the working directory.
+    """
+    try:
+        project_dir = (cwd or Path.cwd()).resolve()
+    except (OSError, RuntimeError):
+        return None
+    return _search_trusted_path("ssh", cwd=project_dir)
+
+
 def configure_git_python_executable(*, cwd: Path | None = None) -> str | None:
     """Pin GitPython to the same trusted executable used by direct callers."""
     executable = resolve_git_executable(cwd=cwd)

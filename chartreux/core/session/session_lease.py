@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 import json
 import os
@@ -43,25 +43,41 @@ class SessionLease:
             except BlockingIOError as exc:
                 file.close()
                 raise SessionBusyError(self._session_id) from exc
-            diagnostic = {
-                "lease_version": 1,
-                "session_id": self._session_id,
-                "process_id": os.getpid(),
-                "acquired_at": _timestamp(),
-            }
-            file.seek(0)
-            file.truncate()
-            file.write(
-                json.dumps(
-                    diagnostic,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ).encode()
-                + b"\n"
-            )
-            file.flush()
-            os.fsync(file.fileno())
+            try:
+                diagnostic = {
+                    "lease_version": 1,
+                    "session_id": self._session_id,
+                    "process_id": os.getpid(),
+                    "acquired_at": _timestamp(),
+                }
+                file.seek(0)
+                file.truncate()
+                file.write(
+                    json.dumps(
+                        diagnostic,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode()
+                    + b"\n"
+                )
+                file.flush()
+                os.fsync(file.fileno())
+            except BaseException:
+                # A lease that cannot publish its diagnostic is not acquired:
+                # undo the lock so the caller can retry. BaseException, not
+                # OSError: the guarded block also runs non-OS code (_timestamp,
+                # getpid, json.dumps), and a Ctrl-C there must roll back too —
+                # _lease_directory_lock uses the same width for that reason.
+                # Closing the descriptor releases the OS-level lock, so the
+                # lease cannot stay stuck even if the explicit unlock fails.
+                try:
+                    _release_file_lock(file)
+                finally:
+                    file.close()
+                with suppress(OSError):
+                    self._path.unlink(missing_ok=True)
+                raise
             self._file = file
         return self
 
@@ -75,7 +91,10 @@ class SessionLease:
                 _release_file_lock(file)
             finally:
                 file.close()
-            self._path.unlink(missing_ok=True)
+            # An unlink failure must not mask the release; leftovers are
+            # harmless (the next acquire reuses the lock file).
+            with suppress(OSError):
+                self._path.unlink(missing_ok=True)
 
     def __enter__(self) -> Self:
         return self.acquire()

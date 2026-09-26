@@ -21,6 +21,7 @@ from chartreux.core.config.default_orchestrator import build_default_orchestrato
 from chartreux.core.config.layer import ConfigStorageError
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.paths import CHARTREUX_HOME, GLOBAL_ENV_FILE, HISTORY_FILE
+from chartreux.utils.private_paths import restrict_private_file
 
 # The TUI app, onboarding, and programmatic runner are each imported at their
 # call site: every launch needs at most one of them, and they are too heavy to
@@ -128,6 +129,9 @@ def bootstrap_config_files() -> None:
         try:
             env_file.parent.mkdir(parents=True, exist_ok=True)
             env_file.write_text("", "utf-8")
+            # The file is created empty but will hold API keys once filled in,
+            # so restrict it to owner-only immediately at creation.
+            restrict_private_file(env_file)
         except Exception as e:
             rprint(f"[yellow]Could not create .env file: {e}[/]")
 

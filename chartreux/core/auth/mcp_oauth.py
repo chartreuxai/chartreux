@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import errno
 from functools import cache
 import time
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Literal
 import urllib.parse
 
 import anyio.to_thread
@@ -18,6 +18,7 @@ from pydantic import AnyUrl, BaseModel, ConfigDict
 
 if TYPE_CHECKING:
     from mcp.client.auth import OAuthClientProvider, OAuthFlowError
+    from mcp.client.auth.oauth2 import OAuthContext
     from mcp.shared.auth import (
         OAuthClientInformationFull,
         OAuthClientMetadata,
@@ -36,10 +37,20 @@ from chartreux.utils.keyring import (
 _USERNAME_PREFIX: Final = "mcp-oauth"
 _CLIENT_NAME: Final = "Chartreux"
 _LOGIN_TIMEOUT_SECONDS: Final = 300.0
+# A login whose browser callback never arrives must not pin the loopback port
+# until the process exits, so the callback wait is bounded: an abandoned login
+# fails loudly after this long and releases the port for later attempts.
+_CALLBACK_TIMEOUT_SECONDS: Final = 300.0
 # What a streamable HTTP endpoint accepts: a POST that says both, per the spec.
 _MCP_ACCEPT: Final = "application/json, text/event-stream"
-_MIN_REQUEST_LINE_PARTS: Final = 2
+_MIN_REQUEST_LINE_PARTS: Final = 3
 _HEADER_TERMINATORS: Final = frozenset({b"\r\n", b"\n", b""})
+_CALLBACK_REQUEST_BYTES: Final = 16_384
+_CALLBACK_LINE_BYTES: Final = 4096
+_CALLBACK_HEADER_COUNT: Final = 64
+_CALLBACK_CONNECTIONS: Final = 8
+_CALLBACK_CONNECTION_SECONDS: Final = 5.0
+_CALLBACK_CLEANUP_SECONDS: Final = 2.0
 # OAuth 2.0 token-endpoint error signalling a permanently dead refresh token.
 _OAUTH_INVALID_GRANT: Final = "invalid_grant"
 _EXPIRED_TOKEN_TIME: Final = -1.0
@@ -61,6 +72,23 @@ class MCPOAuthPortInUse(MCPOAuthError):
             f"Loopback callback port {self.port} is already in use; cannot complete "
             f"OAuth login for MCP server {self.server_alias!r}. "
             "Set `auth.redirect_port` to a free port in this server's config and retry."
+        )
+
+
+class MCPOAuthCallbackTimeout(MCPOAuthError):
+    def __init__(self, *, port: int, server_alias: str, timeout_seconds: float) -> None:
+        self.port = port
+        self.server_alias = server_alias
+        self.timeout_seconds = timeout_seconds
+        super().__init__(self._fmt())
+
+    def _fmt(self) -> str:
+        minutes = self.timeout_seconds / 60
+        return (
+            f"Timed out after {minutes:g} minutes waiting for the OAuth browser "
+            f"callback for MCP server {self.server_alias!r}. The loopback port "
+            f"{self.port} has been released; retry the login and complete the "
+            "browser authorization this time."
         )
 
 
@@ -151,11 +179,26 @@ def _kr_username(alias: str, kind: str) -> str:
 async def _kr_get(username: str) -> str | None:
     # OAuth reads participate in identity checks and transactional rollback, so
     # they must observe storage failures and must never use cached credentials.
-    return await anyio.to_thread.run_sync(get_api_key_from_keyring_uncached, username)
+    raw = await anyio.to_thread.run_sync(get_api_key_from_keyring_uncached, username)
+    from chartreux.core.tools.secret_redaction import (
+        invalidate_keyring_credential,
+        register_mcp_oauth_record,
+    )
+
+    invalidate_keyring_credential(username)
+    register_mcp_oauth_record(username, raw)
+    return raw
 
 
 async def _kr_set(username: str, value: str) -> None:
     await anyio.to_thread.run_sync(set_api_key_in_keyring, username, value)
+    from chartreux.core.tools.secret_redaction import (
+        invalidate_keyring_credential,
+        register_mcp_oauth_record,
+    )
+
+    invalidate_keyring_credential(username)
+    register_mcp_oauth_record(username, value)
 
 
 async def _kr_delete(username: str) -> None:
@@ -163,6 +206,13 @@ async def _kr_delete(username: str) -> None:
         await anyio.to_thread.run_sync(delete_api_key_from_keyring, username)
     except keyring.errors.PasswordDeleteError:
         pass
+    from chartreux.core.tools.secret_redaction import (
+        invalidate_keyring_credential,
+        register_mcp_oauth_record,
+    )
+
+    invalidate_keyring_credential(username)
+    register_mcp_oauth_record(username, None)
 
 
 class Fingerprint(BaseModel):
@@ -598,54 +648,105 @@ class LoopbackCallbackHandler:
                 MCPOAuthError(f"OAuth callback for {self._server_alias!r} {msg}")
             )
 
-    async def serve_once(self) -> tuple[str, str | None]:
+    async def serve_once(self) -> tuple[str, str | None]:  # noqa: PLR0915
         loop = asyncio.get_running_loop()
         future: asyncio.Future[tuple[str, str | None]] = loop.create_future()
+        connections: dict[asyncio.Task[object], asyncio.StreamWriter] = {}
 
-        async def handle(
+        async def handle(  # noqa: PLR0912, PLR0915
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         ) -> None:
+            task = asyncio.current_task()
+            assert task is not None
+            if len(connections) >= _CALLBACK_CONNECTIONS:
+                writer.close()
+                return
+            connections[task] = writer
+            first_byte = b""
             try:
-                request_line = await reader.readline()
-                while True:
-                    line = await reader.readline()
-                    if line in _HEADER_TERMINATORS:
-                        break
-                parts = request_line.split(b" ", 2)
-                if len(parts) < _MIN_REQUEST_LINE_PARTS:
-                    await self._fail(
-                        writer, "received a malformed HTTP request", future=future
+                # One deadline across the entire request; trickling headers cannot
+                # renew it. The StreamReader limit also bounds a single line.
+                async with asyncio.timeout(_CALLBACK_CONNECTION_SECONDS):
+                    first_byte = await reader.read(1)
+                    if not first_byte:
+                        # An empty preconnect/port probe is not a callback.
+                        return
+                    request_line = first_byte + await reader.readline()
+                    if len(request_line) > _CALLBACK_LINE_BYTES:
+                        raise ValueError("request line too large")
+                    total = len(request_line)
+                    for _count in range(_CALLBACK_HEADER_COUNT + 1):
+                        line = await reader.readline()
+                        total += len(line)
+                        if total > _CALLBACK_REQUEST_BYTES:
+                            raise ValueError("request too large")
+                        if line == b"":
+                            raise ValueError("incomplete request")
+                        if line in _HEADER_TERMINATORS:
+                            break
+                    else:
+                        raise ValueError("too many headers")
+                    parts = request_line.split(b" ", 2)
+                    if (
+                        len(parts) != _MIN_REQUEST_LINE_PARTS
+                        or parts[0] != b"GET"
+                        or not parts[2].strip().startswith(b"HTTP/")
+                    ):
+                        await self._fail(
+                            writer, "received a malformed HTTP request", future=future
+                        )
+                        return
+                    path = parts[1].decode("latin-1", errors="replace")
+                    if urllib.parse.urlsplit(path).path != "/callback":
+                        await self._fail(
+                            writer, "received an invalid path", future=future
+                        )
+                        return
+                    query = urllib.parse.urlparse(path).query
+                    params = urllib.parse.parse_qs(query)
+                    code_values = params.get("code") or []
+                    state_values = params.get("state") or []
+                    if not code_values:
+                        await self._fail(
+                            writer, "missing 'code' query parameter", future=future
+                        )
+                        return
+                    writer.write(_http_response(b"HTTP/1.1 200 OK\r\n", _SUCCESS_HTML))
+                    await writer.drain()
+                    if not future.done():
+                        future.set_result((
+                            code_values[0],
+                            state_values[0] if state_values else None,
+                        ))
+            except TimeoutError:
+                if first_byte and not future.done():
+                    future.set_exception(
+                        MCPOAuthError(
+                            f"OAuth callback for {self._server_alias!r} received an invalid or slow request"
+                        )
                     )
-                    return
-                path = parts[1].decode("latin-1", errors="replace")
-                query = urllib.parse.urlparse(path).query
-                params = urllib.parse.parse_qs(query)
-                code_values = params.get("code") or []
-                state_values = params.get("state") or []
-                if not code_values:
-                    await self._fail(
-                        writer, "missing 'code' query parameter", future=future
+            except (ValueError, asyncio.LimitOverrunError):
+                if not future.done():
+                    future.set_exception(
+                        MCPOAuthError(
+                            f"OAuth callback for {self._server_alias!r} received an invalid or slow request"
+                        )
                     )
-                    return
-                writer.write(_http_response(b"HTTP/1.1 200 OK\r\n", _SUCCESS_HTML))
-                await writer.drain()
-                if not future.done():
-                    future.set_result((
-                        code_values[0],
-                        state_values[0] if state_values else None,
-                    ))
-            except BaseException as exc:
-                if not future.done():
-                    future.set_exception(exc)
+            except asyncio.CancelledError:
                 raise
+            except (ConnectionError, OSError):
+                pass
             finally:
+                connections.pop(task, None)
                 writer.close()
                 with _suppress_close_errors():
-                    await writer.wait_closed()
+                    await asyncio.wait_for(
+                        writer.wait_closed(), _CALLBACK_CLEANUP_SECONDS
+                    )
 
         try:
             server = await asyncio.start_server(
-                handle, host="127.0.0.1", port=self._port
+                handle, host="127.0.0.1", port=self._port, limit=_CALLBACK_LINE_BYTES
             )
         except OSError as exc:
             if exc.errno == errno.EADDRINUSE:
@@ -655,16 +756,31 @@ class LoopbackCallbackHandler:
             raise
 
         try:
-            return await asyncio.wait_for(future, timeout=_LOGIN_TIMEOUT_SECONDS)
-        except TimeoutError as exc:
-            raise MCPOAuthLoginFailed(
+            # Bounded so an abandoned login releases the port instead of
+            # blocking every later login on this machine.
+            return await asyncio.wait_for(future, timeout=_CALLBACK_TIMEOUT_SECONDS)
+        except TimeoutError:
+            raise MCPOAuthCallbackTimeout(
+                port=self._port,
                 server_alias=self._server_alias,
-                reason="OAuth flow timed out waiting for the loopback callback after 5 minutes",
-            ) from exc
+                timeout_seconds=_CALLBACK_TIMEOUT_SECONDS,
+            ) from None
         finally:
+            # Python 3.12 waits for accepted transports at server.wait_closed.
+            # Abort those transports before joining the listening server.
             server.close()
+            for task, writer in tuple(connections.items()):
+                writer.close()
+                writer.transport.abort()
+                task.cancel()
             with _suppress_close_errors():
-                await server.wait_closed()
+                await asyncio.wait_for(server.wait_closed(), _CALLBACK_CLEANUP_SECONDS)
+            if connections:
+                with _suppress_close_errors():
+                    await asyncio.wait_for(
+                        asyncio.gather(*tuple(connections), return_exceptions=True),
+                        _CALLBACK_CLEANUP_SECONDS,
+                    )
 
 
 class _suppress_close_errors:
@@ -678,7 +794,7 @@ class _suppress_close_errors:
         tb: object,
     ) -> bool:
         return exc_type is not None and issubclass(
-            exc_type, (ConnectionError, OSError, asyncio.CancelledError)
+            exc_type, (ConnectionError, OSError, asyncio.CancelledError, TimeoutError)
         )
 
 
@@ -693,11 +809,15 @@ async def _classify_refresh_error(response: httpx.Response) -> tuple[str, bool]:
     if not isinstance(payload, dict):
         return f"HTTP {response.status_code}", False
     error = payload.get("error")
-    description = payload.get("error_description") or ""
-    reason = ": ".join(part for part in (error, description) if part) or (
-        f"HTTP {response.status_code}"
+    # OAuth errors are remote data. Only a locally recognized category is safe
+    # to show; neither descriptions nor arbitrary error codes belong in logs.
+    category = (
+        error
+        if isinstance(error, str)
+        and error in {"invalid_grant", "temporarily_unavailable", "invalid_client"}
+        else "other"
     )
-    return reason, error == _OAUTH_INVALID_GRANT
+    return f"HTTP {response.status_code} ({category})", error == _OAUTH_INVALID_GRANT
 
 
 def _first_of_type[E: BaseException](exc: BaseException, target: type[E]) -> E | None:
@@ -749,6 +869,55 @@ if TYPE_CHECKING:
 
 
 @cache
+def _server_issued_secret_context_class() -> type[OAuthContext]:
+    from mcp.client.auth.oauth2 import OAuthContext
+
+    class _ServerIssuedSecretContext(OAuthContext):
+        """``OAuthContext`` that authenticates a server-issued client secret.
+
+        Some authorization servers (e.g. Supabase) accept a registration with
+        ``token_endpoint_auth_method="none"`` but register a confidential client
+        anyway: the response carries a ``client_secret`` while omitting the auth
+        method, and their token endpoint then rejects requests without client
+        authentication. RFC 7591 §2 defaults an omitted method to
+        ``client_secret_basic``, and RFC 6749 §2.3.1 requires servers that issue
+        a client password to support HTTP Basic, so pick the method from what the
+        server advertises in ``token_endpoint_auth_methods_supported`` and only
+        fall back to ``client_secret_post`` when Basic is not an option. The
+        derived value is per request, never persisted, so keyring entries saved
+        before this class existed (method absent or ``"none"``) self-heal.
+        """
+
+        def prepare_token_auth(
+            self, data: dict[str, str], headers: dict[str, str] | None = None
+        ) -> tuple[dict[str, str], dict[str, str]]:
+            client_info = self.client_info
+            if (
+                client_info is not None
+                and client_info.client_secret
+                and client_info.token_endpoint_auth_method in {None, "none"}
+            ):
+                client_info.token_endpoint_auth_method = self._secret_auth_method()
+            return super().prepare_token_auth(data, headers)
+
+        def _secret_auth_method(
+            self,
+        ) -> Literal["client_secret_basic", "client_secret_post"]:
+            supported = (
+                self.oauth_metadata.token_endpoint_auth_methods_supported
+                if self.oauth_metadata is not None
+                else None
+            )
+            if not supported or "client_secret_basic" in supported:
+                return "client_secret_basic"
+            if "client_secret_post" in supported:
+                return "client_secret_post"
+            return "client_secret_basic"
+
+    return _ServerIssuedSecretContext
+
+
+@cache
 def _refresh_aware_oauth_client_provider_class() -> Callable[..., OAuthClientProvider]:
     from mcp.client.auth import OAuthClientProvider
 
@@ -768,6 +937,17 @@ def _refresh_aware_oauth_client_provider_class() -> Callable[..., OAuthClientPro
             client_metadata_url: str | None = None,
         ) -> None:
             super().__init__(
+                server_url=server_url,
+                client_metadata=client_metadata,
+                storage=storage,
+                redirect_handler=redirect_handler,
+                callback_handler=callback_handler,
+                client_metadata_url=client_metadata_url,
+            )
+            # The base class builds a plain OAuthContext; swap it for the one
+            # that authenticates a server-issued client secret on every token
+            # request.
+            self.context = _server_issued_secret_context_class()(
                 server_url=server_url,
                 client_metadata=client_metadata,
                 storage=storage,
@@ -825,6 +1005,10 @@ def __getattr__(name: str) -> Any:
         provider_class = _refresh_aware_oauth_client_provider_class()
         globals()[name] = provider_class
         return provider_class
+    if name == "_ServerIssuedSecretContext":
+        context_class = _server_issued_secret_context_class()
+        globals()[name] = context_class
+        return context_class
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -942,7 +1126,16 @@ async def perform_oauth_login(
             server_alias=server.name, reason=f"Transient error: {exc.reason}"
         ) from exc
     except (OAuthTokenError, OAuthFlowError, httpx.HTTPError, OSError) as exc:
-        raise MCPOAuthLoginFailed(server_alias=server.name, reason=str(exc)) from exc
+        # SDK token-exchange errors can contain the entire remote response body.
+        # Never surface their text (or their chained exception) to callers.
+        category = (
+            "OAuth token exchange failed"
+            if isinstance(exc, OAuthTokenError)
+            else "OAuth authorization failed"
+            if isinstance(exc, OAuthFlowError)
+            else "OAuth transport failed"
+        )
+        raise MCPOAuthLoginFailed(server_alias=server.name, reason=category) from None
     check_current()
     tokens = await storage.get_tokens()
     check_current()

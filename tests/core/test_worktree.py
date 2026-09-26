@@ -8,7 +8,7 @@ import shutil
 import subprocess
 from typing import Any, cast
 
-from git import Repo
+from git import Git, Repo
 from git.exc import GitCommandError
 import pytest
 
@@ -243,6 +243,70 @@ def test_worktree_listing_failure_is_not_masked(
 
     with pytest.raises(GitError, match="Failed to list git worktrees"):
         _linked(tmp_path)
+
+
+def test_listing_does_not_open_per_worktree_repositories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A listing used to re-ask per worktree what `git worktree list` had
+    # already answered: a GitPython repository plus a rev-parse subprocess
+    # each, which was the entire cost of listing. Only the filesystem checks
+    # remain; adopting a directory still validates fully.
+    repo = _init_repo(tmp_path)
+    linked_root = tmp_path.parent / f"{tmp_path.name}-feature"
+    repo.git.worktree("add", "-b", "feat/feature", str(linked_root))
+    original_git = worktree_module._git_python()
+    opened: list[Path] = []
+
+    def repo_factory(path: Path, *args: Any, **kwargs: Any) -> Repo:
+        opened.append(Path(path))
+        return original_git.repo(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        worktree_module,
+        "_git_python",
+        lambda: git_repo_module._GitPython(
+            repo=cast(type[Repo], repo_factory),
+            invalid_git_repository_error=original_git.invalid_git_repository_error,
+            git_command_error=original_git.git_command_error,
+            no_such_path_error=original_git.no_such_path_error,
+        ),
+    )
+
+    linked = _linked(tmp_path)
+
+    assert opened == []
+    assert [(item.branch, item.root) for item in linked] == [
+        ("feat/feature", linked_root.resolve())
+    ]
+
+    # Adoption of an existing directory still pays for the full validation.
+    feature = _prepare("feature", tmp_path)
+    adopted = _prepare("feature", tmp_path)
+
+    assert adopted.created is False
+    assert opened == [feature.root]
+
+
+def test_listing_rejects_a_worktree_swapped_for_another_repository(
+    tmp_path: Path,
+) -> None:
+    # git keeps listing the stale branch label for a registered path whose
+    # directory was replaced behind its back, so the record alone cannot prove
+    # the directory's identity. The .git pointer's gitdir can, filesystem-only.
+    repo = _init_repo(tmp_path)
+    linked_root = tmp_path.parent / f"{tmp_path.name}-feature"
+    repo.git.worktree("add", "-b", "feat/feature", str(linked_root))
+
+    other_root = tmp_path.parent / f"{tmp_path.name}-other"
+    other = _init_repo(other_root)
+    other_worktree = tmp_path.parent / f"{tmp_path.name}-other-feature"
+    other.git.worktree("add", "-b", "feat/other", str(other_worktree))
+
+    shutil.rmtree(linked_root)
+    shutil.copytree(other_worktree, linked_root)
+
+    assert _linked(tmp_path) == ()
 
 
 def test_root_level_system_alias_is_not_an_unstable_path_component(
@@ -850,6 +914,37 @@ def test_lists_current_and_sibling_worktrees_from_linked_worktree(
         ("second", "feat/second", second.path),
     ]
     assert {item.repo_root for item in linked} == {tmp_path.resolve()}
+
+
+def test_listed_worktree_gitdir_must_exist(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    worktree = _prepare("name with spaces", tmp_path, branch="feat/spaces")
+    assert [item.name for item in _linked(tmp_path)] == ["name with spaces"]
+    marker = worktree.root / ".git"
+    original = marker.read_text()
+    marker.write_text(f"gitdir: {tmp_path / '.git' / 'worktrees' / 'missing'}\n")
+    assert _linked(tmp_path) == ()
+    marker.write_text(original)
+    assert [item.name for item in _linked(tmp_path)] == ["name with spaces"]
+
+
+def test_listed_worktree_gitdir_must_be_directory(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    worktree = _prepare("feature", tmp_path, branch="feat/feature")
+    invalid = tmp_path / ".git" / "worktrees" / "not-a-directory"
+    invalid.write_text("not git metadata")
+    (worktree.root / ".git").write_text(f"gitdir: {invalid}\n")
+    assert _linked(tmp_path) == ()
+
+
+def test_listed_worktree_broken_gitdir_symlink_is_rejected(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    worktree = _prepare("feature", tmp_path, branch="feat/feature")
+    marker = worktree.root / ".git"
+    broken = tmp_path / ".git" / "worktrees" / "broken"
+    broken.symlink_to(tmp_path / ".git" / "worktrees" / "missing")
+    marker.write_text(f"gitdir: {broken}\n")
+    assert _linked(tmp_path) == ()
 
 
 def test_separate_git_dir_uses_primary_worktree_root(tmp_path: Path) -> None:
@@ -1547,40 +1642,76 @@ class _RecordingGit:
     def __init__(self, *, hangs: bool = False) -> None:
         self.process = _StubProcess(hangs=hangs)
         self.fetch_kwargs: dict[str, Any] = {}
+        self.GIT_PYTHON_GIT_EXECUTABLE = Git.GIT_PYTHON_GIT_EXECUTABLE
 
     def fetch(self, *_args: Any, **kwargs: Any) -> Any:
         self.fetch_kwargs = kwargs
         return type("_AutoInterrupt", (), {"proc": self.process})()
 
 
-def _fetch_with(git: _RecordingGit) -> None:
-    repo = cast(Any, type("_Repo", (), {"git": git})())
+def _fetch_with(git: _RecordingGit, git_dir: Path) -> None:
+    # The secure fetch preflight inspects repository-scoped HTTP configuration
+    # with the real Git executable before handing execution to this test double.
+    Repo.init(git_dir, bare=True).close()
+    config = type(
+        "_Config",
+        (),
+        {
+            "__enter__": lambda self: self,
+            "__exit__": lambda self, *_args: None,
+            "get": lambda self, _key: "https://example.invalid/repo.git",
+            "sections": lambda self: [],
+        },
+    )()
+    remote = type("_Remote", (), {"config_reader": config})()
+    repo = cast(
+        Any,
+        type(
+            "_Repo",
+            (),
+            {
+                "git_dir": git_dir,
+                "git": git,
+                "remote": lambda self, _name: remote,
+                "config_reader": lambda self, _level: config,
+            },
+        )(),
+    )
     git_repo_module.GitRepo(repo).fetch_branch("origin", "main")
 
 
-def test_fetch_kills_a_remote_that_never_answers() -> None:
+def test_fetch_kills_a_remote_that_never_answers(tmp_path: Path) -> None:
     git = _RecordingGit(hangs=True)
 
     with pytest.raises(GitError, match="Timed out"):
-        _fetch_with(git)
+        _fetch_with(git, tmp_path)
 
     assert git.process.killed
 
 
-def test_fetch_refuses_to_stop_and_ask_for_credentials() -> None:
+def test_fetch_refuses_to_stop_and_ask_for_credentials(tmp_path: Path) -> None:
     # A credential helper would block the fetch behind a prompt the user may
     # never see, and this refresh is optional enough to fail instead.
     git = _RecordingGit()
 
-    _fetch_with(git)
+    _fetch_with(git, tmp_path)
 
     assert git.fetch_kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    env = git.fetch_kwargs["env"]
+    config = {
+        env[f"GIT_CONFIG_KEY_{index}"]: env[f"GIT_CONFIG_VALUE_{index}"]
+        for index in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+    assert config["core.fsmonitor"] == ""
+    assert (
+        config["core.hooksPath"] == git_repo_module._NO_HOOKS_CONFIG.partition("=")[2]
+    )
 
 
-def test_fetch_does_not_use_the_timeout_windows_rejects() -> None:
+def test_fetch_does_not_use_the_timeout_windows_rejects(tmp_path: Path) -> None:
     git = _RecordingGit()
 
-    _fetch_with(git)
+    _fetch_with(git, tmp_path)
 
     assert "kill_after_timeout" not in git.fetch_kwargs
 

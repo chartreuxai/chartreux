@@ -71,7 +71,6 @@ def test_file_guards_precede_every_automatic_allowance(
     decision = tool.resolve_permission(tool.validate_arguments(raw))
     assert decision is not None
     assert decision.permission == expected
-    assert decision.required_permissions == []
     if expected == ToolPermission.NEVER:
         assert decision.reason
 

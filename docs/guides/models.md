@@ -4,7 +4,7 @@ Chartreux separates model **selection** from the provider and deployment **catal
 
 ## Providers
 
-A provider describes an endpoint, credential variable, and protocol. The shipped catalog includes the Mistral backend and a local Codex Responses-compatible endpoint. Additional providers can use these supported protocol styles:
+A provider describes an endpoint, credential variable, and protocol. The shipped catalog is neutral and publicly reachable only: it defines the Mistral public provider (`mistral/default`) and models Mistral actually serves, such as `glm-5-3`. Personal setups — local proxies, LAN endpoints, private model pins — belong in your `models.toml` overlay, not in the shipped catalog. Additional providers can use these supported protocol styles:
 
 - Mistral (`backend = "mistral"`), using the OpenAI-style protocol surface.
 - Codex or another Responses-compatible endpoint (`api_style = "openai-responses"`).

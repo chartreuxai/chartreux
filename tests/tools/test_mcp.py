@@ -37,6 +37,7 @@ from chartreux.core.tools.mcp import (
 )
 from chartreux.core.tools.mcp.pool import _StdioConnection, stdio_key
 from chartreux.core.tools.mcp.tools import _OpenArgs, build_stdio_params
+from chartreux.utils.untrusted_content import frame_untrusted_content
 from tests.conftest import build_test_vibe_config
 from tests.stubs.fake_mcp_registry import FakeMCPRegistry
 
@@ -114,7 +115,9 @@ class TestParseCallResult:
 
         assert result.server == "server"
         assert result.tool == "tool"
-        assert result.text == "Hello world"
+        assert result.text == frame_untrusted_content(
+            "Hello world", "MCP server server"
+        )
         assert result.structured is None
 
     def test_parses_structured_content(self):
@@ -125,7 +128,10 @@ class TestParseCallResult:
         result = _parse_call_result("server", "tool", mock_result)
 
         assert result.structured == {"data": "value"}
-        assert result.text is None
+        # Structured content rides inside the untrusted frame too.
+        assert result.text == frame_untrusted_content(
+            'structured: {"data": "value"}', "MCP server server"
+        )
 
     def test_preserves_structured_and_text(self):
         mock_result = SimpleNamespace()
@@ -135,7 +141,9 @@ class TestParseCallResult:
         result = _parse_call_result("server", "tool", mock_result)
 
         assert result.structured == {"data": "value"}
-        assert result.text == "text content"
+        assert result.text == frame_untrusted_content(
+            'text content\nstructured: {"data": "value"}', "MCP server server"
+        )
 
     def test_joins_multiple_text_blocks(self):
         mock_result = SimpleNamespace()
@@ -147,7 +155,9 @@ class TestParseCallResult:
 
         result = _parse_call_result("server", "tool", mock_result)
 
-        assert result.text == "line1\nline2"
+        assert result.text == frame_untrusted_content(
+            "line1\nline2", "MCP server server"
+        )
 
 
 class TestMCPHttpClient:
@@ -401,6 +411,30 @@ class TestCreateMCPHttpProxyToolClass:
         params = tool_cls.get_parameters()
 
         assert params == {"type": "object", "properties": {"arg": {"type": "string"}}}
+
+    def test_deep_schema_omits_subtree_but_keeps_other_parameters(self):
+        deep: dict[str, Any] = {"description": "unsafe deep payload"}
+        for _ in range(1100):
+            deep = {"properties": {"nested": deep}}
+        remote = RemoteTool.model_validate({
+            "name": "deep",
+            "inputSchema": {"properties": {"deep": deep, "ok": {"type": "string"}}},
+        })
+        for factory in (
+            lambda: create_mcp_http_proxy_tool_class(
+                url="http://localhost:8080", remote=remote, alias="test"
+            ),
+            lambda: create_mcp_stdio_proxy_tool_class(
+                command=["python"], remote=remote, alias="test"
+            ),
+        ):
+            params = factory().get_parameters()
+            assert params["properties"]["ok"] == {"type": "string"}
+            node = params["properties"]["deep"]
+            for _ in range(63):
+                node = node["properties"]["nested"]
+            assert "simplify the server tool schema" in node["description"]
+            assert "unsafe deep payload" not in str(params)
 
 
 class TestCreateMCPStdioProxyToolClass:
@@ -881,9 +915,14 @@ class TestMCPStdioCwd:
 
             await list_tools_stdio(["python", "-m", "srv"], cwd="/tmp/myproject")
 
-            mock_params_cls.assert_called_once_with(
-                command="python", args=["-m", "srv"], env=None, cwd="/tmp/myproject"
-            )
+            mock_params_cls.assert_called_once()
+            kwargs = mock_params_cls.call_args.kwargs
+            assert kwargs["command"] == "python"
+            assert kwargs["args"] == ["-m", "srv"]
+            assert kwargs["cwd"] == "/tmp/myproject"
+            # env is an explicit scrubbed safe environment, never an inherited one
+            assert isinstance(kwargs["env"], dict)
+            assert "PATH" in kwargs["env"]
 
     @pytest.mark.asyncio
     async def test_call_tool_stdio_passes_cwd_to_params(self):
@@ -912,9 +951,14 @@ class TestMCPStdioCwd:
                 ["python", "-m", "srv"], "my_tool", {}, cwd="/tmp/myproject"
             )
 
-            mock_params_cls.assert_called_once_with(
-                command="python", args=["-m", "srv"], env=None, cwd="/tmp/myproject"
-            )
+            mock_params_cls.assert_called_once()
+            kwargs = mock_params_cls.call_args.kwargs
+            assert kwargs["command"] == "python"
+            assert kwargs["args"] == ["-m", "srv"]
+            assert kwargs["cwd"] == "/tmp/myproject"
+            # env is an explicit scrubbed safe environment, never an inherited one
+            assert isinstance(kwargs["env"], dict)
+            assert "PATH" in kwargs["env"]
 
     @pytest.mark.asyncio
     async def test_discover_stdio_passes_cwd_to_list_tools(self):

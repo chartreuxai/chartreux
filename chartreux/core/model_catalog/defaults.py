@@ -1,8 +1,11 @@
 """Shipped model-catalog definitions.
 
-Wire names were verified against the Mistral models API on 2026-09-16 and the
-local Codex configuration/adapter. Prices are published list prices; genuinely
-unknown values are represented by ``None``, never ``0.0``.
+The shipped catalog is neutral and publicly reachable only: it names the
+Mistral public API and models Mistral actually serves (wire names re-verified
+against the Mistral models API on 2026-09-26). Personal setups — local
+proxies, LAN endpoints, private model pins — belong in the user overlay at
+``$CHARTREUX_HOME/models.toml``, never here. Prices are published list
+prices; genuinely unknown values are represented by ``None``, never ``0.0``.
 """
 
 from __future__ import annotations
@@ -18,12 +21,7 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
             "backend": "mistral",
             "reasoning_field_name": "reasoning_content",
             "emits_finish_reason": True,
-        },
-        "codex/local": {
-            "api_base": "http://127.0.0.1:18080/v1",
-            "api_style": "openai-responses",
-            "backend": "generic",
-        },
+        }
     },
     "models": {
         "glm-5-3": {
@@ -38,43 +36,7 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
                     "auto_compact_threshold": 400000,
                 }
             ],
-        },
-        "gpt-6-astra": {
-            "thinking": "low",
-            "deployments": [
-                {
-                    "provider": "codex/local",
-                    "name": "gpt-6-astra",
-                    "prices": {"input": 10.0, "output": 50.0, "cached_input": 1.0},
-                    "supports_images": True,
-                    "auto_compact_threshold": 500000,
-                }
-            ],
-        },
-        "gpt-6-luna": {
-            "thinking": "max",
-            "deployments": [
-                {
-                    "provider": "codex/local",
-                    "name": "gpt-6-luna",
-                    "prices": {"input": 0.1, "output": 0.50, "cached_input": 0.01},
-                    "supports_images": True,
-                    "auto_compact_threshold": 200000,
-                }
-            ],
-        },
-        "gpt-6-sol": {
-            "thinking": "medium",
-            "deployments": [
-                {
-                    "provider": "codex/local",
-                    "name": "gpt-6-sol",
-                    "prices": {"input": 2.0, "output": 10.0, "cached_input": 0.2},
-                    "supports_images": True,
-                    "auto_compact_threshold": 500000,
-                }
-            ],
-        },
+        }
     },
     "roles": {
         "orchestrator": {
@@ -83,23 +45,23 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
         },
         "advisor": {
             "description": "independent perspective for architectural guidance",
-            "models": ["gpt-6-astra"],
+            "models": ["glm-5-3"],
         },
         "small-worker": {
             "description": "fast model for focused implementation tasks",
-            "models": ["gpt-6-luna"],
+            "models": ["glm-5-3"],
         },
         "large-worker": {
             "description": "strongest model for complex, high-stakes tasks",
-            "models": ["gpt-6-sol", "glm-5-3"],
+            "models": ["glm-5-3"],
         },
         "small-reviewer": {
             "description": "fast model for focused reviews",
-            "models": ["gpt-6-luna"],
+            "models": ["glm-5-3"],
         },
         "deep-reviewer": {
             "description": "strongest model for complex, high-stakes reviews",
-            "models": ["gpt-6-astra", "glm-5-3"],
+            "models": ["glm-5-3"],
         },
     },
 })

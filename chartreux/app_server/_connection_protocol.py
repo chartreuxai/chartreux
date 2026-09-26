@@ -71,6 +71,11 @@ class ClientToolTerminalCreateParams(ProtocolModel):
     command: str
     args: list[str] | None = None
     env: dict[str, str] | None = None
+    # Credential variable names the client should remove from the terminal's
+    # inherited environment. The client owns the spawn, so cooperation is
+    # advisory; chartreux forwards the list through ACP's ``_meta``
+    # extensibility and still redacts secret values from returned output.
+    env_scrub: list[str] | None = None
     cwd: str
     output_byte_limit: Annotated[StrictInt, Field(gt=0)]
     tool_call_id: str | None = None

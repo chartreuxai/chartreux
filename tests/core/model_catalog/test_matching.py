@@ -71,7 +71,7 @@ def test_occupied_provider_slot_is_not_appendable() -> None:
 
 
 def test_base_on_another_provider_offers_deployment_addition() -> None:
-    outcome = match_discovered_model(SHIPPED_CATALOG, "codex/local", "glm-5-3")
+    outcome = match_discovered_model(SHIPPED_CATALOG, "new/default", "glm-5-3")
 
     assert outcome.kind == "base_exists_other_provider"
     assert outcome.existing_base == "glm-5-3"
@@ -99,7 +99,7 @@ def test_multiple_deployments_with_same_wire_are_explicitly_ambiguous() -> None:
 
 
 def test_zero_match_creates_a_proposal() -> None:
-    outcome = match_discovered_model(SHIPPED_CATALOG, "codex/local", "brand-new")
+    outcome = match_discovered_model(SHIPPED_CATALOG, "new/default", "brand-new")
 
     assert outcome.kind == "new_model"
     assert outcome.proposed is not None

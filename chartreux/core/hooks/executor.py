@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 import shlex
 
 from chartreux.core.hooks.config import HookConfig
 from chartreux.core.hooks.models import HookExecutionResult, HookInvocation
+from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils import kill_async_subprocess
 from chartreux.utils.io import decode_console_safe
 
@@ -69,6 +71,9 @@ class HookExecutor:
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
                 cwd=self._cwd,
+                # Hooks load from project-writable config, so an injected hook
+                # must not inherit chartreux's credential variables.
+                env=scrub_child_env(os.environ),
             )
         except (OSError, ValueError) as e:
             return HookExecutionResult(

@@ -1,19 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import contextlib
 from dataclasses import dataclass
 from datetime import timedelta
 import hashlib
+import time
 from typing import TYPE_CHECKING, Any
 
 import anyio
 
 from chartreux.core.tools.mcp.tools import (
+    MCPServerCircuitBreaker,
     MCPToolResult,
+    _is_call_timeout as is_call_timeout,
     _parse_call_result as parse_call_result,
     build_stdio_params,
     enter_stdio_session,
+)
+from chartreux.core.tools.secret_redaction import (
+    ScrubPolicy,
+    bind_policy,
+    current_policy,
 )
 from chartreux.observability.logging import logger
 
@@ -62,6 +71,7 @@ class _Request:
     arguments: dict[str, Any]
     call_timeout: timedelta | None
     future: asyncio.Future[Any]
+    policy: ScrubPolicy
 
 
 class _StdioConnection:
@@ -91,11 +101,17 @@ class _StdioConnection:
         self._closing_session = False
         self._cleanup_error: RuntimeError | None = None
 
-    def retire(self) -> None:
+    def retire(self, *, drain_active: bool = False) -> None:
         if self._closed:
             return
         self._closed = True
         worker = self._worker
+        if drain_active:
+            # All admitted requests (including queued work) retain their
+            # admission policy; the sentinel closes the worker after them.
+            if worker is not None and not worker.done():
+                self._requests.put_nowait(None)
+            return
         if (
             worker is not None
             and not worker.done()
@@ -115,9 +131,9 @@ class _StdioConnection:
             raise RuntimeError("MCP stdio connection closed")
         self._ensure_worker()
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        req = _Request(tool_name, arguments, call_timeout, future)
+        req = _Request(tool_name, arguments, call_timeout, future, current_policy())
         try:
-            await self._requests.put(req)
+            self._requests.put_nowait(req)
             return await future
         except asyncio.CancelledError:
             future.cancel()
@@ -133,21 +149,16 @@ class _StdioConnection:
 
     async def _run(self) -> None:
         try:
-            while not self._closed:
+            while True:
                 req = await self._requests.get()
                 if req is None:
-                    return
-                if self._closed:
-                    if not req.future.done():
-                        req.future.set_exception(
-                            RuntimeError("MCP stdio connection closed")
-                        )
                     return
                 if req.future.cancelled():
                     continue
                 self._inflight = req
                 try:
-                    result = await self._handle(req)
+                    with bind_policy(req.policy):
+                        result = await self._handle(req)
                 except Exception as exc:
                     if not req.future.done():
                         req.future.set_exception(exc)
@@ -164,7 +175,7 @@ class _StdioConnection:
 
     async def _handle(self, req: _Request) -> Any:
         session = await self._ensure_session()
-        if self._closed or req.future.cancelled():
+        if req.future.cancelled():
             raise asyncio.CancelledError
         try:
             return await session.call_tool(
@@ -251,19 +262,34 @@ class MCPConnectionPool:
     shared with it). Connections live until ``aclose`` is called at session end.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        policy: ScrubPolicy | None = None,
+    ) -> None:
+        self._policy = policy or current_policy()
+        self._clock = clock
         self._conns: dict[str, _StdioConnection] = {}
+        # Per-server hung-server cooldowns; in-memory for the pool's lifetime,
+        # mirroring the LLM-side AvailabilityRegistry (never persisted).
+        self._breakers: dict[str, MCPServerCircuitBreaker] = {}
         self._creation_lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
 
-    def retire(self) -> None:
-        """Begin asynchronous transport cleanup."""
+    def retire(self, *, drain_active: bool = False) -> None:
+        """Stop admissions; optionally drain admitted requests for about 5 seconds.
+
+        After the bounded drain deadline, workers still running are cancelled.
+        """
         self._closed = True
         for conn in self._conns.values():
-            conn.retire()
-        if self._close_task is None:
+            conn.retire(drain_active=drain_active)
+        if self._close_task is None or (
+            self._close_task.done() and self._close_task.exception() is not None
+        ):
             self._close_task = asyncio.create_task(self._close_connections())
             self._close_task.add_done_callback(self._report_close_failure)
 
@@ -319,7 +345,8 @@ class MCPConnectionPool:
                 await conn.aclose()
                 if self._closed:
                     raise RuntimeError("MCP connection pool closed")
-            params = build_stdio_params(command, env=env, cwd=cwd)
+            with bind_policy(self._policy):
+                params = build_stdio_params(command, env=env, cwd=cwd)
             init_timeout = (
                 timedelta(seconds=startup_timeout_sec) if startup_timeout_sec else None
             )
@@ -343,31 +370,65 @@ class MCPConnectionPool:
             raise RuntimeError("MCP connection pool closed")
         self._bind_loop()
         key = repr((stdio_key(command, env, cwd), server_name))
-        conn = await self._get_or_create(key, command, env, cwd, startup_timeout_sec)
+        breaker = self._breakers.get(key)
+        if breaker is None:
+            breaker = MCPServerCircuitBreaker(clock=self._clock)
+            self._breakers[key] = breaker
+        # Fail fast (cooldown error naming the server) before any session work.
+        admission = breaker.admission(server_name or " ".join(command))
         call_timeout = timedelta(seconds=tool_timeout_sec) if tool_timeout_sec else None
-        result = await conn.call_tool(tool_name, arguments, call_timeout)
-        return parse_call_result("stdio:" + " ".join(command), tool_name, result)
+        try:
+            conn = await self._get_or_create(
+                key, command, env, cwd, startup_timeout_sec
+            )
+            with bind_policy(self._policy):
+                result = await conn.call_tool(tool_name, arguments, call_timeout)
+            parsed = parse_call_result("stdio:" + " ".join(command), tool_name, result)
+        except BaseException as exc:
+            if is_call_timeout(exc):
+                breaker.record_timeout(admission)
+            else:
+                # Auth/tool/transport failures and cancellation have their own
+                # handling; they never trip the breaker, only release a probe.
+                breaker.record_probe_incomplete(admission)
+            raise
+        breaker.record_success(admission)
+        return parsed
 
     async def aclose(self) -> None:
         self.retire()
         if self._close_task is not None:
             _, pending = await asyncio.wait(
-                {self._close_task}, timeout=_CLOSE_TIMEOUT_SEC
+                {self._close_task}, timeout=_CLOSE_TIMEOUT_SEC * 2
             )
             if pending:
                 raise TimeoutError(
                     "MCP pool cleanup still pending; connections retained"
                 )
-            self._close_task.result()
+            try:
+                self._close_task.result()
+            except BaseExceptionGroup as exc:
+                if len(exc.exceptions) == 1 and isinstance(
+                    exc.exceptions[0], TimeoutError
+                ):
+                    raise exc.exceptions[0] from exc
+                raise
 
     async def _close_connections(self) -> None:
         conns = list(self._conns.items())
         outcomes = await asyncio.gather(
-            *(conn._wait_closed(None) for _, conn in conns), return_exceptions=True
+            *(conn._wait_closed(_CLOSE_TIMEOUT_SEC) for _, conn in conns),
+            return_exceptions=True,
         )
         errors = []
-        for (key, _), outcome in zip(conns, outcomes, strict=True):
+        for (key, conn), outcome in zip(conns, outcomes, strict=True):
             if isinstance(outcome, BaseException):
+                if isinstance(outcome, TimeoutError):
+                    conn.retire()
+                    worker = conn._worker
+                    if worker is not None and not worker.done():
+                        worker.cancel()
+                        worker.add_done_callback(self._report_close_failure)
                 errors.append(outcome)
             else:
                 self._conns.pop(key, None)

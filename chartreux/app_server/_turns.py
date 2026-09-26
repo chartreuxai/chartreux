@@ -17,7 +17,10 @@ from chartreux.app_server._execution import (
     cancel_tasks,
 )
 from chartreux.app_server._model import ProtocolModel
-from chartreux.app_server._projection import project_stats
+from chartreux.app_server._projection import (
+    committed_model_recovery_issue,
+    project_stats,
+)
 from chartreux.app_server._projector import EventProjector, ProjectedUpdate
 from chartreux.app_server._root_session import SessionCoordinator, rebind_history
 from chartreux.app_server._state import session_preview
@@ -103,6 +106,10 @@ _retry_turn_id: ContextVar[str | None] = ContextVar(
 
 class TurnConflictError(RuntimeError):
     pass
+
+
+class ModelChoicePendingError(RuntimeError):
+    """A turn was requested before a recovered session chose a model."""
 
 
 class StaleTurnError(RuntimeError):
@@ -262,6 +269,17 @@ class TurnController:  # noqa: PLR0904
         if active is not None and active.id in {"policy-replacement", "configuration"}:
             raise TurnConflictError("Session tree configuration change is in progress")
 
+    def require_model_choice(self) -> None:
+        # A session recovered from a missing committed model must not silently
+        # fall back to the configured default: an explicit selection (a pinned
+        # active_model) is required before any turn can start. Turn-adjacent
+        # operations that would run an LLM completion (compaction, queueing a
+        # turn) gate on the same pending choice.
+        if (
+            issue := committed_model_recovery_issue(self._agent_loop)
+        ) is not None and not self._agent_loop.config.active_model:
+            raise ModelChoicePendingError(issue.message)
+
     @property
     def has_queued_turns(self) -> bool:
         return bool(self._turn_queue)
@@ -302,6 +320,7 @@ class TurnController:  # noqa: PLR0904
         queued_contexts: tuple[DecodedInput, ...] = (),
     ) -> tuple[TurnStartResponse, TurnStartAction]:
         self._require_policy_unreserved()
+        self.require_model_choice()
         active_task = self._active_task
         if (
             active_task is not None
@@ -373,6 +392,11 @@ class TurnController:  # noqa: PLR0904
         self, params: TurnEnqueueParams
     ) -> tuple[TurnQueueEnqueueResult, Callable[[], None] | None]:
         self._require_policy_unreserved()
+        # Fail fast with the same actionable error as a turn start: a queued
+        # turn could not promote while the choice is pending, and promotion
+        # failures inside queue tasks are silent, so a permissive enqueue
+        # would strand the item until an unrelated queue mutation.
+        self.require_model_choice()
         result = self._turn_queue.enqueue(params, validate=self._validate_queued_input)
         if result.duplicate:
             return result, None

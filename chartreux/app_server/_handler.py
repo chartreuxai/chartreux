@@ -64,6 +64,7 @@ from chartreux.app_server._turns import (
     CallbackClosedError,
     CallbackConflictError,
     CallbackNotFoundError,
+    ModelChoicePendingError,
     StaleTurnError,
     TurnConflictError,
     TurnController,
@@ -279,6 +280,10 @@ class CoreRequestHandler:
         except CallbackConflictError as exc:
             raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
         except (ImageSnapshotError, PromptPreparationError, WorkspaceTrustError) as exc:
+            raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
+        except ModelChoicePendingError as exc:
+            # A recovered session has no usable model selection; the message
+            # routes the client to pick one instead of failing opaquely.
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
         except ShellConflictError as exc:
             raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
@@ -1222,6 +1227,10 @@ class CoreRequestHandler:
             raise RequestFailure(
                 ProtocolErrorCode.CONFLICT, "Cannot compact while a turn is active"
             )
+        # Compaction runs an LLM summarization, so a recovered session must
+        # pick a model first — exactly like a turn start — instead of
+        # summarizing on a silently-committed default.
+        self._turns.require_model_choice()
         with self._execution.reserve(
             SessionExecutionKind.LIFECYCLE, f"compact:{params.session_id}"
         ):

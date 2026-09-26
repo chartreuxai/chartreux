@@ -3,6 +3,7 @@ from __future__ import annotations
 from dotenv import dotenv_values, set_key, unset_key
 
 from chartreux.core.paths import GLOBAL_ENV_FILE
+from chartreux.utils.private_paths import restrict_private_file
 
 SUPPORTED_PROXY_VARS: dict[str, str] = {
     "HTTP_PROXY": "Proxy URL for HTTP requests",
@@ -55,6 +56,8 @@ def set_proxy_var(key: str, value: str) -> None:
 
     GLOBAL_ENV_FILE.path.parent.mkdir(parents=True, exist_ok=True)
     set_key(GLOBAL_ENV_FILE.path, key, value)
+    # dotenv honors the process umask, so tighten the key file to owner-only.
+    restrict_private_file(GLOBAL_ENV_FILE.path)
 
 
 def unset_proxy_var(key: str) -> None:
@@ -65,3 +68,4 @@ def unset_proxy_var(key: str) -> None:
         return
 
     unset_key(GLOBAL_ENV_FILE.path, key)
+    restrict_private_file(GLOBAL_ENV_FILE.path)

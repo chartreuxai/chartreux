@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from enum import StrEnum, auto
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-from chartreux.permissions import PermissionScope as PermissionScope, RequiredPermission
+from chartreux.permissions import PermissionScope as PermissionScope
 
 
 class ToolPermissionError(Exception):
@@ -28,5 +28,4 @@ class ToolPermission(StrEnum):
 
 class PermissionContext(BaseModel):
     permission: ToolPermission
-    required_permissions: list[RequiredPermission] = Field(default_factory=list)
     reason: str | None = None

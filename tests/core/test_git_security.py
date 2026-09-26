@@ -12,6 +12,7 @@ import pytest
 from chartreux.core.config import ProjectContextConfig
 from chartreux.core.git.worktree import WorktreeRepository
 from chartreux.core.system_prompt import ProjectContextProvider
+from chartreux.utils.platform import resolve_ssh_executable
 
 
 def _executable(path: Path, body: str = "exit 0") -> Path:
@@ -212,6 +213,55 @@ def test_absolute_process_override_is_preserved_in_fresh_process(
     local_git = _executable(project / "tools" / "git")
 
     assert _fresh_resolution(project, "", str(local_git)) == str(local_git.resolve())
+
+
+def test_resolve_ssh_executable_uses_trusted_absolute_path_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    trusted_ssh = _executable(tmp_path / "trusted" / "ssh")
+    monkeypatch.setenv("PATH", str(trusted_ssh.parent))
+
+    assert resolve_ssh_executable(cwd=project) == str(trusted_ssh.resolve())
+
+
+def test_resolve_ssh_executable_skips_relative_path_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+    _executable(tmp_path / "relative-bin" / "ssh")
+    trusted_ssh = _executable(tmp_path / "trusted" / "ssh")
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join(("relative-bin", str(trusted_ssh.parent)))
+    )
+
+    assert resolve_ssh_executable(cwd=project) == str(trusted_ssh.resolve())
+
+
+def test_resolve_ssh_executable_rejects_project_local_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _executable(project / "ssh")
+    trusted_ssh = _executable(tmp_path / "trusted" / "ssh")
+    monkeypatch.setenv("PATH", os.pathsep.join((str(project), str(trusted_ssh.parent))))
+
+    assert resolve_ssh_executable(cwd=project) == str(trusted_ssh.resolve())
+
+
+def test_resolve_ssh_executable_returns_none_when_cwd_cannot_be_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+
+    assert resolve_ssh_executable() is None
 
 
 def test_git_unavailable_import_and_startup_are_graceful_in_fresh_process(

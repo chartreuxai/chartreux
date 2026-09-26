@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum, auto
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 from chartreux.core.tools.base import BaseTool, BaseToolConfig, BaseToolState
 from chartreux.core.tools.ui import ToolUIData
@@ -25,7 +25,11 @@ class MCPToolResult(BaseModel):
     server: str
     tool: str
     text: str | None = None
-    structured: dict[str, Any] | None = None
+    # Excluded from dumps: the model-visible tool text carries the structured
+    # content inside the untrusted frame (see _parse_call_result), so dumping
+    # the raw dict would render an unframed `structured: {...}` line. Clients
+    # receive it through the presentation's projected output instead.
+    structured: dict[str, Any] | None = Field(default=None, exclude=True)
 
 
 class MCPTool(
@@ -42,6 +46,12 @@ class MCPTool(
     @classmethod
     def get_remote_name(cls) -> str:
         return cls._remote_name or cls.get_name()
+
+    @classmethod
+    def project_result(cls, result: MCPToolResult) -> JsonValue:
+        # The structured field is dump-excluded, so clients get it through the
+        # presentation projection rather than the persisted output dump.
+        return result.structured
 
 
 class RemoteTool(BaseModel):

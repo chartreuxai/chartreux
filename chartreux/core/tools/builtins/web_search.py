@@ -28,6 +28,7 @@ from chartreux.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIDa
 from chartreux.utils.api_keys import resolve_api_key
 from chartreux.utils.http import get_server_url_from_api_base
 from chartreux.utils.tool_presentation import ToolEffectKind
+from chartreux.utils.untrusted_content import frame_untrusted_content
 
 if TYPE_CHECKING:
     from chartreux.core.config import ChartreuxConfigSchema
@@ -35,6 +36,11 @@ if TYPE_CHECKING:
 _MAX_QUERY_PREVIEW_LENGTH = 80
 _MAX_DIAGNOSTIC_LENGTH = 500
 SearchProviderName = Literal["auto", "mistral", "exa", "brave", "duckduckgo"]
+_SEARCH_DEFAULT_KEY_ENVS = {
+    "exa": "EXA_API_KEY",
+    "brave": "BRAVE_SEARCH_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+}
 
 
 class WebSearchArgs(BaseModel):
@@ -157,9 +163,7 @@ def resolve_web_search_provider(
 def _resolve_keyed_provider(
     config: WebSearchConfig, provider: Literal["exa", "brave"]
 ) -> ResolvedSearchProvider | SearchProviderDiagnostic:
-    env_var = config.api_key_env_var or (
-        "EXA_API_KEY" if provider == "exa" else "BRAVE_SEARCH_API_KEY"
-    )
+    env_var = config.api_key_env_var or _SEARCH_DEFAULT_KEY_ENVS[provider]
     api_key = resolve_api_key(env_var)
     if not api_key:
         return _missing_key(provider, env_var)
@@ -180,7 +184,7 @@ def _resolve_mistral(
     env_var = config.api_key_env_var or (
         mistral_provider.api_key_env_var
         if mistral_provider is not None
-        else "MISTRAL_API_KEY"
+        else _SEARCH_DEFAULT_KEY_ENVS["mistral"]
     )
     api_key = resolve_api_key(env_var)
     if not api_key:
@@ -335,7 +339,18 @@ class WebSearch(
             raise ToolError("Search request timed out") from None
         except SearchProviderError as error:
             raise ToolError(error.safe_message) from error
-        yield WebSearchResult(**response.model_dump())
+        result = WebSearchResult(**response.model_dump())
+        if result.answer is not None:
+            result.answer = frame_untrusted_content(result.answer, "web search")
+        for source in result.sources:
+            # Provider URLs are kept raw through search/deduplication, then
+            # framed along with other model-visible provider fields.
+            source.url = frame_untrusted_content(source.url, "web search")
+            if source.title is not None:
+                source.title = frame_untrusted_content(source.title, "web search")
+            if source.snippet is not None:
+                source.snippet = frame_untrusted_content(source.snippet, "web search")
+        yield result
 
     @staticmethod
     def _create_provider(settings: ResolvedSearchProvider) -> SearchProvider:

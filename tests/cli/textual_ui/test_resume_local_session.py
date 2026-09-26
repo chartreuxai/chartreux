@@ -5,7 +5,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from chartreux.app_server.models import AgentStatsSnapshot, PreparedPrompt
+from chartreux.app_server.models import (
+    COMMITTED_MODEL_RECOVERY_ISSUE_FILE,
+    AgentStatsSnapshot,
+    ConfigIssue,
+    PreparedPrompt,
+)
 from chartreux.app_server.protocol import (
     AppServerResponseError,
     ProtocolError,
@@ -292,6 +297,95 @@ async def test_failed_resume_preserves_current_turn_presentation(
         assert chartreux_app._resume_ui_ready.is_set()
         clear_queue.assert_not_awaited()
         sync_queue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resume_local_session_surfaces_committed_model_recovery(
+    chartreux_app: ChartreuxApp,
+) -> None:
+    async with chartreux_app.run_test():
+        runtime = chartreux_app.app_server.resources.runtime
+        recovery = ConfigIssue(
+            file=COMMITTED_MODEL_RECOVERY_ISSUE_FILE,
+            message=(
+                "The model committed to this session (mistral/removed-model) is "
+                "no longer available. Pick a model to continue this session."
+            ),
+        )
+        with (
+            patch.object(runtime, "refresh", AsyncMock()),
+            patch.object(
+                chartreux_app, "_rebuild_transcript_from_current_session", AsyncMock()
+            ),
+            patch.object(chartreux_app, "_finish_resume_notices", AsyncMock()),
+            patch.object(
+                chartreux_app, "_switch_to_model_picker_app", AsyncMock()
+            ) as switch_picker,
+            patch.object(chartreux_app, "_mount_and_scroll", AsyncMock()) as mount,
+        ):
+            runtime._state.issues = [recovery]
+            chartreux_app.app_server.resume = AsyncMock()
+            await chartreux_app._resume_local_session("abcd1234")
+
+        switch_picker.assert_awaited_once()
+        mounted = [call.args[0] for call in mount.call_args_list]
+        assert any(
+            isinstance(widget, ErrorMessage)
+            and "no longer available" in str(widget._error)
+            for widget in mounted
+        )
+
+
+@pytest.mark.asyncio
+async def test_resume_local_session_survives_recovery_surface_failure(
+    chartreux_app: ChartreuxApp,
+) -> None:
+    async with chartreux_app.run_test():
+        runtime = chartreux_app.app_server.resources.runtime
+        with (
+            patch.object(
+                runtime,
+                "refresh",
+                AsyncMock(side_effect=RuntimeError("runtime refresh failed")),
+            ),
+            patch.object(
+                chartreux_app, "_rebuild_transcript_from_current_session", AsyncMock()
+            ),
+            patch.object(chartreux_app, "_finish_resume_notices", AsyncMock()),
+            patch.object(
+                chartreux_app, "_switch_to_model_picker_app", AsyncMock()
+            ) as switch_picker,
+            patch.object(chartreux_app, "_mount_and_scroll", AsyncMock()),
+        ):
+            chartreux_app.app_server.resume = AsyncMock()
+            # The resume already succeeded; a failure while surfacing the
+            # recovery notice must not abort the mount path.
+            await chartreux_app._resume_local_session("abcd1234")
+
+        switch_picker.assert_not_awaited()
+        assert chartreux_app._resume_ui_ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_resume_local_session_without_recovery_keeps_input(
+    chartreux_app: ChartreuxApp,
+) -> None:
+    async with chartreux_app.run_test():
+        runtime = chartreux_app.app_server.resources.runtime
+        with (
+            patch.object(runtime, "refresh", AsyncMock()),
+            patch.object(
+                chartreux_app, "_rebuild_transcript_from_current_session", AsyncMock()
+            ),
+            patch.object(chartreux_app, "_finish_resume_notices", AsyncMock()),
+            patch.object(
+                chartreux_app, "_switch_to_model_picker_app", AsyncMock()
+            ) as switch_picker,
+        ):
+            chartreux_app.app_server.resume = AsyncMock()
+            await chartreux_app._resume_local_session("abcd1234")
+
+        switch_picker.assert_not_awaited()
 
 
 @pytest.mark.asyncio

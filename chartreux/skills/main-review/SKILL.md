@@ -22,7 +22,7 @@ For a pull request, fetch its branch before delegating, then review the branch c
 
 - **Quick:** one `reviewer`-profile launch with `config.model` set to `@small-reviewer`. Use for quick, fast, trivial, or rename-only reviews.
 - **Standard:** one `reviewer`-profile launch with `config.model` set to `@small-reviewer`. Use for most reviews; do not add a second reviewer by default.
-- **Deep:** dispatch the `reviewer` profile with `config.model` set to `@deep-reviewer` and `fan_out` enabled. This launches the astra and glm members in parallel; synthesize both reviews.
+- **Deep:** dispatch the `reviewer` profile with `config.model` set to `@deep-reviewer` and `fan_out` enabled. This launches the role's members in parallel; synthesize the member reviews.
 - **Plans:** use the Deep procedure for plans, specifications, and designs.
 
 Use only the listed profiles and role expressions. Do not call the usage tool automatically. Keep each phase bounded to one dispatch per listed reviewer and at most two refinement rounds unless the user approves a larger budget.
@@ -37,7 +37,7 @@ Each task string must be self-contained:
 task(task="Review: <target>. Intent: <intent>. Tier: <tier>. Return a complete review report with findings, evidence, and verification status.", agent="reviewer", config={model="@small-reviewer"})
 ```
 
-For Deep and Plans, dispatch one `reviewer` task with `fan_out=true`, `background=false`, and `config.model` set to `@deep-reviewer`; astra and glm review in parallel. Foreground fan-out member results arrive inline in the task result; synthesize both reviews from that response. Include any bounded follow-up context in the task.
+For Deep and Plans, dispatch one `reviewer` task with `fan_out=true`, `background=false`, and `config.model` set to `@deep-reviewer`; the role's members review in parallel. Foreground fan-out member results arrive inline in the task result; synthesize the member reviews from that response. Include any bounded follow-up context in the task.
 
 ## Synthesis
 

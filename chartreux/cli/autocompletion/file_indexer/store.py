@@ -250,6 +250,9 @@ class FileIndexStore:
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
+                # This fixed-argv background git index spawn is user-initiated,
+                # not model-invocable; the cli→core boundary forbids importing
+                # the scrub helper here.
             )
         except OSError:
             return None

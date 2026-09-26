@@ -7,8 +7,14 @@ if TYPE_CHECKING:
 
 type AgentEntrypoint = Literal["cli", "acp", "desktop", "programmatic", "unknown"]
 VIBE_WARNING_TAG = "vibe_warning"
+UNTRUSTED_CONTENT_TAG = "untrusted_content"
 
-__all__ = ["VIBE_WARNING_TAG", "AgentEntrypoint", "ToolEffectKind"]
+__all__ = [
+    "UNTRUSTED_CONTENT_TAG",
+    "VIBE_WARNING_TAG",
+    "AgentEntrypoint",
+    "ToolEffectKind",
+]
 
 
 def __getattr__(name: str) -> object:

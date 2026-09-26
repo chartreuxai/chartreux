@@ -223,6 +223,25 @@ def validate_source(
                     and meta.merge_strategy == MergeStrategy.DEEP_MERGE
                 ):
                     continue
+                if (
+                    key == "mcp_servers"
+                    and isinstance(value, dict)
+                    and error["type"] == "list_type"
+                ):
+                    # TOML [mcp_servers.<name>] yields a dict where the schema
+                    # wants a list of tables; surface the actionable spelling
+                    # before the merge, where real config.toml layers fail.
+                    errors.append({
+                        "type": PydanticCustomError(
+                            "source_validation",
+                            "Invalid configuration field ({kind}). "
+                            "Use [[mcp_servers]] instead of [mcp_servers.<name>].",
+                            {"kind": error["type"]},
+                        ),
+                        "loc": (source, key, *error["loc"]),
+                        "input": None,
+                    })
+                    continue
                 errors.append({
                     "type": PydanticCustomError(
                         "source_validation",

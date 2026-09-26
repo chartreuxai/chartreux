@@ -4,8 +4,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 import fnmatch
+import ntpath
 import os
-from pathlib import Path, PurePath
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
+import posixpath
 
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.scratchpad import is_scratchpad_path
@@ -117,12 +119,44 @@ def display_file_path(path_str: str) -> str:
     return str(path)
 
 
+def _is_windows_path(path: str) -> bool:
+    return bool(PureWindowsPath(path).drive) or "\\" in path
+
+
+def _normalized_path(path: str) -> str:
+    if _is_windows_path(path):
+        return ntpath.normcase(ntpath.normpath(path))
+    return posixpath.normpath(path)
+
+
+def path_pattern_matches(path: str, pattern: str) -> bool:
+    """Match a path glob without letting '*' cross separators when absolute.
+
+    ``fnmatch``'s ``*`` crosses separators, so an allowlist entry like
+    ``/home/u/proj/*`` would otherwise authorize the entire subtree below
+    ``proj``. Absolute patterns are matched segment-aware (``*`` stops at the
+    separator); relative patterns keep requiring the whole path to match
+    because ``Path.match`` right-anchors them (``tmp/*`` would otherwise match
+    ``/var/tmp/secret``).
+    """
+    normalized = _normalized_path(path)
+    windows = _is_windows_path(path) or _is_windows_path(pattern)
+    path_cls = PureWindowsPath if windows else PurePosixPath
+    if path_cls(pattern).is_absolute():
+        return path_cls(normalized).match(pattern)
+    if windows:
+        pattern = ntpath.normcase(pattern)
+    return fnmatch.fnmatch(normalized, pattern)
+
+
 def resolve_path_permission(
     path_str: str, *, cwd: Path, allowlist: list[str], denylist: list[str]
 ) -> PermissionContext | None:
     """Resolve permission for a file path against glob patterns.
 
     Returns NEVER on denylist match, ALWAYS on allowlist match, None otherwise.
+    Allowlist globs are segment-aware: ``*`` in an absolute pattern matches a
+    single path level, never a whole subtree.
     """
     if is_foreign_windows_path(path_str):
         return PermissionContext(
@@ -139,7 +173,7 @@ def resolve_path_permission(
             )
 
     for pattern in allowlist:
-        if fnmatch.fnmatch(file_str, pattern):
+        if path_pattern_matches(file_str, pattern):
             return PermissionContext(permission=ToolPermission.ALWAYS)
 
     return None

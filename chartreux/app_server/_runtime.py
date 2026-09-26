@@ -174,6 +174,14 @@ class RuntimeConfigurationError(RuntimeError):
 
 
 class CommittedModelResumeError(RuntimeConfigurationError):
+    """A persisted committed model cannot be used by the resuming process.
+
+    Raised by the blueprint resume path (fresh session open): that flow has
+    no interactive recovery, so it must fail fast with an actionable error
+    instead of loading the session unpinned. Only the root-session resume
+    RPC keeps the recovery flow.
+    """
+
     def __init__(self, code: str, message: str) -> None:
         self.code = code
         super().__init__(message)
@@ -382,14 +390,19 @@ class AgentRuntimeFactory:
             active_model = config_active_model(metadata)
             if resume_identity is not None:
                 source.config.attach_committed_model(resume_identity)
-            elif (
-                session_metadata.launch_config is None
-                or session_metadata.launch_config.version != 1
-            ):
+            elif _is_legacy_root_metadata(session_metadata):
                 await _restore_session_active_model(
                     source.config_orchestrator,
                     active_model,
                     clear_existing=previous_session_pinned,
+                )
+            else:
+                # Committed-model recovery: drop the unresolvable identity and
+                # clear any previous session pin instead of restoring the
+                # missing selection. The user must pick a model before the next
+                # turn; the pending choice is surfaced as a runtime issue.
+                await _restore_session_active_model(
+                    source.config_orchestrator, None, clear_existing=True
                 )
             target_model_applied = True
             # ``_load_session`` already parsed metadata.json into ``metadata``;
@@ -401,6 +414,14 @@ class AgentRuntimeFactory:
             source._committed_selection = source.config.active_model
             if not _same_concrete_identity(source.committed_model, previous_identity):
                 await source.reload_with_initial_messages()
+            if resume_identity is None and not _is_legacy_root_metadata(
+                session_metadata
+            ):
+                # Committed-model recovery: the reload re-commits the
+                # configured default whenever no identity is held, so drop it
+                # again here — the pending user choice must gate turn starts.
+                source.committed_model = None
+                source.config.attach_committed_model(None)
             # Identity transitions are durable at the next session save; this
             # accepted boundary deliberately does not add memory-disk transactions.
             _mark_legacy_root_cost_incomplete(stats, session_metadata)
@@ -457,13 +478,17 @@ class AgentRuntimeFactory:
         )
         await blueprint.config_orchestrator.reload()
         session_metadata = SessionMetadata.model_validate(metadata)
-        resume_identity = _resume_identity(blueprint.config, session_metadata)
+        # Blueprint resume (fresh session open) has no interactive recovery:
+        # an unusable persisted committed model fails fast as a configuration
+        # error instead of loading the session unpinned.
+        resume_identity = _resume_identity(
+            blueprint.config, session_metadata, fail_fast=True
+        )
         if resume_identity is not None:
             blueprint.config.attach_committed_model(resume_identity)
-        elif (
-            session_metadata.launch_config is None
-            or session_metadata.launch_config.version != 1
-        ):
+        else:
+            # Only legacy (absent or V1) envelopes reach here: re-resolve the
+            # stored session pin from the current configuration.
             await _restore_session_active_model(
                 blueprint.config_orchestrator, config_active_model(metadata)
             )
@@ -1186,7 +1211,7 @@ def _legacy_identity_policy() -> None:
 
 
 def _resume_identity(
-    config: ChartreuxConfigSchema, metadata: SessionMetadata
+    config: ChartreuxConfigSchema, metadata: SessionMetadata, *, fail_fast: bool = False
 ) -> CommittedModelIdentity | None:
     envelope = metadata.launch_config
     if envelope is None or envelope.version == 1:
@@ -1198,7 +1223,30 @@ def _resume_identity(
             envelope.committed_model, allowed_models=config.allowed_models
         )
     except ModelResolutionError as exc:
-        raise CommittedModelResumeError(exc.code, str(exc)) from exc
+        if fail_fast:
+            # Blueprint resume (fresh session open) has no interactive
+            # recovery: fail fast with an actionable error instead of
+            # loading the session unpinned.
+            identity = envelope.committed_model
+            raise CommittedModelResumeError(
+                exc.code,
+                f"Cannot resume session {metadata.session_id}: its committed "
+                f"model {identity.provider}/{identity.wire_name} (base "
+                f"{identity.base_model!r}) is unusable in the current "
+                f"configuration: {exc}. Choose another model before resuming "
+                f"this session.",
+            ) from exc
+        # Recovery: the committed deployment left the catalog (or was disabled
+        # or disallowed). Load the session unpinned instead of failing the
+        # resume — the user must choose a model before the next turn. The
+        # pending choice stays derivable from the stored envelope and is
+        # surfaced as a runtime issue; see committed_model_recovery_issue.
+        logger.warning(
+            "Committed model unavailable on resume session_id=%s: %s",
+            metadata.session_id,
+            exc,
+        )
+        return None
     return envelope.committed_model
 
 

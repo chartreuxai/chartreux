@@ -21,6 +21,7 @@ from chartreux.core.tools.base import (
     ToolPermission,
 )
 from chartreux.core.tools.permissions import PermissionContext
+from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from chartreux.core.tools.utils import (
     DEFAULT_SENSITIVE_PATTERNS,
@@ -454,6 +455,7 @@ class Grep(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.cwd,
+                env=scrub_child_env(os.environ),
             )
 
             try:

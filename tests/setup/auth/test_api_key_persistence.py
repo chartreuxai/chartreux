@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import stat
 import tomllib
 
 from dotenv import dotenv_values
 import pytest
 
-from chartreux.core.config import ProviderConfig
+from chartreux.core.config import ProviderConfig, load_dotenv_values
 from chartreux.core.llm_models import Backend
 from chartreux.core.paths import GLOBAL_ENV_FILE
 from chartreux.setup.auth.api_key_persistence import (
@@ -55,3 +56,21 @@ def test_persist_writes_api_key_to_env_file_and_process_env(
     assert persist_api_key(provider(), "new-key") == "completed"
     assert os.environ["CUSTOM_API_KEY"] == "new-key"
     assert dotenv_values(GLOBAL_ENV_FILE.path)["CUSTOM_API_KEY"] == "new-key"
+
+
+def test_persist_restricts_env_file_to_owner_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CUSTOM_API_KEY", raising=False)
+    assert persist_api_key(provider(), "new-key") == "completed"
+    assert stat.S_IMODE(GLOBAL_ENV_FILE.path.stat().st_mode) == 0o600
+
+
+def test_load_restricts_preexisting_permissive_env_file() -> None:
+    env_path = GLOBAL_ENV_FILE.path
+    env_path.write_text("CUSTOM_API_KEY=old-key\n", encoding="utf-8")
+    env_path.chmod(0o644)
+
+    load_dotenv_values(env_path=env_path, environ={})
+
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600

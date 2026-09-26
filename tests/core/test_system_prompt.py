@@ -91,3 +91,31 @@ def test_fetch_git_status_does_not_execute_malicious_fsmonitor_hook(
     assert "Current branch:" in status
     assert "Git operations timed out" not in status
     assert "Not a git repository" not in status
+
+
+def test_fetch_git_context_does_not_inspect_worktree_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = ProjectContextProvider(ProjectContextConfig(), root_path=tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run_git(
+        args: list[str], _timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        output = {
+            ("branch", "--show-current"): "feature\n",
+            ("branch", "-r"): "  origin/master\n",
+            ("log", "--oneline", "-5", "--decorate"): "abc123 message\n",
+        }[tuple(args)]
+        return subprocess.CompletedProcess(args, 0, stdout=output)
+
+    monkeypatch.setattr(provider, "_run_git", fake_run_git)
+
+    context = provider._fetch_git_status()
+
+    assert not any(args and args[0] == "status" for args in calls)
+    assert "Current branch: feature" in context
+    assert "Main branch (you will usually use this for PRs): master" in context
+    assert "abc123 message" in context
+    assert "Status:" not in context

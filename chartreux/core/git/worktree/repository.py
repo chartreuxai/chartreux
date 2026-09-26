@@ -513,9 +513,7 @@ class WorktreeRepository:
             if record.branch is None or record.prunable:
                 continue
             try:
-                _validate_existing_worktree(
-                    record.root, record.branch, paths.common_git_dir
-                )
+                _validate_listed_worktree(record.root, paths.common_git_dir)
                 root = record.root.resolve()
                 path = _target_cwd(root, relative_base)
             except WorktreeError:
@@ -1232,6 +1230,62 @@ def _validate_existing_worktree(
         raise WorktreeError(
             f"Path {target} is checked out on {actual!r}, expected {expected_branch!r}."
         )
+
+
+def _validate_listed_worktree(target: Path, expected_common_git_dir: Path) -> None:
+    """The part of :func:`_validate_existing_worktree` a *listing* still needs.
+
+    The callers that adopt a directory have to establish what it is: the path
+    merely exists, and it has to be proven a worktree of this repository on the
+    branch expected. A listing starts from the other end. Every record here came
+    out of this repository's own ``git worktree list``, so the repository it
+    belongs to and the branch it is on are things git has already answered.
+
+    Re-asking costs a GitPython repository object plus a ``git rev-parse``
+    subprocess *per worktree*, and that is the entire cost of listing: roughly
+    29ms x N worktrees, paid on every listing a session's project resolution
+    walks.
+
+    The filesystem checks stay. They cost a symlink check per path component
+    and one ``.is_file()``, and they catch the one thing the record cannot: a
+    path removed or swapped for a symlink since git wrote it. The ``.git``
+    pointer adds the identity half of the full validation at the same
+    filesystem-only price: a linked worktree of this repository names a gitdir
+    under the common git dir's ``worktrees/`` directory, so a directory whose
+    ``.git`` file points at another repository's worktree is refused without a
+    subprocess, stale branch label notwithstanding.
+    """
+    if _has_linked_path_component(target):
+        raise WorktreeError(
+            f"Path {target} contains a symbolic link or junction, "
+            "not a stable git worktree path."
+        )
+    git_marker = target / ".git"
+    if not git_marker.is_file():
+        raise WorktreeError(f"Path {target} already exists but is not a git worktree.")
+    try:
+        pointer = git_marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as e:
+        raise WorktreeError(f"Failed to inspect worktree {target}: {e}") from e
+    prefix, separator, value = pointer.partition(":")
+    value = value.strip()
+    if not separator or prefix.casefold() != "gitdir" or not value:
+        # Not a usable worktree pointer; git itself would refuse it.
+        raise WorktreeError(f"Path {target} already exists but is not a git worktree.")
+    git_dir = Path(value).expanduser()
+    if not git_dir.is_absolute():
+        git_dir = target / git_dir
+    try:
+        resolved_git_dir = git_dir.resolve(strict=True)
+        expected_worktrees = (expected_common_git_dir / "worktrees").resolve(
+            strict=True
+        )
+    except (OSError, RuntimeError) as e:
+        raise WorktreeError(f"Failed to inspect worktree {target}: {e}") from e
+    if not resolved_git_dir.is_dir():
+        raise WorktreeError(f"Path {target} has no usable worktree git directory.")
+    if not resolved_git_dir.is_relative_to(expected_worktrees):
+        raise WorktreeError(f"Path {target} belongs to a different git repository.")
 
 
 def _has_linked_path_component(path: Path) -> bool:

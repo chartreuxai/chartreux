@@ -145,6 +145,9 @@ def set_api_key_in_keyring(env_key: str, api_key: str) -> None:
         raise KeyringError("keyring disabled")
 
     _set_password(_KEYRING_SERVICE, env_key, api_key)
+    from chartreux.core.tools.secret_redaction import invalidate_keyring_credential
+
+    invalidate_keyring_credential(env_key)
 
 
 def delete_api_key_from_keyring(env_key: str) -> None:
@@ -152,3 +155,6 @@ def delete_api_key_from_keyring(env_key: str) -> None:
         return
 
     _delete_password(_KEYRING_SERVICE, env_key)
+    from chartreux.core.tools.secret_redaction import invalidate_keyring_credential
+
+    invalidate_keyring_credential(env_key)

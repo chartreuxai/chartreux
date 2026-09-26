@@ -51,12 +51,9 @@ def _failing_bash_factory(
         return single_tool_call_chunks(
             call_id=FAILING_BASH_CALL_ID,
             tool_name="bash",
-            arguments={
-                "command": (
-                    f"python -c \"import sys; sys.stderr.write('{FAILING_BASH_STDERR}'); "
-                    'sys.exit(1)"'
-                )
-            },
+            # `cat` fails with exit code 1 and reports the missing file (whose
+            # name carries the marker) on stderr; `python -c` is denied.
+            arguments={"command": f"cat {FAILING_BASH_STDERR}"},
         )
 
     return assistant_text_chunks("Recovered after the shell failure.", created=30)

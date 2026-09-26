@@ -40,7 +40,11 @@ from chartreux.app_server._session_backend_services import SessionBackendService
 from chartreux.app_server._session_history import SessionHistory
 from chartreux.app_server._sessions import SessionRuntime, SessionRuntimeRegistry
 from chartreux.app_server._tool_io import ClientToolIO
-from chartreux.app_server._turns import TurnConflictError, TurnController
+from chartreux.app_server._turns import (
+    ModelChoicePendingError,
+    TurnConflictError,
+    TurnController,
+)
 from chartreux.app_server._utils import now_ms, public_error
 from chartreux.app_server._worktree_effects import WorktreeEffect
 from chartreux.app_server._worktree_session import SessionWorktrees, WorktreeResolution
@@ -869,6 +873,16 @@ class SessionRuntimeControllerImpl:
                         scheduled_loop_id=loop.id,
                     )
                 except (SessionExecutionConflict, TurnConflictError):
+                    continue
+                except ModelChoicePendingError:
+                    # A recovered session must wait for an explicit model
+                    # choice; the pending state is already surfaced as a
+                    # runtime issue. ``due()`` does not advance
+                    # ``next_fire_at``, so skipping this cycle would retry
+                    # (and fail) on every scheduler pass. Mark the loop fired
+                    # to back off one full interval without running it; after
+                    # an explicit selection it fires normally again.
+                    await self._resources.mark_loop_fired(loop.id)
                     continue
                 start()
                 await self._resources.mark_loop_fired(loop.id)

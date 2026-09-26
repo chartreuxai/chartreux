@@ -12,6 +12,7 @@ from pydantic import BeforeValidator
 from pydantic.fields import FieldInfo
 
 from chartreux.core.config._catalog import validate_catalog_scope
+from chartreux.core.config._credential_authority import validate_credential_env_source
 from chartreux.core.config._restrictions import (
     ConfigCandidate,
     PolicySourceIdentity,
@@ -34,6 +35,21 @@ from chartreux.core.config.schema import (
     MergeFieldMetadata,
 )
 from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.utils.merge import MergeStrategy
+
+
+class ConfigMergeError(ValueError):
+    def __init__(
+        self, field_name: str, layer_name: str, expected_type: str, value: Any
+    ) -> None:
+        actual_type = "dictionary" if isinstance(value, dict) else type(value).__name__
+        message = (
+            f"Invalid configuration: {field_name} from {layer_name} must be a "
+            f"{expected_type}, not a {actual_type}."
+        )
+        if field_name == "mcp_servers" and isinstance(value, dict):
+            message += " Use [[mcp_servers]] instead of [mcp_servers.<name>]."
+        super().__init__(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +194,7 @@ class ConfigBuilder[S: ConfigSchema]:
                     loaded = await layer.load(force=force_load)
                 except (UntrustedLayerError, EmptyLayerError):
                     continue
+                validate_credential_env_source(loaded.model_dump(), layer=layer)
                 validate_root_source(loaded.model_dump(), layer=layer)
                 validate_catalog_scope(
                     self._schema,
@@ -187,6 +204,7 @@ class ConfigBuilder[S: ConfigSchema]:
                 )
                 data = overrides.get(layer.name, loaded)
                 raw = data.model_dump()
+                validate_credential_env_source(raw, layer=layer)
                 validate_root_source(raw, layer=layer)
                 validate_catalog_scope(
                     self._schema,
@@ -320,6 +338,12 @@ class ConfigBuilder[S: ConfigSchema]:
                         fragment_value = self._apply_model_before_validators(
                             fragment_key, fragment_field, fragment_value
                         )
+                        self._validate_merge_value(
+                            f"{key}.{fragment_key}",
+                            ld.name,
+                            fragment_meta.merge_strategy,
+                            fragment_value,
+                        )
                         accumulated[key][fragment_key] = (
                             fragment_meta.merge_strategy.apply(
                                 accumulated[key].get(fragment_key),
@@ -337,6 +361,11 @@ class ConfigBuilder[S: ConfigSchema]:
                     continue
 
                 value = self._apply_model_before_validators(key, field_info, value)
+                if key == "mcp_servers" and isinstance(value, dict):
+                    # TOML [mcp_servers.<name>] yields a dict; the schema wants
+                    # a list of tables. REPLACE passes the dict through to
+                    # pydantic, so flag it here with actionable guidance.
+                    raise ConfigMergeError(key, ld.name, "list", value)
                 if key == "thinking_overrides" and isinstance(value, dict):
                     thinking_origins.update({alias: ld.name for alias in value})
                 accumulated[key] = meta.merge_strategy.apply(
@@ -345,6 +374,21 @@ class ConfigBuilder[S: ConfigSchema]:
                 origins[key] = ld.name
 
         return accumulated, origins, thinking_origins
+
+    def _validate_merge_value(
+        self, field_name: str, layer_name: str, strategy: MergeStrategy, value: Any
+    ) -> None:
+        if value is None:
+            return
+        if strategy in {MergeStrategy.CONCAT, MergeStrategy.UNION}:
+            if isinstance(value, list) or (isinstance(value, dict) and not value):
+                return
+            raise ConfigMergeError(field_name, layer_name, "list", value)
+        if strategy in {
+            MergeStrategy.MERGE,
+            MergeStrategy.DEEP_MERGE,
+        } and not isinstance(value, dict):
+            raise ConfigMergeError(field_name, layer_name, "dictionary", value)
 
     def _catalog_for_layers(
         self, layer_dicts: list[_LayerData]

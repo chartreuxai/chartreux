@@ -525,6 +525,43 @@ class TestHookExecutor:
         assert "Failed to start" in result.stderr
         assert "nope" in result.stderr
 
+    @pytest.mark.asyncio
+    async def test_hook_child_does_not_see_credential_env_vars(
+        self, sample_invocation: PostAgentInvocation, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Hooks load from project-writable config, so the hook subprocess must
+        # not inherit chartreux's credential variables.
+        from chartreux.core.tools import secret_redaction as sr
+
+        name = "CHARTREUX_TEST_HOOK_CREDENTIAL"
+        value = "sk-hook-secret-0123456789abcdef"
+        monkeypatch.setenv(name, value)
+        monkeypatch.setattr(sr, "_read_dotenv_entries", lambda: {name: None})
+        monkeypatch.setattr(sr, "_catalog_env_var_names", lambda: frozenset())
+        sr.set_env_passthrough(())
+        sr.set_mcp_static_auth_env_names(())
+        sr.reset_cache()
+        try:
+            hook = _make_hook(
+                command=(
+                    f'{sys.executable} -c "import os;'
+                    f" print(os.environ.get('{name}'))\""
+                )
+            )
+            result = await HookExecutor().run(hook, sample_invocation)
+            assert result.exit_code == 0
+            assert result.stdout == "None"
+
+            # The passthrough list restores the variable when configured.
+            sr.set_env_passthrough([name])
+            result = await HookExecutor().run(hook, sample_invocation)
+            assert result.exit_code == 0
+            assert result.stdout == value
+        finally:
+            sr.set_env_passthrough(())
+            sr.set_mcp_static_auth_env_names(())
+            sr.reset_cache()
+
 
 class TestPostAgentHook:
     @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 import tomllib
 
 import pytest
@@ -43,3 +44,6 @@ def test_bootstrap_creates_empty_env_file() -> None:
 
     assert env_file.exists()
     assert env_file.read_text(encoding="utf-8") == ""
+    # The file will hold API keys once filled in, so creation must restrict
+    # it to owner-only right away rather than waiting for the next load.
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600

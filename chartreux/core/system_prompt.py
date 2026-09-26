@@ -16,6 +16,7 @@ from chartreux.core.config.harness_files import (
 )
 from chartreux.core.paths import CHARTREUX_HOME
 from chartreux.core.prompts import UtilityPrompt
+from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils import get_platform_display_name
 from chartreux.utils.paths import is_dangerous_directory
 from chartreux.utils.platform import resolve_git_executable
@@ -72,22 +73,16 @@ class ProjectContextProvider:
             capture_output=True,
             check=True,
             cwd=self.root_path,
+            # Git children run with chartreux's credential variables scrubbed;
+            # hooks are already disabled above, this keeps tokens out of any
+            # environment a repo's own tooling could observe.
+            env=scrub_child_env(os.environ),
             stdin=None,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
         )
-
-    @staticmethod
-    def _format_git_status(status_output: str) -> str:
-        if not status_output:
-            return "(clean)"
-        status_lines = status_output.splitlines()
-        MAX_GIT_STATUS_SIZE = 50
-        if len(status_lines) > MAX_GIT_STATUS_SIZE:
-            return f"({len(status_lines)} changes - use 'git status' for details)"
-        return f"({len(status_lines)} changes)"
 
     @staticmethod
     def _parse_git_log(log_output: str) -> list[str]:
@@ -113,14 +108,15 @@ class ProjectContextProvider:
             timeout = min(self.config.timeout_seconds, 10.0)
             num_commits = self.config.default_commit_count
 
-            with ThreadPoolExecutor(max_workers=4) as pool:
+            # Do not run `git status` here. Unlike these metadata-only commands,
+            # status may pass working-tree contents through arbitrary clean or
+            # process filters configured by the repository. Project context is
+            # collected automatically, outside the shell permission boundary.
+            with ThreadPoolExecutor(max_workers=3) as pool:
                 branch_future = pool.submit(
                     self._run_git, ["branch", "--show-current"], timeout
                 )
                 remote_future = pool.submit(self._run_git, ["branch", "-r"], timeout)
-                status_future = pool.submit(
-                    self._run_git, ["status", "--porcelain"], timeout
-                )
                 log_future = pool.submit(
                     self._run_git,
                     ["log", "--oneline", f"-{num_commits}", "--decorate"],
@@ -137,13 +133,11 @@ class ProjectContextProvider:
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                 pass
 
-            status = self._format_git_status(status_future.result().stdout.strip())
             recent_commits = self._parse_git_log(log_future.result().stdout.strip())
 
             git_info_parts = [
                 f"Current branch: {current_branch}",
                 f"Main branch (you will usually use this for PRs): {main_branch}",
-                f"Status: {status}",
             ]
 
             if recent_commits:

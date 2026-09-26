@@ -19,11 +19,7 @@ from chartreux.core.tools.base import ToolPermission
 from chartreux.core.tools.builtins.bash import BashArgs
 from chartreux.core.tools.builtins.read_file import ReadFileArgs
 from chartreux.core.tools.builtins.todo import TodoArgs
-from chartreux.core.tools.permissions import (
-    PermissionContext,
-    PermissionScope,
-    RequiredPermission,
-)
+from chartreux.core.tools.permissions import PermissionContext
 from tests.conftest import (
     build_test_agent_loop,
     build_test_vibe_config,
@@ -61,20 +57,10 @@ async def test_decision_denials_respect_configured_permission(
     agent = build_test_agent_loop(
         config=build_test_vibe_config(tools={"todo": {"permission": configured.value}})
     )
-    requirement = RequiredPermission(
-        scope=PermissionScope.COMMAND_PATTERN,
-        invocation_pattern="synthetic",
-        session_pattern="synthetic",
-        label="synthetic",
-    )
     ctx = (
         None
         if resolved is None
-        else PermissionContext(
-            permission=resolved,
-            required_permissions=[requirement],
-            reason="fixture policy",
-        )
+        else PermissionContext(permission=resolved, reason="fixture policy")
     )
     tool = agent.tool_manager.get("todo")
     resolver = MagicMock(return_value=ctx)

@@ -86,6 +86,73 @@ def test_foreign_paths_are_denied_before_posix_canonicalization(
     assert file_permission.permission is ToolPermission.NEVER
 
 
+def test_absolute_allowlist_star_matches_a_single_segment(tmp_path: Path) -> None:
+    root = tmp_path.resolve()
+    result = resolve_path_permission(
+        str(root / "notes.md"), cwd=tmp_path, allowlist=[f"{root}/*"], denylist=[]
+    )
+    assert result is not None
+    assert result.permission is ToolPermission.ALWAYS
+
+
+def test_absolute_allowlist_star_does_not_cross_separators(tmp_path: Path) -> None:
+    root = tmp_path.resolve()
+    result = resolve_path_permission(
+        str(root / "sub" / "notes.md"),
+        cwd=tmp_path,
+        allowlist=[f"{root}/*"],
+        denylist=[],
+    )
+    assert result is None
+
+
+def test_exact_allowlist_path_still_matches(tmp_path: Path) -> None:
+    target = tmp_path.resolve() / "notes.md"
+    result = resolve_path_permission(
+        str(target), cwd=tmp_path, allowlist=[str(target)], denylist=[]
+    )
+    assert result is not None
+    assert result.permission is ToolPermission.ALWAYS
+
+
+def test_relative_allowlist_pattern_matches_the_whole_path(tmp_path: Path) -> None:
+    result = resolve_path_permission(
+        "notes.md", cwd=tmp_path, allowlist=["*.md"], denylist=[]
+    )
+    assert result is not None
+    assert result.permission is ToolPermission.ALWAYS
+
+
+def test_relative_allowlist_pattern_is_not_right_anchored(tmp_path: Path) -> None:
+    # Path.match right-anchors relative patterns; 'tmp/*' must not reach
+    # '/var/tmp/secret' the way a tail match would.
+    result = resolve_path_permission(
+        "/var/tmp/secret", cwd=tmp_path, allowlist=["tmp/*"], denylist=[]
+    )
+    assert result is None
+
+
+def test_denylist_pattern_still_denies(tmp_path: Path) -> None:
+    result = resolve_path_permission(
+        str(tmp_path / "secret.key"), cwd=tmp_path, allowlist=[], denylist=["*/secret*"]
+    )
+    assert result is not None
+    assert result.permission is ToolPermission.NEVER
+
+
+def test_denylist_star_still_crosses_separators(tmp_path: Path) -> None:
+    # Denials stay fail-safe: a denylist '*' still covers the whole subtree.
+    root = tmp_path.resolve()
+    result = resolve_path_permission(
+        str(root / "sub" / "secret.key"),
+        cwd=tmp_path,
+        allowlist=[],
+        denylist=[f"{root}/*"],
+    )
+    assert result is not None
+    assert result.permission is ToolPermission.NEVER
+
+
 @pytest.mark.parametrize(
     "raw",
     [

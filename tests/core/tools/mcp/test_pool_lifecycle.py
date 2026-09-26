@@ -20,6 +20,44 @@ def _result():
 
 
 @pytest.mark.asyncio
+async def test_reload_retirement_drains_admitted_requests(monkeypatch):
+    active, release = asyncio.Event(), asyncio.Event()
+    seen = []
+
+    async def call(name, arguments, **kwargs):
+        if name == "first":
+            active.set()
+            await release.wait()
+        seen.append(name)
+        return _result()
+
+    monkeypatch.setattr(
+        "chartreux.core.tools.mcp.pool.enter_stdio_session",
+        AsyncMock(return_value=SimpleNamespace(call_tool=call)),
+    )
+    pool = MCPConnectionPool()
+    first = asyncio.create_task(
+        pool.call_tool(command=["fake"], tool_name="first", arguments={})
+    )
+    await active.wait()
+    second = asyncio.create_task(
+        pool.call_tool(command=["fake"], tool_name="second", arguments={})
+    )
+    while not next(iter(pool._conns.values()))._requests.qsize():
+        await asyncio.sleep(0)
+    pool.retire(drain_active=True)
+    release.set()
+    try:
+        await asyncio.gather(first, second)
+        assert seen == ["first", "second"]
+        with pytest.raises(RuntimeError, match="closed"):
+            await pool.call_tool(command=["fake"], tool_name="third", arguments={})
+    finally:
+        release.set()
+        await pool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_queued_call_never_dispatches(monkeypatch):
     started, release, queued = asyncio.Event(), asyncio.Event(), asyncio.Event()
     calls = []
@@ -36,14 +74,14 @@ async def test_cancelled_queued_call_never_dispatches(monkeypatch):
         AsyncMock(return_value=SimpleNamespace(call_tool=call)),
     )
     conn = _StdioConnection(build_stdio_params(["fake"]), None)
-    original_put = conn._requests.put
+    original_put = conn._requests.put_nowait
 
-    async def put(request):
-        await original_put(request)
+    def put(request):
+        original_put(request)
         if request is not None and request.tool_name == "cancelled":
             queued.set()
 
-    monkeypatch.setattr(conn._requests, "put", put)
+    monkeypatch.setattr(conn._requests, "put_nowait", put)
     active = asyncio.create_task(conn.call_tool("active", {}, None))
     cancelled = None
     try:
@@ -217,14 +255,14 @@ async def test_session_contexts_unwind_in_owner_task_and_pending_calls_settle(
 
     monkeypatch.setattr("chartreux.core.tools.mcp.pool.enter_stdio_session", enter)
     conn = _StdioConnection(build_stdio_params(["fake"]), None)
-    original_put = conn._requests.put
+    original_put = conn._requests.put_nowait
 
-    async def put(req):
-        await original_put(req)
-        if req.tool_name == "pending":
+    def put(req):
+        original_put(req)
+        if req is not None and req.tool_name == "pending":
             queued.set()
 
-    monkeypatch.setattr(conn._requests, "put", put)
+    monkeypatch.setattr(conn._requests, "put_nowait", put)
     active = asyncio.create_task(conn.call_tool("active", {}, None))
     pending = None
     try:
@@ -367,6 +405,28 @@ async def test_sdk_tool_timeout_is_not_replayed_and_preserves_session(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_retired_drain_has_deadline_and_cancels_worker(monkeypatch):
+    monkeypatch.setattr("chartreux.core.tools.mcp.pool._CLOSE_TIMEOUT_SEC", 0.02)
+    pool = MCPConnectionPool()
+    conn = _StdioConnection(build_stdio_params(["fake"]), None)
+    started = asyncio.Event()
+
+    async def never_settles():
+        started.set()
+        await asyncio.Event().wait()
+
+    conn._worker = asyncio.create_task(never_settles())
+    pool._conns["admitted"] = conn
+    await started.wait()
+    pool.retire(drain_active=True)
+    with pytest.raises(TimeoutError):
+        await pool.aclose()
+    await asyncio.sleep(0)
+    assert pool._close_task is not None and pool._close_task.done()
+    assert conn._worker.done()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("resist_in", ["operation", "cleanup"])
 async def test_close_timeout_reports_failure_and_retains_worker(monkeypatch, resist_in):
     started, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -414,10 +474,11 @@ async def test_close_timeout_reports_failure_and_retains_worker(monkeypatch, res
         with pytest.raises(TimeoutError, match="MCP.*cleanup"):
             await pool.aclose()
         assert cancelled.is_set()
-        assert not worker.done()
         assert conn in pool._conns.values()
-        with pytest.raises(TimeoutError):
-            await conn.aclose()
+        if resist_in == "operation":
+            assert worker.done()  # deadline cancels an unfinished drain
+        else:
+            assert not worker.done()  # SDK cleanup may suppress cancellation
         with pytest.raises(RuntimeError, match="closed"):
             await pool.call_tool(command=["fake"], tool_name="late", arguments={})
         release.set()

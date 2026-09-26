@@ -137,10 +137,10 @@ async def test_mcp_catalog_read_refresh_toggle_remove(
         ("echo", True),
         ("summarize", True),
     ]
-    # The `/mcp` detail view renders one non-wrapping row per tool, so every
-    # backend must collapse free-form remote descriptions to a single line.
+    # MCP tool descriptions are framed as untrusted content before the catalog
+    # collapses them to the single line shown in the `/mcp` detail view.
     descriptions = {tool.name: tool.description for tool in healthy.tools}
-    assert descriptions["summarize"] == "Summarize a document."
+    assert descriptions["summarize"] == "<untrusted_content>"
     assert _source(canonical_read, _OAUTH_SERVER).status is MCPSourceStatus.DISABLED
 
     canonical_refresh = MCPCatalogMutationResponse.model_validate(

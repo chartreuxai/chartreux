@@ -30,6 +30,7 @@ Unless noted, list defaults are `[]`, map defaults are `{}`, and booleans shown 
 | `tool_paths` | `[]` | Paths to custom tool files or directories; directories are shallow-searched. |
 | `enabled_tools` | `[]` | Tool-name patterns. A non-empty list is an allow-only filter. |
 | `disabled_tools` | `[]` | Tool-name patterns removed after `enabled_tools` filtering. |
+| `credential_env_passthrough` | `[]` | Environment-variable names exempt from credential scrubbing in child processes (shell commands, MCP stdio servers, hooks, client terminals). This setting is accepted only from the user configuration layer; project and other layers, including generic config patches, are rejected. |
 | `mcp_servers` | `[]` | Array of [MCP server tables](#mcp-server-tables). |
 
 Every `[tools.<name>]` table except `tools.bash` accepts `permission` (`always`, `ask`, or `never`), `allowlist`, `denylist`, and `sensitive_patterns`; defaults are `ask`, `[]`, `[]`, and `[]`. A tool implementation can accept additional fields. Shipped tool fields are:

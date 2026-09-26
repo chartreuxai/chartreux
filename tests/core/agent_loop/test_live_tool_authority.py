@@ -145,7 +145,6 @@ async def test_removed_root_does_not_survive_in_retained_workspace(
         assert context is not None and context.permission == ToolPermission.NEVER
         context = loop.tool_manager.get("read_file").resolve_permission(args)
         assert context is not None and context.permission == ToolPermission.NEVER
-        assert not context.required_permissions
     finally:
         await loop.aclose()
 

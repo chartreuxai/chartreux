@@ -258,6 +258,9 @@ async def test_removed_session_active_model_falls_back_to_default(
     resumed_connection = await connect_backend_contract_host(
         session_options=SessionOptions(), capabilities=ClientCapabilities()
     )
+    # Blueprint resume (fresh session open) fails fast: the removed committed
+    # model is a configuration error, not a recoverable state. Only the
+    # root-session resume RPC keeps the recovery flow.
     with pytest.raises(AppServerResponseError):
         await resumed_connection.host.resume_session(session_id)
 

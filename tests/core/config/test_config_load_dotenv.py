@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import stat
 import threading
 
 from chartreux.core.config import load_dotenv_values
@@ -73,6 +74,19 @@ def test_ignores_empty_values(tmp_path: Path) -> None:
     assert "EMPTY" not in environ
     assert "MISTRAL_API_KEY" not in environ
     assert "NO_VALUE" not in environ
+
+
+def test_restricts_permissive_regular_file_on_load(tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    _write_env_file(env_path, "MISTRAL_API_KEY=file-key\n")
+    env_path.chmod(0o644)
+
+    environ: dict[str, str] = {}
+    load_dotenv_values(env_path=env_path, environ=environ)
+
+    assert environ["MISTRAL_API_KEY"] == "file-key"
+    # Loading re-restricts a permissive regular file to owner-only.
+    assert stat.S_IMODE(env_path.stat().st_mode) & 0o077 == 0
 
 
 def test_reads_from_fifo(tmp_path: Path) -> None:

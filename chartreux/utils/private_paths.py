@@ -67,6 +67,16 @@ def restrict_private_file(path: Path) -> int:
     if os.name != "posix":
         return 0
     try:
+        # Only regular files are ever opened. Opening other file types can be
+        # harmful by itself: opening a FIFO's read side unblocks a writer
+        # blocked on the reader/writer handshake, so the S_ISREG check after
+        # the open would skip the chmod but the damage is already done.
+        if not stat.S_ISREG(os.lstat(path.expanduser()).st_mode):
+            return 0
+    except OSError as error:
+        logger.debug("Permission repair skipped path=%s err=%s", path, error)
+        return 0
+    try:
         fd = open_nofollow(path, directory=False)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):

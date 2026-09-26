@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import timedelta
+import json
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -75,6 +76,7 @@ from chartreux.core.config import (
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.config.layers.default import DefaultConfigLayer
 from chartreux.core.config.layers.overrides import OverridesLayer
+from chartreux.core.config.layers.user import UserConfigLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.git.errors import GitUnavailableError
 from chartreux.core.git.worktree import (
@@ -1875,7 +1877,7 @@ async def test_legacy_root_runtime_auto_title_policy(
 
 @pytest.mark.asyncio
 async def test_harness_process_configures_globals_once_and_shares_cache(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config = build_test_vibe_config()
     cache_stores: list[object] = []
@@ -1887,16 +1889,27 @@ async def test_harness_process_configures_globals_once_and_shares_cache(
     ) -> ConfigOrchestrator[ChartreuxConfigSchema]:
         del harness_files
         overrides_data.append(data)
+        user_path = tmp_path / "user.toml"
+        user_path.write_text(
+            "credential_env_passthrough = "
+            f"{json.dumps(config.credential_env_passthrough)}\n",
+            encoding="utf-8",
+        )
+        user = UserConfigLayer(path=user_path)
         default = DefaultConfigLayer(schema=ChartreuxConfigSchema)
         ordinary = OverridesLayer(
             data=config.model_dump(
-                mode="json", exclude=_ORDINARY_OVERRIDE_EXCLUDED_FIELDS
+                mode="json",
+                exclude={
+                    *_ORDINARY_OVERRIDE_EXCLUDED_FIELDS,
+                    "credential_env_passthrough",
+                },
             ),
             name="base",
         )
         return await ConfigOrchestrator.create(
             schema=ChartreuxConfigSchema,
-            layers=[default, ordinary],
+            layers=[default, user, ordinary],
             default_layer_resolver=lambda: ordinary,
         )
 

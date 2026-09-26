@@ -48,6 +48,7 @@ can add commands.
 | `/model` | Select the active model. |
 | `/thinking` | Select the session thinking level. |
 | `/reload` | Reload configuration, instructions, and skills from disk. |
+| `/config` | Open the user config file in your editor; creates the file with a commented template if absent, and reloads after editing if it changed. |
 | `/clear`, `/new` | Start a new conversation; optionally provide a seed prompt. |
 | `/copy` | Copy the last agent message. |
 | `/paste-image` | Paste a clipboard image into the prompt (available on supported systems). |

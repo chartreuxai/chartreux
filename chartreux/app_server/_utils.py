@@ -32,6 +32,7 @@ from chartreux.core.errors import (
 )
 from chartreux.core.llm.exceptions import BackendError, IncompleteStreamError
 from chartreux.core.llm_models import ImageAttachment
+from chartreux.core.model_catalog.availability import AllDeploymentsUnavailableError
 from chartreux.core.session.image_snapshot import (
     ImageSnapshotError,
     snapshot_image_bytes,
@@ -111,6 +112,21 @@ def decode_content_blocks(
     )
 
 
+def _all_deployments_unavailable_message(exc: AllDeploymentsUnavailableError) -> str:
+    """Name the model and each deployment's exclusion reason for the user."""
+    if not exc.exclusions:
+        return str(exc)
+    lines = [f"All deployments for model '{exc.base_model}' are unavailable:"]
+    for exclusion in exc.exclusions:
+        item = (
+            f"- {exclusion.provider} ({exclusion.wire_name}): {exclusion.reason.value}"
+        )
+        if exclusion.detail:
+            item = f"{item} ({exclusion.detail})"
+        lines.append(item)
+    return "\n".join(lines)
+
+
 def public_error(exc: Exception) -> PublicError:  # noqa: PLR0912
     details: dict[str, JsonValue] = {}
     for source in (exc, exc.__cause__):
@@ -122,6 +138,7 @@ def public_error(exc: Exception) -> PublicError:  # noqa: PLR0912
             value = getattr(source, name, None)
             if isinstance(value, str):
                 details[name] = value
+    message = str(exc)
     match exc:
         case RateLimitError():
             code = TurnErrorCode.RATE_LIMIT
@@ -140,6 +157,19 @@ def public_error(exc: Exception) -> PublicError:  # noqa: PLR0912
             details["reason"] = exc.reason
         case IncompleteStreamError():
             code = TurnErrorCode.INCOMPLETE_STREAM
+        case AllDeploymentsUnavailableError():
+            code = TurnErrorCode.ALL_DEPLOYMENTS_UNAVAILABLE
+            details["base_model"] = exc.base_model
+            details["exclusions"] = [
+                {
+                    "provider": exclusion.provider,
+                    "wire_name": exclusion.wire_name,
+                    "reason": exclusion.reason.value,
+                    **({"detail": exclusion.detail} if exclusion.detail else {}),
+                }
+                for exclusion in exc.exclusions
+            ]
+            message = _all_deployments_unavailable_message(exc)
         case BackendError() if exc.is_invalid_model:
             code = TurnErrorCode.INVALID_MODEL
         case BackendError() if exc.status in _REFUSED_CREDENTIAL_STATUSES:
@@ -161,7 +191,7 @@ def public_error(exc: Exception) -> PublicError:  # noqa: PLR0912
             details["model"] = cause.model
         case _:
             code = TurnErrorCode.INTERNAL_ERROR
-    return PublicError(message=str(exc), code=code, details=details or None)
+    return PublicError(message=message, code=code, details=details or None)
 
 
 def dump_model(model: BaseModel) -> dict[str, JsonValue]:

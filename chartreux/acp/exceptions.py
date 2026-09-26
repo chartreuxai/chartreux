@@ -20,6 +20,7 @@ Chartreux application codes:
   -31006            Compaction failed
   -31007            Invalid image attachment
   -31008            Images not supported by the active model
+  -31009            All deployments unavailable
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ REFUSAL = -31005
 COMPACTION_FAILED = -31006
 INVALID_IMAGE_ATTACHMENT = -31007
 IMAGES_NOT_SUPPORTED = -31008
+ALL_DEPLOYMENTS_UNAVAILABLE = -31009
 
 
 class ChartreuxRequestError(RequestError):
@@ -184,6 +186,26 @@ class ImagesNotSupportedError(ChartreuxRequestError):
         )
 
 
+class AllDeploymentsUnavailableError(ChartreuxRequestError):
+    """Every deployment of the active model is unavailable (failover exhausted)."""
+
+    code = ALL_DEPLOYMENTS_UNAVAILABLE
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        base_model: str | None = None,
+        exclusions: list[dict[str, Any]] | None = None,
+    ) -> None:
+        data: dict[str, Any] = {}
+        if base_model is not None:
+            data["base_model"] = base_model
+        if exclusions is not None:
+            data["exclusions"] = exclusions
+        super().__init__(message=detail, data=data or None)
+
+
 class ConversationLimitError(ChartreuxRequestError):
     code = CONVERSATION_LIMIT
 
@@ -203,6 +225,8 @@ def from_public_error(error: PublicError) -> ChartreuxRequestError:
     provider = details.get("provider")
     model = details.get("model")
     reason = details.get("reason")
+    base_model = details.get("base_model")
+    exclusions = details.get("exclusions")
     match error.code:
         case TurnErrorCode.RATE_LIMIT if isinstance(provider, str) and isinstance(
             model, str
@@ -236,6 +260,15 @@ def from_public_error(error: PublicError) -> ChartreuxRequestError:
             )
         case TurnErrorCode.IMAGES_NOT_SUPPORTED if isinstance(model, str):
             mapped = ImagesNotSupportedError(model)
+        case TurnErrorCode.ALL_DEPLOYMENTS_UNAVAILABLE:
+            exclusion_items: list[dict[str, Any]] | None = None
+            if isinstance(exclusions, list):
+                exclusion_items = [e for e in exclusions if isinstance(e, dict)]
+            mapped = AllDeploymentsUnavailableError(
+                error.message,
+                base_model=base_model if isinstance(base_model, str) else None,
+                exclusions=exclusion_items,
+            )
         case TurnErrorCode.COMPACTION_FAILED if isinstance(reason, str):
             mapped = CompactionError(reason, error.message)
         case TurnErrorCode.INVALID_MODEL:

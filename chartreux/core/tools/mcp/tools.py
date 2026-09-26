@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 import contextlib
 from dataclasses import dataclass
 from datetime import timedelta
 import hashlib
 import inspect
+import json
 import os
 from pathlib import Path
 import sys
 import threading
+import time
 from typing import TYPE_CHECKING, Any, ClassVar, TextIO
 
 import httpx
@@ -32,10 +34,12 @@ from chartreux.core.tools.mcp.authorization import (
     MCPAuthorizationSnapshot,
 )
 from chartreux.core.tools.remote import MCPTool, MCPToolResult, RemoteTool, _OpenArgs
+from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.tools.ui import ToolResultDisplay
 from chartreux.observability.logging import logger
 from chartreux.utils.http import ChartreuxAsyncHTTPClient, build_ssl_context
 from chartreux.utils.io import decode_console_safe
+from chartreux.utils.untrusted_content import frame_untrusted_content
 
 if TYPE_CHECKING:
     from chartreux.core.events import ToolResultEvent
@@ -60,6 +64,10 @@ def __getattr__(name: str) -> Any:
         from mcp.client.stdio import StdioServerParameters
 
         return StdioServerParameters
+    if name == "get_default_environment":
+        from mcp.client.stdio import get_default_environment
+
+        return get_default_environment
     if name == "stdio_client":
         from mcp.client.stdio import stdio_client
 
@@ -75,6 +83,179 @@ def __getattr__(name: str) -> Any:
 # mcp.shared._httpx_utils, which is an internal module.
 _MCP_DEFAULT_TIMEOUT = 30.0
 _MCP_DEFAULT_SSE_READ_TIMEOUT = 300.0
+
+# The SDK converts a read_timeout_seconds overrun into McpError with this code
+# (httpx.codes.REQUEST_TIMEOUT). This holds for ANY request the session makes —
+# including initialize — so a server that hangs on startup counts the same as
+# one that hangs on a call (desirable: a hung init means a hung server).
+_MCP_CALL_TIMEOUT_CODE = 408
+
+
+def _is_call_timeout(exc: BaseException) -> bool:
+    """Classify the SDK's call-timeout signal, unwrapping exception groups."""
+    from mcp.shared.exceptions import McpError
+
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_is_call_timeout(child) for child in exc.exceptions)
+    return isinstance(exc, McpError) and exc.error.code == _MCP_CALL_TIMEOUT_CODE
+
+
+_MAX_PRESENTATION_SCHEMA_DEPTH = 64
+
+
+def _presentation_schema(
+    schema: dict[str, Any], source: str, depth: int = 0
+) -> dict[str, Any]:
+    """Frame schema prose in the model projection, not the executable schema."""
+    if depth >= _MAX_PRESENTATION_SCHEMA_DEPTH:
+        # Keep other tools and shallow fields available; omit all untrusted
+        # content in the deep subtree rather than failing the whole catalog.
+        return {
+            "description": "MCP schema omitted: nesting exceeds 64 levels; simplify the server tool schema."
+        }
+    result = dict(schema)
+    for key in ("description", "title"):
+        if isinstance(result.get(key), str):
+            result[key] = frame_untrusted_content(result[key], source)
+    for key in (
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+    ):
+        value = result.get(key)
+        if isinstance(value, dict):
+            result[key] = {
+                name: _presentation_schema(child, source, depth + 1)
+                if isinstance(child, dict)
+                else child
+                for name, child in value.items()
+            }
+    for key in (
+        "items",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contains",
+    ):
+        value = result.get(key)
+        if isinstance(value, dict):
+            result[key] = _presentation_schema(value, source, depth + 1)
+    for key in ("allOf", "anyOf", "oneOf", "prefixItems"):
+        value = result.get(key)
+        if isinstance(value, list):
+            result[key] = [
+                _presentation_schema(child, source, depth + 1)
+                if isinstance(child, dict)
+                else child
+                for child in value
+            ]
+    return result
+
+
+def _mcp_description(description: str, source: str) -> str:
+    return frame_untrusted_content(description, source)
+
+
+class MCPServerCooldownError(RuntimeError):
+    """An MCP server is failing fast inside a hung-server cooldown window."""
+
+    code = "mcp_server_cooldown"
+
+    def __init__(self, server: str, retry_in: float) -> None:
+        self.server = server
+        self.retry_in = retry_in
+        super().__init__(
+            f"MCP server {server!r} is cooling down after repeated request "
+            f"timeouts; failing fast, retry in {retry_in:.0f}s"
+        )
+
+
+class MCPServerCircuitBreaker:
+    """In-memory per-server cooldown for MCP servers that hang on requests.
+
+    Mirrors the LLM-side ``AvailabilityRegistry`` pattern: timeouts accumulated
+    since the last successful response put the server into a short cooldown
+    during which calls fail fast instead of burning the full tool timeout; once
+    the cooldown expires, a single-flight recovery probe (the next real call)
+    re-admits the server on success. Any request timeout counts, including
+    ``initialize``: the SDK wraps every request that overruns its
+    ``read_timeout_seconds`` in McpError code 408, and a server that hangs on
+    startup is the same failure as one that hangs on a call. Non-timeout
+    failures (auth errors, tool-level errors, transport deaths, cancellation)
+    never trip the breaker and never reset the timeout counter — they only
+    release an in-flight recovery probe — so the counter is cumulative since
+    the last success, which keeps the breaker fail-closed: timeouts keep
+    accumulating across unrelated failures until a completed response proves
+    the server responsive again.
+    """
+
+    TIMEOUT_THRESHOLD = 3
+    COOLDOWN_SEC = 30.0
+    # Honest retry estimate while a recovery probe is in flight: the probe
+    # resolves within one tool timeout (success re-admits immediately, a
+    # timeout re-trips the cooldown), so "retry in 0s" would be a lie — an
+    # immediate retry fails fast too.
+    PROBE_RETRY_SEC = 5.0
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._timeouts_since_success = 0
+        self._cooldown_until: float | None = None
+        self._epoch = 0
+        self._next_admission = 0
+        self._probe_owner: tuple[int, int] | None = None
+
+    def admission(self, server: str) -> tuple[int, int]:
+        """Return an ownership token for this admitted call."""
+        until = self._cooldown_until
+        if until is not None:
+            now = self._clock()
+            if self._probe_owner is not None:
+                raise MCPServerCooldownError(
+                    server, max(until - now, self.PROBE_RETRY_SEC)
+                )
+            if now < until:
+                raise MCPServerCooldownError(server, until - now)
+        self._next_admission += 1
+        token = (self._epoch, self._next_admission)
+        if until is not None:
+            self._probe_owner = token
+        return token
+
+    def record_timeout(self, token: tuple[int, int]) -> None:
+        """Only a timeout admitted in the current generation can alter state."""
+        if token[0] != self._epoch or (
+            self._cooldown_until is not None and self._probe_owner != token
+        ):
+            return
+        self._timeouts_since_success += 1
+        if self._probe_owner == token:
+            self._probe_owner = None
+        if self._timeouts_since_success >= self.TIMEOUT_THRESHOLD:
+            self._cooldown_until = self._clock() + self.COOLDOWN_SEC
+            self._epoch += 1
+            self._probe_owner = None
+
+    def record_success(self, token: tuple[int, int]) -> None:
+        """A current response clears state, never another generation's probe."""
+        if token[0] != self._epoch or (
+            self._cooldown_until is not None and self._probe_owner != token
+        ):
+            return
+        self._timeouts_since_success = 0
+        self._cooldown_until = None
+        self._probe_owner = None
+        self._epoch += 1
+
+    def record_probe_incomplete(self, token: tuple[int, int]) -> None:
+        """Release only this call's probe; retain the timeout counter."""
+        if self._probe_owner == token:
+            self._probe_owner = None
 
 
 def _stderr_logger_thread(read_fd: int) -> None:
@@ -152,11 +333,29 @@ def _parse_call_result(server: str, tool: str, result_obj: Any) -> MCPToolResult
             parts.append(
                 f"[Unsupported MCP content omitted: {block.type or 'unknown'}]"
             )
+    if parsed.structuredContent is not None:
+        # Structured content reaches the model as a `structured: {...}` line in
+        # the tool-response text, so it rides inside the same untrusted frame
+        # as the text blocks instead of arriving unframed.
+        try:
+            serialized = json.dumps(
+                parsed.structuredContent, default=repr, sort_keys=True
+            )
+        except (TypeError, ValueError):
+            serialized = repr(parsed.structuredContent)
+        parts.append(f"structured: {serialized}")
+    text = "\n".join(parts) if parts else None
     return MCPToolResult(
         server=server,
         tool=tool,
         ok=not parsed.isError,
-        text="\n".join(parts) if parts else None,
+        # Remote MCP servers are untrusted: their output can carry
+        # prompt-injection payloads, so frame it as data for the model.
+        text=(
+            frame_untrusted_content(text, f"MCP server {server}")
+            if text is not None
+            else None
+        ),
         structured=parsed.structuredContent,
     )
 
@@ -279,7 +478,10 @@ def create_mcp_http_proxy_tool_class(
     class MCPHttpProxyTool(MCPTool):
         description: ClassVar[str] = (
             (f"[{computed_alias}] " if computed_alias else "")
-            + (remote.description or f"MCP tool '{remote.name}' from {url}")
+            + _mcp_description(
+                remote.description or f"MCP tool '{remote.name}' from {url}",
+                f"MCP server {computed_alias}",
+            )
             + (f"\nHint: {server_hint}" if server_hint else "")
         )
         _server_name: ClassVar[str] = computed_alias
@@ -293,6 +495,9 @@ def create_mcp_http_proxy_tool_class(
         )
         _startup_timeout_sec: ClassVar[float | None] = startup_timeout_sec
         _tool_timeout_sec: ClassVar[float | None] = tool_timeout_sec
+        # Session-scoped hung-server cooldown state; the class is created per
+        # discovery, so this is in-memory per session and never persisted.
+        _breaker: ClassVar[MCPServerCircuitBreaker] = MCPServerCircuitBreaker()
 
         @classmethod
         def get_name(cls) -> str:
@@ -300,7 +505,9 @@ def create_mcp_http_proxy_tool_class(
 
         @classmethod
         def get_parameters(cls) -> dict[str, Any]:
-            return dict(cls._input_schema)
+            return _presentation_schema(
+                cls._input_schema, f"MCP server {computed_alias}"
+            )
 
         async def run(
             self, args: _OpenArgs, ctx: InvokeContext | None = None
@@ -314,7 +521,12 @@ def create_mcp_http_proxy_tool_class(
             except Exception as exc:
                 if isinstance(exc, ToolError):
                     raise
-                raise ToolError(f"MCP call failed: {exc}") from exc
+                raise ToolError(
+                    "MCP call failed: "
+                    + frame_untrusted_content(
+                        str(exc), f"MCP server {self._server_name} error"
+                    )
+                ) from exc
 
         @classmethod
         async def _call_authorized(cls, payload: dict[str, Any]) -> MCPToolResult:
@@ -371,15 +583,25 @@ def create_mcp_http_proxy_tool_class(
         async def _call_remote(
             cls, payload: dict[str, Any], *, headers: dict[str, str] | None = None
         ) -> MCPToolResult:
-            return await call_tool_http(
-                cls._mcp_url,
-                cls._remote_name,
-                payload,
-                headers=headers if headers is not None else cls._headers,
-                auth=cls._auth,
-                startup_timeout_sec=cls._startup_timeout_sec,
-                tool_timeout_sec=cls._tool_timeout_sec,
-            )
+            admission = cls._breaker.admission(cls._server_name)
+            try:
+                result = await call_tool_http(
+                    cls._mcp_url,
+                    cls._remote_name,
+                    payload,
+                    headers=headers if headers is not None else cls._headers,
+                    auth=cls._auth,
+                    startup_timeout_sec=cls._startup_timeout_sec,
+                    tool_timeout_sec=cls._tool_timeout_sec,
+                )
+            except BaseException as exc:
+                if _is_call_timeout(exc):
+                    cls._breaker.record_timeout(admission)
+                else:
+                    cls._breaker.record_probe_incomplete(admission)
+                raise
+            cls._breaker.record_success(admission)
+            return result
 
         @classmethod
         def get_result_display(cls, event: ToolResultEvent) -> ToolResultDisplay:
@@ -435,12 +657,27 @@ def is_authorization_rejection(exc: BaseException) -> bool:
     return isinstance(exc, OAuthFlowError)
 
 
+def _stdio_environment(env: dict[str, str] | None) -> dict[str, str]:
+    """Resolve the explicit environment for an MCP stdio child process.
+
+    The MCP SDK substitutes a small safe default for an unset env rather than
+    inheriting ``os.environ``; resolving it here pins that behavior and applies
+    chartreux's credential scrubbing to the inherited portion. Explicit
+    per-server ``env`` entries are merged last, so they act as passthrough for
+    that server.
+    """
+    get_default_environment = _mcp_sdk_attribute("get_default_environment")
+    return {**scrub_child_env(get_default_environment()), **(env or {})}
+
+
 def build_stdio_params(
     command: list[str], *, env: dict[str, str] | None = None, cwd: str | None = None
 ) -> StdioServerParameters:
     StdioServerParameters = _mcp_sdk_attribute("StdioServerParameters")
 
-    return StdioServerParameters(command=command[0], args=command[1:], env=env, cwd=cwd)
+    return StdioServerParameters(
+        command=command[0], args=command[1:], env=_stdio_environment(env), cwd=cwd
+    )
 
 
 async def enter_stdio_session(
@@ -531,9 +768,10 @@ def create_mcp_stdio_proxy_tool_class(
     class MCPStdioProxyTool(MCPTool):
         description: ClassVar[str] = (
             (f"[{computed_alias}] " if computed_alias else "")
-            + (
+            + _mcp_description(
                 remote.description
-                or f"MCP tool '{remote.name}' from stdio command: {' '.join(command)}"
+                or f"MCP tool '{remote.name}' from stdio command: {' '.join(command)}",
+                f"MCP server {computed_alias}",
             )
             + (f"\nHint: {server_hint}" if server_hint else "")
         )
@@ -545,6 +783,9 @@ def create_mcp_stdio_proxy_tool_class(
         _cwd: ClassVar[str | None] = cwd
         _startup_timeout_sec: ClassVar[float | None] = startup_timeout_sec
         _tool_timeout_sec: ClassVar[float | None] = tool_timeout_sec
+        # Session-scoped hung-server cooldown for the no-pool one-shot fallback;
+        # pooled calls carry their own breaker on the pool (keyed per server).
+        _breaker: ClassVar[MCPServerCircuitBreaker] = MCPServerCircuitBreaker()
 
         @classmethod
         def get_name(cls) -> str:
@@ -552,7 +793,9 @@ def create_mcp_stdio_proxy_tool_class(
 
         @classmethod
         def get_parameters(cls) -> dict[str, Any]:
-            return dict(cls._input_schema)
+            return _presentation_schema(
+                cls._input_schema, f"MCP server {computed_alias}"
+            )
 
         async def run(
             self, args: _OpenArgs, ctx: InvokeContext | None = None
@@ -572,17 +815,32 @@ def create_mcp_stdio_proxy_tool_class(
                         tool_timeout_sec=self._tool_timeout_sec,
                     )
                     return
-                yield await call_tool_stdio(
-                    self._stdio_command,
-                    self._remote_name,
-                    payload,
-                    env=self._env,
-                    cwd=self._cwd,
-                    startup_timeout_sec=self._startup_timeout_sec,
-                    tool_timeout_sec=self._tool_timeout_sec,
-                )
+                admission = self._breaker.admission(self._server_name)
+                try:
+                    result = await call_tool_stdio(
+                        self._stdio_command,
+                        self._remote_name,
+                        payload,
+                        env=self._env,
+                        cwd=self._cwd,
+                        startup_timeout_sec=self._startup_timeout_sec,
+                        tool_timeout_sec=self._tool_timeout_sec,
+                    )
+                except BaseException as exc:
+                    if _is_call_timeout(exc):
+                        self._breaker.record_timeout(admission)
+                    else:
+                        self._breaker.record_probe_incomplete(admission)
+                    raise
+                self._breaker.record_success(admission)
+                yield result
             except Exception as exc:
-                raise ToolError(f"MCP stdio call failed: {exc!r}") from exc
+                raise ToolError(
+                    "MCP stdio call failed: "
+                    + frame_untrusted_content(
+                        str(exc), f"MCP server {self._server_name} error"
+                    )
+                ) from exc
 
         @classmethod
         def get_result_display(cls, event: ToolResultEvent) -> ToolResultDisplay:

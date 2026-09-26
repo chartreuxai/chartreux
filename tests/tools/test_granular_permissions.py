@@ -31,7 +31,7 @@ from chartreux.core.tools.builtins.write_file import (
     WriteFileArgs,
     WriteFileConfig,
 )
-from chartreux.core.tools.permissions import PermissionContext, PermissionScope
+from chartreux.core.tools.permissions import PermissionContext
 from chartreux.core.tools.utils import (
     DEFAULT_SENSITIVE_PATTERNS,
     matches_sensitive_pattern,
@@ -71,7 +71,6 @@ class TestBashGranularPermissions:
         result = bash.resolve_permission(BashArgs(command="python script.py"))
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ALWAYS
-        assert not result.required_permissions
 
     @pytest.mark.parametrize(
         "command",
@@ -94,14 +93,12 @@ class TestBashGranularPermissions:
         result = bash.resolve_permission(BashArgs(command="npm install"))
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ALWAYS
-        assert not result.required_permissions
 
     def test_arity_based_command_executes_without_approval_requirements(self):
         bash = self._bash()
         result = bash.resolve_permission(BashArgs(command="docker compose up -d"))
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ALWAYS
-        assert not result.required_permissions
 
     def test_multiple_commands_execute_without_approval_requirements(self):
         bash = self._bash()
@@ -110,7 +107,6 @@ class TestBashGranularPermissions:
         )
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ALWAYS
-        assert not result.required_permissions
 
     def test_cd_outside_path_is_denied_by_path_guard(self):
         bash = self._bash()
@@ -211,7 +207,6 @@ class TestBashGranularPermissions:
         )
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ALWAYS
-        assert not result.required_permissions
 
     def test_empty_command_returns_automatic_execution_context(self):
         bash = self._bash()
@@ -299,7 +294,6 @@ class TestReadGranularPermissions:
         result = tool.resolve_permission(ReadFileArgs(file_path=".env"))
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.NEVER
-        assert not result.required_permissions
 
     def test_sensitive_case_insensitive_and_variants_are_denied(self):
         tool = self._read()
@@ -443,7 +437,6 @@ class TestGuardRequirements:
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.NEVER
         assert result.reason
-        assert not result.required_permissions
 
     @pytest.mark.parametrize(
         "command", ["python script.py", "printf fixture", "cat fixture.txt"]
@@ -453,7 +446,6 @@ class TestGuardRequirements:
         result = bash.resolve_permission(BashArgs(command=command))
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ALWAYS
-        assert not result.required_permissions
 
     @pytest.mark.parametrize("path", [".env", ".env.production"])
     def test_sensitive_file_guard_denies_without_reusable_scope(self, path):
@@ -466,83 +458,19 @@ class TestGuardRequirements:
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.NEVER
         assert result.reason
-        assert not result.required_permissions
 
 
 class TestWebFetchPermissions:
     def _make_webfetch(self) -> WebFetch:
         return WebFetch(config_getter=lambda: WebFetchConfig(), state=BaseToolState())
 
-    def test_returns_url_pattern_with_domain(self):
+    def test_ask_returns_ask(self):
         wf = self._make_webfetch()
         result = wf.resolve_permission(
             WebFetchArgs(url="https://docs.python.org/3/library")
         )
         assert isinstance(result, PermissionContext)
-        assert len(result.required_permissions) == 1
-        rp = result.required_permissions[0]
-        assert rp.scope is PermissionScope.URL_PATTERN
-        assert rp.invocation_pattern == "docs.python.org"
-        assert rp.session_pattern == "docs.python.org"
-        assert "docs.python.org" in rp.label
-
-    def test_http_url(self):
-        wf = self._make_webfetch()
-        result = wf.resolve_permission(WebFetchArgs(url="http://example.com/page"))
-        assert isinstance(result, PermissionContext)
-        rp = result.required_permissions[0]
-        assert rp.invocation_pattern == "example.com"
-
-    def test_url_without_scheme(self):
-        wf = self._make_webfetch()
-        result = wf.resolve_permission(WebFetchArgs(url="github.com/anthropics"))
-        assert isinstance(result, PermissionContext)
-        rp = result.required_permissions[0]
-        assert rp.invocation_pattern == "github.com"
-
-    def test_url_with_port(self):
-        wf = self._make_webfetch()
-        result = wf.resolve_permission(WebFetchArgs(url="http://localhost:8080/api"))
-        assert isinstance(result, PermissionContext)
-        rp = result.required_permissions[0]
-        assert rp.invocation_pattern == "localhost:8080"
-
-    def test_url_without_scheme_with_port(self):
-        wf = self._make_webfetch()
-        result = wf.resolve_permission(WebFetchArgs(url="example.com:3000/path"))
-        assert isinstance(result, PermissionContext)
-        rp = result.required_permissions[0]
-        assert rp.invocation_pattern == "example.com:3000"
-
-    def test_different_domains_require_distinct_url_patterns(self):
-        wf = self._make_webfetch()
-        docs = wf.resolve_permission(
-            WebFetchArgs(url="https://docs.python.org/3/library")
-        )
-        evil = wf.resolve_permission(WebFetchArgs(url="https://evil.com"))
-        assert isinstance(docs, PermissionContext)
-        assert isinstance(evil, PermissionContext)
-        assert docs.required_permissions[0].session_pattern == "docs.python.org"
-        assert evil.required_permissions[0].session_pattern == "evil.com"
-        assert docs.required_permissions[0].session_pattern != (
-            evil.required_permissions[0].session_pattern
-        )
-
-    def test_same_domain_reports_the_same_url_pattern(self):
-        wf = self._make_webfetch()
-        first = wf.resolve_permission(WebFetchArgs(url="https://docs.python.org/one"))
-        second = wf.resolve_permission(WebFetchArgs(url="https://docs.python.org/two"))
-        assert isinstance(first, PermissionContext)
-        assert isinstance(second, PermissionContext)
-        assert first.required_permissions[0].session_pattern == "docs.python.org"
-        assert second.required_permissions[0].session_pattern == "docs.python.org"
-
-    def test_double_slash_url(self):
-        wf = self._make_webfetch()
-        result = wf.resolve_permission(WebFetchArgs(url="//cdn.example.com/lib.js"))
-        assert isinstance(result, PermissionContext)
-        rp = result.required_permissions[0]
-        assert rp.invocation_pattern == "cdn.example.com"
+        assert result.permission is ToolPermission.ASK
 
     def test_config_permission_always_honored(self):
         wf = WebFetch(
@@ -561,15 +489,6 @@ class TestWebFetchPermissions:
         result = wf.resolve_permission(WebFetchArgs(url="https://example.com"))
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.NEVER
-
-    def test_config_permission_ask_falls_through_to_domain(self):
-        wf = WebFetch(
-            config_getter=lambda: WebFetchConfig(permission=ToolPermission.ASK),
-            state=BaseToolState(),
-        )
-        result = wf.resolve_permission(WebFetchArgs(url="https://example.com"))
-        assert isinstance(result, PermissionContext)
-        assert result.required_permissions[0].invocation_pattern == "example.com"
 
 
 class TestCollectOutsideDirs:

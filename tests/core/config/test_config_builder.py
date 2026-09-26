@@ -5,7 +5,8 @@ from typing import Annotated, Any
 from pydantic import BeforeValidator, Field, ValidationError
 import pytest
 
-from chartreux.core.config.builder import ConfigBuilder
+from chartreux.core.config.builder import ConfigBuilder, ConfigMergeError
+from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.layer import ConfigLayer, RawConfig
 from chartreux.core.config.models import normalize_model_configs
 from chartreux.core.config.schema import (
@@ -19,7 +20,7 @@ from chartreux.core.config.schema import (
     WithUnionMerge,
 )
 from chartreux.core.config.types import LayerConfigSnapshot
-from chartreux.core.utils.merge import MergeConflictError
+from chartreux.core.utils.merge import MergeConflictError, MergeStrategy
 
 
 class FakeLayer(ConfigLayer[RawConfig]):
@@ -415,3 +416,84 @@ async def test_replace_none_means_absent_so_base_wins() -> None:
     config = await builder.build()
     # None is treated as "not provided" by MergeStrategy, so base wins
     assert config.value == "hello"
+
+
+# --- ConfigMergeError guidance ---
+
+
+class MCPServersSchema(ConfigSchema):
+    mcp_servers: Annotated[list[dict[str, Any]], WithReplaceMerge()] = Field(
+        default_factory=list
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_servers_table_raises_actionable_error() -> None:
+    builder = ConfigBuilder(MCPServersSchema)
+    builder.add_layer(
+        FakeLayer(
+            # TOML [mcp_servers.myserver] instead of [[mcp_servers]]
+            name="user",
+            data={"mcp_servers": {"myserver": {"command": "run"}}},
+        )
+    )
+    with pytest.raises(
+        ConfigMergeError,
+        match=r"Use \[\[mcp_servers\]\] instead of \[mcp_servers\.<name>\]\.",
+    ):
+        await builder.build()
+
+
+@pytest.mark.asyncio
+async def test_chartreux_schema_mcp_servers_table_raises_actionable_error() -> None:
+    builder = ConfigBuilder(ChartreuxConfigSchema)
+    builder.add_layer(
+        FakeLayer(
+            # TOML [mcp_servers.myserver] instead of [[mcp_servers]]
+            name="user",
+            data={"mcp_servers": {"myserver": {"command": "run"}}},
+        )
+    )
+    # The per-layer validation runs before the merge, so real config.toml
+    # layers must see the actionable spelling there, not a generic type error.
+    with pytest.raises(
+        ValidationError,
+        match=r"Use \[\[mcp_servers\]\] instead of \[mcp_servers\.<name>\]\.",
+    ):
+        await builder.build()
+
+
+class ShapeFragment(ConfigFragment):
+    items: Annotated[list[str], WithConcatMerge()] = Field(default_factory=list)
+    settings: Annotated[dict[str, Any], WithDeepMerge()] = Field(default_factory=dict)
+
+
+class FragmentShapeSchema(ConfigSchema):
+    inner: ShapeFragment = Field(default_factory=ShapeFragment)
+
+
+@pytest.mark.asyncio
+async def test_fragment_concat_field_rejects_a_dict() -> None:
+    builder = ConfigBuilder(FragmentShapeSchema)
+    builder.add_layer(FakeLayer(name="user", data={"inner": {"items": {"a": 1}}}))
+    with pytest.raises(ConfigMergeError, match="inner.items from user must be a list"):
+        await builder.build()
+
+
+@pytest.mark.asyncio
+async def test_fragment_deep_merge_field_rejects_a_list() -> None:
+    builder = ConfigBuilder(FragmentShapeSchema)
+    builder.add_layer(FakeLayer(name="user", data={"inner": {"settings": ["a"]}}))
+    with pytest.raises(
+        ConfigMergeError, match="inner.settings from user must be a dictionary"
+    ):
+        await builder.build()
+
+
+def test_validate_merge_value_tolerates_none_and_empty_dict() -> None:
+    builder = ConfigBuilder(SampleSchema)
+    builder._validate_merge_value("inner.items", "user", MergeStrategy.CONCAT, None)
+    builder._validate_merge_value("inner.items", "user", MergeStrategy.UNION, {})
+    builder._validate_merge_value(
+        "inner.settings", "user", MergeStrategy.DEEP_MERGE, None
+    )

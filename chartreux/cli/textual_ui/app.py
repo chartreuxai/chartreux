@@ -12,6 +12,7 @@ from importlib import import_module
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import time
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -20,7 +21,7 @@ from weakref import WeakKeyDictionary
 import webbrowser
 
 from rich import print as rprint
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, VerticalGroup, VerticalScroll
 from textual.dom import NoScreen
@@ -32,12 +33,6 @@ from textual.widgets import Static
 from textual.worker import Worker, WorkerError, WorkerFailed, WorkerState
 
 from chartreux import __version__ as CORE_VERSION
-from chartreux.app_server import (
-    AppServerConnectionClosed,
-    AppServerHost,
-    AppServerSession,
-    SessionExitSummary,
-)
 from chartreux.app_server.config import THINKING_LEVELS, ConfigView, ThinkingLevel
 from chartreux.app_server.events import (
     AgentsUpdate,
@@ -53,6 +48,7 @@ from chartreux.app_server.events import (
     TurnStarted,
 )
 from chartreux.app_server.models import (
+    COMMITTED_MODEL_RECOVERY_ISSUE_FILE,
     ConfigIssue,
     ImageAttachment,
     PreparedPrompt,
@@ -83,10 +79,10 @@ from chartreux.app_server.protocol import (
     ProtocolError,
     ProtocolErrorCode,
 )
-from chartreux.app_server.session import AppServerTurnError
 from chartreux.cli._process_title import process_id_label
 from chartreux.cli.commands import Command, CommandContext, CommandRegistry
 from chartreux.cli.process_start import PROCESS_START_WALLCLOCK
+from chartreux.cli.textual_ui.external_editor import ExternalEditor
 from chartreux.cli.textual_ui.handlers.event_handler import EventHandler
 from chartreux.cli.textual_ui.mcp_commands import (
     MCP_ADD_HELP,
@@ -122,9 +118,6 @@ from chartreux.cli.textual_ui.widgets.chat_input.input_kinds import (
     SlashCommand,
     classify,
 )
-from chartreux.cli.textual_ui.widgets.chat_input.paste_image import (
-    handle_clipboard_image_paste,
-)
 from chartreux.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
 from chartreux.cli.textual_ui.widgets.collapsible import CollapsibleSection
 from chartreux.cli.textual_ui.widgets.compact import CompactMessage
@@ -132,7 +125,6 @@ from chartreux.cli.textual_ui.widgets.context_progress import (
     ContextProgress,
     TokenState,
 )
-from chartreux.cli.textual_ui.widgets.debug_console import DebugConsole
 from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
 from chartreux.cli.textual_ui.widgets.inline_notice import InlineNotice
 from chartreux.cli.textual_ui.widgets.links import normalize_url
@@ -144,7 +136,6 @@ from chartreux.cli.textual_ui.widgets.loading import (
     LoadingWidget,
     paused_timer,
 )
-from chartreux.cli.textual_ui.widgets.log_level_picker import LogLevelPickerApp
 from chartreux.cli.textual_ui.widgets.messages import (
     AssistantMessage,
     CustomToolsDeprecationMessage,
@@ -160,15 +151,9 @@ from chartreux.cli.textual_ui.widgets.messages import (
     WarningMessage,
     WhatsNewMessage,
 )
-from chartreux.cli.textual_ui.widgets.model_picker import ModelOption, ModelPickerApp
 from chartreux.cli.textual_ui.widgets.path_display import PathDisplay
-from chartreux.cli.textual_ui.widgets.proxy_setup_app import ProxySetupApp
-from chartreux.cli.textual_ui.widgets.question_app import QuestionApp
 from chartreux.cli.textual_ui.widgets.reload_message import ReloadConfigMessage
-from chartreux.cli.textual_ui.widgets.rewind_app import RewindApp
 from chartreux.cli.textual_ui.widgets.rewind_fork_message import RewindForkMessage
-from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
-from chartreux.cli.textual_ui.widgets.thinking_picker import ThinkingPickerApp
 from chartreux.cli.textual_ui.widgets.tool_grouping import (
     ToolGroupExpansionState,
     entry_keeps_tool_group,
@@ -190,7 +175,6 @@ from chartreux.cli.textual_ui.windowing import (
     sync_backfill_state,
 )
 from chartreux.cli.textual_ui.windowing.transcript import TranscriptWindow
-from chartreux.cli.textual_ui.word_selection import WordSelectScreen
 from chartreux.config_values import FALLBACK_THEME
 from chartreux.observability.logging import (
     get_log_level_chain,
@@ -206,9 +190,7 @@ from chartreux.ui.clipboard import (
 )
 from chartreux.ui.theme import resolve_auto_theme, resolve_theme, resolve_theme_name
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
-from chartreux.ui.widgets.theme_picker import ThemePickerApp, sorted_theme_names
-from chartreux.utils.cache_store import FileSystemCacheStore
-from chartreux.utils.paths import is_dangerous_directory
+from chartreux.utils.paths import get_chartreux_home, is_dangerous_directory
 from chartreux.utils.retry_prompt import build_retry_prompt
 from chartreux.utils.session_id import shorten_session_id
 
@@ -237,10 +219,39 @@ _INTERRUPT_STILL_STOPPING_WARNING = (
     "The turn is still stopping. New turns will wait until it has fully stopped."
 )
 
+# Written by `/config` when the user config file does not exist yet. Every
+# setting is commented out so the file stays empty until the user edits it.
+_CONFIG_FILE_TEMPLATE = """\
+# Chartreux user configuration.
+#
+# Chartreux uses its built-in defaults until you uncomment or add entries here.
+# Configuration is layered, lowest to highest precedence: built-in defaults,
+# this file, a trusted project `.chartreux/config.toml`, `CHARTREUX_`
+# environment variables, the active agent profile, and runtime override.
+#
+# See docs/reference/configuration.md for the full list of settings. Examples:
+#
+# active_model = "@orchestrator"
+# theme = "auto"  # auto, light, or dark
+# log_level = "INFO"  # DEBUG, INFO, WARNING, or ERROR
+# ask_confirmation_on_exit = true
+"""
+
 
 if TYPE_CHECKING:
+    from chartreux.app_server.host import AppServerHost
+    from chartreux.app_server.session import AppServerSession, SessionExitSummary
+    from chartreux.cli.textual_ui.widgets.debug_console import DebugConsole
+    from chartreux.cli.textual_ui.widgets.log_level_picker import LogLevelPickerApp
     from chartreux.cli.textual_ui.widgets.mcp_app import MCPApp
     from chartreux.cli.textual_ui.widgets.mcp_oauth_app import MCPOAuthApp
+    from chartreux.cli.textual_ui.widgets.model_picker import ModelPickerApp
+    from chartreux.cli.textual_ui.widgets.proxy_setup_app import ProxySetupApp
+    from chartreux.cli.textual_ui.widgets.question_app import QuestionApp
+    from chartreux.cli.textual_ui.widgets.rewind_app import RewindApp
+    from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
+    from chartreux.cli.textual_ui.widgets.thinking_picker import ThinkingPickerApp
+    from chartreux.ui.widgets.theme_picker import ThemePickerApp
 
 
 def _get_mcp_app_class() -> type[MCPApp]:
@@ -253,6 +264,54 @@ def _get_mcp_oauth_app_class() -> type[MCPOAuthApp]:
     from chartreux.cli.textual_ui.widgets.mcp_oauth_app import MCPOAuthApp
 
     return MCPOAuthApp
+
+
+def _get_session_picker_app_class() -> type[SessionPickerApp]:
+    from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
+
+    return SessionPickerApp
+
+
+def _get_model_picker_app_class() -> type[ModelPickerApp]:
+    from chartreux.cli.textual_ui.widgets.model_picker import ModelPickerApp
+
+    return ModelPickerApp
+
+
+def _get_thinking_picker_app_class() -> type[ThinkingPickerApp]:
+    from chartreux.cli.textual_ui.widgets.thinking_picker import ThinkingPickerApp
+
+    return ThinkingPickerApp
+
+
+def _get_log_level_picker_app_class() -> type[LogLevelPickerApp]:
+    from chartreux.cli.textual_ui.widgets.log_level_picker import LogLevelPickerApp
+
+    return LogLevelPickerApp
+
+
+def _get_theme_picker_app_class() -> type[ThemePickerApp]:
+    from chartreux.ui.widgets.theme_picker import ThemePickerApp
+
+    return ThemePickerApp
+
+
+def _get_proxy_setup_app_class() -> type[ProxySetupApp]:
+    from chartreux.cli.textual_ui.widgets.proxy_setup_app import ProxySetupApp
+
+    return ProxySetupApp
+
+
+def _get_question_app_class() -> type[QuestionApp]:
+    from chartreux.cli.textual_ui.widgets.question_app import QuestionApp
+
+    return QuestionApp
+
+
+def _get_rewind_app_class() -> type[RewindApp]:
+    from chartreux.cli.textual_ui.widgets.rewind_app import RewindApp
+
+    return RewindApp
 
 
 def _public_entry(event: AppServerEvent) -> PublicHistoryEntry | None:
@@ -573,6 +632,8 @@ type AppServerBootstrap = Callable[[], Awaitable[AppServerHost | AppServerSessio
 def _split_app_server_source(
     source: AppServerSource,
 ) -> tuple[AppServerSession | None, AppServerStarter | None]:
+    from chartreux.app_server.session import AppServerSession
+
     if isinstance(source, AppServerSession):
         return source, None
     return None, source
@@ -997,6 +1058,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._refresh_command_registry()
 
     def get_default_screen(self) -> Screen:
+        from chartreux.cli.textual_ui.word_selection import WordSelectScreen
+
         return WordSelectScreen(id="_default")
 
     def compose(self) -> ComposeResult:
@@ -1727,6 +1790,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
         is actually running and there is a promotable queued block; otherwise
         the queue promotes on its own as usual.
         """
+        from chartreux.app_server import AppServerConnectionClosed
+
         if self._input_in_queue_mode():
             # Empty Enter while selecting/editing a queued item is an edit
             # action, not a steer (Ctrl+Enter already skips queue mode).
@@ -1764,6 +1829,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
     def on_chat_text_area_clipboard_image_pasted(
         self, message: ChatTextArea.ClipboardImagePasted
     ) -> None:
+        from chartreux.cli.textual_ui.widgets.chat_input.paste_image import (
+            handle_clipboard_image_paste,
+        )
+
         self.run_worker(
             handle_clipboard_image_paste(
                 self, notify_when_empty=message.notify_when_empty
@@ -1772,6 +1841,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
         )
 
     async def _paste_clipboard_image_command(self, **_kwargs: Any) -> None:
+        from chartreux.cli.textual_ui.widgets.chat_input.paste_image import (
+            handle_clipboard_image_paste,
+        )
+
         await handle_clipboard_image_paste(self, notify_when_empty=True)
 
     async def _persist_config_changes(
@@ -2011,7 +2084,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 await self._persist_proxy(message.changes)
             except Exception as exc:
                 logger.warning("Proxy settings update was rejected: %s", exc)
-                self.query_one(ProxySetupApp).show_error(str(exc))
+                self.query_one(_get_proxy_setup_app_class()).show_error(str(exc))
                 return
 
         await self._switch_to_input_app()
@@ -2662,6 +2735,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 await worker.wait()
 
     async def _listen_app_server_events(self) -> None:
+        from chartreux.app_server import AppServerConnectionClosed
+
         try:
             async with aclosing(self.app_server.events()) as events:
                 async for event in events:
@@ -2718,6 +2793,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._queue.notify_busy_changed()
 
     async def _complete_unsolicited_turn(self, event: TurnCompleted) -> None:
+        from chartreux.app_server.session import AppServerTurnError
+
         if event.turn.next_turn_id is not None:
             return
         retry_incomplete_stream = False
@@ -2754,6 +2831,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
         user_initiated_retry: bool = False,
         incomplete_stream_retries: int = 0,
     ) -> None:
+        from chartreux.app_server.session import AppServerTurnError
+
         turn_ui_generation = self._turn_ui_generation
         if self._active_turn_start is None:
             self._active_turn_start = self._transcript.admitted_end_index
@@ -2849,6 +2928,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
         )
 
     async def _mount_turn_error(self, error: Exception, message: str) -> None:
+        from chartreux.app_server.session import AppServerTurnError
+
         if (
             self.event_handler is not None
             and isinstance(error, AppServerTurnError)
@@ -2928,6 +3009,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._terminal_notifier.notify(NotificationContext.COMPLETE)
 
     def _resolve_turn_error_message(self, e: Exception) -> str:
+        from chartreux.app_server.session import AppServerTurnError
+
         if not isinstance(e, AppServerTurnError):
             return str(e)
         code = e.error.code
@@ -3486,7 +3569,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self, sessions: list[PublicSession], *, loading: bool = False
     ) -> SessionPickerApp:
         sessions = sorted(sessions, key=lambda s: s.updated_at, reverse=True)
-        return SessionPickerApp(
+        return _get_session_picker_app_class()(
             sessions=sessions,
             latest_messages={
                 session.id: session.title or session.preview for session in sessions
@@ -3659,7 +3742,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return
 
         try:
-            picker = self.query_one(SessionPickerApp)
+            picker = self.query_one(_get_session_picker_app_class())
         except Exception:
             picker = None
 
@@ -3678,7 +3761,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     def _clear_pending_session_delete(self, option_id: str) -> None:
         try:
-            self.query_one(SessionPickerApp).clear_pending_delete(option_id)
+            self.query_one(_get_session_picker_app_class()).clear_pending_delete(
+                option_id
+            )
         except Exception:
             pass
 
@@ -3731,10 +3816,44 @@ class ChartreuxApp(App):  # noqa: PLR0904
             UserCommandMessage(f"Resumed session `{session_id[:8]}`")
         )
         logger.debug("Resume stage=mounted session_id=%s", session_id)
+        await self._surface_committed_model_recovery()
         # Fast resume returns from the resume RPC before MCP init
         # finishes, so defer post-init notices to the background until the
         # resumed runtime settles instead of racing incomplete state here.
         self.run_worker(self._finish_resume_notices(), exclusive=False)
+
+    async def _surface_committed_model_recovery(self) -> None:
+        """Surface a resumed session whose committed model left the catalog.
+
+        The transcript is already loaded; the runtime issue reported by the
+        server routes the user to the model picker so the next turn runs on an
+        explicitly chosen model instead of a silent default.
+
+        The resume has already succeeded at this point, so a failure while
+        surfacing (refresh, notice, or picker) must not abort the mount path:
+        log it and leave the session usable.
+        """
+        try:
+            runtime = self.app_server.resources.runtime
+            # The resume response carries no runtime snapshot, so read one before
+            # inspecting issues; runtime/updated may still be in flight.
+            await runtime.refresh()
+            issue = next(
+                (
+                    issue
+                    for issue in runtime.issues
+                    if issue.file == COMMITTED_MODEL_RECOVERY_ISSUE_FILE
+                ),
+                None,
+            )
+            if issue is None:
+                return
+            await self._mount_and_scroll(
+                ErrorMessage(issue.message, collapsed=self._tools_collapsed)
+            )
+            await self._switch_to_model_picker_app()
+        except Exception:
+            logger.exception("Failed to surface the committed-model recovery notice")
 
     async def _reset_presentation_after_resume(self) -> None:
         """Discard presentation state owned by the previously attached session."""
@@ -3867,6 +3986,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._show_config_issues()
 
     async def _reload_config(self, **kwargs: Any) -> None:
+        from chartreux.app_server import AppServerConnectionClosed
+
         reload_message = ReloadConfigMessage()
         try:
             await self._mount_and_scroll(reload_message)
@@ -3901,6 +4022,92 @@ class ChartreuxApp(App):  # noqa: PLR0904
             raise
         except Exception as e:
             reload_message.set_error(str(e))
+
+    async def _config_command(self, **kwargs: Any) -> None:
+        """Open the user config file in an external editor, then reload on change."""
+        config_path = get_chartreux_home() / "config.toml"
+        try:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            if config_path.parent.resolve(strict=True) != config_path.parent:
+                raise OSError("Config directory changed")
+            directory_fd = os.open(
+                config_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
+            try:
+                opened_parent = os.fstat(directory_fd)
+                current_parent = os.stat(config_path.parent, follow_symlinks=False)
+                if (opened_parent.st_dev, opened_parent.st_ino) != (
+                    current_parent.st_dev,
+                    current_parent.st_ino,
+                ):
+                    raise OSError("Config directory changed")
+                try:
+                    fd = os.open(
+                        config_path.name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                except FileExistsError:
+                    pass  # Another writer (or an existing user file) wins.
+                else:
+                    with os.fdopen(fd, "w", encoding="utf-8") as config_file:
+                        config_file.write(_CONFIG_FILE_TEMPLATE)
+            finally:
+                os.close(directory_fd)
+            if config_path.is_symlink():
+                raise OSError("Config file is a symbolic link")
+            before = config_path.read_text("utf-8")
+            with self.suspend():
+                ExternalEditor.edit_file(config_path, check=True)
+            changed = config_path.read_text("utf-8") != before
+        except SuspendNotSupported:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Terminal does not support suspending to an editor",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+        except subprocess.CalledProcessError as exc:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Editor exited with an error (code {exc.returncode}): "
+                    f"`{config_path}`",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+        except UnicodeDecodeError:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Config file is not valid UTF-8: `{config_path}`",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+        except ValueError:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Invalid editor command: check the quotes in $VISUAL or $EDITOR",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+        except OSError:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Could not open or read config file: `{config_path}`",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+        if changed:
+            await self._reload_config()
+        else:
+            await self._mount_and_scroll(
+                UserCommandMessage(f"Config file unchanged: `{config_path}`")
+            )
 
     async def _reset_message_widgets(self) -> None:
         """Tear down the on-screen conversation widgets and UI state.
@@ -4062,6 +4269,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 self.event_handler.current_compact = None
 
     def _get_session_exit_summary(self) -> SessionExitSummary:
+        from chartreux.app_server.session import SessionExitSummary
+
         if self._mount_first and self._app_server is None:
             return SessionExitSummary(session_id=None, usage=TokenUsage())
         return self.app_server.exit_summary()
@@ -4148,12 +4357,14 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if self._current_bottom_app == BottomApp.ModelPicker:
             return
 
+        from chartreux.cli.textual_ui.widgets.model_picker import ModelOption
+
         models = [
             ModelOption(alias=model.alias, display_name=model.display_name)
             for model in self.config.models
         ]
         await self._switch_from_input(
-            ModelPickerApp(
+            _get_model_picker_app_class()(
                 models=models,
                 current_model=self.config.active_model.alias,
                 is_pinned=self.config.active_model_pinned,
@@ -4166,7 +4377,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return
 
         await self._switch_from_input(
-            ThinkingPickerApp(
+            _get_thinking_picker_app_class()(
                 thinking_levels=THINKING_LEVELS,
                 current_thinking=self.config.active_model.thinking,
             )
@@ -4175,14 +4386,18 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def _switch_to_log_level_picker_app(self) -> None:
         if self._current_bottom_app == BottomApp.LogLevelPicker:
             return
-        await self._switch_from_input(LogLevelPickerApp(chain=get_log_level_chain()))
+        await self._switch_from_input(
+            _get_log_level_picker_app_class()(chain=get_log_level_chain())
+        )
 
     async def _switch_to_theme_picker_app(self) -> None:
         if self._current_bottom_app == BottomApp.ThemePicker:
             return
 
+        from chartreux.ui.widgets.theme_picker import sorted_theme_names
+
         await self._switch_from_input(
-            ThemePickerApp(
+            _get_theme_picker_app_class()(
                 theme_names=sorted_theme_names(), current_theme=self.config.theme
             )
         )
@@ -4213,10 +4428,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
             return
         await self._mount_and_scroll(UserCommandMessage("Proxy setup opened..."))
-        await self._switch_from_input(ProxySetupApp(settings))
+        await self._switch_from_input(_get_proxy_setup_app_class()(settings))
 
     async def _switch_to_question_app(self, args: UserQuestionRequest) -> None:
-        await self._switch_from_input(QuestionApp(args=args), scroll=True)
+        await self._switch_from_input(_get_question_app_class()(args=args), scroll=True)
 
     async def _switch_to_input_app(self) -> None:
         if self._chat_input_container:
@@ -4238,16 +4453,16 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     def _focus_current_bottom_app(self) -> None:
         focus_widget_by_app: dict[BottomApp, type[Widget]] = {
-            BottomApp.LogLevelPicker: LogLevelPickerApp,
-            BottomApp.ModelPicker: ModelPickerApp,
-            BottomApp.ThemePicker: ThemePickerApp,
-            BottomApp.ThinkingPicker: ThinkingPickerApp,
-            BottomApp.ProxySetup: ProxySetupApp,
-            BottomApp.Question: QuestionApp,
-            BottomApp.SessionPicker: SessionPickerApp,
+            BottomApp.LogLevelPicker: _get_log_level_picker_app_class(),
+            BottomApp.ModelPicker: _get_model_picker_app_class(),
+            BottomApp.ThemePicker: _get_theme_picker_app_class(),
+            BottomApp.ThinkingPicker: _get_thinking_picker_app_class(),
+            BottomApp.ProxySetup: _get_proxy_setup_app_class(),
+            BottomApp.Question: _get_question_app_class(),
+            BottomApp.SessionPicker: _get_session_picker_app_class(),
             BottomApp.MCP: _get_mcp_app_class(),
             BottomApp.MCPOAuth: _get_mcp_oauth_app_class(),
-            BottomApp.Rewind: RewindApp,
+            BottomApp.Rewind: _get_rewind_app_class(),
         }
         try:
             if self._current_bottom_app == BottomApp.Input:
@@ -4259,7 +4474,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     def _handle_question_app_escape(self) -> None:
         try:
-            question_app = self.query_one(QuestionApp)
+            question_app = self.query_one(_get_question_app_class())
             if not question_app.is_within_grace_period():
                 question_app.action_cancel()
         except Exception:
@@ -4268,7 +4483,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     def _handle_log_level_picker_app_escape(self) -> None:
         try:
-            log_level_picker = self.query_one(LogLevelPickerApp)
+            log_level_picker = self.query_one(_get_log_level_picker_app_class())
             log_level_picker.action_apply()
         except Exception:
             pass
@@ -4276,17 +4491,19 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     def _handle_model_picker_app_escape(self) -> None:
         try:
-            model_picker = self.query_one(ModelPickerApp)
-            model_picker.post_message(ModelPickerApp.Cancelled())
+            model_picker = self.query_one(_get_model_picker_app_class())
+            model_picker.post_message(_get_model_picker_app_class().Cancelled())
         except Exception:
             pass
         self._last_escape_time = None
 
     def _handle_theme_picker_app_escape(self) -> None:
         try:
-            theme_picker = self.query_one(ThemePickerApp)
+            theme_picker = self.query_one(_get_theme_picker_app_class())
             theme_picker.post_message(
-                ThemePickerApp.Cancelled(original_theme=self.config.theme)
+                _get_theme_picker_app_class().Cancelled(
+                    original_theme=self.config.theme
+                )
             )
         except Exception:
             pass
@@ -4294,15 +4511,15 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     def _handle_thinking_picker_app_escape(self) -> None:
         try:
-            thinking_picker = self.query_one(ThinkingPickerApp)
-            thinking_picker.post_message(ThinkingPickerApp.Cancelled())
+            thinking_picker = self.query_one(_get_thinking_picker_app_class())
+            thinking_picker.post_message(_get_thinking_picker_app_class().Cancelled())
         except Exception:
             pass
         self._last_escape_time = None
 
     def _handle_session_picker_app_escape(self) -> None:
         try:
-            session_picker = self.query_one(SessionPickerApp)
+            session_picker = self.query_one(_get_session_picker_app_class())
             session_picker.action_cancel()
         except Exception:
             pass
@@ -4432,7 +4649,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if self._current_bottom_app == BottomApp.Rewind:
             # Reuse existing widget if the option set hasn't changed
             try:
-                existing = self.query_one(RewindApp)
+                existing = self.query_one(_get_rewind_app_class())
                 if existing.has_file_changes == has_file_changes:
                     existing.update_preview(message_preview)
                     return
@@ -4440,7 +4657,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             except Exception:
                 pass
 
-            rewind_app = RewindApp(
+            rewind_app = _get_rewind_app_class()(
                 message_preview=message_preview, has_file_changes=has_file_changes
             )
             bottom_container = self.query_one("#bottom-app-container")
@@ -4448,7 +4665,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             await bottom_container.mount(rewind_app)
             self.call_after_refresh(rewind_app.focus)
         else:
-            rewind_app = RewindApp(
+            rewind_app = _get_rewind_app_class()(
                 message_preview=message_preview, has_file_changes=has_file_changes
             )
             await self._switch_from_input(rewind_app)
@@ -4466,7 +4683,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     def _handle_rewind_app_escape(self) -> None:
         try:
-            rewind_app = self.query_one(RewindApp)
+            rewind_app = self.query_one(_get_rewind_app_class())
         except Exception:
             rewind_app = None
         if rewind_app is not None and rewind_app.go_back():
@@ -4618,7 +4835,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 _get_mcp_oauth_app_class()
             ),
             BottomApp.ProxySetup: lambda: self._handle_bottom_app_close_escape(
-                ProxySetupApp
+                _get_proxy_setup_app_class()
             ),
             BottomApp.Question: self._handle_question_app_escape,
             BottomApp.LogLevelPicker: self._handle_log_level_picker_app_escape,
@@ -4838,6 +5055,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
         )
 
     async def _should_show_greeting(self) -> bool:
+        from chartreux.utils.cache_store import FileSystemCacheStore
+
         if self._whats_new_message:
             return False
         if not self.config.show_greeting:
@@ -4855,6 +5074,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     async def _mark_greeting_shown(self) -> None:
         """Mark that greeting was shown with current timestamp."""
+        from chartreux.utils.cache_store import FileSystemCacheStore
+
         try:
             cache = FileSystemCacheStore()
             await asyncio.to_thread(
@@ -4959,6 +5180,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
             await self._debug_console.remove()
             self._debug_console = None
         else:
+            from chartreux.cli.textual_ui.widgets.debug_console import DebugConsole
+
             self._debug_console = DebugConsole(
                 log_source=self.app_server.resources.runtime
             )
@@ -5081,6 +5304,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
             await self._mount_and_scroll(WarningMessage(warning, show_border=False))
 
     async def _show_untrusted_config_warning(self) -> None:
+        from chartreux.utils.cache_store import FileSystemCacheStore
+
         try:
             response = await self.app_server.resources.workspace.untrusted_config_dirs()
             if not response.dirs:
@@ -5333,6 +5558,8 @@ def run_textual_ui(
     resolve_auto_theme()
 
     async def run() -> SessionExitSummary | None:
+        from chartreux.app_server.host import AppServerHost
+
         app_server = await start_app_server()
         effective_startup = startup or StartupOptions()
         if isinstance(app_server, AppServerHost):

@@ -21,7 +21,7 @@ from chartreux.core.tools.builtins.write_file import (
     WriteFileArgs,
     WriteFileConfig,
 )
-from chartreux.core.tools.permissions import PermissionContext, PermissionScope
+from chartreux.core.tools.permissions import PermissionContext
 
 
 @pytest.fixture
@@ -69,7 +69,6 @@ class TestFileToolScratchpadPermissions:
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.NEVER
         assert result.reason
-        assert not result.required_permissions
 
     def test_non_scratchpad_outside_dir_denied(self):
         tool = WriteFile(config_getter=lambda: WriteFileConfig(), state=BaseToolState())
@@ -79,7 +78,6 @@ class TestFileToolScratchpadPermissions:
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.NEVER
         assert result.reason
-        assert not result.required_permissions
 
 
 class TestBashScratchpadPermissions:
@@ -93,7 +91,7 @@ class TestBashScratchpadPermissions:
         dirs = _collect_outside_dirs(["cat /etc/hosts"])
         assert len(dirs) >= 1
 
-    def test_bash_scratchpad_mkdir_no_outside_dir_permission(self, scratchpad):
+    def test_bash_scratchpad_mkdir_allowed_within_scratchpad(self, scratchpad):
         bash = Bash(
             config_getter=lambda: BashToolConfig(),
             state=BaseToolState(),
@@ -101,9 +99,4 @@ class TestBashScratchpadPermissions:
         )
         result = bash.resolve_permission(BashArgs(command=f"mkdir {scratchpad}/subdir"))
         assert isinstance(result, PermissionContext)
-        outside = [
-            rp
-            for rp in result.required_permissions
-            if rp.scope is PermissionScope.OUTSIDE_DIRECTORY
-        ]
-        assert len(outside) == 0
+        assert result.permission is ToolPermission.ALWAYS

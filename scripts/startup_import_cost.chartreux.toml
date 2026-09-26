@@ -11,4 +11,4 @@ budget = 68
 [[commands]]
 label = "from chartreux.cli.textual_ui.app import ChartreuxApp"
 code = "from chartreux.cli.textual_ui.app import ChartreuxApp"
-budget = 791
+budget = 700

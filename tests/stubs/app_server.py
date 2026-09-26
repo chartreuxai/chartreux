@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from chartreux.app_server.server import AppServer
 from chartreux.app_server.session import AppServerSession
 from chartreux.app_server.transport import JsonRpcTransport, memory_transport_pair
 from chartreux.core.agent_loop import AgentLoop
+from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.events import BaseEvent, ToolCallEvent, ToolResultEvent
 from chartreux.core.tools.ui import ToolUIDataAdapter
@@ -157,12 +159,35 @@ def build_test_app_server(
                 agent_loop, Path(request.options.cwd or agent_loop.cwd)
             )
         if session_id is not None:
+            # Match production open_root, which resumes through
+            # resume_blueprint: an unusable persisted committed model fails
+            # fast instead of recovering. Only the root-session resume RPC
+            # keeps the recovery flow.
+            await require_resumable_committed_model(agent_loop.config, session_id)
             await runtime_factory.resume_root(agent_loop, session_id)
         return agent_loop
 
     return create_legacy_app_server(
         transport, open_root=open_root, runtime_factory=runtime_factory
     )
+
+
+async def require_resumable_committed_model(
+    config: ChartreuxConfigSchema, session_id: str
+) -> None:
+    """Fail fast when a stored session's committed model is unusable.
+
+    Production initial-open resume enforces this inside resume_blueprint;
+    this stub reuses the recovery-capable resume_root for the rebind, so it
+    applies the same fail-fast check up front.
+    """
+    from chartreux.app_server._runtime import _load_session, _resume_identity
+    from chartreux.core.session_types import SessionMetadata
+
+    _session_path, _messages, metadata = await asyncio.to_thread(
+        _load_session, config, session_id
+    )
+    _resume_identity(config, SessionMetadata.model_validate(metadata), fail_fast=True)
 
 
 def legacy_backend(server: AppServer) -> SessionBackendImpl:

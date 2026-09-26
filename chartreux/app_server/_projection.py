@@ -18,6 +18,7 @@ from chartreux.app_server._utils import now_ms
 from chartreux.app_server._worktree_effects import WorktreeEffect
 from chartreux.app_server.config import ConfigView, ModelConfigView
 from chartreux.app_server.models import (
+    COMMITTED_MODEL_RECOVERY_ISSUE_FILE,
     AgentStatsSnapshot,
     AgentSummary,
     CancelledEffectState,
@@ -61,7 +62,11 @@ from chartreux.core.llm_models import (
 )
 from chartreux.core.log_reader import PaginatedLogs
 from chartreux.core.model_catalog.resolver import ModelResolutionError
-from chartreux.core.session_types import SessionMetadata, WorktreeContext
+from chartreux.core.session_types import (
+    LaunchMetadataV2,
+    SessionMetadata,
+    WorktreeContext,
+)
 from chartreux.core.skills.models import SkillInfo, SkillSource
 from chartreux.core.tools.base import ToolPermission
 from chartreux.core.tools.builtins.web_search import (
@@ -304,11 +309,39 @@ def project_session_log(agent_loop: AgentLoop) -> SessionLogSummary:
     )
 
 
+def committed_model_recovery_issue(agent_loop: AgentLoop) -> ConfigIssue | None:
+    """A session resumed after its committed deployment left the catalog.
+
+    The resume deliberately loads the transcript without the unresolvable
+    committed identity, so the pending state is derivable: the stored launch
+    envelope still commits a model while the loop no longer carries one. The
+    issue clears once a newly chosen model is committed by the next turn.
+    """
+    metadata = agent_loop.session_logger.session_metadata
+    envelope = metadata.launch_config if metadata is not None else None
+    if (
+        not isinstance(envelope, LaunchMetadataV2)
+        or agent_loop.committed_model is not None
+    ):
+        return None
+    identity = envelope.committed_model
+    return ConfigIssue(
+        file=COMMITTED_MODEL_RECOVERY_ISSUE_FILE,
+        message=(
+            f"The model committed to this session ({identity.provider}/"
+            f"{identity.wire_name}) is no longer available. Pick a model to "
+            "continue this session."
+        ),
+    )
+
+
 def project_diagnostics(agent_loop: AgentLoop) -> tuple[list[ConfigIssue], int]:
     issues = [
         *(_project_issue(issue) for issue in agent_loop.hook_config_issues),
         *(_project_issue(issue) for issue in agent_loop.skill_manager.config_issues),
     ]
+    if (recovery := committed_model_recovery_issue(agent_loop)) is not None:
+        issues.append(recovery)
     return issues, agent_loop.hooks_count
 
 
