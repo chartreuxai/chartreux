@@ -2,6 +2,8 @@
 
 Chartreux is an oppinionated independent fork of [Mistral Vibe](https://github.com/mistralai/mistral-vibe).
 
+Chartreux is pre-release alpha software with no stability guarantees; breaking changes may occur without migration paths.
+
 ```
   ▄▄                ▄▄
   ███▄▄▄        ▄▄▄███

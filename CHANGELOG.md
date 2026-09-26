@@ -2,7 +2,7 @@
 
 All notable changes to Chartreux are documented in this file.
 
-## 0.1.1 (unreleased)
+## 0.2.0 (2026-09-25)
 
 Initial pre-release of Chartreux. This is the first Chartreux release, forked from
 [Mistral Vibe](https://github.com/mistralai/mistral-vibe) v2.25.5; the changes
