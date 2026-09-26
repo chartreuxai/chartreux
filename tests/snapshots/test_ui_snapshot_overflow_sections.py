@@ -9,7 +9,6 @@ from textual.widget import Widget
 from textual.worker import WorkerState
 
 from chartreux.cli.textual_ui.handlers.event_handler import EventHandler
-from chartreux.cli.textual_ui.widgets.messages import BashOutputMessage
 from chartreux.cli.textual_ui.widgets.tool_widgets import EditResultWidget
 from chartreux.core.events import ToolCallEvent, ToolResultEvent
 from chartreux.core.tools.builtins.edit import Edit, EditArgs, EditResult
@@ -52,18 +51,6 @@ class _SnapshotApp(App):
 
     async def populate(self) -> None:
         raise NotImplementedError
-
-
-class BashOverflowApp(_SnapshotApp):
-    async def populate(self) -> None:
-        if self._scroll is None:
-            return
-        # 24 lines: a 20-line preview above, with the 4-line overflow folded under
-        # the classic "+4 lines" / "show less" toggle beneath it.
-        output = "\n".join(f"output line {i}" for i in range(1, 25))
-        await self._scroll.mount(
-            BashOutputMessage("ls -la", "/repo", output=output, exit_code=0)
-        )
 
 
 class EditResultApp(_SnapshotApp):
@@ -128,30 +115,9 @@ async def _populated_edit(pilot: Pilot) -> None:
     assert widget._render_worker.state == WorkerState.SUCCESS
 
 
-async def _populated_bash(pilot: Pilot) -> None:
-    app = cast(_SnapshotApp, pilot.app)
-    await app.populate()
-    await pilot.pause(0.3)
-
-
-async def _collapsed_ansi(pilot: Pilot) -> None:
-    pilot.app.theme = "ansi-dark"
-    await _populated_bash(pilot)
-
-
 def test_snapshot_edit_result(snap_compare: SnapCompare) -> None:
     assert snap_compare(
         "test_ui_snapshot_overflow_sections.py:EditResultApp",
         terminal_size=(80, 16),
         run_before=_populated_edit,
-    )
-
-
-def test_snapshot_bash_overflow_collapsed_ansi(snap_compare: SnapCompare) -> None:
-    # Regression guard: the muted overflow arrow must stay dimmed under an ANSI
-    # theme (it lost its `&:ansi { text-style: dim }` once already).
-    assert snap_compare(
-        "test_ui_snapshot_overflow_sections.py:BashOverflowApp",
-        terminal_size=(80, 30),
-        run_before=_collapsed_ansi,
     )

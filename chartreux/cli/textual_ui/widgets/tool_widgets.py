@@ -35,6 +35,7 @@ from chartreux.cli.textual_ui.widgets.diff_rendering import (
     render_edit_diff_async,
 )
 from chartreux.cli.textual_ui.widgets.links import LinkStatic, link_content
+from chartreux.cli.textual_ui.widgets.virtual_output import VirtualOutputBody
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.utils.tool_presentation import ToolEffectKind
 
@@ -42,6 +43,8 @@ _LINE_NUMBER_PREFIX = re.compile(r"^ *\d+→")
 _BACKTICK_RUN = re.compile(r"`+")
 _UNSAFE_INFO_STRING = re.compile(r"[^A-Za-z0-9_+\-.]")
 _MAX_INFO_STRING_LEN = 32
+_VIRTUAL_OUTPUT_MIN_LINES = 2000
+_VIRTUAL_OUTPUT_MIN_BYTES = 128 * 1024
 
 # ANSI escape sequences (CSI, OSC, and other ESC-prefixed forms).
 _ANSI_ESCAPE = re.compile(
@@ -184,6 +187,19 @@ def _format_generic_value(value: JsonValue) -> str:
     return str(value)
 
 
+def shell_output_is_large(cleaned: str) -> bool:
+    return (
+        cleaned.count("\n") + 1 >= _VIRTUAL_OUTPUT_MIN_LINES
+        or len(cleaned.encode("utf-8")) >= _VIRTUAL_OUTPUT_MIN_BYTES
+    )
+
+
+def shell_output_body(cleaned: str) -> Widget:
+    if shell_output_is_large(cleaned):
+        return VirtualOutputBody(cleaned)
+    return NoMarkupStatic(cleaned, classes="tool-result-detail")
+
+
 class BashResultWidget(ToolResultWidget[ShellOutput]):
     def _collapsed_output(self) -> str:
         return self.result.transcript.strip("\n") if self.result else ""
@@ -193,7 +209,10 @@ class BashResultWidget(ToolResultWidget[ShellOutput]):
             yield from self._footer()
             return
         output = self._collapsed_output()
-        if output:
+        cleaned = clean_output(self.result.transcript)
+        if shell_output_is_large(cleaned) and output:
+            yield shell_output_body(cleaned)
+        elif output:
             yield from self._yield_text(output)
         else:
             yield NoMarkupStatic("(no content)", classes="tool-result-detail")

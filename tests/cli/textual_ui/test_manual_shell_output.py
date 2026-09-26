@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
@@ -21,6 +23,7 @@ from chartreux.app_server.models import (
 from chartreux.app_server.protocol import ShellRunResponse
 from chartreux.cli.textual_ui.widgets.collapsible import CollapsibleSection
 from chartreux.cli.textual_ui.widgets.tools import ToolResultMessage
+from chartreux.cli.textual_ui.widgets.virtual_output import VirtualOutputText
 from chartreux.core.llm_models import ManualShellContext
 
 
@@ -156,6 +159,65 @@ async def test_interrupted_manual_shell_retains_available_output() -> None:
     )
 
     assert "before interruption" in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_large_failed_or_cancelled_manual_shell_uses_virtual_body(
+    cancelled: bool,
+) -> None:
+    output = "start\x1b[31m\rfinished\n" + "row\n" * 2000
+    display = EffectResultDisplay(success=False, message="Stopped")
+    state = (
+        CancelledEffectState(reason="interrupted", output_text=output, display=display)
+        if cancelled
+        else FailedEffectState(
+            error={"message": "Stopped"},  # type: ignore[arg-type]
+            output_text=output,
+            display=display,
+        )
+    )
+    app = _ShellResultApp(_entry(state))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        result = app.result
+        assert result is not None
+        for section in result.query(CollapsibleSection):
+            section.set_collapsed(False)
+        await pilot.pause()
+        virtual = result.query_one(VirtualOutputText)
+        assert virtual.content.startswith("finished\nrow")
+        assert "\x1b" not in virtual.content
+        assert virtual.line_count == 2002
+        assert virtual.content.endswith("row\n")
+
+
+@pytest.mark.asyncio
+async def test_collapsed_agent_shell_does_not_build_large_body() -> None:
+    entry = _entry(
+        CompletedEffectState(
+            output={"stdout": "row\n" * 2000, "stderr": "", "output": "row\n" * 2000},
+            display=EffectResultDisplay(success=True, message="Ran command"),
+        )
+    )
+    entry.detail.tool_name = "bash"
+    app = _ShellResultApp(entry)
+    original_init = VirtualOutputText.__init__
+    with patch.object(
+        VirtualOutputText, "__init__", autospec=True, side_effect=original_init
+    ) as constructor:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            result = app.result
+            assert result is not None
+            constructor.assert_not_called()
+            assert not list(result.query(VirtualOutputText))
+            section = result.query_one(CollapsibleSection)
+            assert section.is_collapsed
+            section.set_collapsed(False)
+            await pilot.pause()
+            constructor.assert_called_once()
+            assert result.query_one(VirtualOutputText).line_count == 2001
 
 
 @pytest.mark.asyncio

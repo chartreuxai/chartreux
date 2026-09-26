@@ -29,14 +29,15 @@ class ContextProgress(NoMarkupStatic):
     tokens = reactive(TokenState())
 
     def __init__(self, **kwargs: Any) -> None:
+        self._last_rendered_text: str | None = None
         super().__init__(**kwargs)
 
     def watch_tokens(self, new_state: TokenState) -> None:
         if new_state.max_tokens == 0:
-            self.update("")
+            self._update_if_changed("")
             return
         if new_state.current_tokens < 0:
-            self.update("Context usage unknown")
+            self._update_if_changed("Context usage unknown")
             return
 
         ratio = min(1, new_state.current_tokens / new_state.max_tokens)
@@ -44,4 +45,10 @@ class ContextProgress(NoMarkupStatic):
             f"{_format_token_count(new_state.current_tokens)}/"
             f"{_format_token_count(new_state.max_tokens)} tokens ({ratio:.0%})"
         )
+        self._update_if_changed(text)
+
+    def _update_if_changed(self, text: str) -> None:
+        if text == self._last_rendered_text:
+            return
         self.update(text)
+        self._last_rendered_text = text

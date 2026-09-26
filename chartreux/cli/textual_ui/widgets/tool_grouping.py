@@ -8,6 +8,7 @@ dependency.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
@@ -37,7 +38,7 @@ class GroupIndicator(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ToolGroupKey:
-    """Stable identity of a group, anchored to its oldest timeline entry."""
+    """Stable identity of a group, anchored to its first creating entry."""
 
     first_entry_id: str
 
@@ -101,7 +102,7 @@ def starts_tool_group(
 
 
 def tool_group_key(first_entry: PublicHistoryEntry) -> ToolGroupKey:
-    """Return the key for a group whose oldest entry is *first_entry*."""
+    """Return the key for the first reasoning/effect entry that creates a group."""
     return ToolGroupKey(first_entry.id)
 
 
@@ -191,11 +192,48 @@ class ToolGroupExpansionState:
 
     default_collapsed: bool = True
     _collapsed: dict[ToolGroupKey, bool] = field(default_factory=dict)
+    revision: int = 0
+    reset_generation: int = 0
+    _change_revisions: list[int] = field(default_factory=list)
+    _changed_keys: list[ToolGroupKey] = field(default_factory=list)
+
+    def _record_changes(self, keys: list[ToolGroupKey]) -> None:
+        self.revision += 1
+        self._change_revisions.extend([self.revision] * len(keys))
+        self._changed_keys.extend(keys)
+
+    def changed_keys_since(self, revision: int) -> set[ToolGroupKey]:
+        return set(self._changed_keys[bisect_right(self._change_revisions, revision) :])
 
     def is_collapsed(self, key: ToolGroupKey) -> bool:
         """Return the stored choice, or the configured default for a new group."""
         return self._collapsed.get(key, self.default_collapsed)
 
+    def register(self, key: ToolGroupKey) -> bool:
+        return self._collapsed.setdefault(key, self.default_collapsed)
+
+    def set_all_collapsed(self, collapsed: bool) -> None:
+        changed = [key for key, value in self._collapsed.items() if value != collapsed]
+        if self.default_collapsed != collapsed or changed:
+            self._record_changes(changed)
+        self.default_collapsed = collapsed
+        for key in self._collapsed:
+            self._collapsed[key] = collapsed
+
+    @property
+    def keys(self) -> frozenset[ToolGroupKey]:
+        return frozenset(self._collapsed)
+
+    def reset(self, *, default_collapsed: bool = True) -> None:
+        self.default_collapsed = default_collapsed
+        self._collapsed.clear()
+        self._change_revisions.clear()
+        self._changed_keys.clear()
+        self.revision += 1
+        self.reset_generation += 1
+
     def set_collapsed(self, key: ToolGroupKey, collapsed: bool) -> None:
         """Persist a group's expansion choice."""
+        if self.is_collapsed(key) != collapsed:
+            self._record_changes([key])
         self._collapsed[key] = collapsed

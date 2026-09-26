@@ -28,14 +28,13 @@ from textual.content import Content
 from textual.css.query import NoMatches
 from textual.geometry import Size
 from textual.reactive import reactive
+from textual.strip import Strip
+from textual.visual import Visual
 from textual.widget import Widget
 from textual.widgets import Link, Static
 
-from chartreux.cli.textual_ui.widgets.collapsible import (
-    ClickWithoutDragMixin,
-    OverflowCollapsibleSection,
-    lines_label,
-)
+from chartreux.cli.textual_ui.widgets.collapsible import ClickWithoutDragMixin
+from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
 from chartreux.cli.textual_ui.widgets.spinner import SpinnerMixin, SpinnerType
 from chartreux.cli.textual_ui.widgets.tool_widgets import clean_output
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
@@ -60,24 +59,14 @@ class ExpandingBorder(NonSelectableStatic):
     def get_content_width(self, container: Size, viewport: Size) -> int:
         return 1
 
-    def render(self) -> Content | str:
-        height = self.size.height
-        chars = ["⎢"] * (height - 1) + ["⎣"]
-        if not self._row_colors:
-            return "\n".join(chars)
-
-        rendered = Content("")
-        for i, ch in enumerate(chars):
-            if i > 0:
-                rendered += Content("\n")
-            if color := self._row_colors.get(i):
-                rendered += Content.styled(ch, color)
-            else:
-                rendered += Content(ch)
-        return rendered
-
-    def on_resize(self) -> None:
-        self.refresh()
+    def render_line(self, y: int) -> Strip:
+        if not self.size.width or y < 0 or y >= self.size.height:
+            return Strip.blank(self.size.width, self.visual_style.rich_style)
+        char = "⎣" if y == self.size.height - 1 else "⎢"
+        color = self._row_colors.get(y)
+        content = Content.styled(char, color) if color else Content(char)
+        strip = Visual.to_strips(self, content, 1, 1, self.visual_style)[0]
+        return strip.apply_offsets(0, y)
 
 
 # Mimic a border bottom with this component in order to have dimmed colors in ANSI themes
@@ -85,9 +74,6 @@ class ExpandingBorder(NonSelectableStatic):
 class ExpandingSeparator(NonSelectableStatic):
     def render(self) -> str:
         return "─" * max(self.size.width, 1)
-
-    def on_resize(self) -> None:
-        self.refresh()
 
 
 def _attachment_label(attachment: ImageAttachment) -> str:
@@ -369,11 +355,23 @@ class ReasoningMessage(ClickWithoutDragMixin, SpinnerMixin, StreamingMessageBase
     COMPLETED_TEXT = "Thought"
 
     def __init__(
-        self, content: str, collapsed: bool = True, *, completed: bool = False
+        self,
+        content: str,
+        collapsed: bool = True,
+        *,
+        completed: bool = False,
+        entry_id: str | None = None,
+        expansion_state: EntryExpansionState | None = None,
     ) -> None:
         super().__init__(content)
         self.add_class("reasoning-message")
-        self.collapsed = collapsed
+        self.entry_id = entry_id
+        self._expansion_state = expansion_state
+        self.collapsed = (
+            expansion_state.register(entry_id)
+            if entry_id is not None and expansion_state is not None
+            else collapsed
+        )
         self._indicator_widget: Static | None = None
         self._header_widget: Horizontal | None = None
         self.init_spinner()
@@ -432,6 +430,8 @@ class ReasoningMessage(ClickWithoutDragMixin, SpinnerMixin, StreamingMessageBase
             return
 
         self.collapsed = collapsed
+        if self.entry_id is not None and self._expansion_state is not None:
+            self._expansion_state.set_collapsed(self.entry_id, collapsed)
         if self._indicator_widget and not self._is_spinning:
             self._indicator_widget.update("⏵" if collapsed else "⏷")
         if self._markdown:
@@ -513,166 +513,6 @@ class InterruptMessage(Static):
                 "Interrupted · What should Chartreux do instead?",
                 classes="interrupt-content",
             )
-
-
-class BashOutputMessage(ClickWithoutDragMixin, SpinnerMixin, Static):
-    SPINNER_TYPE = SpinnerType.PULSE
-    PREVIEW_LINES = 20
-
-    def __init__(
-        self,
-        command: str,
-        cwd: str,
-        output: str = "",
-        exit_code: int = 0,
-        *,
-        pending: bool = False,
-    ) -> None:
-        super().__init__()
-        self.init_spinner()
-        self.add_class("bash-output-message")
-        self._command = command
-        self._cwd = cwd
-        self._output = output.rstrip("\n")
-        self._exit_code = exit_code
-        self._pending = pending
-        self._output_widget: NoMarkupStatic | None = None
-        self._overflow_widget: NoMarkupStatic | None = None
-        self._section: OverflowCollapsibleSection | None = None
-        self._output_container: Horizontal | None = None
-        self._prompt_widget: NonSelectableStatic | None = None
-        self._indicator_widget: Static | None = None
-
-    def _clean_lines(self) -> list[str]:
-        # Sanitize captured output (ANSI escapes, \r redraws, control bytes)
-        # before splitting so it renders terminal-safe and line counts match.
-        return clean_output(self._output).splitlines()
-
-    def _preview_text(self) -> str:
-        return "\n".join(self._clean_lines()[: self.PREVIEW_LINES])
-
-    def _overflow_text(self) -> str:
-        return "\n".join(self._clean_lines()[self.PREVIEW_LINES :])
-
-    def _overflow_count(self) -> int:
-        return max(0, len(self._clean_lines()) - self.PREVIEW_LINES)
-
-    def _refresh_output_widgets(self) -> None:
-        count = self._overflow_count()
-        if self._output_widget:
-            self._output_widget.update(self._preview_text())
-        if self._overflow_widget:
-            self._overflow_widget.update(self._overflow_text())
-        if self._section:
-            self._section.display = count > 0
-            self._section.set_collapsed_label(lines_label(count, prefix="+"))
-
-    def _update_spinner_frame(self) -> None:
-        if not self._is_spinning or not self._prompt_widget:
-            return
-        # Frames are all the same size, so skip the relayout.
-        self._prompt_widget.update(f"{self._spinner.next_frame()} ", layout=False)
-
-    def on_mount(self) -> None:
-        if self._pending:
-            self.start_spinner_timer()
-
-    @property
-    def pending(self) -> bool:
-        return self._pending
-
-    def compose(self) -> ComposeResult:
-        if self._pending:
-            status_class = "bash-pending"
-        elif self._exit_code != 0:
-            status_class = "bash-error"
-        else:
-            status_class = "bash-success"
-        self.add_class(status_class)
-        if self._pending:
-            prompt_text = f"{self._spinner.current_frame()} "
-        else:
-            prompt_text = "$ "
-        with Horizontal(classes="bash-command-line"):
-            self._prompt_widget = NonSelectableStatic(
-                prompt_text, classes=f"bash-prompt {status_class}"
-            )
-            yield self._prompt_widget
-            yield NoMarkupStatic(self._command, classes="bash-command")
-        if not self._pending:
-            count = self._overflow_count()
-            self._output_widget = NoMarkupStatic(
-                self._preview_text(), classes="bash-output"
-            )
-            self._overflow_widget = NoMarkupStatic(
-                self._overflow_text(), classes="bash-output"
-            )
-            self._section = OverflowCollapsibleSection(
-                self._overflow_widget, collapsed_label=lines_label(count, prefix="+")
-            )
-            self._section.display = count > 0
-            self._output_container = Horizontal(classes="bash-output-container")
-            with self._output_container:
-                yield ExpandingBorder(classes="bash-output-border")
-                with Vertical(classes="bash-output-body"):
-                    yield self._output_widget
-                    yield self._section
-
-    async def on_click(self, event: events.Click) -> None:
-        if self._click_is_passive(event):
-            return
-        if self._section and self._overflow_count() > 0:
-            self._section.toggle()
-
-    async def _ensure_output_container(self) -> None:
-        if self._output_container is not None:
-            return
-        self._output_widget = NoMarkupStatic("", classes="bash-output")
-        self._overflow_widget = NoMarkupStatic("", classes="bash-output")
-        self._section = OverflowCollapsibleSection(
-            self._overflow_widget, collapsed_label=lines_label(0, prefix="+")
-        )
-        self._section.display = False
-        self._output_container = Horizontal(
-            ExpandingBorder(classes="bash-output-border"),
-            Vertical(self._output_widget, self._section, classes="bash-output-body"),
-            classes="bash-output-container",
-        )
-        await self.mount(self._output_container)
-
-    async def append_output(self, text: str) -> None:
-        await self._ensure_output_container()
-        self._output += text
-        self._refresh_output_widgets()
-
-    async def finish(self, exit_code: int, *, interrupted: bool = False) -> None:
-        self._exit_code = exit_code
-        self._pending = False
-        self.stop_spinning()
-        if self._prompt_widget:
-            self._prompt_widget.update("$ ")
-        if interrupted:
-            new_class = "bash-interrupted"
-        elif exit_code != 0:
-            new_class = "bash-error"
-        else:
-            new_class = "bash-success"
-        self.remove_class("bash-pending")
-        self.add_class(new_class)
-        if self._prompt_widget:
-            self._prompt_widget.remove_class("bash-pending")
-            self._prompt_widget.add_class(new_class)
-        if interrupted:
-            suffix = (
-                "\n(interrupted)"
-                if self._output and not self._output.endswith("\n")
-                else "(interrupted)"
-            )
-            self._output += suffix
-        if not self._output:
-            self._output = "(no output)"
-        await self._ensure_output_container()
-        self._refresh_output_widgets()
 
 
 class ErrorMessage(Static):

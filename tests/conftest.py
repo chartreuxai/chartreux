@@ -42,6 +42,8 @@ from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
 from tests.stubs.fake_mcp_registry import FakeMCPRegistry
 
+collect_ignore = ["perf"]
+
 _TESTS_ROOT = Path(__file__).parent
 _LOCAL_XDIST_GROUPS = {
     Path("core/test_history_properties.py"): "history_properties",

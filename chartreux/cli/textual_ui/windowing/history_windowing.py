@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from weakref import WeakKeyDictionary
 
 from textual.widget import Widget
 
 from chartreux.app_server.models import PublicHistoryEntry
 from chartreux.cli.textual_ui.windowing.history import (
     split_history_tail,
-    visible_history_indices,
     visible_history_widgets_count,
 )
 from chartreux.cli.textual_ui.windowing.state import SessionWindowing
+from chartreux.cli.textual_ui.windowing.transcript import TranscriptWindow
 
 
 @dataclass(frozen=True)
@@ -43,17 +42,9 @@ def create_resume_plan(
 def sync_backfill_state(
     *,
     history: list[PublicHistoryEntry],
-    messages_children: list[Widget],
-    history_widget_indices: WeakKeyDictionary[Widget, int],
+    transcript: TranscriptWindow,
     windowing: SessionWindowing,
 ) -> bool:
-    if not history:
-        windowing.reset()
-        return False
-    visible_indices = visible_history_indices(messages_children, history_widget_indices)
-    visible_widgets = visible_history_widgets_count(messages_children)
     return windowing.recompute_backfill(
-        history,
-        visible_indices=visible_indices,
-        visible_history_widgets_count=visible_widgets,
+        history, admitted_start_index=transcript.admitted_start_index
     )

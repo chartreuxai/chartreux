@@ -1,9 +1,26 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from chartreux.cli.textual_ui.widgets.context_progress import (
     ContextProgress,
     TokenState,
 )
+
+
+def test_context_progress_skips_updates_when_rendered_text_is_unchanged() -> None:
+    widget = ContextProgress()
+
+    with patch.object(widget, "update", wraps=widget.update) as update:
+        widget.watch_tokens(TokenState(max_tokens=200_000, current_tokens=12_001))
+        widget.watch_tokens(TokenState(max_tokens=200_000, current_tokens=12_999))
+        assert update.call_count == 1
+        assert update.call_args.args == ("12k/200k tokens (6%)",)
+
+        widget.watch_tokens(TokenState(max_tokens=200_000, current_tokens=14_000))
+
+    assert update.call_count == 2
+    assert update.call_args.args == ("14k/200k tokens (7%)",)
 
 
 def test_context_progress_shows_percentage_when_empty() -> None:

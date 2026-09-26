@@ -19,6 +19,7 @@ from chartreux.cli.textual_ui.widgets.loading import LoadingWidget
 from chartreux.cli.textual_ui.widgets.messages import ErrorMessage
 from chartreux.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
+from tests.cli.textual_ui.test_history_grouping import _message
 from tests.conftest import build_test_chartreux_app
 
 _RESUMED_TOKENS = 50_000
@@ -219,6 +220,18 @@ async def test_resume_local_session_shows_zero_when_no_llm_activity(
 
         widget = chartreux_app.query_one(ContextProgress)
         assert widget.tokens.current_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_rebuild_discards_previous_session_admission(
+    chartreux_app: ChartreuxApp,
+) -> None:
+    async with chartreux_app.run_test():
+        chartreux_app._transcript.admit([_message(0)], start_index=0)
+        assert chartreux_app._transcript.unit_ids
+        await chartreux_app._rebuild_transcript_from_current_session()
+        assert not chartreux_app._transcript.unit_ids
+        assert chartreux_app._active_turn_start is None
 
 
 @pytest.mark.asyncio

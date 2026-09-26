@@ -622,77 +622,6 @@ Markdown {
     }
 }
 
-.bash-output-message {
-    margin-top: 1;
-    width: 100%;
-    height: auto;
-
-    &:first-child {
-        margin-top: 0;
-    }
-
-}
-
-.bash-command-line {
-    width: 100%;
-    height: auto;
-    margin: 0;
-}
-
-.bash-prompt {
-    width: auto;
-    height: auto;
-
-    &.bash-pending {
-        color: $foreground;
-    }
-
-    &.bash-success {
-        color: $success;
-    }
-
-    &.bash-error {
-        color: $error;
-    }
-
-    &.bash-interrupted {
-        color: $warning;
-    }
-}
-
-.bash-command {
-    width: 1fr;
-    height: auto;
-}
-
-.bash-output-container {
-    width: 100%;
-    height: auto;
-    margin: 0;
-}
-
-.bash-output-border {
-    width: auto;
-    height: 100%;
-    padding: 0 1 0 2;
-    color: $text-muted;
-
-    &:ansi {
-        text-style: dim;
-    }
-}
-
-.bash-output-body {
-    width: 1fr;
-    height: auto;
-    padding-right: 2;
-}
-
-.bash-output {
-    width: 1fr;
-    height: auto;
-}
-
 .collapsible-section {
     width: 1fr;
     height: auto;
@@ -1087,6 +1016,35 @@ StatusMessage {
 
 .tool-result-warning {
     color: $warning;
+}
+
+.virtual-output-body,
+.virtual-output-scroll {
+    width: 1fr;
+    height: auto;
+}
+
+.virtual-output-scroll {
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-size-horizontal: 1;
+}
+
+.virtual-output-scroll .virtual-output-text {
+    width: auto;
+    min-width: 100%;
+    height: auto;
+    text-wrap: nowrap;
+}
+
+.copy-full-output {
+    width: auto;
+    height: 1;
+    min-width: 0;
+    border: none;
+    padding: 0;
+    background: transparent;
+    color: $text-muted;
 }
 
 .diff-scroll {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from textual.app import App, ComposeResult
@@ -42,6 +43,29 @@ async def test_statusline_aggregates_states_and_expanded_rows_include_turns() ->
         assert "Main agent" in rendered
         assert "turns 2" in rendered
         assert "run · worker" in rendered
+
+
+@pytest.mark.asyncio
+async def test_collapsed_agent_bar_skips_unchanged_content_updates() -> None:
+    app = _BrowserApp()
+    async with app.run_test() as pilot:
+        app.bar.update_agents((_agent("one", idle_seconds=1),))
+        await pilot.pause()
+        content_widget = app.bar._content
+        assert content_widget is not None
+
+        with patch.object(
+            content_widget, "update", wraps=content_widget.update
+        ) as update:
+            app.bar.update_agents((_agent("one", idle_seconds=2),))
+            await pilot.pause()
+            assert update.call_count == 0
+
+            app.bar.update_agents((_agent("one", availability="failed"),))
+            await pilot.pause()
+
+        assert update.call_count == 1
+        assert update.call_args.args == ("1 agents: 1 failed",)
 
 
 @pytest.mark.asyncio

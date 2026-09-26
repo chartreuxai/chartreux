@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from textual.app import App, ComposeResult
@@ -55,6 +56,31 @@ async def test_group_header_category_and_collapsed_body_persist() -> None:
 
     restored = ToolGroup(key=key, expansion_state=state)
     assert not restored.is_collapsed
+
+
+@pytest.mark.asyncio
+async def test_group_header_skips_unchanged_summary_updates() -> None:
+    group = ToolGroup()
+    group.add_call_kind(ToolEffectKind.FILE_READ)
+    app = _ToolGroupApp(group)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        text_widget = group.header._text_widget
+        assert text_widget is not None
+
+        with patch.object(text_widget, "update", wraps=text_widget.update) as update:
+            group.add_call_kind(ToolEffectKind.FILE_READ)
+            group.mark_reasoning()
+            group.mark_reasoning()
+            group.resume()
+            assert update.call_count == 1
+            assert update.call_args.args == ("Reading files, thinking",)
+
+            group.add_call_kind(ToolEffectKind.FILE_WRITE)
+
+        assert update.call_count == 2
+        assert update.call_args.args == ("Reading files, writing files, thinking",)
 
 
 @pytest.mark.asyncio

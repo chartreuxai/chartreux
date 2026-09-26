@@ -10,6 +10,7 @@ from collections.abc import (
     Iterator,
 )
 from contextlib import ExitStack, asynccontextmanager, contextmanager, suppress
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 import enum
 import fnmatch
@@ -57,6 +58,7 @@ from chartreux.app_server.protocol import (
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._loop import _PreparedPolicyReplacement
 from chartreux.core.agents.launch import FrozenPersona, LaunchCandidate, resolve_launch
+from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config._restrictions import (
     SourceRestrictions,
     partition_policy_sources,
@@ -173,6 +175,22 @@ class SessionRuntime:
         if errors:
             raise BaseExceptionGroup("Failed to close session runtime", errors)
         self._closed = True
+
+
+@dataclass(frozen=True, slots=True)
+class _FanOutPreflight:
+    candidate: LaunchCandidate
+    parent: SessionRuntime
+    parent_identity: tuple[str, int]
+    parent_orchestrator: object
+    accepted_config_token: object | None
+    parent_config_snapshot: object
+    catalog_snapshot: object | None
+    authority_revision: int
+    profile_name: str
+    profile_snapshot: AgentProfile
+    model_expression: str
+    launch_config: LaunchConfig
 
 
 @dataclass(slots=True)
@@ -1367,10 +1385,62 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             ),
         )
 
+    def _fan_out_preflight_is_current(
+        self, parent: SessionRuntime, args: TaskArgs, preflight: _FanOutPreflight
+    ) -> bool:
+        config = args.config
+        if config is None or not isinstance(config.model, str):
+            return False
+        profile_name = args.agent if "agent" in args.model_fields_set else "worker"
+        try:
+            current_profile = parent.agent_loop.agent_manager.get_agent(profile_name)
+        except ValueError:
+            return False
+
+        orchestrator = parent.agent_loop.config_orchestrator
+        identity = (parent.agent_loop.session_id, parent.agent_loop._session_generation)
+        # tool_inventory/authorized_tool_names are intentionally not snapshotted:
+        # policy replacement bumps the checked authority revision, launch
+        # reconfiguration swaps the checked orchestrator, and require_idle()-gated
+        # MCP mutations cannot overlap this mid-turn fan-out window.
+        return (
+            preflight.parent is parent
+            and preflight.parent_identity == identity
+            and self._generation_identity == identity
+            and preflight.parent_orchestrator is orchestrator
+            and preflight.accepted_config_token is orchestrator.accepted_token
+            and preflight.parent_config_snapshot is parent.agent_loop.config
+            and preflight.catalog_snapshot is parent.agent_loop.config.catalog_snapshot
+            and preflight.authority_revision == parent.agent_loop._authority_revision
+            and preflight.profile_name == profile_name
+            and preflight.profile_snapshot == current_profile
+            and preflight.profile_snapshot == preflight.candidate.profile
+            and preflight.candidate.profile.name == profile_name
+            and preflight.model_expression == config.model
+            and preflight.candidate.semantic_overrides.model == config.model
+            and preflight.launch_config.model_fields_set == config.model_fields_set
+            and preflight.launch_config.model_dump(exclude_unset=True, mode="python")
+            == config.model_dump(exclude_unset=True, mode="python")
+            and preflight.candidate.orchestrator.availability_registry.is_available(
+                preflight.candidate.committed_model.base_model,
+                preflight.candidate.committed_model.provider,
+            )
+        )
+
     async def _create_registered_child(
-        self, parent: SessionRuntime, args: TaskArgs, ctx: InvokeContext
+        self,
+        parent: SessionRuntime,
+        args: TaskArgs,
+        ctx: InvokeContext,
+        *,
+        preflight: _FanOutPreflight | None = None,
     ) -> tuple[SessionRuntime, int | None]:
-        candidate = self._resolve_launch_candidate(parent, args)
+        candidate = (
+            preflight.candidate
+            if preflight is not None
+            and self._fan_out_preflight_is_current(parent, args, preflight)
+            else self._resolve_launch_candidate(parent, args)
+        )
         generation_identity = (
             parent.agent_loop.session_id,
             parent.agent_loop._session_generation,
@@ -1713,7 +1783,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         # rather than the role also makes each child assignment-time concrete. A
         # member-local model rejection does not prevent runnable siblings from being
         # launched, but the whole call still requires at least one runnable member.
-        member_args: list[tuple[int, str, TaskArgs, LaunchCandidate]] = []
+        member_args: list[
+            tuple[int, str, TaskArgs, LaunchCandidate, _FanOutPreflight]
+        ] = []
         skipped: dict[int, TaskMemberResult] = {}
         first_rejection: tuple[str, LaunchConfigError] | None = None
         for index, base in enumerate(members):
@@ -1747,7 +1819,27 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 raise InvalidLaunchModelError(
                     "config.model", f"fan_out member {base!r} rejected: {exc}"
                 ) from exc
-            member_args.append((index, base, member, candidate))
+            assert member.config is not None and isinstance(member.config.model, str)
+            preflight = _FanOutPreflight(
+                candidate=candidate,
+                parent=parent,
+                parent_identity=(
+                    parent.agent_loop.session_id,
+                    parent.agent_loop._session_generation,
+                ),
+                parent_orchestrator=parent.agent_loop.config_orchestrator,
+                accepted_config_token=(
+                    parent.agent_loop.config_orchestrator.accepted_token
+                ),
+                parent_config_snapshot=parent.agent_loop.config,
+                catalog_snapshot=parent.agent_loop.config.catalog_snapshot,
+                authority_revision=parent.agent_loop._authority_revision,
+                profile_name=candidate.profile.name,
+                profile_snapshot=deepcopy(candidate.profile),
+                model_expression=member.config.model,
+                launch_config=member.config.model_copy(deep=True),
+            )
+            member_args.append((index, base, member, candidate, preflight))
 
         if not member_args:
             assert first_rejection is not None
@@ -1760,44 +1852,63 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             tuple[int, str, LaunchCandidate, TaskResult | BaseException]
         ] = []
         started_member_effect_ids: list[str] = []
-        for index, base, member, candidate in member_args:
-            member_ctx = replace(
-                ctx, tool_call_id=f"{ctx.tool_call_id}:fan-out:{index}"
-            )
-            launch_succeeded = False
-            try:
-                ack: TaskResult | None = None
-                started_member_effect_ids.append(member_ctx.tool_call_id)
-                await self._start_fan_out_member_effect(
-                    parent, ctx.tool_call_id, member_ctx.tool_call_id
+        try:
+            for index, base, member, candidate, preflight in member_args:
+                member_ctx = replace(
+                    ctx, tool_call_id=f"{ctx.tool_call_id}:fan-out:{index}"
                 )
-                self._pending_fan_out_result_leases.add(member_ctx.tool_call_id)
-                async for event in self.run(member, member_ctx):
-                    if isinstance(event, TaskResult):
-                        ack = event
-                assert ack is not None
-                launched.append((index, base, candidate, ack))
-                launch_succeeded = True
-            except asyncio.CancelledError:
-                await asyncio.gather(
-                    *(
-                        self._complete_fan_out_member_effect(
-                            parent, effect_id, "cancelled", "fan-out launch cancelled"
+                launch_succeeded = False
+                try:
+                    ack: TaskResult | None = None
+                    started_member_effect_ids.append(member_ctx.tool_call_id)
+                    await self._start_fan_out_member_effect(
+                        parent, ctx.tool_call_id, member_ctx.tool_call_id
+                    )
+                    self._pending_fan_out_result_leases.add(member_ctx.tool_call_id)
+                    async for event in self.run(
+                        member,
+                        member_ctx,
+                        preflight=preflight,
+                        defer_launch_agents_update=True,
+                    ):
+                        if isinstance(event, TaskResult):
+                            ack = event
+                    assert ack is not None
+                    launched.append((index, base, candidate, ack))
+                    launch_succeeded = True
+                except asyncio.CancelledError:
+                    await asyncio.gather(
+                        *(
+                            self._complete_fan_out_member_effect(
+                                parent,
+                                effect_id,
+                                "cancelled",
+                                "fan-out launch cancelled",
+                            )
+                            for effect_id in started_member_effect_ids
+                        ),
+                        self._release_fan_out_members(started_member_effect_ids),
+                        return_exceptions=True,
+                    )
+                    raise
+                except BaseException as exc:
+                    await self._complete_fan_out_member_effect(
+                        parent, member_ctx.tool_call_id, "failed", str(exc)
+                    )
+                    launched.append((index, base, candidate, exc))
+                finally:
+                    if not launch_succeeded:
+                        self._pending_fan_out_result_leases.discard(
+                            member_ctx.tool_call_id
                         )
-                        for effect_id in started_member_effect_ids
-                    ),
-                    self._release_fan_out_members(started_member_effect_ids),
-                    return_exceptions=True,
-                )
-                raise
-            except BaseException as exc:
-                await self._complete_fan_out_member_effect(
-                    parent, member_ctx.tool_call_id, "failed", str(exc)
-                )
-                launched.append((index, base, candidate, exc))
-            finally:
-                if not launch_succeeded:
-                    self._pending_fan_out_result_leases.discard(member_ctx.tool_call_id)
+        finally:
+            if not self._draining_children:
+                try:
+                    await self._emit_agents_update()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to publish coalesced fan-out agent update", exc_info=exc
+                    )
 
         collected_results: dict[tuple[str, str], TaskResult] = {}
 
@@ -1925,7 +2036,12 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         )
 
     async def run(  # noqa: PLR0912, PLR0914, PLR0915
-        self, args: TaskArgs, ctx: InvokeContext
+        self,
+        args: TaskArgs,
+        ctx: InvokeContext,
+        *,
+        preflight: _FanOutPreflight | None = None,
+        defer_launch_agents_update: bool = False,
     ) -> AsyncGenerator[ToolStreamEvent | TaskResult, None]:
         if ctx.is_subagent:
             raise RuntimeError("Agent depth limit of 1 reached")
@@ -2034,7 +2150,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             else:
                 self._require_task_profile_allowed(parent, args.agent)
                 runtime, idle_ttl_seconds = await self._create_registered_child(
-                    parent, args, ctx
+                    parent, args, ctx, preflight=preflight
                 )
                 agent_id = await self._issue_agent_id(parent)
                 record = AgentRecord(
@@ -2495,12 +2611,14 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 # Acceptance has happened: persistence failure is reported without
                 # rolling the live configuration or accepted run back.
                 await runtime.agent_loop.persist_launch_metadata()
-            try:
-                await self._emit_agents_update()
-            except Exception as exc:
-                logger.warning(
-                    "Failed to publish initial background agent update", exc_info=exc
-                )
+            if not defer_launch_agents_update:
+                try:
+                    await self._emit_agents_update()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to publish initial background agent update",
+                        exc_info=exc,
+                    )
             # An explicit status distinguishes this successful launch acknowledgment
             # from the terminal result that get_agent_result later returns.
             yield TaskResult(

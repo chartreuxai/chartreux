@@ -103,7 +103,7 @@ async def test_terminal_effect_hides_transient_stream_message() -> None:
         call = ToolCallMessage(_effect(completed=False))
         await root.mount(call)
         call.set_stream_message("grep: Found 9 matches")
-        await pilot.pause()
+        await pilot.pause(0.06)
 
         stream = call._stream_widget
         assert stream is not None
@@ -114,6 +114,140 @@ async def test_terminal_effect_hides_transient_stream_message() -> None:
 
         assert not call._is_spinning
         assert not stream.display
+
+
+@pytest.mark.asyncio
+async def test_tool_stream_messages_coalesce_and_flush_on_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _ToolStreamApp()
+
+    async with app.run_test() as pilot:
+        call = ToolCallMessage(_effect(completed=False))
+        await app.query_one("#root", Vertical).mount(call)
+        await pilot.pause()
+        stream = call._stream_widget
+        assert stream is not None
+
+        call.set_stream_message("first")
+        call.set_stream_message("second")
+        call.set_stream_message("latest")
+        assert call._stream_message_buffer == "latest"
+        assert call._stream_write_timer is not None
+        assert not stream.display
+
+        await pilot.pause(0.06)
+        rendered = stream.render()
+        assert isinstance(rendered, Content)
+        assert rendered.plain == "→ latest"
+        assert call._stream_write_timer is None
+
+        call.set_stream_message("before result")
+        call.set_result_text("completed")
+        rendered = stream.render()
+        assert isinstance(rendered, Content)
+        assert rendered.plain == "→ before result"
+        assert call._stream_message_buffer is None
+        assert call._stream_write_timer is None
+
+        rendered_at_flush: list[str] = []
+        flush_stream_message = call._flush_stream_message
+
+        def capture_flush() -> None:
+            flush_stream_message()
+            rendered = stream.render()
+            assert isinstance(rendered, Content)
+            rendered_at_flush.append(rendered.plain)
+
+        monkeypatch.setattr(call, "_flush_stream_message", capture_flush)
+        call.set_stream_message("before settle")
+        call.stop_spinning()
+        assert rendered_at_flush == ["→ before settle"]
+        assert not stream.display
+        assert call._stream_message_buffer is None
+        assert call._stream_write_timer is None
+
+
+@pytest.mark.asyncio
+async def test_tool_stream_pending_message_timer_stops_on_unmount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _ToolStreamApp()
+
+    async with app.run_test() as pilot:
+        call = ToolCallMessage(_effect(completed=False))
+        await app.query_one("#root", Vertical).mount(call)
+        await pilot.pause()
+
+        flushes_after_unmount: list[None] = []
+        flush_stream_message = call._flush_stream_message
+
+        def record_flush() -> None:
+            if not call.is_mounted:
+                flushes_after_unmount.append(None)
+            flush_stream_message()
+
+        monkeypatch.setattr(call, "_flush_stream_message", record_flush)
+        call.set_stream_message("pending at unmount")
+        timer = call._stream_write_timer
+        assert timer is not None
+        assert timer._task is not None
+        assert call._stream_message_buffer == "pending at unmount"
+
+        await call.remove()
+
+        assert call._stream_write_timer is None
+        assert timer._task is None
+        assert call._stream_message_buffer is None
+        await pilot.pause(0.06)
+        assert flushes_after_unmount == []
+
+
+@pytest.mark.asyncio
+async def test_update_entry_skips_unchanged_header_and_updates_changed_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _ToolStreamApp()
+    entry = _effect(completed=False)
+
+    async with app.run_test() as pilot:
+        call = ToolCallMessage(entry)
+        await app.query_one("#root", Vertical).mount(call)
+        await pilot.pause()
+
+        set_text_calls: list[tuple[str, str, str]] = []
+        set_text = call._set_text
+
+        def record_set_text(
+            text: str, suffix: str, *, verb: str = "", linkify: bool = False
+        ) -> None:
+            set_text_calls.append((verb, text, suffix))
+            set_text(text, suffix, verb=verb, linkify=linkify)
+
+        monkeypatch.setattr(call, "_set_text", record_set_text)
+
+        for updated_at in (3, 4, 5):
+            call.update_entry(entry.model_copy(update={"updated_at": updated_at}))
+
+        assert call._entry.updated_at == 5
+        assert set_text_calls == []
+
+        changed_entry = _effect(
+            completed=False,
+            detail=GenericEffectDetail(
+                tool_name="grep",
+                display=EffectCallDisplay(
+                    summary="Searching elsewhere", status_text="Searching files"
+                ),
+            ),
+        )
+        call.update_entry(changed_entry)
+
+        assert set_text_calls == [("", "Searching elsewhere", "")]
+        assert call._text_widget is not None
+        rendered = call._text_widget.render()
+        assert isinstance(rendered, Content)
+        assert rendered.plain == "Searching elsewhere"
 
 
 @pytest.mark.asyncio

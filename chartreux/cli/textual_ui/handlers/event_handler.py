@@ -39,6 +39,7 @@ from chartreux.app_server.models import (
     WaitingForInputNoticeDetail,
 )
 from chartreux.cli.textual_ui.widgets.compact import CompactMessage
+from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
 from chartreux.cli.textual_ui.widgets.loading import (
     DEFAULT_LOADING_STATUS,
     THINKING_LOADING_STATUS,
@@ -54,6 +55,8 @@ from chartreux.cli.textual_ui.widgets.messages import (
     UserCommandMessage,
 )
 from chartreux.cli.textual_ui.widgets.tool_grouping import (
+    ToolGroupExpansionState,
+    ToolGroupKey,
     effect_state_is_failure,
     entry_keeps_tool_group,
 )
@@ -82,8 +85,12 @@ class EventHandler:
         get_show_thinking: Callable[[], bool] | None = None,
         on_context_cleared: Callable[[Path | None], Awaitable[None]] | None = None,
         on_session_title_changed: Callable[[str], None] | None = None,
+        entry_expansion_state: EntryExpansionState | None = None,
+        group_expansion_state: ToolGroupExpansionState | None = None,
     ) -> None:
         self.mount_callback = mount_callback
+        self.entry_expansion_state = entry_expansion_state
+        self.group_expansion_state = group_expansion_state
         self.get_tools_collapsed = get_tools_collapsed
         self.get_show_thinking = get_show_thinking or (lambda: True)
         self.on_context_cleared = on_context_cleared
@@ -94,6 +101,7 @@ class EventHandler:
         self._turn_assistant_message: AssistantMessage | None = None
         self.current_streaming_reasoning: ReasoningMessage | None = None
         self.current_tool_group: ToolGroup | None = None
+        self._finalized_tool_group: ToolGroup | None = None
         self.plan_file_message: PlanFileMessage | None = None
         self._hook_containers: dict[str, HookRunContainer] = {}
         self._tool_call_anchors: dict[str, Widget] = {}
@@ -156,6 +164,8 @@ class EventHandler:
     ) -> ToolCallMessage | None:
         if self.current_tool_group is not None and not entry_keeps_tool_group(entry):
             self._finalize_tool_group()
+        if not entry_keeps_tool_group(entry):
+            self._finalized_tool_group = None
 
         match entry:
             case PublicMessageEntry(role="assistant"):
@@ -169,7 +179,7 @@ class EventHandler:
                 await self._resolve_retry_presentation(continue_assistant=False)
             case PublicReasoningEntry():
                 await self._resolve_retry_presentation(continue_assistant=False)
-                await self._handle_reasoning_delta(entry.text, loading_widget)
+                await self._handle_reasoning_delta(entry.text, loading_widget, entry.id)
                 if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
                     await self.finalize_streaming()
             case PublicEffectEntry():
@@ -209,7 +219,7 @@ class EventHandler:
                     await self.finalize_streaming()
             case PublicReasoningEntry():
                 if delta := _appended_text(update.patch, "/text"):
-                    await self._handle_reasoning_delta(delta, loading_widget)
+                    await self._handle_reasoning_delta(delta, loading_widget, entry.id)
                 if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
                     await self.finalize_streaming()
             case PublicEffectEntry():
@@ -245,7 +255,7 @@ class EventHandler:
                 self._finalize_tool_group()
                 await self.mount_callback(tool_call)
             else:
-                group = await self._ensure_tool_group()
+                group = await self._ensure_tool_group(entry.id)
                 group.resume()
                 group.add_call_kind(entry.detail.kind)
                 self._tool_group_call_positions[entry.id] = (
@@ -263,7 +273,9 @@ class EventHandler:
     ) -> None:
         call_widget = self.tool_calls.get(entry.id)
         anchor = self._tool_call_anchors.get(entry.id) or call_widget
-        result = ToolResultMessage(entry, call_widget)
+        result = ToolResultMessage(
+            entry, call_widget, expansion_state=self.entry_expansion_state
+        )
         await self.mount_callback(result, after=anchor)
         position = self._tool_group_call_positions.pop(entry.id, None)
         if position is not None:
@@ -287,6 +299,9 @@ class EventHandler:
                 for pending_group, _ in self._tool_group_call_positions.values()
             ):
                 group.finalize()
+                if self.current_tool_group is group:
+                    self._finalized_tool_group = group
+                    self.current_tool_group = None
         elif effect_state_is_failure(entry.state):
             # Standalone calls cannot be recovered by a grouped follow-up.
             self._pending_error_results.append(result)
@@ -334,7 +349,7 @@ class EventHandler:
         return assistant
 
     async def _handle_reasoning_delta(
-        self, content: str, loading_widget: LoadingWidget | None
+        self, content: str, loading_widget: LoadingWidget | None, entry_id: str
     ) -> None:
         if loading_widget is not None:
             loading_widget.set_status(THINKING_LOADING_STATUS)
@@ -344,9 +359,14 @@ class EventHandler:
                 await self.current_streaming_message.remove()
             self.current_streaming_message = None
         if self.current_streaming_reasoning is None:
-            message = ReasoningMessage(content, collapsed=self.get_tools_collapsed())
+            message = ReasoningMessage(
+                content,
+                collapsed=self.get_tools_collapsed(),
+                entry_id=entry_id,
+                expansion_state=self.entry_expansion_state,
+            )
             self.current_streaming_reasoning = message
-            group = await self._ensure_tool_group()
+            group = await self._ensure_tool_group(entry_id)
             if self.get_show_thinking():
                 group.mark_reasoning()
             await self._mount_in_group(group, message)
@@ -453,11 +473,19 @@ class EventHandler:
         if self.current_tool_group is not None:
             self.current_tool_group.finalize()
         self.current_tool_group = None
+        self._finalized_tool_group = None
         self._current_tool_group_next_position = 0
 
-    async def _ensure_tool_group(self) -> ToolGroup:
+    async def _ensure_tool_group(self, entry_id: str) -> ToolGroup:
         if self.current_tool_group is None:
-            group = ToolGroup()
+            if self._finalized_tool_group is not None:
+                group = self._finalized_tool_group
+                self._finalized_tool_group = None
+                self.current_tool_group = group
+                return group
+            group = ToolGroup(
+                key=ToolGroupKey(entry_id), expansion_state=self.group_expansion_state
+            )
             self.current_tool_group = group
             self._current_tool_group_next_position = 0
             await self.mount_callback(group)
@@ -517,6 +545,34 @@ class EventHandler:
         if self.current_streaming_message is not None:
             await self.current_streaming_message.stop_stream()
             self.current_streaming_message = None
+
+    def settle_turn(self) -> None:
+        # Retry presentations own their assistant independently after an error.
+        self._turn_assistant_message = None
+        self._finalized_tool_group = None
+
+    def retained_widgets(self) -> set[Widget]:
+        retained: set[Widget] = set(self.tool_calls.values())
+        retained.update(self._tool_call_anchors.values())
+        retained.update(self._hook_containers.values())
+        retained.update(self._pending_error_results)
+        retained.update(self._pending_error_positions)
+        retained.update(group for group, _ in self._tool_group_call_positions.values())
+        for widget in (
+            self.current_compact,
+            self.current_streaming_message,
+            self._turn_assistant_message,
+            self.current_streaming_reasoning,
+            self.current_tool_group,
+            self.plan_file_message,
+        ):
+            if widget is not None:
+                retained.add(widget)
+        if self._retry_presentation is not None:
+            if self._retry_presentation.assistant is not None:
+                retained.add(self._retry_presentation.assistant)
+            retained.update(self._retry_presentation.transient_widgets)
+        return retained
 
     def clear_tool_call_anchors(self) -> None:
         self._tool_call_anchors.clear()

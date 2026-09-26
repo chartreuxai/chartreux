@@ -57,6 +57,7 @@ from chartreux.app_server.models import (
     ImageAttachment,
     PreparedPrompt,
     PublicCallbackEntry,
+    PublicCheckpointEntry,
     PublicEffectEntry,
     PublicError,
     PublicHistoryEntry,
@@ -132,6 +133,7 @@ from chartreux.cli.textual_ui.widgets.context_progress import (
     TokenState,
 )
 from chartreux.cli.textual_ui.widgets.debug_console import DebugConsole
+from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
 from chartreux.cli.textual_ui.widgets.inline_notice import InlineNotice
 from chartreux.cli.textual_ui.widgets.links import normalize_url
 from chartreux.cli.textual_ui.widgets.load_more import HistoryLoadMoreRequested
@@ -167,7 +169,10 @@ from chartreux.cli.textual_ui.widgets.rewind_app import RewindApp
 from chartreux.cli.textual_ui.widgets.rewind_fork_message import RewindForkMessage
 from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
 from chartreux.cli.textual_ui.widgets.thinking_picker import ThinkingPickerApp
-from chartreux.cli.textual_ui.widgets.tool_grouping import ToolGroupExpansionState
+from chartreux.cli.textual_ui.widgets.tool_grouping import (
+    ToolGroupExpansionState,
+    entry_keeps_tool_group,
+)
 from chartreux.cli.textual_ui.widgets.tool_widgets import EditResultWidget
 from chartreux.cli.textual_ui.widgets.tools import (
     ToolCallMessage,
@@ -179,12 +184,12 @@ from chartreux.cli.textual_ui.windowing import (
     LOAD_MORE_BATCH_SIZE,
     HistoryLoadMoreManager,
     SessionWindowing,
-    build_history_widgets,
     create_resume_plan,
     shift_history_widget_indices,
     should_resume_history,
     sync_backfill_state,
 )
+from chartreux.cli.textual_ui.windowing.transcript import TranscriptWindow
 from chartreux.cli.textual_ui.word_selection import WordSelectScreen
 from chartreux.config_values import FALLBACK_THEME
 from chartreux.observability.logging import (
@@ -420,6 +425,9 @@ class ChatScroll(VerticalScroll):
 
     _reanchor_pending: bool = False
     _scrolling_down: bool = False
+    _transcript_tracks_user_scroll: bool = True
+    _transcript_engine_scroll: bool = False
+    _transcript_layout_change: bool = False
 
     @property
     def _is_selecting(self) -> bool:
@@ -441,6 +449,17 @@ class ChatScroll(VerticalScroll):
             self._anchor_released = True
         super().watch_scroll_y(old_value, new_value)
         self._scrolling_down = new_value >= old_value
+        if isinstance(self.app, ChartreuxApp):
+            engine = self.app._transcript
+            engine_scroll = getattr(self, "_transcript_engine_scroll", False)
+            layout_clamp = (
+                getattr(self, "_transcript_layout_change", False)
+                and new_value != self.scroll_target_y
+                and not self.app.animator.is_being_animated(self, "scroll_y")
+            )
+            if not (engine_scroll or layout_clamp):
+                engine._scroll_revision += 1
+            self.app._request_transcript_reconcile(scroll_driven=True)
 
     def release_anchor(self) -> None:
         super().release_anchor()
@@ -482,13 +501,14 @@ class ChatScroll(VerticalScroll):
         # instead of jumping the full sensitivity in a single frame. prevent_default
         # breaks the MRO loop so the base handler's instant jump never runs on top.
         event.prevent_default()
+        if isinstance(self.app, ChartreuxApp):
+            self.app._request_transcript_reconcile(scroll_driven=True)
         if scroller(animate=True, duration=WHEEL_SCROLL_DURATION, easing="linear"):
             event.stop()
 
 
-PRUNE_LOW_MARK = 1000
-PRUNE_HIGH_MARK = 1500
 DOUBLE_ESC_DELAY = 0.2
+_TRANSCRIPT_HIGH_MARK = 1500
 
 _TEXTUAL_THEME_MAP = {"auto": None, "light": "ansi-light", "dark": "ansi-dark"}
 
@@ -505,42 +525,6 @@ def _resolve_typing_debounce_s() -> float:
     except (KeyError, ValueError):
         ms = _DEFAULT_TYPING_DEBOUNCE_MS
     return ms / 1000
-
-
-async def prune_oldest_children(
-    messages_area: Widget, low_mark: int, high_mark: int
-) -> bool:
-    """Remove the oldest children so the virtual height stays within bounds.
-
-    Walks children back-to-front to find how much to keep (up to *low_mark*
-    of visible height), then removes everything before that point.
-    """
-    total_height = messages_area.virtual_size.height
-    if total_height <= high_mark:
-        return False
-
-    children = messages_area.children
-    if not children:
-        return False
-
-    accumulated = 0
-    cut = len(children)
-
-    for child in reversed(children):
-        if not child.display:
-            cut -= 1
-            continue
-        accumulated += child.outer_size.height
-        cut -= 1
-        if accumulated >= low_mark:
-            break
-
-    to_remove = list(children[:cut])
-    if not to_remove:
-        return False
-
-    await messages_area.remove_children(to_remove)
-    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -661,6 +645,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
     _main_ui_mounted: bool = False
     _mount_first: bool = False
     _initial_config_response: ConfigReadResponse | None = None
+    _transcript_under_budget_key: tuple[int, int, int] | None = None
 
     def get_driver_class(self) -> type[Driver]:
         """Patch the platform driver to strip malformed terminal reports from input."""
@@ -752,7 +737,15 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
         self._tools_collapsed = True
         self._tool_group_expansion_state = ToolGroupExpansionState()
+        self._preview_tool_group_expansion_state = ToolGroupExpansionState()
+        self._entry_expansion_state = EntryExpansionState()
+        self._preview_entry_expansion_state = EntryExpansionState()
         self._windowing = SessionWindowing(load_more_batch_size=LOAD_MORE_BATCH_SIZE)
+        self._transcript = TranscriptWindow(
+            expansion_state=self._tool_group_expansion_state,
+            entry_expansion_state=self._entry_expansion_state,
+        )
+        self._active_turn_start: int | None = None
         self._load_more = HistoryLoadMoreManager()
         self._history_widget_indices: WeakKeyDictionary[Widget, int] = (
             WeakKeyDictionary()
@@ -901,12 +894,19 @@ class ChartreuxApp(App):  # noqa: PLR0904
     def _begin_pending_turn(self) -> None:
         """Enter the 'turn in flight' state for a just-submitted idle prompt."""
         self._pending_turn = True
+        if self._active_turn_start is None:
+            self._active_turn_start = self._transcript.admitted_end_index
         self._turn_started_event.clear()
 
     def _clear_pending_turn(self) -> None:
         """Leave the in-flight state and wake anything waiting for turn start."""
         self._pending_turn = False
         self._turn_started_event.set()
+
+    def _clear_active_turn_pins(self) -> None:
+        self._active_turn_start = None
+        for unit in self._transcript.units.values():
+            unit.pin_reasons.discard("active-turn")
 
     def _set_loading_queue_count(self, count: int) -> None:
         if self._loading_widget is not None:
@@ -1165,6 +1165,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
             get_show_thinking=lambda: self.config.show_thinking_nodes,
             on_context_cleared=self._on_context_cleared,
             on_session_title_changed=self._on_session_title_changed,
+            entry_expansion_state=self._entry_expansion_state,
+            group_expansion_state=self._tool_group_expansion_state,
         )
 
         self._chat_input_container = self.query_one(ChatInputContainer)
@@ -2117,10 +2119,12 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 return
         except BaseException:
             self._clear_pending_turn()
+            self._clear_active_turn_pins()
             raise
         # Enqueue was rejected (e.g. prompt prep aborted): leave the in-flight
         # state so the UI returns to idle instead of a stuck spinner.
         self._clear_pending_turn()
+        self._clear_active_turn_pins()
         await self._remove_loading_widget()
         input_widget = self.query_one(ChatInputContainer)
         if not input_widget.value:
@@ -2128,8 +2132,12 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     def _reset_ui_state(self) -> None:
         self._windowing.reset()
+        self._transcript.reset()
+        self._active_turn_start = None
         self._history_widget_indices = WeakKeyDictionary()
         if self.event_handler is not None:
+            self.event_handler._finalize_tool_group()
+            self.event_handler._handle_stop_plan_review()
             self.event_handler.cancel_retry_presentation()
 
     async def _rebuild_transcript_from_current_session(self) -> None:
@@ -2160,7 +2168,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     async def _resume_history_from_messages(self) -> None:
         messages_area = self._messages_area
-        if not should_resume_history(list(messages_area.children)):
+        if self._transcript.admitted_end_index or not should_resume_history(
+            list(messages_area.children)
+        ):
             return
 
         if (
@@ -2189,13 +2199,33 @@ class ChartreuxApp(App):  # noqa: PLR0904
         before: Widget | int | None = None,
         after: Widget | None = None,
     ) -> None:
-        widgets = build_history_widgets(
-            batch=batch,
-            start_index=start_index,
-            history_widget_indices=self._history_widget_indices,
-            tools_collapsed=self._tools_collapsed,
-            expansion_state=self._tool_group_expansion_state,
+        reading_anchor = (
+            self._transcript._reading_anchor(messages_area)
+            if (before is not None or after is not None)
+            and not self._chat_widget.is_at_bottom
+            else None
         )
+        self._transcript.tools_collapsed = self._tools_collapsed
+        self._transcript.expansion_state = (
+            self._preview_tool_group_expansion_state
+            if self._picker.previewing
+            else self._tool_group_expansion_state
+        )
+        self._transcript.entry_expansion_state = (
+            self._preview_entry_expansion_state
+            if self._picker.previewing
+            else self._entry_expansion_state
+        )
+        previous = set(self._transcript.unit_ids)
+        self._transcript.admit(
+            batch, start_index=start_index, geometry_width=messages_area.size.width
+        )
+        new_ids = [key for key in self._transcript.unit_ids if key not in previous]
+        widgets_by_unit = [
+            (key, self._transcript.build_unit(key, self._history_widget_indices))
+            for key in new_ids
+        ]
+        widgets = [widget for _, roots in widgets_by_unit for widget in roots]
 
         with self.batch_update():
             if not widgets:
@@ -2210,6 +2240,214 @@ class ChartreuxApp(App):  # noqa: PLR0904
         for widget in widgets:
             if isinstance(widget, StreamingMessageBase):
                 await widget.write_initial_content()
+        for key, roots in widgets_by_unit:
+            self._transcript.register_mounted(key, roots)
+        if reading_anchor is not None:
+            await self._restore_reading_anchor(reading_anchor, messages_area)
+        self._request_transcript_reconcile()
+
+    async def _restore_reading_anchor(
+        self, reading_anchor: tuple[str, int, int], messages_area: Widget
+    ) -> None:
+        """Scroll the viewport so a recorded reading anchor stays on its row."""
+        anchor_id, row_offset, screen_row = reading_anchor
+        unit = self._transcript.units.get(anchor_id)
+        placement = self._transcript._placement(unit) if unit else None
+        if placement is None:
+            return
+        for _ in range(3):
+            await self._transcript._layout_pass(messages_area)
+            delta = placement.region.y + row_offset - screen_row
+            if delta:
+                self._transcript._set_scroll_flag(
+                    self._chat_widget, "_transcript_engine_scroll", True
+                )
+                try:
+                    self._chat_widget.scroll_to(
+                        y=self._chat_widget.scroll_offset.y + delta,
+                        animate=False,
+                        immediate=True,
+                    )
+                finally:
+                    self._transcript._set_scroll_flag(
+                        self._chat_widget, "_transcript_engine_scroll", False
+                    )
+
+    def _admit_live_history(self) -> None:
+        if self.event_handler and self.event_handler.current_tool_group is not None:
+            return
+        history = self.app_server.history
+        start = self._transcript.admitted_end_index
+        if start >= len(history):
+            return
+        batch = history[start:]
+        if self._transcript.unit_ids and all(
+            entry_keeps_tool_group(entry) for entry in batch
+        ):
+            # Defensive for callers that admit while a finalized group is still
+            # held; normal turn finalization has no partial group to extend here.
+            last = self._transcript.units[self._transcript.unit_ids[-1]]
+            if (
+                last.group_key is not None
+                and last.mounted_roots
+                and self.event_handler is not None
+                and self.event_handler._finalized_tool_group is last.mounted_roots[0]
+            ):
+                self._transcript.admit(
+                    batch,
+                    start_index=start,
+                    geometry_width=self._messages_area.size.width,
+                    extend_group=True,
+                )
+                self._request_transcript_reconcile()
+                return
+        preview = TranscriptWindow()
+        preview.admit(batch, start_index=start)
+        mounted = {
+            root
+            for unit in self._transcript.units.values()
+            for root in unit.mounted_roots
+        }
+        candidates = [
+            child
+            for child in self._messages_area.children
+            if child not in mounted
+            and type(child)
+            in {
+                UserMessage,
+                AssistantMessage,
+                ReasoningMessage,
+                ToolCallMessage,
+                ToolResultMessage,
+                ToolGroup,
+                CompactMessage,
+            }
+        ]
+        counts = [
+            2
+            if unit.group_key is None
+            and len(unit.entries) == 1
+            and isinstance(unit.entries[0], PublicEffectEntry)
+            else 1
+            for unit in (preview.units[key] for key in preview.unit_ids)
+        ]
+        if sum(counts) != len(candidates):
+            return
+        self._transcript.admit(
+            batch, start_index=start, geometry_width=self._messages_area.size.width
+        )
+        offset = 0
+        for key, count in zip(preview.unit_ids, counts, strict=True):
+            roots = candidates[offset : offset + count]
+            self._transcript.register_mounted(key, roots)
+            offset += count
+        self._request_transcript_reconcile()
+
+    def _request_transcript_reconcile(self, *, scroll_driven: bool = False) -> None:
+        if self._shutdown_started or not self._transcript.unit_ids:
+            return
+        chat = self._chat_widget
+        transcript = self._transcript
+        messages = self._messages_area
+        idle = transcript._reconcile_task is None or transcript._reconcile_task.done()
+        budget_key = (
+            transcript.geometry_version,
+            messages.virtual_size.height,
+            messages.size.width,
+        )
+        if scroll_driven and idle and budget_key == self._transcript_under_budget_key:
+            # Eviction/restoration bumps geometry_version; no resident scan is
+            # needed on scroll ticks while the measured placement is unchanged.
+            return
+        if not scroll_driven:
+            self._transcript_under_budget_key = None
+        has_placeholders = any(unit.placeholders for unit in transcript.units.values())
+        needs_protection = has_placeholders or bool(
+            transcript.eviction_candidates(chat.region.y, chat.region.height)
+        )
+        if scroll_driven and idle and not needs_protection:
+            # Only cache the genuine under-budget case: a temporarily protected
+            # over-budget unit must be reconsidered on the next scroll.
+            budgeted_rows = sum(
+                unit.mounted_roots[-1].region.bottom - unit.mounted_roots[0].region.y
+                for unit in transcript.units.values()
+                if unit.mounted_roots
+                and not unit.pin_reasons
+                and unit.mounted_roots[-1].region.bottom
+                - unit.mounted_roots[0].region.y
+                <= _TRANSCRIPT_HIGH_MARK
+            )
+            if budgeted_rows <= _TRANSCRIPT_HIGH_MARK:
+                self._transcript_under_budget_key = budget_key
+            return
+        selected = (
+            self._selected_transcript_units() if needs_protection else frozenset()
+        )
+        retained = (
+            self.event_handler.retained_widgets() if self.event_handler else set()
+        )
+        for widget in (
+            self._rewind_highlighted_widget,
+            self._queue_selected_widget,
+            self._agent_transcript_focus_target,
+        ):
+            if widget is not None:
+                retained.add(widget)
+        live: set[str] = set()
+        neighbors: set[str] = set()
+        for key in self._transcript.unit_ids:
+            unit = self._transcript.units[key]
+            if (
+                self._active_turn_start is not None
+                and unit.start_index >= self._active_turn_start
+            ):
+                unit.pin_reasons.add("active-turn")
+            if needs_protection and any(
+                node in retained
+                or getattr(node, "_is_spinning", False)
+                or getattr(node, "_stream_write_timer", None) is not None
+                or getattr(node, "_stream_message_buffer", None)
+                or getattr(node, "_write_timer", None) is not None
+                or getattr(node, "_to_write_buffer", None)
+                for root in unit.mounted_roots
+                for node in (root, *root.walk_children())
+            ):
+                live.add(key)
+        for index, key in enumerate(self._transcript.unit_ids):
+            unit = self._transcript.units[key]
+            if not any(
+                isinstance(entry, PublicCheckpointEntry) for entry in unit.entries
+            ):
+                continue
+            adjacent = self._transcript.unit_ids[max(index - 1, 0) : index + 2]
+            if any(
+                self._transcript.units[item].mounted_roots
+                for item in adjacent
+                if item != key
+            ):
+                neighbors.add(key)
+        self._transcript.request_reconcile(
+            self._messages_area,
+            self._history_widget_indices,
+            follow_bottom=chat.is_at_bottom,
+            selected=selected,
+            live=frozenset(live),
+            compaction_neighbors=frozenset(neighbors),
+        )
+
+    def _selected_transcript_units(self) -> frozenset[str]:
+        selected: set[str] = set()
+        for key, unit in self._transcript.units.items():
+            for root in unit.mounted_roots:
+                if any(
+                    getattr(node, "text_selection", None)
+                    for node in (root, *root.walk_children())
+                ):
+                    selected.add(key)
+        return frozenset(selected)
+
+    def on_resize(self) -> None:
+        self._request_transcript_reconcile()
 
     def _is_tool_enabled_in_main_agent(self, tool: str) -> bool:
         return self.app_server.resources.runtime.has_tool(tool)
@@ -2406,6 +2644,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         # after _shutdown has closed the screen, so the worker would otherwise
         # mount into a closing tree and raise MountError. This runs on every
         # shutdown path (App.run_async and Pilot.run_test both call _shutdown).
+        self._transcript.reset()
         await self._stop_app_server_event_listener()
         await super()._shutdown()
 
@@ -2429,6 +2668,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     await self._resume_ui_ready.wait()
                     async with self._app_server_event_handler_lock:
                         if isinstance(event, TurnStarted):
+                            self._active_turn_start = (
+                                self._active_turn_start
+                                if self._active_turn_start is not None
+                                else self._transcript.admitted_end_index
+                            )
                             await self._prepare_main_turn_view()
                             # The in-flight turn surfaced: leave the pending state and
                             # wake any interrupt waiting for it.
@@ -2511,6 +2755,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
         incomplete_stream_retries: int = 0,
     ) -> None:
         turn_ui_generation = self._turn_ui_generation
+        if self._active_turn_start is None:
+            self._active_turn_start = self._transcript.admitted_end_index
         await self._remove_loading_widget()
         retry_incomplete_stream = False
 
@@ -2670,7 +2916,15 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 return
             if self.event_handler:
                 self.event_handler.clear_tool_call_anchors()
+            try:
+                self._admit_live_history()
+            except Exception:
+                logger.exception("Failed to admit live history while finalizing turn")
+            if self.event_handler:
+                self.event_handler.settle_turn()
             await self._refresh_windowing_from_history()
+            self._clear_active_turn_pins()
+            self._request_transcript_reconcile()
             self._terminal_notifier.notify(NotificationContext.COMPLETE)
 
     def _resolve_turn_error_message(self, e: Exception) -> str:
@@ -2746,6 +3000,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             # and _maybe_settle_interrupt would keep the window open while
             # accepted-but-unpaused items exist -- waiting on a pause that a
             # real interrupt would emit but this no-op never will.
+            self._clear_active_turn_pins()
             self._settle_interrupt()
             return
 
@@ -2801,6 +3056,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             interrupt = self.app_server.interrupt()
 
         if interrupt is None:
+            self._clear_active_turn_pins()
             self._settle_interrupt()
             return
 
@@ -3301,6 +3557,12 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self, session_id: str, history: list[PublicHistoryEntry]
     ) -> None:
         self._picker.previewing = True
+        self._preview_tool_group_expansion_state = ToolGroupExpansionState(
+            default_collapsed=self._tools_collapsed
+        )
+        self._preview_entry_expansion_state = EntryExpansionState(
+            default_collapsed=self._tools_collapsed
+        )
         self._reset_ui_state()
         plan = create_resume_plan(history, HISTORY_RESUME_TAIL_MESSAGES)
         with self.batch_update():
@@ -3325,10 +3587,16 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 remaining=self._history_backfill_remaining,
             )
 
+    def _exit_picker_preview(self) -> bool:
+        was_previewing = self._picker.exit_preview()
+        if was_previewing:
+            self._tools_collapsed = self._entry_expansion_state.default_collapsed
+        return was_previewing
+
     async def on_session_picker_app_session_selected(
         self, event: SessionPickerApp.SessionSelected
     ) -> None:
-        was_previewing = self._picker.exit_preview()
+        was_previewing = self._exit_picker_preview()
         await self._switch_to_input_app()
         # Mark ready in the finally (covers both the failure return and success),
         # but only after _resume_local_session so a turn can't dispatch mid-rebind.
@@ -3421,7 +3689,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if self._show_resume_picker:
             self._show_resume_picker = False
             self._startup_prompt_processed = True
-        if self._picker.exit_preview():
+        if self._exit_picker_preview():
             await self._rebuild_transcript_from_current_session()
             return
         self.run_worker(
@@ -3436,7 +3704,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         await self._mount_and_scroll(UserCommandMessage("Resume cancelled."))
 
     async def _resume_local_session(self, session_id: str) -> None:
-        self._picker.exit_preview()
+        self._exit_picker_preview()
         await self._close_agent_transcript_viewer(restore_focus=False)
         self._resume_ui_ready.clear()
         try:
@@ -3470,6 +3738,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     async def _reset_presentation_after_resume(self) -> None:
         """Discard presentation state owned by the previously attached session."""
+        self._entry_expansion_state.reset(default_collapsed=self._tools_collapsed)
+        self._tool_group_expansion_state.reset(default_collapsed=self._tools_collapsed)
         async with self._turn_ui_lock():
             self._turn_ui_generation += 1
             self._interrupt_requested = False
@@ -3639,6 +3909,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
         touch the agent loop's message history — callers decide whether the core
         history also needs clearing.
         """
+        self._entry_expansion_state.reset(default_collapsed=self._tools_collapsed)
+        self._tool_group_expansion_state.reset(default_collapsed=self._tools_collapsed)
         self._reset_ui_state()
         if self._chat_input_container:
             self._chat_input_container.set_custom_border(None)
@@ -4442,7 +4714,19 @@ class ChartreuxApp(App):  # noqa: PLR0904
         try:
             if not self._windowing.has_backfill:
                 if not await self._load_older_history_page():
+                    messages_area = self._messages_area
+                    # A failed/empty older-page fetch hides the button the user
+                    # scrolled up to click; keep the reading anchor's row.
+                    hiding_load_more = self._load_more.widget is not None
+                    reading_anchor = None
+                    if hiding_load_more and not self._chat_widget.is_at_bottom:
+                        await self._transcript._layout_pass(messages_area)
+                        reading_anchor = self._transcript._reading_anchor(messages_area)
                     await self._load_more.hide()
+                    if reading_anchor is not None:
+                        await self._restore_reading_anchor(
+                            reading_anchor, messages_area
+                        )
                     return
             if (batch := self._windowing.next_load_more_batch()) is None:
                 await self._load_more.hide()
@@ -4461,11 +4745,25 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 before=before,
                 after=after,
             )
+            # Removing an exhausted Load More button shrinks the content above the
+            # reading anchor; record the anchor first and restore its row after
+            # the removal so the view does not jump.
+            hiding_load_more = (
+                not self._has_older_history and self._load_more.widget is not None
+            )
+            reading_anchor = None
+            if hiding_load_more and not self._chat_widget.is_at_bottom:
+                # The prepend compensation's final scroll must be laid out before
+                # placement regions describe the settled reading anchor.
+                await self._transcript._layout_pass(messages_area)
+                reading_anchor = self._transcript._reading_anchor(messages_area)
             await self._load_more.set_visible(
                 messages_area,
                 visible=self._has_older_history,
                 remaining=self._history_backfill_remaining,
             )
+            if reading_anchor is not None:
+                await self._restore_reading_anchor(reading_anchor, messages_area)
         finally:
             self._load_more.set_enabled(True)
 
@@ -4503,18 +4801,32 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     async def action_toggle_tool(self) -> None:
         groups = list(self.query(ToolGroup))
-        # Individual group headers are authoritative: once every group has been
-        # expanded locally, Ctrl+O must collapse rather than repeat expansion.
-        self._tools_collapsed = (
-            all(not group.is_collapsed for group in groups)
-            if groups
-            else not self._tools_collapsed
+        sections = list(self.query(CollapsibleSection))
+        reasoning = list(self.query(ReasoningMessage))
+        group_state = (
+            self._preview_tool_group_expansion_state
+            if self._picker.previewing
+            else self._tool_group_expansion_state
         )
-        for section in self.query(CollapsibleSection):
-            section.set_collapsed(self._tools_collapsed)
-        self._tool_group_expansion_state.default_collapsed = self._tools_collapsed
+        entry_state = (
+            self._preview_entry_expansion_state
+            if self._picker.previewing
+            else self._entry_expansion_state
+        )
+        expanded = [not group_state.is_collapsed(key) for key in group_state.keys]
+        expanded.extend(
+            not group.is_collapsed for group in groups if group._key is None
+        )
+        self._tools_collapsed = all(expanded) if expanded else not self._tools_collapsed
+        group_state.set_all_collapsed(self._tools_collapsed)
+        entry_state.set_all_collapsed(self._tools_collapsed)
         for group in groups:
             group.set_collapsed(self._tools_collapsed)
+        for section in sections:
+            section.set_collapsed(self._tools_collapsed)
+        for node in reasoning:
+            await node.set_collapsed(self._tools_collapsed)
+        self._request_transcript_reconcile()
 
     def _refresh_context_progress(self) -> None:
         if self._context_progress is None:
@@ -4748,12 +5060,14 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     def action_scroll_chat_up(self) -> None:
         try:
+            self._request_transcript_reconcile(scroll_driven=True)
             self._chat_widget.scroll_relative(y=-5, animate=False)
         except Exception:
             pass
 
     def action_scroll_chat_down(self) -> None:
         try:
+            self._request_transcript_reconcile(scroll_driven=True)
             self._chat_widget.scroll_relative(y=5, animate=False)
         except Exception:
             pass
@@ -4879,19 +5193,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
             if isinstance(widget, StreamingMessageBase):
                 await widget.write_initial_content()
 
-        self.call_after_refresh(self._try_prune)
+        self._request_transcript_reconcile()
         if should_anchor:
             self._chat_widget.anchor()
-
-    async def _try_prune(self) -> None:
-        pruned = await prune_oldest_children(
-            self._messages_area, PRUNE_LOW_MARK, PRUNE_HIGH_MARK
-        )
-        if self._load_more.widget and not self._load_more.widget.parent:
-            self._load_more.widget = None
-        if pruned:
-            if self._chat_widget.is_at_bottom:
-                self.call_later(self._chat_widget.anchor)
 
     async def _refresh_windowing_from_history(self) -> None:
         if self._load_more.widget is None:
@@ -4899,16 +5203,25 @@ class ChartreuxApp(App):  # noqa: PLR0904
         messages_area = self._messages_area
         has_backfill = sync_backfill_state(
             history=self.app_server.history,
-            messages_children=list(messages_area.children),
-            history_widget_indices=self._history_widget_indices,
+            transcript=self._transcript,
             windowing=self._windowing,
         )
-        await self._load_more.set_visible(
-            messages_area,
-            visible=has_backfill
-            or self.app_server.resources.sessions.history_before_cursor is not None,
-            remaining=self._history_backfill_remaining,
+        visible = (
+            has_backfill
+            or self.app_server.resources.sessions.history_before_cursor is not None
         )
+        # Hiding a live transcript's Load More button shrinks the content above
+        # the reading anchor; keep its row. Fresh mounts and rebuilds never get
+        # here because they have no button to hide.
+        reading_anchor = None
+        if not visible and not self._chat_widget.is_at_bottom:
+            await self._transcript._layout_pass(messages_area)
+            reading_anchor = self._transcript._reading_anchor(messages_area)
+        await self._load_more.set_visible(
+            messages_area, visible=visible, remaining=self._history_backfill_remaining
+        )
+        if reading_anchor is not None:
+            await self._restore_reading_anchor(reading_anchor, messages_area)
 
     def _clipboard_notice_message(self, copy_result: ClipboardCopyResult) -> str:
         if copy_result.verified:

@@ -119,6 +119,7 @@ class CollapsibleSection(ClickWithoutDragMixin, Vertical):
             self._body = body
             body.display = False
         self._is_collapsed = True
+        self.on_collapse_changed: Callable[[bool], None] | None = None
         self._triangle = NonSelectableStatic("⏵", classes="collapsible-triangle")
 
     @property
@@ -164,6 +165,8 @@ class CollapsibleSection(ClickWithoutDragMixin, Vertical):
             self._show_body()
         self._triangle.update("⏵" if self._is_collapsed else "⏷")
         self._on_toggled(self._is_collapsed)
+        if self.on_collapse_changed is not None:
+            self.on_collapse_changed(self._is_collapsed)
         self.post_message(self.Toggled(self, self._is_collapsed))
         # Toggling reflows the row and resizes the body. Repaint after the reflow
         # settles, otherwise cells vacated by it ghost until the next scroll.

@@ -235,6 +235,7 @@ ignore_decorators = ["@*"]
 addopts = "-p pytest_chartreux -vvvv -q -n auto --dist=loadgroup --durations=10 --import-mode=importlib --maxschedchunk=1"
 timeout = 10
 markers = [
+    "perf: opt-in performance measurement scenario",
 ]
 filterwarnings = [
     # (e2e) streaming mock server is started in a thread; and the cli is spawn in a fork

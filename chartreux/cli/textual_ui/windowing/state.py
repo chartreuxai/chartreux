@@ -6,7 +6,6 @@ from textual.widget import Widget
 
 from chartreux.app_server.models import PublicHistoryEntry
 from chartreux.cli.textual_ui.widgets.load_more import HistoryLoadMoreMessage
-from chartreux.cli.textual_ui.windowing.history import history_entry_renders_widget
 
 HISTORY_RESUME_TAIL_MESSAGES = 20
 LOAD_MORE_BATCH_SIZE = 10
@@ -51,33 +50,16 @@ class SessionWindowing:
         return LoadMoreBatch(start_index=start_index, entries=batch)
 
     def recompute_backfill(
-        self,
-        history: list[PublicHistoryEntry],
-        visible_indices: list[int],
-        visible_history_widgets_count: int,
+        self, history: list[PublicHistoryEntry], *, admitted_start_index: int
     ) -> bool:
         if not history:
-            self._backfill_entries = []
-            self._backfill_cursor = 0
+            self.reset()
             return False
-        if visible_indices:
-            oldest_widget = min(visible_indices)
-            if oldest_widget > self._backfill_cursor:
-                prefix = history[self._backfill_cursor : oldest_widget]
-                backfill_end = (
-                    self._backfill_cursor
-                    if prefix
-                    and not any(history_entry_renders_widget(entry) for entry in prefix)
-                    else oldest_widget
-                )
-            else:
-                backfill_end = self._backfill_cursor
-        else:
-            backfill_end = max(len(history) - visible_history_widgets_count, 0)
-        backfill_end = min(backfill_end, len(history))
-        self._backfill_entries = history[:backfill_end]
-        self._backfill_cursor = len(self._backfill_entries)
-        return self._backfill_cursor > 0
+        # Admission is independent of DOM residency: eviction must never
+        # make an already admitted entry available through Load More again.
+        self._backfill_cursor = min(self._backfill_cursor, admitted_start_index)
+        self._backfill_entries = history[: self._backfill_cursor]
+        return self.has_backfill
 
 
 class HistoryLoadMoreManager:

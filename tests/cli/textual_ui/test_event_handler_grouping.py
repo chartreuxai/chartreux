@@ -7,9 +7,12 @@ import pytest
 from textual.widget import Widget
 
 from chartreux.app_server._shell import shell_effect_detail
+from chartreux.app_server.events import HistoryEntryAdded
 from chartreux.app_server.models import (
+    HookNoticeDetail,
     PublicEffectEntry,
     PublicEntryGenerationStatus,
+    PublicNoticeEntry,
     RunningEffectState,
 )
 from chartreux.cli.textual_ui.handlers.event_handler import EventHandler
@@ -382,6 +385,7 @@ async def test_restored_group_supports_local_expansion_and_ctrl_o() -> None:
         history_widget_indices=WeakKeyDictionary(),
         tools_collapsed=True,
         expansion_state=app._tool_group_expansion_state,
+        entry_expansion_state=app._entry_expansion_state,
     )[0]
 
     assert isinstance(restored_group, ToolGroup)
@@ -391,10 +395,62 @@ async def test_restored_group_supports_local_expansion_and_ctrl_o() -> None:
         await pilot.click(".tool-group-header")
         await pilot.pause()
         assert not restored_group.is_collapsed
+        assert app._entry_expansion_state.is_collapsed(projection.history[0].id)
 
+        # The folded child does not change the group-header direction rule.
         await app.action_toggle_tool()
         assert restored_group.is_collapsed
+        assert app._entry_expansion_state.is_collapsed(projection.history[0].id)
         assert app._tools_collapsed
+
+        await app.action_toggle_tool()
+        assert not restored_group.is_collapsed
+        assert not app._entry_expansion_state.is_collapsed(projection.history[0].id)
+
+
+@pytest.mark.asyncio
+async def test_hook_before_group_preserves_fold_choice_after_rebuild() -> None:
+    app = build_test_chartreux_app(config=build_test_vibe_config())
+    projection = CoreEventProjection()
+    notice = PublicNoticeEntry(
+        id="hook-first",
+        session_id="session-1",
+        created_at=1,
+        updated_at=1,
+        generation_status=PublicEntryGenerationStatus.COMPLETED,
+        level="info",
+        message="Hook started",
+        detail=HookNoticeDetail(kind="hook_run_started"),
+    )
+
+    async with app.run_test() as pilot:
+        handler = app.event_handler
+        assert handler is not None
+        await handler.handle_event(HistoryEntryAdded(notice))
+        await projection.dispatch(_call_event("after-hook"), handler.handle_event)
+        await pilot.pause()
+        live_group = app._messages_area.query_one(ToolGroup)
+        assert live_group._key is not None
+        assert live_group._key.first_entry_id == projection.history[0].id
+        live_group.set_collapsed(False)
+        live_group.set_collapsed(True)
+        assert live_group.is_collapsed
+
+        await app._messages_area.remove_children()
+        await app._messages_area.mount_all(
+            build_history_widgets(
+                [notice, *projection.history],
+                start_index=0,
+                history_widget_indices=WeakKeyDictionary(),
+                tools_collapsed=False,
+                expansion_state=app._tool_group_expansion_state,
+                entry_expansion_state=app._entry_expansion_state,
+            )
+        )
+        await pilot.pause()
+        rebuilt = app._messages_area.query_one(ToolGroup)
+        assert rebuilt._key == live_group._key
+        assert rebuilt.is_collapsed
 
 
 @pytest.mark.asyncio

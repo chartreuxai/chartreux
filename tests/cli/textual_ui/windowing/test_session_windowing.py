@@ -49,22 +49,21 @@ def test_recompute_backfill_keeps_cursor_when_oldest_widgets_skip_entry_prefix()
         *[_checkpoint(index) for index in range(80, 85)],
         _message(85, content="visible"),
     ]
-    visible_indices = [85]
-    has_backfill = w.recompute_backfill(
-        history, visible_indices=visible_indices, visible_history_widgets_count=1
-    )
+    has_backfill = w.recompute_backfill(history, admitted_start_index=80)
     assert has_backfill
     assert w.remaining == 80
 
 
-def test_recompute_backfill_advances_cursor_when_prefix_was_pruned() -> None:
+def test_recompute_backfill_does_not_resurrect_evicted_entries() -> None:
     history: list[PublicHistoryEntry] = [_message(index) for index in range(100)]
     w = SessionWindowing(LOAD_MORE_BATCH_SIZE)
     w.set_backfill(history[:70])
     assert w.remaining == 70
 
-    has_backfill = w.recompute_backfill(
-        history, visible_indices=[80], visible_history_widgets_count=10
-    )
+    has_backfill = w.recompute_backfill(history, admitted_start_index=70)
     assert has_backfill
-    assert w.remaining == 80
+    assert w.remaining == 70
+    assert w.next_load_more_batch() is not None
+    assert w.remaining == 60
+    w.recompute_backfill(history, admitted_start_index=60)
+    assert w.remaining == 60

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
+from textual.visual import VisualType
 from textual.widget import Widget
 from textual.widgets import Static
+
+if TYPE_CHECKING:
+    from textual.timer import Timer
 
 from chartreux.app_server.models import (
     CancelledEffectState,
@@ -25,6 +31,7 @@ from chartreux.cli.textual_ui.widgets.collapsible import (
     OverflowCollapsibleSection,
     lines_label,
 )
+from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
 from chartreux.cli.textual_ui.widgets.links import LinkStatic, linkify_urls_in_text
 from chartreux.cli.textual_ui.widgets.messages import ExpandingBorder
 from chartreux.cli.textual_ui.widgets.status_message import (
@@ -45,9 +52,13 @@ from chartreux.cli.textual_ui.widgets.tool_widgets import (
     effect_result_is_collapsible,
     get_result_widget,
     linkify_effect_result,
+    shell_output_body,
+    shell_output_is_large,
 )
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic, NonSelectableStatic
 from chartreux.utils.tool_presentation import ToolEffectKind
+
+TOOL_STREAM_WRITE_FRAME_SECONDS = 0.05
 
 _TOOL_CATEGORY_LABELS: dict[ToolEffectKind, str] = {
     ToolEffectKind.FILE_READ: "read files",
@@ -125,6 +136,7 @@ class ToolGroupHeader(ClickWithoutDragMixin, StatusMessage):
         super().__init__(initial_text="")
         self._categories: list[ToolEffectKind] = []
         self._has_reasoning = False
+        self._last_rendered_text: VisualType | None = None
         self._last_state = IndicatorState.SUCCESS
         self._is_collapsed = True
         self.add_class("tool-group-header")
@@ -182,9 +194,29 @@ class ToolGroupHeader(ClickWithoutDragMixin, StatusMessage):
                 "⏵" if self._is_collapsed else "⏷", layout=False
             )
 
+    def update_display(self) -> None:
+        if self._indicator_widget is None or self._text_widget is None:
+            return
+
+        if self._is_spinning:
+            self._indicator_widget.update(self._spinner.next_frame(), layout=False)
+        else:
+            self._indicator_widget.update(
+                self.SETTLED_GLYPH or self._state.glyph, layout=False
+            )
+
+        for state in IndicatorState:
+            self._indicator_widget.set_class(
+                not self._is_spinning and state is self._state, state.css_class
+            )
+
+        self._update_text()
+
     def _update_text(self) -> None:
-        if self._text_widget is not None:
-            self._text_widget.update(self.get_content())
+        text = self._format_text(self.get_content())
+        if self._text_widget is not None and text != self._last_rendered_text:
+            self._text_widget.update(text)
+            self._last_rendered_text = text
 
     async def on_click(self, event: events.Click) -> None:
         if self._click_is_passive(event):
@@ -211,7 +243,7 @@ class ToolGroup(Vertical):
         self._border = ExpandingBorder(classes="tool-result-border")
         self._timeline_status = TimelineStatus()
         self._is_collapsed = (
-            expansion_state.is_collapsed(key)
+            expansion_state.register(key)
             if key is not None and expansion_state is not None
             else True
         )
@@ -304,6 +336,8 @@ class ToolCallMessage(StatusMessage):
         self._entry = entry
         self._tool_name = entry.detail.tool_name
         self._stream_widget: NoMarkupStatic | None = None
+        self._stream_message_buffer: str | None = None
+        self._stream_write_timer: Timer | None = None
         self._suffix_widget: NoMarkupStatic | None = None
         self._verb_widget: NoMarkupStatic | None = None
         self._header_row: Horizontal | None = None
@@ -404,18 +438,45 @@ class ToolCallMessage(StatusMessage):
         return self._entry.detail.display
 
     def update_entry(self, entry: PublicEffectEntry) -> None:
+        previous_header = self._header_parts()
         self._entry = entry
         self._tool_name = entry.detail.tool_name
         verb, message, suffix = self._header_parts()
-        self._set_text(message, suffix, verb=verb)
+        if (verb, message, suffix) != previous_header:
+            self._set_text(message, suffix, verb=verb)
 
     def set_stream_message(self, message: str) -> None:
-        """Update the stream message displayed below the tool call indicator."""
-        if self._stream_widget:
-            self._stream_widget.update(f"→ {message}")
-            self._stream_widget.display = True
+        """Coalesce stream-message refreshes while retaining the latest delta."""
+        if self._stream_widget is None:
+            return
+        self._stream_message_buffer = message
+        if not self.is_mounted:
+            self._flush_stream_message()
+        elif self._stream_write_timer is None:
+            self._stream_write_timer = self.set_timer(
+                TOOL_STREAM_WRITE_FRAME_SECONDS, self._flush_stream_message
+            )
+
+    def _flush_stream_message(self) -> None:
+        self._cancel_stream_write_timer()
+        message = self._stream_message_buffer
+        self._stream_message_buffer = None
+        if message is None or self._stream_widget is None:
+            return
+        self._stream_widget.update(f"→ {message}")
+        self._stream_widget.display = True
+
+    def _cancel_stream_write_timer(self) -> None:
+        if self._stream_write_timer is not None:
+            self._stream_write_timer.stop()
+            self._stream_write_timer = None
+
+    def on_unmount(self) -> None:
+        self._cancel_stream_write_timer()
+        self._stream_message_buffer = None
 
     def settle(self, state: IndicatorState) -> None:
+        self._flush_stream_message()
         super().settle(state)
         if self._stream_widget is None:
             return
@@ -425,6 +486,7 @@ class ToolCallMessage(StatusMessage):
     def set_result_text(
         self, text: str, suffix: str = "", *, verb: str = "", linkify: bool = False
     ) -> None:
+        self._flush_stream_message()
         self._set_text(text, suffix, verb=verb, linkify=linkify)
 
     def _set_text(
@@ -472,9 +534,18 @@ class ToolCallMessage(StatusMessage):
 
 class ToolResultMessage(ClickWithoutDragMixin, Static):
     def __init__(
-        self, entry: PublicEffectEntry, call_widget: ToolCallMessage | None = None
+        self,
+        entry: PublicEffectEntry,
+        call_widget: ToolCallMessage | None = None,
+        *,
+        expansion_state: EntryExpansionState | None = None,
     ) -> None:
         self._entry = entry
+        self._expansion_state = expansion_state
+        if expansion_state is not None and (
+            _result_is_collapsible(entry) or isinstance(entry.state, FailedEffectState)
+        ):
+            expansion_state.register(entry.id)
         self._call_widget = call_widget
         self._tool_name = entry.detail.tool_name
         self._content_container: Vertical | None = None
@@ -605,7 +676,12 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
             return None
         if not isinstance(self._state, FailedEffectState | CancelledEffectState):
             return None
-        return clean_output(self._state.output_text).strip("\n") or "(no output)"
+        cleaned = clean_output(self._state.output_text)
+        return (
+            cleaned
+            if shell_output_is_large(cleaned)
+            else cleaned.strip("\n") or "(no output)"
+        )
 
     def _get_result_parts(self) -> tuple[str, str, str]:
         if isinstance(self._state, FailedEffectState):
@@ -626,6 +702,20 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
             await self._render_result_collapsible()
         else:
             await self._render_result_expanded()
+
+    async def _mount_section(
+        self, section: CollapsibleSection, container: Widget
+    ) -> None:
+        state = self._expansion_state
+        if state is not None:
+            collapsed = state.register(self._entry.id)
+            section.on_collapse_changed = lambda value: state.set_collapsed(
+                self._entry.id, value
+            )
+        else:
+            collapsed = True
+        await container.mount(section)
+        section.set_collapsed(collapsed)
 
     async def _render_result_collapsible(self) -> None:
         # Bodies are built lazily (factory closures): a collapsed result keeps
@@ -648,10 +738,7 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
                     Content.from_markup("[$error]Error[/]: ") + Content(error)
                 )
                 body: Widget = (
-                    Vertical(
-                        error_widget,
-                        NoMarkupStatic(output, classes="tool-result-detail"),
-                    )
+                    Vertical(error_widget, shell_output_body(output))
                     if output is not None
                     else error_widget
                 )
@@ -664,7 +751,7 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
                 header_suffix=suffix,
                 header_muted=True,
             )
-            await self.mount(self._muted_section)
+            await self._mount_section(self._muted_section, self)
             if self._call_widget:
                 self._call_widget.display = False
             self.display = True
@@ -677,10 +764,7 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
             def build_skipped_body() -> Widget:
                 reason_widget = NoMarkupStatic(f"Skipped: {reason}")
                 return self._bordered(
-                    Vertical(
-                        reason_widget,
-                        NoMarkupStatic(output, classes="tool-result-detail"),
-                    )
+                    Vertical(reason_widget, shell_output_body(output))
                     if output is not None
                     else reason_widget
                 )
@@ -690,7 +774,7 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
                 header_text=self._muted_header_text(),
                 header_muted=True,
             )
-            await self.mount(self._muted_section)
+            await self._mount_section(self._muted_section, self)
             if self._call_widget:
                 self._call_widget.display = False
             self.display = True
@@ -751,7 +835,7 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
             collapsible=has_body,
         )
         self._muted_section = section if not display.success else None
-        await self.mount(section)
+        await self._mount_section(section, self)
         if self._call_widget:
             self._call_widget.display = False
         self.display = True
@@ -775,18 +859,16 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
                     Content.from_markup("[$error]Error[/]: ") + Content(message)
                 )
                 return (
-                    Vertical(
-                        error_widget,
-                        NoMarkupStatic(output, classes="tool-result-detail"),
-                    )
+                    Vertical(error_widget, shell_output_body(output))
                     if output is not None
                     else error_widget
                 )
 
-            await self._content_container.mount(
+            await self._mount_section(
                 OverflowCollapsibleSection(
                     build_error_body, collapsed_label=lines_label(line_count)
-                )
+                ),
+                self._content_container,
             )
             self.display = True
             return
@@ -797,9 +879,7 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
             output = self._manual_shell_output()
             await self._content_container.mount(NoMarkupStatic(f"Skipped: {reason}"))
             if output is not None:
-                await self._content_container.mount(
-                    NoMarkupStatic(output, classes="tool-result-detail")
-                )
+                await self._content_container.mount(shell_output_body(output))
             self.display = True
             return
 

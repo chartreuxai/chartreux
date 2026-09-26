@@ -83,6 +83,7 @@ class AgentBar(VerticalScroll):
         self._previous_agent_ids: tuple[str, ...] = ()
         self._content: NoMarkupStatic | None = None
         self._rendered = ""
+        self._last_rendered_content: str | None = None
 
     def compose(self) -> ComposeResult:
         self._content = NoMarkupStatic(id="agent-bar-content")
@@ -236,8 +237,9 @@ class AgentBar(VerticalScroll):
 
     def _update_content(self, content: str) -> None:
         self._rendered = content
-        if self._content is not None:
+        if self._content is not None and content != self._last_rendered_content:
             self._content.update(content)
+            self._last_rendered_content = content
 
     def _row(self, agent_id: str | None, details: str) -> str:
         return f"{'›' if agent_id == self._selected_agent_id else ' '} {details}"

@@ -4,10 +4,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from chartreux.app_server.models import AgentStatsSnapshot, SessionLogSummary
+from chartreux.app_server.models import (
+    AgentStatsSnapshot,
+    PublicHistoryEntry,
+    SessionLogSummary,
+)
 from chartreux.cli.textual_ui.app import ChartreuxApp
 from chartreux.cli.textual_ui.widgets.context_progress import ContextProgress
 from chartreux.cli.textual_ui.widgets.messages import UserCommandMessage
+from tests.cli.textual_ui.test_history_grouping import _message
 from tests.conftest import build_test_chartreux_app
 
 _SPENT_TOKENS = 50_000
@@ -48,6 +53,20 @@ def _empty_the_context(chartreux_app: ChartreuxApp) -> None:
     other half: that the widget re-reads the cache instead of waiting for an event.
     """
     chartreux_app.app_server.resources.runtime._state.stats = AgentStatsSnapshot()
+
+
+@pytest.mark.asyncio
+async def test_reset_message_widgets_cancels_transcript_window(
+    chartreux_app: ChartreuxApp,
+) -> None:
+    async with chartreux_app.run_test():
+        chartreux_app._transcript.admit([_message(0)], start_index=0)
+        backfill: list[PublicHistoryEntry] = [_message(1)]
+        chartreux_app._windowing.set_backfill(backfill)
+        assert chartreux_app._transcript.unit_ids
+        await chartreux_app._reset_message_widgets()
+        assert not chartreux_app._transcript.unit_ids
+        assert not chartreux_app._windowing.has_backfill
 
 
 @pytest.mark.asyncio

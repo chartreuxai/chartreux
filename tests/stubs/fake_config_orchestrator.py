@@ -43,6 +43,7 @@ class FakeConfigOrchestrator[C: ChartreuxConfigSchema](ConfigOrchestrator[C]):
         self._extra_layers: list[ConfigLayer[RawConfig]] = []
         self._bus = EventBus()
         self._policy_owner = uuid4()
+        self._accepted_token = uuid4()
         self._availability_registry = AvailabilityRegistry()
 
     def copy(self, *, config: C | None = None) -> FakeConfigOrchestrator[C]:

@@ -5689,6 +5689,311 @@ async def test_fan_out_launches_ordered_retained_members_with_exact_shape(
 
 
 @pytest.mark.asyncio
+async def test_fan_out_emits_one_coalesced_launch_update_and_terminal_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, parent, context = await _fan_out_registry(
+        monkeypatch, role_members=["small", "large"]
+    )
+    backend = BlockingBackend()
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_kwargs: backend
+    )
+    registry._notify_agents = AsyncMock()
+    notifier = cast(AsyncMock, registry._notify_agents)
+    try:
+        result = await _background_result(
+            registry,
+            TaskArgs(task="panel", fan_out=True, config=LaunchConfig(model="@panel")),
+            context,
+        )
+
+        assert result.members is not None
+        assert len(result.members) == 2
+        notifier.assert_awaited_once()
+        assert notifier.await_args is not None
+        launch_agents = notifier.await_args.args[0]
+        assert len(launch_agents) == 2
+        assert {agent.agent_id for agent in launch_agents} == set(
+            registry._agent_records
+        )
+
+        backend.release.set()
+        completions = await asyncio.gather(
+            *(
+                registry.wait_for_agent(member.agent_id, member.run_id)
+                for member in result.members
+                if member.agent_id is not None and member.run_id is not None
+            )
+        )
+        assert all(completion.completed for completion in completions)
+        assert notifier.await_count >= 3
+        assert any(
+            agent.last_run_status == "completed"
+            for call in notifier.await_args_list[1:]
+            for agent in call.args[0]
+        )
+    finally:
+        backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fan_out_terminal_update_is_published_during_launch_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, parent, context = await _fan_out_registry(
+        monkeypatch, role_members=["small", "large"]
+    )
+    updates: list[list[Any]] = []
+    first_terminal_update = asyncio.Event()
+    terminal_update_position: int | None = None
+
+    async def notify_agents(agents: list[Any], _evictions: list[Any]) -> None:
+        nonlocal terminal_update_position
+        updates.append(agents)
+        if terminal_update_position is None and any(
+            agent.last_run_status == "completed" for agent in agents
+        ):
+            terminal_update_position = len(updates) - 1
+            first_terminal_update.set()
+
+    registry._notify_agents = notify_agents
+    original_start = registry._start_fan_out_member_effect
+    second_member_started = False
+
+    async def wait_for_first_terminal(
+        parent_runtime: SessionRuntime,
+        parent_tool_call_id: str,
+        member_tool_call_id: str,
+    ) -> None:
+        nonlocal second_member_started
+        if member_tool_call_id.endswith(":fan-out:1"):
+            await asyncio.wait_for(first_terminal_update.wait(), timeout=5)
+            second_member_started = True
+        await original_start(parent_runtime, parent_tool_call_id, member_tool_call_id)
+
+    monkeypatch.setattr(
+        registry, "_start_fan_out_member_effect", wait_for_first_terminal
+    )
+    try:
+        result = await _background_result(
+            registry,
+            TaskArgs(task="panel", fan_out=True, config=LaunchConfig(model="@panel")),
+            context,
+        )
+
+        assert result.members is not None
+        assert second_member_started
+        assert terminal_update_position is not None
+        assert any(
+            agent.last_run_status == "completed"
+            for agent in updates[terminal_update_position]
+        )
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fan_out_partial_launch_failure_still_emits_coalesced_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, parent, context = await _fan_out_registry(monkeypatch)
+    backend = BlockingBackend()
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_kwargs: backend
+    )
+    registry._notify_agents = AsyncMock()
+    notifier = cast(AsyncMock, registry._notify_agents)
+    original_run = registry.run
+
+    async def fail_large_member(args: TaskArgs, ctx: InvokeContext, **kwargs: Any):
+        if (
+            not args.fan_out
+            and args.config is not None
+            and args.config.model == "large"
+        ):
+            raise RuntimeError("synthetic member launch failure")
+        async for event in original_run(args, ctx, **kwargs):
+            yield event
+
+    monkeypatch.setattr(registry, "run", fail_large_member)
+    try:
+        result = await _background_result(
+            registry,
+            TaskArgs(task="panel", fan_out=True, config=LaunchConfig(model="@panel")),
+            context,
+        )
+
+        assert result.members is not None
+        assert [member.status for member in result.members] == [
+            "running",
+            "failed",
+            "running",
+        ]
+        notifier.assert_awaited_once()
+        assert notifier.await_args is not None
+        assert len(notifier.await_args.args[0]) == 2
+    finally:
+        backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_direct_background_launches_still_emit_each_launch_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, parent, context = await _fan_out_registry(monkeypatch)
+    backend = BlockingBackend()
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_kwargs: backend
+    )
+    registry._notify_agents = AsyncMock()
+    notifier = cast(AsyncMock, registry._notify_agents)
+    try:
+        for launch_number in range(1, 3):
+            result = await _background_result(
+                registry,
+                TaskArgs(task=f"direct launch {launch_number}", background=True),
+                context,
+            )
+            assert result.status == "launched"
+            assert notifier.await_count == launch_number
+
+        assert [len(call.args[0]) for call in notifier.await_args_list] == [1, 2]
+    finally:
+        backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fan_out_reuses_preflight_candidates_for_child_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, parent, context = await _fan_out_registry(monkeypatch)
+    resolver = MagicMock(wraps=registry._resolve_launch_candidate)
+    monkeypatch.setattr(registry, "_resolve_launch_candidate", resolver)
+    try:
+        result = await _background_result(
+            registry,
+            TaskArgs(task="panel", fan_out=True, config=LaunchConfig(model="@panel")),
+            context,
+        )
+
+        assert result.completed
+        assert resolver.call_count == len(result.members or []) == 3
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fan_out_stale_preflight_candidate_falls_back_to_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, parent, context = await _fan_out_registry(
+        monkeypatch, role_members=["small"]
+    )
+    resolver = MagicMock(wraps=registry._resolve_launch_candidate)
+    monkeypatch.setattr(registry, "_resolve_launch_candidate", resolver)
+
+    async def change_catalog_snapshot(
+        _parent: SessionRuntime, _parent_tool_call_id: str, _member_tool_call_id: str
+    ) -> None:
+        parent.config.attach_catalog_snapshot(
+            _fan_out_snapshot(role_members=["small"], disabled={"small"})
+        )
+
+    monkeypatch.setattr(
+        registry, "_start_fan_out_member_effect", change_catalog_snapshot
+    )
+    try:
+        result = await _background_result(
+            registry,
+            TaskArgs(task="panel", fan_out=True, config=LaunchConfig(model="@panel")),
+            context,
+        )
+
+        assert resolver.call_count == 2
+        assert result.members is not None
+        member = result.members[0]
+        assert member.status == "failed"
+        assert member.base_model == "small"
+        assert member.provider == "test/first"
+        assert member.error is not None
+        assert member.error["code"] == "launch_failed"
+        assert "disabled" in member.error["message"]
+        assert registry._agent_records == {}
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fan_out_re_resolves_preflight_candidate_when_deployment_cools_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, parent, context = await _fan_out_registry(
+        monkeypatch, role_members=["small"]
+    )
+    original_resolver = registry._resolve_launch_candidate
+    resolved_candidates: list[Any] = []
+
+    def resolve_and_capture(*args: Any, **kwargs: Any) -> Any:
+        candidate = original_resolver(*args, **kwargs)
+        resolved_candidates.append(candidate)
+        return candidate
+
+    resolver = MagicMock(side_effect=resolve_and_capture)
+    monkeypatch.setattr(registry, "_resolve_launch_candidate", resolver)
+
+    async def cool_down_preflight_deployment(
+        _parent: SessionRuntime, _parent_tool_call_id: str, _member_tool_call_id: str
+    ) -> None:
+        candidate = resolved_candidates[0]
+        identity = candidate.committed_model
+        assert (
+            candidate.orchestrator.availability_registry
+            is parent.config_orchestrator.availability_registry
+        )
+        parent.config_orchestrator.availability_registry.record_failure(
+            identity.base_model, identity.provider
+        )
+        assert not candidate.orchestrator.availability_registry.is_available(
+            identity.base_model, identity.provider
+        )
+
+    monkeypatch.setattr(
+        registry, "_start_fan_out_member_effect", cool_down_preflight_deployment
+    )
+    try:
+        result = await _background_result(
+            registry,
+            TaskArgs(task="panel", fan_out=True, config=LaunchConfig(model="@panel")),
+            context,
+        )
+
+        assert resolver.call_count == 2
+        assert resolved_candidates[1].committed_model.provider != (
+            resolved_candidates[0].committed_model.provider
+        )
+        assert result.members is not None
+        assert result.members[0].base_model == "small"
+        assert any(
+            record.runtime.agent_loop.committed_model
+            == resolved_candidates[1].committed_model
+            for record in registry._agent_records.values()
+        )
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
 async def test_fan_out_links_members_during_a_projected_parent_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6144,7 +6449,7 @@ async def test_fan_out_propagates_launch_cancellation_without_launching_later_me
     )
     launched: list[str] = []
 
-    async def cancelled_run(args: TaskArgs, ctx: InvokeContext):
+    async def cancelled_run(args: TaskArgs, ctx: InvokeContext, **_kwargs: Any):
         launched.append(cast(str, args.config and args.config.model))
         raise asyncio.CancelledError()
         yield TaskResult(response="", turns_used=0, completed=False)
@@ -6173,7 +6478,7 @@ async def test_fan_out_failed_launch_discards_pending_result_lease(
         monkeypatch, role_members=["small"]
     )
 
-    async def failed_run(_args: TaskArgs, _ctx: InvokeContext):
+    async def failed_run(_args: TaskArgs, _ctx: InvokeContext, **_kwargs: Any):
         raise RuntimeError("launch failed")
         yield TaskResult(response="", turns_used=0, completed=False)
 
@@ -6207,10 +6512,10 @@ async def test_fan_out_launch_cancellation_releases_already_started_members(
     )
     original_run = registry.run
 
-    async def cancel_second(args: TaskArgs, ctx: InvokeContext):
+    async def cancel_second(args: TaskArgs, ctx: InvokeContext, **kwargs: Any):
         if args.config is not None and args.config.model == "large":
             raise asyncio.CancelledError()
-        async for event in original_run(args, ctx):
+        async for event in original_run(args, ctx, **kwargs):
             yield event
 
     monkeypatch.setattr(registry, "run", cancel_second)

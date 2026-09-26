@@ -91,8 +91,9 @@ async def test_group_summary_and_individual_error_muting_are_separate() -> None:
     await projection.dispatch(_call_event("b"), handler.handle_event)
     await projection.dispatch(_ok_result("b"), handler.handle_event)
 
-    group = handler.current_tool_group
+    group = handler._finalized_tool_group
     assert group is not None
+    assert handler.current_tool_group is None
     assert group.header._last_state is IndicatorState.SUCCESS
     assert failed_result._should_escalate is False
 
