@@ -266,7 +266,7 @@ class EditResultWidget(ToolResultWidget[FileEditOutput]):
             yield from self._footer()
             return
         warnings = [
-            NoMarkupStatic(f"⚠ {w}", classes="tool-result-warning")
+            NoMarkupStatic(f"! Warning: {w}", classes="tool-result-warning")
             for w in self.warnings
         ]
         # Wrap the diff in a horizontal-scroll container so wide lines can be
@@ -355,9 +355,17 @@ class ReadResultWidget(ToolResultWidget[FileReadOutput]):
             yield from self._footer()
             return
         for warning in self.warnings:
-            yield NoMarkupStatic(f"⚠ {warning}", classes="tool-result-warning")
+            yield NoMarkupStatic(f"! Warning: {warning}", classes="tool-result-warning")
         if self.result.content:
             ext = Path(self.result.file_path).suffix.lstrip(".") or "text"
+            if any(
+                _LINE_NUMBER_PREFIX.match(line)
+                for line in self.result.content.splitlines()
+            ):
+                yield NoMarkupStatic(
+                    "Displayed content omits captured line numbers.",
+                    classes="tool-result-hint",
+                )
             yield from self._yield_markdown(
                 _strip_line_numbers(self.result.content), ext=ext
             )
@@ -367,7 +375,7 @@ class ReadResultWidget(ToolResultWidget[FileReadOutput]):
 class GrepResultWidget(ToolResultWidget[FileSearchOutput]):
     def compose(self) -> ComposeResult:
         for warning in self.warnings:
-            yield NoMarkupStatic(f"⚠ {warning}", classes="tool-result-warning")
+            yield NoMarkupStatic(f"! Warning: {warning}", classes="tool-result-warning")
         if not self.result or not self.result.matches:
             yield from self._footer()
             return

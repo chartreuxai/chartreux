@@ -9,6 +9,7 @@ from textual.visual import VisualType
 from textual.widgets import Static
 
 from chartreux.cli.textual_ui.widgets.spinner import SpinnerMixin, SpinnerType
+from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic, NonSelectableStatic
 
 
@@ -21,11 +22,11 @@ class IndicatorState(StrEnum):
     def glyph(self) -> str:
         match self:
             case IndicatorState.SUCCESS:
-                return "✓"
+                return chrome_glyph("success")
             case IndicatorState.ERROR:
-                return "✕"
+                return chrome_glyph("error")
             case IndicatorState.MUTED:
-                return "□"
+                return chrome_glyph("muted")
 
     @property
     def css_class(self) -> str:

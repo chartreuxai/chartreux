@@ -6,6 +6,7 @@ from textual.content import Content
 
 from chartreux.app_server.models import (
     EffectCallDisplay,
+    FileReadEffectOutput,
     GenericEffectDetail,
     ShellEffectDetail,
     ShellEffectInput,
@@ -14,6 +15,7 @@ from chartreux.app_server.models import (
 from chartreux.cli.textual_ui.widgets.collapsible import CollapsibleSection
 from chartreux.cli.textual_ui.widgets.tool_widgets import (
     GenericToolResultWidget,
+    ReadResultWidget,
     ToolResultWidget,
     _fenced_code_block,
     _strip_line_numbers,
@@ -97,6 +99,17 @@ def test_leaves_warning_lines_untouched() -> None:
 def test_preserves_arrows_inside_content() -> None:
     content = "        1→a → b → c"
     assert _strip_line_numbers(content) == "a → b → c"
+
+
+def test_read_result_discloses_removed_line_numbers() -> None:
+    result = FileReadEffectOutput(
+        file_path="x.py", content="   10→hello", num_lines=1, start_line=10
+    )
+    children = list(ReadResultWidget(result, True, "read").compose())
+    hint = children[0].render()
+    assert isinstance(hint, Content)
+    assert "omits captured line numbers" in hint.plain
+    assert len(children) == 2
 
 
 def test_fence_uses_three_backticks_for_plain_content() -> None:

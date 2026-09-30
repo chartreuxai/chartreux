@@ -1,19 +1,32 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncGenerator
 import json
+from unittest.mock import Mock
 
 import pytest
 
-from chartreux.core.config import ProviderConfig
+from chartreux.core.agent_loop.llm_gateway import (
+    CallResources,
+    CompletionInputs,
+    LLMGateway,
+    TranscriptAppend,
+    messages_for_backend,
+)
+from chartreux.core.config import ModelConfig, ProviderConfig
 from chartreux.core.llm.backend.anthropic import AnthropicAdapter, AnthropicMapper
+from chartreux.core.llm.types import BackendLike
 from chartreux.core.llm_models import (
     AvailableFunction,
     AvailableTool,
     FunctionCall,
+    LLMChunk,
     LLMMessage,
     Role,
     ToolCall,
 )
+from chartreux.core.session_types import AgentStats
 from tests.constants import ANTHROPIC_BASE_URL, ANTHROPIC_MESSAGES_PATH
 
 
@@ -35,6 +48,85 @@ def provider():
         api_key_env_var="ANTHROPIC_API_KEY",
         api_style="anthropic",
     )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_thinking_is_durable_but_omitted_from_next_request(provider):
+    adapter = AnthropicAdapter()
+    events = [
+        {"type": "message_start", "message": {}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "unfinished thought"},
+        },
+    ]
+
+    async def interrupted_stream(**kwargs) -> AsyncGenerator[LLMChunk, None]:
+        for event in events:
+            yield adapter.parse_response(event)
+        raise asyncio.CancelledError
+
+    backend = Mock(spec=BackendLike)
+    backend.complete_streaming = interrupted_stream
+    model = ModelConfig(
+        name="claude-sonnet-4-20250514", alias="test", provider=provider.name
+    )
+    history = [LLMMessage(role=Role.user, content="First request")]
+    inputs = CompletionInputs(
+        model=model,
+        provider_name=provider.name,
+        emits_finish_reason=True,
+        messages=tuple(history),
+        tools=None,
+        tool_choice=None,
+        extra_headers={},
+        metadata={},
+        max_tokens=1024,
+    )
+    resources = CallResources(
+        backend=backend, stats=AgentStats(), process_message=lambda message: message
+    )
+    outcomes: list[TranscriptAppend] = []
+    with pytest.raises(asyncio.CancelledError):
+        async for _ in LLMGateway().chat_streaming(
+            inputs, resources, transcript=outcomes.append
+        ):
+            pass
+
+    assert len(outcomes) == 1
+    assert outcomes[0].kind == "interrupted"
+    partial = outcomes[0].message
+    assert partial.reasoning_content == "unfinished thought"
+    assert not partial.reasoning_payloads
+    history.extend([partial, LLMMessage(role=Role.user, content="Next request")])
+    projected = messages_for_backend(history, model)
+    # Provider-independent context retains durable reasoning.
+    assert partial in projected
+    request = AnthropicAdapter().prepare_request(
+        model_name=model.name,
+        messages=projected,
+        temperature=0.5,
+        tools=None,
+        max_tokens=1024,
+        tool_choice=None,
+        enable_streaming=True,
+        provider=provider,
+        thinking="off",
+    )
+    wire_messages = json.loads(request.body)["messages"]
+    assert [message["role"] for message in wire_messages] == ["user", "user"]
+    assert [message["content"][0]["text"] for message in wire_messages] == [
+        "First request",
+        "Next request",
+    ]
+    assert history[1] is partial
+    assert partial.reasoning_content == "unfinished thought"
 
 
 class TestMapperPrepareMessages:
@@ -321,6 +413,77 @@ class TestMapperParseResponse:
 
 
 class TestAdapterPrepareRequest:
+    @pytest.mark.parametrize(
+        ("message", "expected_role", "expected_block"),
+        [
+            (
+                LLMMessage(role=Role.assistant, content="Answer"),
+                "assistant",
+                {"type": "text", "text": "Answer"},
+            ),
+            (
+                LLMMessage(
+                    role=Role.assistant,
+                    tool_calls=[
+                        ToolCall(
+                            id="tc_1",
+                            function=FunctionCall(name="search", arguments="{}"),
+                        )
+                    ],
+                ),
+                "assistant",
+                {"type": "tool_use", "id": "tc_1", "name": "search", "input": {}},
+            ),
+            (
+                LLMMessage(
+                    role=Role.assistant,
+                    reasoning_payloads=[
+                        {"type": "thinking", "thinking": "", "signature": "sig"}
+                    ],
+                ),
+                "assistant",
+                {"type": "thinking", "thinking": "", "signature": "sig"},
+            ),
+            (
+                LLMMessage(
+                    role=Role.assistant,
+                    reasoning_payloads=[{"type": "redacted_thinking", "data": "xyz"}],
+                ),
+                "assistant",
+                {"type": "redacted_thinking", "data": "xyz"},
+            ),
+            (
+                LLMMessage(role=Role.tool, content="", tool_call_id="tc_1"),
+                "user",
+                {"type": "tool_result", "tool_use_id": "tc_1", "content": ""},
+            ),
+        ],
+        ids=[
+            "text",
+            "tool-call",
+            "signed-thinking",
+            "redacted-thinking",
+            "tool-result",
+        ],
+    )
+    def test_nonempty_provider_blocks_are_preserved(
+        self, adapter, provider, message, expected_role, expected_block
+    ):
+        request = adapter.prepare_request(
+            model_name="claude-sonnet-4-20250514",
+            messages=[message, LLMMessage(role=Role.user, content="Next request")],
+            temperature=0.5,
+            tools=None,
+            max_tokens=1024,
+            tool_choice=None,
+            enable_streaming=True,
+            provider=provider,
+            thinking="off",
+        )
+        wire_messages = json.loads(request.body)["messages"]
+        assert wire_messages[0]["role"] == expected_role
+        assert wire_messages[0]["content"][0] == expected_block
+
     def test_basic(self, adapter, provider):
         messages = [LLMMessage(role=Role.user, content="Hello")]
         req = adapter.prepare_request(

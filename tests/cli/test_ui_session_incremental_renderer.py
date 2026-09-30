@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 import time
 
 import pytest
@@ -19,8 +18,7 @@ from chartreux.cli.textual_ui.windowing import (
 )
 from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
 from chartreux.core.llm_models import LLMMessage, Role
-from tests.conftest import build_test_agent_loop
-from tests.stubs.app_server import create_test_app_server_session
+from tests.conftest import build_test_agent_loop, build_test_chartreux_app
 
 
 @pytest.fixture
@@ -29,10 +27,7 @@ def vibe_config(make_config) -> ChartreuxConfigSchema:
 
 
 def _app(agent_loop) -> ChartreuxApp:
-    return ChartreuxApp(
-        app_server=lambda: create_test_app_server_session(agent_loop),
-        history_file=Path(".chartreuxhistory"),
-    )
+    return build_test_chartreux_app(agent_loop=agent_loop)
 
 
 async def _wait_until(pause, predicate, timeout: float = 2.0) -> None:

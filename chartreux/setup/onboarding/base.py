@@ -10,8 +10,7 @@ from textual.screen import Screen
 class OnboardingHost:
     """Small host adapter used by onboarding-only screens."""
 
-    show_theme: Callable[[], None]
-    confirm_theme: Callable[[str], None]
+    show_providers: Callable[[], None]
     cancel: Callable[[], None]
 
 

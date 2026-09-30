@@ -122,3 +122,55 @@ async def test_restart_title_drain_rebinds_when_the_loop_changes() -> None:
     await asyncio.sleep(0)
     assert first.cancelled()
     second.cancel()
+
+
+@pytest.mark.asyncio
+async def test_resume_admission_racing_agent_start_rejects_before_drain() -> None:
+    from chartreux.app_server._execution import SessionExecutionConflict
+    from chartreux.app_server._sessions import SessionRuntimeRegistry
+    from chartreux.core.subagents import RunStatus
+
+    registry: Any = object.__new__(SessionRuntimeRegistry)
+    registry._ensure_child_lock = asyncio.Lock()
+    registry._agent_records = {}
+    registry._creating_children = 0
+    registry._admission_closed = False
+    root = SimpleNamespace(
+        execution=SimpleNamespace(active=None),
+        turns=SimpleNamespace(has_queued_turns=False, callbacks=[]),
+    )
+    async with registry._ensure_child_lock:
+        admission = asyncio.create_task(registry.reserve_resume_admission(root))
+        await asyncio.sleep(0)
+        registry._agent_records["agent"] = SimpleNamespace(
+            current_run=SimpleNamespace(status=RunStatus.RUNNING)
+        )
+    with pytest.raises(SessionExecutionConflict, match="background agents are running"):
+        await admission
+    assert not registry._admission_closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["queue", "decision"])
+async def test_resume_admission_rejects_pending_session_work(reason: str) -> None:
+    from chartreux.app_server._execution import SessionExecutionConflict
+    from chartreux.app_server._sessions import SessionRuntimeRegistry
+    from chartreux.app_server.models import OpenCallbackState
+
+    registry: Any = object.__new__(SessionRuntimeRegistry)
+    registry._ensure_child_lock = asyncio.Lock()
+    registry._agent_records = {}
+    registry._creating_children = 0
+    registry._admission_closed = False
+    root = SimpleNamespace(
+        execution=SimpleNamespace(active=None),
+        turns=SimpleNamespace(
+            has_queued_turns=reason == "queue",
+            callbacks=[SimpleNamespace(state=OpenCallbackState())]
+            if reason == "decision"
+            else [],
+        ),
+    )
+    with pytest.raises(SessionExecutionConflict, match="Cannot switch sessions"):
+        await registry.reserve_resume_admission(root)
+    assert not registry._admission_closed

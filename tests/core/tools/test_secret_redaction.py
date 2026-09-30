@@ -92,6 +92,77 @@ def test_live_sessions_union_credential_names(monkeypatch: pytest.MonkeyPatch) -
         sr.unregister_session_policy(b)
 
 
+@pytest.mark.parametrize(
+    "snapshot", [None, SimpleNamespace(), SimpleNamespace(catalog=None)]
+)
+def test_scrub_policy_accepts_snapshot_without_catalog(snapshot: Any) -> None:
+    config = SimpleNamespace(catalog_snapshot=snapshot, credential_env_passthrough=[])
+
+    assert sr.ScrubPolicy.from_config(config).credential_names == frozenset()
+
+
+@pytest.mark.parametrize("refresh", ["rediscovery", "reset_cache"])
+def test_accepted_provider_names_survive_disk_removal(
+    monkeypatch: pytest.MonkeyPatch, refresh: str
+) -> None:
+    from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+    from chartreux.core.model_catalog.loader import CatalogSnapshot
+    from chartreux.core.model_catalog.schema import ModelCatalog, ProviderDefinition
+
+    catalog = ModelCatalog(
+        providers={
+            "test": ProviderDefinition(
+                api_base="https://test.invalid", api_key_env_var=FAKE_NAME
+            ),
+            "keyless": ProviderDefinition(api_base="https://keyless.invalid"),
+        },
+        models={},
+    )
+    config = ChartreuxConfigSchema.model_construct().attach_catalog_snapshot(
+        CatalogSnapshot(catalog, "accepted")
+    )
+    policy = sr.ScrubPolicy.from_config(config)
+    passthrough_policy = sr.ScrubPolicy.from_config(
+        config.model_copy(update={"credential_env_passthrough": [FAKE_NAME]})
+    )
+    assert policy.credential_names == {FAKE_NAME}
+    assert policy.redaction_credentials == ()
+    assert policy.redaction_oauth_values == frozenset()
+
+    disk_names = {FAKE_NAME}
+    identity = [1]
+    monkeypatch.setenv(FAKE_NAME, FAKE_VALUE)
+    monkeypatch.setattr(sr, "_read_dotenv_entries", lambda: {})
+    monkeypatch.setattr(sr, "_catalog_env_var_names", lambda: frozenset(disk_names))
+    monkeypatch.setattr(sr, "_env_file_token", lambda: identity[0])
+    sr.reset_cache()
+    assert FAKE_NAME in sr.credential_env_var_names()
+    disk_names.clear()
+    if refresh == "rediscovery":
+        identity[0] += 1
+    else:
+        sr.reset_cache()
+    assert FAKE_NAME not in sr.credential_env_var_names()
+
+    with sr.bind_policy(policy):
+        assert FAKE_NAME not in _shell_environment()
+        assert sr.redact(FAKE_VALUE) == sr.REDACTED_PLACEHOLDER
+    assert sr.scrub_child_env({FAKE_NAME: FAKE_VALUE}, policy) == {}
+
+    owner = object_owner()
+    sr.register_session_policy(owner, passthrough_policy)
+    try:
+        assert FAKE_NAME not in _shell_environment()
+        assert sr.redact(FAKE_VALUE) == sr.REDACTED_PLACEHOLDER
+        with sr.bind_policy(passthrough_policy):
+            assert _shell_environment()[FAKE_NAME] == FAKE_VALUE
+            assert sr.redact(FAKE_VALUE) == sr.REDACTED_PLACEHOLDER
+        assert sr.scrub_child_env({FAKE_NAME: FAKE_VALUE}, policy) == {}
+    finally:
+        sr.unregister_session_policy(owner)
+    assert FAKE_NAME not in sr.credential_env_var_names()
+
+
 def object_owner() -> Any:
     return type("Session", (), {})()
 

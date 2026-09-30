@@ -18,8 +18,9 @@ from chartreux.cli.textual_ui.widgets.tool_grouping import (
     ToolGroupExpansionState,
     ToolGroupKey,
 )
-from chartreux.cli.textual_ui.widgets.tools import ToolGroup
+from chartreux.cli.textual_ui.widgets.tools import ToolCallMessage, ToolGroup
 from chartreux.utils.tool_presentation import ToolEffectKind
+from tests.cli.textual_ui.test_tool_stream_message import _effect
 
 
 class _ToolGroupApp(App[None]):
@@ -47,6 +48,13 @@ async def test_group_header_category_and_collapsed_body_persist() -> None:
         assert group.header.get_content() == "Reading files"
         assert group.is_collapsed
         assert group.content_container.display is False
+        group.header.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not group.is_collapsed
+        assert app.focused is group.header
+        await pilot.press("space")
+        assert group.is_collapsed
 
         await pilot.click(".tool-group-header")
         await pilot.pause()
@@ -84,7 +92,7 @@ async def test_group_header_skips_unchanged_summary_updates() -> None:
 
 
 @pytest.mark.asyncio
-async def test_running_indicator_settles_to_colored_disclosure() -> None:
+async def test_running_indicator_settles_to_outcome() -> None:
     group = ToolGroup()
     group.add_call_kind(ToolEffectKind.SHELL)
     app = _ToolGroupApp(group)
@@ -99,7 +107,7 @@ async def test_running_indicator_settles_to_colored_disclosure() -> None:
         group.settle_indicator(IndicatorState.ERROR)
         group.finalize()
         await pilot.pause()
-        assert str(indicator.render()) == "⏵"
+        assert str(indicator.render()) == "✗"
         assert "error" in indicator.classes
         assert group.header._spinner_timer is None
 
@@ -154,6 +162,22 @@ def test_effect_states_use_policy_indicator_mapping() -> None:
         CompletedEffectState(display=EffectResultDisplay(success=True, message="done"))
     )
     assert group.header._last_state is IndicatorState.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_group_folded_summary_keeps_target_and_failure() -> None:
+    group = ToolGroup()
+    group.add_call_kind(ToolEffectKind.FILE_SEARCH)
+    call = ToolCallMessage(_effect(completed=False))
+    group.add_content_child(call)
+    app = _ToolGroupApp(group)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert "Searching" in group.header.get_content()
+        group.settle_indicator(IndicatorState.ERROR)
+        group.finalize()
+        assert group.header.get_content().startswith("Failed:")
+        assert group.is_collapsed
 
 
 @pytest.mark.asyncio

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
+from dataclasses import dataclass
 from enum import StrEnum, auto
 import fnmatch
 import os
 from pathlib import Path
 import shutil
-from typing import TYPE_CHECKING
+import threading
+import time
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field, JsonValue
 
@@ -30,11 +33,16 @@ from chartreux.core.tools.utils import (
     resolve_tool_path,
 )
 from chartreux.core.utils import kill_async_subprocess
+from chartreux.core.workspace import Workspace
 from chartreux.utils.io import decode_console_safe, read_safe
 from chartreux.utils.tool_presentation import ToolEffectKind
 
 if TYPE_CHECKING:
     from chartreux.core.events import ToolResultEvent
+
+
+_GATE_SECONDS = 0.005
+_RESTARTS = 3
 
 
 class GrepBackend(StrEnum):
@@ -176,6 +184,244 @@ class GrepResult(BaseModel):
         return results
 
 
+@dataclass(frozen=True)
+class _FileAuthority:
+    permission: ToolPermission
+    allowlist: tuple[str, ...]
+    denylist: tuple[str, ...]
+    sensitive: tuple[str, ...]
+    workspace: Workspace
+    scratchpad: Path | None
+
+    def allows(self, path: Path) -> bool:
+        decision = resolve_file_tool_permission(
+            str(path),
+            tool_name="grep",
+            allowlist=list(self.allowlist),
+            denylist=list(self.denylist),
+            config_permission=self.permission,
+            sensitive_patterns=list(self.sensitive),
+            workspace=self.workspace,
+            scratchpad_dir=self.scratchpad,
+        )
+        return decision is not None and decision.permission == ToolPermission.ALWAYS
+
+
+@dataclass(frozen=True)
+class _GrepSettings:
+    excludes: tuple[str, ...]
+    ignore_names: tuple[str, ...]
+    max_output_bytes: int
+    max_matches: int
+    timeout: int
+    cwd: Path
+
+
+class _AuthorityChanged(Exception):
+    pass
+
+
+class _WorkerStopped(Exception):
+    pass
+
+
+def _checkpoint(stop: threading.Event) -> None:
+    if stop.is_set():
+        raise _WorkerStopped
+
+
+def _collect_excludes(
+    settings: _GrepSettings, allows: Callable[[Path], bool], stop: threading.Event
+) -> list[str]:
+    patterns = list(settings.excludes)
+    for name in settings.ignore_names:
+        _checkpoint(stop)
+        path = settings.cwd / name
+        if not path.is_file():
+            continue
+        if allows(path):
+            try:
+                for line in read_safe(path).text.splitlines():
+                    _checkpoint(stop)
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        patterns.append(line)
+            except OSError:
+                pass
+        break
+    return patterns
+
+
+def _collect_paths(
+    root: Path,
+    excludes: list[str],
+    allows: Callable[[Path], bool],
+    stop: threading.Event,
+) -> list[Path]:
+    _checkpoint(stop)
+    if not allows(root):
+        raise ToolError("Search path denied by policy")
+    if root.is_file():
+        return [root]
+
+    def excluded(path: Path, *, directory: bool = False) -> bool:
+        return any(
+            fnmatch.fnmatchcase(path.name, pattern.rstrip("/"))
+            for pattern in excludes
+            if directory or not pattern.endswith("/")
+        )
+
+    candidates: list[Path] = []
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        _checkpoint(stop)
+        base = Path(directory)
+        retained = []
+        for name in dirs:
+            _checkpoint(stop)
+            path = base / name
+            if allows(path) and not excluded(path, directory=True):
+                retained.append(name)
+        dirs[:] = retained
+        for name in files:
+            _checkpoint(stop)
+            path = base / name
+            if allows(path) and not excluded(path) and path.is_file():
+                candidates.append(path)
+    return candidates
+
+
+def _listing_command(
+    root: Path,
+    excludes: list[str],
+    use_ignore: bool,
+    allows: Callable[[Path], bool],
+    stop: threading.Event,
+) -> list[str]:
+    cmd = ["rg", "--files", "--null", "--no-config", "--no-ignore-global"]
+    parents = list(root.parents)
+    for parent in parents:
+        for name in (".ignore", ".gitignore", ".rgignore"):
+            _checkpoint(stop)
+            path = parent / name
+            if path.exists() and not allows(path):
+                cmd.append("--no-ignore-parent")
+                break
+    for base in [root, *parents]:
+        _checkpoint(stop)
+        git = base / ".git"
+        if git.exists() and (not git.is_dir() or not allows(git / "info" / "exclude")):
+            cmd.append("--no-ignore-exclude")
+    if not use_ignore:
+        cmd.append("--no-ignore")
+    for pattern in excludes:
+        _checkpoint(stop)
+        cmd.extend(["--glob", f"!{pattern}"])
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        _checkpoint(stop)
+        base = Path(directory)
+        for name in [*dirs, *files]:
+            _checkpoint(stop)
+            path = base / name
+            if name == ".git" and (
+                not path.is_dir() or not allows(path / "info" / "exclude")
+            ):
+                cmd.append("--no-ignore-exclude")
+            if (
+                use_ignore
+                and name in {".ignore", ".gitignore", ".rgignore"}
+                and not allows(path)
+            ):
+                raise ToolError("Search ignore file denied by policy")
+            if name in dirs and not allows(path):
+                literal = "".join(
+                    "\\" + char if char in "\\*?[]{}" else char
+                    for char in path.relative_to(root).as_posix()
+                )
+                cmd.extend(["--glob", f"!/{literal}/"])
+                dirs.remove(name)
+    cmd.extend(["--", str(root)])
+    return cmd
+
+
+def _intersect_listing(
+    listed: str, candidates: list[Path], cwd: Path, stop: threading.Event
+) -> list[Path]:
+    visible = set()
+    for path in listed.split("\0"):
+        _checkpoint(stop)
+        if path:
+            visible.add(cwd / path)
+    result = []
+    for path in candidates:
+        _checkpoint(stop)
+        if path in visible:
+            result.append(path)
+    return result
+
+
+def _prepare_batch(paths: list[Path], stop: threading.Event) -> list[Path]:
+    result = []
+    for path in paths:
+        _checkpoint(stop)
+        result.append(path)
+    return result
+
+
+def _decode_output(
+    stdout: bytes, stderr: bytes, stop: threading.Event
+) -> tuple[str, str]:
+    _checkpoint(stop)
+    result = (
+        decode_console_safe(stdout) if stdout else "",
+        decode_console_safe(stderr) if stderr else "",
+    )
+    _checkpoint(stop)
+    return result
+
+
+def _finish_output(
+    kept: list[str],
+    max_matches: int,
+    pattern: str,
+    settings: _GrepSettings,
+    stop: threading.Event,
+) -> GrepResult:
+    _checkpoint(stop)
+    selected = kept[:max_matches]
+    output = "\n".join(selected)
+    _checkpoint(stop)
+    return GrepResult(
+        matches=output[: settings.max_output_bytes],
+        match_count=len(selected),
+        pattern=pattern,
+        was_truncated=len(kept) > max_matches
+        or len(output) > settings.max_output_bytes,
+        cwd=str(settings.cwd),
+    )
+
+
+def _parse_frozen(
+    chunks: list[str],
+    max_matches: int,
+    pattern: str,
+    settings: _GrepSettings,
+    allows: Callable[[Path], bool],
+    stop: threading.Event,
+) -> GrepResult:
+    # Joining and decoding/parsing large output never run on the event loop.
+    stdout = "\n".join(chunks)
+    _checkpoint(stop)
+    kept: list[str] = []
+    for line in stdout.splitlines():
+        _checkpoint(stop)
+        match = GrepMatch.from_output_line(line, settings.cwd)
+        if match is not None and allows(Path(match.path)):
+            kept.append(line)
+            if len(kept) > max_matches:
+                break
+    return _finish_output(kept, max_matches, pattern, settings, stop)
+
+
 class Grep(
     BaseTool[GrepArgs, GrepResult, GrepToolConfig, BaseToolState],
     ToolUIData[GrepArgs, GrepResult],
@@ -194,13 +440,14 @@ class Grep(
         }
 
     def resolve_permission(self, args: GrepArgs) -> PermissionContext | None:
+        config = self.config
         return resolve_file_tool_permission(
             args.path,
             tool_name=self.get_name(),
-            allowlist=self.config.allowlist,
-            denylist=self.config.denylist,
-            config_permission=self.config.permission,
-            sensitive_patterns=self.config.sensitive_patterns,
+            allowlist=config.allowlist,
+            denylist=config.denylist,
+            config_permission=config.permission,
+            sensitive_patterns=config.sensitive_patterns,
             workspace=self.workspace,
             scratchpad_dir=self.scratchpad_dir,
         )
@@ -215,47 +462,443 @@ class Grep(
             "Please install ripgrep: https://github.com/BurntSushi/ripgrep#installation"
         )
 
-    async def run(
+    def _snapshot(
+        self,
+    ) -> tuple[tuple[object, ...] | None, Callable[[Path], bool] | None, _GrepSettings]:
+        """Capture each selected ancestor independently; never approximate a custom resolver."""
+        config = self.config
+        settings = _GrepSettings(
+            tuple(config.exclude_patterns),
+            (config.codeignore_file,)
+            if "codeignore_file" in config.model_fields_set
+            else (config.codeignore_file, ".vibeignore"),
+            config.max_output_bytes,
+            config.default_max_matches,
+            config.default_timeout,
+            self.cwd,
+        )
+        manager = getattr(self, "_grep_authority_manager", None)
+        states: list[_FileAuthority] = []
+        if manager is None:
+            if (
+                type(self).resolve_permission is not Grep.resolve_permission
+                or "resolve_permission" in self.__dict__
+            ):
+                return None, None, settings
+            states.append(
+                _FileAuthority(
+                    config.permission,
+                    tuple(config.allowlist),
+                    tuple(config.denylist),
+                    tuple(config.sensitive_patterns),
+                    self.workspace,
+                    self.scratchpad_dir,
+                )
+            )
+            frozen_states = tuple(states)
+            return (
+                self._current_token(),
+                lambda path: all(state.allows(path) for state in frozen_states),
+                settings,
+            )
+        token = manager._effective_authority_token()
+        cursor = manager
+        while cursor is not None:
+            if (
+                token is None
+                or cursor._authority_retired
+                or not cursor._name_versionable(self.get_name())
+            ):
+                return None, None, settings
+            try:
+                tool = cursor.get(self.get_name())
+                if type(tool).resolve_permission is not Grep.resolve_permission:
+                    return token, None, settings
+                cfg = cursor.get_tool_config(self.get_name())
+                states.append(
+                    _FileAuthority(
+                        cfg.permission,
+                        tuple(cfg.allowlist),
+                        tuple(cfg.denylist),
+                        tuple(cfg.sensitive_patterns),
+                        cursor.workspace,
+                        cursor._scratchpad_dir,
+                    )
+                )
+                cursor = (
+                    cursor._parent_authority()
+                    if cursor._parent_authority_getter
+                    else None
+                )
+            except Exception:
+                return None, None, settings
+        if manager._effective_authority_token() != token:
+            raise _AuthorityChanged
+        frozen_states = tuple(states)
+        return (
+            token,
+            lambda path: all(state.allows(path) for state in frozen_states),
+            settings,
+        )
+
+    def _current_token(self) -> tuple[object, ...] | None:
+        manager = getattr(self, "_grep_authority_manager", None)
+        if manager is not None:
+            return manager._effective_authority_token()
+        # Unmanaged tools have no publication signal; compare their live inputs
+        # at every async boundary rather than trusting a mutable config object.
+        config = self.config
+        return (
+            config.model_dump_json(),
+            frozenset(config.model_fields_set),
+            self.workspace,
+            self.scratchpad_dir,
+        )
+
+    def _ensure_current(self, token: tuple[object, ...] | None) -> None:
+        if not self._authority_is_current():
+            raise _AuthorityChanged
+        if token is not None and self._current_token() != token:
+            raise _AuthorityChanged
+
+    async def _stage(
+        self, function: Callable[..., Any], *args: Any, stop: threading.Event
+    ) -> Any:
+        try:
+            return await asyncio.to_thread(function, *args, stop)
+        except asyncio.CancelledError:
+            stop.set()
+            raise
+
+    async def _verify_paths(
+        self,
+        paths: list[Path],
+        token: tuple[object, ...] | None,
+        *,
+        regular: bool = False,
+    ) -> list[Path]:
+        """Live checks are bounded by both count and wall-clock quantum."""
+        result: list[Path] = []
+        for attempt in range(_RESTARTS):
+            result.clear()
+            started = time.monotonic()
+            try:
+                self._ensure_current(token)
+                for index, path in enumerate(paths):
+                    if index and (
+                        index % 16 == 0 or time.monotonic() - started >= _GATE_SECONDS
+                    ):
+                        await asyncio.sleep(0)
+                        self._ensure_current(token)
+                        started = time.monotonic()
+                    permitted = self._can_read(path)
+                    if not permitted and regular:
+                        # Candidate was accepted earlier: a changed policy must
+                        # rebuild the entire search, not silently underfill first-N.
+                        raise _AuthorityChanged
+                    if permitted and (not regular or path.is_file()):
+                        result.append(path)
+                    self._ensure_current(token)
+                return result
+            except _AuthorityChanged:
+                if attempt == _RESTARTS - 1:
+                    break
+                await asyncio.sleep(0)
+        raise _AuthorityChanged
+
+    async def run(  # noqa: PLR0912, PLR0914, PLR0915 - explicit gate sequence
         self, args: GrepArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | GrepResult, None]:
         backend = self._detect_backend()
         self._validate_args(args)
+        stop = threading.Event()
+        try:
+            for _restart in range(_RESTARTS):
+                stop.clear()
+                try:
+                    token, frozen, settings = self._snapshot()
+                    # Unknown/custom ancestor variants retain their actual live resolver.
+                    # This fallback cooperatively yields; it never substitutes grep rules.
+                    if frozen is None:
+                        allows = self._can_read
+                        worker = False
+                    else:
+                        allows = frozen
+                        worker = True
+                    root = resolve_tool_path(args.path, settings.cwd)
+                    if worker:
+                        excludes = await self._stage(
+                            _collect_excludes, settings, allows, stop=stop
+                        )
+                        candidates = await self._stage(
+                            _collect_paths, root, excludes, allows, stop=stop
+                        )
+                    else:
+                        excludes = await self._collect_live_excludes(
+                            settings, token, stop
+                        )
+                        candidates = await self._collect_live_paths(
+                            root, excludes, allows, stop, token
+                        )
+                    self._ensure_current(token)
+                    if backend == GrepBackend.RIPGREP and root.is_dir():
+                        if worker:
+                            cmd = await self._stage(
+                                _listing_command,
+                                root,
+                                excludes,
+                                args.use_default_ignore,
+                                allows,
+                                stop=stop,
+                            )
+                        else:
+                            cmd = await self._listing_command_live(
+                                root, excludes, args.use_default_ignore, token
+                            )
+                        self._ensure_current(token)
+                        listed = await self._execute_search(cmd)
+                        self._ensure_current(token)
+                        candidates = await self._stage(
+                            _intersect_listing,
+                            listed,
+                            candidates,
+                            settings.cwd,
+                            stop=stop,
+                        )
+                    limit = (
+                        args.max_matches
+                        if args.max_matches is not None and args.max_matches > 0
+                        else settings.max_matches
+                    )
+                    chunks: list[str] = []
+                    for offset in range(0, len(candidates), 128):
+                        batch = await self._stage(
+                            _prepare_batch, candidates[offset : offset + 128], stop=stop
+                        )
+                        self._ensure_current(token)
+                        paths = await self._verify_paths(batch, token, regular=True)
+                        if not paths:
+                            continue
+                        cmd = self._build_command(args, [], backend)[:-1]
+                        if backend == GrepBackend.GNU_GREP:
+                            cmd.remove("-r")
+                        else:
+                            cmd.extend(["--no-config", "--no-ignore"])
+                        cmd.extend(["--", *(str(path) for path in paths)])
+                        self._ensure_current(token)  # Last gate before spawn.
+                        chunks.append(await self._execute_search(cmd))
+                        self._ensure_current(token)
+                    if worker:
+                        result = await self._stage(
+                            _parse_frozen,
+                            chunks,
+                            limit,
+                            args.pattern,
+                            settings,
+                            allows,
+                            stop=stop,
+                        )
+                    else:
+                        result = await self._parse_live(
+                            chunks, limit, args.pattern, settings, stop
+                        )
+                    self._ensure_current(token)
+                    # Recheck every published match, not just the search operands.
+                    published = await self._stage(
+                        lambda value, event: [
+                            Path(match.path) for match in value.parsed_matches
+                        ],
+                        result,
+                        stop=stop,
+                    )
+                    verified = await self._verify_paths(published, token)
+                    if len(verified) != len(published):
+                        raise _AuthorityChanged
+                    self._ensure_current(token)
+                    yield result
+                    return
+                except _AuthorityChanged:
+                    stop.set()
+                    await asyncio.sleep(0)
+            raise ToolError("Search authority changed repeatedly; result discarded")
+        finally:
+            stop.set()
 
-        exclude_patterns = self._collect_exclude_patterns()
-        candidates = self._collect_candidates(args, exclude_patterns)
-        if (
-            backend == GrepBackend.RIPGREP
-            and resolve_tool_path(args.path, self.cwd).is_dir()
-        ):
-            candidates = await self._filter_ripgrep_candidates(
-                args, exclude_patterns, candidates
-            )
+    async def _listing_command_live(
+        self,
+        root: Path,
+        excludes: list[str],
+        use_ignore: bool,
+        token: tuple[object, ...] | None,
+    ) -> list[str]:
+        """Custom resolvers stay on the loop; no worker may call them."""
+        cmd = ["rg", "--files", "--null", "--no-config", "--no-ignore-global"]
+        parents = list(root.parents)
+        count = 0
+        started = time.monotonic()
 
-        chunks: list[str] = []
-        # Pass only checked regular files, never recursive directory operands.
-        # Recheck immediately before each batch; this is not a filesystem-race
-        # sandbox (a hostile concurrent replacement still requires OS isolation).
-        batch_size = 128
-        for offset in range(0, len(candidates), batch_size):
-            paths = [
-                str(path)
-                for path in candidates[offset : offset + batch_size]
-                if self._can_read(path) and path.is_file()
-            ]
-            if not paths:
+        async def gate() -> None:
+            nonlocal count, started
+            count += 1
+            if count % 16 == 0 or time.monotonic() - started >= _GATE_SECONDS:
+                await asyncio.sleep(0)
+                self._ensure_current(token)
+                started = time.monotonic()
+
+        for parent in parents:
+            for name in (".ignore", ".gitignore", ".rgignore"):
+                await gate()
+                path = parent / name
+                if path.exists() and not self._can_read(path):
+                    cmd.append("--no-ignore-parent")
+                    break
+        for base in [root, *parents]:
+            await gate()
+            git = base / ".git"
+            if git.exists() and (
+                not git.is_dir() or not self._can_read(git / "info" / "exclude")
+            ):
+                cmd.append("--no-ignore-exclude")
+        if not use_ignore:
+            cmd.append("--no-ignore")
+        for pattern in excludes:
+            await gate()
+            cmd.extend(["--glob", f"!{pattern}"])
+        for directory, dirs, files in os.walk(root, followlinks=False):
+            await gate()
+            for name in [*dirs, *files]:
+                await gate()
+                path = Path(directory) / name
+                if name == ".git" and (
+                    not path.is_dir() or not self._can_read(path / "info" / "exclude")
+                ):
+                    cmd.append("--no-ignore-exclude")
+                if (
+                    use_ignore
+                    and name in {".ignore", ".gitignore", ".rgignore"}
+                    and not self._can_read(path)
+                ):
+                    raise ToolError("Search ignore file denied by policy")
+                if name in dirs and not self._can_read(path):
+                    literal = "".join(
+                        "\\" + char if char in "\\*?[]{}" else char
+                        for char in path.relative_to(root).as_posix()
+                    )
+                    cmd.extend(["--glob", f"!/{literal}/"])
+                    dirs.remove(name)
+        cmd.extend(["--", str(root)])
+        return cmd
+
+    async def _collect_live_excludes(
+        self,
+        settings: _GrepSettings,
+        token: tuple[object, ...] | None,
+        stop: threading.Event,
+    ) -> list[str]:
+        patterns = list(settings.excludes)
+        for name in settings.ignore_names:
+            _checkpoint(stop)
+            path = settings.cwd / name
+            if not path.is_file():
                 continue
-            cmd = self._build_command(args, [], backend)[:-1]
-            if backend == GrepBackend.GNU_GREP:
-                cmd.remove("-r")
-            else:
-                cmd.extend(["--no-config", "--no-ignore"])
-            cmd.extend(["--", *paths])
-            chunks.append(await self._execute_search(cmd))
+            if self._can_read(path):
+                try:
+                    lines = await self._stage(
+                        lambda target, event: read_safe(target).text.splitlines(),
+                        path,
+                        stop=stop,
+                    )
+                except OSError:
+                    lines = []
+                self._ensure_current(token)
+                for index, line in enumerate(lines):
+                    if index % 16 == 0:
+                        await asyncio.sleep(0)
+                        self._ensure_current(token)
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        patterns.append(line)
+            break
+        return patterns
 
-        yield self._parse_output(
-            "\n".join(chunks),
-            args.max_matches or self.config.default_max_matches,
-            args.pattern,
+    async def _collect_live_paths(
+        self,
+        root: Path,
+        excludes: list[str],
+        allows: Callable[[Path], bool],
+        stop: threading.Event,
+        token: tuple[object, ...] | None,
+    ) -> list[Path]:
+        # Unversioned/custom resolvers must stay on the owning loop.
+        if not allows(root):
+            raise ToolError("Search path denied by policy")
+        if root.is_file():
+            return [root]
+        result = []
+        started = time.monotonic()
+        count = 0
+
+        async def gate() -> None:
+            nonlocal count, started
+            count += 1
+            if count % 16 == 0 or time.monotonic() - started >= _GATE_SECONDS:
+                await asyncio.sleep(0)
+                self._ensure_current(token)
+                started = time.monotonic()
+
+        for directory, dirs, files in os.walk(root, followlinks=False):
+            await gate()
+            retained = []
+            for name in dirs:
+                path = Path(directory) / name
+                if allows(path) and not any(
+                    fnmatch.fnmatchcase(name, p.rstrip("/")) for p in excludes
+                ):
+                    retained.append(name)
+                await gate()
+            dirs[:] = retained
+            for name in files:
+                path = Path(directory) / name
+                if (
+                    allows(path)
+                    and not any(
+                        fnmatch.fnmatchcase(name, p.rstrip("/"))
+                        for p in excludes
+                        if not p.endswith("/")
+                    )
+                    and path.is_file()
+                ):
+                    result.append(path)
+                await gate()
+        return result
+
+    async def _parse_live(
+        self,
+        chunks: list[str],
+        limit: int,
+        pattern: str,
+        settings: _GrepSettings,
+        stop: threading.Event,
+    ) -> GrepResult:
+        # A custom resolver cannot run in a worker; yield between authorization chunks.
+        lines = await self._stage(
+            lambda data, event: ("\n".join(data)).splitlines(), chunks, stop=stop
+        )
+        kept = []
+        started = time.monotonic()
+        for index, line in enumerate(lines):
+            if index and (
+                index % 16 == 0 or time.monotonic() - started >= _GATE_SECONDS
+            ):
+                await asyncio.sleep(0)
+                started = time.monotonic()
+            match = GrepMatch.from_output_line(line, settings.cwd)
+            if match is not None and self._can_read(Path(match.path)):
+                kept.append(line)
+                if len(kept) > limit:
+                    break
+        return await self._stage(
+            _finish_output, kept, limit, pattern, settings, stop=stop
         )
 
     def _can_read(self, path: Path) -> bool:
@@ -393,6 +1036,13 @@ class Grep(
 
         return patterns
 
+    def _match_limit(self, args: GrepArgs) -> int:
+        return (
+            args.max_matches
+            if args.max_matches is not None and args.max_matches > 0
+            else self.config.default_max_matches
+        )
+
     def _build_command(
         self, args: GrepArgs, exclude_patterns: list[str], backend: GrepBackend
     ) -> list[str]:
@@ -403,7 +1053,7 @@ class Grep(
     def _build_ripgrep_command(
         self, args: GrepArgs, exclude_patterns: list[str]
     ) -> list[str]:
-        max_matches = args.max_matches or self.config.default_max_matches
+        max_matches = self._match_limit(args)
 
         cmd = [
             "rg",
@@ -430,7 +1080,7 @@ class Grep(
     def _build_gnu_grep_command(
         self, args: GrepArgs, exclude_patterns: list[str]
     ) -> list[str]:
-        max_matches = args.max_matches or self.config.default_max_matches
+        max_matches = self._match_limit(args)
 
         cmd = ["grep", "-r", "-n", "-H", "-I", "-E", f"--max-count={max_matches + 1}"]
 
@@ -473,8 +1123,16 @@ class Grep(
                 )
                 raise
 
-            stdout = decode_console_safe(stdout_bytes) if stdout_bytes else ""
-            stderr = decode_console_safe(stderr_bytes) if stderr_bytes else ""
+            # Residual unboundedness: communicate() still collects complete process
+            # output in memory before worker decoding/parsing; this is not a byte cap.
+            decode_stop = threading.Event()
+            try:
+                stdout, stderr = await asyncio.to_thread(
+                    _decode_output, stdout_bytes, stderr_bytes, decode_stop
+                )
+            except asyncio.CancelledError:
+                decode_stop.set()
+                raise
 
             if proc.returncode not in {0, 1}:
                 error_msg = stderr or f"Process exited with code {proc.returncode}"
@@ -487,7 +1145,9 @@ class Grep(
         except Exception as exc:
             raise ToolError(f"Error running grep: {exc}") from exc
 
-    def _drop_sensitive_matches(self, lines: list[str]) -> list[str]:
+    def _drop_sensitive_matches(
+        self, lines: list[str], max_matches: int | None = None
+    ) -> list[str]:
         """Defensive output check; candidate checks prevent the actual reads."""
         kept: list[str] = []
         for line in lines:
@@ -495,13 +1155,18 @@ class Grep(
             if match is None or not self._can_read(Path(match.path)):
                 continue
             kept.append(line)
+            # One authorized lookahead distinguishes an exact cap from truncation.
+            if max_matches is not None and len(kept) > max_matches:
+                break
         return kept
 
     def _parse_output(
         self, stdout: str, max_matches: int, pattern: str = ""
     ) -> GrepResult:
+        if max_matches <= 0:
+            max_matches = self.config.default_max_matches
         output_lines = stdout.splitlines() if stdout else []
-        output_lines = self._drop_sensitive_matches(output_lines)
+        output_lines = self._drop_sensitive_matches(output_lines, max_matches)
 
         truncated_lines = output_lines[:max_matches]
         truncated_output = "\n".join(truncated_lines)

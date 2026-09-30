@@ -45,28 +45,34 @@ def _snapshot(revision: str, *, first_wire: str = "first") -> CatalogSnapshot:
     return CatalogSnapshot(
         ModelCatalog.model_validate({
             "providers": {
-                "test/one": {"api_base": "https://one.invalid"},
-                "test/two": {"api_base": "https://two.invalid"},
+                "test-one": {"api_base": "https://one.invalid"},
+                "test-two": {"api_base": "https://two.invalid"},
             },
             "models": {
                 "first": {
                     "deployments": [
-                        {"provider": "test/one", "name": first_wire},
-                        {"provider": "test/two", "name": "first-two-wire"},
+                        {"provider": "test-one", "name": first_wire},
+                        {"provider": "test-two", "name": "first-two-wire"},
                     ]
                 },
                 "later": {
-                    "deployments": [{"provider": "test/two", "name": "later-wire"}]
+                    "deployments": [{"provider": "test-two", "name": "later-wire"}]
                 },
                 "compact": {
                     "thinking": "low",
                     "deployments": [
-                        {"provider": "test/one", "name": "compact-one"},
-                        {"provider": "test/two", "name": "compact-two"},
+                        {"provider": "test-one", "name": "compact-one"},
+                        {"provider": "test-two", "name": "compact-two"},
                     ],
                 },
             },
-            "roles": {"ordered": {"models": ["first", "later"]}},
+            "roles": {
+                "ordered": {
+                    "description": "test preset",
+                    "model": "first",
+                    "thinking": "high",
+                }
+            },
         }),
         revision,
     )
@@ -137,7 +143,7 @@ async def test_role_bound_child_uses_its_role_instead_of_parent_committed_model(
     parent_loop = build_test_agent_loop(config=config, backend=FakeBackend())
     committed = CommittedModelIdentity(
         base_model="later",
-        provider="test/two",
+        provider="test-two",
         wire_name="later-wire",
         catalog_revision="A",
     )
@@ -191,7 +197,15 @@ async def test_resumed_role_bound_child_reresolves_its_role(tmp_path: Path) -> N
         await child.aclose()
 
         updated_catalog = snapshot.catalog.model_copy(
-            update={"roles": {"ordered": RoleDefinition(models=("later",))}}
+            update={
+                "roles": {
+                    "ordered": RoleDefinition(
+                        description="updated test preset",
+                        model="later",
+                        thinking="high",
+                    )
+                }
+            }
         )
         parent.config.attach_catalog_snapshot(CatalogSnapshot(updated_catalog, "B"))
         resumed = await AgentRuntimeFactory().resume_child(
@@ -224,7 +238,7 @@ def test_role_thinking_resolves_base_and_rejects_v0_1_expressions() -> None:
     )
     assert candidate.effective_thinking == "low"
     resolver = ModelResolver(snapshot)
-    for expression in (["first"], "test/one/first"):
+    for expression in (["first"], "test-one/first"):
         with pytest.raises(ModelResolutionError) as error:
             resolver.expression_bases(expression)  # type: ignore[arg-type]
         assert error.value.code == "invalid_expression"
@@ -250,7 +264,7 @@ async def test_compaction_alias_materializes_destination_deployment_and_thinking
 
     assert backend.requested_models[0].alias == "compact"
     assert (backend.requested_models[0].provider, backend.requested_models[0].name) == (
-        "test/one",
+        "test-one",
         "compact-one",
     )
     assert backend.requested_models[0].thinking == "low"
@@ -298,7 +312,7 @@ class _SiblingCompletionBackend(FakeBackend):
         return result
 
 
-async def _fan_out_result(
+async def _task_result(
     registry: SessionRuntimeRegistry, args: TaskArgs, context: InvokeContext
 ) -> TaskResult:
     return cast(TaskResult, [event async for event in registry.run(args, context)][-1])
@@ -308,14 +322,18 @@ async def _fan_out_result(
 async def test_failover_terminal_identity_survives_eviction_and_result_serialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A real fan-out preserves the terminal failover identity after eviction."""
+    """A retained task preserves its terminal failover metadata after eviction."""
     snapshot = _snapshot("A")
     snapshot = CatalogSnapshot(
         ModelCatalog.model_validate({
             **snapshot.catalog.model_dump(),
             "roles": {
                 **snapshot.catalog.model_dump()["roles"],
-                "single": {"models": ["first"]},
+                "single": {
+                    "description": "single preset",
+                    "model": "first",
+                    "thinking": "high",
+                },
             },
         }),
         snapshot.revision,
@@ -328,7 +346,7 @@ async def test_failover_terminal_identity_survives_eviction_and_result_serializa
     def create_backend(*, provider: ProviderConfig, **_kwargs: object) -> FakeBackend:
         return (
             failed
-            if provider.name == "test/one"
+            if provider.name == "test-one"
             else FakeBackend([mock_llm_chunk(content="completed after failover")])
         )
 
@@ -345,34 +363,31 @@ async def test_failover_terminal_identity_survives_eviction_and_result_serializa
     registry._retention_policy = (0, 0)
     try:
         task = asyncio.create_task(
-            _fan_out_result(
+            _task_result(
                 registry,
                 TaskArgs(
                     task="fail over",
-                    fan_out=True,
-                    background=False,
+                    background=True,
                     config=LaunchConfig(model="@single"),
                 ),
-                InvokeContext(tool_call_id="fan-out", session_id=parent.session_id),
+                InvokeContext(
+                    tool_call_id="single-preset", session_id=parent.session_id
+                ),
             )
         )
         await asyncio.wait_for(failed.started.wait(), timeout=1)
+        launch = await asyncio.wait_for(task, timeout=1)
+        assert launch.status == "launched"
+        assert launch.agent_id is not None and launch.run_id is not None
         failed.release.set()
-        result = await asyncio.wait_for(task, timeout=1)
-
-        assert result.completed and result.members is not None
-        member = result.members[0]
-        assert (member.base_model, member.provider, member.display_name) == (
-            "first",
-            "test/two",
-            "test/two/first-two-wire",
+        result = await asyncio.wait_for(
+            registry.wait_for_agent(launch.agent_id, launch.run_id), timeout=1
         )
-        assert member.agent_id is not None and member.run_id is not None
+        assert result.completed
         assert registry._agent_records == {}
-        delivered = await registry.wait_for_agent(member.agent_id, member.run_id)
-        serialized = delivered.model_dump(mode="json")
-        assert TaskResult.model_validate(serialized) == delivered
-        assert serialized["metadata"]["providers_used"] == [["test/one", "test/two"]]
+        serialized = result.model_dump(mode="json")
+        assert TaskResult.model_validate(serialized) == result
+        assert serialized["metadata"]["providers_used"] == [["test-one", "test-two"]]
     finally:
         failed.release.set()
         await registry.drain_children()
@@ -380,7 +395,7 @@ async def test_failover_terminal_identity_survives_eviction_and_result_serializa
 
 
 @pytest.mark.asyncio
-async def test_fan_out_sibling_survives_failover_and_shares_root_cooldown(
+async def test_parallel_explicit_tasks_survive_failover_and_share_root_cooldown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failing fan-out member neither cancels its sibling nor owns its cooldown."""
@@ -392,7 +407,7 @@ async def test_fan_out_sibling_survives_failover_and_shares_root_cooldown(
     sibling = _SiblingCompletionBackend()
 
     def create_backend(*, provider: ProviderConfig, **_kwargs: object) -> FakeBackend:
-        return failed if provider.name == "test/one" else sibling
+        return failed if provider.name == "test-one" else sibling
 
     monkeypatch.setattr(
         "chartreux.core.agent_loop._loop.create_backend", create_backend
@@ -405,41 +420,41 @@ async def test_fan_out_sibling_survives_failover_and_shares_root_cooldown(
     root.turns.link_subagent = AsyncMock()
     registry.bind_root(root)
     try:
-        task = asyncio.create_task(
-            _fan_out_result(
+        first_task = asyncio.create_task(
+            _task_result(
                 registry,
                 TaskArgs(
-                    task="run siblings",
-                    fan_out=True,
+                    task="inspect first model",
                     background=False,
-                    config=LaunchConfig(model="@ordered"),
+                    config=LaunchConfig(model="first"),
                 ),
-                InvokeContext(tool_call_id="fan-out", session_id=parent.session_id),
+                InvokeContext(tool_call_id="first-task", session_id=parent.session_id),
+            )
+        )
+        later_task = asyncio.create_task(
+            _task_result(
+                registry,
+                TaskArgs(
+                    task="inspect later model",
+                    background=False,
+                    config=LaunchConfig(model="later"),
+                ),
+                InvokeContext(tool_call_id="later-task", session_id=parent.session_id),
             )
         )
         await asyncio.wait_for(failed.started.wait(), timeout=1)
         await asyncio.wait_for(sibling.later_completed.wait(), timeout=1)
-        assert not task.done()
+        assert not first_task.done()
         assert sibling.completed_bases == ["later"]
 
         failed.release.set()
-        result = await asyncio.wait_for(task, timeout=1)
+        first_result, later_result = await asyncio.wait_for(
+            asyncio.gather(first_task, later_task), timeout=1
+        )
 
         root_registry = parent.config_orchestrator._availability_registry
-        assert root_registry.cooldown_until("first", "test/one") is not None
-        assert all(
-            record.runtime.agent_loop.config_orchestrator._availability_registry
-            is root_registry
-            for record in registry._agent_records.values()
-        )
-        assert result.completed and result.members is not None
-        assert {
-            (member.base_model, member.provider, member.display_name)
-            for member in result.members
-        } == {
-            ("first", "test/two", "test/two/first-two-wire"),
-            ("later", "test/two", "test/two/later-wire"),
-        }
+        assert root_registry.cooldown_until("first", "test-one") is not None
+        assert first_result.completed and later_result.completed
         assert sibling.completed_bases == ["later", "first"]
     finally:
         failed.release.set()
@@ -447,7 +462,7 @@ async def test_fan_out_sibling_survives_failover_and_shares_root_cooldown(
         await parent.aclose()
 
 
-_LEGACY_CONFIG = b"""active_model = "friendly"\n[[providers]]\nname = "test"\napi_base = "https://example.test/v1"\n[[models]]\nname = "base"\nprovider = "test"\nalias = "friendly"\n"""
+_LEGACY_CONFIG = b"""[[providers]]\nname = "test"\napi_base = "https://example.test/v1"\n[[models]]\nname = "base"\nprovider = "test"\nalias = "friendly"\n"""
 
 
 @pytest.mark.asyncio
@@ -489,7 +504,7 @@ async def test_migration_legacy_unknown_cost_policy_round_trips_through_stats(
             resumed.committed_model.base_model,
             resumed.committed_model.provider,
             resumed.committed_model.wire_name,
-        ) == ("base", "test/default", "base")
+        ) == ("base", "test", "base")
         assert (resumed.stats.has_unknown_cost, resumed.stats.known_cost_total) == (
             True,
             0.0,
@@ -532,7 +547,7 @@ async def test_reload_while_background_child_runs_keeps_child_snapshot_isolated(
     runtime.turns.link_subagent = AsyncMock()
     registry.bind_root(runtime)
     try:
-        launch = await _fan_out_result(
+        launch = await _task_result(
             registry,
             TaskArgs(task="snapshot", agent="worker", background=True),
             InvokeContext(tool_call_id="background", session_id=parent.session_id),
@@ -589,7 +604,7 @@ async def test_repeated_attempt_lifecycle_closes_once_and_does_not_extend_deadli
         _self: AgentLoop, model: ModelConfig, budget: RequestRetryBudget
     ) -> FakeBackend:
         deadlines.append(budget.deadline)
-        return {"test/one": first, "test/two": second}[model.provider]
+        return {"test-one": first, "test-two": second}[model.provider]
 
     agent._backend_for_attempt = backend_for_attempt.__get__(agent, AgentLoop)  # type: ignore[method-assign]
     before = len(os.listdir("/proc/self/fd"))

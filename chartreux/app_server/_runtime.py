@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import threading
@@ -21,6 +21,9 @@ from chartreux.app_server._session_model import (
     active_model_is_pinned,
     clear_session_active_model_override,
     config_active_model,
+    config_thinking_overrides,
+    override_active_model,
+    restore_session_thinking_overrides,
     set_session_active_model_override,
 )
 from chartreux.app_server.client import AppServerClient
@@ -371,7 +374,8 @@ class AgentRuntimeFactory:
         lease = await asyncio.to_thread(
             _acquire_session_lease, source.config, session_id
         )
-        previous_model = source.config.get_active_model().alias
+        previous_model_override = override_active_model(source.config_orchestrator)
+        previous_thinking = dict(source.config.thinking_overrides)
         previous_identity = source.committed_model
         previous_session_pinned = source.session_logger.active_model is not None
         prepared_scratchpad: Path | None = None
@@ -388,6 +392,14 @@ class AgentRuntimeFactory:
             session_metadata = SessionMetadata.model_validate(metadata)
             resume_identity = _resume_identity(source.config, session_metadata)
             active_model = config_active_model(metadata)
+            target_model_applied = True
+            await _restore_session_thinking(
+                source.config_orchestrator,
+                config_thinking_overrides(metadata)
+                if resume_identity is not None
+                or _is_legacy_root_metadata(session_metadata)
+                else {},
+            )
             if resume_identity is not None:
                 source.config.attach_committed_model(resume_identity)
             elif _is_legacy_root_metadata(session_metadata):
@@ -404,7 +416,6 @@ class AgentRuntimeFactory:
                 await _restore_session_active_model(
                     source.config_orchestrator, None, clear_existing=True
                 )
-            target_model_applied = True
             # ``_load_session`` already parsed metadata.json into ``metadata``;
             # parse that dict instead of re-reading the file from disk.
             stats = _build_stats(source, metadata)
@@ -442,7 +453,12 @@ class AgentRuntimeFactory:
                 cleanup_scratchpad(prepared_scratchpad)
             if target_model_applied:
                 await _restore_session_active_model(
-                    source.config_orchestrator, previous_model, clear_existing=False
+                    source.config_orchestrator,
+                    previous_model_override,
+                    clear_existing=True,
+                )
+                await _restore_session_thinking(
+                    source.config_orchestrator, previous_thinking
                 )
             if lease is not None:
                 await asyncio.to_thread(lease.release)
@@ -483,6 +499,9 @@ class AgentRuntimeFactory:
         # error instead of loading the session unpinned.
         resume_identity = _resume_identity(
             blueprint.config, session_metadata, fail_fast=True
+        )
+        await _restore_session_thinking(
+            blueprint.config_orchestrator, config_thinking_overrides(metadata)
         )
         if resume_identity is not None:
             blueprint.config.attach_committed_model(resume_identity)
@@ -1174,6 +1193,19 @@ async def _restore_session_active_model(
     if failures:
         raise RuntimeConfigurationError(
             f"Failed to restore session active model: {failures[0]}"
+        )
+
+
+async def _restore_session_thinking(
+    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
+    overrides: Mapping[str, str],
+) -> None:
+    failures = await restore_session_thinking_overrides(
+        orchestrator, overrides, reason="restore session thinking choices"
+    )
+    if failures:
+        raise RuntimeConfigurationError(
+            f"Failed to restore session thinking: {failures[0]}"
         )
 
 

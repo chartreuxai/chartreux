@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
+import pytest
 from textual.pilot import Pilot
 
 from chartreux.app_server._projection import project_debug_logs
@@ -62,6 +63,38 @@ def test_snapshot_debug_console_open(snap_compare: SnapCompare) -> None:
     assert snap_compare(
         DebugConsoleSnapshotApp(), terminal_size=(120, 36), run_before=run_before
     )
+
+
+def test_snapshot_debug_console_narrow_browser(snap_compare: SnapCompare) -> None:
+    _LOG_FILE.write_text(_SAMPLE_LOGS + "\n")
+
+    async def run_before(pilot: Pilot) -> None:
+        await pilot.pause(0.1)
+        await pilot.press("ctrl+backslash")
+        await pilot.pause(0.4)
+        console = pilot.app.query_one("#debug-console")
+        assert console.has_class("-fullscreen")
+        assert console.size.width >= 78
+        assert pilot.app.screen.focused is console.query_one("#debug-console-log")
+
+    assert snap_compare(
+        DebugConsoleSnapshotApp(), terminal_size=(80, 24), run_before=run_before
+    )
+
+
+@pytest.mark.asyncio
+async def test_narrow_debug_console_restores_opener_focus() -> None:
+    app = DebugConsoleSnapshotApp()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause(0.1)
+        opener = app.screen.focused
+        await pilot.press("ctrl+backslash")
+        await pilot.pause(0.15)
+        assert app.screen.focused is app.query_one("#debug-console-log")
+        await pilot.press("ctrl+backslash")
+        await pilot.pause()
+        assert app.screen.focused is opener
+        assert opener is not None and opener.can_focus
 
 
 def test_snapshot_debug_console_live_append(snap_compare: SnapCompare) -> None:

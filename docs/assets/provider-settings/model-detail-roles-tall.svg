@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" data-cols="80" data-rows="48" viewBox="0 0 976 1171.2" role="img">
+<title>Model detail — Global Model catalog</title>
+<desc>Tall model detail opened from Global Model catalog, with expanded deployment and readiness information. Display label, prices, capabilities, deployment, and six ordered role memberships are editable; Save model edits stages changes until Apply or Create.</desc>
+<rect width="976" height="1171.2" fill="#171a1f"/>
+<text data-row="0" x="12.2" y="18.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee" font-weight="bold">Provider Settings  /  Global Model catalog  /  Model detail</text>
+<text data-row="1" x="12.2" y="42.4" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Mistral  ·  model fields and ordered role membership</text>
+<text data-row="2" x="12.2" y="66.8" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Model ID       glm-5-3  [read-only]</text>
+<rect data-focus-row="3" x="0" y="73.2" width="976" height="24.4" fill="#dce3ed"/>
+<text data-row="3" x="12.2" y="91.2" font-family="Fira Code,monospace" font-size="20" fill="#10151c" font-weight="bold">▸ Display label  [GLM-5.3▏]</text>
+<text data-row="4" x="12.2" y="115.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Input price    [unknown]</text>
+<text data-row="5" x="12.2" y="140.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Output price   [unknown]</text>
+<text data-row="6" x="12.2" y="164.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Capabilities   [x] chat  [x] tools  [x] streaming</text>
+<text data-row="7" x="12.2" y="188.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Deployment     [glm-5-3]  [x] enabled</text>
+<text data-row="8" x="12.2" y="213.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="9" x="12.2" y="237.6" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">ROLE MEMBERSHIP  ·  saved position order</text>
+<text data-row="10" x="12.2" y="262.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  [x] @orchestrator  ·  position 1</text>
+<text data-row="11" x="12.2" y="286.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  [ ] @advisor       ·  not assigned</text>
+<text data-row="12" x="12.2" y="310.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  [x] @small-worker  ·  position 1</text>
+<text data-row="13" x="12.2" y="335.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  [ ] @large-worker  ·  not assigned</text>
+<text data-row="14" x="12.2" y="359.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  [x] @small-reviewer ·  position 2</text>
+<text data-row="15" x="12.2" y="384.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  [ ] @deep-reviewer ·  not assigned</text>
+<text data-row="16" x="12.2" y="408.4" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">New members append at the end of a role.</text>
+<text data-row="17" x="12.2" y="432.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="18" x="12.2" y="457.2" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">DEPLOYMENT DETAILS</text>
+<text data-row="19" x="12.2" y="481.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Provider: Mistral  ·  wire model: glm-5-3</text>
+<text data-row="20" x="12.2" y="506.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Deployment enabled; provider credential is saved.</text>
+<text data-row="21" x="12.2" y="530.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Effective capabilities: chat, tools, streaming</text>
+<text data-row="22" x="12.2" y="554.8" font-family="Fira Code,monospace" font-size="20" fill="#8ab4f8">Validation: complete · model is runnable</text>
+<text data-row="23" x="12.2" y="579.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="24" x="12.2" y="603.6" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">READINESS CHECK</text>
+<text data-row="25" x="12.2" y="628.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Provider enabled: yes</text>
+<text data-row="26" x="12.2" y="652.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Credential available: yes</text>
+<text data-row="27" x="12.2" y="676.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Model enabled: yes</text>
+<text data-row="28" x="12.2" y="701.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Deployment enabled: yes</text>
+<text data-row="29" x="12.2" y="725.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Endpoint: https://api.mistral.ai/v1</text>
+<text data-row="30" x="12.2" y="750.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Protocol: OpenAI-compatible</text>
+<text data-row="31" x="12.2" y="774.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Request model name: glm-5-3</text>
+<text data-row="32" x="12.2" y="798.8" font-family="Fira Code,monospace" font-size="20" fill="#8ab4f8">Runnable: provider, key, model, deployment are valid</text>
+<text data-row="33" x="12.2" y="823.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Effective capabilities: chat, tools, streaming</text>
+<text data-row="34" x="12.2" y="847.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="35" x="12.2" y="872.0" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">CATALOG IDENTITY</text>
+<text data-row="36" x="12.2" y="896.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Canonical model ID remains glm-5-3 across deployments.</text>
+<text data-row="37" x="12.2" y="920.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Deployment name is the provider wire model identifier.</text>
+<text data-row="38" x="12.2" y="945.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  [ Save model edits ] stages details in pending catalog changes.</text>
+<text data-row="39" x="12.2" y="969.6" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Apply or Create saves them. Clean Esc returns to Global Model catalog.</text>
+<text data-row="40" x="12.2" y="994.0" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Dirty Esc: Keep editing · Save model edits · Discard detail.</text>
+<text data-row="41" x="12.2" y="1018.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="42" x="12.2" y="1042.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="43" x="12.2" y="1067.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="44" x="12.2" y="1091.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="45" x="12.2" y="1116.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="46" x="12.2" y="1140.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="47" x="12.2" y="1164.8" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Enter Next field   Tab Next control   Esc Global Model catalog</text>
+</svg>

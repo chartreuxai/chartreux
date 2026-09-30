@@ -15,6 +15,43 @@ from chartreux.core.config.layers.project import ProjectConfigLayer
 from chartreux.core.config.layers.user import UserConfigLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.config.patch import AddOperationPatch, PatchOp, RemoveOperationPatch
+from chartreux.core.tools.builtins.web_search import (
+    SearchProviderDiagnostic,
+    WebSearchConfig,
+    effective_web_search_config,
+)
+
+
+def touches_web_search(ops: list[ConfigWriteOpWire]) -> bool:
+    """Scope search validation to writes that can change its effective values."""
+    return any(
+        op.path in {"", "/tools", "/tools/web_search"}
+        or op.path.startswith("/tools/web_search/")
+        for op in ops
+    )
+
+
+def validate_web_search_candidate(config: ChartreuxConfigSchema) -> None:
+    """Reject invalid search settings before a source is replaced."""
+    if isinstance(effective_web_search_config(config), SearchProviderDiagnostic):
+        raise ValueError("Invalid web search settings")
+
+
+def validate_web_search_write_ops(ops: list[ConfigWriteOpWire]) -> None:
+    """Validate changed leaves even when a higher layer shadows their values."""
+    for op in ops:
+        if op.op != "set":
+            continue
+        if op.path.startswith("/tools/web_search/"):
+            name = op.path.removeprefix("/tools/web_search/")
+            if "/" not in name and name in WebSearchConfig.model_fields:
+                WebSearchConfig.model_validate({name: op.value})
+        elif op.path == "/tools/web_search" and isinstance(op.value, dict):
+            WebSearchConfig.model_validate(op.value)
+        elif op.path == "/tools" and isinstance(op.value, dict):
+            search = op.value.get("web_search")
+            if isinstance(search, dict):
+                WebSearchConfig.model_validate(search)
 
 
 def config_write_targets(

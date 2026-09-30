@@ -34,11 +34,11 @@ def random_config_file_name() -> str:
 @pytest.mark.asyncio
 async def test_reads_toml_file(tmp_working_directory: Path) -> None:
     path = tmp_working_directory / random_config_file_name()
-    path.write_text('active_model = "mistral-large"\ncount = 42\n')
+    path.write_text('theme = "dark"\ncount = 42\n')
 
     layer = UserConfigLayer(path=path)
     data = await layer.load()
-    assert data.model_extra == {"active_model": "mistral-large", "count": 42}
+    assert data.model_extra == {"theme": "dark", "count": 42}
     fingerprint = layer.fingerprint
     assert isinstance(fingerprint, str)
     assert fingerprint
@@ -77,13 +77,13 @@ async def test_apply_creates_file_when_it_does_not_exist(
 
     await layer.apply(
         ConfigPatch(
-            AddOperationPatch(path="/active_model", value="mistral-large"),
+            AddOperationPatch(path="/theme", value="dark"),
             fingerprint=MISSING_BACKING_STORE_DATA_FINGERPRINT,
         )
     )
 
     with path.open("rb") as file:
-        assert tomllib.load(file) == {"active_model": "mistral-large"}
+        assert tomllib.load(file) == {"theme": "dark"}
         assert layer.fingerprint == create_file_fingerprint(file)
 
 
@@ -93,7 +93,7 @@ async def test_apply_sets_field_and_refreshes_cache(
 ) -> None:
     path = tmp_working_directory / random_config_file_name()
     path.write_text("""\
-active_model = "old"
+theme = "dark"
 
 [tools]
 disabled_tools = ["bash", "python"]
@@ -107,7 +107,7 @@ deprecated_setting = true
 
     await layer.apply(
         ConfigPatch(
-            ReplaceOperationPatch(path="/active_model", value="new"),
+            ReplaceOperationPatch(path="/theme", value="light"),
             AddOperationPatch(path="/tools/enabled_tools", value=["read"]),
             AddOperationPatch(path="/tools/disabled_tools/-", value="node"),
             RemoveOperationPatch(path="/tools/disabled_tools/0"),
@@ -117,7 +117,7 @@ deprecated_setting = true
     )
 
     expected_data = {
-        "active_model": "new",
+        "theme": "light",
         "tools": {"disabled_tools": ["python", "node"], "enabled_tools": ["read"]},
     }
     with path.open("rb") as file:
@@ -138,7 +138,7 @@ async def test_apply_raises_config_storage_error_when_write_fails(
     # ConfigStorageError, not an uncaught traceback. chmod is unreliable under
     # root, so raise the OSError from the write path directly.
     path = tmp_working_directory / random_config_file_name()
-    path.write_text('active_model = "old"\n')
+    path.write_text('theme = "dark"\n')
     layer = UserConfigLayer(path=path)
     await layer.load()
     fingerprint = layer.fingerprint
@@ -152,7 +152,7 @@ async def test_apply_raises_config_storage_error_when_write_fails(
     with pytest.raises(ConfigStorageError) as excinfo:
         await layer.apply(
             ConfigPatch(
-                ReplaceOperationPatch(path="/active_model", value="new"),
+                ReplaceOperationPatch(path="/theme", value="light"),
                 fingerprint=fingerprint,
             )
         )
@@ -167,7 +167,7 @@ async def test_load_raises_config_storage_error_when_read_fails(
     tmp_working_directory: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_working_directory / random_config_file_name()
-    path.write_text('active_model = "old"\n')
+    path.write_text('theme = "dark"\n')
     layer = UserConfigLayer(path=path)
 
     original_open = Path.open
@@ -201,8 +201,7 @@ async def test_apply_cache_fingerprint_matches_written_file(
 
     await layer.apply(
         ConfigPatch(
-            AddOperationPatch(path="/active_model", value="mistral-large"),
-            fingerprint=fingerprint,
+            AddOperationPatch(path="/theme", value="dark"), fingerprint=fingerprint
         )
     )
 
@@ -224,15 +223,14 @@ async def test_apply_uses_unique_temp_file(tmp_working_directory: Path) -> None:
 
     await layer.apply(
         ConfigPatch(
-            AddOperationPatch(path="/active_model", value="mistral-large"),
-            fingerprint=fingerprint,
+            AddOperationPatch(path="/theme", value="dark"), fingerprint=fingerprint
         )
     )
 
     assert fixed_tmp_path.read_text() == "stale"
     assert list(tmp_working_directory.glob(f".{path.name}.*.tmp")) == []
     with path.open("rb") as file:
-        assert tomllib.load(file) == {"active_model": "mistral-large"}
+        assert tomllib.load(file) == {"theme": "dark"}
 
 
 @pytest.mark.asyncio
@@ -241,8 +239,8 @@ async def test_checked_write_rejects_replaced_snapshot_revision(
 ) -> None:
     path = tmp_working_directory / random_config_file_name()
     replacement = tmp_working_directory / f"replacement-{path.name}"
-    path.write_text('active_model = "opened"\n')
-    replacement.write_text('active_model = "replacement"\n')
+    path.write_text('theme = "dark"\n')
+    replacement.write_text('theme = "light"\n')
     layer = UserConfigLayer(path=path)
 
     snapshot = await layer.load()
@@ -256,7 +254,7 @@ async def test_checked_write_rejects_replaced_snapshot_revision(
     assert exc_info.value.expected_fp == revision
     with path.open("rb") as file:
         assert exc_info.value.actual_fp == create_file_fingerprint(file)
-    assert tomllib.loads(path.read_text()) == {"active_model": "replacement"}
+    assert tomllib.loads(path.read_text()) == {"theme": "light"}
 
 
 def test_atomic_replace_preserves_replacement_fingerprint(
@@ -286,7 +284,7 @@ async def test_apply_raises_when_layer_is_not_loaded(
     with pytest.raises(LayerNotLoadedError, match="loaded before applying patches"):
         await layer.apply(
             ConfigPatch(
-                AddOperationPatch(path="/active_model", value="mistral-large"),
+                AddOperationPatch(path="/theme", value="dark"),
                 fingerprint=MISSING_BACKING_STORE_DATA_FINGERPRINT,
             )
         )
@@ -297,7 +295,7 @@ async def test_apply_raises_when_cache_is_invalidated(
     tmp_working_directory: Path,
 ) -> None:
     path = tmp_working_directory / random_config_file_name()
-    path.write_text('active_model = "old"\n')
+    path.write_text('theme = "dark"\n')
     layer = UserConfigLayer(path=path)
 
     await layer.load()
@@ -308,7 +306,7 @@ async def test_apply_raises_when_cache_is_invalidated(
     with pytest.raises(LayerNotLoadedError, match="loaded before applying patches"):
         await layer.apply(
             ConfigPatch(
-                ReplaceOperationPatch(path="/active_model", value="new"),
+                ReplaceOperationPatch(path="/theme", value="light"),
                 fingerprint=fingerprint,
             )
         )
@@ -325,19 +323,19 @@ async def test_apply_creates_parent_directory_when_it_does_not_exist(
 
     await layer.apply(
         ConfigPatch(
-            AddOperationPatch(path="/active_model", value="mistral-large"),
+            AddOperationPatch(path="/theme", value="dark"),
             fingerprint=MISSING_BACKING_STORE_DATA_FINGERPRINT,
         )
     )
 
     with path.open("rb") as file:
-        assert tomllib.load(file) == {"active_model": "mistral-large"}
+        assert tomllib.load(file) == {"theme": "dark"}
 
 
 @pytest.mark.asyncio
 async def test_commit_sets_missing_nested_field(tmp_working_directory: Path) -> None:
     path = tmp_working_directory / random_config_file_name()
-    path.write_text("[models]\n")
+    path.write_text("[tools]\n")
     layer = UserConfigLayer(path=path)
 
     await layer.load()
@@ -346,13 +344,13 @@ async def test_commit_sets_missing_nested_field(tmp_working_directory: Path) -> 
 
     await layer.apply(
         ConfigPatch(
-            AddOperationPatch(path="/models/active_model", value="mistral-large"),
+            AddOperationPatch(path="/tools/enabled_tools", value=["read"]),
             fingerprint=fingerprint,
         )
     )
 
     with path.open("rb") as file:
-        assert tomllib.load(file) == {"models": {"active_model": "mistral-large"}}
+        assert tomllib.load(file) == {"tools": {"enabled_tools": ["read"]}}
 
 
 @pytest.mark.asyncio
@@ -360,42 +358,41 @@ async def test_apply_overwrites_external_file_changes(
     tmp_working_directory: Path,
 ) -> None:
     path = tmp_working_directory / random_config_file_name()
-    path.write_text('active_model = "old"\n')
+    path.write_text('theme = "dark"\n')
     layer = UserConfigLayer(path=path)
 
     await layer.load()
     fingerprint = layer.fingerprint
     assert isinstance(fingerprint, str)
-    path.write_text('active_model = "external"\n')
+    path.write_text('theme = "external"\n')
 
     await layer.apply(
         ConfigPatch(
-            ReplaceOperationPatch(path="/active_model", value="new"),
-            fingerprint=fingerprint,
+            ReplaceOperationPatch(path="/theme", value="light"), fingerprint=fingerprint
         )
     )
 
     with path.open("rb") as file:
-        assert tomllib.load(file) == {"active_model": "new"}
+        assert tomllib.load(file) == {"theme": "light"}
     data = await layer.load()
-    assert data.model_extra == {"active_model": "new"}
+    assert data.model_extra == {"theme": "light"}
 
 
 @pytest.mark.asyncio
 async def test_nested_toml_structure(tmp_working_directory: Path) -> None:
     path = tmp_working_directory / random_config_file_name()
     path.write_text("""\
-[models]
-active_model = "test"
+[tools]
+enabled_tools = ["read"]
 
-[[models.items]]
+[[tools.items]]
 alias = "a"
 provider = "p"
 """)
     layer = UserConfigLayer(path=path)
     data = await layer.load()
     assert data.model_extra == {
-        "models": {"active_model": "test", "items": [{"alias": "a", "provider": "p"}]}
+        "tools": {"enabled_tools": ["read"], "items": [{"alias": "a", "provider": "p"}]}
     }
 
 

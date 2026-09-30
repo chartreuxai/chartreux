@@ -10,8 +10,7 @@ from collections.abc import (
     Iterator,
 )
 from contextlib import ExitStack, asynccontextmanager, contextmanager, suppress
-from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 import enum
 import fnmatch
 import itertools
@@ -35,13 +34,8 @@ from chartreux.app_server._streaming import BoundedEventQueue, stream_until_comp
 from chartreux.app_server._turns import DeliverCallback, TurnController, TurnStartAction
 from chartreux.app_server.models import (
     CallbackOutput,
-    CancelledEffectState,
-    CompletedEffectState,
-    EffectResultDisplay,
-    FailedEffectState,
     OpenCallbackState,
     PublicCallbackEntry,
-    PublicError,
     PublicHistoryEntry,
     PublicSessionState,
     PublicTurn,
@@ -58,7 +52,6 @@ from chartreux.app_server.protocol import (
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._loop import _PreparedPolicyReplacement
 from chartreux.core.agents.launch import FrozenPersona, LaunchCandidate, resolve_launch
-from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config._restrictions import (
     SourceRestrictions,
     partition_policy_sources,
@@ -76,7 +69,6 @@ from chartreux.core.subagents import (
     AgentProfileMismatchError,
     AgentResultExpiredError,
     AgentSummary,
-    InvalidLaunchModelError,
     LaunchConfig,
     LaunchConfigError,
     ReleaseAgentOutcome,
@@ -84,7 +76,6 @@ from chartreux.core.subagents import (
     SubagentRunAccumulator,
     SubagentRunnerPort,
     TaskArgs,
-    TaskMemberResult,
     TaskResult,
     UnknownAgentError,
     normalize_task_summary,
@@ -175,22 +166,6 @@ class SessionRuntime:
         if errors:
             raise BaseExceptionGroup("Failed to close session runtime", errors)
         self._closed = True
-
-
-@dataclass(frozen=True, slots=True)
-class _FanOutPreflight:
-    candidate: LaunchCandidate
-    parent: SessionRuntime
-    parent_identity: tuple[str, int]
-    parent_orchestrator: object
-    accepted_config_token: object | None
-    parent_config_snapshot: object
-    catalog_snapshot: object | None
-    authority_revision: int
-    profile_name: str
-    profile_snapshot: AgentProfile
-    model_expression: str
-    launch_config: LaunchConfig
 
 
 @dataclass(slots=True)
@@ -343,9 +318,6 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         ] = {}
         self._detached_child_ids: set[str] = set()
         self._monitor_tasks: set[asyncio.Task[None]] = set()
-        self._fan_out_effect_projectors: dict[str, Any] = {}
-        self._pending_fan_out_result_leases: set[str] = set()
-        self._fan_out_result_leases: dict[str, tuple[str, str]] = {}
         self._eviction_tasks: set[asyncio.Task[bool]] = set()
         self._registry_lock = asyncio.Lock()
         self._clock = clock
@@ -1385,62 +1357,10 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             ),
         )
 
-    def _fan_out_preflight_is_current(
-        self, parent: SessionRuntime, args: TaskArgs, preflight: _FanOutPreflight
-    ) -> bool:
-        config = args.config
-        if config is None or not isinstance(config.model, str):
-            return False
-        profile_name = args.agent if "agent" in args.model_fields_set else "worker"
-        try:
-            current_profile = parent.agent_loop.agent_manager.get_agent(profile_name)
-        except ValueError:
-            return False
-
-        orchestrator = parent.agent_loop.config_orchestrator
-        identity = (parent.agent_loop.session_id, parent.agent_loop._session_generation)
-        # tool_inventory/authorized_tool_names are intentionally not snapshotted:
-        # policy replacement bumps the checked authority revision, launch
-        # reconfiguration swaps the checked orchestrator, and require_idle()-gated
-        # MCP mutations cannot overlap this mid-turn fan-out window.
-        return (
-            preflight.parent is parent
-            and preflight.parent_identity == identity
-            and self._generation_identity == identity
-            and preflight.parent_orchestrator is orchestrator
-            and preflight.accepted_config_token is orchestrator.accepted_token
-            and preflight.parent_config_snapshot is parent.agent_loop.config
-            and preflight.catalog_snapshot is parent.agent_loop.config.catalog_snapshot
-            and preflight.authority_revision == parent.agent_loop._authority_revision
-            and preflight.profile_name == profile_name
-            and preflight.profile_snapshot == current_profile
-            and preflight.profile_snapshot == preflight.candidate.profile
-            and preflight.candidate.profile.name == profile_name
-            and preflight.model_expression == config.model
-            and preflight.candidate.semantic_overrides.model == config.model
-            and preflight.launch_config.model_fields_set == config.model_fields_set
-            and preflight.launch_config.model_dump(exclude_unset=True, mode="python")
-            == config.model_dump(exclude_unset=True, mode="python")
-            and preflight.candidate.orchestrator.availability_registry.is_available(
-                preflight.candidate.committed_model.base_model,
-                preflight.candidate.committed_model.provider,
-            )
-        )
-
     async def _create_registered_child(
-        self,
-        parent: SessionRuntime,
-        args: TaskArgs,
-        ctx: InvokeContext,
-        *,
-        preflight: _FanOutPreflight | None = None,
+        self, parent: SessionRuntime, args: TaskArgs, ctx: InvokeContext
     ) -> tuple[SessionRuntime, int | None]:
-        candidate = (
-            preflight.candidate
-            if preflight is not None
-            and self._fan_out_preflight_is_current(parent, args, preflight)
-            else self._resolve_launch_candidate(parent, args)
-        )
+        candidate = self._resolve_launch_candidate(parent, args)
         generation_identity = (
             parent.agent_loop.session_id,
             parent.agent_loop._session_generation,
@@ -1474,11 +1394,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 link_recorded = True
                 self._validate_background_admission(parent, generation_identity)
                 projection_started = True
-                should_link_projection = parent.turns._projector is not None and (
-                    ctx.tool_call_id not in self._pending_fan_out_result_leases
-                    or ctx.tool_call_id in self._fan_out_effect_projectors
-                )
-                if should_link_projection:
+                if parent.turns._projector is not None:
                     await parent.turns.link_subagent(ctx.tool_call_id, child.session_id)
                 self._validate_background_admission(parent, generation_identity)
             except BaseException:
@@ -1570,485 +1486,16 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         if any(fnmatch.fnmatch(profile, pattern) for pattern in config.denylist):
             raise ToolPermissionError(f"Task denied for agent profile: {profile}")
 
-    async def _start_fan_out_member_effect(
-        self, parent: SessionRuntime, parent_tool_call_id: str, member_tool_call_id: str
-    ) -> None:
-        """Create the synthetic projected effect required for a fan-out child link."""
-        projector = parent.turns._projector
-        if projector is not None:
-            try:
-                update = projector.start_fan_out_member_effect(
-                    parent_tool_call_id, member_tool_call_id
-                )
-            except ValueError:
-                return
-            self._fan_out_effect_projectors[member_tool_call_id] = projector
-            await parent.turns._emit_projected(update)
-
-    async def _complete_fan_out_member_effect(
-        self,
-        parent: SessionRuntime,
-        member_tool_call_id: str,
-        status: str,
-        message: str = "",
-    ) -> None:
-        """Complete a synthetic fan-out effect with its member's terminal status."""
-        projector = self._fan_out_effect_projectors.pop(member_tool_call_id, None)
-        if projector is None:
-            return
-        display = EffectResultDisplay(success=status == "completed", message=message)
-        if status == "completed":
-            state = CompletedEffectState(output=None, display=display)
-        elif status == "cancelled":
-            state = CancelledEffectState(reason=message, display=display)
-        else:
-            state = FailedEffectState(
-                error=PublicError(message=message), display=display
-            )
-        try:
-            update = projector.complete_effect(member_tool_call_id, state)
-        except ValueError:
-            return
-        await parent.turns._emit_projected(update)
-
-    def _hold_fan_out_result_lease(
-        self, member_tool_call_id: str, agent_id: str, run_id: str
-    ) -> None:
-        """Protect a committed member result before its launch acknowledgement yields."""
-        key = (agent_id, run_id)
-        self._wait_leases[key] = self._wait_leases.get(key, 0) + 1
-        self._fan_out_result_leases[member_tool_call_id] = key
-
-    async def _release_fan_out_result_lease(self, member_tool_call_id: str) -> None:
-        key = self._fan_out_result_leases.pop(member_tool_call_id, None)
-        if key is None:
-            return
-        async with self._registry_lock:
-            leases = self._wait_leases.get(key, 0)
-            if leases > 1:
-                self._wait_leases[key] = leases - 1
-            else:
-                self._wait_leases.pop(key, None)
-            self._expire_results_locked()
-
-    async def _release_fan_out_members(self, member_tool_call_ids: list[str]) -> None:
-        """Release every member committed before a fan-out launch was cancelled."""
-        self._pending_fan_out_result_leases.difference_update(member_tool_call_ids)
-        agent_ids = {
-            record.agent_id
-            for record in self._agent_records.values()
-            if self._child_links.get(record.session_id, (None, None))[1]
-            in member_tool_call_ids
-        }
-        await asyncio.gather(
-            *(
-                self._release_fan_out_result_lease(effect_id)
-                for effect_id in member_tool_call_ids
-            ),
-            *(self.release_agent(agent_id) for agent_id in agent_ids),
-            return_exceptions=True,
-        )
-
-    def _watch_fan_out_member(
-        self,
-        parent: SessionRuntime,
-        member_tool_call_id: str,
-        member: TaskMemberResult,
-        candidate: LaunchCandidate,
-    ) -> None:
-        """Update a background fan-out member and its effect when its run finishes."""
-        assert member.agent_id is not None and member.run_id is not None
-        agent_id = member.agent_id
-        run_id = member.run_id
-
-        async def watch() -> None:
-            try:
-                result = await self.wait_for_agent(agent_id, run_id)
-                identity = self._fan_out_member_identity(agent_id, run_id, candidate)
-                member.base_model = identity["base_model"]
-                member.provider = identity["provider"]
-                member.display_name = identity["display_name"]
-                if result.completed:
-                    await self._complete_fan_out_member_effect(
-                        parent, member_tool_call_id, "completed", "task completed"
-                    )
-                elif (
-                    self._fan_out_member_terminal_status(agent_id, run_id)
-                    is RunStatus.CANCELLED
-                ):
-                    await self._complete_fan_out_member_effect(
-                        parent, member_tool_call_id, "cancelled", "task cancelled"
-                    )
-                else:
-                    await self._complete_fan_out_member_effect(
-                        parent, member_tool_call_id, "failed", result.response
-                    )
-            except asyncio.CancelledError:
-                await self._complete_fan_out_member_effect(
-                    parent, member_tool_call_id, "cancelled", "task cancelled"
-                )
-                raise
-            except BaseException as exc:
-                member.status = "failed"
-                member.error = {"code": "wait_failed", "message": str(exc)}
-                await self._complete_fan_out_member_effect(
-                    parent, member_tool_call_id, "failed", str(exc)
-                )
-            finally:
-                await self._release_fan_out_result_lease(member_tool_call_id)
-
-        task = asyncio.create_task(
-            watch(), name=f"vibe-fan-out-member:{agent_id}:{run_id}"
-        )
-        self._monitor_tasks.add(task)
-        task.add_done_callback(self._monitor_tasks.discard)
-
-    def _fan_out_member_terminal_status(self, agent_id: str, run_id: str) -> RunStatus:
-        """Return the retained terminal status for an exact fan-out run."""
-        record = self._agent_records.get(agent_id)
-        if record is not None:
-            for run in (record.current_run, *record.run_history):
-                if run is not None and run.run_id == run_id:
-                    if run.status is not RunStatus.RUNNING:
-                        return run.status
-        raise RuntimeError(
-            f"Fan-out run {run_id} on agent {agent_id} has no terminal status"
-        )
-
-    def _fan_out_member_identity(
-        self, agent_id: str | None, run_id: str | None, candidate: LaunchCandidate
-    ) -> dict[str, str]:
-        """Return the concrete identity captured for this exact run."""
-        terminal_identity: tuple[str, str, str] | None = None
-        if agent_id is not None and run_id is not None:
-            record = self._agent_records.get(agent_id)
-            if record is not None:
-                runs = (record.current_run, *record.run_history)
-                for run in runs:
-                    if run is not None and run.run_id == run_id:
-                        terminal_identity = run.terminal_identity
-                        break
-            if terminal_identity is None:
-                stored = self._result_store.get((agent_id, run_id))
-                if stored is not None:
-                    terminal_identity = stored.terminal_identity
-        if terminal_identity is not None:
-            base_model, provider, wire_name = terminal_identity
-            return {
-                "base_model": base_model,
-                "provider": provider,
-                "display_name": format_model_display_name(provider, wire_name),
-            }
-        committed = candidate.committed_model
-        return {
-            "base_model": committed.base_model,
-            "provider": committed.provider,
-            "display_name": format_model_display_name(
-                committed.provider, committed.wire_name
-            ),
-        }
-
-    async def _run_fan_out(  # noqa: PLR0912, PLR0914, PLR0915
-        self, parent: SessionRuntime, args: TaskArgs, ctx: InvokeContext
-    ) -> TaskResult:
-        """Launch every explicit role member through the ordinary retained path."""
-        if args.agent_id is not None:
-            raise InvalidLaunchModelError("agent_id", "fan_out cannot reuse an agent")
-        if args.config is None or "model" not in args.config.model_fields_set:
-            raise InvalidLaunchModelError(
-                "config.model", "fan_out requires an explicitly supplied @role model"
-            )
-        expression = args.config.model
-        if not isinstance(expression, str):
-            raise InvalidLaunchModelError(
-                "config.model", "fan_out requires exactly one string @role model"
-            )
-        if not expression.startswith("@") or expression == "@":
-            raise InvalidLaunchModelError(
-                "config.model", "fan_out requires an explicitly supplied @role model"
-            )
-        snapshot = parent.agent_loop.config.catalog_snapshot
-        if snapshot is None:
-            raise InvalidLaunchModelError(
-                "config.model", "Model catalog is unavailable"
-            )
-        role = snapshot.catalog.roles.get(expression[1:])
-        if role is None:
-            raise InvalidLaunchModelError(
-                "config.model", f"Unknown model role {expression!r}"
-            )
-        members = role.models
-
-        # Resolve every member before creating any child. Passing its canonical base
-        # rather than the role also makes each child assignment-time concrete. A
-        # member-local model rejection does not prevent runnable siblings from being
-        # launched, but the whole call still requires at least one runnable member.
-        member_args: list[
-            tuple[int, str, TaskArgs, LaunchCandidate, _FanOutPreflight]
-        ] = []
-        skipped: dict[int, TaskMemberResult] = {}
-        first_rejection: tuple[str, LaunchConfigError] | None = None
-        for index, base in enumerate(members):
-            member_config = args.config.model_copy(update={"model": base})
-            member = args.model_copy(
-                update={"config": member_config, "fan_out": False, "background": True}
-            )
-            try:
-                candidate = self._resolve_launch_candidate(parent, member)
-            except InvalidLaunchModelError as exc:
-                if first_rejection is None:
-                    first_rejection = (base, exc)
-                definition = snapshot.catalog.models.get(base)
-                deployment = (
-                    definition.deployments[0]
-                    if definition is not None and definition.deployments
-                    else None
-                )
-                provider = deployment.provider if deployment is not None else ""
-                wire_name = deployment.name if deployment is not None else base
-                skipped[index] = TaskMemberResult(
-                    index=index,
-                    base_model=base,
-                    provider=provider,
-                    display_name=format_model_display_name(provider, wire_name),
-                    status="skipped",
-                    error={"code": "preflight_rejected", "message": str(exc)},
-                )
-                continue
-            except LaunchConfigError as exc:
-                raise InvalidLaunchModelError(
-                    "config.model", f"fan_out member {base!r} rejected: {exc}"
-                ) from exc
-            assert member.config is not None and isinstance(member.config.model, str)
-            preflight = _FanOutPreflight(
-                candidate=candidate,
-                parent=parent,
-                parent_identity=(
-                    parent.agent_loop.session_id,
-                    parent.agent_loop._session_generation,
-                ),
-                parent_orchestrator=parent.agent_loop.config_orchestrator,
-                accepted_config_token=(
-                    parent.agent_loop.config_orchestrator.accepted_token
-                ),
-                parent_config_snapshot=parent.agent_loop.config,
-                catalog_snapshot=parent.agent_loop.config.catalog_snapshot,
-                authority_revision=parent.agent_loop._authority_revision,
-                profile_name=candidate.profile.name,
-                profile_snapshot=deepcopy(candidate.profile),
-                model_expression=member.config.model,
-                launch_config=member.config.model_copy(deep=True),
-            )
-            member_args.append((index, base, member, candidate, preflight))
-
-        if not member_args:
-            assert first_rejection is not None
-            base, exc = first_rejection
-            raise InvalidLaunchModelError(
-                "config.model", f"fan_out member {base!r} rejected: {exc}"
-            ) from exc
-
-        launched: list[
-            tuple[int, str, LaunchCandidate, TaskResult | BaseException]
-        ] = []
-        started_member_effect_ids: list[str] = []
-        try:
-            for index, base, member, candidate, preflight in member_args:
-                member_ctx = replace(
-                    ctx, tool_call_id=f"{ctx.tool_call_id}:fan-out:{index}"
-                )
-                launch_succeeded = False
-                try:
-                    ack: TaskResult | None = None
-                    started_member_effect_ids.append(member_ctx.tool_call_id)
-                    await self._start_fan_out_member_effect(
-                        parent, ctx.tool_call_id, member_ctx.tool_call_id
-                    )
-                    self._pending_fan_out_result_leases.add(member_ctx.tool_call_id)
-                    async for event in self.run(
-                        member,
-                        member_ctx,
-                        preflight=preflight,
-                        defer_launch_agents_update=True,
-                    ):
-                        if isinstance(event, TaskResult):
-                            ack = event
-                    assert ack is not None
-                    launched.append((index, base, candidate, ack))
-                    launch_succeeded = True
-                except asyncio.CancelledError:
-                    await asyncio.gather(
-                        *(
-                            self._complete_fan_out_member_effect(
-                                parent,
-                                effect_id,
-                                "cancelled",
-                                "fan-out launch cancelled",
-                            )
-                            for effect_id in started_member_effect_ids
-                        ),
-                        self._release_fan_out_members(started_member_effect_ids),
-                        return_exceptions=True,
-                    )
-                    raise
-                except BaseException as exc:
-                    await self._complete_fan_out_member_effect(
-                        parent, member_ctx.tool_call_id, "failed", str(exc)
-                    )
-                    launched.append((index, base, candidate, exc))
-                finally:
-                    if not launch_succeeded:
-                        self._pending_fan_out_result_leases.discard(
-                            member_ctx.tool_call_id
-                        )
-        finally:
-            if not self._draining_children:
-                try:
-                    await self._emit_agents_update()
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to publish coalesced fan-out agent update", exc_info=exc
-                    )
-
-        collected_results: dict[tuple[str, str], TaskResult] = {}
-
-        async def terminal(
-            item: tuple[int, str, LaunchCandidate, TaskResult | BaseException],
-        ) -> TaskMemberResult:
-            index, _base, candidate, value = item
-            member_tool_call_id = f"{ctx.tool_call_id}:fan-out:{index}"
-            common = {
-                "index": index,
-                **self._fan_out_member_identity(None, None, candidate),
-            }
-            if isinstance(value, BaseException):
-                return TaskMemberResult(
-                    **common,
-                    status="failed",
-                    error={"code": "launch_failed", "message": str(value)},
-                )
-            if args.background:
-                common = {
-                    "index": index,
-                    **self._fan_out_member_identity(
-                        value.agent_id, value.run_id, candidate
-                    ),
-                }
-                member = TaskMemberResult(
-                    **common,
-                    status="running",
-                    agent_id=value.agent_id,
-                    run_id=value.run_id,
-                )
-                self._watch_fan_out_member(
-                    parent, member_tool_call_id, member, candidate
-                )
-                return member
-            assert value.agent_id is not None and value.run_id is not None
-            try:
-                result = await self.wait_for_agent(value.agent_id, value.run_id)
-                collected_results[(value.agent_id, value.run_id)] = result
-            except asyncio.CancelledError:
-                await self._release_fan_out_result_lease(member_tool_call_id)
-                await self._complete_fan_out_member_effect(
-                    parent, member_tool_call_id, "cancelled", "fan-out wait cancelled"
-                )
-                raise
-            except BaseException as exc:
-                await self._release_fan_out_result_lease(member_tool_call_id)
-                await self._complete_fan_out_member_effect(
-                    parent, member_tool_call_id, "failed", str(exc)
-                )
-                return TaskMemberResult(
-                    **common,
-                    status="failed",
-                    agent_id=value.agent_id,
-                    run_id=value.run_id,
-                    error={"code": "wait_failed", "message": str(exc)},
-                )
-            common = {
-                "index": index,
-                **self._fan_out_member_identity(
-                    value.agent_id, value.run_id, candidate
-                ),
-            }
-            terminal_status = (
-                self._fan_out_member_terminal_status(value.agent_id, value.run_id)
-                if not result.completed
-                else None
-            )
-            await self._release_fan_out_result_lease(member_tool_call_id)
-            if result.completed:
-                await self._complete_fan_out_member_effect(
-                    parent, member_tool_call_id, "completed", "task completed"
-                )
-                return TaskMemberResult(
-                    **common,
-                    status="completed",
-                    agent_id=value.agent_id,
-                    run_id=value.run_id,
-                    result=result.response,
-                    metadata=result.metadata,
-                )
-            if terminal_status is RunStatus.CANCELLED:
-                await self._complete_fan_out_member_effect(
-                    parent, member_tool_call_id, "cancelled", "task cancelled"
-                )
-                return TaskMemberResult(
-                    **common,
-                    status="cancelled",
-                    agent_id=value.agent_id,
-                    run_id=value.run_id,
-                    metadata=result.metadata,
-                )
-            await self._complete_fan_out_member_effect(
-                parent, member_tool_call_id, "failed", result.response
-            )
-            return TaskMemberResult(
-                **common,
-                status="failed",
-                agent_id=value.agent_id,
-                run_id=value.run_id,
-                error={"code": "runtime_failed", "message": result.response},
-                metadata=result.metadata,
-            )
-
-        # gather deliberately does not cancel siblings when one run fails.
-        try:
-            terminal_results = await asyncio.gather(
-                *(terminal(item) for item in launched)
-            )
-        except asyncio.CancelledError:
-            await self._release_fan_out_members(started_member_effect_ids)
-            raise
-        results_by_index = {member.index: member for member in terminal_results}
-        results_by_index.update(skipped)
-        results = [results_by_index[index] for index in range(len(members))]
-        turns_used = sum(result.turns_used for result in collected_results.values())
-        return TaskResult(
-            response="",
-            turns_used=turns_used,
-            completed=all(
-                member.status in {"running", "completed", "skipped"}
-                for member in results
-            ),
-            members=results,
-        )
-
     async def run(  # noqa: PLR0912, PLR0914, PLR0915
         self,
         args: TaskArgs,
         ctx: InvokeContext,
         *,
-        preflight: _FanOutPreflight | None = None,
         defer_launch_agents_update: bool = False,
     ) -> AsyncGenerator[ToolStreamEvent | TaskResult, None]:
         if ctx.is_subagent:
             raise RuntimeError("Agent depth limit of 1 reached")
         parent = self._runtime(ctx.session_id)
-        if args.fan_out:
-            yield await self._run_fan_out(parent, args, ctx)
-            return
         parent_identity = (
             parent.agent_loop.session_id,
             parent.agent_loop._session_generation,
@@ -2150,7 +1597,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             else:
                 self._require_task_profile_allowed(parent, args.agent)
                 runtime, idle_ttl_seconds = await self._create_registered_child(
-                    parent, args, ctx, preflight=preflight
+                    parent, args, ctx
                 )
                 agent_id = await self._issue_agent_id(parent)
                 record = AgentRecord(
@@ -2547,17 +1994,12 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     committed_model.provider if committed_model is not None else None
                 )
                 committed = True
-                if ctx.tool_call_id in self._pending_fan_out_result_leases:
-                    self._pending_fan_out_result_leases.remove(ctx.tool_call_id)
-                    self._hold_fan_out_result_lease(ctx.tool_call_id, agent_id, run_id)
                 if prepared_reconfiguration is not None:
                     assert backend_publication is not None
                     runtime.agent_loop.finalize_launch_reconfiguration(
                         prepared_reconfiguration, backend_publication
                     )
             except BaseException as exc:
-                if committed:
-                    await self._release_fan_out_result_lease(ctx.tool_call_id)
                 if action is not None and not committed:
                     action.abort()
                 if prepared_reconfiguration is not None and not committed:
@@ -3499,6 +2941,37 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             raise KeyError(session_id)
         return child
 
+    async def reserve_resume_admission(self, root: SessionRuntime) -> None:
+        """Close child admission atomically with the live-work check."""
+        async with self._ensure_child_lock:
+            reasons = []
+            if (
+                root.execution.active is not None
+                and root.execution.active.kind is not SessionExecutionKind.LIFECYCLE
+            ):
+                reasons.append("a turn or operation is running")
+            if root.turns.has_queued_turns:
+                reasons.append("input is queued")
+            if any(
+                isinstance(callback.state, OpenCallbackState)
+                for callback in root.turns.callbacks
+            ):
+                reasons.append("a decision is pending")
+            if self._creating_children or any(
+                record.current_run is not None
+                and record.current_run.status is RunStatus.RUNNING
+                for record in self._agent_records.values()
+            ):
+                reasons.append("background agents are running")
+            if reasons:
+                raise SessionExecutionConflict(
+                    "Cannot switch sessions while "
+                    + ", ".join(reasons)
+                    + ". Wait for work to finish, answer pending decisions, remove queued input, "
+                    "or stop work first; then retry. Nothing was switched."
+                )
+            self._admission_closed = True
+
     async def close_children(self) -> None:
         self._require_policy_unreserved()
         self._admission_closed = True
@@ -3549,8 +3022,6 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 self._expired_results.clear()
                 self._latest_run_ids.clear()
                 self._wait_leases.clear()
-                self._pending_fan_out_result_leases.clear()
-                self._fan_out_result_leases.clear()
                 self._pending_notifications.clear()
                 self._result_write_tokens.clear()
                 children = list(self._children.values())

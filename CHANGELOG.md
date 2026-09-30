@@ -2,6 +2,43 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.3.0 (2026-09-30)
+
+### Added
+
+- A `/settings` UI for all `config.toml` settings, with inline editing, bounded
+  inputs, checkboxes and dropdowns, and a single screen to enable or disable
+  tools, skills and agents. Changes are saved to `config.toml`.
+- A delegation protocol and configured model catalog in the system prompt, so
+  the orchestrator can route work to subagents using available roles and models
+  rather than guessing model names or doing everything itself.
+- Guided web-search configuration and model presets for simpler setup.
+
+### Changed
+
+- Provider Settings is now the single provider configuration surface, shared
+  with streamlined onboarding.
+- Applied a consistent design language across the TUI, with clearer controls,
+  keyboard and mouse interactions, and fewer navigation traps.
+- The advisor profile can now load skills, and task prompt examples use shipped
+  roles. Setup guidance and the prompt list now match available capabilities.
+
+### Fixed
+
+- TUI freezes under heavy subagent usage, including agent-bar updates and
+  switching between agent transcripts.
+- Credential names accepted by a session's model catalog remain scrubbed from
+  subprocess environments even after catalog reloads.
+- Shell timeouts, interrupts and cancellation terminate descendant process
+  groups with bounded waits, including cancellation immediately after spawning;
+  detached background jobs still survive successful commands.
+- Interrupted Anthropic thinking no longer leaves an invalid empty assistant
+  message in the next request.
+- A full disk while creating a session directory now takes the fail-soft path
+  instead of crashing the agent loop.
+- Setup no longer imports the CLI, and settings tool-filter help and inventory
+  views now match runtime behavior.
+
 ## 0.2.0 (2026-09-25)
 
 Initial pre-release of Chartreux. This is the first Chartreux release, forked from

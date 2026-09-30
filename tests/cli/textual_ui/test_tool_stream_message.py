@@ -27,6 +27,53 @@ from chartreux.core.tools.builtins.bash import Bash, BashArgs
 from tests.stubs.app_server import CoreEventProjection
 
 
+@pytest.mark.asyncio
+async def test_folded_warning_and_failure_are_explicit() -> None:
+    app = _ToolStreamApp()
+    async with app.run_test() as pilot:
+        root = app.query_one("#root", Vertical)
+        success = _effect(completed=True)
+        assert isinstance(success.state, CompletedEffectState)
+        warned = success.model_copy(
+            update={
+                "state": success.state.model_copy(
+                    update={
+                        "display": success.state.display.model_copy(
+                            update={"warnings": ["Some matches were skipped"]}
+                        )
+                    }
+                )
+            }
+        )
+        result = ToolResultMessage(warned)
+        await root.mount(result)
+        await pilot.pause()
+        warning_content = result.query_one(
+            ".status-indicator-text", NoMarkupStatic
+        ).render()
+        assert isinstance(warning_content, Content)
+        assert "Warning: Some matches were skipped" in warning_content.plain
+        failed = success.model_copy(
+            update={
+                "state": success.state.model_copy(
+                    update={
+                        "display": success.state.display.model_copy(
+                            update={"success": False, "message": "command exited 1"}
+                        )
+                    }
+                )
+            }
+        )
+        failure = ToolResultMessage(failed)
+        await root.mount(failure)
+        await pilot.pause()
+        failure_content = failure.query_one(
+            ".status-indicator-text", NoMarkupStatic
+        ).render()
+        assert isinstance(failure_content, Content)
+        assert "Failed:" in failure_content.plain
+
+
 class _ToolStreamApp(App[None]):
     CSS_PATH = Path(__file__).parents[3] / "chartreux/cli/textual_ui/app.tcss"
 
@@ -107,6 +154,11 @@ async def test_terminal_effect_hides_transient_stream_message() -> None:
 
         stream = call._stream_widget
         assert stream is not None
+        assert not stream.display
+        assert call._header_row is not None
+        call._header_row.focus()
+        await pilot.press("enter")
+        await pilot.pause()
         assert stream.display
 
         await root.mount(ToolResultMessage(_effect(completed=True), call))
@@ -243,11 +295,11 @@ async def test_update_entry_skips_unchanged_header_and_updates_changed_header(
         )
         call.update_entry(changed_entry)
 
-        assert set_text_calls == [("", "Searching elsewhere", "")]
+        assert set_text_calls == [("", "Running: Searching elsewhere", "")]
         assert call._text_widget is not None
         rendered = call._text_widget.render()
         assert isinstance(rendered, Content)
-        assert rendered.plain == "Searching elsewhere"
+        assert rendered.plain == "Running: Searching elsewhere"
 
 
 @pytest.mark.asyncio
@@ -277,12 +329,12 @@ async def test_running_bash_uses_progressive_verb_and_message() -> None:
         assert isinstance(verb, Content)
         assert isinstance(message, Content)
         assert verb.plain == "Running"
-        assert message.plain == "sleep 4"
+        assert message.plain == "Running: sleep 4"
         assert call._header_row is not None
         assert call._header_row.has_class("running")
         assert call._header_row.has_class("collapsible-result")
-        assert call._verb_widget.styles.text_opacity == 0.55
-        assert call._text_widget.styles.text_opacity == 0.55
+        assert call._verb_widget.styles.text_opacity == 1.0
+        assert call._text_widget.styles.text_opacity == 1.0
 
         call.stop_spinning()
         await pilot.pause()

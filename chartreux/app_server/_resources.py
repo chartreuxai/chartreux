@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractContextManager
-from typing import Any
+from dataclasses import asdict
+from typing import Any, Literal
 
 from chartreux.app_server._config_introspect import (
     HIDDEN_SETTINGS,
@@ -16,6 +17,9 @@ from chartreux.app_server._config_write import (
     config_write_ops_to_patches,
     config_write_projection,
     config_write_targets,
+    touches_web_search,
+    validate_web_search_candidate,
+    validate_web_search_write_ops,
 )
 from chartreux.app_server._dispatch import (
     DispatchResult,
@@ -35,6 +39,7 @@ from chartreux.app_server._projection import (
     project_stats,
     project_tools,
 )
+from chartreux.app_server._web_search_settings import project_web_search_settings
 from chartreux.app_server.config import ProxySettingsView
 from chartreux.app_server.models import MCPState, ScheduledLoop
 from chartreux.app_server.protocol import (
@@ -54,6 +59,7 @@ from chartreux.app_server.protocol import (
     DiagnosticsLogsReadParams,
     DiagnosticsLogsReadResponse,
     EmptyResponse,
+    InventoryItemStateWire,
     LoopsClearParams,
     LoopsClearResponse,
     LoopsCreateParams,
@@ -66,6 +72,10 @@ from chartreux.app_server.protocol import (
     RuntimeReadParams,
     RuntimeReadResponse,
     RuntimeSnapshot,
+    SettingDescriptorWire,
+    SettingLeafWire,
+    SettingsReadParams,
+    SettingsReadResponse,
     SkillsInstalledParams,
     SkillsInstalledResponse,
     SkillsListParams,
@@ -81,8 +91,16 @@ from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.layer import ConfigLayerError
 from chartreux.core.config.layers.project import ProjectConfigLayer
 from chartreux.core.config.layers.user import UserConfigLayer
+from chartreux.core.config.settings_catalog import (
+    DEFERRED_SETTINGS,
+    EDITABLE_BY_PATH,
+    EDITABLE_SETTINGS,
+    LINK_SETTINGS,
+    VISIBLE_SETTINGS,
+)
 from chartreux.core.log_reader import LogReader
 from chartreux.core.loop import LoopError, LoopManager
+from chartreux.core.prompts import SystemPrompt, custom_prompt_ids
 from chartreux.core.proxy_setup import (
     SUPPORTED_PROXY_VARS,
     ProxySetupError,
@@ -92,6 +110,85 @@ from chartreux.core.proxy_setup import (
     validate_proxy_var,
 )
 from chartreux.core.session_types import ScheduledLoop as CoreScheduledLoop
+from chartreux.core.utils.matching import name_matches
+
+
+def _inventory_item_states(
+    inventories: dict[Literal["tools", "skills", "agents"], list[str]],
+    setting_values: dict[str, Any],
+) -> dict[Literal["tools", "skills", "agents"], dict[str, InventoryItemStateWire]]:
+    states: dict[
+        Literal["tools", "skills", "agents"], dict[str, InventoryItemStateWire]
+    ] = {}
+    for category, names in inventories.items():
+        enabled_value = setting_values.get(f"enabled_{category}")
+        disabled_value = setting_values.get(f"disabled_{category}")
+        enabled = (
+            [entry for entry in enabled_value if isinstance(entry, str)]
+            if isinstance(enabled_value, list)
+            else []
+        )
+        disabled = (
+            [entry for entry in disabled_value if isinstance(entry, str)]
+            if isinstance(disabled_value, list)
+            else []
+        )
+        active_patterns = (
+            enabled + disabled if category == "tools" else enabled or disabled
+        )
+        states[category] = {
+            name: InventoryItemStateWire(
+                effective=(
+                    (not enabled or name_matches(name, enabled))
+                    and not name_matches(name, disabled)
+                    if category == "tools"
+                    else name_matches(name, enabled)
+                    if enabled
+                    else not name_matches(name, disabled)
+                ),
+                default_effective=not name_matches(name, disabled),
+                pattern_driven=any(
+                    entry.lower() != name.lower() and name_matches(name, [entry])
+                    for entry in active_patterns
+                ),
+            )
+            for name in names
+        }
+    return states
+
+
+def _settings_inventory_data(
+    agent_loop: AgentLoop, fields: list[SettingLeafWire]
+) -> tuple[
+    dict[Literal["tools", "skills", "agents"], list[str]],
+    dict[Literal["tools", "skills", "agents"], dict[str, InventoryItemStateWire]],
+]:
+    inventories: dict[Literal["tools", "skills", "agents"], list[str]] = {
+        "tools": agent_loop.tool_manager.settings_inventory,
+        "skills": agent_loop.skill_manager.settings_inventory,
+        "agents": agent_loop.agent_manager.settings_inventory,
+    }
+    return inventories, _inventory_item_states(
+        inventories, {field.path: field.effective_value for field in fields}
+    )
+
+
+def _settings_catalog_wire() -> list[SettingDescriptorWire]:
+    custom_ids = custom_prompt_ids()
+    choices = {
+        "system_prompt_id": tuple(
+            sorted({*(p.value for p in SystemPrompt), *custom_ids})
+        ),
+        "compaction_prompt_id": tuple(sorted({"compact", *custom_ids})),
+    }
+    return [
+        SettingDescriptorWire.model_validate(
+            {**asdict(descriptor), "choices": choices[descriptor.path]}
+            if descriptor.path in choices
+            else asdict(descriptor)
+        )
+        for descriptor in (*VISIBLE_SETTINGS, *DEFERRED_SETTINGS, *LINK_SETTINGS)
+    ]
 
 
 class ResourceRequestHandler:
@@ -231,6 +328,11 @@ class ResourceRequestHandler:
                     validate_wire(ConfigFieldsReadParams, raw_params)
                 )
                 runtime_updated = False
+            case "config/settings/read":
+                response = await self._settings_read(
+                    validate_wire(SettingsReadParams, raw_params)
+                )
+                runtime_updated = False
             case "config/reload":
                 response = await self._config_reload(
                     validate_wire(ConfigReloadParams, raw_params)
@@ -348,9 +450,12 @@ class ResourceRequestHandler:
         loop = self._agent_loop
         orchestrator = loop.config_orchestrator
         prepared: _PreparedReload | None = None
+        validate_search = touches_web_search(params.ops)
 
         async def prepare(config: ChartreuxConfigSchema) -> None:
             nonlocal prepared
+            if validate_search:
+                validate_web_search_candidate(config)
             # Do not leave an unjoined preparation thread behind on cancellation.
             prepared = loop._prepare_reload(config, True)
 
@@ -359,6 +464,8 @@ class ResourceRequestHandler:
             loop._commit_reload(prepared, True)
 
         try:
+            if validate_search:
+                validate_web_search_write_ops(params.ops)
             operations = config_write_ops_to_patches(params.ops)
             if params.target != "session":
                 result = await orchestrator.save(
@@ -526,6 +633,95 @@ class ResourceRequestHandler:
                     revisions[layer.name] = layer.fingerprint
         return ConfigFieldsReadResponse(
             fields=fields, targets=self._config_targets(), revisions=revisions
+        )
+
+    async def _settings_read(self, params: SettingsReadParams) -> SettingsReadResponse:
+        """Pair effective leaves and user revision from one force-loaded copy."""
+        self._require_session(params.session_id)
+        # Never force-load the live orchestrator's layers: reads must not mutate
+        # accepted runtime authority. The builder reuses these loaded caches.
+        snapshot = self._agent_loop.config_orchestrator.copy()
+        layers: list[tuple[str, dict[str, Any]]] = []
+        user_layer: str | None = None
+        user_revision: str | None = None
+        user_unavailable = False
+        for layer in snapshot.layers:
+            if isinstance(layer, UserConfigLayer):
+                user_layer = layer.name
+            try:
+                loaded = await layer.load(force=True)
+            except ConfigLayerError:
+                if isinstance(layer, UserConfigLayer):
+                    user_unavailable = True
+                continue
+            layers.append((layer.name, loaded.model_dump(mode="json")))
+            if isinstance(layer, UserConfigLayer):
+                user_revision = layer.fingerprint
+        # A failed source read/build cannot be paired with the freshly loaded
+        # layers. Display the accepted runtime config with honest provenance.
+        fallback = user_unavailable
+        if fallback:
+            config = self._agent_loop.config_orchestrator.config
+        else:
+            try:
+                config = (await snapshot.preview_candidate()).config
+            except ConfigLayerError:
+                config = self._agent_loop.config_orchestrator.config
+                fallback = True
+        effective = config.model_dump(mode="json")
+        fields: list[SettingLeafWire] = []
+        for descriptor in EDITABLE_SETTINGS:
+            parts = descriptor.path.split(".")
+            leaf_values: list[tuple[str, Any]] = []
+            for name, data in reversed(layers):
+                value: Any = data
+                for part in parts:
+                    if not isinstance(value, dict) or part not in value:
+                        break
+                    value = value[part]
+                else:
+                    leaf_values.append((name, value))
+            value = effective
+            for part in parts:
+                value = value[part]
+            saved = next(
+                (entry for entry in leaf_values if entry[0] == user_layer), None
+            )
+            fields.append(
+                SettingLeafWire(
+                    path=descriptor.path,
+                    effective_value=value,
+                    origin="live config"
+                    if fallback
+                    else leaf_values[0][0]
+                    if leaf_values
+                    else "default",
+                    saved_explicit=saved is not None and not user_unavailable,
+                    saved_value=saved[1]
+                    if saved is not None and not user_unavailable
+                    else None,
+                )
+            )
+        inventory_data = _settings_inventory_data(self._agent_loop, fields)
+        return SettingsReadResponse(
+            fields=fields,
+            web_search=project_web_search_settings(
+                config,
+                layers,
+                user_layer=user_layer,
+                user_unavailable=user_unavailable,
+                fallback=fallback,
+            ),
+            catalog=_settings_catalog_wire(),
+            backing_settings={
+                path: SettingDescriptorWire.model_validate(asdict(descriptor))
+                for path, descriptor in EDITABLE_BY_PATH.items()
+                if path.startswith(("enabled_", "disabled_"))
+            },
+            inventories=inventory_data[0],
+            inventory_states=inventory_data[1],
+            user_layer=user_layer,
+            user_revision=user_revision,
         )
 
     def _config_targets(self) -> list[str]:

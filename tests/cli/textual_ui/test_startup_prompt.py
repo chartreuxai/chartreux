@@ -109,7 +109,8 @@ async def test_failed_resume_mounts_error_when_transcript_rebuild_fails(
     errors = [call.args[0] for call in mount.await_args_list]
     assert any(
         isinstance(error, ErrorMessage)
-        and "Failed to load session: resume boom" in str(error._error)
+        and "Session not changed; failed to load `session-`: resume boom"
+        in str(error._error)
         for error in errors
     )
 

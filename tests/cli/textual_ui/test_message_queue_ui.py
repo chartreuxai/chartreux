@@ -651,11 +651,10 @@ async def test_slash_command_rejected_while_agent_busy() -> None:
         backend.release.set()
 
 
-def test_slash_command_message_strips_leading_slash_for_display() -> None:
-    # The widget renders its own PROMPT_CHAR ("/"), so the stored raw input
-    # "/clear" must not show as "//clear". Payload-path content has no slash.
-    assert SlashCommandMessage("/clear").get_content() == "clear"
-    assert SlashCommandMessage("model sonnet").get_content() == "model sonnet"
+def test_slash_command_message_displays_command_with_leading_slash() -> None:
+    # The migrated role label is "You", so the slash stays in the content.
+    assert SlashCommandMessage("/clear").get_content() == "/clear"
+    assert SlashCommandMessage("model sonnet").get_content() == "/model sonnet"
 
 
 @pytest.mark.asyncio

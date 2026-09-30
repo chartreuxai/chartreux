@@ -128,6 +128,7 @@ class ShellController:
         self._operations: set[str] = set()
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._interrupted: set[str] = set()
+        self._interrupt_events: dict[str, asyncio.Event] = {}
 
     async def run(
         self, params: ShellRunParams, observe_output: ShellOutputObserver | None = None
@@ -143,6 +144,10 @@ class ShellController:
         stdout: list[str] = []
         stderr: list[str] = []
         readers: list[asyncio.Task[None]] = []
+        completion: asyncio.Future[list[None | int]] | None = None
+        interrupt_event = asyncio.Event()
+        self._interrupt_events[params.operation_id] = interrupt_event
+        interrupt_waiter = asyncio.create_task(interrupt_event.wait())
         timed_out = False
         interrupted = False
         try:
@@ -156,22 +161,34 @@ class ShellController:
                     self._read_stream(process.stderr, stderr, observe_output)
                 ),
             ]
-            if params.operation_id in self._interrupted:
+            # The deadline covers both exit and EOF: descendants can inherit
+            # the pipes after the shell leader has already exited.
+            completion = asyncio.gather(*readers, process.wait())
+            done, _ = await asyncio.wait(
+                (completion, interrupt_waiter),
+                timeout=params.timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if interrupt_waiter in done:
                 await kill_async_subprocess(process)
+            elif completion in done:
+                await completion
             else:
-                try:
-                    await asyncio.wait_for(
-                        process.wait(), timeout=params.timeout_seconds
-                    )
-                except TimeoutError:
-                    timed_out = True
-                    await kill_async_subprocess(process)
-            await asyncio.gather(*readers)
+                timed_out = True
+                await kill_async_subprocess(process)
         except BaseException:
             if process is not None:
                 await kill_async_subprocess(process)
             raise
         finally:
+            interrupt_waiter.cancel()
+            if completion is not None and not completion.done():
+                completion.cancel()
+            await asyncio.gather(
+                interrupt_waiter,
+                *([completion] if completion is not None else []),
+                return_exceptions=True,
+            )
             for reader in readers:
                 if not reader.done():
                     reader.cancel()
@@ -180,6 +197,7 @@ class ShellController:
             interrupted = params.operation_id in self._interrupted
             self._interrupted.discard(params.operation_id)
             self._processes.pop(params.operation_id, None)
+            self._interrupt_events.pop(params.operation_id, None)
             self._operations.discard(params.operation_id)
 
         if process is None:
@@ -199,6 +217,7 @@ class ShellController:
         if operation_id not in self._operations:
             return False
         self._interrupted.add(operation_id)
+        self._interrupt_events[operation_id].set()
         if process := self._processes.get(operation_id):
             await kill_async_subprocess(process)
         return True

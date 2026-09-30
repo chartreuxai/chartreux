@@ -7,6 +7,8 @@ import pytest
 
 from chartreux.core.agents import AgentManager
 from chartreux.core.config import ChartreuxConfigSchema
+from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.prompts import (
     MissingPromptFileError,
     SystemPrompt,
@@ -38,6 +40,172 @@ def test_system_prompt_reports_resolved_model_when_unpinned(
 
     assert f"Your model name is: `{config.get_active_model().alias}`" in prompt
     assert "Your model name is: ``" not in prompt
+
+
+def test_model_catalog_section_uses_live_eligible_models_and_roles(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+) -> None:
+    config = build_config(
+        active_model="base",
+        include_prompt_detail=False,
+        include_project_context=False,
+        include_commit_signature=False,
+    )
+    catalog = ModelCatalog.model_validate({
+        "providers": {"test-provider": {"api_base": "https://example.test"}},
+        "models": {
+            name: {
+                "disabled": name == "disabled",
+                "deployments": [{"provider": "test-provider", "name": f"wire-{name}"}],
+            }
+            for name in ("base", "backup", "disabled")
+        },
+        "roles": {
+            "worker": {
+                "model": "base",
+                "thinking": "high",
+                "description": "Do bounded work",
+            },
+            "unavailable": {
+                "model": "disabled",
+                "thinking": "high",
+                "description": "Unavailable",
+            },
+        },
+    })
+    config.attach_catalog_snapshot(CatalogSnapshot(catalog, "prompt-test"))
+    prompt = get_universal_system_prompt(
+        config, SkillManager(lambda: config), AgentManager(load_orchestrator(config))
+    )
+
+    assert "# Model catalog" in prompt
+    assert "| Canonical name | Display name | Provider |" in prompt
+    assert "| base | test-provider/wire-base | test-provider |" in prompt
+    assert "| backup | test-provider/wire-backup | test-provider |" in prompt
+    assert "| @worker | base | high | Do bounded work |" in prompt
+    assert "| disabled |" not in prompt
+    assert "@unavailable" not in prompt
+
+    restricted = config.model_copy(update={"allowed_models": ["base"]})
+    restricted_prompt = get_universal_system_prompt(
+        restricted,
+        SkillManager(lambda: restricted),
+        AgentManager(load_orchestrator(restricted)),
+    )
+    assert "| backup |" not in restricted_prompt
+    assert "| @worker | base | high | Do bounded work |" in restricted_prompt
+
+
+def test_worker_profile_child_omits_model_catalog_without_role_instructions(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+) -> None:
+    config = build_config(
+        system_prompt_id="worker",
+        include_prompt_detail=False,
+        include_project_context=False,
+        include_commit_signature=False,
+    )
+    prompt = get_universal_system_prompt(
+        config,
+        SkillManager(lambda: config),
+        AgentManager(load_orchestrator(config)),
+        role_instructions=None,
+        is_subagent=True,
+    )
+    assert "Your model name is:" in prompt
+    assert "# Model catalog" not in prompt
+    assert "Do not spawn, delegate to, or coordinate nested subagents." in prompt
+
+
+def test_model_catalog_omits_empty_section(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = build_config(
+        include_prompt_detail=False,
+        include_project_context=False,
+        include_commit_signature=False,
+    )
+    monkeypatch.setattr(ChartreuxConfigSchema, "available_models", lambda self: {})
+    prompt = get_universal_system_prompt(
+        config, SkillManager(lambda: config), AgentManager(load_orchestrator(config))
+    )
+    assert "Your model name is:" in prompt
+    assert "# Model catalog" not in prompt
+    assert "| Canonical name |" not in prompt
+
+
+def test_model_catalog_escapes_configured_table_cells(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = build_config(
+        active_model="base",
+        include_prompt_detail=False,
+        include_project_context=False,
+        include_commit_signature=False,
+    )
+    catalog = ModelCatalog.model_validate({
+        "providers": {"test-provider": {"api_base": "https://example.test"}},
+        "models": {
+            "base": {
+                "deployments": [{"provider": "test-provider", "name": "wire-base"}]
+            }
+        },
+        "roles": {
+            "worker": {
+                "model": "base",
+                "thinking": "high",
+                "description": "Bounded | work\nwith care",
+            }
+        },
+    })
+    config.attach_catalog_snapshot(CatalogSnapshot(catalog, "escaped"))
+    model = config.get_active_model().model_copy(
+        update={"display_name": "Local | Model\nsecond line"}
+    )
+    monkeypatch.setattr(
+        ChartreuxConfigSchema, "available_models", lambda self: {"base": model}
+    )
+    prompt = get_universal_system_prompt(
+        config, SkillManager(lambda: config), AgentManager(load_orchestrator(config))
+    )
+    assert "| base | Local \\| Model second line | test-provider |" in prompt
+    assert "| @worker | base | high | Bounded \\| work with care |" in prompt
+
+
+@pytest.mark.parametrize(
+    ("model_info", "role_instructions", "attached"),
+    [(False, None, True), (True, "Child instructions", True), (True, None, False)],
+)
+def test_model_catalog_section_is_gated_and_catalogless_is_safe(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+    model_info: bool,
+    role_instructions: str | None,
+    attached: bool,
+) -> None:
+    config = build_config(
+        include_model_info=model_info,
+        include_prompt_detail=False,
+        include_project_context=False,
+        include_commit_signature=False,
+    )
+    if not attached:
+        config.attach_catalog_snapshot(None)
+    prompt = get_universal_system_prompt(
+        config,
+        SkillManager(lambda: config),
+        AgentManager(load_orchestrator(config)),
+        role_instructions=role_instructions,
+    )
+    assert "# Model catalog" not in prompt
+    if role_instructions is not None:
+        assert role_instructions in prompt
 
 
 def test_commit_signature_uses_literal_shell_syntax(
@@ -143,6 +311,40 @@ def test_current_date_placeholder_substituted_in_prompt(
     expected = f"Today's date is {today.isoformat()} ({today.strftime('%A')})."
     assert expected in prompt
     assert "$current_date" not in prompt
+
+
+def test_default_prompt_renders_delegation_protocol(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+) -> None:
+    config = build_config(
+        system_prompt_id="cli", include_model_info=False, include_commit_signature=False
+    )
+    prompt = get_universal_system_prompt(
+        config, SkillManager(lambda: config), AgentManager(load_orchestrator(config))
+    )
+
+    assert "## Delegation protocol" in prompt
+    assert "## Orchestration" not in prompt
+    assert "## Background subagents" not in prompt
+    assert "every subsequent API call" in prompt
+    for tool in (
+        "task",
+        "read_file",
+        "write_file",
+        "edit",
+        "bash",
+        "skill",
+        "todo",
+        "web_search",
+        "web_fetch",
+    ):
+        assert f"`{tool}`" in prompt
+    assert "scratchpad only, never repo edits" in prompt
+    assert "read-only orchestration metadata only" in prompt
+    assert "selects that role's one model and thinking level" in prompt
+    assert "launch separate tasks" in prompt
+    assert "$role" not in prompt
 
 
 def test_system_prompt_builtin_ids_and_default_are_explicit() -> None:

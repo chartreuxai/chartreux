@@ -1,0 +1,24 @@
+ Settings                                                                       
+ Filter: enable_system_trust_store                                              
+ Trust OS certificate authorities for API connections? Cancel preserves the     
+ current trust setting.                                                         
+                                                                                
+  [Trust authorities]                                                           
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+ ────────────────────────────────────────────────────────────────────────────── 
+ Trust operating-system certificate authorities for API connections.            
+ Saved user value: Not Set  Effective: False (default)                          
+ Applies: after save (expected)                                                 
+ Enter Cancel  ↑↓ Choose  Esc Cancel                                            

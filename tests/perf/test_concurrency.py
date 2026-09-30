@@ -17,10 +17,10 @@ import pytest
 from chartreux.app_server.protocol import AgentSummaryModel
 from chartreux.core.subagents import AgentEviction
 from tests.perf._harness import (
-    FanOutHarness,
     GatedSequenceBackend,
-    create_fan_out_harness,
-    launch_fan_out,
+    SubagentHarness,
+    create_subagent_harness,
+    launch_explicit_tasks,
 )
 from tests.perf._metrics import machine_context, percentiles, record
 from tests.stubs.fake_backend import FakeBackend
@@ -139,7 +139,7 @@ async def _heartbeat(
             thread_counts.append(threading.active_count())
 
 
-async def _await_update_count(harness: FanOutHarness, expected: int) -> None:
+async def _await_update_count(harness: SubagentHarness, expected: int) -> None:
     deadline = asyncio.get_running_loop().time() + 10
     while len(harness.agents_update_sizes) < expected:
         if asyncio.get_running_loop().time() >= deadline:
@@ -154,7 +154,7 @@ async def _iteration(
     agent_count: int, monkeypatch: pytest.MonkeyPatch
 ) -> _IterationMetrics:
     baseline_tasks = set(asyncio.all_tasks())
-    role_members = [f"perf-model-{index}" for index in range(agent_count)]
+    model_names = [f"perf-model-{index}" for index in range(agent_count)]
     backend = GatedSequenceBackend()
     for _ in range(agent_count):
         backend.add_gate()
@@ -165,7 +165,7 @@ async def _iteration(
     monkeypatch.setattr(
         "chartreux.core.agent_loop._loop.create_backend", create_backend
     )
-    harness: FanOutHarness | None = None
+    harness: SubagentHarness | None = None
     heartbeat: asyncio.Task[None] | None = None
     heartbeat_results: tuple[None | BaseException, ...] = ()
     stop_heartbeat = asyncio.Event()
@@ -176,7 +176,7 @@ async def _iteration(
     payload_sizes_bytes: list[int] = []
     closed = False
     try:
-        harness = await create_fan_out_harness(role_members)
+        harness = await create_subagent_harness(model_names)
         registry = harness.registry
 
         # Pin the measurement to SessionRuntimeRegistry._emit_agents_update in
@@ -223,12 +223,17 @@ async def _iteration(
             name=f"perf-loop-heartbeat-{agent_count}",
         )
 
-        fan_out_started_at = time.perf_counter()
-        result = await launch_fan_out(registry, harness.context, harness.role)
-        assert result.members is not None
-        assert len(result.members) == agent_count
-        assert [member.base_model for member in result.members] == role_members
-        assert all(member.status == "running" for member in result.members)
+        launch_started_at = time.perf_counter()
+        results = await launch_explicit_tasks(
+            registry, harness.context, harness.model_names
+        )
+        assert len(results) == agent_count
+        assert all(
+            result.status == "launched"
+            and result.agent_id is not None
+            and result.run_id is not None
+            for result in results
+        )
 
         await asyncio.wait_for(
             asyncio.gather(*(started.wait() for started in backend.started)),
@@ -240,34 +245,31 @@ async def _iteration(
         )
         assert all(timestamp is not None for timestamp in backend.started_at)
         launch_latencies_ms = [
-            (timestamp - fan_out_started_at) * 1000
+            (timestamp - launch_started_at) * 1000
             for timestamp in backend.started_at
             if timestamp is not None
         ]
         assert len(launch_latencies_ms) == agent_count
-        await _await_update_count(harness, 1)
-        assert len(harness.agents_update_sizes) >= 1
+        await _await_update_count(harness, agent_count)
+        assert len(harness.agents_update_sizes) >= agent_count
         tasks_at_release = len(asyncio.all_tasks())
         for release in backend.releases:
             release.set()
 
-        members: list[tuple[str, str]] = []
-        for member in result.members:
-            if member.agent_id and member.run_id:
-                members.append((member.agent_id, member.run_id))
-        assert len(members) == agent_count
         completions = await asyncio.wait_for(
             asyncio.gather(
                 *(
                     registry.wait_for_agent(agent_id, run_id, timeout=120)
-                    for agent_id, run_id in members
+                    for result in results
+                    if (agent_id := result.agent_id) is not None
+                    and (run_id := result.run_id) is not None
                 )
             ),
             timeout=120,
         )
+        assert len(completions) == agent_count
         assert all(completion.completed for completion in completions)
-        # Each member publishes both terminal/finalizing and idle updates; the
-        # coalesced fan-out launch contributes one additional batch update.
+        # Every independent child publishes its own launch and terminal updates.
         await _await_update_count(harness, 2 * agent_count + 1)
         agents_update_count = len(harness.agents_update_sizes)
 
@@ -456,7 +458,7 @@ def _summarize(
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize("agent_count", [8, 16])
 @pytest.mark.asyncio
-async def test_real_fan_out_concurrency(
+async def test_real_explicit_subagent_concurrency(
     agent_count: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     iterations = [await _iteration(agent_count, monkeypatch) for _ in range(3)]

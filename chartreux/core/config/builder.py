@@ -29,6 +29,8 @@ from chartreux.core.config.layer import (
 )
 from chartreux.core.config.layers.agent_profile import AgentProfileLayer
 from chartreux.core.config.layers.launch_overrides import LaunchOverridesLayer
+from chartreux.core.config.layers.project import ProjectConfigLayer
+from chartreux.core.config.layers.user import UserConfigLayer
 from chartreux.core.config.schema import (
     ConfigFragment,
     ConfigSchema,
@@ -194,6 +196,7 @@ class ConfigBuilder[S: ConfigSchema]:
                     loaded = await layer.load(force=force_load)
                 except (UntrustedLayerError, EmptyLayerError):
                     continue
+                self._reject_persisted_model_overrides(layer, loaded.model_dump())
                 validate_credential_env_source(loaded.model_dump(), layer=layer)
                 validate_root_source(loaded.model_dump(), layer=layer)
                 validate_catalog_scope(
@@ -204,6 +207,7 @@ class ConfigBuilder[S: ConfigSchema]:
                 )
                 data = overrides.get(layer.name, loaded)
                 raw = data.model_dump()
+                self._reject_persisted_model_overrides(layer, raw)
                 validate_credential_env_source(raw, layer=layer)
                 validate_root_source(raw, layer=layer)
                 validate_catalog_scope(
@@ -285,6 +289,25 @@ class ConfigBuilder[S: ConfigSchema]:
             for live, staged in zip(self._layers, layers, strict=True):
                 live._accept_loaded_state(staged)
             return candidate
+
+    @staticmethod
+    def _reject_persisted_model_overrides(
+        layer: ConfigLayer[RawConfig], raw: dict[str, Any]
+    ) -> None:
+        if not isinstance(layer, (UserConfigLayer, ProjectConfigLayer)):
+            return
+        if "active_model" in raw:
+            raise ValueError(
+                f"{layer.name} ({layer.source_locator}) contains obsolete "
+                "'active_model'; set [roles.orchestrator] model and thinking "
+                "in models.toml instead"
+            )
+        if "thinking_overrides" in raw:
+            raise ValueError(
+                f"{layer.name} ({layer.source_locator}) contains obsolete "
+                "'thinking_overrides'; set each role's model and thinking in "
+                "models.toml, or use /thinking for this session"
+            )
 
     @staticmethod
     def _restriction_projection(

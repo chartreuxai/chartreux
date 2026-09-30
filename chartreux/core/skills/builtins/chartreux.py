@@ -67,11 +67,10 @@ context.
 ### Exit
 
 Chat input (case-insensitive): `/exit`, `exit`, `quit`, `:q`, `:quit`.
-Keyboard: `Ctrl+C` / `Ctrl+D` — press twice within ~1s to quit. For `Ctrl+C`,
-the first press instead interrupts the running job or clears the input if either
-is present. Set `ask_confirmation_on_exit = false` in `config.toml` to make
-`Ctrl+D` quit on the first press; `Ctrl+C` always requires a second
-press. `Ctrl+Z` suspends on POSIX (resume with `fg`).
+When idle, `Ctrl+C` and `Ctrl+D` follow `ask_confirmation_on_exit`; `/exit`
+quits immediately. During active work, `Ctrl+C` interrupts, while `/exit` opens
+confirmation for consequential work. `Ctrl+D` deletes to the right in the input.
+`Ctrl+Z` suspends on POSIX (resume with `fg`).
 
 ### Version
 
@@ -115,7 +114,7 @@ folders to see a different set. The explicit `--resume <SESSION_ID>` form is
 **not** folder-scoped: it resolves the session by id regardless of which folder
 it ran in.
 
-Each session commits the resolved base model and concrete provider deployment when it is assigned. On resume, Chartreux validates that stored identity and never re-selects a role or deployment. An explicit re-task can reconfigure a retained child; `/clear` starts a new conversation that follows the current configuration. An explicit persistent model save changes only its selected user or project layer.
+Each session commits the resolved base model and concrete provider deployment when it is assigned. On resume, Chartreux validates that stored identity and never re-selects a role or deployment. An explicit re-task can reconfigure a retained child; `/clear` starts a new conversation that follows the current configuration. `/model` and `/thinking` change the current session; edit the orchestrator preset in `models.toml` to change the saved main default.
 
 ## Configuration (config.toml)
 
@@ -164,14 +163,15 @@ from `~/.chartreux/prompts/`, and finally from the built-in bundled prompts.
 
 ```toml
 # Model selection
-active_model = "@orchestrator"  # Canonical model or @role; omit or set "" for the orchestrator role
+# Saved main model and thinking live in [roles.orchestrator] in models.toml.
 
 # UI preferences
 theme = "auto"  # Follow terminal background, then OS light/dark preference
 disable_welcome_banner_animation = false
 autocopy_to_clipboard = true  # Enable automatic copying of selected text to clipboard
 file_watcher_for_autocomplete = false
-ask_confirmation_on_exit = true  # Require a second Ctrl+D to quit (Ctrl+C always confirms)
+ask_confirmation_on_exit = true  # Confirm idle Ctrl+C/Ctrl+D quits
+ascii_chrome = false  # Use ASCII equivalents for application chrome glyphs
 show_greeting = true  # Show "Hello {name}" greeting below the banner at startup (Mistral providers, once per 24h)
 log_level = "WARNING"  # Optional. DEBUG | INFO | WARNING | ERROR | CRITICAL — log level for ~/.chartreux/logs/chartreux.log
 displayed_workdir = ""  # Optional working-directory label shown in the UI
@@ -188,7 +188,7 @@ show_thinking_nodes = false  # Show reasoning/thinking nodes in the UI
 # Behavior
 system_prompt_id = "cli"          # Built-in "cli" or custom .md filename
 compaction_prompt_id = "compact"  # Compaction prompt: built-in "compact" or custom .md filename
-compaction_model = ""             # Canonical model or @role; empty uses active model, same provider required
+compaction_model = ""             # Canonical model or @role; empty uses current main model, same provider required
 enable_notifications = true
 enable_system_trust_store = false  # Use OS trust store for outbound HTTPS
 api_timeout = 720.0               # API request timeout in seconds
@@ -223,11 +223,13 @@ Chartreux does not create product analytics or OpenTelemetry spans, configure te
 
 Providers, models, and roles live in `~/.chartreux/models.toml` (or
 `$CHARTREUX_HOME/models.toml`), a sparse user overlay on the shipped catalog.
-`config.toml` contains selections such as `active_model`; it cannot define catalog
-tables. If a legacy `config.toml` contains `providers` or `models` tables, run
-`chartreux models migrate` (then `chartreux models migrate --apply` after reviewing
-the preview) rather than editing those tables manually. Use `/providers` to manage
-providers in the UI, or `chartreux --setup` for onboarding.
+`config.toml` contains runtime settings; it cannot define catalog tables or save
+the main-model selection. The `[roles.orchestrator]` preset is the saved default,
+while `/model` and `/thinking` override the current session. If a legacy
+`config.toml` contains `active_model`, edit the orchestrator preset; if it
+contains `providers` or `models` tables, run `chartreux models migrate` (then
+`chartreux models migrate --apply` after reviewing the preview). Use `/providers`
+to manage providers in Provider Settings, or `chartreux --setup` for onboarding.
 
 Generic providers support the `openai`, `openai-responses`, and `anthropic` API
 styles. The Mistral backend uses `backend = "mistral"`. Provider definitions may
@@ -279,11 +281,21 @@ timeout = 30
 max_results = 5
 ```
 
-`web_search` uses the configured provider credentials: `MISTRAL_API_KEY` for
-`mistral` (and `auto` when it selects Mistral), `EXA_API_KEY` for `exa`, and
-`BRAVE_SEARCH_API_KEY` for `brave`; `duckduckgo` requires no credential. Set
-`api_key_env_var` to use a different environment variable. `read_image` is
-available only when the active deployment in `models.toml` has
+`web_search` defaults to `auto`, which always selects Mistral and never falls
+back to another provider. An explicit `api_key_env_var` takes precedence. For
+`auto` and `mistral`, the selected variable is the configured Mistral
+provider's credential variable, or `MISTRAL_API_KEY` when no Mistral provider
+is configured; `exa` and `brave` use `EXA_API_KEY` and `BRAVE_SEARCH_API_KEY` by
+default. Only the selected variable is checked. `duckduckgo` requires no
+credential. Use Settings > Web search or `/web-search`; `Save API key` is
+independent of `Save search settings`, and reports whether the key was saved or
+is available only for the current session. Readiness does not verify a live
+connection. Standalone Settings shows Mistral once; `auto` remains a supported
+configuration alias for Mistral. First-run setup preserves ready search
+settings and skips the Web search step. If the step is needed, it offers Exa,
+Brave, and DuckDuckGo, not `auto` or Mistral fallback choices. **Skip for now**
+leaves existing web-search settings and tool enablement unchanged. `read_image`
+is available only when the active deployment in `models.toml` has
 `supports_images = true`.
 
 For an `openai-responses` provider that does not accept images in function-call
@@ -460,9 +472,10 @@ generate_titles = false           # Background LLM session titles; false uses th
 
 ### Provider Authentication
 
-Onboarding accepts an API key for the active provider and retains theme selection.
-Providers without an `api_key_env_var` do not require a key. Provider inference
-URLs remain configured through `api_base`; credentials use `api_key_env_var`.
+Onboarding accepts an API key for the active provider and uses the theme already
+configured for Chartreux; it does not ask for or save a theme choice. Providers
+without an `api_key_env_var` do not require a key. Provider endpoints remain
+configured through `api_base`; credentials use `api_key_env_var`.
 
 ### Hooks
 
@@ -666,9 +679,9 @@ scope checks remain enforced.
 
 ### Subagents
 
-- **worker**: General-purpose subagent bound to `@small-worker` with the `worker` role prompt.
-- **advisor**: Independent, read-only advisor bound to `@advisor` with the `advisor` role prompt. Its tools are limited to `read_file`, `grep`, `web_search`, and `web_fetch`, and its TTL is `0`.
-- **reviewer**: Independent, read-only reviewer bound to `@small-reviewer` with the `reviewer` role prompt.
+- **worker**: General-purpose subagent bound to the `@medium` capacity preset with the `worker` role prompt.
+- **advisor**: Independent, read-only advisor bound to the `@large` capacity preset with the `advisor` role prompt. Its tools are limited to `read_file`, `grep`, `web_search`, and `web_fetch`, and its TTL is `0`.
+- **reviewer**: Independent, read-only reviewer bound to the `@medium` capacity preset with the `reviewer` role prompt.
 
 Use `task` to launch a subagent. Profiles are presets: the orchestrator can choose a configured canonical model or role, predefined system prompt, inline instructions, tools, and thinking for an individual launch, but never beyond the parent authority ceiling. Per-call configuration is not written to `config.toml`; committed child launch state is retained in child-session metadata and revalidated fail-closed on resume. For a bounded design, feature, or review loop,
 keep the engagement cast — advisors, planner, implementors, and reviewers —
@@ -706,8 +719,10 @@ subagents. Custom subagents are TOML files in `~/.chartreux/agents/NAME.toml`.
 - `/thinking` - Select the thinking level for this session (stored in the ephemeral
   session override, not `config.toml`)
 - `/theme` - Select Textual UI theme; `auto` follows terminal/OS appearance (persisted in config)
+- `/settings` - Browse and edit curated user settings in the bottom panel
+- `/web-search` - Configure the web-search provider and credentials in Settings
 - `/reload` - Reload configuration, agent instructions, and skills from disk
-- `/config` - Open the user `~/.chartreux/config.toml` in the user's editor
+- `/open-config-file` - Open the user `~/.chartreux/config.toml` in the user's editor
   (`$VISUAL`/`$EDITOR`, falling back to `nano`); creates the file with a
   commented template when absent and reloads configuration after editing if the
   file changed
@@ -774,7 +789,7 @@ subagents. Custom subagents are TOML files in `~/.chartreux/agents/NAME.toml`.
   - Loops are persisted in the session metadata (`loops` field of `meta.json`)
     and restored on `--resume`/`--continue`.
 - `/proxy-setup` - Configure proxy and SSL certificate settings
-- `/providers` - Add or manage model providers. Available only while no turn is active.
+- `/providers` - Open Provider Settings to add or manage model providers. Available only while no turn is active.
 - `/exit` - Exit the application
 
 ## File Mentions (`@`)

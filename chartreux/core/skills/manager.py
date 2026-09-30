@@ -42,8 +42,9 @@ class SkillManager:
         self._harness_files = harness_files or get_harness_files_manager()
         self._search_paths = self._compute_search_paths(self._config)
         self._config_issues: list[SkillConfigIssue] = []
+        self._discovered_skills = self._discover_skills()
         self.available_skills: Mapping[str, SkillInfo] = MappingProxyType(
-            self._apply_filters(self._discover_skills())
+            self._apply_filters(self._discovered_skills)
         )
 
         if self.available_skills:
@@ -56,6 +57,11 @@ class SkillManager:
     @property
     def _config(self) -> ChartreuxConfigSchema:
         return self._config_getter()
+
+    @property
+    def settings_inventory(self) -> list[str]:
+        """Discovered skill names, including those excluded by current filters."""
+        return sorted(self._discovered_skills)
 
     @property
     def config_issues(self) -> tuple[SkillConfigIssue, ...]:

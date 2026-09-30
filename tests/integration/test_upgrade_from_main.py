@@ -67,7 +67,7 @@ def test_m7_upgrade_from_main_config_and_session_preserves_effective_model(
     effective = resolved.materialize(auto_compact_threshold=200_000)
     assert (effective.name, effective.provider, effective.temperature) == (
         "glm-5-2",
-        "mistral/default",
+        "mistral",
         0.2,
     )
     assert effective.input_price == 1.4 and effective.auto_compact_threshold == 400_000

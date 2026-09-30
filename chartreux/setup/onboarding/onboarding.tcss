@@ -17,8 +17,8 @@ Horizontal {
 }
 
 #welcome-text {
-    border: round $foreground-muted;
-    padding: 1 3;
+    border: solid $foreground-muted;
+    padding: 1 2;
     margin-bottom: 2;
     text-align: center;
     width: auto;
@@ -32,128 +32,4 @@ WelcomeScreen #enter-hint {
 
 WelcomeScreen #enter-hint.hidden {
     visibility: hidden;
-}
-
-/* Theme Selection Screen */
-
-#theme-outer {
-    width: 100%;
-    height: 100%;
-    align: center middle;
-    overflow-y: auto;
-}
-
-#theme-content {
-    width: auto;
-    height: auto;
-}
-
-#theme-title,
-#theme-explanations {
-    text-align: center;
-    width: 100%;
-}
-
-#theme-title {
-    margin-bottom: 1;
-}
-
-#theme-explanations {
-    color: $foreground-muted;
-    margin-bottom: 1;
-}
-
-#theme-row {
-    width: auto;
-    height: auto;
-}
-
-#theme-row.narrow {
-    layout: vertical;
-    align: center middle;
-}
-
-#theme-row.narrow #nav-hint,
-#theme-row.narrow #enter-hint {
-    width: auto;
-    height: auto;
-    content-align: center middle;
-    padding: 0;
-}
-
-#nav-hint {
-    color: $text;
-    width: 16;
-    height: 100%;
-    content-align: right middle;
-    padding-right: 2;
-}
-
-#theme-list {
-    width: 30;
-    height: auto;
-}
-
-.theme-item {
-    text-align: center;
-    width: 100%;
-    background: transparent;
-}
-
-.theme-item.selected {
-    color: $text;
-    text-style: bold;
-    border: round $foreground-muted;
-    padding: 0 2;
-}
-
-.theme-item.fade-1 {
-    text-opacity: 50%;
-}
-
-.theme-item.fade-2 {
-    text-opacity: 25%;
-}
-
-.theme-item.fade-3 {
-    text-opacity: 10%;
-}
-
-ThemeSelectionScreen #enter-hint {
-    color: $text;
-    width: 16;
-    height: 100%;
-    content-align: left middle;
-    padding-left: 2;
-}
-
-#preview-center {
-    width: 100%;
-    height: auto;
-    margin-top: 2;
-    align: center middle;
-}
-
-#preview {
-    width: 50;
-    min-width: 0;
-    max-width: 100%;
-    height: auto;
-    max-height: 100%;
-    overflow: auto;
-    border: round $foreground-muted;
-    border-title-align: center;
-}
-
-#preview-inner {
-    width: 100%;
-    height: auto;
-    padding: 0 1 0 1;
-}
-
-#api-base {
-    border: none;
-    width: 100%;
-    height: 1;
-    padding: 0 1;
 }

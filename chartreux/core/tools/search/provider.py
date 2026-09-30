@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 import json
+import socket
+import ssl
 from typing import Protocol
 import unicodedata
 from urllib.parse import urljoin, urlparse
@@ -19,6 +21,8 @@ from chartreux.core.tools.search.models import (
     SearchSource,
 )
 from chartreux.utils.http import ChartreuxAsyncHTTPClient, build_ssl_context
+
+_MAX_TRANSPORT_CAUSE_DEPTH = 16
 
 
 class SearchProvider(Protocol):
@@ -191,12 +195,51 @@ async def fetch_json(
     except (httpx.TimeoutException, TimeoutError) as error:
         raise SearchProviderError("Search request timed out") from error
     except httpx.RequestError as error:
-        raise SearchProviderError("Search request failed") from error
+        raise SearchProviderError(_transport_error_message(error)) from error
 
     try:
         return json.loads(body)
     except (TypeError, ValueError) as error:
         raise SearchProviderError("Search provider returned malformed JSON") from error
+
+
+def _transport_error_message(error: httpx.RequestError) -> str:
+    """Classify a bounded exception chain without exposing its untrusted text."""
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    causes: list[BaseException] = []
+    while pending and len(seen) < _MAX_TRANSPORT_CAUSE_DEPTH:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        causes.append(current)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        elif not current.__suppress_context__ and current.__context__ is not None:
+            pending.append(current.__context__)
+
+    categories = (
+        (socket.gaierror, "hostname could not be resolved"),
+        (ssl.SSLCertVerificationError, "TLS certificate verification failed"),
+        (httpx.ProxyError, "proxy connection failed"),
+        (httpx.UnsupportedProtocol, "provider endpoint URL is invalid"),
+        (httpx.DecodingError, "provider response could not be decoded"),
+        (
+            (
+                httpx.RemoteProtocolError,
+                httpx.LocalProtocolError,
+                httpx.ReadError,
+                httpx.WriteError,
+            ),
+            "response transfer or protocol error",
+        ),
+        (httpx.ConnectError, "could not connect to provider"),
+    )
+    for error_types, detail in categories:
+        if any(isinstance(cause, error_types) for cause in causes):
+            return f"Search request failed: {detail}"
+    return "Search request failed"
 
 
 async def _request_with_checked_redirects(

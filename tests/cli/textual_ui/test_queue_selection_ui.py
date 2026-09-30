@@ -595,7 +595,10 @@ async def test_edit_mode_hint_shown_on_enter(chartreux_app: ChartreuxApp) -> Non
         await pilot.press("enter")
         await pilot.pause(0.1)
 
-        assert chartreux_app._inline_notice.content == "Enter to save · Esc to discard"
+        body = chartreux_app.query_one(ChatInputContainer)._body
+        assert body is not None and body._queue_footer is not None
+        assert body._queue_footer.display
+        assert body._queue_footer.content == "Enter Save  Esc Discard"
 
 
 @pytest.mark.asyncio
@@ -608,18 +611,25 @@ async def test_edit_mode_hint_persists_until_exit(chartreux_app: ChartreuxApp) -
         await pilot.pause(0.1)
         await pilot.press("enter")
         await pilot.pause(0.1)
-        assert chartreux_app._inline_notice.display
+        body = chartreux_app.query_one(ChatInputContainer)._body
+        assert body is not None and body._queue_footer is not None
+        assert body._queue_footer.display
 
-        # The hint must persist for as long as edit mode is active — it must
-        # not self-hide after a timeout while the user is still editing.
+        # The local footer persists for as long as edit mode is active.
         await pilot.pause(4.0)
-        assert chartreux_app._inline_notice.display
-        assert chartreux_app._inline_notice.content == "Enter to save · Esc to discard"
+        assert body._queue_footer.display
+        assert body._queue_footer.content == "Enter Save  Esc Discard"
 
-        # Leaving edit mode (Escape) clears the hint.
+        # Escape leaves edit mode and restores the selection-mode shortcuts.
         await pilot.press("escape")
         await pilot.pause(0.15)
-        assert not chartreux_app._inline_notice.display
+        assert body._queue_footer.display
+        assert body._queue_footer.content == (
+            "↑↓ Select  Enter Edit  Backspace/Delete Remove  Esc Exit"
+        )
+        await pilot.press("escape")
+        await pilot.pause(0.15)
+        assert not body._queue_footer.display
 
 
 @pytest.mark.asyncio

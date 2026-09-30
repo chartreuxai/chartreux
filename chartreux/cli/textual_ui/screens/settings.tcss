@@ -1,0 +1,159 @@
+#settings-screen {
+    align: center middle;
+}
+
+#settings-content {
+    width: 92;
+    height: 100%;
+    background: $surface;
+    border: solid $foreground-muted;
+    border-title-color: $foreground;
+    border-title-style: bold;
+    padding: 0 1;
+}
+
+#settings-content.fullscreen {
+    width: 100%;
+    height: 100%;
+    background: $background;
+    border: none;
+}
+
+#settings-title {
+    display: none;
+    height: 1;
+    text-style: bold;
+    color: $foreground;
+}
+
+#settings-content.fullscreen #settings-title {
+    display: block;
+}
+
+#settings-pending-action {
+    height: 1;
+    width: 100%;
+    color: $warning;
+    text-overflow: ellipsis;
+}
+
+#settings-filter {
+    height: 1;
+    color: $text-muted;
+}
+
+#settings-options, #settings-checklist {
+    width: 100%;
+    height: 1fr;
+    border: none;
+    text-wrap: nowrap;
+}
+
+#settings-options:focus {
+    border: none;
+}
+
+#settings-options:focus > .option-list--option-highlighted {
+    text-style: bold;
+    color: $foreground;
+    background: transparent;
+}
+
+#settings-options > .option-list--option-disabled {
+    color: $text-muted;
+}
+
+#settings-options:blur > .option-list--option-highlighted {
+    text-style: none;
+    background: transparent;
+}
+
+#settings-checklist > .selection-list--button-selected,
+#settings-checklist > .selection-list--button-selected-highlighted,
+#settings-checklist > .selection-list--button-highlighted {
+    color: $foreground;
+    background: transparent;
+}
+
+#settings-help {
+    height: 4;
+    overflow-y: auto;
+    color: $text-muted;
+    border-top: solid $foreground-muted;
+}
+
+#settings-help.inventory-help {
+    height: 6;
+}
+
+#settings-help.details-open {
+    height: 12;
+}
+
+#settings-help:focus {
+    border-top: solid $primary;
+}
+
+#settings-hint {
+    height: 1;
+    color: $text-muted;
+}
+
+#settings-editor, #settings-confirmation {
+    display: none;
+    height: 1fr;
+    width: 100%;
+}
+
+#settings-editor-label {
+    height: 1;
+    text-style: bold;
+}
+
+#settings-input {
+    height: 3;
+    border: solid $foreground-muted;
+    background: $surface;
+}
+
+#settings-input:focus {
+    border: solid $primary;
+}
+
+#settings-input.-invalid {
+    border: solid $error;
+}
+
+#settings-editor-error {
+    height: 2;
+    color: $error;
+}
+
+#settings-confirmation-scroll {
+    height: auto;
+    max-height: 8;
+    overflow-y: auto;
+}
+
+#settings-confirmation-scroll:focus {
+    border-left: solid $primary;
+}
+
+#settings-confirmation-text {
+    height: auto;
+}
+
+#settings-confirmation-actions {
+    height: 2;
+    border: none;
+}
+
+#settings-confirmation-actions:focus > .option-list--option-highlighted {
+    text-style: bold reverse;
+    background: transparent;
+}
+
+#settings-confirmation-actions:blur > .option-list--option-highlighted {
+    text-style: none;
+    background: transparent;
+}

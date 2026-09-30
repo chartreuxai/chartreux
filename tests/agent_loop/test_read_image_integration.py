@@ -219,7 +219,7 @@ async def test_read_image_hook_replacement_and_committed_nonvision_switch_fail_c
 
     committed = CommittedModelIdentity(
         base_model="text",
-        provider="mistral/default",
+        provider="mistral",
         wire_name="text",
         catalog_revision=config.catalog_snapshot.revision,
     )

@@ -210,12 +210,11 @@ async def test_lifecycle_makes_no_product_service_attempts_with_fake_inference(
     }
     (config_dir / "config.toml").write_text(
         tomli_w.dumps({
-            "active_model": model_alias,
-            "session_logging": {"enabled": True, "save_dir": str(session_root)},
+            "session_logging": {"enabled": True, "save_dir": str(session_root)}
         }),
         encoding="utf-8",
     )
-    provider_id = f"{provider_name}/default"
+    provider_id = provider_name
     (config_dir / "models.toml").write_text(
         tomli_w.dumps({
             "providers": {
@@ -226,6 +225,13 @@ async def test_lifecycle_makes_no_product_service_attempts_with_fake_inference(
             "models": {
                 model_alias: {
                     "deployments": [{"provider": provider_id, "name": model_alias}]
+                }
+            },
+            "roles": {
+                "orchestrator": {
+                    "description": "Local contract test preset",
+                    "model": model_alias,
+                    "thinking": "off",
                 }
             },
         }),

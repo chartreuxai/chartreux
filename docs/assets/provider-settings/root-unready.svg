@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" data-cols="80" data-rows="24" viewBox="0 0 976 585.6" role="img">
+<title>Provider Settings — Onboarding, no runnable model</title>
+<desc>Onboarding root with Mistral missing a key and no runnable deployments. Set up Mistral is focused; Finish setup is disabled until a runnable model exists.</desc>
+<rect width="976" height="585.6" fill="#171a1f"/>
+<text data-row="0" x="12.2" y="18.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee" font-weight="bold">Provider Settings  /  Onboarding</text>
+<text data-row="1" x="12.2" y="42.4" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Providers  |  all providers</text>
+<text data-row="2" x="12.2" y="66.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Mistral</text>
+<text data-row="3" x="12.2" y="91.2" font-family="Fira Code,monospace" font-size="20" fill="#f2c879">  ├ Connection · Key Required</text>
+<text data-row="4" x="12.2" y="115.6" font-family="Fira Code,monospace" font-size="20" fill="#f2c879">  └ Models · No runnable models</text>
+<text data-row="5" x="12.2" y="140.0" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Repair: save a key, then enable a valid deployment.</text>
+<text data-row="6" x="12.2" y="164.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="7" x="12.2" y="188.8" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">ACTIONS</text>
+<rect data-focus-row="8" x="0" y="195.2" width="976" height="24.4" fill="#dce3ed"/>
+<text data-row="8" x="12.2" y="213.2" font-family="Fira Code,monospace" font-size="20" fill="#10151c" font-weight="bold">▸ Set up Mistral</text>
+<text data-row="9" x="12.2" y="237.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  Add custom provider</text>
+<text data-row="10" x="12.2" y="262.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  Model catalog</text>
+<text data-row="11" x="12.2" y="286.4" font-family="Fira Code,monospace" font-size="20" fill="#727a86">  Finish setup [disabled: no runnable model]</text>
+<text data-row="12" x="12.2" y="310.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="13" x="12.2" y="335.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="14" x="12.2" y="359.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="15" x="12.2" y="384.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="16" x="12.2" y="408.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="17" x="12.2" y="432.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="18" x="12.2" y="457.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="19" x="12.2" y="481.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="20" x="12.2" y="506.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="21" x="12.2" y="530.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="22" x="12.2" y="554.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="23" x="12.2" y="579.2" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Enter Set up   Esc Cancel setup</text>
+</svg>

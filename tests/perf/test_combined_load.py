@@ -25,10 +25,10 @@ from chartreux.core.llm_models import LLMChunk, LLMMessage
 from chartreux.core.subagents import TaskResult
 from tests.mock.utils import mock_llm_chunk
 from tests.perf._harness import (
-    FanOutHarness,
     GatedSequenceBackend,
-    create_fan_out_harness,
-    launch_fan_out,
+    SubagentHarness,
+    create_subagent_harness,
+    launch_explicit_tasks,
 )
 from tests.perf._metrics import machine_context, percentiles, record
 from tests.perf._synthetic import synthetic_messages
@@ -250,7 +250,7 @@ async def _measure_stream(
 
 
 def _install_large_child_contexts(
-    harness: FanOutHarness,
+    harness: SubagentHarness,
     backend: ContextGatedBackend,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -285,18 +285,23 @@ def _install_large_child_contexts(
 
 
 async def _start_children_and_release(
-    harness: FanOutHarness,
+    harness: SubagentHarness,
     backend: ContextGatedBackend,
     *,
     rss_at_gate_mb: list[float],
     results: list[TaskResult],
 ) -> None:
-    result = await asyncio.wait_for(
-        launch_fan_out(harness.registry, harness.context, harness.role), timeout=120
+    launches = await asyncio.wait_for(
+        launch_explicit_tasks(harness.registry, harness.context, harness.model_names),
+        timeout=120,
     )
-    assert result.members is not None
-    assert len(result.members) == _AGENT_COUNT
-    assert all(member.status == "running" for member in result.members)
+    assert len(launches) == _AGENT_COUNT
+    assert all(
+        result.status == "launched"
+        and result.agent_id is not None
+        and result.run_id is not None
+        for result in launches
+    )
 
     await asyncio.wait_for(
         asyncio.gather(*(started.wait() for started in backend.started)), timeout=120
@@ -313,18 +318,17 @@ async def _start_children_and_release(
         f"child requests did not carry the full synthetic context: {backend.context_chars}"
     )
     rss_at_gate_mb.append(_rss_mb())
-    results.append(result)
+    results.extend(launches)
 
     for release in backend.releases:
         release.set()
 
 
-async def _await_children(harness: FanOutHarness, result: TaskResult) -> None:
-    assert result.members is not None
+async def _await_children(harness: SubagentHarness, results: list[TaskResult]) -> None:
     members: list[tuple[str, str]] = []
-    for member in result.members:
-        if member.agent_id and member.run_id:
-            members.append((member.agent_id, member.run_id))
+    for result in results:
+        if result.agent_id and result.run_id:
+            members.append((result.agent_id, result.run_id))
     assert len(members) == _AGENT_COUNT
     completions = await asyncio.wait_for(
         asyncio.gather(
@@ -352,24 +356,24 @@ async def _iteration(
         baseline_backend = MidStreamGatedBackend(_chunks(), pause_at_midpoint=False)
         streaming_only = await _measure_stream(baseline_backend, monkeypatch)
 
-    role_members = [f"perf-combined-{index}" for index in range(_AGENT_COUNT)]
+    model_names = [f"perf-combined-{index}" for index in range(_AGENT_COUNT)]
     child_backend = ContextGatedBackend()
     for _ in range(_AGENT_COUNT):
         child_backend.add_gate()
 
     combined_backend = MidStreamGatedBackend(_chunks(), pause_at_midpoint=True)
-    harness: FanOutHarness | None = None
+    harness: SubagentHarness | None = None
     heartbeat: asyncio.Task[None] | None = None
     heartbeat_results: tuple[None | BaseException, ...] = ()
     stop_heartbeat = asyncio.Event()
     loop_lag_ms: list[float] = []
     rss_at_gate_mb: list[float] = []
-    fan_out_results: list[TaskResult] = []
+    task_results: list[TaskResult] = []
     rss_before_mb: float | None = None
     combined: StreamMeasurement | None = None
     stream_completed = False
     try:
-        harness = await create_fan_out_harness(role_members)
+        harness = await create_subagent_harness(model_names)
         _install_large_child_contexts(harness, child_backend, monkeypatch)
         rss_before_mb = _rss_mb()
 
@@ -379,7 +383,7 @@ async def _iteration(
                 harness,
                 child_backend,
                 rss_at_gate_mb=rss_at_gate_mb,
-                results=fan_out_results,
+                results=task_results,
             )
 
         heartbeat = asyncio.create_task(
@@ -390,8 +394,8 @@ async def _iteration(
             combined_backend, monkeypatch, during_midstream=launch_and_release
         )
         stream_completed = True
-        assert len(fan_out_results) == 1
-        await _await_children(harness, fan_out_results[0])
+        assert len(task_results) == _AGENT_COUNT
+        await _await_children(harness, task_results)
         assert len(child_backend.started) == _AGENT_COUNT
         assert combined.chunk_count == ASSISTANT_CHUNK_COUNT
         assert rss_at_gate_mb

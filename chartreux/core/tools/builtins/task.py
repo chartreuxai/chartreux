@@ -23,21 +23,6 @@ from chartreux.model_display import format_model_display_name
 from chartreux.utils.tool_presentation import ToolEffectKind
 
 
-def _skipped_member_lines(result: TaskResult) -> list[str]:
-    if result.members is None:
-        return []
-    return [
-        f"Skipped {member.base_model}: "
-        + (
-            member.error.get("message", "member was rejected during preflight")
-            if member.error is not None
-            else "member was rejected during preflight"
-        )
-        for member in result.members
-        if member.status == "skipped"
-    ]
-
-
 def _switch_notice_lines(metadata: dict[str, object] | None) -> list[str]:
     if not metadata:
         return []
@@ -58,12 +43,6 @@ def _switch_notice_lines(metadata: dict[str, object] | None) -> list[str]:
 
 
 def _result_display_names(result: TaskResult) -> list[str]:
-    if result.members is not None:
-        return [
-            member.display_name
-            for member in result.members
-            if member.status != "skipped"
-        ]
     metadata = result.metadata or {}
     return (
         [
@@ -119,20 +98,7 @@ class Task(
         if isinstance(result, TaskResult):
             names = _result_display_names(result)
             switches = _switch_notice_lines(result.metadata)
-            skipped = _skipped_member_lines(result)
-            detail = "; ".join([*names, *switches, *skipped])
-            if result.members is not None:
-                members_running = any(
-                    member.status == "running" for member in result.members
-                )
-                launched_count = len(result.members) - len(skipped)
-                skipped_summary = f", {len(skipped)} skipped" if skipped else ""
-                return ToolResultDisplay(
-                    success=result.completed,
-                    verb="Launched" if members_running else "Completed",
-                    message=f"{launched_count} agents{skipped_summary}"
-                    + (f": {detail}" if detail else ""),
-                )
+            detail = "; ".join([*names, *switches])
             if result.agent_id is not None:
                 return ToolResultDisplay(
                     success=True,
@@ -166,16 +132,13 @@ class Task(
     def project_result(cls, result: TaskResult) -> dict[str, JsonValue] | None:
         names = _result_display_names(result)
         switches = _switch_notice_lines(result.metadata)
-        skipped = _skipped_member_lines(result)
-        if not names and not switches and not skipped:
+        if not names and not switches:
             return None
         output: dict[str, JsonValue] = {}
         if names:
             output["models"] = cast(JsonValue, names)
         if switches:
             output["switches"] = cast(JsonValue, switches)
-        if skipped:
-            output["skipped"] = cast(JsonValue, skipped)
         return output
 
     @classmethod

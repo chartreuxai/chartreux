@@ -28,6 +28,18 @@ from chartreux.cli.textual_ui.windowing.history import (
 from chartreux.cli.textual_ui.windowing.placeholder import PlacementPlaceholder
 
 
+@dataclass(frozen=True, slots=True)
+class TranscriptAnchor:
+    """Logical reading position, independent of a placement's DOM lifetime."""
+
+    entry_id: str
+    history_index: int
+    row_offset: int
+    screen_row: int
+    following: bool
+    scroll_revision: int
+
+
 @dataclass(slots=True)
 class TranscriptUnit:
     id: str
@@ -681,6 +693,66 @@ class TranscriptWindow:
                 offset = max(0, top - placement.region.y)
                 return unit_id, offset, placement.region.y + offset
         return None
+
+    def capture_anchor(
+        self, stream: Widget, *, following: bool
+    ) -> TranscriptAnchor | None:
+        """Capture the top inspected placement before a reflow or teardown."""
+        reading = self._reading_anchor(stream)
+        if reading is None:
+            return None
+        unit_id, offset, screen_row = reading
+        unit = self.units[unit_id]
+        return TranscriptAnchor(
+            entry_id=unit.member_entry_ids[0],
+            history_index=unit.start_index,
+            row_offset=offset,
+            screen_row=screen_row,
+            following=following,
+            scroll_revision=self._scroll_revision,
+        )
+
+    async def restore_anchor(
+        self, stream: Widget, anchor: TranscriptAnchor, *, check_revision: bool = True
+    ) -> None:
+        """Restore the nearest available row, unless a later user scroll owns the view."""
+        view = self._scroll_view(stream)
+        if check_revision and self._scroll_revision != anchor.scroll_revision:
+            return
+        if anchor.following:
+            self._set_scroll_flag(view, "_transcript_engine_scroll", True)
+            try:
+                view.scroll_end(animate=False, immediate=True)
+                view.anchor()
+            finally:
+                self._set_scroll_flag(view, "_transcript_engine_scroll", False)
+            return
+        unit_id = self._entry_to_unit.get(anchor.entry_id)
+        if unit_id is None and self.unit_ids:
+            unit_id = min(
+                self.unit_ids,
+                key=lambda key: abs(self.units[key].start_index - anchor.history_index),
+            )
+        unit = self.units.get(unit_id) if unit_id is not None else None
+        placement = self._placement(unit) if unit is not None else None
+        if placement is None:
+            return
+        view.release_anchor()
+        for _ in range(3):
+            await self._layout_pass(stream)
+            if check_revision and self._scroll_revision != anchor.scroll_revision:
+                return
+            offset = min(anchor.row_offset, max(0, placement.region.height - 1))
+            delta = placement.region.y + offset - anchor.screen_row
+            if not delta:
+                break
+            self._set_scroll_flag(view, "_transcript_engine_scroll", True)
+            try:
+                view.scroll_to(
+                    y=view.scroll_offset.y + delta, animate=False, immediate=True
+                )
+            finally:
+                self._set_scroll_flag(view, "_transcript_engine_scroll", False)
 
     @staticmethod
     async def _initialize_roots(roots: Sequence[Widget]) -> None:

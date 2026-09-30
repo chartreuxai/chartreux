@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" data-cols="80" data-rows="24" viewBox="0 0 976 585.6" role="img">
+<title>Global Model catalog</title>
+<desc>Global catalog with separate provider and model filters, one row per canonical model, and bounded deployment and role detail.</desc>
+<rect width="976" height="585.6" fill="#171a1f"/>
+<text data-row="0" x="12.2" y="18.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee" font-weight="bold">Provider Settings  /  Model catalog</text>
+<text data-row="1" x="12.2" y="42.4" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Provider filter [All providers]   Model filter [all models]</text>
+<text data-row="2" x="12.2" y="66.8" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">CANONICAL MODELS</text>
+<rect data-focus-row="3" x="0" y="73.2" width="976" height="24.4" fill="#dce3ed"/>
+<text data-row="3" x="12.2" y="91.2" font-family="Fira Code,monospace" font-size="20" fill="#10151c" font-weight="bold">▸ glm-5-3       Mistral       enabled · runnable · 3 roles</text>
+<text data-row="4" x="12.2" y="115.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  mistral-small Mistral       enabled · runnable · 1 role</text>
+<text data-row="5" x="12.2" y="140.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  gpt-4.1       OpenAI        enabled · runnable · 2 roles</text>
+<text data-row="6" x="12.2" y="164.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  claude-sonnet Anthropic     enabled · runnable · 1 role</text>
+<text data-row="7" x="12.2" y="188.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  qwen3-32b     Local         disabled · not runnable</text>
+<text data-row="8" x="12.2" y="213.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="9" x="12.2" y="237.6" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">SELECTED MODEL  ·  glm-5-3</text>
+<text data-row="10" x="12.2" y="262.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Deployments: Mistral / glm-5-3</text>
+<text data-row="11" x="12.2" y="286.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Roles: @orchestrator (1), @small-worker (1), @small-reviewer (2)</text>
+<text data-row="12" x="12.2" y="310.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="13" x="12.2" y="335.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="14" x="12.2" y="359.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="15" x="12.2" y="384.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="16" x="12.2" y="408.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="17" x="12.2" y="432.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="18" x="12.2" y="457.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="19" x="12.2" y="481.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="20" x="12.2" y="506.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="21" x="12.2" y="530.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="22" x="12.2" y="554.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="23" x="12.2" y="579.2" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Enter Details   Shift-Tab Filters   Esc Root</text>
+</svg>

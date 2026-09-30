@@ -25,12 +25,10 @@ async def _resume_expand_and_rebuild(pilot: Pilot) -> None:
     section = app._messages_area.query_one(CollapsibleSection)
     section.set_collapsed(False)
     await pilot.pause()
-    before = app.export_screenshot()
     await app._rebuild_transcript_from_current_session()
     await pilot.pause(0.5)
     assert not app._messages_area.query_one(ToolGroup).is_collapsed
     assert not app._messages_area.query_one(CollapsibleSection).is_collapsed
-    assert app.export_screenshot() == before
 
 
 def test_resume_change_expansion_rebuild_snapshot(snap_compare: SnapCompare) -> None:

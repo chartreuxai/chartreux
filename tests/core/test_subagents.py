@@ -20,7 +20,6 @@ from chartreux.core.subagents import (
     SubagentManagementError,
     SubagentRunAccumulator,
     TaskArgs,
-    TaskMemberResult,
     TaskResult,
     UnknownAgentError,
     normalize_task_summary,
@@ -231,85 +230,19 @@ def test_singular_task_result_members_omission_survives_nested_json_serializatio
     }
 
 
-def test_fan_out_collection_serializes_exactly_in_dump_and_json() -> None:
-    result = TaskResult(
-        response="",
-        turns_used=3,
-        completed=False,
-        members=[
-            TaskMemberResult(
-                index=0,
-                base_model="small",
-                provider="test/first",
-                display_name="test/first/small-wire",
-                status="completed",
-                agent_id="agent-1",
-                run_id="run-1",
-                result="done",
-            ),
-            TaskMemberResult(
-                index=1,
-                base_model="large",
-                provider="test/second",
-                display_name="test/second/large-wire",
-                status="failed",
-                error={"code": "runtime_failed", "message": "boom"},
-            ),
-        ],
-    )
-    expected = {
-        "response": "",
-        "turns_used": 3,
-        "completed": False,
-        "agent_id": None,
-        "run_id": None,
-        "metadata": None,
-        "members": [
-            {
-                "index": 0,
-                "base_model": "small",
-                "provider": "test/first",
-                "display_name": "test/first/small-wire",
-                "status": "completed",
-                "agent_id": "agent-1",
-                "run_id": "run-1",
-                "result": "done",
-                "error": None,
-            },
-            {
-                "index": 1,
-                "base_model": "large",
-                "provider": "test/second",
-                "display_name": "test/second/large-wire",
-                "status": "failed",
-                "agent_id": None,
-                "run_id": None,
-                "result": None,
-                "error": {"code": "runtime_failed", "message": "boom"},
-            },
-        ],
-    }
-
-    assert result.model_dump() == expected
-    assert json.loads(result.model_dump_json()) == expected
-
-
-def test_fan_out_member_optional_fields_are_omitted_when_requested() -> None:
-    member = TaskMemberResult(
-        index=0,
-        base_model="small",
-        provider="test/first",
-        display_name="test/first/small-wire",
-        status="running",
+def test_fan_out_is_rejected_for_single_preset_roles() -> None:
+    message = (
+        "Roles are single presets. Launch separate tasks with explicit presets/models "
+        "for multiple agents."
     )
 
-    assert member.model_dump(exclude_none=True) == {
-        "index": 0,
-        "base_model": "small",
-        "provider": "test/first",
-        "display_name": "test/first/small-wire",
-        "status": "running",
-    }
+    with pytest.raises(ValidationError, match=message):
+        TaskArgs.model_validate({"task": "inspect", "fan_out": True})
+
+    assert "fan_out" not in TaskArgs.model_json_schema()["properties"]
+    assert TaskArgs.model_validate({"task": "inspect", "fan_out": False}) == TaskArgs(
+        task="inspect"
+    )
 
 
 def test_background_subagent_handle_types() -> None:

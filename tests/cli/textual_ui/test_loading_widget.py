@@ -8,6 +8,14 @@ from chartreux.cli.textual_ui.widgets.loading import (
 )
 
 
+def test_status_is_semantic_and_uses_running_wording() -> None:
+    widget = LoadingWidget(status="Discovering models")
+    assert widget.status == "Discovering models"
+    assert widget._build_status_text() == "Running: Discovering models…"
+    widget.set_status(THINKING_LOADING_STATUS)
+    assert widget.status == THINKING_LOADING_STATUS
+
+
 def test_interrupting_status_sticks_against_late_streaming_updates() -> None:
     """Once interrupting, late streaming status updates must not overwrite it.
 
@@ -58,20 +66,21 @@ def test_next_action_required_status_does_not_reset_saved_progress() -> None:
     assert widget.base_status == "Running command"
 
 
-def test_queue_hint_includes_steer_shortcut() -> None:
+def test_queue_hint_labels_next_turn_submission() -> None:
     widget = LoadingWidget()
     widget.set_queue_count(2)
 
     hint = widget._format_hint(10)
 
     assert "Enter" in hint
-    assert "to steer" in hint
+    assert "queues next turn" in hint
     assert "to cancel last queued message" in hint
 
 
-def test_hint_without_queue_omits_steer_shortcut() -> None:
+def test_hint_without_queue_labels_first_submission() -> None:
     widget = LoadingWidget()
 
     hint = widget._format_hint(10)
 
-    assert "to steer" not in hint
+    assert "Enter" in hint
+    assert "queues next turn" in hint

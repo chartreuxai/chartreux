@@ -4,6 +4,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from textual import events
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.message import Message
@@ -127,6 +128,13 @@ class ChatInputContainer(Vertical):
             self._body.input_widget.set_completion_manager(self._completion_manager)
             self._body.focus_input()
 
+    def on_resize(self, _event: events.Resize) -> None:
+        if not self.is_mounted:
+            return
+        popup = self.query_one(CompletionPopup)
+        if popup.is_mounted:
+            popup.refresh_viewport_layout()
+
     def on_unmount(self) -> None:
         self._path_completer.shutdown()
 
@@ -134,6 +142,18 @@ class ChatInputContainer(Vertical):
         self, _event: ChatInputBody.CompletionResetRequested
     ) -> None:
         self._completion_manager.reset()
+
+    def on_completion_popup_suggestion_clicked(
+        self, event: CompletionPopup.SuggestionClicked
+    ) -> None:
+        event.stop()
+        widget = self.input_widget
+        if widget is None or not self._completion_manager.has_active_completion():
+            return
+        self._completion_manager.accept_suggestion(
+            event.index, widget.get_full_text(), widget._get_full_cursor_offset()
+        )
+        self.focus_input()
 
     @property
     def input_widget(self) -> ChatTextArea | None:

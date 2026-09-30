@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" data-cols="80" data-rows="24" viewBox="0 0 960 576" role="img">
+<title>Connect provider and save forward</title>
+<desc>Conceptual dark 80 by 24 terminal frame. Save and configure models is the primary action, even when a credential is not yet available.</desc>
+<rect width="960" height="576" fill="#171a1f"/>
+<g fill="#e4e8ee" font-family="monospace" font-size="18">
+<text x="16" y="28" font-weight="bold">Provider Settings / Connect provider</text>
+<text x="16" y="56" fill="#aab2bd">Step 1 of 3 · Mistral</text>
+<text x="16" y="104">Provider name   Mistral [built-in]</text>
+<text x="16" y="134">API base        https://api.mistral.ai/v1</text>
+<text x="16" y="164">Protocol        OpenAI-compatible</text>
+<text x="16" y="194">Credential      MISTRAL_API_KEY · Missing</text>
+<text x="16" y="238">  Save credential</text>
+<rect x="0" y="253" width="960" height="29" fill="#dce3ed"/>
+<text x="16" y="276" fill="#10151c" font-weight="bold">▸ Save and configure models</text>
+<text x="16" y="320" fill="#f2c879">A missing key may be repaired before Finish setup.</text>
+<text x="16" y="350" fill="#aab2bd">The provider definition saves now; models open next.</text>
+<text x="16" y="552" fill="#aab2bd">↑/↓ Navigate   Enter Edit/save   Esc Provider opener</text>
+</g>
+</svg>

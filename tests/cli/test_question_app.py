@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from textual.app import App, ComposeResult
 from textual.containers import Container
@@ -71,6 +73,24 @@ def multi_select_args():
 
 
 class TestQuestionAppState:
+    @pytest.mark.asyncio
+    async def test_ascii_chrome_picker_prefixes(self, multi_select_args):
+        class Host(App[None]):
+            config: SimpleNamespace
+
+            def compose(self) -> ComposeResult:
+                yield QuestionApp(multi_select_args)
+
+        app = Host()
+        app.config = SimpleNamespace(ascii_chrome=True)
+        async with app.run_test() as pilot:
+            picker = app.query_one(QuestionApp)
+            assert picker._format_option_prefix(0, True, True, True) == "  [x] "
+            assert picker._format_option_prefix(0, True, False, False) == "> 1. "
+            assert picker.submit_widget is not None
+            assert str(picker.submit_widget.render()).endswith("->")
+            await pilot.pause()
+
     def test_init_state(self, single_question_args):
         from chartreux.cli.textual_ui.widgets.question_app import QuestionApp
 
@@ -113,6 +133,22 @@ class TestQuestionAppState:
 
         # 2 options + Other = 3 (no Submit for single-select)
         assert app._total_options == 3
+
+    def test_space_toggles_multi_select_without_advancing(self, multi_select_args):
+        app = QuestionApp(multi_select_args)
+        app.action_toggle_option()
+        assert app.multi_selections[0] == {0}
+        assert app.answers == {}
+        app.action_toggle_option()
+        assert app.multi_selections[0] == set()
+
+    def test_format_multi_select_option_prefix_matches_checklist(
+        self, multi_select_args
+    ):
+        app = QuestionApp(multi_select_args)
+
+        assert app._format_option_prefix(0, True, True, True) == "  [■] "
+        assert app._format_option_prefix(1, False, True, False) == "  [ ] "
 
     def test_total_options_multi_select_includes_submit(self, multi_select_args):
         from chartreux.cli.textual_ui.widgets.question_app import QuestionApp
@@ -884,11 +920,15 @@ class TestQuestionAppClicks:
         app = _HostApp(single_question_args)
         async with app.run_test() as pilot:
             qapp = app.query_one(QuestionApp)
+            qapp._mount_time = 0.0
             assert qapp.selected_option == 0
 
             await pilot.click(qapp.option_widgets[1])
 
             assert qapp.selected_option == 1
+            assert (
+                qapp.answers[0][0] == single_question_args.questions[0].options[1].label
+            )
 
     @pytest.mark.asyncio
     async def test_clicking_other_row_selects_other(self, single_question_args):

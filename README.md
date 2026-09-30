@@ -1,6 +1,6 @@
 # Chartreux
 
-Chartreux is an oppinionated independent fork of [Mistral Vibe](https://github.com/mistralai/mistral-vibe).
+Chartreux is an opinionated independent fork of [Mistral Vibe](https://github.com/mistralai/mistral-vibe).
 
 Chartreux is pre-release alpha software with no stability guarantees; breaking changes may occur without migration paths.
 
@@ -54,7 +54,7 @@ From a project you trust:
 chartreux
 ```
 
-Configuration is stored in `~/.chartreux/config.toml`; provider credentials can be stored in `~/.chartreux/.env`. See the [configuration guide](https://chartreuxai.github.io/chartreux/docs/guides/configuration/).
+Runtime configuration is stored in `~/.chartreux/config.toml`; providers, models, and saved presets live in the user catalog at `~/.chartreux/models.toml`; provider credentials can be stored in `~/.chartreux/.env`. See the [configuration guide](https://chartreuxai.github.io/chartreux/docs/guides/configuration/).
 
 ## Documentation
 

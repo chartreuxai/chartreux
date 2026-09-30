@@ -37,6 +37,7 @@ class ConfigView(ProtocolModel):
     file_watcher_for_autocomplete: bool
     ask_confirmation_on_exit: bool
     show_thinking_nodes: bool
+    ascii_chrome: bool = False
     enable_notifications: bool
     enable_system_trust_store: bool = False
     models: list[ModelConfigView]

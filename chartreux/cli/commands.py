@@ -9,7 +9,7 @@ from chartreux.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
 
 @dataclass(frozen=True)
 class CommandContext:
-    pass
+    retry_available: bool = False
 
 
 CommandAvailability = Callable[[CommandContext], bool]
@@ -60,8 +60,8 @@ class CommandRegistry:
                 description="Reload configuration, agent instructions, and skills from disk",
                 handler="_reload_config",
             ),
-            "config": Command(
-                aliases=frozenset(["/config"]),
+            "open-config-file": Command(
+                aliases=frozenset(["/open-config-file"]),
                 description=(
                     "Open the user config file in your editor and reload "
                     "configuration after editing"
@@ -133,6 +133,16 @@ class CommandRegistry:
                 handler="_show_status",
                 side_channel=True,
             ),
+            "settings": Command(
+                aliases=frozenset(["/settings"]),
+                description="Browse and edit curated user settings",
+                handler="_show_settings",
+            ),
+            "web-search": Command(
+                aliases=frozenset(["/web-search"]),
+                description="Configure web search provider and credentials",
+                handler="_show_web_search",
+            ),
             "proxy-setup": Command(
                 aliases=frozenset(["/proxy-setup"]),
                 description="Configure proxy and SSL certificate settings",
@@ -140,7 +150,7 @@ class CommandRegistry:
             ),
             "providers": Command(
                 aliases=frozenset(["/providers"]),
-                description="Add or manage model providers",
+                description="Open Provider Settings to add or manage model providers",
                 handler="_show_providers",
             ),
             "resume": Command(
@@ -181,10 +191,11 @@ class CommandRegistry:
             "retry": Command(
                 aliases=frozenset(["/retry"]),
                 description=(
-                    "Continue an interrupted model response; optionally pass "
-                    "additional instructions"
+                    "Start a new turn after an interrupted response; completed tool results "
+                    "are kept and recent actions may repeat. Optionally pass instructions"
                 ),
                 handler="_retry",
+                is_available=lambda ctx: ctx.retry_available,
             ),
             "loop": Command(
                 aliases=frozenset(["/loop"]),

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.widgets import Input, OptionList
 from textual.worker import Worker
@@ -16,12 +18,14 @@ from chartreux.app_server.models import (
 )
 from chartreux.app_server.protocol import (
     AppServerResponseError,
+    MCPAuthUrlParams,
     ProtocolError,
     ProtocolErrorCode,
 )
-from chartreux.cli.textual_ui.app import ChartreuxApp
+from chartreux.cli.textual_ui.app import BottomApp, ChartreuxApp
 from chartreux.cli.textual_ui.widgets.mcp_app import (
     _LIST_VIEW_HELP_AUTH,
+    _LIST_VIEW_HELP_STATE,
     _LIST_VIEW_HELP_TOOLS,
     _REFRESHING_LABEL,
     MCPApp,
@@ -32,7 +36,10 @@ from chartreux.cli.textual_ui.widgets.mcp_app import (
     _source_option_id,
     _tool_count_text,
 )
+from chartreux.cli.textual_ui.widgets.mcp_oauth_app import MCPOAuthApp
 from chartreux.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
+from tests.conftest import build_test_chartreux_app, wait_until
+from tests.snapshots.snapshot_event_loop import install_snapshot_wake
 
 
 def _source(
@@ -49,6 +56,10 @@ def _source(
 
 def _state(*sources: MCPSourceSummary) -> MCPState:
     return MCPState(sources=list(sources))
+
+
+def _plain_content(widget: NoMarkupStatic) -> str:
+    return cast(Text, widget.content).plain
 
 
 class MCPAppHarness(App[None]):
@@ -107,7 +118,7 @@ def test_filter_sources_fuzzy_matches_and_ranks_names() -> None:
 
 
 @pytest.mark.asyncio
-async def test_overview_starts_on_first_source_and_search_wraps_like_a_row() -> None:
+async def test_overview_starts_on_first_source_and_search_uses_tab() -> None:
     app = MCPAppHarness(_state(_source("gmail"), _source("slack")))
 
     async with app.run_test() as pilot:
@@ -115,49 +126,59 @@ async def test_overview_starts_on_first_source_and_search_wraps_like_a_row() -> 
         search = app.query_one("#mcp-search", Input)
         search_icon = app.query_one("#mcp-search-icon", NoMarkupStatic)
 
-        assert search_icon.content == "🔍"
-        assert search.placeholder == "Search servers (← to focus)"
+        assert search_icon.content == "Search"
+        assert search.placeholder == "Search servers"
         assert app.screen.focused is option_list
-        assert option_list.get_option_at_index(option_list.highlighted or 0).id == (
-            "server:gmail"
-        )
-
-        await pilot.press("up")
-        assert app.screen.focused is search
+        assert option_list.highlighted_option is not None
+        assert option_list.highlighted_option.id == "server:gmail"
 
         await pilot.press("up")
         assert app.screen.focused is option_list
-        assert option_list.get_option_at_index(option_list.highlighted or 0).id == (
-            "server:slack"
-        )
+        assert option_list.highlighted_option is not None
+        assert option_list.highlighted_option.id == "server:slack"
 
-        option_list.scroll_to = MagicMock(wraps=option_list.scroll_to)
-        await pilot.press("left")
+        await pilot.press("tab")
         assert app.screen.focused is search
-        option_list.scroll_to.assert_any_call(
-            y=0, animate=False, force=True, immediate=True
-        )
-
-        await pilot.press("down")
+        await pilot.press("tab")
         assert app.screen.focused is option_list
-        assert option_list.get_option_at_index(option_list.highlighted or 0).id == (
-            "server:gmail"
-        )
 
-        await pilot.press("up", "up")
-        assert app.screen.focused is option_list
-        assert option_list.get_option_at_index(option_list.highlighted or 0).id == (
-            "server:slack"
-        )
-
-        await pilot.press("down")
+        await pilot.press("shift+tab")
         assert app.screen.focused is search
+        await pilot.press("tab")
+        assert app.screen.focused is option_list
 
         await pilot.press("down")
         assert app.screen.focused is option_list
-        assert option_list.get_option_at_index(option_list.highlighted or 0).id == (
-            "server:gmail"
-        )
+        assert option_list.highlighted_option is not None
+        assert option_list.highlighted_option.id == "server:gmail"
+
+
+@pytest.mark.asyncio
+async def test_escape_leaves_detail_then_filter_then_browser() -> None:
+    app = MCPAppHarness(_state(_source("gmail"), _source("slack")))
+    async with app.run_test() as pilot:
+        picker = app.query_one(MCPApp)
+        options = picker.query_one(MCPOptionList)
+        assert options.highlighted_option is not None
+        prompt = options.highlighted_option.prompt
+        assert isinstance(prompt, Text)
+        assert prompt.plain.startswith("▸ ")
+        await pilot.press("shift+tab", "g")
+        await pilot.pause()
+        assert picker._query == "g"
+        await pilot.press("tab", "enter")
+        await pilot.pause()
+        assert picker._viewing_name == "gmail"
+        await pilot.press("escape")
+        await pilot.pause()
+        assert picker._viewing_name is None
+        assert picker._query == "g"
+        await pilot.press("escape")
+        await pilot.pause()
+        assert picker._query == ""
+        await pilot.press("escape")
+        await pilot.pause()
+        assert picker._viewing_name is None
 
 
 @pytest.mark.asyncio
@@ -168,7 +189,7 @@ async def test_search_fuzzy_filters_sources_without_taking_initial_focus() -> No
 
     async with app.run_test() as pilot:
         option_list = app.query_one(MCPOptionList)
-        await pilot.press("up", "g", "d")
+        await pilot.press("shift+tab", "g", "d")
 
         source_ids = [
             option.id
@@ -178,13 +199,66 @@ async def test_search_fuzzy_filters_sources_without_taking_initial_focus() -> No
         assert app.screen.focused is app.query_one("#mcp-search", Input)
         assert source_ids == ["server:Google Drive"]
 
-        await pilot.press("down")
-        option_list.scroll_to = MagicMock(wraps=option_list.scroll_to)
+        await pilot.press("tab")
+        assert app.screen.focused is option_list
         await pilot.press("up")
+        assert app.screen.focused is option_list
 
-        assert app.screen.focused is app.query_one("#mcp-search", Input)
-        option_list.scroll_to.assert_any_call(
-            y=0, animate=False, force=True, immediate=True
+
+@pytest.mark.asyncio
+async def test_empty_overview_status_row_is_focusable_without_enter_action() -> None:
+    app = MCPAppHarness(_state())
+
+    async with app.run_test() as pilot:
+        option_list = app.query_one(MCPOptionList)
+        assert option_list.highlighted_option is not None
+        assert option_list.highlighted_option.id == "state:empty"
+        assert option_list.highlighted_option.disabled is False
+
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert _plain_content(app.query_one("#mcp-help", NoMarkupStatic)).startswith(
+            "This status row is informational."
+        )
+
+        await pilot.press("d", "e")
+        await pilot.pause()
+
+        assert _plain_content(app.query_one("#mcp-help", NoMarkupStatic)).startswith(
+            "No MCP server is available to toggle."
+        )
+
+
+@pytest.mark.asyncio
+async def test_empty_overview_help_omits_server_actions() -> None:
+    app = MCPAppHarness(_state())
+
+    async with app.run_test():
+        picker = app.query_one(MCPApp)
+        event = MagicMock()
+        event.option.id = "state:empty"
+        picker.on_option_list_option_highlighted(event)
+        help_text = _plain_content(app.query_one("#mcp-help", NoMarkupStatic))
+
+        assert "Disable/Enable" not in _LIST_VIEW_HELP_STATE
+        assert "Enter" not in _LIST_VIEW_HELP_STATE
+        assert "Disable/Enable" not in help_text
+        assert "Enter" not in help_text
+
+
+@pytest.mark.asyncio
+async def test_tool_enter_explains_disable_enable_controls() -> None:
+    app = MCPAppHarness(_state(_source("local", tools=[MCPToolSummary(name="search")])))
+
+    async with app.run_test() as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert _plain_content(app.query_one("#mcp-help", NoMarkupStatic)).startswith(
+            "Use d to disable or e to enable this tool."
         )
 
 
@@ -261,6 +335,55 @@ def test_oauth_source_detail_requests_server_auth() -> None:
     assert message.server_name == "oauth"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+async def test_cancelled_oauth_returns_to_mcp_overview(
+    size: tuple[int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_snapshot_wake()
+    app = build_test_chartreux_app()
+    state = _state(_source("oauth", status=MCPSourceStatus.NEEDS_AUTH))
+    login_release = asyncio.Event()
+
+    async def login(_name: str):
+        yield MCPAuthUrlParams(name="oauth", url="https://auth.example.com/oauth")
+        await login_release.wait()
+
+    async with app.run_test(size=size) as pilot:
+        mcp = app.app_server.resources.mcp
+        mcp._state.mcp = state
+        monkeypatch.setattr(mcp, "read", AsyncMock(return_value=state))
+        monkeypatch.setattr(mcp, "login", login)
+        app._settings_return_bottom_app = BottomApp.MCP
+
+        try:
+            await app._show_mcp()
+            await wait_until(pilot, lambda: bool(app.query(MCPApp)))
+            await pilot.press("enter")
+            await wait_until(
+                pilot,
+                lambda: bool(
+                    app.query(MCPOAuthApp)
+                    and app.query_one(MCPOAuthApp)._auth_url is not None
+                ),
+            )
+
+            await pilot.press("escape")
+            await wait_until(
+                pilot,
+                lambda: (
+                    app._current_bottom_app == BottomApp.MCP
+                    and not app.query(MCPOAuthApp)
+                ),
+            )
+
+            assert app.query_one(MCPApp)._viewing_name is None
+            assert app._settings_return_bottom_app == BottomApp.MCP
+        finally:
+            login_release.set()
+            await pilot.pause()
+
+
 def test_server_detail_shows_bootstrap_error() -> None:
     source = _source(
         "slack", status=MCPSourceStatus.UNAVAILABLE, error="Slack OAuth token expired"
@@ -276,7 +399,7 @@ def test_server_detail_shows_bootstrap_error() -> None:
     labels = " ".join(
         str(call.args[0].prompt) for call in option_list.add_option.call_args_list
     )
-    assert "Failed to bootstrap" in labels
+    assert "✗ Failed: Bootstrap" in labels
     assert "Slack OAuth token expired" in labels
 
 
@@ -297,7 +420,7 @@ def test_server_detail_shows_error_over_needs_auth() -> None:
     labels = " ".join(
         str(call.args[0].prompt) for call in option_list.add_option.call_args_list
     )
-    assert "Failed to bootstrap" in labels
+    assert "✗ Failed: Bootstrap" in labels
     assert "upstream 500" in labels
     app.post_message.assert_not_called()
 
@@ -319,7 +442,7 @@ def test_server_detail_shows_error_over_unavailable_status() -> None:
     labels = " ".join(
         str(call.args[0].prompt) for call in option_list.add_option.call_args_list
     )
-    assert "Failed to bootstrap" in labels
+    assert "✗ Failed: Bootstrap" in labels
     assert "missing credentials" in labels
 
 
@@ -466,7 +589,7 @@ def test_detail_view_unavailable_server_shows_discovery_failed() -> None:
     app._show_detail_view(option_list, source)
 
     calls = option_list.add_option.call_args_list
-    assert "Tool discovery failed" in calls[0].args[0].prompt
+    assert "✗ Failed: Tool discovery" in calls[0].args[0].prompt
 
 
 def test_detail_view_unavailable_server_shows_discovery_error_message() -> None:
@@ -482,7 +605,7 @@ def test_detail_view_unavailable_server_shows_discovery_error_message() -> None:
     app._show_detail_view(option_list, source)
 
     calls = option_list.add_option.call_args_list
-    assert "Tool discovery failed" in calls[0].args[0].prompt
+    assert "✗ Failed: Tool discovery" in calls[0].args[0].prompt
     assert "spawn nonexistent-binary ENOENT" in str(calls[1].args[0].prompt)
 
 
@@ -507,7 +630,7 @@ def test_a_group_of_configured_servers_claims_no_owner_column() -> None:
     app._add_source_group(option_list, "Local MCP Servers", [source])
 
     row = option_list.add_option.call_args_list[1].args[0].prompt.plain
-    assert row == "  local  [stdio]  no tools  ● connected"
+    assert row == "  local  [stdio]  no tools  ✓ connected"
 
 
 @pytest.mark.asyncio

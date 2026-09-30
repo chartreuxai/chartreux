@@ -391,61 +391,80 @@ class SessionRuntimeControllerImpl:
         self, session_id: str, history_limit: int
     ) -> PublicSessionState:
         previous = self._require_root()
+        if previous.session.execution.active is not None:
+            raise RequestFailure(
+                ProtocolErrorCode.CONFLICT,
+                "Cannot switch sessions while a turn or operation is running. "
+                "Wait for it to finish or stop work first; then retry. Nothing was switched.",
+            )
         with previous.session.execution.reserve(
             SessionExecutionKind.LIFECYCLE, f"resume:{session_id}"
         ):
-            async with self._services.lifecycle_transition():
-                for task in list(self._resume_tasks):
-                    task.cancel()
-                self._resume_tasks.clear()
-                agent_loop = previous.session.agent_loop
-                try:
-                    await self._sessions.drain_children()
-                except Exception:
-                    logger.exception(
-                        "Failed to drain child sessions while resuming session_id=%s",
-                        session_id,
-                    )
-                try:
-                    await self._runtime_factory.resume_root(agent_loop, session_id)
-                except RuntimeSessionNotFoundError as exc:
-                    raise RequestFailure(
-                        ProtocolErrorCode.NOT_FOUND, f"Session not found: {session_id}"
-                    ) from exc
-                except SessionBusyError as exc:
-                    raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
-                except RequestFailure:
-                    raise
-                except Exception as exc:
-                    raise RequestFailure(
-                        ProtocolErrorCode.INTERNAL_ERROR,
-                        f"Failed to resume session {session_id}: {exc}",
-                    ) from exc
-                # The core rebind has committed. Refresh and attach the public
-                # projection before the next await so cancellation cannot leave
-                # the coordinator pointing at the old session.
-                self._root_session.replace_from_core()
-                self._root_session.attach(agent_loop.session_id)
-                try:
-                    await previous.session.turns.reset()
-                except Exception:
-                    logger.exception(
-                        "Failed to reset the turn controller while resuming "
-                        "session_id=%s",
-                        session_id,
-                    )
-                state = self._root_session.append_checkpoint(
-                    current_history=[],
-                    kind="resume",
-                    message=(
-                        "Session resumed. Live and retained agent handles were not "
-                        "restored; old agent IDs now raise UnknownAgentError."
-                    ),
-                    history_limit=history_limit,
+            try:
+                await self._sessions.reserve_resume_admission(previous.session)
+            except SessionExecutionConflict as exc:
+                raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
+            try:
+                return await self._replace_root_admitted(
+                    previous, session_id, history_limit
                 )
-                self._sessions.begin_root_generation()
+            finally:
                 self._sessions._admission_closed = False
-                return state
+
+    async def _replace_root_admitted(
+        self, previous: SessionBackendImpl, session_id: str, history_limit: int
+    ) -> PublicSessionState:
+        async with self._services.lifecycle_transition():
+            for task in list(self._resume_tasks):
+                task.cancel()
+            self._resume_tasks.clear()
+            agent_loop = previous.session.agent_loop
+            try:
+                await self._sessions.drain_children()
+            except Exception:
+                logger.exception(
+                    "Failed to drain child sessions while resuming session_id=%s",
+                    session_id,
+                )
+            try:
+                await self._runtime_factory.resume_root(agent_loop, session_id)
+            except RuntimeSessionNotFoundError as exc:
+                raise RequestFailure(
+                    ProtocolErrorCode.NOT_FOUND, f"Session not found: {session_id}"
+                ) from exc
+            except SessionBusyError as exc:
+                raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
+            except RequestFailure:
+                raise
+            except Exception as exc:
+                raise RequestFailure(
+                    ProtocolErrorCode.INTERNAL_ERROR,
+                    f"Failed to resume session {session_id}: {exc}",
+                ) from exc
+            # The core rebind has committed. Refresh and attach the public
+            # projection before the next await so cancellation cannot leave
+            # the coordinator pointing at the old session.
+            self._root_session.replace_from_core()
+            self._root_session.attach(agent_loop.session_id)
+            try:
+                await previous.session.turns.reset()
+            except Exception:
+                logger.exception(
+                    "Failed to reset the turn controller while resuming session_id=%s",
+                    session_id,
+                )
+            state = self._root_session.append_checkpoint(
+                current_history=[],
+                kind="resume",
+                message=(
+                    "Session resumed. Live and retained agent handles were not "
+                    "restored; old agent IDs now raise UnknownAgentError."
+                ),
+                history_limit=history_limit,
+            )
+            self._sessions.begin_root_generation()
+            self._sessions._admission_closed = False
+            return state
 
     async def _adopt_root(
         self,

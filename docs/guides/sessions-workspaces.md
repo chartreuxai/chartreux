@@ -39,7 +39,8 @@ requests use the latest compacted context followed by newer messages.
 Automatic compaction follows the selected model's threshold, falling back to
 `auto_compact_threshold`. Set `compaction_model` to use another compatible
 catalog model, or `compaction_prompt_id` to select a custom compaction prompt.
-An empty `compaction_model` uses the active model. The [configuration
+An empty `compaction_model` uses the current main model, including any
+session override. The [configuration
 reference](../reference/configuration.md) lists the related settings.
 
 ## Session roots and working directories

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from textual import events
 from textual.app import ComposeResult
+from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
 from textual.visual import VisualType
@@ -27,8 +28,10 @@ from chartreux.app_server.models import (
 from chartreux.cli.textual_ui.widgets.collapsible import (
     ClickWithoutDragMixin,
     CollapsibleSection,
+    DisclosureHeader,
     HeaderCollapsibleSection,
     OverflowCollapsibleSection,
+    _single_line,
     lines_label,
 )
 from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
@@ -55,6 +58,7 @@ from chartreux.cli.textual_ui.widgets.tool_widgets import (
     shell_output_body,
     shell_output_is_large,
 )
+from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic, NonSelectableStatic
 from chartreux.utils.tool_presentation import ToolEffectKind
 
@@ -130,7 +134,16 @@ def _result_is_collapsible(entry: PublicEffectEntry) -> bool:
 class ToolGroupHeader(ClickWithoutDragMixin, StatusMessage):
     """Collapsible, persisted summary line for a :class:`ToolGroup`."""
 
-    SETTLED_GLYPH = "⏵"
+    SETTLED_GLYPH = ""
+    can_focus = True
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("enter", "activate", "Expand or collapse", show=False),
+        Binding("space", "activate", "Expand or collapse", show=False),
+    ]
+
+    def action_activate(self) -> None:
+        if isinstance(self.parent, ToolGroup):
+            self.parent.set_collapsed(not self.parent.is_collapsed)
 
     def __init__(self) -> None:
         super().__init__(initial_text="")
@@ -165,6 +178,7 @@ class ToolGroupHeader(ClickWithoutDragMixin, StatusMessage):
 
     def stop_spinning(self, success: bool = True) -> None:
         super().settle(self._last_state)
+        self._update_text()
         self._update_disclosure_glyph()
 
     def resume(self) -> None:
@@ -186,13 +200,37 @@ class ToolGroupHeader(ClickWithoutDragMixin, StatusMessage):
         ]
         if self._has_reasoning:
             labels.append("thinking" if self._is_spinning else "thought")
-        return ", ".join(labels).capitalize()
+        summary = ", ".join(labels).capitalize()
+        if isinstance(self.parent, ToolGroup):
+            calls = [
+                child
+                for child in self.parent.content_container.children
+                if isinstance(child, ToolCallMessage)
+            ]
+            targets = [
+                _single_line(
+                    call._call_display().message or call._call_display().summary
+                )
+                for call in calls
+            ]
+            if targets:
+                summary += ": " + "; ".join(dict.fromkeys(targets))
+            warnings = [
+                warning
+                for child in self.parent.content_container.children
+                if isinstance(child, ToolResultMessage)
+                and isinstance(child._state, CompletedEffectState)
+                for warning in child._state.display.warnings
+            ]
+            if warnings:
+                summary = f"Warning: {'; '.join(warnings)} · {summary}"
+        if not self._is_spinning and self._last_state is IndicatorState.ERROR:
+            summary = f"Failed: {summary}"
+        return summary
 
     def _update_disclosure_glyph(self) -> None:
         if self._indicator_widget is not None:
-            self._indicator_widget.update(
-                "⏵" if self._is_collapsed else "⏷", layout=False
-            )
+            self._indicator_widget.update(self._state.glyph, layout=False)
 
     def update_display(self) -> None:
         if self._indicator_widget is None or self._text_widget is None:
@@ -258,6 +296,7 @@ class ToolGroup(Vertical):
 
     def on_mount(self) -> None:
         self._header.set_collapsed(self._is_collapsed)
+        self._header._update_text()
 
     @property
     def content_container(self) -> Vertical:
@@ -313,6 +352,13 @@ class ToolGroup(Vertical):
         self._header.resume()
 
     def set_collapsed(self, collapsed: bool) -> None:
+        if (
+            collapsed
+            and self._content.is_mounted
+            and self.screen.focused is not None
+            and self._content in self.screen.focused.ancestors_with_self
+        ):
+            self._header.focus()
         self._is_collapsed = collapsed
         self._content.display = not collapsed
         self._border.display = not collapsed
@@ -323,6 +369,7 @@ class ToolGroup(Vertical):
     def add_content_child(self, widget: Widget) -> None:
         """Pre-mount a history child before this group is attached to an app."""
         self._content._add_child(widget)
+        self._header._update_text()
 
     def sync_visibility(self) -> None:
         """Hide groups whose body contains only hidden timeline entries."""
@@ -330,11 +377,12 @@ class ToolGroup(Vertical):
 
 
 class ToolCallMessage(StatusMessage):
-    SETTLED_GLYPH = "⏵"
+    SETTLED_GLYPH = ""
 
     def __init__(self, entry: PublicEffectEntry) -> None:
         self._entry = entry
         self._tool_name = entry.detail.tool_name
+        self._stream_expanded = False
         self._stream_widget: NoMarkupStatic | None = None
         self._stream_message_buffer: str | None = None
         self._stream_write_timer: Timer | None = None
@@ -361,12 +409,18 @@ class ToolCallMessage(StatusMessage):
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="tool-call-container"):
-            self._header_row = Horizontal(classes="tool-call-header")
+            self._header_row = DisclosureHeader(
+                activate=self.toggle_stream_detail, classes="tool-call-header"
+            )
+            self._header_row.can_focus = self._is_spinning
             with self._header_row:
                 self._indicator_widget = NonSelectableStatic(
                     self._spinner.current_frame(), classes="status-indicator-icon"
                 )
                 yield self._indicator_widget
+                yield NoMarkupStatic(
+                    f"Tool: {self._tool_name}", classes="tool-call-label"
+                )
                 self._verb_widget = NoMarkupStatic(
                     "", classes="collapsible-header-verb"
                 )
@@ -386,6 +440,10 @@ class ToolCallMessage(StatusMessage):
     def on_mount(self) -> None:
         super().on_mount()
         self.recompute_gap()
+        if isinstance(self.parent, Vertical) and isinstance(
+            self.parent.parent, ToolGroup
+        ):
+            self.parent.parent.header._update_text()
 
     def recompute_gap(self) -> None:
         # Outside a group (history / standalone), collapse the gap when the
@@ -419,9 +477,18 @@ class ToolCallMessage(StatusMessage):
 
     def _header_parts(self) -> tuple[str, str, str]:
         if display := self._settled_display():
-            return display.verb, display.message, display.suffix
+            message = display.message
+            failed = isinstance(self._entry.state, FailedEffectState) or (
+                isinstance(self._entry.state, CompletedEffectState)
+                and not self._entry.state.display.success
+            )
+            if failed and not message.startswith("Failed:"):
+                message = f"Failed: {message}"
+            return display.verb, message, display.suffix
         display = self._call_display()
         message = display.message if display.message is not None else display.summary
+        if not message.startswith("Running:"):
+            message = f"Running: {message}"
         return display.verb, message, display.suffix
 
     def _settled_display(self) -> EffectResultDisplay | None:
@@ -445,6 +512,23 @@ class ToolCallMessage(StatusMessage):
         if (verb, message, suffix) != previous_header:
             self._set_text(message, suffix, verb=verb)
 
+    def toggle_stream_detail(self) -> None:
+        if self._stream_widget is None or not self._is_spinning:
+            return
+        self._stream_expanded = not self._stream_expanded
+        self._stream_widget.display = self._stream_expanded and bool(
+            self._stream_widget.render()
+        )
+
+    def on_click(self, event: events.Click) -> None:
+        if (
+            self._header_row is not None
+            and event.widget is not None
+            and self._header_row in event.widget.ancestors_with_self
+        ):
+            self.toggle_stream_detail()
+            event.stop()
+
     def set_stream_message(self, message: str) -> None:
         """Coalesce stream-message refreshes while retaining the latest delta."""
         if self._stream_widget is None:
@@ -463,8 +547,8 @@ class ToolCallMessage(StatusMessage):
         self._stream_message_buffer = None
         if message is None or self._stream_widget is None:
             return
-        self._stream_widget.update(f"→ {message}")
-        self._stream_widget.display = True
+        self._stream_widget.update(f"{chrome_glyph('forward')} {message}")
+        self._stream_widget.display = self._stream_expanded
 
     def _cancel_stream_write_timer(self) -> None:
         if self._stream_write_timer is not None:
@@ -482,6 +566,8 @@ class ToolCallMessage(StatusMessage):
             return
         self._stream_widget.update("")
         self._stream_widget.display = False
+        if self._header_row is not None:
+            self._header_row.can_focus = False
 
     def set_result_text(
         self, text: str, suffix: str = "", *, verb: str = "", linkify: bool = False
@@ -614,6 +700,10 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
         await self._render_result()
         if self._should_escalate:
             self.escalate_error()
+        if isinstance(self.parent, Vertical) and isinstance(
+            self.parent.parent, ToolGroup
+        ):
+            self.parent.parent.header._update_text()
 
     def recompute_gap(self) -> None:
         self.set_class(self._needs_standalone_gap(), "has-gap")
@@ -746,7 +836,9 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
 
             self._muted_section = HeaderCollapsibleSection(
                 build_error_body,
-                header_text=message,
+                header_text=message
+                if message.startswith("Failed:")
+                else f"Failed: {message}",
                 header_verb=verb,
                 header_suffix=suffix,
                 header_muted=True,
@@ -825,9 +917,15 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
         # The header is inert only when there is genuinely nothing to unfold: no
         # structured output, no fallback text, and no warnings.
         has_body = not (output is None and not fallback_text and not display.warnings)
+        warning = "; ".join(display.warnings)
+        header_text = display.message
+        if not display.success and not header_text.startswith("Failed:"):
+            header_text = f"Failed: {header_text}"
+        if warning:
+            header_text = f"Warning: {warning} · {header_text}"
         section = HeaderCollapsibleSection(
             build_result_body,
-            header_text=display.message,
+            header_text=header_text,
             header_verb=display.verb,
             header_suffix=display.suffix,
             header_success=display.success,

@@ -217,7 +217,7 @@ def _resolved(
     return ResolvedSearchProvider(
         provider=provider,
         api_key=api_key,
-        base_url=base_url,
+        base_url=base_url or None,
         timeout=config.timeout,
         max_results=config.max_results,
         model=config.model,
@@ -226,8 +226,9 @@ def _resolved(
 
 def _missing_key(provider: str, env_var: str) -> SearchProviderDiagnostic:
     return _diagnostic(
-        f"Web search provider '{provider}' requires {env_var}; set that environment variable "
-        "or configure tools.web_search.api_key_env_var.",
+        f"Web search provider '{provider}' requires {env_var}; configure Web Search with `/web-search` "
+        f"(Settings > Web Search), set {env_var} in the environment, or configure "
+        "tools.web_search.api_key_env_var directly.",
         provider,
         env_var=env_var,
         config_key="tools.web_search.api_key_env_var",

@@ -54,13 +54,16 @@ async def test_cold_mount_applies_configured_theme_not_fallback() -> None:
 
 @pytest.mark.asyncio
 async def test_cold_mount_shows_startup_issue_before_session_starts() -> None:
-    message = "--experimental-harness\nunavailable; falling back to the legacy harness."
     starter_called = asyncio.Event()
 
     async def _blocking_starter() -> AppServerSession:
         assert any(
-            notification.message == message for notification in app._notifications
+            "--experimental-harness" in issue
+            and "unavailable; falling back to the legacy harness." in issue
+            and "/reload" in issue
+            for _, issue in app._recovery_issues.values()
         )
+        assert app.query_one("#recovery-notice").display
         starter_called.set()
         await asyncio.Event().wait()
         raise RuntimeError("unreachable")
@@ -162,7 +165,7 @@ async def test_stats_update_keeps_context_progress_visible() -> None:
         context_progress = app.query_one(ContextProgress)
         assert context_progress.tokens.max_tokens == 200_000
         assert context_progress.tokens.current_tokens == 12_500
-        assert str(context_progress.render()) == "12k/200k tokens (6%)"
+        assert str(context_progress.render()) == "ctx 12k/200k"
 
 
 @pytest.mark.asyncio

@@ -299,6 +299,7 @@ def eligible_deployments(  # noqa: PLR0912, PLR0914
                 model = resolved.materialize(
                     auto_compact_threshold=config.auto_compact_threshold,
                     thinking=thinking,
+                    validate_thinking=False,
                 )
                 problem = compatibility_exclusion(
                     config=config,
@@ -341,6 +342,7 @@ def eligible_deployments(  # noqa: PLR0912, PLR0914
                     compaction_model = compaction_resolved.materialize(
                         auto_compact_threshold=config.auto_compact_threshold,
                         thinking=compaction_thinking,
+                        validate_thinking=False,
                     )
                     compaction_problem = compatibility_exclusion(
                         config=config,

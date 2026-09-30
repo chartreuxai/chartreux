@@ -142,7 +142,7 @@ async def test_check_agents_returns_agent_summaries() -> None:
         ttl_remaining_seconds=None,
         effective_model="strong",
         base_model="base",
-        active_provider="test/provider",
+        active_provider="test-provider",
         effective_thinking="high",
     )
     result = await collect_result(
@@ -165,7 +165,7 @@ async def test_check_agents_returns_agent_summaries() -> None:
         "ttl_remaining_seconds": None,
         "effective_model": "strong",
         "base_model": "base",
-        "active_provider": "test/provider",
+        "active_provider": "test-provider",
         "effective_thinking": "high",
         "result_expired": False,
         "last_run_status": None,

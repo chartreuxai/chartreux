@@ -4,7 +4,6 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import ClassVar
 
 from rich.text import Text
-from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Horizontal, Vertical
@@ -17,18 +16,24 @@ from textual.worker import Worker
 from chartreux.app_server.models import MCPSourceStatus, MCPSourceSummary, MCPState
 from chartreux.cli.autocompletion.fuzzy import fuzzy_match
 from chartreux.cli.textual_ui.widgets.vscode_compat import VscodeCompatInput
-from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
+from chartreux.ui.chrome_glyphs import chrome_glyph
+from chartreux.ui.shortcut_hints import rich_theme_style, shortcut, shortcut_hint
 from chartreux.ui.widgets.navigable_option_list import NavigableOptionList
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
-_REFRESHING_LABEL = "refreshing"
+_REFRESHING_LABEL = "Running: Refreshing servers"
 _LIST_VIEW_HELP_TOOLS = (
-    f"{shortcut('↑↓/jk')} Navigate  {shortcut('Enter')} Show tools  "
-    f"{shortcut('d')} Disable  {shortcut('e')} Enable  {shortcut('Esc')} Close"
+    f"{shortcut('↑↓')} Move  {shortcut('Tab')} Search  "
+    f"{shortcut('Enter')} Tools  {shortcut('d/e')} Disable/Enable  "
+    f"{shortcut('Esc')} Back/Close"
 )
 _LIST_VIEW_HELP_AUTH = (
-    f"{shortcut('↑↓/jk')} Navigate  {shortcut('Enter')} Connect  "
-    f"{shortcut('d')} Disable  {shortcut('e')} Enable  {shortcut('Esc')} Close"
+    f"{shortcut('↑↓')} Move  {shortcut('Tab')} Search  "
+    f"{shortcut('Enter')} Connect  {shortcut('d/e')} Disable/Enable  "
+    f"{shortcut('Esc')} Back/Close"
+)
+_LIST_VIEW_HELP_STATE = (
+    f"{shortcut('↑↓')} Move  {shortcut('Tab')} Search  {shortcut('Esc')} Back/Close"
 )
 _DETAIL_VIEW_HELP = (
     f"{shortcut('↑↓/jk')} Navigate  {shortcut('d')} Disable  "
@@ -36,52 +41,25 @@ _DETAIL_VIEW_HELP = (
 )
 _DETAIL_VIEW_HELP_NO_TOOLS = (
     f"{shortcut('↑↓/jk')} Navigate  {shortcut('Backspace')} Back  "
-    f"{shortcut('Esc')} Close"
+    f"{shortcut('Esc')} Back/Close"
 )
+_MCP_STATE_FEEDBACK = "This status row is informational. Press Esc to go back or close."
+_MCP_STATE_TOGGLE_FEEDBACK = (
+    "No MCP server is available to toggle. Press Esc to go back or close."
+)
+_MCP_TOOL_FEEDBACK = "Use d to disable or e to enable this tool."
 _BACKGROUND_REFRESH_INTERVAL_SECONDS = 60.0
 
 
 class MCPOptionList(NavigableOptionList):
+    """MCP options stay in the list; Tab moves to the search control."""
+
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("left", "focus_search", "Search", show=False)
+        Binding("tab", "focus_search", "Search", show=False)
     ]
 
-    def __init__(
-        self, *, focus_search: Callable[[], None], id: str | None = None
-    ) -> None:
-        super().__init__(id=id)
-        self._focus_search = focus_search
-
-    def action_cursor_up(self) -> None:
-        if self.highlighted == self._first_selectable_index():
-            self._focus_search()
-            return
-        super().action_cursor_up()
-
-    def action_cursor_down(self) -> None:
-        if self.highlighted == self._last_selectable_index():
-            self._focus_search()
-            return
-        super().action_cursor_down()
-
     def action_focus_search(self) -> None:
-        self._focus_search()
-
-    def _first_selectable_index(self) -> int | None:
-        return next(
-            (index for index, option in enumerate(self.options) if not option.disabled),
-            None,
-        )
-
-    def _last_selectable_index(self) -> int | None:
-        return next(
-            (
-                index
-                for index in range(len(self.options) - 1, -1, -1)
-                if not self.options[index].disabled
-            ),
-            None,
-        )
+        self.app.query_one("#mcp-search", Input).focus()
 
 
 class MCPApp(Container):
@@ -129,13 +107,9 @@ class MCPApp(Container):
         with Vertical(id="mcp-content"):
             yield NoMarkupStatic("", id="mcp-title", classes="settings-title")
             with Horizontal(id="mcp-search-row"):
-                yield NoMarkupStatic("🔍", id="mcp-search-icon")
-                yield VscodeCompatInput(
-                    placeholder="Search servers (← to focus)",
-                    id="mcp-search",
-                    compact=True,
-                )
-            yield MCPOptionList(focus_search=self._focus_search, id="mcp-options")
+                yield NoMarkupStatic("Search", id="mcp-search-icon")
+                yield VscodeCompatInput(placeholder="Search servers", id="mcp-search")
+            yield MCPOptionList(id="mcp-options")
             yield NoMarkupStatic("", id="mcp-help", classes="settings-help")
 
     def on_mount(self) -> None:
@@ -150,11 +124,15 @@ class MCPApp(Container):
         self._rebuild_preserving_scroll()
 
     def on_descendant_blur(self, _event: DescendantBlur) -> None:
+        if self._viewing_name is None:
+            self.call_after_refresh(self._update_source_cursors)
         if self.screen.focused in {self.query_one(Input), self.query_one(OptionList)}:
             return
         self.query_one(OptionList).focus()
 
     def on_descendant_focus(self, event: DescendantFocus) -> None:
+        if self._viewing_name is None:
+            self.call_after_refresh(self._update_source_cursors)
         search = self.query_one(Input)
         if event.control is not search:
             return
@@ -169,21 +147,19 @@ class MCPApp(Container):
         if self._viewing_name is None:
             self._refresh_view(None)
 
-    def on_key(self, event: events.Key) -> None:
-        if self.screen.focused is not self.query_one(Input):
-            return
-        match event.key:
-            case "up":
-                self._focus_list(last=True)
-            case "down":
-                self._focus_list(last=False)
-            case _:
-                return
-        event.prevent_default()
-        event.stop()
-
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        name = _source_from_option_id(event.option.id or "")
+        option_id = event.option.id
+        if isinstance(option_id, str) and option_id.startswith("state:"):
+            self._set_help_text(_MCP_STATE_FEEDBACK)
+            return
+        if (
+            self._viewing_name is not None
+            and isinstance(option_id, str)
+            and option_id.startswith("tool:")
+        ):
+            self._set_help_text(_MCP_TOOL_FEEDBACK)
+            return
+        name = _source_from_option_id(option_id if isinstance(option_id, str) else "")
         if name is not None:
             self._refresh_view(name)
 
@@ -202,11 +178,25 @@ class MCPApp(Container):
         ):
             option_list.scroll_to(y=0, animate=False, force=True, immediate=True)
         if self._viewing_name is None:
+            self._update_source_cursors()
+            option_id = event.option.id
+            if isinstance(option_id, str) and option_id.startswith("state:"):
+                self._set_help_text(_LIST_VIEW_HELP_STATE)
+                return
             source = self._source_for_option(event.option)
             self._set_help_text(
                 _LIST_VIEW_HELP_AUTH
                 if source is not None and source.status is MCPSourceStatus.NEEDS_AUTH
                 else _LIST_VIEW_HELP_TOOLS
+            )
+        elif isinstance(event.option.id, str) and event.option.id.startswith("state:"):
+            self._set_help_text(_DETAIL_VIEW_HELP_NO_TOOLS)
+        else:
+            source = self._viewing_source()
+            self._set_help_text(
+                _DETAIL_VIEW_HELP
+                if source is not None and source.tools
+                else _DETAIL_VIEW_HELP_NO_TOOLS
             )
 
     def action_back(self) -> None:
@@ -214,7 +204,12 @@ class MCPApp(Container):
             self._refresh_view(None)
 
     def action_close(self) -> None:
-        self.post_message(self.MCPClosed())
+        if self._viewing_name is not None:
+            self._refresh_view(None)
+        elif self._query:
+            self.query_one("#mcp-search", Input).value = ""
+        else:
+            self.post_message(self.MCPClosed())
 
     def action_disable(self) -> None:
         self._set_highlighted_disabled(disabled=True)
@@ -259,6 +254,14 @@ class MCPApp(Container):
         if self._viewing_name is not None:
             self._set_highlighted_tool_disabled(disabled=disabled)
             return
+        if self.is_mounted:
+            option_list = self.query_one(OptionList)
+            highlighted = option_list.highlighted
+            if highlighted is not None:
+                option_id = option_list.get_option_at_index(highlighted).id
+                if isinstance(option_id, str) and option_id.startswith("state:"):
+                    self._set_help_text(_MCP_STATE_TOGGLE_FEEDBACK)
+                    return
         target = self._highlighted_source()
         if target is None:
             return
@@ -315,7 +318,9 @@ class MCPApp(Container):
         servers = _filter_sources(self._state.sources, self._query)
         title = "MCP Servers"
         self.query_one("#mcp-title", NoMarkupStatic).update(
-            f"{title}  ({_REFRESHING_LABEL})" if self._refreshing else title
+            f"{title}  {chrome_glyph('running')} {_REFRESHING_LABEL}"
+            if self._refreshing
+            else title
         )
         self._set_help_text(_LIST_VIEW_HELP_TOOLS)
         if servers:
@@ -326,10 +331,10 @@ class MCPApp(Container):
                     "No matching MCP servers"
                     if self._query.strip()
                     else "No MCP servers configured",
-                    disabled=True,
+                    id="state:empty",
                 )
             )
-            option_list.highlighted = None
+            option_list.highlighted = 0
             return
         option_list.highlighted = next(
             (
@@ -339,11 +344,22 @@ class MCPApp(Container):
             ),
             0,
         )
+        self.call_after_refresh(self._update_source_cursors)
+
+    def _theme_style(self, role: str) -> str:
+        return (
+            rich_theme_style(self.app.theme_variables[role]) if self.is_attached else ""
+        )
 
     def _add_source_group(
         self, option_list: OptionList, title: str, sources: Sequence[MCPSourceSummary]
     ) -> None:
-        option_list.add_option(Option(Text(title, style="bold"), disabled=True))
+        option_list.add_option(
+            Option(
+                Text(title.upper(), style=self._theme_style("text-muted")),
+                disabled=True,
+            )
+        )
         max_name = max(len(source.name) for source in sources)
         max_transport = max(len(source.transport) + 2 for source in sources)
         tool_labels = {}
@@ -356,14 +372,84 @@ class MCPApp(Container):
                 tool_labels[source.name] = _tool_count_text(enabled, total)
         max_tools = max(len(label) for label in tool_labels.values())
         for source in sources:
-            label = Text(no_wrap=True)
-            type_tag = f"[{source.transport}]"
-            label.append(f"  {source.name:<{max_name}}")
-            label.append(f"  {type_tag:<{max_transport}}", style="dim")
-            label.append(f"  {tool_labels[source.name]:<{max_tools}}", style="dim")
-            symbol, style, status = _source_status(source)
-            _append_status(label, symbol, style, status)
-            option_list.add_option(Option(label, id=_source_option_id(source.name)))
+            option_list.add_option(
+                Option(
+                    self._source_row(
+                        source,
+                        max_name,
+                        max_transport,
+                        max_tools,
+                        tool_labels[source.name],
+                        "  ",
+                    ),
+                    id=_source_option_id(source.name),
+                )
+            )
+
+    def _source_row(
+        self,
+        source: MCPSourceSummary,
+        max_name: int,
+        max_transport: int,
+        max_tools: int,
+        tools: str,
+        cursor: str,
+    ) -> Text:
+        label = Text(no_wrap=True)
+        muted = self._theme_style("text-muted")
+        label.append(
+            cursor,
+            style=muted
+            if cursor.startswith(chrome_glyph("cursor"))
+            and self.screen.focused is not self.query_one(OptionList)
+            else "",
+        )
+        label.append(f"{source.name:<{max_name}}")
+        label.append(f"  {f'[{source.transport}]':<{max_transport}}", style=muted)
+        label.append(f"  {tools:<{max_tools}}", style=muted)
+        symbol, role, status = _source_status(source)
+        _append_status(label, symbol, self._theme_style(role), status, muted)
+        return label
+
+    def _update_source_cursors(self) -> None:
+        if not self.is_attached or self._viewing_name is not None:
+            return
+        option_list = self.query_one(OptionList)
+        sources = _filter_sources(self._state.sources, self._query)
+        if not sources:
+            return
+        max_name = max(len(source.name) for source in sources)
+        max_transport = max(len(source.transport) + 2 for source in sources)
+        tool_labels = {
+            source.name: (
+                "tool discovery failed"
+                if source.status is MCPSourceStatus.UNAVAILABLE and not source.tools
+                else _tool_count_text(
+                    sum(tool.enabled for tool in source.tools), len(source.tools)
+                )
+            )
+            for source in sources
+        }
+        max_tools = max(map(len, tool_labels.values()))
+        highlighted = option_list.highlighted_option
+        for source in sources:
+            option_id = _source_option_id(source.name)
+            cursor = (
+                f"{chrome_glyph('cursor')} "
+                if highlighted is not None and highlighted.id == option_id
+                else "  "
+            )
+            option_list.replace_option_prompt(
+                option_id,
+                self._source_row(
+                    source,
+                    max_name,
+                    max_transport,
+                    max_tools,
+                    tool_labels[source.name],
+                    cursor,
+                ),
+            )
 
     def _show_detail_view(
         self, option_list: OptionList, source: MCPSourceSummary
@@ -375,9 +461,23 @@ class MCPApp(Container):
         )
         if source.error:
             self._set_help_text(_DETAIL_VIEW_HELP_NO_TOOLS)
-            option_list.add_option(Option("Failed to bootstrap", disabled=True))
             option_list.add_option(
-                Option(Text(source.error, style="dim"), disabled=True)
+                Option(
+                    Text(
+                        f"{chrome_glyph('error')} Failed: Bootstrap",
+                        style=self._theme_style("error"),
+                    ),
+                    id="state:bootstrap-error",
+                )
+            )
+            option_list.add_option(
+                Option(
+                    Text(
+                        f"{chrome_glyph('error')} Failed: {source.error}",
+                        style=self._theme_style("error"),
+                    ),
+                    id="state:error",
+                )
             )
             return
         if source.status is MCPSourceStatus.NEEDS_AUTH:
@@ -389,24 +489,39 @@ class MCPApp(Container):
         )
         if not source.tools:
             if source.status is MCPSourceStatus.UNAVAILABLE:
-                option_list.add_option(Option("Tool discovery failed", disabled=True))
+                option_list.add_option(
+                    Option(
+                        Text(
+                            f"{chrome_glyph('error')} Failed: Tool discovery",
+                            style=self._theme_style("error"),
+                        ),
+                        id="state:tool-discovery",
+                    )
+                )
                 if error := self._state.discovery_errors.get(source.name):
                     option_list.add_option(
-                        Option(Text(error, style="dim"), disabled=True)
+                        Option(
+                            Text(
+                                f"{chrome_glyph('error')} Failed: {error}",
+                                style=self._theme_style("error"),
+                            ),
+                            id="state:error",
+                        )
                     )
             else:
-                option_list.add_option(Option("No tools discovered", disabled=True))
+                option_list.add_option(Option("No tools discovered", id="state:empty"))
             return
         for tool in sorted(source.tools, key=lambda item: item.name):
             label = Text(no_wrap=True)
-            style = "bold" if tool.enabled else "dim"
-            label.append(tool.name, style=style)
+            label.append(
+                tool.name, style="" if tool.enabled else self._theme_style("text-muted")
+            )
             if tool.description:
                 label.append(
-                    f"  -  {tool.description}", style=None if tool.enabled else "dim"
+                    f"  -  {tool.description}", style=self._theme_style("text-muted")
                 )
             if not tool.enabled:
-                label.append("  (disabled)", style="dim italic")
+                label.append("  (disabled)", style=self._theme_style("text-muted"))
             option_list.add_option(Option(label, id=f"tool:{tool.name}"))
         option_list.highlighted = 0
 
@@ -434,22 +549,6 @@ class MCPApp(Container):
     def _set_help_text(self, text: str) -> None:
         self.query_one("#mcp-help", NoMarkupStatic).update(shortcut_hint(text))
 
-    def _focus_search(self) -> None:
-        if self._viewing_name is None:
-            self.query_one(Input).focus()
-
-    def _focus_list(self, *, last: bool) -> None:
-        option_list = self.query_one(MCPOptionList)
-        selectable = [
-            index
-            for index, option in enumerate(option_list.options)
-            if not option.disabled
-        ]
-        if not selectable:
-            return
-        option_list.highlighted = selectable[-1] if last else selectable[0]
-        option_list.focus()
-
 
 def _source_option_id(name: str) -> str:
     return f"server:{name}"
@@ -463,21 +562,23 @@ def _source_from_option_id(value: str) -> str | None:
 def _source_status(source: MCPSourceSummary) -> tuple[str, str, str]:
     match source.status:
         case MCPSourceStatus.CONNECTED:
-            return "●", "green", "connected"
+            return chrome_glyph("success"), "success", "connected"
         case MCPSourceStatus.ENABLED:
-            return "●", "green", "enabled"
+            return chrome_glyph("information"), "text-muted", "enabled"
         case MCPSourceStatus.NEEDS_AUTH:
-            return "○", "dim", "needs auth"
+            return chrome_glyph("information"), "text-muted", "needs auth"
         case MCPSourceStatus.UNAVAILABLE:
-            return "○", "dim", "error - check your config"
+            return chrome_glyph("error"), "error", "Failed: check your config"
         case MCPSourceStatus.DISABLED:
-            return "○", "dim", "disabled"
+            return chrome_glyph("information"), "text-muted", "disabled"
 
 
-def _append_status(label: Text, symbol: str, symbol_style: str, text: str) -> None:
+def _append_status(
+    label: Text, symbol: str, symbol_style: str, text: str, muted_style: str
+) -> None:
     label.append("  ")
     label.append(symbol, style=symbol_style)
-    label.append(f" {text}", style="dim")
+    label.append(f" {text}", style=muted_style)
 
 
 def _tool_count_text(enabled: int, total: int) -> str:

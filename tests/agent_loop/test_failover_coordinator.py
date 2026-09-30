@@ -15,6 +15,7 @@ from chartreux.core.agent_loop.backend_lifetime import BackendLifetime
 from chartreux.core.agent_loop.errors import AgentLoopLLMResponseError
 from chartreux.core.agent_loop.llm_gateway import TranscriptAppend, _append_interrupted
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+from chartreux.core.config.layers import OverridesLayer
 from chartreux.core.config.models import ModelConfig
 from chartreux.core.llm.failures import RequestRetryBudget
 from chartreux.core.llm_models import (
@@ -43,24 +44,24 @@ def _snapshot(*, compaction: bool = False) -> CatalogSnapshot:
     models: dict[str, object] = {
         "base": {
             "deployments": [
-                {"provider": "test/first", "name": "first"},
-                {"provider": "test/second", "name": "second"},
+                {"provider": "test-first", "name": "first"},
+                {"provider": "test-second", "name": "second"},
             ]
         },
-        "other": {"deployments": [{"provider": "test/second", "name": "other-second"}]},
+        "other": {"deployments": [{"provider": "test-second", "name": "other-second"}]},
     }
     if compaction:
         models["compact"] = {
             "deployments": [
-                {"provider": "test/first", "name": "compact-first"},
-                {"provider": "test/second", "name": "compact-second"},
+                {"provider": "test-first", "name": "compact-first"},
+                {"provider": "test-second", "name": "compact-second"},
             ]
         }
     return CatalogSnapshot(
         ModelCatalog.model_validate({
             "providers": {
-                "test/first": {"api_base": "https://first.invalid"},
-                "test/second": {"api_base": "https://second.invalid"},
+                "test-first": {"api_base": "https://first.invalid"},
+                "test-second": {"api_base": "https://second.invalid"},
             },
             "models": models,
             "roles": {},
@@ -84,19 +85,19 @@ def _thinking_agent() -> AgentLoop:
     snapshot = CatalogSnapshot(
         ModelCatalog.model_validate({
             "providers": {
-                "test/first": {"api_base": "https://first.invalid"},
-                "test/second": {"api_base": "https://second.invalid"},
+                "test-first": {"api_base": "https://first.invalid"},
+                "test-second": {"api_base": "https://second.invalid"},
             },
             "models": {
                 "base": {
                     "deployments": [
                         {
-                            "provider": "test/first",
+                            "provider": "test-first",
                             "name": "first",
                             "supported_thinking_levels": ["off", "high"],
                         },
                         {
-                            "provider": "test/second",
+                            "provider": "test-second",
                             "name": "second",
                             "supported_thinking_levels": ["off"],
                         },
@@ -104,8 +105,8 @@ def _thinking_agent() -> AgentLoop:
                 },
                 "compact": {
                     "deployments": [
-                        {"provider": "test/first", "name": "compact-first"},
-                        {"provider": "test/second", "name": "compact-second"},
+                        {"provider": "test-first", "name": "compact-first"},
+                        {"provider": "test-second", "name": "compact-second"},
                     ]
                 },
             },
@@ -134,30 +135,30 @@ def test_failover_uses_attempted_model_thinking_for_compaction() -> None:
     assert [
         candidate.resolved.deployment.provider
         for candidate in agent._failover_candidates(agent.messages, compaction_model)
-    ] == ["test/first", "test/second"]
+    ] == ["test-first", "test-second"]
     assert [
         candidate.resolved.deployment.provider
         for candidate in agent._failover_candidates(agent.messages, active_model)
-    ] == ["test/first"]
+    ] == ["test-first"]
 
 
 def test_compaction_failover_uses_compactor_thinking_not_conversation_model() -> None:
     snapshot = CatalogSnapshot(
         ModelCatalog.model_validate({
             "providers": {
-                "test/mistral": {
+                "test-mistral": {
                     "api_base": "https://mistral.invalid",
                     "backend": "mistral",
                 }
             },
             "models": {
                 "base": {
-                    "deployments": [{"provider": "test/mistral", "name": "zai-glm-5-3"}]
+                    "deployments": [{"provider": "test-mistral", "name": "zai-glm-5-3"}]
                 },
                 "compact": {
                     "deployments": [
                         {
-                            "provider": "test/mistral",
+                            "provider": "test-mistral",
                             "name": "mistral-small",
                             "supported_thinking_levels": ["off"],
                         }
@@ -182,20 +183,20 @@ def test_compaction_failover_uses_compactor_thinking_not_conversation_model() ->
             agent.config.get_compaction_model(),
             call_type="secondary_call",
         )
-    ] == ["test/mistral"]
+    ] == ["test-mistral"]
 
 
 @pytest.mark.asyncio
 async def test_compaction_fallback_respects_deployment_thinking_narrowing() -> None:
     snapshot = CatalogSnapshot(
         ModelCatalog.model_validate({
-            "providers": {"test/first": {"api_base": "https://first.invalid"}},
+            "providers": {"test-first": {"api_base": "https://first.invalid"}},
             "models": {
-                "base": {"deployments": [{"provider": "test/first", "name": "base"}]},
+                "base": {"deployments": [{"provider": "test-first", "name": "base"}]},
                 "compact": {
                     "deployments": [
                         {
-                            "provider": "test/first",
+                            "provider": "test-first",
                             "name": "compact",
                             "supported_thinking_levels": ["high"],
                         }
@@ -227,18 +228,18 @@ def test_failover_projects_only_current_request_context_for_image_compatibility(
     snapshot = CatalogSnapshot(
         ModelCatalog.model_validate({
             "providers": {
-                "test/images": {"api_base": "https://images.invalid"},
-                "test/text": {"api_base": "https://text.invalid"},
+                "test-images": {"api_base": "https://images.invalid"},
+                "test-text": {"api_base": "https://text.invalid"},
             },
             "models": {
                 "base": {
                     "deployments": [
                         {
-                            "provider": "test/images",
+                            "provider": "test-images",
                             "name": "images",
                             "supports_images": True,
                         },
-                        {"provider": "test/text", "name": "text"},
+                        {"provider": "test-text", "name": "text"},
                     ]
                 }
             },
@@ -264,7 +265,7 @@ def test_failover_projects_only_current_request_context_for_image_compatibility(
         for candidate in agent._failover_candidates(
             agent.messages, agent.config.get_active_model()
         )
-    ] == ["test/images", "test/text"]
+    ] == ["test-images", "test-text"]
 
     agent.messages.append(
         LLMMessage(role=Role.user, content="live image", images=[image])
@@ -274,22 +275,22 @@ def test_failover_projects_only_current_request_context_for_image_compatibility(
         for candidate in agent._failover_candidates(
             agent.messages, agent.config.get_active_model()
         )
-    ] == ["test/images"]
+    ] == ["test-images"]
 
 
 def _image_compatibility_agent(*, vision_available: bool) -> AgentLoop:
     snapshot = CatalogSnapshot(
         ModelCatalog.model_validate({
             "providers": {
-                "test/text": {"api_base": "https://text.invalid"},
-                "test/vision": {"api_base": "https://vision.invalid"},
+                "test-text": {"api_base": "https://text.invalid"},
+                "test-vision": {"api_base": "https://vision.invalid"},
             },
             "models": {
                 "base": {
                     "deployments": [
-                        {"provider": "test/text", "name": "text"},
+                        {"provider": "test-text", "name": "text"},
                         {
-                            "provider": "test/vision",
+                            "provider": "test-vision",
                             "name": "vision",
                             "supports_images": vision_available,
                         },
@@ -330,7 +331,7 @@ def test_compaction_failover_skips_nonvision_candidate_for_tool_result_images() 
     )
 
     assert [candidate.resolved.deployment.provider for candidate in candidates] == [
-        "test/vision"
+        "test-vision"
     ]
 
 
@@ -357,7 +358,7 @@ def _failover_backends(
     def backend_for_attempt(
         _self: AgentLoop, model: ModelConfig, _budget: object
     ) -> FakeBackend:
-        return {"test/first": first, "test/second": second}[model.provider]
+        return {"test-first": first, "test-second": second}[model.provider]
 
     agent._backend_for_attempt = MethodType(backend_for_attempt, agent)  # type: ignore[method-assign]
 
@@ -370,30 +371,34 @@ def test_committed_active_model_ignores_historical_selection_expression() -> Non
     config.attach_committed_model(
         CommittedModelIdentity(
             base_model="base",
-            provider="test/first",
+            provider="test-first",
             wire_name="first",
             catalog_revision="older-revision",
         )
     )
 
     assert config.get_active_model().name == "first"
-    assert config.get_active_model().provider == "test/first"
+    assert config.get_active_model().provider == "test-first"
 
 
 @pytest.mark.asyncio
 async def test_reload_recommits_changed_selection_and_persists_v2_identity() -> None:
     agent = _agent()
     assert not await agent.config_orchestrator.set_field(
-        "/active_model", "other", reason="select another root model"
+        "/active_model",
+        "other",
+        reason="select another root model",
+        target_layer=OverridesLayer.NAME,
     )
 
     await agent.reload_with_initial_messages()
 
     assert agent.committed_model == CommittedModelIdentity(
         base_model="other",
-        provider="test/second",
+        provider="test-second",
         wire_name="other-second",
         catalog_revision="test-revision",
+        thinking="medium",
     )
     assert agent.config.get_active_model().name == "other-second"
     metadata = agent.session_logger.session_metadata
@@ -413,7 +418,7 @@ async def test_per_deployment_retry_budget_preserves_time_for_next_provider() ->
         _self: AgentLoop, model: ModelConfig, budget: object
     ) -> FakeBackend:
         budgets.append(cast(RequestRetryBudget, budget))
-        return {"test/first": first, "test/second": second}[model.provider]
+        return {"test-first": first, "test-second": second}[model.provider]
 
     agent._backend_for_attempt = MethodType(backend_for_attempt, agent)  # type: ignore[method-assign]
     assert (await agent._chat()).message.content == "ok"
@@ -439,7 +444,7 @@ async def test_finalization_failure_rolls_back_publication_and_identity(
     agent = _agent(streaming=streaming)
     original_identity = agent.committed_model
     original_backend = agent._backend_lifetime.active
-    agent.config_orchestrator.availability_registry.record_failure("base", "test/first")
+    agent.config_orchestrator.availability_registry.record_failure("base", "test-first")
     replacement = FakeBackend([mock_llm_chunk(content="ok")])
     _failover_backends(agent, FakeBackend(), replacement)
 
@@ -483,7 +488,7 @@ async def test_reload_prepares_backend_from_retained_committed_deployment() -> N
 
     _ = agent._prepare_reload(target, False)
 
-    assert captured_models[-1].provider == "test/second"
+    assert captured_models[-1].provider == "test-second"
     assert captured_models[-1].name == "second"
 
 
@@ -492,7 +497,7 @@ async def test_permanent_probe_failure_releases_recovery_claim() -> None:
     agent = _agent()
     registry = agent.config_orchestrator.availability_registry
     registry.initial_cooldown = 0
-    registry.record_failure("base", "test/first")
+    registry.record_failure("base", "test-first")
     permanent = httpx.HTTPStatusError(
         "auth",
         request=httpx.Request("GET", "https://x"),
@@ -501,7 +506,7 @@ async def test_permanent_probe_failure_releases_recovery_claim() -> None:
     _failover_backends(agent, FakeBackend(exception_to_raise=permanent), FakeBackend())
     with pytest.raises(RuntimeError, match="API error"):
         await agent._chat()
-    assert registry.admission("base", "test/first")[:2] == (True, True)
+    assert registry.admission("base", "test-first")[:2] == (True, True)
 
 
 @pytest.mark.asyncio
@@ -553,7 +558,7 @@ async def test_coordinator_is_used_by_chat_complete_and_streaming_with_one_budge
     assert [chunk.message.content async for chunk in streaming._chat_streaming()] == [
         "replayed"
     ]
-    assert streaming._completion_providers[-1] == ("test/first", "test/second")
+    assert streaming._completion_providers[-1] == ("test-first", "test-second")
 
 
 @pytest.mark.asyncio
@@ -567,7 +572,7 @@ async def test_eligible_failure_switches_and_permanent_failure_stops() -> None:
     committed = agent.committed_model
     if committed is None:
         raise RuntimeError("expected a committed model after successful chat")
-    assert committed.provider == "test/second"
+    assert committed.provider == "test-second"
 
     stopped = _agent()
     permanent = httpx.HTTPStatusError(
@@ -580,7 +585,7 @@ async def test_eligible_failure_switches_and_permanent_failure_stops() -> None:
     )
     with pytest.raises(RuntimeError, match="API error"):
         await stopped._chat()
-    assert stopped._completion_providers[-1] == ("test/first",)
+    assert stopped._completion_providers[-1] == ("test-first",)
 
 
 @pytest.mark.asyncio
@@ -606,10 +611,10 @@ async def test_streaming_replays_before_semantic_delta_but_not_after_content_rea
     committed = interrupted.committed_model
     if committed is None:
         raise RuntimeError("expected a committed model after interrupted chat")
-    assert committed.provider == "test/first"
+    assert committed.provider == "test-first"
     assert (
         interrupted.config_orchestrator.availability_registry.cooldown_until(
-            "base", "test/first"
+            "base", "test-first"
         )
         is not None
     )
@@ -622,7 +627,7 @@ async def test_partial_stream_transcript_keeps_producing_deployment_identity() -
     if previous_identity is None:
         raise RuntimeError("expected initial committed model")
     registry = agent.config_orchestrator.availability_registry
-    registry.record_failure("base", "test/first")
+    registry.record_failure("base", "test-first")
     outcomes: list[TranscriptAppend] = []
     append_transcript = agent._append_transcript
 
@@ -644,16 +649,18 @@ async def test_partial_stream_transcript_keeps_producing_deployment_identity() -
     assert outcomes[-1].kind == "interrupted"
     assert outcomes[-1].committed_model == CommittedModelIdentity(
         base_model="base",
-        provider="test/second",
+        provider="test-second",
         wire_name="second",
         catalog_revision="test-revision",
+        thinking="medium",
     )
     assert agent.messages[-1].content == "from second"
     assert agent.messages[-1].deployment_identity == {
         "base_model": "base",
-        "provider": "test/second",
+        "provider": "test-second",
         "wire_name": "second",
         "catalog_revision": "test-revision",
+        "thinking": "medium",
     }
 
 
@@ -683,12 +690,12 @@ async def test_attempt_rejects_missing_prepared_backend_before_publication() -> 
     agent = _agent()
     agent.committed_model = CommittedModelIdentity(
         base_model="base",
-        provider="test/first",
+        provider="test-first",
         wire_name="first",
         catalog_revision="test-revision",
     )
     registry = agent.config_orchestrator.availability_registry
-    registry.record_failure("base", "test/first")
+    registry.record_failure("base", "test-first")
     _failover_backends(
         agent, FakeBackend([mock_llm_chunk(content="recovered")]), FakeBackend()
     )
@@ -700,8 +707,8 @@ async def test_attempt_rejects_missing_prepared_backend_before_publication() -> 
         )
     ]
 
-    assert agent._completion_providers[-1] == ("test/first",)
-    assert registry.cooldown_until("base", "test/first") is None
+    assert agent._completion_providers[-1] == ("test-first",)
+    assert registry.cooldown_until("base", "test-first") is None
 
 
 @pytest.mark.asyncio
@@ -730,18 +737,19 @@ async def test_switch_visibility_identity_metadata_and_destination_compaction_mo
     identity = agent.committed_model
     assert identity == CommittedModelIdentity(
         base_model="base",
-        provider="test/second",
+        provider="test-second",
         wire_name="second",
         catalog_revision="test-revision",
+        thinking="medium",
     )
     assert agent.completion_metadata_since((0, 0))["providers_used"] == [
-        ["test/first", "test/second"]
+        ["test-first", "test-second"]
     ]
     assert agent.completion_metadata_since((0, 0))["switch_notices"] == [
         {
             "base_model": "base",
-            "old_provider": "test/first",
-            "new_provider": "test/second",
+            "old_provider": "test-first",
+            "new_provider": "test-second",
             "reason": "connection",
         }
     ]
@@ -806,7 +814,7 @@ async def test_metadata_restoration_failure_still_releases_recovery_probe() -> N
     agent = _agent()
     registry = agent.config_orchestrator.availability_registry
     registry.initial_cooldown = 0
-    registry.record_failure("base", "test/first")
+    registry.record_failure("base", "test-first")
     candidate = agent._failover_candidates(
         agent.messages, agent.config.get_active_model()
     )[0]
@@ -819,7 +827,7 @@ async def test_metadata_restoration_failure_still_releases_recovery_probe() -> N
     with pytest.raises(RuntimeError, match="metadata restoration failed"):
         agent._rollback_attempt(publication, agent.committed_model, candidate)
 
-    assert registry.admission("base", "test/first")[:2] == (True, True)
+    assert registry.admission("base", "test-first")[:2] == (True, True)
     await agent.aclose()
 
 
@@ -830,7 +838,7 @@ async def test_outer_stream_aclose_releases_attempt_resources_and_preserves_part
     agent = _agent(streaming=True)
     registry = agent.config_orchestrator.availability_registry
     registry.initial_cooldown = 0
-    registry.record_failure("base", "test/first")
+    registry.record_failure("base", "test-first")
     backend = FakeBackend([mock_llm_chunk(content="partial", prompt_tokens=1)])
     _failover_backends(agent, backend, FakeBackend())
 
@@ -839,7 +847,7 @@ async def test_outer_stream_aclose_releases_attempt_resources_and_preserves_part
     await stream.aclose()
 
     assert agent._backend_lifetime._borrow_counts == {}
-    assert registry.admission("base", "test/first")[:2] == (True, True)
+    assert registry.admission("base", "test-first")[:2] == (True, True)
     assert agent.messages[-1].content == "partial"
     assert agent.stats.session_prompt_tokens == 1
     assert agent.stats.session_completion_tokens == 5
@@ -873,12 +881,12 @@ def test_failover_visibility_is_accepted_by_task_results_and_agent_summaries() -
         availability=AgentAvailability.IDLE,
         current_run_id=None,
         current_run_status=None,
-        effective_model="test/second",
+        effective_model="test-second",
         base_model="base",
-        active_provider="test/second",
+        active_provider="test-second",
     )
     assert result.metadata == metadata
-    assert (summary.base_model, summary.active_provider) == ("base", "test/second")
+    assert (summary.base_model, summary.active_provider) == ("base", "test-second")
 
 
 @pytest.mark.asyncio
@@ -906,7 +914,7 @@ async def test_preparation_failure_releases_recovery_probe_claim() -> None:
     agent = _agent()
     registry = agent.config_orchestrator.availability_registry
     registry.initial_cooldown = 0
-    registry.record_failure("base", "test/first")
+    registry.record_failure("base", "test-first")
 
     def fail_backend(_self: AgentLoop, _model: ModelConfig, _budget: object) -> object:
         raise RuntimeError("backend construction failed")
@@ -914,7 +922,7 @@ async def test_preparation_failure_releases_recovery_probe_claim() -> None:
     agent._backend_for_attempt = MethodType(fail_backend, agent)  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="backend construction failed"):
         await agent._chat()
-    assert registry.admission("base", "test/first")[:2] == (True, True)
+    assert registry.admission("base", "test-first")[:2] == (True, True)
 
 
 def test_interrupted_transcript_preserves_reasoning_and_incomplete_tool_calls() -> None:

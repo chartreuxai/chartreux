@@ -6,13 +6,35 @@ import tempfile
 import threading
 import time
 import tomllib
+from typing import cast
 
-from chartreux.core.model_catalog.loader import CatalogStore
+from chartreux.core.model_catalog.loader import CatalogStore, load_catalog
 from chartreux.ui.providers.contracts import (
     CatalogChanges,
     CatalogValidationError,
     CatalogWriteResult,
 )
+
+
+def test_overlay_provenance_includes_explicit_shipped_default(tmp_path: Path) -> None:
+    path = tmp_path / "models.toml"
+    assert not load_catalog(path).overlaid_providers
+    path.write_text('[providers.mistral]\napi_base = "https://api.mistral.ai/v1"\n')
+    assert load_catalog(path).overlaid_providers == frozenset({"mistral"})
+    result = CatalogStore(path).apply_changes(
+        CatalogChanges("custom", {"api_base": "https://custom.test"})
+    )
+    assert isinstance(result, CatalogWriteResult)
+    assert result.snapshot.overlaid_providers == frozenset({"mistral", "custom"})
+
+
+def test_overlay_provenance_uses_trimmed_provider_identity(tmp_path: Path) -> None:
+    path = tmp_path / "models.toml"
+    path.write_text('[providers." custom "]\napi_base = "https://custom.test"\n')
+    assert load_catalog(path).overlaid_providers == frozenset({"custom"})
+    result = CatalogStore(path).apply_changes(CatalogChanges("", {}))
+    assert isinstance(result, CatalogWriteResult)
+    assert result.snapshot.overlaid_providers == frozenset({"custom"})
 
 
 def _apply_changes_in_process(
@@ -48,7 +70,7 @@ def _apply_changes_in_process(
 def _changes(**kwargs: object) -> CatalogChanges:
     provider = kwargs.pop("provider", {"api_base": "https://test.example/v1"})
     return CatalogChanges(
-        provider_id="test/default",
+        provider_id="test",
         provider=provider,  # type: ignore[arg-type]
         **kwargs,  # type: ignore[arg-type]
     )
@@ -58,6 +80,85 @@ def _written(path: Path) -> dict[str, object]:
     return tomllib.loads(path.read_text())
 
 
+def test_catalog_wide_provider_and_role_move_is_single_transaction(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "models.toml"
+    store = CatalogStore(path)
+    source = CatalogChanges(
+        "first",
+        {"api_base": "https://first.test"},
+        {"source": {"deployments": [{"provider": "first", "name": "source"}]}},
+        {
+            "handoff": {
+                "description": "handoff preset",
+                "model": "source",
+                "thinking": "high",
+            }
+        },
+    )
+    assert isinstance(store.apply_changes(source), CatalogWriteResult)
+    before = path.read_bytes()
+    invalid = CatalogChanges("first", {}, roles={"handoff": {"model": ""}})
+    assert isinstance(store.apply_changes(invalid), CatalogValidationError)
+    assert path.read_bytes() == before
+    combined = CatalogChanges(
+        "first",
+        {},
+        {"target": {"deployments": [{"provider": "second", "name": "target"}]}},
+        {"handoff": {"model": "target"}},
+        {
+            "first": {"api_base": "https://first-updated.test"},
+            "second": {"api_base": "https://second.test"},
+        },
+    )
+    result = store.apply_changes(combined)
+    assert isinstance(result, CatalogWriteResult)
+    assert result.snapshot.catalog.roles["handoff"].model == "target"
+    assert result.snapshot.catalog.models["source"].deployments[0].provider == "first"
+    assert set(combined.provider_patches) == {"first", "second"}
+    assert set(cast("dict[str, object]", _written(path)["providers"])) == {
+        "first",
+        "second",
+    }
+
+
+def test_revision_conflict_rejects_stale_draft_without_losing_other_write(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "models.toml"
+    store = CatalogStore(path)
+    original = load_catalog(path).revision
+    first = store.apply_changes(
+        _changes(
+            provider={"api_base": "https://first.test"}, expected_revision=original
+        )
+    )
+    assert isinstance(first, CatalogWriteResult)
+    before = path.read_bytes()
+    stale = store.apply_changes(
+        _changes(
+            provider={"api_base": "https://stale.test"}, expected_revision=original
+        )
+    )
+    assert isinstance(stale, CatalogValidationError)
+    assert "changed since" in stale.message
+    assert path.read_bytes() == before
+    assert load_catalog(path).revision == first.snapshot.revision
+    store.upsert_provider({"api_base": "https://compatible.test"}, "compatible")
+    assert "compatible" in load_catalog(path).catalog.providers
+
+
+def test_upsert_provider_and_positional_legacy_changes(tmp_path: Path) -> None:
+    store = CatalogStore(tmp_path / "models.toml")
+    store.upsert_provider({"api_base": "https://one.test"}, "one")
+    result = store.apply_changes(
+        CatalogChanges("two", {"api_base": "https://two.test"})
+    )
+    assert isinstance(result, CatalogWriteResult)
+    assert {"one", "two"} <= result.snapshot.catalog.providers.keys()
+
+
 def test_apply_changes_writes_sparse_atomic_provider_model_and_tag_batch(
     tmp_path: Path,
 ) -> None:
@@ -65,22 +166,32 @@ def test_apply_changes_writes_sparse_atomic_provider_model_and_tag_batch(
     result = CatalogStore(path).apply_changes(
         _changes(
             models={
-                "new-model": {
-                    "deployments": [{"provider": "test/default", "name": "new-wire"}]
+                "new-model": {"deployments": [{"provider": "test", "name": "new-wire"}]}
+            },
+            roles={
+                "new": {
+                    "description": "new model preset",
+                    "model": "new-model",
+                    "thinking": "high",
                 }
             },
-            roles={"new": {"description": "", "models": ["new-model"]}},
         )
     )
 
     assert isinstance(result, CatalogWriteResult) and result.changed
     raw = _written(path)
     assert set(raw) == {"providers", "models", "roles"}
-    assert raw["providers"] == {"test/default": {"api_base": "https://test.example/v1"}}
+    assert raw["providers"] == {"test": {"api_base": "https://test.example/v1"}}
     assert raw["models"] == {
-        "new-model": {"deployments": [{"provider": "test/default", "name": "new-wire"}]}
+        "new-model": {"deployments": [{"provider": "test", "name": "new-wire"}]}
     }
-    assert raw["roles"] == {"new": {"description": "", "models": ["new-model"]}}
+    assert raw["roles"] == {
+        "new": {
+            "description": "new model preset",
+            "model": "new-model",
+            "thinking": "high",
+        }
+    }
     assert result.snapshot.catalog.models["new-model"].deployments[0].name == "new-wire"
 
 
@@ -92,9 +203,7 @@ def test_unchanged_existing_selection_is_a_noop(tmp_path: Path) -> None:
             provider={},
             models={
                 "glm-5-3": {
-                    "deployments": [
-                        {"provider": "mistral/default", "name": "zai-glm-5-3"}
-                    ]
+                    "deployments": [{"provider": "mistral", "name": "zai-glm-5-3"}]
                 }
             },
         )
@@ -109,21 +218,19 @@ def test_append_preserves_effective_order_and_raw_user_overrides(
 ) -> None:
     path = tmp_path / "models.toml"
     path.write_text("""
-[providers."test/default"]
+[providers."test"]
 api_base = "https://test.example"
 
 [models.glm-5-3]
 deployments = [
-  { provider = "mistral/default", name = "user-wire", supports_images = true },
+  { provider = "mistral", name = "user-wire", supports_images = true },
 ]
 """)
 
     result = CatalogStore(path).apply_changes(
         _changes(
             models={
-                "glm-5-3": {
-                    "deployments": [{"provider": "test/default", "name": "test-wire"}]
-                }
+                "glm-5-3": {"deployments": [{"provider": "test", "name": "test-wire"}]}
             }
         )
     )
@@ -131,8 +238,8 @@ deployments = [
     assert isinstance(result, CatalogWriteResult) and result.changed
     deployments = _written(path)["models"]["glm-5-3"]["deployments"]  # type: ignore[index]
     assert deployments == [
-        {"provider": "mistral/default", "name": "user-wire", "supports_images": True},
-        {"provider": "test/default", "name": "test-wire"},
+        {"provider": "mistral", "name": "user-wire", "supports_images": True},
+        {"provider": "test", "name": "test-wire"},
     ]
 
 
@@ -144,9 +251,7 @@ def test_append_uses_shipped_stubs_without_losing_inherited_metadata(
         _changes(
             models={
                 "glm-5-3": {
-                    "deployments": [
-                        {"provider": "test/default", "name": "test-glm-5-3"}
-                    ]
+                    "deployments": [{"provider": "test", "name": "test-glm-5-3"}]
                 }
             }
         )
@@ -154,7 +259,7 @@ def test_append_uses_shipped_stubs_without_losing_inherited_metadata(
 
     assert isinstance(result, CatalogWriteResult) and result.changed
     deployments = _written(path)["models"]["glm-5-3"]["deployments"]  # type: ignore[index]
-    assert deployments[0] == {"provider": "mistral/default"}
+    assert deployments[0] == {"provider": "mistral"}
     model = result.snapshot.catalog.models["glm-5-3"]
     assert model.thinking == "high"
     assert model.temperature == 0.2
@@ -167,29 +272,37 @@ def test_roles_are_patched_per_key(tmp_path: Path) -> None:
     first = store.apply_changes(
         _changes(
             models={
-                "one": {"deployments": [{"provider": "test/default", "name": "one"}]},
-                "two": {"deployments": [{"provider": "test/default", "name": "two"}]},
+                "one": {"deployments": [{"provider": "test", "name": "one"}]},
+                "two": {"deployments": [{"provider": "test", "name": "two"}]},
             },
             roles={
-                "first": {"models": ["one"]},
-                "second": {"description": "", "models": ["two"]},
+                "first": {
+                    "description": "first preset",
+                    "model": "one",
+                    "thinking": "high",
+                },
+                "second": {
+                    "description": "second preset",
+                    "model": "two",
+                    "thinking": "high",
+                },
             },
         )
     )
     assert isinstance(first, CatalogWriteResult)
-    repeated = store.apply_changes(_changes(roles={"first": {"models": ["one"]}}))
+    repeated = store.apply_changes(_changes(roles={"first": {"model": "one"}}))
     assert isinstance(repeated, CatalogWriteResult) and not repeated.changed
     before = path.read_bytes()
 
-    result = store.apply_changes(_changes(roles={"first": {"models": []}}))
+    result = store.apply_changes(_changes(roles={"first": {"model": ""}}))
 
     assert isinstance(result, CatalogValidationError)
-    assert "at least 1 item" in result.message
+    assert "model" in result.message
     assert path.read_bytes() == before
     raw = _written(path)
     assert raw["roles"] == {
-        "first": {"models": ["one"]},
-        "second": {"description": "", "models": ["two"]},
+        "first": {"description": "first preset", "model": "one", "thinking": "high"},
+        "second": {"description": "second preset", "model": "two", "thinking": "high"},
     }
 
 
@@ -202,11 +315,7 @@ def test_zero_price_is_written_while_unknown_price_fields_are_omitted(
             models={
                 "free": {
                     "deployments": [
-                        {
-                            "provider": "test/default",
-                            "name": "free",
-                            "prices": {"input": 0.0},
-                        }
+                        {"provider": "test", "name": "free", "prices": {"input": 0.0}}
                     ]
                 }
             }
@@ -227,9 +336,7 @@ def test_failed_validation_leaves_original_bytes_and_repeated_save_is_idempotent
     path = tmp_path / "models.toml"
     store = CatalogStore(path)
     changes = _changes(
-        models={
-            "saved": {"deployments": [{"provider": "test/default", "name": "saved"}]}
-        }
+        models={"saved": {"deployments": [{"provider": "test", "name": "saved"}]}}
     )
     first = store.apply_changes(changes)
     assert isinstance(first, CatalogWriteResult) and first.changed
@@ -239,9 +346,7 @@ def test_failed_validation_leaves_original_bytes_and_repeated_save_is_idempotent
     invalid = store.apply_changes(
         _changes(
             models={
-                "invalid": {
-                    "deployments": [{"provider": "test/default", "name": "bad@wire"}]
-                }
+                "invalid": {"deployments": [{"provider": "test", "name": "bad@wire"}]}
             }
         )
     )
@@ -284,7 +389,7 @@ def test_interleaved_writes_preserve_both_changes(tmp_path: Path, monkeypatch) -
     first = threading.Thread(target=lambda: store.apply_changes(_changes()))
     second = threading.Thread(
         target=lambda: store.apply_changes(
-            CatalogChanges("second/default", {"api_base": "https://second.example/v1"})
+            CatalogChanges("second", {"api_base": "https://second.example/v1"})
         )
     )
 
@@ -300,8 +405,8 @@ def test_interleaved_writes_preserve_both_changes(tmp_path: Path, monkeypatch) -
     assert not first.is_alive()
     assert not second.is_alive()
     assert _written(path)["providers"] == {
-        "test/default": {"api_base": "https://test.example/v1"},
-        "second/default": {"api_base": "https://second.example/v1"},
+        "test": {"api_base": "https://test.example/v1"},
+        "second": {"api_base": "https://second.example/v1"},
     }
 
 
@@ -314,13 +419,13 @@ def test_process_independent_stores_preserve_both_writes(tmp_path: Path) -> None
     second_result = context.Queue()
     first = context.Process(
         target=_apply_changes_in_process,
-        args=(path, "first/default", first_read, release_first, first_result),
+        args=(path, "first", first_read, release_first, first_result),
     )
     first.start()
     first_read.get(timeout=5)
     second = context.Process(
         target=_apply_changes_in_process,
-        args=(path, "second/default", None, None, second_result),
+        args=(path, "second", None, None, second_result),
     )
     second.start()
     time.sleep(0.1)
@@ -333,7 +438,7 @@ def test_process_independent_stores_preserve_both_writes(tmp_path: Path) -> None
     assert second_result.get(timeout=1) == "success"
     providers = _written(path)["providers"]
     assert isinstance(providers, dict)
-    assert set(providers) == {"first/default", "second/default"}
+    assert set(providers) == {"first", "second"}
 
 
 def test_atomic_writes_use_unique_temp_files(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

@@ -37,7 +37,7 @@ class TestCommandRegistry:
     def test_get_command_name_returns_canonical_name_for_alias(self) -> None:
         registry = CommandRegistry()
         assert registry.get_command_name("/help") == "help"
-        assert registry.get_command_name("/config") == "config"
+        assert registry.get_command_name("/open-config-file") == "open-config-file"
         assert registry.get_command_name("/model") == "model"
         assert registry.get_command_name("/connectors") is None
         assert registry.get_command_name("/clear") == "clear"
@@ -225,13 +225,31 @@ class TestCommandRegistry:
 
         assert registry.commands[command_name].side_channel is False
 
+    def test_settings_command_registration(self) -> None:
+        registry = CommandRegistry()
+        assert registry.get_command_name("/settings") == "settings"
+        result = registry.parse_command("/settings")
+        assert result is not None
+        name, command, args = result
+        assert name == "settings"
+        assert command.handler == "_show_settings"
+        assert command.side_channel is False
+        assert command.exits is False
+        assert args == ""
+
+    def test_providers_workbench_is_the_only_provider_route(self) -> None:
+        registry = CommandRegistry()
+        assert registry.parse_command("/providers-workbench") is None
+        assert registry.commands["providers"].handler == "_show_providers"
+
     def test_config_command_registration(self) -> None:
         registry = CommandRegistry()
-        assert registry.get_command_name("/config") == "config"
-        result = registry.parse_command("/config")
+        assert registry.get_command_name("/open-config-file") == "open-config-file"
+        assert registry.get_command_name("/config") is None
+        result = registry.parse_command("/open-config-file")
         assert result is not None
         cmd_name, cmd, cmd_args = result
-        assert cmd_name == "config"
+        assert cmd_name == "open-config-file"
         assert cmd.handler == "_config_command"
         assert cmd.side_channel is False
         assert cmd.exits is False

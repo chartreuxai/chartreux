@@ -42,12 +42,12 @@ The built-in profiles are presets for common delegated work:
 
 | Profile | Model role | Prompt ID | Use it for |
 | --- | --- | --- | --- |
-| `worker` | `small-worker` | `worker` | General-purpose bounded implementation or miscellaneous work. |
-| `advisor` | `advisor` | `advisor` | Independent architectural guidance, second opinions, and risk analysis. |
-| `reviewer` | `small-reviewer` | `reviewer` | Independent read-only reviews of code, documentation, specifications, and plans. |
+| `worker` | `medium` | `worker` | General-purpose bounded implementation or miscellaneous work. |
+| `advisor` | `large` | `advisor` | Independent architectural guidance, second opinions, and risk analysis. |
+| `reviewer` | `medium` | `reviewer` | Independent read-only reviews of code, documentation, specifications, and plans. |
 
 `advisor` is restricted to the read-only tools `read_file`, `grep`,
-`web_search`, and `web_fetch`. It is configured with no idle-TTL eviction so it
+`web_search`, `web_fetch`, and `skill`. It is configured with no idle-TTL eviction so it
 can be retained across related design and planning iterations. The normal idle
 cap and explicit `release_agent` lifecycle still apply.
 
@@ -60,10 +60,10 @@ profile with a built-in name overrides that built-in profile according to
 profile discovery precedence. This lets users replace a profile or its prompt
 without changing Chartreux's shipped defaults.
 
-Use the profile's role binding for model selection, for example
-`config={model="@advisor"}` or `config={model="@small-reviewer"}` when a
-specific role tier is required. Runtime configuration is an override for that
-launch; it does not change the profile or its role prompt.
+Use the profile's role binding by default. Set `config={model="@small"}` for
+lighter work or `config={model="@large"}` when a task needs more capacity.
+Runtime configuration overrides the model for that launch; it does not change
+the profile or its role prompt.
 
 ## Dynamic launch configuration
 
@@ -114,14 +114,13 @@ tombstone and stored results, so `get_agent_result` remains usable after
 eviction. Result expiry is separate: each root generation retains at most 32
 unreferenced stored results. Release subagents when you are done.
 
-## Parallel fan-out
+## Parallel tasks
 
-For an explicit model role, `fan_out: true` starts one retained subagent per role
-member. Each member has its own handle and outcome; the ordered member results
-identify the selected model and provider. Fan-out does not substitute a failed
-member or cancel its siblings. Unavailable or forbidden members are skipped with a
-reported reason; the call is rejected only when no member can run. See the [configuration reference](../reference/configuration.md)
-for model roles.
+A role selects one model and thinking level. To run independent investigations
+in parallel, make separate background `task` calls with explicit roles or
+models. Each launched agent has its own handle and result. The old
+`fan_out: true` flag is rejected with guidance to launch separate tasks. See
+the [configuration reference](../reference/configuration.md) for role presets.
 
 ## TUI monitoring
 
@@ -168,7 +167,7 @@ display_name = "Reviewer"
 description = "Read-only review work"
 agent_type = "subagent"
 instructions = "Report concrete findings with file and line references."
-role = "small-reviewer"
+role = "medium"
 disabled_tools = ["edit", "write_file"]
 
 [tools.bash]
@@ -177,8 +176,8 @@ permission = "ask"
 
 Profile fields are validated during discovery; an invalid profile is not made
 available. Use `role` to bind a profile to a role; `active_model` is rejected in
-profile TOML. A retained subagent keeps its committed model when reused, even if
-its profile's role has since been edited, unless the task supplies an explicit
-`config.model` override. Project profiles are subject to the same trusted-project
+profile TOML. A retained subagent keeps its committed model and thinking level
+when reused, even if its profile's role has since been edited, unless the task
+supplies an explicit model or thinking override. Project profiles are subject to the same trusted-project
 rules as other local configuration. See [configuration](configuration.md) for the
 configuration model and [tools and safety](tools-safety.md) for tool policy.

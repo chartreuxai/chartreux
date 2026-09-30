@@ -9,7 +9,6 @@ import tomllib
 import pexpect
 import pytest
 
-from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from tests import TESTS_ROOT
 from tests.e2e.common import (
     ansi_tolerant_pattern,
@@ -26,33 +25,25 @@ def _send_and_wait_for_text(
     child: pexpect.spawn, keys: str, text: str, *, timeout: float = 10
 ) -> None:
     """Send keyboard input and wait for the resulting screen state."""
-    child.send(keys)
-    child.expect(ansi_tolerant_pattern(text), timeout=timeout)
-
-
-def _select_option_with_keyboard(
-    child: pexpect.spawn, captured: io.StringIO, option_text: str
-) -> None:
-    """Select a newly added model from the fresh-home active-model picker."""
-    wait_for_rendered_text(child, captured, "Labels identify deployments;", timeout=10)
-    assert option_text in strip_ansi(captured.getvalue())
-    # A fresh home highlights Default first. Canonical model rows are sorted,
-    # followed by role rows, so derive this model's offset from the shipped set.
-    model_names = sorted((*SHIPPED_CATALOG.models, option_text))
-    child.send("j" * (model_names.index(option_text) + 1))
-    drain_child_output(child, idle_sleep=0.03)
-    child.send("\r")
+    if keys.startswith(("\x1b[A", "\x1b[B", "\x1b[F")) and keys.endswith("\r"):
+        child.send(keys[:-1])
+        time.sleep(0.1)
+        child.send("\r")
+    else:
+        child.send(keys)
+    try:
+        child.expect(ansi_tolerant_pattern(text), timeout=timeout)
+    except pexpect.TIMEOUT as exc:
+        raise AssertionError(strip_ansi(str(child.before))[-2400:]) from exc
 
 
 def _advance_welcome_with_keyboard(child: pexpect.spawn, timeout: float) -> None:
-    """Press Enter on output events until the typed welcome accepts it."""
+    """Press Enter until Welcome opens the Providers screen."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         child.send("\r")
         try:
-            child.expect(
-                ansi_tolerant_pattern("Select your preferred theme"), timeout=0.2
-            )
+            child.expect(ansi_tolerant_pattern("Add custom provider"), timeout=0.2)
         except pexpect.TIMEOUT:
             continue
         return
@@ -96,71 +87,117 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
 
     try:
         _advance_welcome_with_keyboard(child, timeout=10)
-        child.send("\r")
 
-        wait_for_rendered_text(child, captured, "Choose a provider", timeout=10)
-        # Let the provider screen finish mounting/focusing before navigating.
-        # Sending Tab and Enter in one PTY write can race the screen transition.
+        wait_for_rendered_text(child, captured, "Provider Settings", timeout=10)
+        wait_for_rendered_text(child, captured, "Add custom provider", timeout=10)
+        child.send("\x1b[H")
         drain_child_output(child, captured, idle_sleep=0.1)
-        child.send("\t")
+        child.send("\x1b[B")
         drain_child_output(child, captured, idle_sleep=0.1)
-        _send_and_wait_for_text(child, "\r", "Preset", timeout=25)
-
-        _send_and_wait_for_text(child, "\t\t", "Generic OpenAI-style")
-        child.sendcontrol("a")
-        child.sendcontrol("k")
-        child.send("Local e2e provider")
-        child.send("\t")
-        child.sendcontrol("a")
-        child.sendcontrol("k")
-        child.send(streaming_mock_server.api_base)
-        child.send("\t\t")
-        child.sendcontrol("a")
-        child.sendcontrol("k")
-        child.send(api_key_env_var)
-        _send_and_wait_for_text(child, "\t\t\r", "Credential")
-
-        child.send("\t")
-        child.send(api_key_value)
-        _send_and_wait_for_text(child, "\t\r", "Manual entry")
-
-        _send_and_wait_for_text(child, "\t\t\r", "Enter the provider wire name")
+        _send_and_wait_for_text(
+            child, "\r", "New provider: unnamed — connection", timeout=25
+        )
+        _send_and_wait_for_text(child, "\r", "Provider Name *")
+        _send_and_wait_for_text(
+            child, "Local e2e provider\r", "Name  Local e2e provider"
+        )
+        _send_and_wait_for_text(child, "\x1b[B\r", "API Base *")
+        _send_and_wait_for_text(
+            child, streaming_mock_server.api_base + "\r", "API base"
+        )
+        child.send("\x1b[B\x1b[B")
+        _send_and_wait_for_text(child, "\r", "Credential Env Var")
+        _send_and_wait_for_text(child, api_key_env_var + "\r", "Credential env var")
+        _send_and_wait_for_text(child, "\x1b[B\r", "API Key *")
+        _send_and_wait_for_text(child, api_key_value + "\r", "Saved: Credential")
+        _send_and_wait_for_text(
+            child, "\x1b[B\r", "Models for Local e2e provider", timeout=25
+        )
+        _send_and_wait_for_text(child, "\x1b[C", "▸ Retry discovery")
+        _send_and_wait_for_text(child, "\x1b[B", "▸ Edit connection")
+        _send_and_wait_for_text(child, "\x1b[B", "▸ Add model manually")
+        _send_and_wait_for_text(child, "\r", "Model ID *")
+        child.send("onboarding-mock-model\r")
+        wait_for_rendered_text(child, captured, "onboarding-mock-model", timeout=10)
+        _send_and_wait_for_text(child, "\x1b[C", "▸ Add model manually")
+        _send_and_wait_for_text(child, "\x1b[B", "▸ Save and add another provider")
+        _send_and_wait_for_text(child, "\x1b[B", "▸ Save and continue to presets")
+        _send_and_wait_for_text(child, "\r", "Choose default presets", timeout=25)
+        catalog_path = chartreux_home / "models.toml"
+        deadline = time.monotonic() + 8
+        while not catalog_path.is_file() and time.monotonic() < deadline:
+            drain_child_output(child, captured, idle_sleep=0.1)
+        assert catalog_path.is_file(), strip_ansi(captured.getvalue())[-1200:]
+        presets = (
+            ("orchestrator", "Main Assistant"),
+            ("large", "Large"),
+            ("medium", "Medium"),
+            ("small", "Small"),
+        )
+        for index, (role, title) in enumerate(presets):
+            if index:
+                _send_and_wait_for_text(
+                    child, "\x1b[B", f"▸ {title} (@{role})", timeout=10
+                )
+            _send_and_wait_for_text(child, "\r", f"Edit {title} preset", timeout=10)
+            _send_and_wait_for_text(child, "\r", f"Choose model for {role}", timeout=10)
+            _send_and_wait_for_text(
+                child, "\x1b[F\r", "Model  onboarding-mock-model", timeout=10
+            )
+            _send_and_wait_for_text(child, "\x1b[B", "▸ Thinking")
+            _send_and_wait_for_text(
+                child, "\r", f"Choose thinking for {role}", timeout=10
+            )
+            _send_and_wait_for_text(child, "\x1b[B", "▸ low")
+            _send_and_wait_for_text(child, "\x1b[B", "▸ medium")
+            _send_and_wait_for_text(child, "\r", f"Edit {title} preset", timeout=10)
+            _send_and_wait_for_text(child, "\x1b[B", "▸ Apply model and thinking")
+            _send_and_wait_for_text(child, "\r", "Choose default presets", timeout=10)
+        _send_and_wait_for_text(
+            child,
+            "\x1b[B\r",
+            "Choose Exa, Brave or DuckDuckGo to set up web search",
+            timeout=25,
+        )
+        # From the provider list, Shift+Tab visits the form, then Skip for now.
+        # Pace the keys so focus moves before Enter reaches the button.
         child.send("\x1b[Z")
-        child.send("onboarding-mock-model")
-        _send_and_wait_for_text(child, "\t\t\r", "Selected models")
-        _send_and_wait_for_text(child, "\t" * 6 + "\r", "Provider saved.")
-        time.sleep(0.1)
-        _send_and_wait_for_text(child, "\r", "Choose Active Model")
-        time.sleep(0.1)
-
-        _select_option_with_keyboard(child, captured, "onboarding-mock-model")
-        wait_for_rendered_text(child, captured, "Setup complete", timeout=25)
-
+        drain_child_output(child, captured, idle_sleep=0.1)
+        child.send("\x1b[Z")
+        drain_child_output(child, captured, idle_sleep=0.1)
+        _send_and_wait_for_text(child, "\r", "Setup complete", timeout=25)
         config_path = chartreux_home / "config.toml"
         env_path = chartreux_home / ".env"
         catalog_path = chartreux_home / "models.toml"
-        assert config_path.is_file()
         assert env_path.is_file()
         assert catalog_path.is_file()
 
-        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        config = (
+            tomllib.loads(config_path.read_text(encoding="utf-8"))
+            if config_path.is_file()
+            else {}
+        )
         catalog = tomllib.loads(catalog_path.read_text(encoding="utf-8"))
-        assert config["active_model"] == "onboarding-mock-model"
-        assert config["theme"] == "auto"
-        provider = catalog["providers"]["local-e2e-provider/default"]
+        assert "active_model" not in config
+        assert "theme" not in config
+        assert config.get("theme", "auto") == "auto"
+        provider = catalog["providers"]["Local e2e provider"]
         assert provider["api_base"] == streaming_mock_server.api_base
         assert provider["api_key_env_var"] == api_key_env_var
         deployment = catalog["models"]["onboarding-mock-model"]["deployments"][0]
-        assert deployment["provider"] == "local-e2e-provider/default"
+        assert deployment["provider"] == "Local e2e provider"
         assert deployment["name"] == "onboarding-mock-model"
+        assert set(catalog["roles"]) == {"orchestrator", "large", "medium", "small"}
+        assert all(
+            role["model"] == "onboarding-mock-model"
+            for role in catalog["roles"].values()
+        )
         assert f"{api_key_env_var}=" in env_path.read_text(encoding="utf-8")
 
         # Wait for the main TUI to finish starting up before typing, otherwise
         # the message keystrokes arrive while the app is still entering its
         # input screen and are lost.
-        wait_for_rendered_text(
-            child, captured, "Type /help for more information", timeout=25
-        )
+        wait_for_rendered_text(child, captured, "F1 Help", timeout=25)
         child.send("Greet from onboarding")
         child.send("\r")
         wait_for_request_count_while_draining_child_output(

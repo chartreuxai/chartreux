@@ -12,7 +12,15 @@ class PathDisplay(NoMarkupStatic):
         self._path = Path(path)
         self._update_display()
 
+    def compact(self, enabled: bool) -> None:
+        """Show just the workspace name when status space is scarce."""
+        self._compact = enabled
+        self._update_display()
+
     def _update_display(self) -> None:
+        if getattr(self, "_compact", False):
+            self.update(self._path.name or str(self._path))
+            return
         path_str = str(self._path)
         try:
             home = Path.home()

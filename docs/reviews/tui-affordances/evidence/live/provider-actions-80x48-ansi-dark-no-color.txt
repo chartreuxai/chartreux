@@ -1,0 +1,48 @@
+ Provider Settings                                                              
+ Provider: one                                                                  
+ ▸ Name (read-only)  one                                                        
+   API base  https://one.test                                                   
+   API style  openai                                                            
+   Credential env var  SHARED_KEY                                               
+   API key —  From environment                                                  
+   Discover models                                                              
+   Models  1 available                                                          
+   Apply all catalog changes                                                    
+   Choose default presets                                                       
+   Discard catalog edits                                                        
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+ one. Unique provider name; existing providers cannot be renamed. Enter accepts 
+ this field into the draft.                                                     
+ ↑↓ Move  Enter Select  Esc Back                                                

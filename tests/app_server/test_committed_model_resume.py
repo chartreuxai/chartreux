@@ -140,7 +140,7 @@ async def test_resume_with_present_committed_model_is_unaffected(
 
         assert source.committed_model is not None
         assert source.committed_model.base_model == "model-b"
-        assert source.committed_model.provider == "mistral/default"
+        assert source.committed_model.provider == "mistral"
         assert committed_model_recovery_issue(source) is None
         runtime = session.resources.runtime
         await runtime.refresh()

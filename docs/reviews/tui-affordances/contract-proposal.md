@@ -1,0 +1,52 @@
+# Affordance contract proposal
+
+**Status: independently reviewed and revised proposal, not an adopted product contract.** This proposal follows the blind baseline in [surface-ledger.md](surface-ledger.md) and independently observed effects in [findings.md](findings.md). Initial independent Astra review raised six P2 design objections; the proposal and sketches were revised, and an independent visual reader rechecked the text frames. Some focused code repairs now have tests and after captures; whole-TUI blind acceptance remains pending. It does not amend `DESIGN.md`. The first baseline covers only captured fixtures, not the whole TUI.
+
+## Vocabulary and exact consequences
+
+| Verb shown to user | Visual role | Consequence and return | Scope cue |
+| --- | --- | --- | --- |
+| Open | Action row with destination noun (`Open model details`) | Navigate; leave data unchanged; Back/Escape behavior is named for that route | Destination and return named in row/help. |
+| Edit field | Action row with field noun (`Edit API base`) | Enter a local scalar editor; Enter accepts that field into the parent draft, Escape cancels that field | `Draft` until explicit Save. |
+| Open editor | Action row with object noun (`Open model editor`) | Open a full editor view; its own Apply/Cancel rules name the return route | `Draft` until explicit Save. |
+| Choose | Radio/destination row with one current-value marker | Select one value; immediate destination pickers close only after successful apply, draft pickers return to parent editor | `This session`, `Saved default`, or `Draft` at the value. |
+| Toggle | Checkbox `[x]`/`[ ]`, separate from cursor | Change independent membership or setting; activation key is Space, or Enter only when explicitly advertised | Show `Draft` or `Saves immediately`. |
+| Expand / Collapse | Header with `+`/`-` or another disclosure marker distinct from focus `>`; body remains a reading region | Reveal or hide content without changing data | No save cue. |
+| Save | Action row with object and destination (`Save presets`, `Save and stay`) | Persist named scope; remain or return as stated | `Saving…`, `Saved`, or `Not saved: reason`. |
+| Save & continue | Forward action row | Persist current step, then navigate to named next screen | Name both saved object and next route. |
+| Apply to session | Action row | Change current session only; preserve saved default | `This session` remains visible afterward. |
+| Retry | Action row with failed operation | Repeat only the failed operation; retain draft and focus until outcome | Pending state blocks duplicate trigger. |
+| Open externally | Action row with destination | Attempt browser/editor launch; report actual result | `Could not open; show/copy URL` if launch fails. |
+| Copy | Action row or explicit secondary target | Copy named value; never hide copy behind ordinary text click | `Copied` only after clipboard success. |
+| Confirm / Discard / Delete | Scoped modal action, default Cancel for destructive effects | Name exactly what is lost and retained, then return to the route named on the modal | Saved credentials, disk config, and local draft distinguished. |
+
+Use `▸` (or `>` in ASCII) only for the current keyboard row, reverse-video focus across that row, `[x]` only for independent selected membership, and `(●)`/`( )` only for exclusive draft choice. `Current`, `Saved default`, and `This session` are value badges, not focus markers. Hover must not imitate focus; moving focus must not change a value. A forward arrow must never be reused as the cursor. Color can reinforce status but must not be its only carrier. A disabled action keeps its verb and says why it is unavailable; a heading, status, empty-state explanation, or help line is visually inert and has no activation handler. These proposals align with the current list/focus rules in `DESIGN.md:280-311`; the finding register records where real behavior diverges.
+
+For a row that looks actionable, the label, marker, and horizontal padding should share one documented mouse action. A checkbox row may be whole-row Toggle, but if Enter instead opens details, write both in help (`Click/Space toggle · Enter details`) and keep the checkbox state visibly separate from focus. If a truly split hit target is essential, give each target its own label and focusable region. Buttons or option rows under a modal must render their text in focused, unfocused, color, and no-color states; the dimmed background must not accept clicks. **One pointer gesture must not activate controls on two routes:** the originating view consumes trailing clicks from a double click even if the destination renders immediately. Keyboard and mouse Cancel follow the same route-specific return contract and restore its opener focus/selection when returning to an opener.
+
+**Settings policy for prototype testing:** a field saves to user settings when its own advertised save action is activated; there is no global Settings draft or combined Save action. A boolean row says `Save toggle to user settings` before click, Space, or Enter writes. An enum editor may hold a local radio selection with Space, but Enter says `Save selected choice to user settings` and writes that field immediately; Escape discards only that unsaved local selection. A scalar editor labels Enter as an immediate user-settings save. Every pending, successful, and failed state must identify that field and scope. This preserves the current per-field persistence model while repairing the misleading cues in F-002/F-006. Credential storage remains a separate scope. Pending feedback names the operation (`Saving proxy…`) and disables its action until the result is known. A failed save retains the editor or picker with its selection and a visible Retry/Cancel route. A successful disk write followed by a failed runtime reload must say `Saved to config; runtime reload failed` and offer Retry reload; it must not say `Not saved`. A false external launch result must not be shown as success. Source-only concerns remain hypotheses until full-host replay confirms them.
+
+**Question hypothesis for prototype testing:** Click/Space/Enter on a multi-answer option changes only the local selection; only a focused `Send answers to assistant` action submits. This intentionally differs from the current last-question Enter auto-submit path and would require a behavior change. Cancel/Escape continues to send a cancellation result to the requester. Global loading hints behind the focused question must yield to the question's own key meanings (F-028).
+
+## Explicit exceptions still to decide
+
+| Exception candidate | Reason it may be needed | Acceptance evidence required |
+| --- | --- | --- |
+| Command completion accepts pointer selection | Composer focus must stay in the input while rows update | Click a visible slash or path suggestion to insert it without submitting the prompt; preserve keyboard selection and composer focus. F-021 has a code/test repair pending final capture. |
+| Transcript body might support click-to-collapse | Large reading targets may be convenient | Header/body boundary must be visibly communicated; test text selection, links, and nested tool content. F-016 currently shows accidental collapse. |
+| Session picker selection may immediately close | Immediate destination lists have no draft | Show `This session` scope, preserve retry context on failure, and validate padding and pending gate. F-004 is unresolved. |
+| Risk acceptance may default affirmative | Trust differs from deletion | The default and consequence must remain visible; every visible choice must work with mouse and keyboard. F-018 currently has a dead mouse target. |
+
+## Repair batches and remaining acceptance evidence
+
+The module owner below describes a code ownership boundary for repair and acceptance. Several items now have implementation and after captures; use [findings.md](findings.md) for per-ID state. A batch closes only with relevant behavior tests and fresh captures. Sequence shared interaction primitives first; avoid parallel edits to the same focus/mouse infrastructure.
+
+| Priority / shared cause | Findings and controls | Proposed owner boundary | Required behavior tests and captures |
+| --- | --- | --- | --- |
+| 1. Mouse targets and cross-view activation | F-007, F-018, F-019, F-021, F-023; T02/T08/T09/T11/T13 | Shared list interaction owner for `ui/widgets/navigable_option_list.py`, then separate workbench/trust/completion/rewind consumers | Single click label/marker/padding; double click during route transition; inert headings/background; keyboard parity; 80×24 and 80×48 dark/light plus ASCII/no-color exceptions. |
+| 2. Opener focus and failed operation recovery | F-004, F-020; T03/T04 | Session picker owner `widgets/session_picker.py`; app picker/settings-update owner `app.py` | Escape/mouse Cancel return same focus/selection; failed model/thinking apply preserves selected value or Retry; resize and pending gate; failure-state PNG files. |
+| 3. Honest scope and operation state | F-001, F-002, F-003, F-006, F-008–010, F-022 | Settings `screens/settings.py`, OAuth `widgets/mcp_oauth_app.py`, proxy `widgets/proxy_setup_app.py` plus app persistence route | Draft vs durable/session labels; failed browser launch; delayed write double-trigger; saved-then-reload-failed; MCP Tab hint; source and full-host replay with error/pending/return captures. |
+| 4. Inert versus actionable text | F-005, F-011, F-014, F-017, F-022, F-024; T01/T02/T05/T16 | Settings/workbench/debug consumer owners after shared style contract | Read-only Name no-op cue; focused Cancel text visible in color/no-color; debug copy explicit; disabled and no-match state hints truthful; exact mouse hit targets. |
+| 5. Disclosure and compact hierarchy | F-012, F-015, F-016, F-025–027; T02/T04/T07/T12/T13/T17 | Transcript disclosure owner `widgets/{messages,collapsible,tools}.py`; separate proxy/session/workbench/trust owners | Header-only vs body click, text selection and links, compact error overflow, nondestructive session identity, ASCII glyph/footer and modal chrome exceptions, 80×24/48 and wide captures. |
+
+No batch should be marked ready solely because an initial screenshot exists. Independent Astra and visual readers accepted the bounded finding repairs, while the ledger still lacks many route/state combinations and this proposal remains outside the adopted `DESIGN.md` contract.

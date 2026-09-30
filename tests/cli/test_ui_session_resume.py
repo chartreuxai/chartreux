@@ -212,9 +212,9 @@ async def test_selected_model_survives_exit_and_fresh_resume_without_new_turn(
         await wait_until(pilot, lambda: bool(app.query(ModelPickerApp)))
         picker = app.query_one(ModelPickerApp)
         await wait_until(pilot, lambda: picker.query_one(OptionList).has_focus)
-        await pilot.press("down", "enter")
-        await wait_until(pilot, lambda: app.config.active_model.alias == "beta")
-        await wait_until(
+        await pilot.press("down", "down", "down", "enter")
+        assert await wait_until(pilot, lambda: app.config.active_model.alias == "beta")
+        assert await wait_until(
             pilot,
             lambda: (
                 saved.committed_model is not None
@@ -242,6 +242,7 @@ async def test_selected_model_survives_exit_and_fresh_resume_without_new_turn(
     try:
         await AgentRuntimeFactory().resume_root(resumed, session_id)
         assert resumed.committed_model == selected_identity
+        assert resumed.config.get_active_model().alias == "beta"
 
         async for _ in resumed.act("continue"):
             pass

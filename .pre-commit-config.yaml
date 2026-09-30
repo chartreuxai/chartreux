@@ -11,8 +11,9 @@ repos:
       - id: check-toml
       - id: check-yaml
       - id: end-of-file-fixer
+        exclude: docs/reviews/(tui-affordances|web-search)/evidence/.*\.txt$
       - id: trailing-whitespace
-        exclude: tests/snapshots/.*\.svg$
+        exclude: (tests/snapshots/.*\.svg$|docs/reviews/(tui-affordances|web-search)/evidence/.*\.(svg|txt)$)
 
   - repo: https://github.com/fsouza/mirrors-pyright
     rev: 35d1c990dba50abf6fabe1becfa0c289042b2073 # v1.1.407
@@ -32,4 +33,4 @@ repos:
     hooks:
       - id: typos
         args: [--write-changes]
-        exclude: __snapshots__/.*\.svg$
+        exclude: (__snapshots__/.*\.svg$|docs/reviews/(tui-affordances|web-search)/evidence/.*\.(svg|txt)$)

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from rich.text import Text
 from textual.widgets import OptionList
 
 from chartreux.app_server.config import THINKING_LEVELS
@@ -17,6 +19,7 @@ from chartreux.cli.textual_ui.widgets.context_progress import ContextProgress
 from chartreux.cli.textual_ui.widgets.model_picker import ModelPickerApp
 from chartreux.cli.textual_ui.widgets.thinking_picker import ThinkingPickerApp
 from chartreux.core.config import ModelConfig
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from tests.conftest import build_test_chartreux_app, build_test_vibe_config, wait_until
 
 
@@ -35,7 +38,7 @@ def _make_config_with_models(**kwargs):
 
 
 def _make_unpinned_config(**kwargs):
-    # active_model="" is the unpinned/default sentinel.
+    # active_model="" is the unpinned sentinel.
     return build_test_vibe_config(models=_model_configs(), active_model="", **kwargs)
 
 
@@ -47,6 +50,177 @@ async def _open_model_picker(pilot, app) -> ModelPickerApp:
     picker = app.query_one(ModelPickerApp)
     await wait_until(pilot, lambda: picker.query_one(OptionList).has_focus)
     return picker
+
+
+def _error_text(picker: ModelPickerApp | ThinkingPickerApp) -> str:
+    error_id = (
+        "#modelpicker-error"
+        if isinstance(picker, ModelPickerApp)
+        else "#thinkingpicker-error"
+    )
+    content = picker.query_one(error_id, NoMarkupStatic).content
+    return content.plain if isinstance(content, Text) else str(content)
+
+
+@pytest.mark.asyncio
+async def test_model_write_failure_keeps_choice_and_retries() -> None:
+    app = build_test_chartreux_app(config=_make_config_with_models())
+    async with app.run_test() as pilot:
+        picker = await _open_model_picker(pilot, app)
+        await pilot.press("down", "down", "down")
+        options = picker.query_one(OptionList)
+        selected = options.highlighted
+        with (
+            patch.object(
+                app.app_server.resources.config,
+                "update",
+                new=AsyncMock(side_effect=[OSError("disk denied"), None]),
+            ) as update,
+            patch.object(
+                app, "_reload_config", new=AsyncMock(return_value=None)
+            ) as reload,
+        ):
+            await pilot.press("enter")
+            await wait_until(pilot, lambda: "disk denied" in _error_text(picker))
+            assert app.query_one(ModelPickerApp) is picker
+            assert options.highlighted == selected
+            assert options.has_focus
+            reload.assert_not_awaited()
+
+            await pilot.press("enter")
+            await wait_until(pilot, lambda: not app.query(ModelPickerApp))
+            assert update.await_count == 2
+            reload.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_model_reload_failure_retries_without_rewriting_choice() -> None:
+    app = build_test_chartreux_app(config=_make_config_with_models())
+    async with app.run_test() as pilot:
+        picker = await _open_model_picker(pilot, app)
+        await pilot.press("down", "down", "down")
+        with (
+            patch.object(
+                app.app_server.resources.config, "update", new=AsyncMock()
+            ) as update,
+            patch.object(
+                app,
+                "_reload_config",
+                new=AsyncMock(side_effect=["runtime offline", None]),
+            ) as reload,
+        ):
+            await pilot.press("enter")
+            await wait_until(
+                pilot, lambda: "runtime reload failed" in _error_text(picker)
+            )
+            assert "Enter retries reload" in _error_text(picker)
+            assert picker.query_one(OptionList).has_focus
+
+            await pilot.press("enter")
+            await wait_until(pilot, lambda: not app.query(ModelPickerApp))
+            update.assert_awaited_once()
+            assert reload.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_model_reload_retry_token_expires_when_picker_is_cancelled() -> None:
+    app = build_test_chartreux_app(config=_make_config_with_models())
+    async with app.run_test() as pilot:
+        picker = await _open_model_picker(pilot, app)
+        await pilot.press("down", "down", "down")
+        with (
+            patch.object(
+                app.app_server.resources.config, "update", new=AsyncMock()
+            ) as update,
+            patch.object(
+                app,
+                "_reload_config",
+                new=AsyncMock(side_effect=["runtime offline", None]),
+            ),
+        ):
+            await pilot.press("enter")
+            await wait_until(
+                pilot, lambda: "runtime reload failed" in _error_text(picker)
+            )
+            await pilot.press("escape")
+            await wait_until(pilot, lambda: not app.query(ModelPickerApp))
+
+            reopened = await _open_model_picker(pilot, app)
+            await pilot.press("down", "down", "down", "enter")
+            await wait_until(pilot, lambda: not app.query(ModelPickerApp))
+            assert reopened is not picker
+            assert update.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_thinking_write_failure_keeps_picker_for_retry() -> None:
+    app = build_test_chartreux_app(config=_make_config_with_models())
+    async with app.run_test() as pilot:
+        await app._show_thinking()
+        await wait_until(pilot, lambda: bool(app.query(ThinkingPickerApp)))
+        picker = app.query_one(ThinkingPickerApp)
+        await wait_until(pilot, lambda: picker.query_one(OptionList).has_focus)
+        await pilot.press("down")
+        selected = picker.query_one(OptionList).highlighted
+        with (
+            patch.object(
+                app.app_server.resources.config,
+                "set_thinking",
+                new=AsyncMock(side_effect=[OSError("disk denied"), None]),
+            ) as write,
+            patch.object(
+                app, "_reload_config", new=AsyncMock(return_value=None)
+            ) as reload,
+        ):
+            await pilot.press("enter")
+            await wait_until(pilot, lambda: "disk denied" in _error_text(picker))
+            assert picker.query_one(OptionList).highlighted == selected
+            assert picker.query_one(OptionList).has_focus
+
+            await pilot.press("enter")
+            await wait_until(pilot, lambda: not app.query(ThinkingPickerApp))
+            assert write.await_count == 2
+            reload.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["model", "thinking"])
+async def test_queued_duplicate_picker_selection_writes_once(kind: str) -> None:
+    app = build_test_chartreux_app(config=_make_config_with_models())
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_write(*_args: object) -> None:
+        started.set()
+        await release.wait()
+
+    async with app.run_test() as pilot:
+        if kind == "model":
+            picker = await _open_model_picker(pilot, app)
+            message = ModelPickerApp.ModelSelected("beta")
+            duplicate = ModelPickerApp.ModelSelected("beta")
+            write_target = "update"
+        else:
+            await app._show_thinking()
+            await wait_until(pilot, lambda: bool(app.query(ThinkingPickerApp)))
+            picker = app.query_one(ThinkingPickerApp)
+            message = ThinkingPickerApp.ThinkingSelected("low")
+            duplicate = ThinkingPickerApp.ThinkingSelected("low")
+            write_target = "set_thinking"
+        with (
+            patch.object(
+                app.app_server.resources.config,
+                write_target,
+                new=AsyncMock(side_effect=slow_write),
+            ) as write,
+            patch.object(app, "_reload_config", new=AsyncMock(return_value=None)),
+        ):
+            picker.post_message(message)
+            await asyncio.wait_for(started.wait(), timeout=2)
+            picker.post_message(duplicate)
+            release.set()
+            await wait_until(pilot, lambda: app._current_bottom_app == BottomApp.Input)
+            assert write.await_count == 1
 
 
 # --- /model command ---
@@ -111,14 +285,12 @@ async def test_model_picker_shows_display_name_but_persists_alias() -> None:
 
         picker = app.query_one(ModelPickerApp)
         assert [model.display_name for model in picker._models] == [
-            "mistral/default/zai-glm-5-3",
-            "mistral/default/model-a",
-            "mistral/default/custom-model",
+            "mistral/zai-glm-5-3",
+            "mistral/model-a",
+            "mistral/custom-model",
         ]
         option_list = picker.query_one(OptionList)
-        assert "mistral/default/custom-model" in str(
-            option_list.get_option_at_index(3).prompt
-        )
+        assert "mistral/custom-model" in str(option_list.get_option_at_index(3).prompt)
 
         # Selecting it still persists the alias, not the label.
         await pilot.press("home", "down", "down", "down", "enter")
@@ -164,8 +336,8 @@ async def test_model_picker_select_model() -> None:
         await pilot.pause(0.1)
         await _open_model_picker(pilot, app)
 
-        # Navigate down to "beta" and select
-        await pilot.press("down")
+        # Default, shipped model, and alpha precede beta.
+        await pilot.press("down", "down", "down")
         await pilot.press("enter")
         await wait_until(pilot, lambda: app.config.active_model.alias == "beta")
 
@@ -182,6 +354,7 @@ async def test_model_picker_select_current_model() -> None:
         await pilot.pause(0.1)
         await _open_model_picker(pilot, app)
 
+        await pilot.press("down", "down")
         await pilot.press("enter")
         await pilot.pause(0.2)
 
@@ -236,11 +409,9 @@ async def test_model_picker_offers_default_row() -> None:
         option_list = picker.query_one(OptionList)
         # Default + one shipped and three explicitly configured models.
         assert option_list.option_count == 5
-        # A pinned model pre-highlights that model, not the Default row.
-        assert picker._is_pinned is True
-        assert (
-            option_list.highlighted == 2
-        )  # "alpha", offset by Default and shipped models
+        # The fixture has no session override, so Default is current.
+        assert picker._is_pinned is False
+        assert option_list.highlighted == 0
 
 
 @pytest.mark.asyncio
@@ -319,8 +490,8 @@ async def test_model_switch_updates_context_window_status_bar() -> None:
         assert app.query_one(ContextProgress).tokens.max_tokens == 200_000
 
         await _open_model_picker(pilot, app)
-        # Highlight starts on pinned "alpha" (index 1); move down to "beta".
-        await pilot.press("down")
+        # Highlight starts on Default; beta follows the shipped model and alpha.
+        await pilot.press("down", "down", "down")
         await pilot.press("enter")
         await wait_until(pilot, lambda: app.config.active_model.alias == "beta")
 
@@ -381,7 +552,7 @@ async def test_thinking_picker_select_level() -> None:
         # Navigate down to "low" (second item) and select
         await pilot.press("down")
         with (
-            patch.object(app, "_reload_config", new=AsyncMock()),
+            patch.object(app, "_reload_config", new=AsyncMock(return_value=None)),
             patch.object(
                 app.app_server.resources.config, "set_thinking", new=AsyncMock()
             ) as set_thinking,

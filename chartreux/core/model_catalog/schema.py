@@ -7,6 +7,7 @@ from math import isfinite
 import re
 from types import MappingProxyType
 from typing import Any, Literal
+from unicodedata import category
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -114,6 +115,20 @@ class Prices(_FrozenCatalogModel):
         return value
 
 
+def valid_provider_name(value: str) -> str:
+    """Validate a persisted provider identity without changing its spelling."""
+    name = value.strip()
+    if (
+        not name
+        or any(char in name for char in "/@")
+        or any(category(char) == "Cc" for char in name)
+    ):
+        raise ValueError(
+            "Provider name must be non-empty and contain no '/', '@', or control characters"
+        )
+    return name
+
+
 class DeploymentDefinition(_FrozenCatalogModel):
     provider: str
     name: str
@@ -123,11 +138,16 @@ class DeploymentDefinition(_FrozenCatalogModel):
     auto_compact_threshold: float | None = None
     disabled: bool = False
 
-    @field_validator("provider", "name")
+    @field_validator("provider")
+    @classmethod
+    def provider_name_is_valid(cls, value: str) -> str:
+        return valid_provider_name(value)
+
+    @field_validator("name")
     @classmethod
     def no_reserved_at(cls, value: str) -> str:
         if "@" in value:
-            raise ValueError("'@' is reserved in deployment names and provider IDs")
+            raise ValueError("'@' is reserved in deployment names")
         return value
 
     @field_validator("supported_thinking_levels")
@@ -166,15 +186,42 @@ class BaseModelDefinition(_FrozenCatalogModel):
     def unique_provider_deployments(self) -> BaseModelDefinition:
         providers = [deployment.provider for deployment in self.deployments]
         if len(providers) != len(set(providers)):
-            raise ValueError("Only one deployment per (base, provider) is allowed")
+            raise ValueError(
+                "Only one existing provider deployment per model is allowed"
+            )
         return self
 
 
 class RoleDefinition(_FrozenCatalogModel):
-    """An ordered, documented priority list of canonical model names."""
+    """One named default preset selecting a canonical model and thinking level."""
 
     description: str = ""
-    models: tuple[str, ...] = Field(min_length=1)
+    model: str = Field(min_length=1)
+    thinking: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_members(cls, value: Any) -> Any:
+        if isinstance(value, Mapping) and "models" in value:
+            raise ValueError(
+                "Role 'models' lists are no longer supported; set one 'model' "
+                "and one 'thinking' level for this preset"
+            )
+        return value
+
+    @field_validator("model")
+    @classmethod
+    def canonical_model_name(cls, value: str) -> str:
+        if "@" in value or not value.strip():
+            raise ValueError("role model must be a non-empty canonical model name")
+        return value
+
+    @field_validator("thinking")
+    @classmethod
+    def thinking_is_known(cls, value: str) -> str:
+        if value not in _THINKING_LEVELS:
+            raise ValueError("role thinking must be a known thinking level")
+        return value
 
 
 class ModelCatalog(_FrozenCatalogModel):
@@ -202,15 +249,20 @@ class ModelCatalog(_FrozenCatalogModel):
 
     @field_validator("providers")
     @classmethod
-    def provider_ids_are_qualified(
+    def provider_names_are_valid(
         cls, value: Mapping[str, ProviderDefinition]
     ) -> Mapping[str, ProviderDefinition]:
-        for provider_id in value:
-            if "/" not in provider_id:
-                raise ValueError("Provider IDs must contain '/'")
-            if "@" in provider_id:
-                raise ValueError("'@' is reserved in provider IDs")
-        return MappingProxyType(dict(value))
+        providers: dict[str, ProviderDefinition] = {}
+        original_names: dict[str, str] = {}
+        for raw_name, definition in value.items():
+            name = valid_provider_name(raw_name)
+            if name in providers:
+                raise ValueError(
+                    f"Provider name collision: {original_names[name]!r} and {raw_name!r}"
+                )
+            providers[name] = definition
+            original_names[name] = raw_name
+        return MappingProxyType(providers)
 
     @field_validator("models")
     @classmethod
@@ -226,14 +278,9 @@ class ModelCatalog(_FrozenCatalogModel):
     def nonempty_unique_roles(
         cls, value: Mapping[str, RoleDefinition]
     ) -> Mapping[str, RoleDefinition]:
-        for name, definition in value.items():
-            members = definition.models
+        for name in value:
             if "@" in name:
                 raise ValueError("'@' is reserved in role names")
-            if len(members) != len(set(members)):
-                raise ValueError("Duplicate role members are not allowed")
-            if any("@" in member for member in members):
-                raise ValueError("'@' is reserved in role members")
         return MappingProxyType(dict(value))
 
     @model_validator(mode="after")
@@ -245,10 +292,6 @@ class ModelCatalog(_FrozenCatalogModel):
                         f"Model {base_name!r} references unknown provider "
                         f"{deployment.provider!r}"
                     )
-        for role_name, definition in self.roles.items():
-            unknown = set(definition.models) - set(self.models)
-            if unknown:
-                raise ValueError(
-                    f"Role {role_name!r} references unknown models: {sorted(unknown)!r}"
-                )
+        # A saved provider/model draft may temporarily leave a preset pointing
+        # at an unavailable model. Finish checks runnability after setup.
         return self

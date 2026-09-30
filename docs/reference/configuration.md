@@ -4,7 +4,7 @@ This page defines the accepted configuration surface. For locations, layering, a
 
 ## Files and precedence
 
-`config.toml` selects runtime behavior. The user file is `$CHARTREUX_HOME/config.toml` (`~/.chartreux/config.toml` by default). A trusted project may provide `.chartreux/config.toml`; discovery searches upward from the working directory. Effective precedence, low to high, is built-in defaults, user file, trusted project file, `CHARTREUX_*` environment overrides, agent profile, and runtime override.
+`config.toml` selects runtime behavior. Open the user file in your editor with `/open-config-file`. The user file is `$CHARTREUX_HOME/config.toml` (`~/.chartreux/config.toml` by default). A trusted project may provide `.chartreux/config.toml`; discovery searches upward from the working directory. Effective precedence, low to high, is built-in defaults, user file, trusted project file, `CHARTREUX_*` environment overrides, agent profile, and runtime override.
 
 `models.toml` is a separate user-only catalog overlay at `$CHARTREUX_HOME/models.toml`. Provider and deployment tables in `config.toml` are rejected. To move a legacy catalog, run `chartreux models migrate --apply`.
 
@@ -16,10 +16,8 @@ Unless noted, list defaults are `[]`, map defaults are `{}`, and booleans shown 
 
 | Key | Default | Accepted value |
 | --- | --- | --- |
-| `active_model` | `""` | Canonical base-model name or `@role`; empty selects `@orchestrator`. |
-| `compaction_model` | `""` | Model expression; empty uses the active model. The resolved model must share the active provider. |
+| `compaction_model` | `""` | Model expression; empty uses the current main model. The resolved model must share the main provider. |
 | `allowed_models` | `[]` | Model-expression patterns. A non-empty list restricts selection. |
-| `thinking_overrides` | `{}` | Table mapping a canonical base-model name to `off`, `low`, `medium`, `high`, or `max`. |
 | `auto_compact_threshold` | `200000` | Positive fallback token threshold; a catalog deployment may set its own. |
 
 ### Tools and integrations
@@ -42,7 +40,7 @@ Every `[tools.<name>]` table except `tools.bash` accepts `permission` (`always`,
 | `tools.grep` | `max_output_bytes = 64000`, `default_max_matches = 100`, `default_timeout = 60`, `exclude_patterns` (the built-in exclusion list), `codeignore_file = ".chartreuxignore"`; permission `always`. |
 | `tools.bash` | `max_output_bytes = 16000`, `default_timeout = 300`, `denylist`, `denylist_standalone`, and `sensitive_patterns`; it does not accept `allowlist`. |
 | `tools.web_fetch` | `default_timeout = 30`, `max_timeout = 120`, `max_content_bytes = 120000`, `user_agent` (the built-in browser-like value). |
-| `tools.web_search` | `provider = "auto"`, `api_key_env_var` and `base_url` unset, `timeout = 120` (> 0), `max_results = 5`, `model = "mistral-vibe-cli-with-tools"`. Provider is `auto`, `mistral`, `exa`, `brave`, or `duckduckgo`. |
+| `tools.web_search` | `provider = "auto"`, `api_key_env_var` and `base_url` unset, `timeout = 120` (> 0), `max_results = 5`, `model = "mistral-vibe-cli-with-tools"`. A blank or unset `base_url` uses the selected provider's default endpoint. Provider is `auto`, `mistral`, `exa`, `brave`, or `duckduckgo`; `auto` means Mistral only and never falls back. Configure it in Settings > Web search or with `/web-search`. `Configured; connection not verified` reflects configuration and credential availability, not a connectivity check. |
 | `tools.task` | `allowlist = ["worker"]`; permission `ask`. |
 | `tools.todo` | `max_todos = 100`; permission `always`. |
 | `tools.read_image` | Permission `always`; no additional documented fields. |
@@ -73,10 +71,11 @@ The built-in read/edit/write/image/grep configurations include sensitive pattern
 | `show_greeting` | `true` | Boolean. |
 | `autocopy_to_clipboard` | `true` | Boolean. |
 | `file_watcher_for_autocomplete` | `false` | Boolean. |
-| `ask_confirmation_on_exit` | `true` | Boolean. |
+| `ask_confirmation_on_exit` | `true` | Boolean. Controls confirmation for idle Ctrl-C/Ctrl-D quits; `/exit` exits immediately while idle. Confirmation for consequential active work is always shown. |
 | `displayed_workdir` | `""` | UI label for the working directory. |
 | `context_warnings` | `false` | Boolean. |
 | `show_thinking_nodes` | `false` | Boolean. |
+| `ascii_chrome` | `false` | Boolean. Use ASCII equivalents for application chrome glyphs. |
 | `raise_on_compaction_failure` | `false` | Boolean. |
 | `system_prompt_id` | `"cli"` | Prompt ID. Built-ins are `cli`, `explore`, `tests`, `minimal`, `worker`, `advisor`, and `reviewer`; custom IDs resolve from prompt directories. |
 | `compaction_prompt_id` | `"compact"` | Compaction prompt ID; `compact` is the default built-in. |
@@ -127,7 +126,11 @@ For local servers, set `transport = "stdio"`, `command`, optional `args = []`, `
 
 ## `models.toml` catalog overlay
 
-The overlay patches the shipped catalog. Scalars replace shipped values, lists replace lists, deployments are matched by base model and provider, and roles are merged per role key. Provider IDs contain `/`; canonical model names, role names, role members, and deployment identities must not contain `@`.
+The overlay patches the shipped catalog. Scalars replace shipped values, lists replace lists, deployments are matched by base model and provider, and roles are merged per role key. Provider IDs must not contain `/` or `@`; canonical model names, role names, role model values, and deployment identities must not contain `@`. `@orchestrator` is the sole saved main-assistant default. `/model` and `/thinking` affect the current session; `active_model` in `config.toml` is rejected with guidance to edit the orchestrator preset.
+
+Persisted `thinking_overrides` in user or project `config.toml` are also rejected.
+Set the orchestrator or other role's `thinking` in `models.toml`; use
+`/thinking` for a session choice or `config.thinking` for one subagent launch.
 
 | Table and field | Default / allowed value |
 | --- | --- |
@@ -148,10 +151,14 @@ The overlay patches the shipped catalog. Scalars replace shipped values, lists r
 | `supported_thinking_levels` | Unset, or a list of known thinking levels. |
 | `auto_compact_threshold` | Unset positive number. |
 | `[models."base".deployments.prices]` | `input`, `output`, and `cached_input`: non-negative price per million tokens. Omit an unknown price; zero means explicitly free. |
-| `[roles."name"]` | Role definition: `description` is an optional string and `models` is a non-empty, unique ordered list of canonical base-model names. |
+| `[roles."name"]` | Default preset: `model` is one canonical base-model name; `thinking` is one of `off`, `low`, `medium`, `high`, or `max`; `description` is optional. Old `models` lists are rejected. |
+
+The shipped role presets are `orchestrator` (the main assistant), `large`,
+`medium`, and `small`. Worker and Reviewer profiles use `medium`; Advisor uses
+`large`. The preset editor labels `orchestrator` as **Main**.
 
 ```toml
-[providers."example/openai"]
+[providers."example-openai"]
 api_base = "https://api.example.test/v1"
 api_key_env_var = "EXAMPLE_API_KEY"
 api_style = "openai"
@@ -160,13 +167,14 @@ api_style = "openai"
 thinking = "medium"
 
 [[models."example-model".deployments]]
-provider = "example/openai"
+provider = "example-openai"
 name = "example-model-v1"
 supports_images = false
 
-[roles.reviewers]
-description = "Models used for independent review"
-models = ["glm-5-3", "example-model"]
+[roles.custom-review]
+description = "Default for independent review"
+model = "example-model"
+thinking = "high"
 ```
 
 ## Environment variables and `.env`

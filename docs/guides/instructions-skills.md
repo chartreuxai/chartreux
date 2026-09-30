@@ -10,7 +10,7 @@ Use `~/.chartreux/AGENTS.md` for instructions that apply to your projects. Put `
 
 ## Custom system prompts
 
-The built-in system prompt IDs are `cli`, `explore`, `tests`, and `minimal`. Select one, or select a custom bare filename:
+The built-in system prompt IDs are `cli`, `explore`, `tests`, `minimal`, `worker`, `advisor`, and `reviewer`. Select one, or select a custom bare filename:
 
 ```toml
 system_prompt_id = "my-review-prompt"

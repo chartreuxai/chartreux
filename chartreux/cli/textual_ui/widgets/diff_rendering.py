@@ -28,7 +28,7 @@ _HUNK_HEADER_RE = re.compile(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 _ADDED_STYLE = "$text-success"
 _REMOVED_STYLE = "$text-error"
 _MUTED_STYLE = "$text-muted"
-_DIM_MUTED_STYLE = "dim $text-muted"
+_DIM_MUTED_STYLE = "$text-muted"
 
 _DIFF_CSS_CLASS_BY_PREFIX: dict[str, str] = {
     "-": "diff-removed",

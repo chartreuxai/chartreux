@@ -24,6 +24,7 @@ import tomli_w
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import merge_catalog_overlay
 from chartreux.core.model_catalog.matching import match_discovered_model
+from chartreux.core.model_catalog.schema import valid_provider_name
 from chartreux.utils.paths import get_chartreux_home
 
 _MIGRATION_HINT = (
@@ -63,7 +64,10 @@ class MigrationPlan:
 
 
 def _provider_id(name: str) -> str:
-    return name if "/" in name else f"{name}/default"
+    try:
+        return valid_provider_name(name)
+    except ValueError as exc:
+        raise MigrationError(f"Invalid legacy provider name {name!r}: {exc}") from exc
 
 
 def _legacy_models(raw: Any) -> list[dict[str, Any]]:
@@ -251,12 +255,29 @@ def _build_catalog(  # noqa: PLR0912, PLR0914, PLR0915
     def add_role(role_name: str, description: str, members: Any) -> None:
         if not isinstance(role_name, str) or not isinstance(members, list):
             raise MigrationError("Legacy role entries must be arrays of model names.")
-        definition = {
-            "description": description,
-            "models": [
-                _canonical_legacy_reference(member, aliases) for member in members
-            ],
-        }
+        if len(members) != 1:
+            member_summary = ", ".join(repr(member) for member in members) or "none"
+            raise MigrationError(
+                f"Legacy role {role_name!r} contains {member_summary}; roles are now "
+                "single model-and-thinking presets. Choose one model for this role "
+                "in the legacy config, then retry migration."
+            )
+        member = members[0]
+        if not isinstance(member, str):
+            raise MigrationError(
+                f"Legacy role {role_name!r} model names must be strings."
+            )
+        model = _canonical_legacy_reference(member, aliases)
+        model_definition = models.get(model)
+        if isinstance(model_definition, dict):
+            thinking = model_definition.get("thinking", "off")
+        elif model in SHIPPED_CATALOG.models:
+            thinking = SHIPPED_CATALOG.models[model].thinking
+        else:
+            raise MigrationError(
+                f"Legacy role {role_name!r} references unknown model {model!r}."
+            )
+        definition = {"description": description, "model": model, "thinking": thinking}
         if role_name in roles and roles[role_name] != definition:
             raise MigrationConflictError(
                 f"Legacy role {role_name!r} has conflicting definitions."
@@ -309,7 +330,7 @@ def _migration_warnings(  # noqa: PLR0912
     warnings: list[str] = []
     references: set[str] = set()
 
-    for field in ("active_model", "compaction_model"):
+    for field in ("compaction_model",):
         value = data.get(field)
         if isinstance(value, str):
             canonical = _canonical_legacy_reference(value, aliases)
@@ -384,8 +405,10 @@ def _canonicalize_selections(
     config.pop("models", None)
     config.pop("tags", None)
     config.pop("roles", None)
+    config.pop("active_model", None)
+    config.pop("thinking_overrides", None)
 
-    for field in ("active_model", "compaction_model"):
+    for field in ("compaction_model",):
         value = config.get(field)
         if isinstance(value, str):
             config[field] = _canonical_legacy_reference(value, aliases)
@@ -451,6 +474,18 @@ def plan_migration(config_path: Path, catalog_path: Path) -> MigrationPlan:
         raise MigrationError(f"Cannot parse legacy config.toml: {exc}") from exc
     if not {"providers", "models", "tags", "roles"}.intersection(parsed):
         raise MigrationError(f"No legacy catalog tables found. {_MIGRATION_HINT}")
+    active_model = parsed.get("active_model")
+    if isinstance(active_model, str) and active_model:
+        raise MigrationError(
+            "Persisted active_model selections are no longer supported. Set the "
+            "main assistant model and thinking level in the orchestrator preset "
+            "after migration, then retry."
+        )
+    if "thinking_overrides" in parsed:
+        raise MigrationError(
+            "Persisted [thinking_overrides] are no longer supported. Set model and "
+            "thinking together in each role preset after migration, then retry."
+        )
     catalog, aliases = _build_catalog(parsed)
     migration_warnings = _migration_warnings(parsed, catalog, aliases)
     cleaned, canonicalization_warnings = _canonicalize_selections(parsed, aliases)

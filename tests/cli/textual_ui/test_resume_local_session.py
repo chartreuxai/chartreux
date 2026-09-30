@@ -21,7 +21,7 @@ from chartreux.cli.textual_ui.app import ChartreuxApp
 from chartreux.cli.textual_ui.widgets.chat_input import ChatInputContainer
 from chartreux.cli.textual_ui.widgets.context_progress import ContextProgress
 from chartreux.cli.textual_ui.widgets.loading import LoadingWidget
-from chartreux.cli.textual_ui.widgets.messages import ErrorMessage
+from chartreux.cli.textual_ui.widgets.messages import ErrorMessage, UserCommandMessage
 from chartreux.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
 from tests.cli.textual_ui.test_history_grouping import _message
@@ -159,7 +159,7 @@ async def test_resume_local_session_updates_context_progress(
         runtime = chartreux_app.app_server.resources.runtime
         assert runtime.stats.context_tokens == 0
 
-        def _apply_resumed_stats(*args: object) -> None:
+        def _apply_resumed_stats(*args: object, **kwargs: object) -> None:
             runtime._state.stats = AgentStatsSnapshot(
                 context_tokens=_RESUMED_TOKENS, session_prompt_tokens=_RESUMED_TOKENS
             )
@@ -195,7 +195,7 @@ async def test_resume_local_session_updates_banner_model(
             update={"active_model": resumed_model}
         )
 
-        def _apply_resumed_model(*args: object) -> None:
+        def _apply_resumed_model(*args: object, **kwargs: object) -> None:
             chartreux_app.app_server._state.config = resumed_config
 
         chartreux_app.app_server.resume = AsyncMock(side_effect=_apply_resumed_model)
@@ -547,7 +547,8 @@ async def test_auto_resume_failure_is_rendered_when_transcript_rebuild_fails(
             await chartreux_app._auto_resume_on_startup()
 
         assert any(
-            "Failed to resume session: connection closed" in str(error._error)
+            "Session not changed; failed to resume: connection closed"
+            in str(error._error)
             for error in chartreux_app.query(ErrorMessage)
         )
 
@@ -751,3 +752,73 @@ async def test_ensure_runtime_ready_instant_when_session_ready() -> None:
 
     await asyncio.wait_for(app._ensure_runtime_ready(), timeout=1.0)
     runtime.wait_until_ready.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["refresh", "rebuild", "queue", "cancel"])
+async def test_adopted_resume_failure_shows_new_session_recovery(
+    chartreux_app: ChartreuxApp, failure: str
+) -> None:
+    async with chartreux_app.run_test():
+        previous_id = chartreux_app.app_server.session_id
+
+        async def adopt_then_fail(_id: str, *, on_adopt: object) -> None:
+            chartreux_app.app_server._state.projection.state.session.id = "new-session"
+            assert callable(on_adopt)
+            on_adopt()
+            if failure == "refresh":
+                raise RuntimeError("refresh unavailable")
+            if failure == "cancel":
+                raise asyncio.CancelledError()
+
+        chartreux_app.app_server.resume = AsyncMock(side_effect=adopt_then_fail)
+        error = asyncio.CancelledError if failure == "cancel" else RuntimeError
+        with (
+            patch.object(
+                chartreux_app,
+                "_rebuild_transcript_from_current_session",
+                AsyncMock(side_effect=RuntimeError("rebuild failed"))
+                if failure == "rebuild"
+                else AsyncMock(),
+            ),
+            patch.object(
+                chartreux_app._queue,
+                "sync_server_queue",
+                AsyncMock(side_effect=RuntimeError("queue failed"))
+                if failure == "queue"
+                else AsyncMock(),
+            ),
+        ):
+            with pytest.raises(error):
+                await chartreux_app._resume_local_session("new-session")
+        assert chartreux_app.app_server.session_id != previous_id
+        assert chartreux_app._resume_ui_ready.is_set()
+        assert any(
+            "is active, but its presentation did not finish" in str(message._error)
+            for message in chartreux_app.query(ErrorMessage)
+        )
+
+
+@pytest.mark.asyncio
+async def test_failed_preview_replaces_previous_session_content_with_identity(
+    chartreux_app: ChartreuxApp,
+) -> None:
+    async with chartreux_app.run_test(size=(100, 30)):
+        await chartreux_app._messages_area.mount(UserCommandMessage("old history"))
+        with patch.object(
+            chartreux_app.app_server.resources.sessions,
+            "get_session_history",
+            AsyncMock(side_effect=OSError("unreadable")),
+        ):
+            await chartreux_app.on_session_picker_app_session_highlighted(
+                MagicMock(session_id="other-session")
+            )
+        assert chartreux_app._picker.previewing
+        assert chartreux_app._picker.preview_session_id == "other-session"
+        assert not any(
+            "old history" in str(item) for item in chartreux_app._messages_area.children
+        )
+        assert any(
+            "Preview `other-se` failed to load" in str(item._error)
+            for item in chartreux_app.query(ErrorMessage)
+        )

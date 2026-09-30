@@ -107,7 +107,7 @@ def _build_agent(
             models=[
                 ModelConfig(
                     name="vision",
-                    provider="mistral/default",
+                    provider="mistral",
                     alias="vision",
                     supports_images=True,
                 )

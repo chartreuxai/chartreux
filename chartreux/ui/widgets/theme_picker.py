@@ -12,7 +12,7 @@ from textual.widgets import OptionList
 from textual.widgets.option_list import Option
 
 from chartreux.config_values import AUTO_THEME, DARK_THEME, LIGHT_THEME
-from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
+from chartreux.ui.shortcut_hints import rich_theme_style, shortcut, shortcut_hint
 from chartreux.ui.widgets.navigable_option_list import NavigableOptionList
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
@@ -23,11 +23,12 @@ def sorted_theme_names() -> list[str]:
     return [AUTO_THEME, LIGHT_THEME, DARK_THEME]
 
 
-def _build_option_text(theme: str, is_current: bool) -> Text:
+def _build_option_text(theme: str, is_current: bool, muted_style: str = "") -> Text:
     text = Text(no_wrap=True)
-    marker = "› " if is_current else "  "
-    text.append(marker, style="green" if is_current else "")
-    text.append(theme, style="bold" if is_current else "")
+    text.append("  ")
+    text.append(theme)
+    if is_current:
+        text.append("  Active", style=muted_style)
     return text
 
 
@@ -64,7 +65,14 @@ class ThemePickerApp(Container):
 
     def compose(self) -> ComposeResult:
         options = [
-            Option(_build_option_text(name, name == self._current_theme), id=name)
+            Option(
+                _build_option_text(
+                    name,
+                    name == self._current_theme,
+                    rich_theme_style(self.app.theme_variables["text-muted"]),
+                ),
+                id=name,
+            )
             for name in self._theme_names
         ]
         with Vertical(id="themepicker-content"):

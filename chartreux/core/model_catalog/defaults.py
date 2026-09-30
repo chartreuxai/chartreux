@@ -14,7 +14,7 @@ from chartreux.core.model_catalog.schema import ModelCatalog
 
 SHIPPED_CATALOG = ModelCatalog.model_validate({
     "providers": {
-        "mistral/default": {
+        "mistral": {
             "api_base": "https://api.mistral.ai/v1",
             "api_key_env_var": "MISTRAL_API_KEY",
             "api_style": "openai",
@@ -29,7 +29,7 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
             "temperature": 0.2,
             "deployments": [
                 {
-                    "provider": "mistral/default",
+                    "provider": "mistral",
                     "name": "zai-glm-5-3",
                     "prices": {"input": 1.4, "output": 4.4, "cached_input": 0.14},
                     "supports_images": False,
@@ -40,28 +40,24 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
     },
     "roles": {
         "orchestrator": {
-            "description": "primary model for orchestration and coordination",
-            "models": ["glm-5-3"],
+            "description": "main assistant default model and thinking level",
+            "model": "glm-5-3",
+            "thinking": "high",
         },
-        "advisor": {
-            "description": "independent perspective for architectural guidance",
-            "models": ["glm-5-3"],
+        "large": {
+            "description": "capacity preset for complex tasks",
+            "model": "glm-5-3",
+            "thinking": "high",
         },
-        "small-worker": {
-            "description": "fast model for focused implementation tasks",
-            "models": ["glm-5-3"],
+        "medium": {
+            "description": "capacity preset for routine tasks",
+            "model": "glm-5-3",
+            "thinking": "medium",
         },
-        "large-worker": {
-            "description": "strongest model for complex, high-stakes tasks",
-            "models": ["glm-5-3"],
-        },
-        "small-reviewer": {
-            "description": "fast model for focused reviews",
-            "models": ["glm-5-3"],
-        },
-        "deep-reviewer": {
-            "description": "strongest model for complex, high-stakes reviews",
-            "models": ["glm-5-3"],
+        "small": {
+            "description": "capacity preset for focused tasks",
+            "model": "glm-5-3",
+            "thinking": "low",
         },
     },
 })

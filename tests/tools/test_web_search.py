@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
+import httpx
 import pytest
 
 from chartreux.core.config import ModelConfig
@@ -109,6 +110,89 @@ def test_invalid_mistral_base_url_never_falls_back_to_sdk_default(monkeypatch):
 
     assert isinstance(resolution, SearchProviderDiagnostic)
     assert resolution.config_key == "tools.web_search.base_url"
+
+
+def test_blank_mistral_base_url_inherits_configured_endpoint(monkeypatch):
+    monkeypatch.setenv("MISTRAL_API_KEY", "key")
+    config = build_test_vibe_config(
+        active_model="mock",
+        providers=[
+            {
+                "name": "mistral-search",
+                "api_base": "https://custom-mistral.example/v1",
+                "api_key_env_var": "MISTRAL_API_KEY",
+                "backend": "mistral",
+            }
+        ],
+        models=[ModelConfig(name="mock", provider="mistral-search", alias="mock")],
+    )
+
+    resolution = resolve_web_search_provider(WebSearchConfig(base_url=""), config)
+
+    assert isinstance(resolution, ResolvedSearchProvider)
+    assert resolution.base_url == "https://custom-mistral.example"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "base_url", "expected_url"),
+    [
+        ("exa", None, "https://api.exa.ai/search"),
+        ("exa", "", "https://api.exa.ai/search"),
+        ("exa", "https://custom.example/api", "https://custom.example/api/search"),
+        (
+            "brave",
+            None,
+            "https://api.search.brave.com/res/v1/web/search?q=news&count=5",
+        ),
+        ("brave", "", "https://api.search.brave.com/res/v1/web/search?q=news&count=5"),
+        (
+            "brave",
+            "https://custom.example/api",
+            "https://custom.example/api/res/v1/web/search?q=news&count=5",
+        ),
+    ],
+)
+async def test_saved_blank_endpoint_uses_provider_default_in_real_search(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    base_url: str | None,
+    expected_url: str,
+) -> None:
+    monkeypatch.setenv(
+        "EXA_API_KEY" if provider == "exa" else "BRAVE_SEARCH_API_KEY", "test-key"
+    )
+    search_values = {"provider": provider}
+    if base_url is not None:
+        search_values["base_url"] = base_url
+    config = build_test_vibe_config(tools={"web_search": search_values})
+    effective = effective_web_search_config(config)
+    assert isinstance(effective, WebSearchConfig)
+    resolved = resolve_web_search_provider(effective, config)
+    assert isinstance(resolved, ResolvedSearchProvider)
+    assert resolved.base_url == (base_url or None)
+
+    requested: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(
+            200, json={"results": []} if provider == "exa" else {"web": {"results": []}}
+        )
+
+    monkeypatch.setattr(
+        "chartreux.core.tools.search.provider.ChartreuxAsyncHTTPClient",
+        lambda **_kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), trust_env=False
+        ),
+    )
+    tool = WebSearch(config_getter=lambda: effective, state=BaseToolState())
+    tool._set_runtime_config_getter(lambda: config)
+
+    result = await collect_result(tool.run(WebSearchArgs(query="news")))
+
+    assert result.provider == provider
+    assert requested == [expected_url]
 
 
 def test_unconfigured_search_is_hidden_from_manager(monkeypatch):

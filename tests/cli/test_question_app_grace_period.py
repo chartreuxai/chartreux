@@ -36,7 +36,7 @@ def question_app(monkeypatch: pytest.MonkeyPatch):
 
 
 class TestQuestionAppGracePeriod:
-    def test_select_and_cancel_ignored_within_grace_period(
+    def test_select_is_ignored_but_cancel_is_available_within_grace_period(
         self, question_app: QuestionApp
     ):
         with (
@@ -47,9 +47,10 @@ class TestQuestionAppGracePeriod:
             assert question_app.is_within_grace_period()
 
             question_app.action_select()
-            question_app.action_cancel()
-
             posted.assert_not_called()
+            question_app.action_cancel()
+            posted.assert_called_once()
+            assert isinstance(posted.call_args.args[0], QuestionApp.Cancelled)
 
     def test_cancel_posts_message_after_grace_period(self, question_app: QuestionApp):
         with (

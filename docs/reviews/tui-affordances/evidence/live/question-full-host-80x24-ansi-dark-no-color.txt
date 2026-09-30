@@ -1,0 +1,24 @@
+                                                                                
+  ⡠⣒⠄  ⡔⢄⠔⡄                                                                     
+ ⢸⠸⣀⡔⢉⠱⣃⡢⣂⡣                                                                     
+  ⠉⠒⠣⠤⠵⠤⠬⠮⠆                                                                     
+                                                                                
+Chartreux v0.2.0 · mistral/zai-glm-5-3[high]                                    
+1 model · 0 MCP servers · 0 skills                                              
+F1 Help · /help                                                                 
+                                                                                
+                                                                                
+                                                                                
+────────────────────────────────────────────────────────────────────────────────
+>                                                                               
+────────────────────────────────────────────────────────────────────────────────
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ Which database should we use for this project?                               │
+│ ▸ 1. PostgreSQL - Relational database                                        │
+│   2. MongoDB - Document database                                             │
+│   3. Redis - In-memory store                                                 │
+│   4. Other: Type your answer...                                              │
+│                                                                              │
+│ ↑↓/jk navigate  Enter select  Esc cancel                                     │
+└──────────────────────────────────────────────────────────────────────────────┘
+/test/workdir [PID 5]                                                           

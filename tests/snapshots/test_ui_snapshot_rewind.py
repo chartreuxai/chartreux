@@ -142,7 +142,7 @@ def test_snapshot_rewind_error_shows_toast(
         app = cast(RewindSnapshotApp, pilot.app)
         monkeypatch.setattr(app.app_server.resources.sessions, "rewind", failing_rewind)
         await _enter_rewind(pilot)
-        await pilot.press("enter")
+        await pilot.press("down", "down", "enter")
         await pilot.press("enter")
         await pilot.pause(0.3)
 

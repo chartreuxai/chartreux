@@ -62,16 +62,20 @@ class TaskArgs(BaseModel):
         default=None,
         description="Optional semantic launch configuration overrides for this child.",
     )
-    fan_out: bool = Field(
-        default=False,
-        description="Launch one retained child for every member of an explicit @role model.",
-    )
 
     @model_validator(mode="before")
     @classmethod
     def _omit_null_config(cls, value: Any) -> Any:
         if not isinstance(value, dict):
             return value
+
+        fan_out = value.get("fan_out", False)
+        if fan_out is not False and fan_out is not None:
+            raise ValueError(
+                "Roles are single presets. Launch separate tasks with explicit "
+                "presets/models for multiple agents."
+            )
+        value = {key: item for key, item in value.items() if key != "fan_out"}
 
         config = value.get("config")
         if isinstance(config, str):
@@ -90,27 +94,6 @@ class TaskArgs(BaseModel):
     @classmethod
     def _normalize_task_summary(cls, value: str | None) -> str | None:
         return normalize_task_summary(value)
-
-
-class TaskMemberResult(BaseModel):
-    """One ordered member of a fan-out task result."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    index: int
-    base_model: str
-    provider: str
-    display_name: str
-    status: Literal["running", "completed", "failed", "cancelled", "skipped"]
-    agent_id: str | None = None
-    run_id: str | None = None
-    result: str | None = None
-    error: dict[str, str] | None = None
-    metadata: dict[str, Any] | None = Field(
-        default=None,
-        exclude_if=lambda value: value is None,
-        description="Additive completion metadata for this fan-out member.",
-    )
 
 
 class TaskResult(BaseModel):
@@ -135,11 +118,6 @@ class TaskResult(BaseModel):
     metadata: dict[str, Any] | None = Field(
         default=None,
         description="Additive completion metadata, including provider failover visibility.",
-    )
-    members: list[TaskMemberResult] | None = Field(
-        default=None,
-        exclude_if=lambda value: value is None,
-        description="Ordered fan-out member results; omitted for ordinary task calls.",
     )
 
 

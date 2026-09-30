@@ -71,7 +71,10 @@ class AnthropicMapper:
                         )
                     converted.append({"role": "user", "content": user_content or ""})
                 case Role.assistant:
-                    converted.append(self._convert_assistant_message(msg))
+                    assistant = self._convert_assistant_message(msg)
+                    # Interrupted display-only reasoning has no replayable blocks.
+                    if assistant["content"]:
+                        converted.append(assistant)
                 case Role.tool:
                     self._append_tool_result(converted, msg)
 

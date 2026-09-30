@@ -119,7 +119,7 @@ async def test_vision_rejection_names_the_display_name(
         async for _ in agent.act("look", images=[png_attachment]):
             pass
 
-    assert "mistral/default/mistral-vibe-cli-latest" in str(excinfo.value)
+    assert "mistral/mistral-vibe-cli-latest" in str(excinfo.value)
 
 
 @pytest.mark.asyncio

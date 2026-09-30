@@ -85,6 +85,7 @@ from chartreux.app_server.review import (
     ReviewScope,
     ReviewTarget,
 )
+from chartreux.core.config.settings_catalog import validate_setting_value
 from chartreux.utils.mcp import MCPAddTransport
 from chartreux.utils.tool_presentation import (
     ToolCallPresentation,
@@ -95,6 +96,7 @@ SERVER_METHODS: tuple[str, ...] = (
     "agent/transcript/get",
     "callback/result",
     "config/fields/read",
+    "config/settings/read",
     "config/proxy/read",
     "config/proxy/write",
     "config/read",
@@ -1043,6 +1045,83 @@ class ConfigFieldsReadResponse(ProtocolModel):
     fields: list[ConfigFieldWire]
     targets: list[str]
     revisions: dict[str, str] = Field(default_factory=dict)
+
+
+class SettingsReadParams(ProtocolModel):
+    session_id: str
+
+
+class SettingLeafWire(ProtocolModel):
+    path: str
+    effective_value: JsonValue
+    origin: str
+    saved_explicit: bool
+    saved_value: JsonValue = None
+
+
+class WebSearchSettingsWire(ProtocolModel):
+    fields: list[SettingLeafWire]
+    invalid_fields: list[str] = Field(default_factory=list)
+    readiness: Literal["ready", "missing_key", "invalid"]
+    readiness_message: str | None = None
+    credential_env_var: str | None = None
+    default_credential_env_vars: dict[str, str | None] = Field(default_factory=dict)
+
+
+class SettingDescriptorWire(ProtocolModel):
+    path: str
+    label: str
+    description: str
+    kind: Literal["bool", "enum", "int", "float", "str", "list", "link", "deferred"]
+    group: str
+    choices: tuple[str, ...] = ()
+    item_kind: Literal["path", "pattern"] | None = None
+    control: Literal["checklist", "toggle_inventory"] | None = None
+    inventory: Literal["tools", "skills", "agents"] | None = None
+    minimum: int | float | None = None
+    exclusive_minimum: bool = False
+    empty: str = "Empty text is a saved value; use Remove User Override for Not Set."
+    risk: Literal["routine", "needs-confirmation"] = "routine"
+    timing: Literal["after-save", "next-turn", "next-conversation", "next-launch"] = (
+        "after-save"
+    )
+    timing_verified: bool = False
+    command: str | None = None
+
+    def validate_value(self, value: JsonValue) -> None:
+        validate_setting_value(
+            self.path,
+            self.kind,
+            self.choices,
+            self.minimum,
+            self.exclusive_minimum,
+            value,
+        )
+
+
+class InventoryItemStateWire(ProtocolModel):
+    effective: bool
+    default_effective: bool
+    pattern_driven: bool
+
+
+class SettingsReadResponse(ProtocolModel):
+    fields: list[SettingLeafWire]
+    web_search: WebSearchSettingsWire | None = None
+    catalog: list[SettingDescriptorWire] = Field(default_factory=list)
+    backing_settings: dict[str, SettingDescriptorWire] = Field(default_factory=dict)
+    inventories: dict[Literal["tools", "skills", "agents"], list[str]] = Field(
+        default_factory=dict
+    )
+    inventory_states: dict[
+        Literal["tools", "skills", "agents"], dict[str, InventoryItemStateWire]
+    ] = Field(default_factory=dict)
+    user_layer: str | None = None
+    user_revision: str | None = None
+
+    @property
+    def view_only(self) -> bool:
+        return self.user_revision is None
 
 
 class ConfigWriteOpWire(ProtocolModel):

@@ -25,6 +25,7 @@ from chartreux.cli.textual_ui.widgets.messages import (
 from chartreux.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
 from chartreux.utils.tool_presentation import EffectCallDisplay
 from tests.snapshots.snap_compare import SnapCompare
+from tests.snapshots.snapshot_event_loop import install_snapshot_wake
 
 
 def _text_entry(
@@ -137,6 +138,9 @@ class AgentTranscriptViewerSnapshotApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield self.viewer
+
+    async def on_load(self) -> None:
+        install_snapshot_wake()
 
 
 def test_snapshot_agent_transcript_viewer_renders_all_entry_kinds(

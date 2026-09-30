@@ -22,6 +22,11 @@ from packaging.requirements import Requirement
 from packaging.utils import NormalizedName, canonicalize_name
 import pytest
 
+from chartreux.core.config.builder import ConfigBuilder
+from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+from chartreux.core.config.layers.default import DefaultConfigLayer
+from chartreux.core.config.layers.user import UserConfigLayer
+from chartreux.core.model_catalog.loader import load_catalog
 from tests.stubs.fake_installed_provider import FakeInstalledProvider
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -674,7 +679,6 @@ def _write_fake_config(home: Path, api_base: str, *, session_dir: Path) -> None:
     config.mkdir(parents=True, exist_ok=True)
     (config / "config.toml").write_text(
         "\n".join([
-            'active_model = "installed-fake-model"',
             "disable_welcome_banner_animation = true",
             "",
             "[session_logging]",
@@ -686,7 +690,7 @@ def _write_fake_config(home: Path, api_base: str, *, session_dir: Path) -> None:
     )
     (config / "models.toml").write_text(
         "\n".join([
-            '[providers."installed-fake/default"]',
+            '[providers."installed-fake"]',
             f'api_base = "{api_base}"',
             'api_key_env_var = "FAKE_PROVIDER_KEY"',
             'backend = "generic"',
@@ -695,12 +699,45 @@ def _write_fake_config(home: Path, api_base: str, *, session_dir: Path) -> None:
             'thinking = "off"',
             "",
             '[[models."installed-fake-model".deployments]]',
-            'provider = "installed-fake/default"',
+            'provider = "installed-fake"',
             'name = "installed-fake-model"',
+            "",
+            "[roles.orchestrator]",
+            'model = "installed-fake-model"',
+            'thinking = "off"',
         ])
         + "\n",
         encoding="utf-8",
     )
+
+
+@pytest.mark.asyncio
+async def test_fake_config_resolves_orchestrator_preset(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    session_dir = tmp_path / "sessions"
+    api_base = "http://127.0.0.1:12345/v1"
+    _write_fake_config(home, api_base, session_dir=session_dir)
+    config_dir = home / ".chartreux"
+    snapshot = load_catalog(config_dir / "models.toml")
+    builder = ConfigBuilder(ChartreuxConfigSchema, catalog_snapshot=snapshot)
+    builder.add_layers([
+        DefaultConfigLayer(schema=ChartreuxConfigSchema),
+        UserConfigLayer(path=config_dir / "config.toml"),
+    ])
+
+    config = await builder.build()
+
+    model = config.get_active_model()
+    assert (model.alias, model.name, model.provider, model.thinking) == (
+        "installed-fake-model",
+        "installed-fake-model",
+        "installed-fake",
+        "off",
+    )
+    assert config.get_active_provider().api_base == api_base
+    assert config.disable_welcome_banner_animation is True
+    assert config.session_logging.enabled is True
+    assert config.session_logging.save_dir == str(session_dir)
 
 
 async def _read_json_rpc_response(
@@ -870,9 +907,11 @@ import importlib.util
 import os
 from pathlib import Path
 import sys
+import tomllib
 import chartreux
 
 source_root = Path(os.environ["CHARTREUX_SOURCE_ROOT"]).resolve()
+expected_version = tomllib.loads((source_root / "pyproject.toml").read_text())["project"]["version"]
 dist = metadata.distribution("chartreux")
 source = Path(chartreux.__file__).resolve()
 prefix = Path(sys.prefix).resolve()
@@ -884,8 +923,8 @@ assert source.parent.name == "chartreux"
 assert importlib.util.find_spec("vibe") is None
 assert all(not str(file).replace("\\\\", "/").startswith("vibe/") for file in (dist.files or ()))
 assert dist.metadata["Name"] == "chartreux"
-assert chartreux.__version__ == "0.1.1"
-assert dist.version == "0.1.1"
+assert chartreux.__version__ == expected_version
+assert dist.version == expected_version
 assert Path(dist._path).resolve().is_relative_to(prefix)
 assert all(
     not Path(entry).resolve().is_relative_to(source_root)
@@ -937,10 +976,13 @@ print({
             assert f"'exec' '{python}'" in script_text
         else:
             assert first_line == f"#!{python}"
+    expected_version = tomllib.loads((_PROJECT_ROOT / "pyproject.toml").read_text())[
+        "project"
+    ]["version"]
     for executable in (cli, acp):
         version = _run(executable, ["--version"], cwd=root, env=env)
         assert version.returncode == 0, version.stderr
-        assert version.stdout.strip() == f"{executable.name} 0.1.1"
+        assert version.stdout.strip() == f"{executable.name} {expected_version}"
         _assert_no_secret_output(guard, version.stdout, version.stderr)
     negative_guard = root / "identity-negative-network-guard"
     negative_helper = root / "identity-negative-helper"

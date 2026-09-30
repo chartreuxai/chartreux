@@ -21,7 +21,7 @@ Plan how to deliver an approved design without expanding scope. The orchestrator
 3. **Dispatch the advisor for planning analysis.** Send a self-contained task to the `advisor` profile:
 
 ```text
-task(task="Planning analysis for: <design goal>. Design: <approved approach>. Files and subsystems: <list>. Constraints: <dependencies, shared interfaces, preserved behavior>. Return: bounded work packages, dependency order, safe parallelism, acceptance checks per package, verification commands, and rollback approach.", agent="advisor", config={model="@advisor"})
+task(task="Planning analysis for: <design goal>. Design: <approved approach>. Files and subsystems: <list>. Constraints: <dependencies, shared interfaces, preserved behavior>. Return: bounded work packages, dependency order, safe parallelism, acceptance checks per package, verification commands, and rollback approach.", agent="advisor", config={model="@large"})
 ```
 
 For cross-cutting changes that span multiple subsystems, dispatch the `advisor` profile (or `worker`) with `sub-architecture-mapper` first to map interfaces and dependencies, then use that output to frame the planning question.

@@ -20,6 +20,7 @@ from chartreux.core.config import (
 from chartreux.core.config.default_orchestrator import build_default_orchestrator
 from chartreux.core.config.layer import ConfigStorageError
 from chartreux.core.config.orchestrator import ConfigOrchestrator
+from chartreux.core.config.settings_catalog import render_initial_user_config
 from chartreux.core.paths import CHARTREUX_HOME, GLOBAL_ENV_FILE, HISTORY_FILE
 from chartreux.utils.private_paths import restrict_private_file
 
@@ -117,7 +118,7 @@ def bootstrap_config_files() -> None:
     if not config_file.exists():
         try:
             config_file.parent.mkdir(parents=True, exist_ok=True)
-            config_file.write_text("", "utf-8")
+            config_file.write_text(render_initial_user_config(), "utf-8")
             rprint(
                 f"[dim]Created selections config at {config_file}[/]", file=sys.stderr
             )

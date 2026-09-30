@@ -4,9 +4,15 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
+from textual import events
+from textual.widgets import Button, OptionList, Static
 
-from chartreux.cli.textual_ui.widgets.log_level_picker import LogLevelPickerApp
-from chartreux.cli.textual_ui.widgets.messages import ErrorMessage, UserCommandMessage
+from chartreux.cli.textual_ui.widgets.log_level_picker import (
+    LogLevelPickerApp,
+    _build_row,
+)
+from chartreux.cli.textual_ui.widgets.messages import UserCommandMessage
 from chartreux.observability.logging import (
     _ChartreuxFileHandler,
     get_effective_log_level,
@@ -21,6 +27,12 @@ from tests.conftest import (
     build_test_chartreux_app,
     build_test_vibe_config,
 )
+from tests.snapshots.snapshot_event_loop import install_snapshot_wake
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _snapshot_event_loop_wake() -> None:
+    install_snapshot_wake()
 
 
 async def _wait_until(pilot, predicate: Callable[[], bool], *, tries: int = 50) -> bool:
@@ -59,6 +71,116 @@ async def test_bare_opens_picker_panel() -> None:
         assert app.query(LogLevelPickerApp)
 
     assert handled is True
+
+
+def test_badge_focus_uses_tab_not_horizontal_arrows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    picker = LogLevelPickerApp(get_log_level_chain())
+    monkeypatch.setattr(picker, "_redraw", lambda: None)
+    picker.on_key(events.Key("tab", None))
+    assert picker._focused_badge == "config"
+    picker.on_key(events.Key("left", None))
+    assert picker._focused_badge == "config"
+    picker.on_key(events.Key("shift+tab", None))
+    assert picker._focused_badge == "session"
+
+
+def test_highlighted_log_badges_distinguish_set_and_unset() -> None:
+    row = _build_row(
+        "DEBUG",
+        is_highlighted=True,
+        focused_badge="session",
+        effective_level="DEBUG",
+        session_level="DEBUG",
+        config_level=None,
+    )
+    assert "● session" in row.plain
+    assert "○ config" in row.plain
+    assert "[" not in row.plain
+    unhighlighted = _build_row(
+        "DEBUG",
+        is_highlighted=False,
+        focused_badge="config",
+        effective_level="DEBUG",
+        session_level="DEBUG",
+        config_level=None,
+    )
+    assert unhighlighted.plain == row.plain
+
+
+@pytest.mark.asyncio
+async def test_picker_escape_confirms_dirty_draft() -> None:
+    config = build_test_vibe_config()
+    app = build_test_chartreux_app(agent_loop=build_test_agent_loop(config=config))
+
+    async with app.run_test() as pilot:
+        await app._handle_command("/log-level")
+        await pilot.pause()
+        picker = app.query_one(LogLevelPickerApp)
+        assert get_session_override() is None
+        picker._session_level = "DEBUG"
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.query(LogLevelPickerApp)
+        assert app.focused is picker.query_one("#loglevelpicker-keep", Button)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.query(LogLevelPickerApp)
+        await pilot.press("escape")
+        await pilot.pause()
+        picker.query_one("#loglevelpicker-confirm-discard", Button).press()
+        await pilot.pause()
+        assert not app.query(LogLevelPickerApp)
+        assert get_session_override() is None
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+@pytest.mark.asyncio
+async def test_discard_confirmation_fits_and_restores_log_level_picker(
+    size: tuple[int, int],
+) -> None:
+    config = build_test_vibe_config()
+    app = build_test_chartreux_app(agent_loop=build_test_agent_loop(config=config))
+
+    async with app.run_test(size=size) as pilot:
+        await app._handle_command("/log-level")
+        await pilot.pause()
+        picker = app.query_one(LogLevelPickerApp)
+        options = picker.query_one("#loglevelpicker-options", OptionList)
+        highlighted = options.highlighted_option
+        assert highlighted is not None
+
+        await pilot.press("tab", "space", "escape")
+        await pilot.pause()
+
+        cancel = picker.query_one("#loglevelpicker-keep", Button)
+        discard = picker.query_one("#loglevelpicker-confirm-discard", Button)
+        help_widget = picker.query_one("#loglevelpicker-help", Static)
+        assert picker._confirming_discard
+        assert not options.display
+        assert cancel.region.bottom <= picker.region.bottom
+        assert discard.region.bottom <= picker.region.bottom
+        assert help_widget.region.bottom <= picker.region.bottom
+        assert app.focused is cancel
+        assert picker._config_level == picker._highlighted_level
+
+        await pilot.press("tab")
+        assert app.focused is discard
+        await pilot.press("ctrl+s")
+        assert app.query(LogLevelPickerApp)
+        assert picker._confirming_discard
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not picker._confirming_discard
+        assert options.display
+        assert options.has_focus
+        assert options.highlighted_option is highlighted
+        assert picker._focused_badge == "config"
+        assert picker._config_level == picker._highlighted_level
+        assert not picker.query_one("#loglevelpicker-discard").display
+        assert "Navigate" in str(help_widget.content)
 
 
 @pytest.mark.asyncio
@@ -227,10 +349,8 @@ async def test_picker_config_write_failure_surfaces_error(monkeypatch) -> None:
         )
         await pilot.pause()
 
-        errors = app.query(ErrorMessage)
-        assert any(
-            "log-level" in str(m._error) or "disk on fire" in str(m._error)
-            for m in errors
-        )
+        assert "disk on fire" in app._recovery_issues["log-level-save"][1]
+        assert app.query_one("#recovery-notice").display
+        assert "/log-level" in app._recovery_issues["log-level-save"][1]
         success = app.query(UserCommandMessage)
         assert not any("config.toml" in m._content for m in success)

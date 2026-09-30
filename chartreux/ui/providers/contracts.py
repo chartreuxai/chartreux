@@ -7,7 +7,7 @@ layer.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Protocol
 
@@ -71,28 +71,10 @@ class ModelEdits:
     input_price: OptionalEdit[float] = field(default_factory=OptionalEdit)
     output_price: OptionalEdit[float] = field(default_factory=OptionalEdit)
     cached_input_price: OptionalEdit[float] = field(default_factory=OptionalEdit)
-    role_memberships: OptionalEdit[tuple[str, ...]] = field(
-        default_factory=OptionalEdit
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class ModelSelectionDraft:
-    """A discovered wire ID selected for addition with optional metadata edits."""
-
-    wire_name: str
-    base_name: str
-    edits: ModelEdits = field(default_factory=ModelEdits)
-
-
-@dataclass(frozen=True, slots=True)
-class ProviderManagementDraft:
-    """All unsaved data for one provider-management flow instance."""
-
-    provider: ProviderDraft
-    selections: tuple[ModelSelectionDraft, ...] = ()
-    theme: str | None = None
-    active_model: str | None = None
+    thinking: OptionalEdit[str] = field(default_factory=OptionalEdit)
+    temperature: OptionalEdit[float] = field(default_factory=OptionalEdit)
+    supports_images: OptionalEdit[bool] = field(default_factory=OptionalEdit)
+    auto_compact_threshold: OptionalEdit[float] = field(default_factory=OptionalEdit)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,12 +111,25 @@ class TLSConfig:
 
 @dataclass(frozen=True, slots=True)
 class CatalogChanges:
-    """One atomic provider catalog commit expressed as validated plain-data patches."""
+    """One atomic catalog commit with positional legacy provider support."""
 
     provider_id: str
     provider: Mapping[str, object]
     models: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
     roles: Mapping[str, Mapping[str, object]] | None = None
+    providers: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
+    expected_revision: str | None = None
+
+    @property
+    def provider_patches(self) -> dict[str, Mapping[str, object]]:
+        """Combine the positional legacy provider patch with catalog-wide patches."""
+        patches = dict(self.providers)
+        if self.provider:
+            patches[self.provider_id] = {
+                **patches.get(self.provider_id, {}),
+                **self.provider,
+            }
+        return patches
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,11 +172,10 @@ class ConfigReloadResult:
 
 
 @dataclass(frozen=True, slots=True)
-class ProviderFlowResult:
-    """Typed value passed to ``ModalScreen.dismiss`` by either flow host."""
+class ProviderWorkbenchResult:
+    """Typed completion or cancellation returned by Provider Settings."""
 
     status: Literal["completed", "cancelled"]
-    active_model: str | None = None
     changed: bool = False
     warning: str | None = None
 
@@ -225,63 +219,6 @@ class ConfigService(Protocol):
         """Persist the literal theme selection, including ``auto``."""
         ...
 
-    async def persist_active_model(self, expression: str) -> ConfigPersistResult:
-        """Persist only a v0.1 canonical name or ``@role`` expression."""
-        ...
-
     async def reload_catalog_and_config(self) -> ConfigReloadResult:
-        """Reload the combined catalog and configuration before active-model adoption."""
+        """Reload the combined catalog and configuration after a catalog save."""
         ...
-
-
-def serialize_draft(draft: ProviderManagementDraft) -> dict[str, object]:
-    """Return a plain-data representation for tests and host state handoff."""
-    return {
-        "provider": {
-            "preset": draft.provider.preset,
-            "provider_id": draft.provider.provider_id,
-            "name": draft.provider.name,
-            "api_base": draft.provider.api_base,
-            "api_style": draft.provider.api_style,
-            "api_key_env_var": draft.provider.api_key_env_var,
-            "backend": draft.provider.backend,
-            "reasoning_field_name": draft.provider.reasoning_field_name,
-            "extra_headers": dict(draft.provider.extra_headers),
-        },
-        "selections": [
-            {
-                "wire_name": selection.wire_name,
-                "base_name": selection.base_name,
-                "edits": _serialize_edits(selection.edits),
-            }
-            for selection in draft.selections
-        ],
-        "theme": draft.theme,
-        "active_model": draft.active_model,
-    }
-
-
-def _serialize_edits(edits: ModelEdits) -> dict[str, dict[str, object]]:
-    return {
-        name: {"state": edit.state, "value": edit.value}
-        for name, edit in (
-            ("input_price", edits.input_price),
-            ("output_price", edits.output_price),
-            ("cached_input_price", edits.cached_input_price),
-            ("role_memberships", edits.role_memberships),
-        )
-    }
-
-
-def active_model_expression_is_valid(expression: str) -> bool:
-    """Recognize v0.1 active-model expressions: name or a nonempty role."""
-    if not expression or "/" in expression:
-        return False
-    if expression.startswith("@"):
-        return len(expression) > 1 and "@" not in expression[1:]
-    return "@" not in expression
-
-
-def selected_wire_ids(result: DiscoveryResult) -> Sequence[str]:
-    """Expose discovered IDs without changing their provider-provided spelling."""
-    return tuple(item.wire_id for item in result.models)

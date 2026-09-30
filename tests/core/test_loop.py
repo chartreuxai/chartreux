@@ -104,7 +104,7 @@ class TestLoopManagerMutations:
         manager, fake = _build_manager()
 
         with pytest.raises(LoopError, match="cannot start with '/'"):
-            await manager.create("30s", "/config")
+            await manager.create("30s", "/open-config-file")
 
         assert manager.loops == []
         assert fake.persisted == []

@@ -152,6 +152,19 @@ class TestSessionPickerAppInit:
         )
         assert picker._delete_state is None
 
+    def test_current_session_row_marks_active_even_when_cursor_moves(
+        self,
+        sample_sessions: list[SavedSessionSummary],
+        sample_latest_messages: dict[str, str],
+    ) -> None:
+        picker = SessionPickerApp(
+            sessions=sample_sessions,
+            latest_messages=sample_latest_messages,
+            current_session_id="session-b",
+        )
+        assert "Active" in picker._normal_option_text(sample_sessions[1]).plain
+        assert "Active" not in picker._normal_option_text(sample_sessions[0]).plain
+
     def test_has_sessions_tracks_session_list(
         self,
         sample_sessions: list[SavedSessionSummary],
@@ -195,9 +208,19 @@ class TestSessionPickerLoading:
         async with PickerHostApp(picker).run_test() as pilot:
             picker.load_sessions([], {})
             await pilot.pause()
-            status = picker.query_one(".sessionpicker-loading-status", NoMarkupStatic)
-            assert "No saved sessions found." in str(status.content)
-            assert picker.query_one("#sessionpicker-loading").display is True
+            option_list = picker.query_one(OptionList)
+            assert option_list.highlighted_option is not None
+            assert option_list.highlighted_option.id == "state:empty"
+            assert "No saved sessions. Start a conversation to create one." in str(
+                option_list.highlighted_option.prompt
+            )
+            await pilot.press("enter")
+            await pilot.pause()
+            assert picker._selection_pending is False
+            assert str(
+                picker.query_one("#sessionpicker-help", NoMarkupStatic).content
+            ) == ("No session available. Esc Cancel")
+            assert picker.query_one("#sessionpicker-loading").display is False
 
             session = public_session("loaded-session", 1_000)
             picker.add_sessions([session], {session.id: "Loaded session"})
@@ -276,6 +299,10 @@ class TestSessionPickerAppBindings:
     def test_has_delete_binding(self) -> None:
         assert "d" in self._get_binding_keys()
         assert "D" not in self._get_binding_keys()
+
+    def test_session_id_actions_are_available(self) -> None:
+        assert "i" in self._get_binding_keys()
+        assert "c" in self._get_binding_keys()
 
 
 class TestSessionPickerPreviewDebounce:
@@ -414,6 +441,85 @@ class TestSessionPickerPreviewDebounce:
 
 
 class TestSessionPickerSessionRemoval:
+    @pytest.mark.asyncio
+    async def test_id_hints_survive_navigation_and_modal_blocks_id_actions(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sessions = [
+            public_session("12345678-first-session-id", 2_000),
+            public_session("12345678-second-session-id", 1_000),
+        ]
+        picker = SessionPickerApp(sessions, {})
+        copied: list[str] = []
+
+        async with PickerHostApp(picker).run_test() as pilot:
+            monkeypatch.setattr(pilot.app, "copy_to_clipboard", copied.append)
+            await pilot.press("down")
+            await pilot.pause()
+            hint = str(picker.query_one("#sessionpicker-help", NoMarkupStatic).content)
+            assert "i ID" in hint
+            assert "c Copy ID" in hint
+
+            await pilot.press("d", "i", "c")
+            await pilot.pause()
+            assert picker._delete_state is not None
+            assert picker._delete_state.kind == "confirmation"
+            assert (
+                picker.query_one("#sessionpicker-id-detail", NoMarkupStatic).display
+                is False
+            )
+            assert copied == []
+            assert pilot.app.screen.focused is picker.query_one(
+                "#sessionpicker-cancel-delete"
+            )
+
+    @pytest.mark.asyncio
+    async def test_inspect_and_copy_expose_full_colliding_session_ids(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first_id = "12345678-first-session-id"
+        second_id = "12345678-second-session-id"
+        sessions = [public_session(first_id, 2_000), public_session(second_id, 1_000)]
+        picker = SessionPickerApp(sessions, {first_id: "first", second_id: "second"})
+        copied: list[str] = []
+
+        async with PickerHostApp(picker).run_test() as pilot:
+            monkeypatch.setattr(pilot.app, "copy_to_clipboard", copied.append)
+            await pilot.press("i")
+            detail = picker.query_one("#sessionpicker-id-detail", NoMarkupStatic)
+            assert detail.display
+            assert first_id in str(detail.content)
+            assert "Esc Cancel" in str(
+                picker.query_one("#sessionpicker-help", NoMarkupStatic).content
+            )
+
+            await pilot.press("c")
+            assert copied == [first_id]
+
+            await pilot.press("escape")
+            assert detail.display is False
+            assert pilot.app.screen.focused is picker.query_one(OptionList)
+
+    @pytest.mark.asyncio
+    async def test_escape_from_delete_confirmation_restores_list_focus(
+        self,
+        sample_sessions: list[SavedSessionSummary],
+        sample_latest_messages: dict[str, str],
+    ) -> None:
+        picker = SessionPickerApp(sample_sessions, sample_latest_messages)
+        async with PickerHostApp(picker).run_test() as pilot:
+            await pilot.press("d")
+            await pilot.pause()
+            assert pilot.app.screen.focused is picker.query_one(
+                "#sessionpicker-cancel-delete"
+            )
+
+            await pilot.press("escape")
+            await pilot.pause()
+
+            assert picker._delete_state is None
+            assert pilot.app.screen.focused is picker.query_one(OptionList)
+
     def test_first_delete_request_enters_confirmation(
         self,
         sample_sessions: list[SavedSessionSummary],
@@ -433,7 +539,7 @@ class TestSessionPickerSessionRemoval:
         assert_delete_state(picker, kind="confirmation", option_id="session-a")
         assert option_list.replaced_prompts[-1].option_id == "session-a"
         prompt = option_list.replaced_prompts[-1].prompt
-        assert "Press d again to delete" in prompt.plain
+        assert "Delete session session-" in prompt.plain
         assert posted_messages == []
 
     def test_confirmation_prompt_highlights_shortcut_with_theme_variable(
@@ -448,7 +554,7 @@ class TestSessionPickerSessionRemoval:
         prompt = picker._delete_confirmation_option_text(sample_sessions[0])
 
         assert isinstance(prompt, Content)
-        assert any("$primary" in str(span.style) for span in prompt.spans)
+        assert "Delete session" in prompt.plain
 
     def test_second_delete_request_posts_delete_message(
         self,
@@ -465,11 +571,14 @@ class TestSessionPickerSessionRemoval:
         monkeypatch.setattr(picker, "post_message", posted_messages.append)
 
         picker.action_request_delete()
-        picker.action_request_delete()
+        picker._confirm_delete(sample_sessions[0])
 
         assert_delete_state(picker, kind="pending", option_id="session-a")
         assert option_list.replaced_prompts[-1].option_id == "session-a"
-        assert "Deleting..." in option_list.replaced_prompts[-1].prompt.plain
+        assert (
+            "… Running: Deleting session"
+            in option_list.replaced_prompts[-1].prompt.plain
+        )
         assert len(posted_messages) == 1
         message = posted_messages[0]
         assert isinstance(message, SessionPickerApp.SessionDeleteRequested)
@@ -491,13 +600,16 @@ class TestSessionPickerSessionRemoval:
         monkeypatch.setattr(picker, "post_message", posted_messages.append)
 
         picker.action_request_delete()
-        picker.action_request_delete()
+        picker._confirm_delete(sample_sessions[0])
         picker.action_request_delete()
 
         assert len(posted_messages) == 1
         assert_delete_state(picker, kind="pending", option_id="session-a")
         assert option_list.replaced_prompts[-1].option_id == "session-a"
-        assert "Deleting..." in option_list.replaced_prompts[-1].prompt.plain
+        assert (
+            "… Running: Deleting session"
+            in option_list.replaced_prompts[-1].prompt.plain
+        )
 
     def test_delete_request_shows_feedback_for_current_session(
         self,
@@ -545,7 +657,7 @@ class TestSessionPickerSessionRemoval:
         monkeypatch.setattr(picker, "post_message", posted_messages.append)
 
         picker.action_request_delete()
-        picker.action_request_delete()
+        picker._confirm_delete(sample_sessions[0])
         picker.on_option_list_option_selected(
             cast(OptionList.OptionSelected, FakeOptionEvent("session-a"))
         )
@@ -572,7 +684,7 @@ class TestSessionPickerSessionRemoval:
         monkeypatch.setattr(picker, "post_message", posted_messages.append)
 
         picker.action_request_delete()
-        picker.action_request_delete()
+        picker._confirm_delete(sample_sessions[0])
 
         assert picker.clear_pending_delete("session-a") is True
         assert picker._delete_state is None
@@ -748,7 +860,7 @@ class TestSessionPickerPublicSessions:
             cast(OptionList.OptionSelected, FakeOptionEvent(session.id))
         )
         picker.action_request_delete()
-        picker.action_request_delete()
+        picker._confirm_delete(session)
 
         selected, delete_requested = posted_messages
         assert isinstance(selected, SessionPickerApp.SessionSelected)

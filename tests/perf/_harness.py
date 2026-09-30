@@ -74,13 +74,13 @@ class GatedSequenceBackend(FakeBackend):
 
 
 @dataclass(slots=True)
-class FanOutHarness:
-    """Real retained-session machinery configured for a role-based fan-out."""
+class SubagentHarness:
+    """Real retained-session machinery configured for explicit subagent models."""
 
     parent: AgentLoop
     registry: SessionRuntimeRegistry
     context: InvokeContext
-    role: str
+    model_names: list[str]
     agents_update_sizes: list[int]
 
     async def close(self) -> None:
@@ -89,37 +89,34 @@ class FanOutHarness:
         await self.parent.aclose()
 
 
-async def create_fan_out_harness(
-    role_members: Sequence[str], *, role: str = "perf-panel"
-) -> FanOutHarness:
-    """Create a root registry whose real catalog role contains ``role_members``.
-
-    The registry's normal runtime factory creates every retained child; callers
-    launch them via :func:`launch_fan_out`, which enters ``registry.run`` and its
-    production ``_run_fan_out`` path.
-    """
-    if not role_members:
-        raise ValueError("a fan-out role must contain at least one model")
+async def create_subagent_harness(model_names: Sequence[str]) -> SubagentHarness:
+    """Create a registry for launching independent tasks with explicit models."""
+    if not model_names:
+        raise ValueError("at least one explicit model is required")
 
     providers: dict[str, dict[str, str]] = {
-        "test/perf": {"api_base": "https://perf.test", "backend": "generic"}
+        "test-perf": {"api_base": "https://perf.test", "backend": "generic"}
     }
     models = {
-        member: {"deployments": [{"provider": "test/perf", "name": f"{member}-wire"}]}
-        for member in role_members
+        name: {"deployments": [{"provider": "test-perf", "name": f"{name}-wire"}]}
+        for name in model_names
     }
     snapshot = CatalogSnapshot(
         ModelCatalog.model_validate({
             "providers": providers,
             "models": models,
-            "roles": {role: {"models": list(role_members)}},
+            "roles": {
+                "orchestrator": {
+                    "description": "Performance harness main preset",
+                    "model": model_names[0],
+                    "thinking": "high",
+                }
+            },
         }),
         "perf-fan-out-test",
     )
     config = build_test_vibe_config(
-        active_model=role_members[0],
-        enabled_tools=["task"],
-        tools={"task": {"permission": "always"}},
+        enabled_tools=["task"], tools={"task": {"permission": "always"}}
     ).attach_catalog_snapshot(snapshot)
     parent = build_test_agent_loop(config=config, backend=FakeBackend())
 
@@ -146,32 +143,49 @@ async def create_fan_out_harness(
     root.turns._projector = None
     registry.bind_root(root)
 
-    return FanOutHarness(
+    return SubagentHarness(
         parent=parent,
         registry=registry,
         context=InvokeContext(
-            tool_call_id="perf-fan-out", session_id=parent.session_id
+            tool_call_id="perf-subagents", session_id=parent.session_id
         ),
-        role=role,
+        model_names=list(model_names),
         agents_update_sizes=agents_update_sizes,
     )
 
 
-async def launch_fan_out(
+async def launch_explicit_tasks(
     registry: SessionRuntimeRegistry,
     context: InvokeContext,
-    role: str,
+    model_names: Sequence[str],
     *,
     task: str = "Run the performance harness task",
-) -> TaskResult:
-    """Launch every model in ``@role`` through the real retained fan-out path."""
-    result: TaskResult | None = None
-    args = TaskArgs(
-        task=task, fan_out=True, background=True, config=LaunchConfig(model=f"@{role}")
+) -> list[TaskResult]:
+    """Launch one background task per explicit model, concurrently."""
+
+    async def launch_one(index: int, model_name: str) -> TaskResult:
+        result: TaskResult | None = None
+        args = TaskArgs(
+            task=f"{task} ({model_name})",
+            background=True,
+            config=LaunchConfig(model=model_name),
+        )
+        task_context = InvokeContext(
+            tool_call_id=f"{context.tool_call_id}-{index}",
+            session_id=context.session_id,
+        )
+        async for event in registry.run(args, task_context):
+            if isinstance(event, TaskResult):
+                result = event
+        if result is None:
+            raise RuntimeError("registry.run completed without a task launch result")
+        return result
+
+    return list(
+        await asyncio.gather(
+            *(
+                launch_one(index, model_name)
+                for index, model_name in enumerate(model_names)
+            )
+        )
     )
-    async for event in registry.run(args, context):
-        if isinstance(event, TaskResult):
-            result = event
-    if result is None:
-        raise RuntimeError("registry.run completed without a fan-out TaskResult")
-    return result

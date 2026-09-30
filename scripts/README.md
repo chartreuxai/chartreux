@@ -51,3 +51,36 @@ uv run scripts/check_startup_import_cost.py
 # Override the project or config
 uv run scripts/check_startup_import_cost.py --project chartreux --config path/to/config.toml
 ```
+
+## TUI vision captures
+
+`capture_tui.py` renders deterministic provider, settings, session-picker, and
+model-picker surfaces with Textual's test pilot. It uses the existing fake
+fixtures, so it does not start Chartreux's app-server or contact an LLM or
+network service. The `chat` surface uses a fake backend and the snapshot app's
+in-process test app-server to render a deterministic conversation.
+
+SVG files are always written. If `inkscape` is installed, matching PNG files
+are written beside them. The default sizes are `80x24`, `120x36`, and
+`120x72`; pass `--size` more than once to choose sizes. For a compact ASCII
+capture:
+
+```sh
+env -u NO_COLOR .venv/bin/python scripts/capture_tui.py \
+  --surface all --size 80x24 --theme textual-dark --ascii
+```
+
+Use `--surface provider|settings|session|model|chat`, `--theme textual-dark|textual-light|ansi-dark|ansi-light`, and `--output PATH` as needed. `NO_COLOR=1` disables color for monochrome captures; leave it unset for normal color output.
+
+Capture the full fake-backend chat surface with:
+
+```sh
+env -u NO_COLOR .venv/bin/python scripts/capture_tui.py \
+  --surface chat --size 120x36 --theme textual-dark
+```
+
+The chat capture uses `SnapshotTestAppWithConversation`, fake credentials, and
+the test harness file manager. It submits one prompt and waits 0.4 seconds for
+the deterministic fake response; it never contacts a real model or network.
+The full chat is bottom-anchored in tall viewports by design, so blank space
+above the conversation is expected.

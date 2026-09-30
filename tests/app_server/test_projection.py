@@ -189,6 +189,7 @@ def test_snapshot_session_cost_never_negative_when_cached_exceeds_prompt() -> No
 
 def test_config_view_flags_pinned_active_model() -> None:
     from chartreux.core.config import ModelConfig
+    from chartreux.core.config.layers.overrides import OverridesLayer
 
     models = [
         ModelConfig(name="model-a", provider="mistral", alias="alpha"),
@@ -197,6 +198,11 @@ def test_config_view_flags_pinned_active_model() -> None:
     agent_loop = build_test_agent_loop(
         config=build_test_vibe_config(models=models, active_model="beta")
     )
+    agent_loop.config_orchestrator.insert_layer(
+        OverridesLayer(data={"active_model": "beta"}),
+        len(agent_loop.config_orchestrator.layers),
+    )
+    agent_loop.config_orchestrator.rebuild()
 
     config = project_config(agent_loop)
 
@@ -249,7 +255,7 @@ def test_config_view_default_alias_never_follows_the_active_model() -> None:
 
     assert pinned.active_model.alias == "beta"
     assert pinned.default_model_alias == "glm-5-3"
-    assert pinned.default_model_display_name == "mistral/default/zai-glm-5-3"
+    assert pinned.default_model_display_name == "mistral/zai-glm-5-3"
     assert unflagged.default_model_alias == "glm-5-3"
     assert unpinned.active_model.alias == "glm-5-3"
     assert unpinned.default_model_alias == "glm-5-3"
@@ -274,16 +280,16 @@ def test_config_view_hydrates_display_name_from_alias() -> None:
     config = project_config(agent_loop)
 
     # UI renders canonical provider/wire display names from the catalog.
-    assert "mistral/default/model-a" in [model.display_name for model in config.models]
-    assert config.model_display_name("glm-5-2") == "mistral/default/zai-glm-5-2"
-    assert config.default_model_display_name == "mistral/default/zai-glm-5-3"
+    assert "mistral/model-a" in [model.display_name for model in config.models]
+    assert config.model_display_name("glm-5-2") == "mistral/zai-glm-5-2"
+    assert config.default_model_display_name == "mistral/zai-glm-5-3"
     # An alias that names no configured model is echoed back unchanged.
     assert config.model_display_name("unknown") == "unknown"
 
 
 _OTHER_PROVIDER: dict[str, object] = {"api_base": "https://other.test/v1"}
 _OTHER_MODEL: dict[str, object] = {
-    "deployments": [{"provider": "other/openai", "name": "other-model"}]
+    "deployments": [{"provider": "other-openai", "name": "other-model"}]
 }
 
 
@@ -292,7 +298,7 @@ _OTHER_MODEL: dict[str, object] = {
     [
         pytest.param(
             {
-                "providers": {"other/openai": _OTHER_PROVIDER},
+                "providers": {"other-openai": _OTHER_PROVIDER},
                 "models": {"other-model": _OTHER_MODEL},
             },
             ["other-model"],
@@ -301,8 +307,8 @@ _OTHER_MODEL: dict[str, object] = {
         pytest.param(
             {
                 "providers": {
-                    "other/openai": _OTHER_PROVIDER,
-                    "mistral/default": {"disabled": True},
+                    "other-openai": _OTHER_PROVIDER,
+                    "mistral": {"disabled": True},
                 },
                 "models": {"other-model": _OTHER_MODEL},
             },

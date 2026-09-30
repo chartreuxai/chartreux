@@ -5,8 +5,11 @@ from dataclasses import replace
 import os
 from pathlib import Path
 import sys
+import tempfile
+from tempfile import TemporaryDirectory
 import time
 from typing import Any
+import weakref
 
 import keyring
 from keyring.backend import KeyringBackend
@@ -134,7 +137,7 @@ def _disable_os_keyring(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None
 
 
 def get_base_config() -> dict[str, Any]:
-    return {"active_model": "glm-5-3"}
+    return {}
 
 
 @pytest.fixture(autouse=True)
@@ -198,11 +201,16 @@ def _scratchpad_dir(
 ) -> Generator[Path]:
     scratchpad_root = tmp_path_factory.mktemp("scratchpad")
     _counter = 0
+    real_mkdtemp = tempfile.mkdtemp
 
-    def _fake_mkdtemp(prefix: str = "") -> str:
+    def _fake_mkdtemp(
+        suffix: str | None = None, prefix: str | None = None, dir: str | None = None
+    ) -> str:
         nonlocal _counter
+        if not (prefix or "").startswith(("chartreux-scratchpad-", "vibe-scratchpad-")):
+            return real_mkdtemp(suffix, prefix, dir)
         _counter += 1
-        d = scratchpad_root / f"{prefix}{_counter}"
+        d = scratchpad_root / f"{prefix}{_counter}{suffix or ''}"
         d.mkdir(parents=True, exist_ok=True)
         return str(d)
 
@@ -442,17 +450,15 @@ def _test_catalog_snapshot(kwargs: dict[str, Any]) -> CatalogSnapshot:
     raw = SHIPPED_CATALOG.model_dump(mode="json")
     provider_ids: dict[str, str] = {}
     for provider in providers or []:
-        provider_id = (
-            provider.name if "/" in provider.name else f"{provider.name}/default"
-        )
+        provider_id = provider.name.strip()
         provider_ids[provider.name] = provider_id
         values = provider.model_dump(mode="json")
         values.pop("name")
         raw["providers"][provider_id] = values
     for model in models or []:
-        provider_id = provider_ids.get(model.provider or "", model.provider or "")
-        if "/" not in provider_id:
-            provider_id = f"{provider_id}/default"
+        provider_id = provider_ids.get(
+            model.provider or "", model.provider or ""
+        ).strip()
         values = model.model_dump(mode="json")
         raw["models"][model.alias] = {
             "thinking": values["thinking"],
@@ -551,6 +557,11 @@ def build_test_agent_loop(
     )
 
 
+def make_test_history_file() -> tuple[Path, TemporaryDirectory[str]]:
+    history_dir = TemporaryDirectory(prefix="chartreux-test-history-")
+    return Path(history_dir.name) / "history.jsonl", history_dir
+
+
 def build_test_chartreux_app(
     *,
     config: ChartreuxConfigSchema | None = None,
@@ -573,15 +584,21 @@ def build_test_chartreux_app(
         if app_server is not None
         else lambda: create_test_app_server_session(resolved_agent_loop)
     )
-    history_file = kwargs.pop("history_file", Path(".chartreuxhistory"))
+    history_file = kwargs.pop("history_file", None)
+    history_dir = None
+    if history_file is None:
+        history_file, history_dir = make_test_history_file()
     startup = kwargs.pop("startup", None) or StartupOptions(
         initial_prompt=kwargs.pop("initial_prompt", None)
     )
 
-    return ChartreuxApp(
+    app = ChartreuxApp(
         app_server=app_server_source,
         history_file=history_file,
         startup=startup,
         current_version=resolved_current_version,
         **kwargs,
     )
+    if history_dir is not None:
+        weakref.finalize(app, history_dir.cleanup)
+    return app

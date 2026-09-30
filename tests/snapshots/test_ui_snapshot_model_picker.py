@@ -77,6 +77,7 @@ def test_snapshot_model_picker_select_different_model(
     async def run_before(pilot: Pilot) -> None:
         await pilot.pause(0.2)
         await pilot.press("down")
+        await pilot.press("down")
         await pilot.press("enter")
         await pilot.pause(0.2)
 

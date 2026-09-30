@@ -57,6 +57,56 @@ async def _enter_rewind(pilot) -> None:
 
 
 @pytest.mark.asyncio
+async def test_click_rewind_action_and_persistence_rows() -> None:
+    app = _make_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _send_messages(pilot, ["hello", "world"])
+        await _enter_rewind(pilot)
+
+        rewind = app.query_one(RewindApp)
+        assert rewind._step == _RewindStep.ACTION
+        edit_only = rewind.option_widgets[len(rewind._options) - 1]
+        await pilot.click(edit_only, offset=(5, 0))
+        await pilot.pause()
+
+        assert rewind._step == _RewindStep.PERSISTENCE
+        assert rewind._restore_files is False
+        assert app.focused is rewind
+
+        fork = rewind.option_widgets[1]
+        await pilot.click(fork, offset=(5, 0))
+        await _wait_until(pilot, lambda: not app._rewind_mode)
+        assert app._current_bottom_app != BottomApp.Rewind
+
+
+@pytest.mark.asyncio
+async def test_double_click_rewind_action_cannot_confirm_new_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _make_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _send_messages(pilot, ["hello", "world"])
+        await _enter_rewind(pilot)
+
+        rewind = app.query_one(RewindApp)
+        copied: list[str] = []
+        monkeypatch.setattr(app, "copy_to_clipboard", copied.append)
+        await pilot.click(rewind.option_widgets[1], offset=(5, 0), times=2)
+        await pilot.pause()
+
+        assert rewind._step == _RewindStep.PERSISTENCE
+        assert rewind._restore_files is False
+        assert app._rewind_mode
+        assert app.focused is rewind
+        assert copied == []
+        assert "Copied" not in str(app._inline_notice.content)
+
+        await pilot.pause(0.6)
+        await pilot.click(rewind.option_widgets[1], offset=(5, 0))
+        await _wait_until(pilot, lambda: not app._rewind_mode)
+
+
+@pytest.mark.asyncio
 async def test_rewind_mode_activates_on_double_escape() -> None:
     app = _make_app()
     async with app.run_test() as pilot:
@@ -207,7 +257,7 @@ async def test_rewind_q_exits_mode_from_persistence_step() -> None:
         await _send_messages(pilot, ["hello", "world"])
 
         await _enter_rewind(pilot)
-        await pilot.press("enter")
+        await pilot.press("down", "enter")
         await pilot.pause(0.1)
 
         rewind_app = app.query_one(RewindApp)
@@ -262,7 +312,7 @@ async def test_rewind_confirm_edits_message_and_prefills_input() -> None:
         await _enter_rewind(pilot)
 
         # First enter picks the action, second enter confirms persistence
-        await pilot.press("enter")
+        await pilot.press("down", "enter")
         await pilot.pause(0.1)
         await pilot.press("enter")
         await _wait_until(pilot, lambda: not app._rewind_mode)
@@ -296,7 +346,7 @@ async def test_rewind_truncates_public_history_and_appends_checkpoint() -> None:
         assert app._rewind_highlighted_widget.get_content() == "second"
 
         # Confirm: pick action, then confirm persistence
-        await pilot.press("enter")
+        await pilot.press("down", "enter")
         await pilot.pause(0.1)
         await pilot.press("enter")
         await _wait_until(pilot, lambda: not app._rewind_mode)
@@ -370,13 +420,25 @@ async def test_rewind_option_selection_with_number_keys() -> None:
 
         await _enter_rewind(pilot)
 
-        # Press "1" to select the first action, then "1" to confirm persistence
-        await pilot.press("1")
+        # Option 1 cancels; select the edit action explicitly.
+        await pilot.press("2")
         await pilot.pause(0.1)
         await pilot.press("1")
         await _wait_until(pilot, lambda: not app._rewind_mode)
 
         assert app._rewind_mode is False
+        assert app._current_bottom_app == BottomApp.Input
+
+
+@pytest.mark.asyncio
+async def test_rewind_enter_defaults_to_cancel() -> None:
+    app = _make_app()
+    async with app.run_test() as pilot:
+        await _send_messages(pilot, ["hello"])
+        await _enter_rewind(pilot)
+        assert app.query_one(RewindApp).selected_option == 0
+        await pilot.press("enter")
+        await _wait_until(pilot, lambda: not app._rewind_mode)
         assert app._current_bottom_app == BottomApp.Input
 
 
@@ -391,7 +453,7 @@ async def test_rewind_shows_persistence_step_after_action() -> None:
         rewind_app = app.query_one(RewindApp)
         assert rewind_app._step == _RewindStep.ACTION
 
-        await pilot.press("enter")
+        await pilot.press("down", "enter")
         await pilot.pause(0.1)
 
         # Persistence step defaults to the first (in-place) option
@@ -406,7 +468,7 @@ async def test_rewind_escape_on_persistence_step_returns_to_action() -> None:
         await _send_messages(pilot, ["hello", "world"])
 
         await _enter_rewind(pilot)
-        await pilot.press("enter")
+        await pilot.press("down", "enter")
         await pilot.pause(0.1)
 
         rewind_app = app.query_one(RewindApp)
@@ -444,7 +506,7 @@ async def test_rewind_in_place_persists_in_current_session(monkeypatch) -> None:
 
         await _enter_rewind(pilot)
         # Action, then confirm the default in-place option
-        await pilot.press("enter")
+        await pilot.press("down", "enter")
         await pilot.pause(0.1)
         await pilot.press("enter")
         await _wait_until(pilot, lambda: not app._rewind_mode)
@@ -474,7 +536,7 @@ async def test_rewind_fork_creates_new_session(monkeypatch) -> None:
 
         await _enter_rewind(pilot)
         # Action, then pick the fork (second) persistence option
-        await pilot.press("enter")
+        await pilot.press("down", "enter")
         await pilot.pause(0.1)
         await pilot.press("2")
         await _wait_until(pilot, lambda: not app._rewind_mode)
@@ -491,7 +553,7 @@ async def test_rewind_fork_shows_session_hint() -> None:
         old_session_id = app.app_server.session_id
 
         await _enter_rewind(pilot)
-        await pilot.press("enter")
+        await pilot.press("down", "enter")
         await pilot.pause(0.1)
         await pilot.press("2")
         await _wait_until(pilot, lambda: not app._rewind_mode)
@@ -512,7 +574,7 @@ async def test_rewind_in_place_shows_no_session_hint() -> None:
         await _send_messages(pilot, ["hello", "world"])
 
         await _enter_rewind(pilot)
-        await pilot.press("enter")
+        await pilot.press("down", "enter")
         await pilot.pause(0.1)
         await pilot.press("enter")
         await _wait_until(pilot, lambda: not app._rewind_mode)

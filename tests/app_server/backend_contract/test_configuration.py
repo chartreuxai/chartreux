@@ -77,7 +77,6 @@ async def test_first_turn_does_not_pin_default_and_resume_keeps_committed_defaul
 ) -> None:
     config_file = config_dir / "config.toml"
     config = tomllib.loads(config_file.read_text(encoding="utf-8"))
-    config["active_model"] = ""
     _write_catalog(config_dir, {"alternate": "alternate-model"})
     session_root = tmp_path / "sessions"
     config["session_logging"] = {"enabled": True, "save_dir": str(session_root)}
@@ -124,9 +123,7 @@ async def test_first_turn_does_not_pin_default_and_resume_keeps_committed_defaul
         await session.close()
 
     config = tomllib.loads(config_file.read_text(encoding="utf-8"))
-    assert config["active_model"] == ""
-    config["active_model"] = "alternate"
-    config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
+    assert "active_model" not in config
 
     resumed_connection = await connect_backend_contract_host(
         session_options=SessionOptions(), capabilities=ClientCapabilities()
@@ -156,7 +153,6 @@ async def test_explicit_active_model_target_controls_session_pin_update(
 ) -> None:
     config_file = config_dir / "config.toml"
     config = tomllib.loads(config_file.read_text(encoding="utf-8"))
-    config["active_model"] = ""
     _write_catalog(config_dir, {"alternate": "alternate-model"})
     session_root = tmp_path / "sessions"
     config["session_logging"] = {"enabled": True, "save_dir": str(session_root)}
@@ -188,8 +184,7 @@ async def test_explicit_active_model_target_controls_session_pin_update(
                 expected_revision=fields.revisions["user-toml"],
                 reason="explicit saved model selection",
             )
-            assert result.persistence == "saved"
-            assert result.application == "applied"
+            assert result.rejected is True
         else:
             await session.resources.config.update(
                 {"active_model": "alternate"},
@@ -213,9 +208,7 @@ async def test_explicit_active_model_target_controls_session_pin_update(
         await session.close()
 
     persisted_config = tomllib.loads(config_file.read_text(encoding="utf-8"))
-    assert persisted_config["active_model"] == (
-        "" if updates_session_pin else "alternate"
-    )
+    assert "active_model" not in persisted_config
 
 
 @pytest.mark.asyncio
@@ -227,7 +220,6 @@ async def test_removed_session_active_model_falls_back_to_default(
 ) -> None:
     config_file = config_dir / "config.toml"
     config = tomllib.loads(config_file.read_text(encoding="utf-8"))
-    config["active_model"] = "removed-model"
     _write_catalog(
         config_dir,
         {"removed-model": "removed-model", "lower-layer-model": "lower-layer-model"},
@@ -244,6 +236,9 @@ async def test_removed_session_active_model_falls_back_to_default(
     )
     session = await connection.host.open_session()
     try:
+        await session.resources.config.update(
+            {"active_model": "removed-model"}, reload_runtime=True
+        )
         _ = [event async for event in session.act("pin the removed model")]
         session_id = session.session_id
         assert _stored_active_model(session_root, session_id, False) == "removed-model"
@@ -251,7 +246,6 @@ async def test_removed_session_active_model_falls_back_to_default(
         await session.close()
 
     config = tomllib.loads(config_file.read_text(encoding="utf-8"))
-    config["active_model"] = "lower-layer-model"
     _write_catalog(config_dir, {"lower-layer-model": "lower-layer-model"})
     config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
 
@@ -269,7 +263,7 @@ def _write_catalog(config_dir: Path, models: dict[str, str]) -> None:
     (config_dir / "models.toml").write_text(
         tomli_w.dumps({
             "models": {
-                alias: {"deployments": [{"provider": "mistral/default", "name": name}]}
+                alias: {"deployments": [{"provider": "mistral", "name": name}]}
                 for alias, name in models.items()
             }
         }),

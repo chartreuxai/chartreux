@@ -24,9 +24,9 @@ from chartreux.core.model_catalog.schema import ModelCatalog, Prices, ProviderDe
 
 def _minimal() -> dict[str, object]:
     return {
-        "providers": {"test/provider": {"api_base": "https://example.test"}},
+        "providers": {"test-provider": {"api_base": "https://example.test"}},
         "models": {
-            "base": {"deployments": [{"provider": "test/provider", "name": "wire"}]}
+            "base": {"deployments": [{"provider": "test-provider", "name": "wire"}]}
         },
         "roles": {},
     }
@@ -40,7 +40,7 @@ def test_1_schema_accepts_minimal_valid_catalog() -> None:
 def test_2_schema_forbids_unknown_fields() -> None:
     raw = _minimal()
     for table, field in (
-        (raw["providers"]["test/provider"], "provider_extra"),  # type: ignore[index]
+        (raw["providers"]["test-provider"], "provider_extra"),  # type: ignore[index]
         (raw["models"]["base"]["deployments"][0], "deployment_extra"),  # type: ignore[index]
         (raw["models"]["base"], "base_extra"),  # type: ignore[index]
         (raw, "catalog_extra"),
@@ -60,10 +60,10 @@ def test_3_catalog_is_frozen() -> None:
 def test_4_duplicate_deployment_provider_is_rejected() -> None:
     raw = _minimal()
     raw["models"]["base"]["deployments"].append({  # type: ignore[index]
-        "provider": "test/provider",
+        "provider": "test-provider",
         "name": "other",
     })
-    with pytest.raises(ValidationError, match="one deployment"):
+    with pytest.raises(ValidationError, match="existing provider deployment"):
         ModelCatalog.model_validate(raw)
 
 
@@ -73,40 +73,67 @@ def test_5_roles_and_reserved_at_are_validated() -> None:
     with pytest.raises(ValidationError, match="reserved"):
         ModelCatalog.model_validate(raw)
     raw = _minimal()
-    raw["roles"] = {"bad@role": {"models": ["base"]}}
+    raw["roles"] = {"bad@role": {"model": "base", "thinking": "medium"}}
     with pytest.raises(ValidationError, match="reserved"):
         ModelCatalog.model_validate(raw)
 
 
-def test_6_provider_id_and_unknown_provider_are_rejected() -> None:
+def test_6_provider_name_and_unknown_provider_are_rejected() -> None:
+    for invalid in ("", "  ", "bad/name", "bad@name", "bad\nname", "bad\x7fname"):
+        raw = _minimal()
+        raw["providers"] = {invalid: {"api_base": "https://example.test"}}
+        with pytest.raises(ValidationError, match="Provider name"):
+            ModelCatalog.model_validate(raw)
+
     raw = _minimal()
-    raw["providers"] = {"unqualified": {"api_base": "https://example.test"}}
-    with pytest.raises(ValidationError, match="must contain"):
+    raw["providers"] = {" test-provider ": raw["providers"]["test-provider"]}  # type: ignore[index]
+    raw["models"]["base"]["deployments"][0]["provider"] = " test-provider "  # type: ignore[index]
+    catalog = ModelCatalog.model_validate(raw)
+    assert list(catalog.providers) == ["test-provider"]
+    assert catalog.models["base"].deployments[0].provider == "test-provider"
+
+    raw = _minimal()
+    raw["providers"][" test-provider "] = raw["providers"]["test-provider"]  # type: ignore[index]
+    with pytest.raises(ValidationError, match="collision"):
         ModelCatalog.model_validate(raw)
+
+    for invalid in ("bad/name", "bad@name", "bad\nname", "  "):
+        raw = _minimal()
+        raw["models"]["base"]["deployments"][0]["provider"] = invalid  # type: ignore[index]
+        with pytest.raises(ValidationError, match="Provider name"):
+            ModelCatalog.model_validate(raw)
+
     raw = _minimal()
-    raw["models"]["base"]["deployments"][0]["provider"] = "other/provider"  # type: ignore[index]
+    raw["models"]["base"]["deployments"][0]["provider"] = "other-provider"  # type: ignore[index]
     with pytest.raises(ValidationError, match="unknown provider"):
         ModelCatalog.model_validate(raw)
 
 
-def test_7_duplicate_role_members_and_empty_lists_are_rejected() -> None:
+def test_provider_names_preserve_case_and_inner_spaces() -> None:
+    raw = _minimal()
+    raw["providers"] = {"My Gateway": {"api_base": "https://example.test"}}
+    raw["models"]["base"]["deployments"][0]["provider"] = "My Gateway"  # type: ignore[index]
+    assert list(ModelCatalog.model_validate(raw).providers) == ["My Gateway"]
+
+
+def test_7_legacy_role_lists_and_missing_preset_fields_are_rejected() -> None:
     raw = _minimal()
     raw["roles"] = {"role": {"models": ["base", "base"]}}
-    with pytest.raises(ValidationError, match="Duplicate role"):
+    with pytest.raises(ValidationError, match="one 'model'.*'thinking'"):
         ModelCatalog.model_validate(raw)
     raw = _minimal()
     raw["models"]["base"]["deployments"] = []  # type: ignore[index]
     with pytest.raises(ValidationError):
         ModelCatalog.model_validate(raw)
     raw = _minimal()
-    raw["roles"] = {"role": {"models": []}}
-    with pytest.raises(ValidationError, match="at least 1 item"):
+    raw["roles"] = {"role": {"model": "base"}}
+    with pytest.raises(ValidationError, match="thinking"):
         ModelCatalog.model_validate(raw)
 
 
 def test_8_disabled_entries_are_valid() -> None:
     raw = _minimal()
-    raw["providers"]["test/provider"]["disabled"] = True  # type: ignore[index]
+    raw["providers"]["test-provider"]["disabled"] = True  # type: ignore[index]
     raw["models"]["base"]["disabled"] = True  # type: ignore[index]
     raw["models"]["base"]["deployments"][0]["disabled"] = True  # type: ignore[index]
     assert ModelCatalog.model_validate(raw).models["base"].disabled is True
@@ -121,12 +148,11 @@ def test_9_unknown_and_free_prices_are_distinct() -> None:
 
 def test_10_sparse_provider_overlay_inherits_shipped_fields() -> None:
     catalog = merge_catalog_overlay(
-        SHIPPED_CATALOG,
-        {"providers": {"mistral/default": {"emits_finish_reason": False}}},
+        SHIPPED_CATALOG, {"providers": {"mistral": {"emits_finish_reason": False}}}
     )
-    provider = catalog.providers["mistral/default"]
+    provider = catalog.providers["mistral"]
     assert provider.emits_finish_reason is False
-    assert provider.api_base == SHIPPED_CATALOG.providers["mistral/default"].api_base
+    assert provider.api_base == SHIPPED_CATALOG.providers["mistral"].api_base
 
 
 def test_11_overlay_replaces_scalars_and_deployment_lists() -> None:
@@ -136,7 +162,7 @@ def test_11_overlay_replaces_scalars_and_deployment_lists() -> None:
             "models": {
                 "glm-5-3": {
                     "thinking": "low",
-                    "deployments": [{"provider": "mistral/default", "name": "glm-5-3"}],
+                    "deployments": [{"provider": "mistral", "name": "glm-5-3"}],
                 }
             }
         },
@@ -149,12 +175,12 @@ def test_12_deployment_overlay_inherits_by_provider_and_adds_provider() -> None:
     catalog = merge_catalog_overlay(
         SHIPPED_CATALOG,
         {
-            "providers": {"test/second": {"api_base": "https://second.test"}},
+            "providers": {"test-second": {"api_base": "https://second.test"}},
             "models": {
                 "glm-5-3": {
                     "deployments": [
-                        {"provider": "mistral/default", "supports_images": True},
-                        {"provider": "test/second", "name": "glm-second"},
+                        {"provider": "mistral", "supports_images": True},
+                        {"provider": "test-second", "name": "glm-second"},
                     ]
                 }
             },
@@ -162,8 +188,8 @@ def test_12_deployment_overlay_inherits_by_provider_and_adds_provider() -> None:
     )
     deployments = catalog.models["glm-5-3"].deployments
     assert [(item.provider, item.name) for item in deployments] == [
-        ("mistral/default", "zai-glm-5-3"),
-        ("test/second", "glm-second"),
+        ("mistral", "zai-glm-5-3"),
+        ("test-second", "glm-second"),
     ]
     assert deployments[0].supports_images is True
 
@@ -197,20 +223,20 @@ def test_16_shipped_defaults_validate_and_have_verified_wire_names() -> None:
     # The shipped catalog is neutral and publicly reachable only: the Mistral
     # public provider and models it actually serves. Personal setups (local
     # proxies, private pins) belong in the user models.toml overlay.
-    assert set(catalog.providers) == {"mistral/default"}
-    assert catalog.providers["mistral/default"].api_base == "https://api.mistral.ai/v1"
+    assert set(catalog.providers) == {"mistral"}
+    assert catalog.providers["mistral"].api_base == "https://api.mistral.ai/v1"
     assert set(catalog.models) == {"glm-5-3"}
     assert {name: model.thinking for name, model in catalog.models.items()} == {
         "glm-5-3": "high"
     }
-    assert catalog.roles["orchestrator"].models == ("glm-5-3",)
-    assert {name: role.models for name, role in catalog.roles.items()} == {
-        "orchestrator": ("glm-5-3",),
-        "advisor": ("glm-5-3",),
-        "small-worker": ("glm-5-3",),
-        "large-worker": ("glm-5-3",),
-        "small-reviewer": ("glm-5-3",),
-        "deep-reviewer": ("glm-5-3",),
+    assert catalog.roles["orchestrator"].model == "glm-5-3"
+    assert {
+        name: (role.model, role.thinking) for name, role in catalog.roles.items()
+    } == {
+        "orchestrator": ("glm-5-3", "high"),
+        "large": ("glm-5-3", "high"),
+        "medium": ("glm-5-3", "medium"),
+        "small": ("glm-5-3", "low"),
     }
     assert {
         name: (
@@ -222,7 +248,7 @@ def test_16_shipped_defaults_validate_and_have_verified_wire_names() -> None:
             model.deployments[0].auto_compact_threshold,
         )
         for name, model in catalog.models.items()
-    } == {"glm-5-3": ("mistral/default", "zai-glm-5-3", 1.4, 4.4, 0.14, 400000)}
+    } == {"glm-5-3": ("mistral", "zai-glm-5-3", 1.4, 4.4, 0.14, 400000)}
     assert {
         deployment.name
         for model in catalog.models.values()
@@ -234,6 +260,25 @@ def test_shipped_catalog_json_dump_round_trips() -> None:
     dumped = SHIPPED_CATALOG.model_dump_json()
 
     assert ModelCatalog.model_validate_json(dumped) == SHIPPED_CATALOG
+
+
+@pytest.mark.parametrize(
+    ("preset", "thinking"),
+    [
+        ("orchestrator", "high"),
+        ("large", "high"),
+        ("medium", "medium"),
+        ("small", "low"),
+    ],
+)
+def test_shipped_presets_resolve_their_own_thinking(preset: str, thinking: str) -> None:
+    resolver = ModelResolver(CatalogSnapshot(SHIPPED_CATALOG, "test"))
+
+    resolved = resolver.resolve(f"@{preset}")
+
+    assert resolved.base_model == "glm-5-3"
+    assert resolved.thinking == thinking
+    assert resolved.materialize(auto_compact_threshold=200000).thinking == thinking
 
 
 def test_provider_definition_extra_headers_serialize_without_warnings() -> None:
@@ -253,7 +298,7 @@ def test_provider_definition_extra_headers_serialize_without_warnings() -> None:
 
 def test_17_resolver_expands_scalar_models_and_roles_only() -> None:
     raw = _minimal()
-    raw["roles"] = {"preferred": {"models": ["base"]}}
+    raw["roles"] = {"preferred": {"model": "base", "thinking": "medium"}}
     resolver = ModelResolver(CatalogSnapshot(ModelCatalog.model_validate(raw), "test"))
     assert resolver.expression_bases("base") == ("base",)
     assert resolver.expression_bases("@preferred") == ("base",)
@@ -267,20 +312,105 @@ def test_17_resolver_expands_scalar_models_and_roles_only() -> None:
         resolver.expression_bases("@")
 
 
+def test_roles_can_share_a_model_with_distinct_thinking() -> None:
+    raw = _minimal()
+    raw["roles"] = {
+        "planner": {"model": "base", "thinking": "low"},
+        "reviewer": {"model": "base", "thinking": "high"},
+    }
+    resolver = ModelResolver(CatalogSnapshot(ModelCatalog.model_validate(raw), "test"))
+    planner = resolver.resolve("@planner")
+    reviewer = resolver.resolve("@reviewer")
+    assert planner.base_model == reviewer.base_model == "base"
+    assert planner.materialize(auto_compact_threshold=100).thinking == "low"
+    assert reviewer.materialize(auto_compact_threshold=100).thinking == "high"
+    assert (
+        reviewer.materialize(auto_compact_threshold=100, thinking="medium").thinking
+        == "medium"
+    )
+    assert planner.identity.thinking == "low"
+    assert reviewer.identity.thinking == "high"
+
+
+def test_incomplete_preset_is_structurally_valid_but_resolution_guides_repair() -> None:
+    raw = _minimal()
+    raw["roles"] = {"planner": {"model": "pending", "thinking": "high"}}
+    resolver = ModelResolver(CatalogSnapshot(ModelCatalog.model_validate(raw), "test"))
+    with pytest.raises(
+        ModelResolutionError, match="missing model.*edit its model and thinking"
+    ) as error:
+        resolver.resolve("@planner")
+    assert error.value.code == "preset_model_missing"
+
+
+def test_invalid_preset_thinking_and_legacy_overlay_are_actionable() -> None:
+    raw = _minimal()
+    raw["roles"] = {"planner": {"model": "base", "thinking": "absurd"}}
+    with pytest.raises(ValidationError, match="known thinking level"):
+        ModelCatalog.model_validate(raw)
+    with pytest.raises(
+        ValueError, match="roles.planner.models is obsolete.*model.*thinking"
+    ):
+        merge_catalog_overlay(
+            SHIPPED_CATALOG, {"roles": {"planner": {"models": ["glm-5-3"]}}}
+        )
+
+
+def test_preset_thinking_must_be_supported_by_selected_deployment() -> None:
+    raw = _minimal()
+    raw["models"]["base"]["deployments"][0]["supported_thinking_levels"] = ["low"]  # type: ignore[index]
+    raw["roles"] = {"planner": {"model": "base", "thinking": "high"}}
+    resolver = ModelResolver(CatalogSnapshot(ModelCatalog.model_validate(raw), "test"))
+    with pytest.raises(
+        ModelResolutionError, match="supporting thinking level"
+    ) as error:
+        resolver.resolve("@planner")
+    assert error.value.code == "thinking_unsupported"
+    overridden = resolver.resolve("@planner", thinking_override="low")
+    assert (
+        overridden.materialize(auto_compact_threshold=100, thinking="low").thinking
+        == "low"
+    )
+
+
+def test_committed_preset_pair_revalidates_after_deployment_capability_change() -> None:
+    raw = _minimal()
+    raw["roles"] = {"planner": {"model": "base", "thinking": "high"}}
+    committed = (
+        ModelResolver(CatalogSnapshot(ModelCatalog.model_validate(raw), "before"))
+        .resolve("@planner")
+        .identity
+    )
+    raw["models"]["base"]["deployments"][0]["supported_thinking_levels"] = ["low"]  # type: ignore[index]
+    changed = ModelResolver(CatalogSnapshot(ModelCatalog.model_validate(raw), "after"))
+    with pytest.raises(ModelResolutionError, match="Committed thinking level") as error:
+        changed.resolve_committed(committed)
+    assert error.value.code == "committed_thinking_unsupported"
+
+
+def test_preset_candidate_filter_rejection_is_not_a_thinking_error() -> None:
+    raw = _minimal()
+    raw["roles"] = {"planner": {"model": "base", "thinking": "high"}}
+    resolver = ModelResolver(CatalogSnapshot(ModelCatalog.model_validate(raw), "test"))
+    with pytest.raises(ModelResolutionError) as error:
+        resolver.resolve("@planner", candidate_filter=lambda _candidate: False)
+    assert error.value.code == "no_compatible_deployment"
+
+
 def test_18_resolver_materializes_wire_name_and_filters_deployments() -> None:
     raw = _minimal()
-    raw["providers"]["second/provider"] = {"api_base": "https://second.test"}  # type: ignore[index]
+    raw["providers"]["second-provider"] = {"api_base": "https://second.test"}  # type: ignore[index]
     raw["models"]["base"]["thinking"] = "high"  # type: ignore[index]
     raw["models"]["base"]["temperature"] = 0.7  # type: ignore[index]
     raw["models"]["base"]["deployments"].append(  # type: ignore[index]
-        {"provider": "second/provider", "name": "second-wire"}
+        {"provider": "second-provider", "name": "second-wire"}
     )
     resolver = ModelResolver(CatalogSnapshot(ModelCatalog.model_validate(raw), "test"))
-    selected = resolver.resolve("base", allowed_models=["second/*"])
+    selected = resolver.resolve("base", allowed_models=["second-provider/*"])
     model = selected.materialize(auto_compact_threshold=123)
     assert (model.name, model.provider, model.thinking, model.temperature) == (
         "second-wire",
-        "second/provider",
+        "second-provider",
         "high",
         0.7,
     )
@@ -294,14 +424,24 @@ def test_resolver_unknown_explicit_name_is_typed() -> None:
     with pytest.raises(ModelResolutionError) as error:
         resolver.resolve("typo-model")
     assert error.value.code == "unknown_model"
+    assert "Valid canonical models: glm-5-3" in str(error.value)
+
+
+def test_resolver_unknown_role_lists_valid_roles() -> None:
+    resolver = ModelResolver(CatalogSnapshot(SHIPPED_CATALOG, "test"))
+    with pytest.raises(ModelResolutionError) as error:
+        resolver.resolve("@not-a-role")
+    assert error.value.code == "unknown_role"
+    assert "@orchestrator" in str(error.value)
+    assert "@medium" in str(error.value)
 
 
 def test_deployment_priority_disabled_skip_and_all_disabled() -> None:
     raw = _minimal()
-    raw["providers"]["second/provider"] = {"api_base": "https://second.test"}  # type: ignore[index]
+    raw["providers"]["second-provider"] = {"api_base": "https://second.test"}  # type: ignore[index]
     raw["models"]["base"]["deployments"] = [  # type: ignore[index]
-        {"provider": "test/provider", "name": "first", "disabled": True},
-        {"provider": "second/provider", "name": "second"},
+        {"provider": "test-provider", "name": "first", "disabled": True},
+        {"provider": "second-provider", "name": "second"},
     ]
     catalog = ModelCatalog.model_validate(raw)
     resolver = ModelResolver(CatalogSnapshot(catalog, "test"))
@@ -343,7 +483,7 @@ def test_real_config_consumer_materializes_wire_name_and_base_label() -> None:
     model = config.get_active_model()
     assert model.alias == "glm-5-3"
     assert model.name == "zai-glm-5-3"
-    assert model.provider == "mistral/default"
+    assert model.provider == "mistral"
 
 
 def test_glm_canonical_name_keeps_exact_deployment_wire_name() -> None:
@@ -356,35 +496,35 @@ def test_glm_canonical_name_keeps_exact_deployment_wire_name() -> None:
 
 def test_catalog_snapshot_is_deeply_immutable() -> None:
     raw = _minimal()
-    raw["providers"]["test/provider"]["extra_headers"] = {"Authorization": "test"}  # type: ignore[index]
+    raw["providers"]["test-provider"]["extra_headers"] = {"Authorization": "test"}  # type: ignore[index]
     raw["models"]["base"]["deployments"][0]["supported_thinking_levels"] = [  # type: ignore[index]
         "low"
     ]
-    raw["roles"] = {"role": {"models": ["base"]}}
+    raw["roles"] = {"role": {"model": "base", "thinking": "low"}}
     catalog = ModelCatalog.model_validate(raw)
 
     with pytest.raises(TypeError):
-        catalog.providers["other/provider"] = catalog.providers["test/provider"]  # type: ignore[index]
+        catalog.providers["other/provider"] = catalog.providers["test-provider"]  # type: ignore[index]
     with pytest.raises(TypeError):
         catalog.models["other"] = catalog.models["base"]  # type: ignore[index]
     with pytest.raises(TypeError):
         catalog.roles["other"] = catalog.roles["role"]  # type: ignore[index]
     with pytest.raises(TypeError):
-        catalog.providers["test/provider"].extra_headers["Other"] = "value"  # type: ignore[index]
+        catalog.providers["test-provider"].extra_headers["Other"] = "value"  # type: ignore[index]
     with pytest.raises(TypeError):
         catalog.models["base"].deployments[0] = catalog.models["base"].deployments[0]  # type: ignore[index]
     with pytest.raises(TypeError):
         catalog.models["base"].deployments[0].supported_thinking_levels[0] = "high"  # type: ignore[index]
-    with pytest.raises(TypeError):
-        catalog.roles["role"].models[0] = "other"  # type: ignore[index]
+    with pytest.raises(ValidationError, match="frozen"):
+        catalog.roles["role"].model = "other"  # type: ignore[misc]
 
 
 @pytest.mark.parametrize(
     ("path", "value", "message"),
     [
-        (("providers", "test/provider", "api_base"), "", "HTTP"),
-        (("providers", "test/provider", "api_base"), "not-a-url", "HTTP"),
-        (("providers", "test/provider", "api_key_env_var"), "BAD-NAME", "environment"),
+        (("providers", "test-provider", "api_base"), "", "HTTP"),
+        (("providers", "test-provider", "api_base"), "not-a-url", "HTTP"),
+        (("providers", "test-provider", "api_key_env_var"), "BAD-NAME", "environment"),
         (("models", "base", "thinking"), "invalid", "known thinking"),
         (("models", "base", "deployments", 0, "prices", "input"), -1, "non-negative"),
         (
@@ -439,60 +579,90 @@ async def test_orchestrator_copy_reattaches_supplied_and_source_catalog_snapshot
 
 def test_role_overlay_merges_per_key_and_rejects_legacy_names() -> None:
     catalog = merge_catalog_overlay(
-        SHIPPED_CATALOG, {"roles": {"orchestrator": {"models": ["glm-5-3"]}}}
+        SHIPPED_CATALOG, {"roles": {"orchestrator": {"thinking": "medium"}}}
     )
-    assert catalog.roles["orchestrator"].models == ("glm-5-3",)
+    assert catalog.roles["orchestrator"].model == "glm-5-3"
+    assert catalog.roles["orchestrator"].thinking == "medium"
     assert (
         catalog.roles["orchestrator"].description
         == SHIPPED_CATALOG.roles["orchestrator"].description
     )
-    assert catalog.roles["advisor"] == SHIPPED_CATALOG.roles["advisor"]
+    assert catalog.roles["large"] == SHIPPED_CATALOG.roles["large"]
     with pytest.raises(ValueError, match=r"migration required.*\[roles\]"):
         merge_catalog_overlay(SHIPPED_CATALOG, {"tags": {}})
     with pytest.raises(ValueError, match="remove aliases"):
         merge_catalog_overlay(SHIPPED_CATALOG, {"models": {"glm-5-3": {"aliases": []}}})
 
 
-def test_role_priority_skips_disabled_first_member() -> None:
+def test_disabled_preset_model_does_not_fall_back_to_another_model() -> None:
     catalog = merge_catalog_overlay(
         SHIPPED_CATALOG,
         {
-            "providers": {"backup/default": {"api_base": "https://backup.test/v1"}},
+            "providers": {"backup": {"api_base": "https://backup.test/v1"}},
             "models": {
                 "glm-5-3": {"disabled": True},
                 "backup-model": {
-                    "deployments": [
-                        {"provider": "backup/default", "name": "backup-model"}
-                    ]
+                    "deployments": [{"provider": "backup", "name": "backup-model"}]
                 },
             },
-            "roles": {"priority": {"models": ["glm-5-3", "backup-model"]}},
+            "roles": {"priority": {"model": "glm-5-3", "thinking": "high"}},
         },
     )
-    assert (
-        ModelResolver(CatalogSnapshot(catalog, "test")).resolve("@priority").base_model
-        == "backup-model"
-    )
+    with pytest.raises(ModelResolutionError, match="disabled"):
+        ModelResolver(CatalogSnapshot(catalog, "test")).resolve("@priority")
 
 
-def test_role_priority_skips_allowlist_excluded_first_member() -> None:
+def test_unknown_expression_options_only_list_eligible_models_and_roles() -> None:
+    raw = _minimal()
+    raw["providers"]["disabled-provider"] = {  # type: ignore[index]
+        "api_base": "https://disabled.test",
+        "disabled": True,
+    }
+    raw["models"].update({  # type: ignore[union-attr]
+        "off": {
+            "disabled": True,
+            "deployments": [{"provider": "test-provider", "name": "off"}],
+        },
+        "blocked": {
+            "deployments": [{"provider": "disabled-provider", "name": "blocked"}]
+        },
+        "restricted": {
+            "deployments": [{"provider": "test-provider", "name": "restricted"}]
+        },
+    })
+    raw["roles"] = {
+        "usable": {"model": "base", "thinking": "medium"},
+        "disabled-only": {"model": "off", "thinking": "medium"},
+        "restricted-only": {"model": "restricted", "thinking": "medium"},
+    }
+    resolver = ModelResolver(CatalogSnapshot(ModelCatalog.model_validate(raw), "test"))
+    for expression, expected in (
+        ("unknown", "Valid canonical models: base"),
+        ("@unknown", "Valid roles: @usable"),
+    ):
+        with pytest.raises(ModelResolutionError) as error:
+            resolver.resolve(expression, allowed_models=["base"])
+        assert expected in str(error.value)
+        assert "off" not in str(error.value)
+        assert "blocked" not in str(error.value)
+        assert "restricted" not in str(error.value)
+    assert resolver.resolve("@usable", allowed_models=["base"]).base_model == "base"
+
+
+def test_allowlist_exclusion_does_not_change_preset_model() -> None:
     catalog = merge_catalog_overlay(
         SHIPPED_CATALOG,
         {
-            "providers": {"backup/default": {"api_base": "https://backup.test/v1"}},
+            "providers": {"backup": {"api_base": "https://backup.test/v1"}},
             "models": {
                 "backup-model": {
-                    "deployments": [
-                        {"provider": "backup/default", "name": "backup-model"}
-                    ]
+                    "deployments": [{"provider": "backup", "name": "backup-model"}]
                 }
             },
-            "roles": {"priority": {"models": ["glm-5-3", "backup-model"]}},
+            "roles": {"priority": {"model": "glm-5-3", "thinking": "high"}},
         },
     )
-    assert (
-        ModelResolver(CatalogSnapshot(catalog, "test"))
-        .resolve("@priority", allowed_models=["backup-model"])
-        .base_model
-        == "backup-model"
-    )
+    with pytest.raises(ModelResolutionError, match="permitted"):
+        ModelResolver(CatalogSnapshot(catalog, "test")).resolve(
+            "@priority", allowed_models=["backup-model"]
+        )

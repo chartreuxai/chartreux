@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from textual.app import ComposeResult
-from textual.containers import Horizontal
+from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.widget import Widget
 
@@ -14,6 +14,7 @@ from chartreux.cli.commands import CommandRegistry
 from chartreux.cli.history_manager import HistoryManager
 from chartreux.cli.input_modes import InputMode
 from chartreux.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
+from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
 
@@ -70,6 +71,7 @@ class ChatInputBody(Widget):
         super().__init__(**kwargs)
         self.input_widget: ChatTextArea | None = None
         self.prompt_widget: NoMarkupStatic | None = None
+        self._queue_footer: NoMarkupStatic | None = None
         self._command_registry = command_registry
         self._queue_edit_active_getter = queue_edit_active_getter
         self._queue_items_getter = queue_items_getter
@@ -87,14 +89,29 @@ class ChatInputBody(Widget):
             self.history = None
 
     def compose(self) -> ComposeResult:
-        with Horizontal():
-            self.prompt_widget = NoMarkupStatic(">", id="prompt")
-            yield self.prompt_widget
+        with Vertical(classes="input-body-layout"):
+            with Horizontal():
+                self.prompt_widget = NoMarkupStatic(">", id="prompt")
+                yield self.prompt_widget
 
-            self.input_widget = ChatTextArea(
-                id="input", command_registry=self._command_registry
+                self.input_widget = ChatTextArea(
+                    id="input", command_registry=self._command_registry
+                )
+                yield self.input_widget
+            self._queue_footer = NoMarkupStatic("", id="queue-mode-footer")
+            self._queue_footer.display = False
+            yield self._queue_footer
+
+    def _update_queue_footer(self) -> None:
+        if self._queue_footer is None:
+            return
+        self._queue_footer.display = self.in_queue_mode
+        if self.in_queue_mode:
+            self._queue_footer.update(
+                "Enter Save  Esc Discard"
+                if self._queue_in_edit_mode
+                else f"{chrome_glyph('vertical')} Select  Enter Edit  Backspace/Delete Remove  Esc Exit"
             )
-            yield self.input_widget
 
     def on_mount(self) -> None:
         if self.input_widget:
@@ -297,12 +314,7 @@ class ChatInputBody(Widget):
         self.input_widget._queue_selection_active = True
         self._lock_input_for_selection()
         self._post_scroll()
-        self.post_message(
-            self.InlineNoticeRequested(
-                "Up/Down: select  ·  Enter: edit  ·  Backspace/Delete: remove  ·  Esc: exit",
-                timeout=3.0,
-            )
-        )
+        self._update_queue_footer()
         return True
 
     def on_chat_text_area_queue_selection_previous(
@@ -342,9 +354,7 @@ class ChatInputBody(Widget):
         self.input_widget._queue_edit_active = True
         self._unlock_input_for_edit()
         self._load_history_entry(content)
-        self.post_message(
-            self.InlineNoticeRequested("Enter to save · Esc to discard", timeout=None)
-        )
+        self._update_queue_footer()
 
     def on_chat_text_area_queue_selection_remove(
         self, _event: ChatTextArea.QueueSelectionRemove
@@ -387,12 +397,14 @@ class ChatInputBody(Widget):
             self.input_widget.clear_text()
             self._update_prompt()
         self._lock_input_for_selection()
+        self._update_queue_footer()
         self._post_scroll()
         self.post_message(self.InlineNoticeCleared())
 
     def _exit_queue_mode(self) -> None:
         was_in_edit = self._queue_in_edit_mode
         self._queue_cursor = -1
+        self._update_queue_footer()
         self._queue_items = []
         self._queue_in_edit_mode = False
         self._queue_edit_consumed = False
@@ -429,6 +441,7 @@ class ChatInputBody(Widget):
             self._update_prompt()
         self._notify_completion_reset()
         self._lock_input_for_selection()
+        self._update_queue_footer()
         if scroll_to_selection:
             self._post_scroll()
         self.post_message(self.InlineNoticeCleared())
@@ -467,9 +480,9 @@ class ChatInputBody(Widget):
                 self._queue_edit_consumed = True
                 self.post_message(
                     self.InlineNoticeRequested(
-                        "This message was already processed — "
+                        "Warning: This message was already processed — "
                         "press Enter to submit as new, or Escape to discard.",
-                        timeout=8.0,
+                        timeout=None,
                     )
                 )
                 return

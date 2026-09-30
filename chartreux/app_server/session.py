@@ -731,10 +731,15 @@ class AppServerSession:  # noqa: PLR0904
         )
         await self.respond_to_callback(callback.callback_id, output)
 
-    async def resume(self, session_id: str) -> None:
-        await self.resources.sessions.resume(
-            session_id, on_adopt=self._advance_event_generation
-        )
+    async def resume(
+        self, session_id: str, *, on_adopt: Callable[[], None] | None = None
+    ) -> None:
+        def adopted() -> None:
+            self._advance_event_generation()
+            if on_adopt is not None:
+                on_adopt()
+
+        await self.resources.sessions.resume(session_id, on_adopt=adopted)
         await self.resources.refresh()
 
     def _advance_event_generation(self) -> None:

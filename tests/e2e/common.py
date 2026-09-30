@@ -28,15 +28,11 @@ def write_e2e_config(
 ) -> None:
     vibe_home.mkdir(parents=True, exist_ok=True)
     (vibe_home / "config.toml").write_text(
-        "\n".join([
-            'active_model = "mock-model"',
-            "disable_welcome_banner_animation = true",
-        ]),
-        encoding="utf-8",
+        "\n".join(["disable_welcome_banner_animation = true"]), encoding="utf-8"
     )
     (vibe_home / "models.toml").write_text(
         "\n".join([
-            f'[providers."{provider_name}/default"]',
+            f'[providers."{provider_name}"]',
             f'api_base = "{api_base}"',
             'api_key_env_var = "MISTRAL_API_KEY"',
             'backend = "generic"',
@@ -46,13 +42,19 @@ def write_e2e_config(
             "temperature = 0.2",
             "",
             '[[models."mock-model".deployments]]',
-            f'provider = "{provider_name}/default"',
+            f'provider = "{provider_name}"',
             'name = "mock-model"',
             "supports_images = false",
             "",
-            '[roles."small-worker"]',
-            'description = "E2E worker role"',
-            'models = ["mock-model"]',
+            '[roles."orchestrator"]',
+            'description = "E2E main assistant preset"',
+            'model = "mock-model"',
+            'thinking = "high"',
+            "",
+            '[roles."medium"]',
+            'description = "E2E medium preset"',
+            'model = "mock-model"',
+            'thinking = "high"',
         ]),
         encoding="utf-8",
     )
@@ -154,7 +156,7 @@ def wait_for_request_count_while_draining_child_output(
 
 
 def wait_for_main_screen(child: pexpect.spawn, timeout: float = 20.0) -> None:
-    child.expect(ansi_tolerant_pattern("Chartreux v"), timeout=timeout)
+    child.expect(ansi_tolerant_pattern("Chartreux"), timeout=timeout)
 
 
 def drain_child_output(

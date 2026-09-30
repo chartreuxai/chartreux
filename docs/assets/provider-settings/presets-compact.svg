@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" data-cols="80" data-rows="24" viewBox="0 0 960 576" role="img">
+<title>Default presets at 80 by 24</title>
+<desc>Conceptual dark terminal frame. Main, Large, Medium, and Small each have one model and thinking level; Main is the saved default.</desc>
+<rect width="960" height="576" fill="#171a1f"/>
+<g fill="#e4e8ee" font-family="monospace" font-size="18">
+<text x="16" y="28" font-weight="bold">Provider Settings / Default presets</text>
+<text x="16" y="56" fill="#aab2bd">Step 3 · Two providers saved · Choose defaults</text>
+<text x="16" y="101">Role              Model                 Thinking</text>
+<rect x="0" y="111" width="960" height="29" fill="#dce3ed"/>
+<text x="16" y="134" fill="#10151c" font-weight="bold">▸ Main             glm-5-3               high   Default</text>
+<text x="16" y="162">  Large            glm-5-3               max</text>
+<text x="16" y="190">  Medium           glm-5-3               low</text>
+<text x="16" y="218">  Small            mistral-large         medium</text>
+<text x="16" y="254" fill="#aab2bd">Enter edits model + thinking for the selected preset.</text>
+<text x="16" y="300">  Finish setup</text>
+<text x="16" y="342" fill="#aab2bd">Current session: uses saved orchestrator preset</text>
+<text x="16" y="552" fill="#aab2bd">↑/↓ Navigate   Enter Edit/finish   Esc Models opener</text>
+</g>
+</svg>

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" data-cols="80" data-rows="24" viewBox="0 0 960 576" role="img">
+<title>Finish validation with direct preset repair</title>
+<desc>Conceptual 80 by 24 dark terminal frame. Provider saves succeeded; Finish identifies a missing credential for the Large preset and offers a focused repair action.</desc>
+<rect width="960" height="576" fill="#171a1f"/>
+<g fill="#e4e8ee" font-family="monospace" font-size="18">
+<text x="16" y="28" font-weight="bold">Provider Settings / Default presets</text>
+<text x="16" y="56" fill="#aab2bd">Providers and models saved · Finish needs one repair</text>
+<text x="16" y="108">orchestrator  glm-5-3      high   Ready</text>
+<text x="16" y="137">Medium        glm-5-3      low    Ready</text>
+<text x="16" y="166" fill="#f2c879">Large         local-model  max    Credential required</text>
+<text x="16" y="210" fill="#f2c879">Finish: Large uses local-model via local provider;</text>
+<text x="16" y="239" fill="#f2c879">LOCAL_API_KEY is missing. Saved models are preserved.</text>
+<rect x="0" y="259" width="960" height="29" fill="#dce3ed"/>
+<text x="16" y="282" fill="#10151c" font-weight="bold">▸ Repair local provider credential</text>
+<text x="16" y="315">  Edit Large preset</text>
+<text x="16" y="348">  Finish setup [unavailable]</text>
+<text x="16" y="552" fill="#aab2bd">↑/↓ Navigate   Enter Repair   Esc Presets opener</text>
+</g>
+</svg>

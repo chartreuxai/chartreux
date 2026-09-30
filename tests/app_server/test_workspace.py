@@ -101,7 +101,7 @@ def test_prepare_prompt_rejects_images_for_text_model(
     agent_loop = build_test_agent_loop(config=_vision_config(supports_images=False))
 
     with pytest.raises(
-        PromptPreparationError, match="`mistral/default/mistral-vibe-cli-latest`"
+        PromptPreparationError, match="`mistral/mistral-vibe-cli-latest`"
     ):
         prepare_prompt(agent_loop, "look at @shot.png")
 
@@ -119,7 +119,7 @@ def test_prepare_prompt_rejection_names_the_display_name(
 
     with pytest.raises(
         PromptPreparationError,
-        match=r"`mistral/default/mistral-vibe-cli-latest` does not support",
+        match=r"`mistral/mistral-vibe-cli-latest` does not support",
     ):
         prepare_prompt(agent_loop, "look at @shot.png")
 

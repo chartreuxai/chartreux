@@ -7,6 +7,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from textual.widgets import Static
 
 from chartreux.cli.textual_ui.app import ChartreuxApp, _run_app_with_cleanup
 from chartreux.cli.textual_ui.quit_manager import QUIT_CONFIRM_DELAY, QuitManager
@@ -38,7 +39,7 @@ class _SessionReadyApp:
 
     @pytest.fixture(autouse=True)
     def _set_app_server(self, app: ChartreuxApp) -> None:
-        app._app_server = MagicMock()
+        app._app_server = MagicMock(turn_active=False)
 
 
 class TestQuitManager:
@@ -115,7 +116,8 @@ class TestActionInterruptOrQuit(_SessionReadyApp):
             patch.object(app._quit_manager, "request_confirmation") as mock_confirm,
         ):
             app.action_interrupt_or_quit()
-        mock_confirm.assert_called_once_with("Ctrl+C", "")
+        assert mock_confirm.call_args.args[0] == "Ctrl+C"
+        assert "Main work:" in mock_confirm.call_args.args[1]
 
     def test_quits_on_confirmed(self, app: ChartreuxApp) -> None:
         app._quit_manager._confirm_time = time.monotonic()
@@ -149,7 +151,8 @@ class TestActionInterruptOrQuit(_SessionReadyApp):
             patch.object(app._quit_manager, "request_confirmation") as mock_confirm,
         ):
             app.action_interrupt_or_quit()
-        mock_confirm.assert_called_once_with("Ctrl+C", "")
+        assert mock_confirm.call_args.args[0] == "Ctrl+C"
+        assert "Main work:" in mock_confirm.call_args.args[1]
 
 
 class TestActionDeleteRightOrQuit(_SessionReadyApp):
@@ -170,7 +173,8 @@ class TestActionDeleteRightOrQuit(_SessionReadyApp):
             patch.object(app._quit_manager, "request_confirmation") as mock_confirm,
         ):
             app.action_delete_right_or_quit()
-        mock_confirm.assert_called_once_with("Ctrl+D", "")
+        assert mock_confirm.call_args.args[0] == "Ctrl+D"
+        assert "pending decisions:" in mock_confirm.call_args.args[1]
 
     def test_quits_on_confirmed(self, app: ChartreuxApp) -> None:
         app._quit_manager._confirm_time = time.monotonic()
@@ -188,22 +192,18 @@ class TestActionDeleteRightOrQuit(_SessionReadyApp):
             patch.object(app._quit_manager, "request_confirmation") as mock_confirm,
         ):
             app.action_delete_right_or_quit()
-        mock_confirm.assert_called_once_with("Ctrl+D", "")
+        assert mock_confirm.call_args.args[0] == "Ctrl+D"
+        assert "pending decisions:" in mock_confirm.call_args.args[1]
 
     def test_shows_queue_warning_when_queue_non_empty(self, app: ChartreuxApp) -> None:
         with (
             patch.object(app, "_get_chat_input", return_value=None),
-            patch.object(
-                app._queue,
-                "quit_warning_extra",
-                return_value="1 queued message will be discarded",
-            ),
+            patch.object(type(app._queue), "has_server_work", True),
             patch.object(app._quit_manager, "request_confirmation") as mock_confirm,
         ):
             app.action_delete_right_or_quit()
-        mock_confirm.assert_called_once_with(
-            "Ctrl+D", "1 queued message will be discarded"
-        )
+        assert mock_confirm.call_args.args[0] == "Ctrl+D"
+        assert "queued input:" in mock_confirm.call_args.args[1]
 
     def test_quits_immediately_when_confirmation_disabled(
         self, monkeypatch: pytest.MonkeyPatch
@@ -211,7 +211,7 @@ class TestActionDeleteRightOrQuit(_SessionReadyApp):
         app = build_test_chartreux_app(
             config=build_test_vibe_config(ask_confirmation_on_exit=False)
         )
-        app._app_server = MagicMock()
+        app._app_server = MagicMock(turn_active=False)
         config = build_test_app_config().model_copy(
             update={"ask_confirmation_on_exit": False}
         )
@@ -301,3 +301,98 @@ async def test_run_app_with_cleanup_sigterm_triggers_force_quit(
 
     force_quit.assert_called_once_with()
     remove_handler.assert_any_call(signal.SIGTERM)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["/exit", "Ctrl+C", "Ctrl+D"])
+async def test_intentional_exits_require_consequence_confirmation(
+    app: ChartreuxApp, route: str
+) -> None:
+    app._app_server = MagicMock(turn_active=True)
+    app._active_callback = MagicMock()
+    with (
+        patch.object(app, "_force_quit") as force,
+        patch.object(app._quit_manager, "request_confirmation") as confirm,
+        patch.object(app, "_get_chat_input", return_value=None),
+        patch.object(app, "_try_interrupt_no_job_steps", return_value=False),
+        patch.object(app, "_try_interrupt_running_job", return_value=False),
+    ):
+        if route == "/exit":
+            await app._exit_app()
+        elif route == "Ctrl+C":
+            app.action_interrupt_or_quit()
+        else:
+            app.action_delete_right_or_quit()
+    force.assert_not_called()
+    assert confirm.call_args.args[0] == route
+    consequences = confirm.call_args.args[1]
+    assert "Main work:" in consequences
+    assert "background agents:" in consequences
+    assert "pending decisions:" in consequences
+    assert "queued input:" in consequences
+
+
+@pytest.mark.asyncio
+async def test_explicit_exit_skips_idle_confirmation_with_session_attached(
+    app: ChartreuxApp,
+) -> None:
+    app._app_server = MagicMock(turn_active=False)
+    with (
+        patch.object(app, "_force_quit") as force,
+        patch.object(app._quit_manager, "request_confirmation") as confirm,
+    ):
+        await app._exit_app()
+
+    force.assert_called_once()
+    confirm.assert_not_called()
+
+
+def test_disabled_confirmation_still_checks_agents_and_queued_input(
+    app: ChartreuxApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = build_test_app_config().model_copy(
+        update={"ask_confirmation_on_exit": False}
+    )
+    monkeypatch.setattr(ChartreuxApp, "config", property(lambda _app: config))
+    app._app_server = MagicMock(turn_active=False)
+    app._agent_summaries = [
+        MagicMock(
+            current_run_status="running", last_run_status=None, availability="running"
+        )
+    ]
+    with (
+        patch.object(app, "_get_chat_input", return_value=None),
+        patch.object(type(app._queue), "has_server_work", True),
+        patch.object(app._quit_manager, "request_confirmation") as confirm,
+        patch.object(app, "_force_quit") as force,
+    ):
+        app.action_delete_right_or_quit()
+    force.assert_not_called()
+    assert (
+        "background agents: shutdown requests their stop" in confirm.call_args.args[1]
+    )
+    assert "queued input: not run after exit" in confirm.call_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_consequential_exit_modal_is_reachable_and_cancelable() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        app._pending_turn = True
+        with patch.object(app, "_force_quit") as force:
+            await app._exit_app()
+            await pilot.pause()
+            from chartreux.cli.textual_ui.quit_manager import ExitConsequencesScreen
+
+            dialog = app.screen
+            assert isinstance(dialog, ExitConsequencesScreen)
+            assert "Main work:" in str(dialog.query_one("Static", Static).content)
+            await pilot.press("escape")
+            await pilot.pause()
+            force.assert_not_called()
+            assert not isinstance(app.screen, ExitConsequencesScreen)
+            await app._exit_app()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            force.assert_called_once()

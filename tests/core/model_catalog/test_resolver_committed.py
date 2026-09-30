@@ -21,7 +21,7 @@ def _resolver_config():
 
 
 def _identity(
-    *, base_model: str = "model-a", provider: str = "mistral/default"
+    *, base_model: str = "model-a", provider: str = "mistral"
 ) -> CommittedModelIdentity:
     return CommittedModelIdentity(
         base_model=base_model,
@@ -35,7 +35,7 @@ def test_resolve_committed_returns_the_stored_deployment() -> None:
     resolved = resolver_for(_resolver_config()).resolve_committed(_identity())
 
     assert resolved.base_model == "model-a"
-    assert resolved.deployment.provider == "mistral/default"
+    assert resolved.deployment.provider == "mistral"
     assert resolved.deployment.name == "model-a"
 
 
@@ -50,8 +50,6 @@ def test_resolve_committed_reports_missing_base_model() -> None:
 
 def test_resolve_committed_reports_missing_deployment() -> None:
     with pytest.raises(ModelResolutionError) as exc_info:
-        resolver_for(_resolver_config()).resolve_committed(
-            _identity(provider="other/default")
-        )
+        resolver_for(_resolver_config()).resolve_committed(_identity(provider="other"))
 
     assert exc_info.value.code == "committed_deployment_missing"

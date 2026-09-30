@@ -11,6 +11,32 @@ Run `chartreux` from a project directory to open the interactive interface. Type
 
 For commands, session controls, and programmatic invocation, see the [command reference](../reference/commands.md).
 
+## Settings and provider setup
+
+Use `/settings` to browse curated settings, `/providers` to open Provider
+Settings, and `/web-search` to configure the search provider and credentials.
+The first-run `chartreux --setup` flow connects a provider, configures its
+models, offers **Add another provider** or **Continue to presets**, and checks
+web-search readiness after presets. A ready automatic Mistral configuration or
+ready explicit search provider is preserved without opening the Web search
+step. If the step opens, it offers Exa, Brave, and DuckDuckGo; setup does not
+offer `auto` or a second Mistral choice. **Back to presets** returns to preset
+choices, **Skip for now** leaves current search settings unchanged, and
+**Finish setup** completes when the configuration and required key are ready.
+With edited settings, **Save and finish** saves and applies them before
+completing setup. In standalone Settings, Mistral appears once; `auto` is still
+accepted as a Mistral config alias. Follow each screen's labeled Save and
+forward actions; you do not need to backtrack to advance.
+
+On Provider Settings list and action screens, Up and Down move through visible
+choices, Enter edits or activates the selected control, and Tab is optional.
+Escape backs out one local level. In the Web Search editor, arrows move within
+the current provider choice or text field, Space selects a provider, Enter
+accepts the current draft, and Tab moves focus between controls. Escape offers
+a Keep editing/Discard edits choice when a draft needs one. Read each screen's help because
+some settings save immediately while provider and web-search forms use explicit
+Save actions.
+
 ## Input and queueing
 
 A prompt submitted while a turn is running joins the queued follow-up input. Queued prompts are combined into the next follow-up turn rather than executed as separate FIFO turns.
@@ -35,6 +61,10 @@ The available themes are `auto` (the default), `light`, and `dark`. `auto` first
 # config.toml
 theme = "dark"
 ```
+
+Set `ascii_chrome = true` in `config.toml` to use ASCII equivalents for
+application chrome glyphs such as arrows, status marks, and spinners. It is
+`false` by default and does not change user-provided text.
 
 ## Notifications
 

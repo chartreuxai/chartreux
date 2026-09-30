@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from chartreux.core.config.models import ModelConfig, ThinkingLevel
+from chartreux.core.llm.thinking_levels import get_thinking_levels
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.schema import (
     BaseModelDefinition,
@@ -28,6 +29,17 @@ class ModelResolutionError(ValueError):
         self.code = code
 
 
+def _supports_thinking(
+    provider: ProviderDefinition, deployment: DeploymentDefinition, thinking: str
+) -> bool:
+    """Check declared deployment limits and known backend wire capabilities."""
+    declared = deployment.supported_thinking_levels
+    if declared is not None and thinking not in declared:
+        return False
+    levels = get_thinking_levels(provider.backend, provider.api_style, deployment.name)
+    return levels is None or thinking in levels
+
+
 @dataclass(frozen=True)
 class ResolvedModel:
     """A canonical base and concrete catalog deployment."""
@@ -37,6 +49,7 @@ class ResolvedModel:
     deployment: DeploymentDefinition
     provider: ProviderDefinition
     catalog_revision: str
+    thinking: str | None = None
 
     @property
     def identity(self) -> CommittedModelIdentity:
@@ -45,12 +58,30 @@ class ResolvedModel:
             provider=self.deployment.provider,
             wire_name=self.deployment.name,
             catalog_revision=self.catalog_revision,
+            thinking=self.thinking,
         )
 
     def materialize(
-        self, *, auto_compact_threshold: int, thinking: str | None = None
+        self,
+        *,
+        auto_compact_threshold: int,
+        thinking: str | None = None,
+        validate_thinking: bool = True,
     ) -> ModelConfig:
         """Produce the legacy backend input, always retaining the wire name."""
+        selected_thinking = (
+            thinking
+            if thinking is not None
+            else self.thinking or self.definition.thinking
+        )
+        if validate_thinking and not _supports_thinking(
+            self.provider, self.deployment, selected_thinking
+        ):
+            raise ModelResolutionError(
+                "thinking_unsupported",
+                f"Thinking level {selected_thinking!r} is unsupported by "
+                f"{self.deployment.provider}/{self.deployment.name}; edit the preset thinking level",
+            )
         prices = self.deployment.prices
         return ModelConfig(
             name=self.deployment.name,
@@ -68,10 +99,7 @@ class ResolvedModel:
             input_price_known=prices.input is not None,
             output_price_known=prices.output is not None,
             cached_input_price_known=prices.cached_input is not None,
-            thinking=cast(
-                ThinkingLevel,
-                thinking if thinking is not None else self.definition.thinking,
-            ),
+            thinking=cast(ThinkingLevel, selected_thinking),
             supported_thinking_levels=cast(
                 list[ThinkingLevel] | None, self.deployment.supported_thinking_levels
             ),
@@ -85,12 +113,36 @@ class ResolvedModel:
 
 
 class ModelResolver:
-    """Resolve catalog expressions with no implicit model or deployment fallback."""
+    """Resolve singleton presets, selecting a deployment of their exact model."""
 
     def __init__(self, snapshot: CatalogSnapshot) -> None:
         self.snapshot = snapshot
 
-    def canonicalize(self, expression: str) -> str:
+    def eligible_models(self, allowed_models: Sequence[str] = ()) -> set[str]:
+        """Canonical bases with an enabled, permitted deployment."""
+        return {
+            base
+            for base, definition in self.snapshot.catalog.models.items()
+            if not definition.disabled
+            and any(
+                not deployment.disabled
+                and not self.snapshot.catalog.providers[deployment.provider].disabled
+                and self._allowed(base, definition, deployment, allowed_models)
+                for deployment in definition.deployments
+            )
+        }
+
+    def eligible_roles(self, allowed_models: Sequence[str] = ()) -> list[str]:
+        eligible = self.eligible_models(allowed_models)
+        return sorted(
+            name
+            for name, role in self.snapshot.catalog.roles.items()
+            if role.model in eligible
+        )
+
+    def canonicalize(
+        self, expression: str, *, allowed_models: Sequence[str] = ()
+    ) -> str:
         """Return the one base represented by a non-role expression."""
         if not isinstance(expression, str) or not expression:
             raise ModelResolutionError(
@@ -102,7 +154,7 @@ class ModelResolver:
                     "reserved_at", "'@' is reserved for a named role"
                 )
             raise ModelResolutionError(
-                "role_not_scalar", "A role expression selects an ordered model set"
+                "role_not_scalar", "A role expression selects a named preset"
             )
         if expression in self.snapshot.catalog.models:
             return expression
@@ -111,11 +163,15 @@ class ModelResolver:
                 "invalid_expression",
                 "Provider-qualified model expressions are unsupported; use a canonical base name",
             )
+        options = ", ".join(sorted(self.eligible_models(allowed_models))) or "none"
         raise ModelResolutionError(
-            "unknown_model", f"Unknown model expression {expression!r}"
+            "unknown_model",
+            f"Unknown model expression {expression!r}. Valid canonical models: {options}",
         )
 
-    def expression_bases(self, expression: str) -> tuple[str, ...]:
+    def expression_bases(
+        self, expression: str, *, allowed_models: Sequence[str] = ()
+    ) -> tuple[str, ...]:
         """Expand one scalar expression into canonical base names."""
         if not isinstance(expression, str):
             raise ModelResolutionError(
@@ -129,11 +185,18 @@ class ModelResolver:
         if expression.startswith("@"):
             definition = self.snapshot.catalog.roles.get(expression[1:])
             if definition is None:
-                raise ModelResolutionError(
-                    "unknown_role", f"Unknown model role {expression!r}"
+                options = (
+                    ", ".join(
+                        f"@{name}" for name in self.eligible_roles(allowed_models)
+                    )
+                    or "none"
                 )
-            return definition.models
-        return (self.canonicalize(expression),)
+                raise ModelResolutionError(
+                    "unknown_role",
+                    f"Unknown model role {expression!r}. Valid roles: {options}",
+                )
+            return (definition.model,)
+        return (self.canonicalize(expression, allowed_models=allowed_models),)
 
     def resolve(
         self,
@@ -141,10 +204,21 @@ class ModelResolver:
         *,
         allowed_models: Sequence[str] = (),
         candidate_filter: Callable[[ResolvedModel], bool] | None = None,
+        thinking_override: str | None = None,
     ) -> ResolvedModel:
-        """Resolve the first allowed, enabled, and compatible deployment."""
+        """Resolve a single canonical model, selecting an eligible deployment."""
+        role = (
+            self.snapshot.catalog.roles.get(expression[1:])
+            if isinstance(expression, str) and expression.startswith("@")
+            else None
+        )
         last_error: ModelResolutionError | None = None
-        for base in self.expression_bases(expression):
+        for base in self.expression_bases(expression, allowed_models=allowed_models):
+            if base not in self.snapshot.catalog.models:
+                raise ModelResolutionError(
+                    "preset_model_missing",
+                    f"Preset {expression!r} selects missing model {base!r}; edit its model and thinking fields",
+                )
             definition = self.snapshot.catalog.models[base]
             if definition.disabled:
                 last_error = ModelResolutionError(
@@ -175,19 +249,39 @@ class ModelResolver:
                     f"Model {base!r} has no deployment permitted by allowed_models",
                 )
                 continue
+            thinking_compatible = False
             for deployment in allowed:
+                if role is not None and not _supports_thinking(
+                    self.snapshot.catalog.providers[deployment.provider],
+                    deployment,
+                    thinking_override
+                    if thinking_override is not None
+                    else role.thinking,
+                ):
+                    continue
+                thinking_compatible = True
                 resolved = ResolvedModel(
                     base,
                     definition,
                     deployment,
                     self.snapshot.catalog.providers[deployment.provider],
                     self.snapshot.revision,
+                    role.thinking if role is not None else None,
                 )
                 if candidate_filter is None or candidate_filter(resolved):
                     return resolved
             last_error = ModelResolutionError(
-                "no_compatible_deployment",
-                f"Model {base!r} has no compatible available deployment",
+                "thinking_unsupported"
+                if role is not None and not thinking_compatible
+                else "no_compatible_deployment",
+                (
+                    f"Preset {expression!r} has no deployment of model {base!r} "
+                    f"supporting thinking level "
+                    f"{(thinking_override if thinking_override is not None else role.thinking)!r}; "
+                    "edit its thinking level"
+                    if role is not None and not thinking_compatible
+                    else f"Model {base!r} has no compatible available deployment"
+                ),
             )
         if last_error is not None:
             raise last_error
@@ -236,12 +330,21 @@ class ModelResolver:
                 "allowlist_excluded",
                 f"Committed deployment {label!r} is not permitted by allowed_models",
             )
+        if identity.thinking is not None and not _supports_thinking(
+            provider, deployment, identity.thinking
+        ):
+            raise ModelResolutionError(
+                "committed_thinking_unsupported",
+                f"Committed thinking level {identity.thinking!r} is no longer "
+                f"supported by {label!r}; edit the preset thinking level",
+            )
         return ResolvedModel(
             identity.base_model,
             definition,
             deployment,
             provider,
             self.snapshot.revision,
+            identity.thinking,
         )
 
     def resolve_precedence(

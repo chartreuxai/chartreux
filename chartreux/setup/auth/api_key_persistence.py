@@ -8,6 +8,7 @@ from dotenv import set_key, unset_key
 from chartreux.core.config import ChartreuxConfigSchema, ProviderConfig
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.model_catalog.loader import CatalogLoadError, CatalogStore
+from chartreux.core.model_catalog.schema import valid_provider_name
 from chartreux.core.paths import GLOBAL_ENV_FILE
 from chartreux.core.utils.concurrency import run_sync
 from chartreux.observability.logging import logger
@@ -52,10 +53,9 @@ async def apply_provider_to_config(
     payload = provider.model_dump(
         mode="json", exclude={"name"}, exclude_none=True, exclude_defaults=True
     )
-    provider_id = provider.name if "/" in provider.name else f"{provider.name}/default"
     try:
-        CatalogStore().upsert_provider(payload, provider_id)
-    except CatalogLoadError as failure:
+        CatalogStore().upsert_provider(payload, valid_provider_name(provider.name))
+    except (CatalogLoadError, ValueError) as failure:
         logger.error(
             "Failed to persist provider to models.toml name=%s",
             provider.name,

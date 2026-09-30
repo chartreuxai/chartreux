@@ -695,7 +695,7 @@ def test_agents_update_carries_retention_metadata() -> None:
                 ttl_remaining_seconds=42.0,
                 effective_model="strong",
                 base_model="base",
-                active_provider="test/provider",
+                active_provider="test-provider",
                 effective_thinking="high",
                 result_expired=True,
             )
@@ -725,7 +725,7 @@ def test_agents_update_carries_retention_metadata() -> None:
         "ttlRemainingSeconds": 42.0,
         "effectiveModel": "strong",
         "baseModel": "base",
-        "activeProvider": "test/provider",
+        "activeProvider": "test-provider",
         "effectiveThinking": "high",
         "resultExpired": True,
     }

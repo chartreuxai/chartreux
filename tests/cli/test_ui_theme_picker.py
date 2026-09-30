@@ -9,6 +9,7 @@ import pytest
 
 from chartreux.cli.textual_ui.app import BottomApp
 from chartreux.config_values import AUTO_THEME
+from chartreux.ui.widgets.navigable_option_list import NavigableOptionList
 from chartreux.ui.widgets.theme_picker import ThemePickerApp
 from tests.conftest import build_test_chartreux_app, build_test_vibe_config
 
@@ -183,6 +184,44 @@ async def test_theme_picker_restores_canonical_theme_when_write_fails() -> None:
 
         assert app.config.theme == "dark"
         assert app.theme == "ansi-dark"
+
+
+@pytest.mark.asyncio
+async def test_theme_failure_keeps_selection_for_retry_and_navigation() -> None:
+    app = build_test_chartreux_app(config=build_test_vibe_config(theme="dark"))
+    async with app.run_test() as pilot:
+        await app._show_theme()
+        await pilot.pause(0.1)
+        picker = app.query_one(ThemePickerApp)
+        with patch.object(
+            app.app_server.resources.config,
+            "update",
+            new=AsyncMock(side_effect=RuntimeError("disk full")),
+        ):
+            await app.on_theme_picker_app_theme_selected(
+                ThemePickerApp.ThemeSelected("light")
+            )
+        assert app._current_bottom_app == BottomApp.ThemePicker
+        assert app.query_one(ThemePickerApp) is picker
+        assert app._pending_theme_selection == "light"
+        assert app.theme == "ansi-dark"
+        assert "disk full" in app._recovery_issues["theme-save"][1]
+        await app._switch_to_input_app()
+        assert app.query_one("#recovery-notice").display
+        await app._show_theme()
+        await pilot.pause(0.1)
+        assert (
+            app
+            .query_one(ThemePickerApp)
+            .query_one("#themepicker-options", NavigableOptionList)
+            .highlighted
+            == 1
+        )
+        await app.on_theme_picker_app_theme_selected(
+            ThemePickerApp.ThemeSelected("light")
+        )
+        assert "theme-save" not in app._recovery_issues
+        assert app._pending_theme_selection is None
 
 
 @pytest.mark.asyncio

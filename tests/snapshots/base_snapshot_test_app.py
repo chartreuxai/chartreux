@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
+import weakref
 
 from rich.style import Style
 from textual.widgets.text_area import TextAreaTheme
@@ -12,8 +12,9 @@ from chartreux.core.config import ChartreuxConfigSchema
 from tests.conftest import (
     build_test_agent_loop,
     build_test_vibe_config,
-    get_base_config,
+    make_test_history_file,
 )
+from tests.snapshots.snapshot_event_loop import install_snapshot_wake
 from tests.stubs.app_server import create_test_app_server_session
 from tests.stubs.fake_backend import FakeBackend
 
@@ -29,8 +30,9 @@ def default_config(**kwargs) -> ChartreuxConfigSchema:
     - Pins the model set to the shared on-disk test seed so the banner renders a
       stable single model regardless of the schema's evolving built-in defaults.
     """
-    seed = get_base_config()
-    kwargs.setdefault("active_model", seed["active_model"])
+    # Use the session-scoped model override to keep banner snapshots stable while
+    # the persisted main default lives in the catalog's orchestrator preset.
+    kwargs.setdefault("active_model", "glm-5-3")
     kwargs.setdefault("show_thinking_nodes", True)
     return build_test_vibe_config(
         disable_welcome_banner_animation=True,
@@ -60,11 +62,22 @@ class BaseSnapshotTestApp(ChartreuxApp):
             **agent_loop_kwargs,
         )
 
+        history_file = kwargs.pop("history_file", None)
+        history_dir = None
+        if history_file is None:
+            history_file, history_dir = make_test_history_file()
+
         super().__init__(
-            history_file=kwargs.pop("history_file", Path(".chartreuxhistory")),
+            history_file=history_file,
             app_server=lambda: create_test_app_server_session(resolved_agent_loop),
             **kwargs,
         )
+        if history_dir is not None:
+            weakref.finalize(self, history_dir.cleanup)
+
+    async def on_load(self):
+        install_snapshot_wake()
+        await super().on_load()
 
     async def on_ready(self):
         # on_ready is called once all the on_mount in the MRO chain have been called

@@ -35,6 +35,8 @@ def test_web_search_missing_credentials_are_actionable_and_current(
     assert len(missing) == 1
     assert missing_key in missing[0]
     assert "tools.web_search.api_key_env_var" in missing[0]
+    assert "/web-search" in missing[0]
+    assert "Settings > Web Search" in missing[0]
     assert "mock" not in missing[0]
     monkeypatch.setenv(missing_key, "restored-secret")
     assert project_config_view(config).validation_warnings == []

@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import pytest
+import pytest_asyncio
 from textual.geometry import Offset
 from textual.message import Message
 from textual.selection import Selection
 
 from chartreux.cli.autocompletion.completers import PathCompleter
 from chartreux.cli.textual_ui.widgets.chat_input import ChatInputContainer, ChatTextArea
+from chartreux.cli.textual_ui.widgets.chat_input.completion_popup import CompletionPopup
 from chartreux.cli.textual_ui.widgets.messages import UserMessage
 from tests.conftest import build_test_chartreux_app
+from tests.snapshots.snapshot_event_loop import install_snapshot_wake
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _snapshot_event_loop_wake() -> None:
+    install_snapshot_wake()
+
 
 OPTION_WORD_LEFT_KEYS = ["alt+left", "ctrl+left"]
 OPTION_WORD_RIGHT_KEYS = ["alt+right", "ctrl+right"]
@@ -259,3 +268,66 @@ async def test_steer_chord_does_nothing_when_input_has_text() -> None:
         assert posted == []
         assert submitted == []
         assert app.query_one(ChatInputContainer).value == "draft message"
+
+
+@pytest.mark.asyncio
+async def test_escape_dismisses_completion_before_clearing_slash_input() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause(0.1)
+        text_area = app.query_one(ChatTextArea)
+        text_area.focus()
+        await pilot.press("/", "t", "h")
+        await pilot.pause(0.1)
+
+        chat_input = app.query_one(ChatInputContainer)
+        popup = app.query_one(CompletionPopup)
+        assert popup.styles.display == "block"
+        assert chat_input.value == "/th"
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert popup.styles.display == "none"
+        assert chat_input.value == "/th"
+        assert app.focused is text_area
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert chat_input.value == ""
+
+
+@pytest.mark.asyncio
+async def test_workbench_escape_is_not_consumed_by_hidden_slash_input() -> None:
+    from typing import ClassVar
+
+    from textual.binding import Binding
+    from textual.screen import Screen
+    from textual.widgets import Static
+
+    class ProviderWorkbenchScreen(Screen):
+        BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "back", "Back")]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.back_count = 0
+
+        def compose(self):
+            yield Static("workbench")
+
+        def action_back(self) -> None:
+            self.back_count += 1
+
+    app = build_test_chartreux_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause(0.1)
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.value = "/th"
+        screen = ProviderWorkbenchScreen()
+        await app.push_screen(screen)
+        await pilot.pause(0.1)
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert screen.back_count == 1
+        assert chat_input.value == "/th"

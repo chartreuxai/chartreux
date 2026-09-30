@@ -38,6 +38,24 @@ method list, including typed parameter and result models. It covers:
   trust and Git worktree operations; and
 - MCP catalog read/add/remove/toggle/refresh/login/logout operations.
 
+## Settings projection and writes
+
+`config/settings/read` returns the curated settings view and the current user
+configuration revision. Its optional `web_search` projection contains only
+supported search-setting leaves, with effective and saved values, their
+origins, selected credential-variable names, readiness, and safe repair
+metadata. It never returns a resolved API-key value. Readiness reflects local
+configuration and credential availability; it is not a provider connectivity
+probe.
+
+Clients save web-search settings through `config/write` with the user target
+and the revision from the read. The server validates the complete candidate
+search configuration before applying the write. The response reports
+persistence and runtime application separately, so a client can explain a
+successful save whose runtime reload failed and retry application without
+writing the settings again. Credential persistence remains a separate client
+action and is not part of the settings projection.
+
 The server emits typed live notifications and can send typed callbacks or
 advertised `clientTool/*` requests to a capable client. It does not offer a
 generic command-execution RPC: clients map their own presentation commands to

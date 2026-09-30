@@ -91,6 +91,12 @@ class SlashCommandController:
             self._suggestions, self._selected_index
         )
 
+    def accept_suggestion(self, index: int, text: str, cursor_index: int) -> bool:
+        if not 0 <= index < len(self._suggestions):
+            return False
+        self._selected_index = index
+        return self._apply_selected_completion(text, cursor_index)
+
     def _apply_selected_completion(self, text: str, cursor_index: int) -> bool:
         if not self._suggestions:
             return False

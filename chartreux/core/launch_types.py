@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from chartreux.core.config.models import ThinkingLevel
 from chartreux.core.tools.models import ToolPermission
@@ -29,7 +29,9 @@ class LaunchConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    model: str | None = None
+    model: str | None = Field(
+        default=None, description="canonical model name or `@role`"
+    )
     instructions: str | None = None
     system_prompt_id: str | None = None
     thinking: ThinkingLevel | None = None

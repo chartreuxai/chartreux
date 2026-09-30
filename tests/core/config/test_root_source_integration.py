@@ -46,7 +46,7 @@ async def test_real_user_roots_are_accepted_and_immutable(tmp_path: Path) -> Non
     assert roots[0].roots == (tmp_path / "extra",)
     orchestrator.config.authorized_roots_by_project.clear()
     assert orchestrator.restrictions[-1].authorized_roots == roots
-    assert await orchestrator.set_field("/active_model", "", reason="ordinary") == []
+    assert await orchestrator.set_field("/theme", "dark", reason="ordinary") == []
     assert orchestrator.restrictions[-1].authorized_roots == roots
     staged = await orchestrator._stage_policy_replacement(
         source="renamed-user", tools={}, expected_token=orchestrator.accepted_token

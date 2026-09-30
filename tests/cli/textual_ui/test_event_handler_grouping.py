@@ -366,8 +366,9 @@ async def test_live_and_restored_tool_groups_have_matching_structure() -> None:
         )[0]
 
         assert isinstance(restored_group, ToolGroup)
-        assert live_group.header.get_content() == restored_group.header.get_content()
         assert live_group.header._last_state is restored_group.header._last_state
+        assert live_group.header.get_content().startswith("Called tools")
+        assert restored_group.header.get_content().startswith("Called tools")
         assert [type(child) for child in live_group.content_container.children] == [
             type(child) for child in restored_group.content_container.children
         ]

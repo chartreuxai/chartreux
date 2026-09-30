@@ -33,17 +33,13 @@ class ContextProgress(NoMarkupStatic):
         super().__init__(**kwargs)
 
     def watch_tokens(self, new_state: TokenState) -> None:
-        if new_state.max_tokens == 0:
+        if new_state.max_tokens <= 0 or new_state.current_tokens <= 0:
             self._update_if_changed("")
             return
-        if new_state.current_tokens < 0:
-            self._update_if_changed("Context usage unknown")
-            return
 
-        ratio = min(1, new_state.current_tokens / new_state.max_tokens)
         text = (
-            f"{_format_token_count(new_state.current_tokens)}/"
-            f"{_format_token_count(new_state.max_tokens)} tokens ({ratio:.0%})"
+            f"ctx {_format_token_count(new_state.current_tokens)}/"
+            f"{_format_token_count(new_state.max_tokens)}"
         )
         self._update_if_changed(text)
 

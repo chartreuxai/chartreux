@@ -160,8 +160,8 @@ async def test_project_discovery_write_keeps_selection_authority_at_discovered_f
         default_layer_resolver=lambda: project,
     )
     assert orch.config.theme == "ancestor"
-    assert not await orch.set_field("/active_model", "glm-5-3")
-    assert "active_model" in ancestor.read_text()
+    assert not await orch.set_field("/theme", "project")
+    assert 'theme = "project"' in ancestor.read_text()
     assert not (child / ".chartreux").exists()
 
 

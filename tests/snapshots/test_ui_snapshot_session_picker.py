@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from textual.pilot import Pilot
+from textual.widgets import Button
 
 from chartreux.app_server.models import SavedSessionSummary
 from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
@@ -35,6 +36,22 @@ class SessionPickerTestApp(BaseSnapshotTestApp):
             sessions=_SESSIONS, latest_messages=_LATEST_MESSAGES, cwd="/test/workdir"
         )
         await self._switch_from_input(picker)
+
+
+def test_snapshot_session_picker_delete_confirmation(snap_compare: SnapCompare) -> None:
+    async def run_before(pilot: Pilot) -> None:
+        await pilot.pause(0.2)
+        await pilot.press("d")
+        await pilot.pause(0.1)
+        assert pilot.app.screen.focused is pilot.app.query_one(
+            "#sessionpicker-cancel-delete", Button
+        )
+
+    assert snap_compare(
+        "test_ui_snapshot_session_picker.py:SessionPickerTestApp",
+        terminal_size=(100, 36),
+        run_before=run_before,
+    )
 
 
 def test_snapshot_session_picker_header(snap_compare: SnapCompare) -> None:

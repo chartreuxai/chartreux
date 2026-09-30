@@ -908,6 +908,10 @@ class SessionLogger:  # noqa: PLR0904
         try:
             session_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
         except OSError as e:
+            if _is_enospc(e):
+                raise SessionDiskFullError(
+                    session_dir, "create session directory"
+                ) from e
             raise RuntimeError(
                 f"Failed to create session directory at {session_dir}: {type(e).__name__}: {e}"
             ) from e
@@ -1014,7 +1018,14 @@ class SessionLogger:  # noqa: PLR0904
                 return
             session_dir, session_metadata = session_info
             payload = launch_config.model_dump(mode="json")
-            session_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+            try:
+                session_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+            except OSError as e:
+                if _is_enospc(e):
+                    raise SessionDiskFullError(
+                        session_dir, "create session directory"
+                    ) from e
+                raise
             metadata_path = session_dir / METADATA_FILENAME
             if metadata_path.exists():
                 try:

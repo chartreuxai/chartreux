@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 from chartreux.core.tools.secret_redaction import scrub_child_env
+from chartreux.core.utils.async_subprocess import spawn_registered_process
 
 
 async def spawn_shell_command(
@@ -12,15 +13,17 @@ async def spawn_shell_command(
 ) -> asyncio.subprocess.Process:
     env = _shell_environment()
     cwd = cwd or Path.cwd()
-    return await asyncio.create_subprocess_shell(
-        command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        stdin=asyncio.subprocess.DEVNULL,
-        env=env,
-        cwd=cwd,
-        executable=os.environ.get("SHELL"),
-        start_new_session=True,
+    return await spawn_registered_process(
+        asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            env=env,
+            cwd=cwd,
+            executable=os.environ.get("SHELL"),
+            start_new_session=True,
+        )
     )
 
 

@@ -113,7 +113,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--setup",
         action="store_true",
-        help="Run interactive setup: theme, providers, API keys, and model selection.",
+        help="Run interactive setup: providers, API keys, and model selection.",
     )
     parser.add_argument(
         "--workdir",

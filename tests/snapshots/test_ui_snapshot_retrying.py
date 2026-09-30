@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from typing import cast
 
-import pytest
 from textual.pilot import Pilot
 
 from tests.conftest import build_test_agent_loop
@@ -59,22 +58,18 @@ def test_snapshot_shows_retrying_status(snap_compare: SnapCompare) -> None:
     )
 
 
-def test_easter_eggs_replace_only_the_model_is_working_statuses(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A joke may stand in for "Generating"/"Thinking", never for a factual status."""
+def test_loading_statuses_remain_semantic() -> None:
     from chartreux.cli.textual_ui.widgets import loading
 
-    # Force the easter egg to fire on every status change.
-    monkeypatch.setattr(loading.random, "random", lambda: 0.0)
-    eggs = loading.LoadingWidget.EASTER_EGGS
     widget = loading.LoadingWidget()
-    assert widget.status in eggs
+    assert widget.status == loading.DEFAULT_LOADING_STATUS
 
-    for status in (loading.RETRYING_LOADING_STATUS, "Reading main.py", "Running hook"):
+    for status in (
+        loading.THINKING_LOADING_STATUS,
+        loading.RETRYING_LOADING_STATUS,
+        "Reading main.py",
+        "Running hook",
+    ):
         widget.set_status(status)
         assert widget.status == status
-
-    for status in (loading.DEFAULT_LOADING_STATUS, loading.THINKING_LOADING_STATUS):
-        widget.set_status(status)
-        assert widget.status in eggs
+        assert widget._build_status_text() == f"Running: {status}…"

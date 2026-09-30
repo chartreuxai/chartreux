@@ -6,7 +6,7 @@ from chartreux.core.model_catalog.schema import ModelCatalog
 
 
 def test_existing_deployment_reuses_its_base() -> None:
-    outcome = match_discovered_model(SHIPPED_CATALOG, "mistral/default", "zai-glm-5-3")
+    outcome = match_discovered_model(SHIPPED_CATALOG, "mistral", "zai-glm-5-3")
 
     assert outcome.kind == "existing"
     assert outcome.existing_base == "glm-5-3"
@@ -15,7 +15,7 @@ def test_existing_deployment_reuses_its_base() -> None:
 
 def test_former_alias_wire_names_become_new_model_proposals() -> None:
     for wire_name in ("zai-glm-5", "zai-glm-latest"):
-        outcome = match_discovered_model(SHIPPED_CATALOG, "new/default", wire_name)
+        outcome = match_discovered_model(SHIPPED_CATALOG, "new", wire_name)
 
         assert outcome.kind == "new_model"
         assert outcome.proposed is not None
@@ -23,9 +23,7 @@ def test_former_alias_wire_names_become_new_model_proposals() -> None:
 
 
 def test_new_model_uses_conservative_defaults_and_off_when_allowed() -> None:
-    outcome = match_discovered_model(
-        SHIPPED_CATALOG, "mistral/default", "future-mistral-model"
-    )
+    outcome = match_discovered_model(SHIPPED_CATALOG, "mistral", "future-mistral-model")
 
     assert outcome.kind == "new_model"
     assert outcome.proposed is not None
@@ -40,15 +38,12 @@ def test_new_model_uses_conservative_defaults_and_off_when_allowed() -> None:
 def test_exact_known_model_without_off_uses_an_admitted_default() -> None:
     catalog = ModelCatalog.model_validate({
         "providers": {
-            "mistral/default": {
-                "api_base": "https://api.mistral.ai/v1",
-                "backend": "mistral",
-            }
+            "mistral": {"api_base": "https://api.mistral.ai/v1", "backend": "mistral"}
         },
         "models": {},
     })
 
-    outcome = match_discovered_model(catalog, "mistral/default", "zai-glm-5")
+    outcome = match_discovered_model(catalog, "mistral", "zai-glm-5")
 
     assert outcome.kind == "new_model"
     assert outcome.proposed is not None
@@ -57,13 +52,13 @@ def test_exact_known_model_without_off_uses_an_admitted_default() -> None:
 
 def test_occupied_provider_slot_is_not_appendable() -> None:
     catalog = ModelCatalog.model_validate({
-        "providers": {"test/default": {"api_base": "https://test.example"}},
+        "providers": {"test": {"api_base": "https://test.example"}},
         "models": {
-            "known": {"deployments": [{"provider": "test/default", "name": "old-wire"}]}
+            "known": {"deployments": [{"provider": "test", "name": "old-wire"}]}
         },
     })
 
-    outcome = match_discovered_model(catalog, "test/default", "known")
+    outcome = match_discovered_model(catalog, "test", "known")
 
     assert outcome.kind == "occupied_slot"
     assert outcome.provider_slot_occupied
@@ -71,7 +66,7 @@ def test_occupied_provider_slot_is_not_appendable() -> None:
 
 
 def test_base_on_another_provider_offers_deployment_addition() -> None:
-    outcome = match_discovered_model(SHIPPED_CATALOG, "new/default", "glm-5-3")
+    outcome = match_discovered_model(SHIPPED_CATALOG, "new", "glm-5-3")
 
     assert outcome.kind == "base_exists_other_provider"
     assert outcome.existing_base == "glm-5-3"
@@ -81,25 +76,21 @@ def test_base_on_another_provider_offers_deployment_addition() -> None:
 
 def test_multiple_deployments_with_same_wire_are_explicitly_ambiguous() -> None:
     catalog = ModelCatalog.model_validate({
-        "providers": {"test/default": {"api_base": "https://test.example"}},
+        "providers": {"test": {"api_base": "https://test.example"}},
         "models": {
-            "first": {
-                "deployments": [{"provider": "test/default", "name": "same-wire"}]
-            },
-            "second": {
-                "deployments": [{"provider": "test/default", "name": "same-wire"}]
-            },
+            "first": {"deployments": [{"provider": "test", "name": "same-wire"}]},
+            "second": {"deployments": [{"provider": "test", "name": "same-wire"}]},
         },
     })
 
-    outcome = match_discovered_model(catalog, "test/default", "same-wire")
+    outcome = match_discovered_model(catalog, "test", "same-wire")
 
     assert outcome.kind == "multiple_matches"
     assert {match.base_name for match in outcome.matches} == {"first", "second"}
 
 
 def test_zero_match_creates_a_proposal() -> None:
-    outcome = match_discovered_model(SHIPPED_CATALOG, "new/default", "brand-new")
+    outcome = match_discovered_model(SHIPPED_CATALOG, "new", "brand-new")
 
     assert outcome.kind == "new_model"
     assert outcome.proposed is not None

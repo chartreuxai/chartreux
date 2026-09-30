@@ -40,9 +40,10 @@ def load_orchestrator(config_dir: Path) -> OrchestratorLoader[ChartreuxConfigSch
         config: ChartreuxConfigSchema,
     ) -> ConfigOrchestrator[ChartreuxConfigSchema]:
         path = config_dir / "config.toml"
-        path.write_text(
-            tomli_w.dumps(config.model_dump(mode="json", exclude_none=True))
-        )
+        persisted = config.model_dump(mode="json", exclude_none=True)
+        persisted.pop("active_model", None)
+        persisted.pop("thinking_overrides", None)
+        path.write_text(tomli_w.dumps(persisted))
         user = UserConfigLayer(path=path)
         return run_sync(
             ConfigOrchestrator.create(

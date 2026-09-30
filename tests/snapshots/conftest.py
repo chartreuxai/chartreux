@@ -1,8 +1,21 @@
 from __future__ import annotations
 
+import re
 import time
 
 import pytest
+import pytest_textual_snapshot
+
+
+@pytest.fixture(autouse=True)
+def _normalize_svg_whitespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep generated SVG snapshots free of trailing whitespace."""
+    normalize = pytest_textual_snapshot.normalize_svg
+    monkeypatch.setattr(
+        pytest_textual_snapshot,
+        "normalize_svg",
+        lambda svg: re.sub(r"[ \t]+(?=\r?$)", "", normalize(svg), flags=re.MULTILINE),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -27,13 +40,6 @@ def _pin_banner_version(monkeypatch: pytest.MonkeyPatch) -> None:
 def _pin_process_title(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "chartreux.cli.textual_ui.app.process_id_label", lambda: "[PID 00000]"
-    )
-
-
-@pytest.fixture(autouse=True)
-def _disable_loading_easter_eggs(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "chartreux.cli.textual_ui.widgets.loading.random.random", lambda: 1.0
     )
 
 

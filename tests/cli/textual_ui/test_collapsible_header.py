@@ -108,6 +108,39 @@ async def test_expanding_section_preserves_scroll_position() -> None:
         assert chat.is_at_bottom
 
 
+@pytest.mark.asyncio
+async def test_keyboard_header_toggles_without_losing_focus() -> None:
+    app = _HeaderApp("read file")
+    async with app.run_test() as pilot:
+        header = app.section._toggle_row
+        header.focus()
+        await pilot.press("enter")
+        assert not app.section.is_collapsed
+        assert app.focused is header
+        await pilot.press("space")
+        assert app.section.is_collapsed
+        assert app.focused is header
+        assert header.styles.background is not None
+
+
+@pytest.mark.asyncio
+async def test_body_click_does_not_toggle_collapsible_section() -> None:
+    app = _HeaderApp("read file")
+    async with app.run_test() as pilot:
+        app.section.set_collapsed(False)
+        await pilot.pause()
+        body = app.section._body
+        assert body is not None
+
+        await pilot.click(body)
+        await pilot.pause()
+        assert app.section.is_collapsed is False
+
+        await pilot.click(app.section._toggle_row)
+        await pilot.pause()
+        assert app.section.is_collapsed is True
+
+
 class _InertHeaderApp(App[None]):
     CSS_PATH = Path(__file__).parents[3] / "chartreux/cli/textual_ui/app.tcss"
 
@@ -130,14 +163,14 @@ class _InertHeaderApp(App[None]):
 @pytest.mark.asyncio
 async def test_inert_header_keeps_verb_and_never_opens() -> None:
     # An empty result stays a single line: the verb is kept, the disclosure caret is
-    # replaced by a muted marker, and toggling/clicking never builds a body.
+    # replaced by a blank slot, and toggling/clicking never builds a body.
     app = _InertHeaderApp()
     async with app.run_test(size=(80, 10)) as pilot:
         await pilot.pause()
 
         assert app.query_one(".collapsible-header-verb", NoMarkupStatic)
         marker = app.section._triangle
-        assert str(marker.render()) == "▪"
+        assert str(marker.render()) == " "
         assert "success" not in marker.classes
 
         app.section.toggle()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import os
 from pathlib import Path
@@ -15,7 +16,8 @@ from chartreux.core.session.session_logger import (
     SessionLogger,
     _is_enospc,
 )
-from chartreux.core.session_types import AgentStats
+from chartreux.core.session_types import AgentStats, LaunchMetadataV1, LaunchPersonaV1
+from chartreux.core.subagents import LaunchConfig
 from chartreux.core.tools.manager import ToolManager
 from tests.conftest import build_test_vibe_config
 
@@ -49,9 +51,13 @@ def _patch_replace(monkeypatch, raiser) -> None:
     monkeypatch.setattr("chartreux.core.session.session_logger.os.replace", raiser)
 
 
-async def _save(logger: SessionLogger) -> None:
+async def _save(
+    logger: SessionLogger, messages: list[LLMMessage] | None = None
+) -> None:
     await logger.save_interaction(
-        messages=[
+        messages=messages
+        if messages is not None
+        else [
             LLMMessage(role=Role.system, content="System prompt"),
             LLMMessage(role=Role.user, content="Hello"),
         ],
@@ -86,6 +92,91 @@ class TestEnospcClassification:
 
 
 class TestDiskFullSaveInteraction:
+    @pytest.mark.asyncio
+    async def test_mkdir_enospc_save_fails_soft(
+        self, session_config: SessionLoggingConfig, monkeypatch, caplog
+    ) -> None:
+        logger = SessionLogger(session_config, "disk-full-session")
+        assert logger.session_dir is not None
+        assert not logger.session_dir.exists()
+        monkeypatch.setattr(Path, "mkdir", _enospc)
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            await _save(logger)
+
+        warnings = _disk_full_warnings(caplog)
+        assert len(warnings) == 1
+        assert str(logger.session_dir) in warnings[0].getMessage()
+        assert not logger.persisted
+        assert not logger.session_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_repeated_mkdir_enospc_saves_do_not_spam(
+        self, session_config: SessionLoggingConfig, monkeypatch, caplog
+    ) -> None:
+        logger = SessionLogger(session_config, "disk-full-session")
+        monkeypatch.setattr(Path, "mkdir", _enospc)
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            for _ in range(3):
+                await _save(logger)
+
+        assert len(_disk_full_warnings(caplog)) == 1
+        assert not logger.persisted
+
+    @pytest.mark.asyncio
+    async def test_mkdir_enospc_retry_does_not_duplicate_records(
+        self, session_config: SessionLoggingConfig, monkeypatch, caplog
+    ) -> None:
+        logger = SessionLogger(session_config, "disk-full-session")
+        messages = [LLMMessage(role=Role.user, content="Hello")]
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            with monkeypatch.context() as patch:
+                patch.setattr(Path, "mkdir", _enospc)
+                await _save(logger, messages)
+                await _save(logger, messages)
+            assert not logger.persisted
+
+            await _save(logger, messages)
+            await _save(logger, messages)
+            assert logger.persisted
+            assert logger.session_dir is not None
+            records = [
+                json.loads(line)
+                for line in (logger.session_dir / "messages.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            assert records == [
+                message.model_dump(exclude_none=True, mode="json")
+                for message in messages
+            ]
+
+            # A successful retry also re-arms the warning for the next failure.
+            logger.invalidate_transcript_cursor()
+            with monkeypatch.context() as patch:
+                patch.setattr(Path, "mkdir", _enospc)
+                await _save(logger)
+
+        assert len(_disk_full_warnings(caplog)) == 2
+
+    @pytest.mark.asyncio
+    async def test_mkdir_eacces_still_raises(
+        self, session_config: SessionLoggingConfig, monkeypatch
+    ) -> None:
+        logger = SessionLogger(session_config, "permission-error-session")
+
+        def permission_denied(*args, **kwargs) -> None:
+            raise OSError(errno.EACCES, "Permission denied")
+
+        monkeypatch.setattr(Path, "mkdir", permission_denied)
+        with pytest.raises(
+            RuntimeError, match="Failed to create session directory"
+        ) as exc:
+            await _save(logger)
+
+        assert not isinstance(exc.value, SessionDiskFullError)
+        assert isinstance(exc.value.__cause__, OSError)
+        assert exc.value.__cause__.errno == errno.EACCES
+
     @pytest.mark.asyncio
     async def test_enospc_save_fails_soft_and_session_continues(
         self, session_config: SessionLoggingConfig, monkeypatch, caplog
@@ -147,6 +238,45 @@ class TestDiskFullSaveInteraction:
         # Only ENOSPC fails soft; other persist errors keep raising.
         with pytest.raises(RuntimeError, match="Failed to save session"):
             await _save(logger)
+
+
+class TestLaunchConfigDirectoryFailure:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_number", [errno.ENOSPC, errno.EACCES])
+    async def test_launch_config_mkdir_errors_remain_observable(
+        self, session_config: SessionLoggingConfig, monkeypatch, error_number: int
+    ) -> None:
+        logger = SessionLogger(session_config, "launch-config-session")
+        launch_config = LaunchMetadataV1(
+            version=1,
+            profile="test-agent",
+            overrides=LaunchConfig(),
+            persona=LaunchPersonaV1(system_prompt_id="tests", instructions=None),
+        )
+
+        def mkdir_failure(*args, **kwargs) -> None:
+            raise OSError(error_number, "mkdir failed")
+
+        monkeypatch.setattr(Path, "mkdir", mkdir_failure)
+        expected_error = (
+            SessionDiskFullError if error_number == errno.ENOSPC else OSError
+        )
+        with pytest.raises(expected_error) as exc:
+            await logger.persist_launch_config(launch_config)
+
+        if error_number == errno.ENOSPC:
+            assert isinstance(exc.value, SessionDiskFullError)
+            assert exc.value.path == logger.session_dir
+            assert exc.value.operation == "create session directory"
+            assert isinstance(exc.value.__cause__, OSError)
+            assert exc.value.__cause__.errno == errno.ENOSPC
+        else:
+            assert isinstance(exc.value, OSError)
+            assert exc.value.errno == errno.EACCES
+        assert not logger.persisted
+        assert logger.session_metadata is not None
+        assert logger.session_metadata.launch_config == launch_config
+        assert logger._launch_config_dirty
 
 
 class TestQuarantineDiskFull:

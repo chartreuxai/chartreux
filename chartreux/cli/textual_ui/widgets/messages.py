@@ -33,10 +33,14 @@ from textual.visual import Visual
 from textual.widget import Widget
 from textual.widgets import Link, Static
 
-from chartreux.cli.textual_ui.widgets.collapsible import ClickWithoutDragMixin
+from chartreux.cli.textual_ui.widgets.collapsible import (
+    ClickWithoutDragMixin,
+    DisclosureHeader,
+)
 from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
 from chartreux.cli.textual_ui.widgets.spinner import SpinnerMixin, SpinnerType
 from chartreux.cli.textual_ui.widgets.tool_widgets import clean_output
+from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic, NonSelectableStatic
 
@@ -120,8 +124,8 @@ class UserMessageAttachment(Horizontal):
 
 
 class UserMessage(Static):
-    PROMPT_CHAR: ClassVar[str] = ">"
-    SHOW_SEPARATOR: ClassVar[bool] = True
+    PROMPT_CHAR: ClassVar[str] = "You"
+    SHOW_SEPARATOR: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -225,15 +229,12 @@ class QueueHeaderMessage(Static):
 
 
 class SlashCommandMessage(UserMessage):
-    PROMPT_CHAR = "/"
+    PROMPT_CHAR = "You"
     SHOW_SEPARATOR = False
 
     def __init__(self, content: str, pending: bool = False) -> None:
-        # content is the raw user input (e.g. "/clear"); the widget already
-        # renders PROMPT_CHAR, so drop a leading slash to avoid "//clear".
-        # Payload-path callers pass content without a slash (e.g. "model x").
         super().__init__(
-            content[1:] if content.startswith("/") else content, pending=pending
+            content if content.startswith("/") else f"/{content}", pending=pending
         )
         self.add_class("slash-command-message")
 
@@ -346,6 +347,7 @@ class AssistantMessage(StreamingMessageBase):
 
         markdown = Markdown("")
         self._markdown = markdown
+        yield NonSelectableStatic("Assistant", classes="assistant-message-label")
         yield markdown
 
 
@@ -379,10 +381,14 @@ class ReasoningMessage(ClickWithoutDragMixin, SpinnerMixin, StreamingMessageBase
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="reasoning-message-wrapper"):
-            self._header_widget = Horizontal(classes="reasoning-message-header")
+            self._header_widget = DisclosureHeader(
+                activate=self._toggle_collapsed, classes="reasoning-message-header"
+            )
             with self._header_widget:
                 self._indicator_widget = NonSelectableStatic(
-                    self._spinner.current_frame() if self._is_spinning else "■",
+                    self._spinner.current_frame()
+                    if self._is_spinning
+                    else chrome_glyph("checked"),
                     classes="reasoning-indicator",
                 )
                 yield self._indicator_widget
@@ -409,13 +415,17 @@ class ReasoningMessage(ClickWithoutDragMixin, SpinnerMixin, StreamingMessageBase
         super().stop_spinning(success)
         if self._indicator_widget:
             self._indicator_widget.remove_class("success", "error")
-            self._indicator_widget.update("⏵" if self.collapsed else "⏷")
+            self._indicator_widget.update(
+                chrome_glyph(
+                    "disclosure_closed" if self.collapsed else "disclosure_open"
+                )
+            )
 
     def _is_click_on_toggle(self, event: events.Click) -> bool:
         return self._is_click_within(event, self._header_widget)
 
     async def on_click(self, event: events.Click) -> None:
-        if self._click_is_passive(event):
+        if not self._is_click_on_toggle(event) or self._click_is_passive(event):
             return
         await self._toggle_collapsed()
 
@@ -429,11 +439,23 @@ class ReasoningMessage(ClickWithoutDragMixin, SpinnerMixin, StreamingMessageBase
         if self.collapsed == collapsed:
             return
 
+        focused = self.screen.focused
+        if (
+            collapsed
+            and self._markdown is not None
+            and self._markdown.is_mounted
+            and focused is not None
+            and self._markdown in focused.ancestors_with_self
+        ):
+            assert self._header_widget is not None
+            self._header_widget.focus()
         self.collapsed = collapsed
         if self.entry_id is not None and self._expansion_state is not None:
             self._expansion_state.set_collapsed(self.entry_id, collapsed)
         if self._indicator_widget and not self._is_spinning:
-            self._indicator_widget.update("⏵" if collapsed else "⏷")
+            self._indicator_widget.update(
+                chrome_glyph("disclosure_closed" if collapsed else "disclosure_open")
+            )
         if self._markdown:
             self._markdown.display = not collapsed
             if not collapsed and self._content:
@@ -510,7 +532,7 @@ class InterruptMessage(Static):
         with Horizontal(classes="interrupt-container"):
             yield ExpandingBorder(classes="interrupt-border")
             yield NoMarkupStatic(
-                "Interrupted · What should Chartreux do instead?",
+                "Interrupted — completed tool results are kept; in-progress effects may be partial. What next?",
                 classes="interrupt-content",
             )
 
@@ -554,9 +576,9 @@ class HookRunContainer(Vertical):
 
 
 _HOOK_SEVERITY_ICONS: dict[HookSeverity, str] = {
-    HookSeverity.OK: "✓",
-    HookSeverity.WARNING: "⚠",
-    HookSeverity.ERROR: "✗",
+    HookSeverity.OK: "success",
+    HookSeverity.WARNING: "warning",
+    HookSeverity.ERROR: "error",
 }
 
 
@@ -575,13 +597,21 @@ class HookSystemMessageLine(Static):
         self._severity = severity
 
     def compose(self) -> ComposeResult:
-        icon = _HOOK_SEVERITY_ICONS.get(
-            self._severity, _HOOK_SEVERITY_ICONS[HookSeverity.WARNING]
+        icon = chrome_glyph(
+            _HOOK_SEVERITY_ICONS.get(
+                self._severity, _HOOK_SEVERITY_ICONS[HookSeverity.WARNING]
+            )
         )
+        wording = {
+            HookSeverity.OK: "Saved:",
+            HookSeverity.WARNING: "Warning:",
+            HookSeverity.ERROR: "Failed:",
+        }.get(self._severity, "Warning:")
         with Horizontal(classes="hook-system-container"):
             yield NonSelectableStatic(icon, classes="hook-system-icon")
             yield NoMarkupStatic(
-                f"[{self._hook_name}] {self._content}", classes="hook-system-content"
+                f"[{self._hook_name}] {wording} {self._content}",
+                classes="hook-system-content",
             )
 
 
@@ -596,7 +626,9 @@ class WarningMessage(Static):
         with Horizontal(classes="warning-container"):
             if self._show_border:
                 yield ExpandingBorder(classes="warning-border")
-            yield NoMarkupStatic(self._message, classes="warning-content")
+            yield NoMarkupStatic(
+                f"! Warning: {self._message}", classes="warning-content"
+            )
 
 
 class PlanFileMessage(Widget):

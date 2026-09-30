@@ -84,7 +84,7 @@ async def test_tui_mcp_auth_notice_skips_disabled_servers() -> None:
 
 
 def test_tui_mcp_discovery_failures_surface_errors() -> None:
-    notify = Mock()
+    set_issue = Mock()
     app = cast(
         ChartreuxApp,
         SimpleNamespace(
@@ -97,16 +97,18 @@ def test_tui_mcp_discovery_failures_surface_errors() -> None:
                     )
                 )
             ),
-            notify=notify,
+            _recovery_issues={},
+            _set_recovery_issue=set_issue,
         ),
     )
 
     ChartreuxApp._show_mcp_discovery_failures(app)
 
-    assert [call.args[0] for call in notify.call_args_list] == [
-        "MCP server 'broken' failed to connect: no binary",
-        "MCP server 'fail-http' failed to connect: down",
+    assert [call.args[0] for call in set_issue.call_args_list] == [
+        "mcp:broken",
+        "mcp:fail-http",
     ]
+    assert "run /mcp" in set_issue.call_args_list[0].args[1]
 
 
 @pytest.mark.asyncio

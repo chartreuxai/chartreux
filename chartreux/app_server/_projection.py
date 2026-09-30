@@ -110,6 +110,7 @@ def project_config_view(
         file_watcher_for_autocomplete=config.file_watcher_for_autocomplete,
         ask_confirmation_on_exit=config.ask_confirmation_on_exit,
         show_thinking_nodes=config.show_thinking_nodes,
+        ascii_chrome=config.ascii_chrome,
         enable_notifications=config.enable_notifications,
         enable_system_trust_store=config.enable_system_trust_store,
         models=[

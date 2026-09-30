@@ -61,6 +61,8 @@ from chartreux.app_server.protocol import (
     RuntimeUpdatedParams,
     SessionReadyWaitParams,
     SessionReadyWaitResponse,
+    SettingsReadParams,
+    SettingsReadResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -121,6 +123,16 @@ class ConfigResource:
             await client.request(
                 "config/fields/read",
                 ConfigFieldsReadParams(session_id=self._state.session_id),
+            ),
+        )
+
+    async def read_settings(self) -> SettingsReadResponse:
+        client = await self._connection.connect()
+        return validate_wire(
+            SettingsReadResponse,
+            await client.request(
+                "config/settings/read",
+                SettingsReadParams(session_id=self._state.session_id),
             ),
         )
 

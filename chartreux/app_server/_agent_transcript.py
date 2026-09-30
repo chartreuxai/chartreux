@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import hashlib
 import json
@@ -91,9 +91,10 @@ def read_agent_transcript(
     except (OSError, ValueError):
         return _no_saved_transcript()
 
-    return _read_projected_entries(
-        _project_entries(loaded.messages or []), before, limit
-    )
+    messages = loaded.messages or []
+    index = _describe_saved_messages(messages)
+    materializer = _EntryMaterializer(index, messages, live=False)
+    return _read_selected_entries(index, materializer, before=before, limit=limit)
 
 
 def read_live_agent_transcript(
@@ -105,17 +106,332 @@ def read_live_agent_transcript(
     """Project an in-memory child transcript through the persisted-view rules."""
     if not 1 <= limit <= _MAX_LIMIT:
         raise ValueError(f"limit must be between 1 and {_MAX_LIMIT}")
-    persisted_messages = [
-        message.model_dump(exclude_none=True, mode="json")
-        for message in messages
-        if message.role is not Role.system
-    ]
-    return _read_projected_entries(_project_entries(persisted_messages), before, limit)
+    kept = [message for message in messages if message.role is not Role.system]
+    index = _describe_live_messages(kept)
+    materializer = _EntryMaterializer(index, kept, live=True)
+    return _read_selected_entries(index, materializer, before=before, limit=limit)
+
+
+@dataclass(frozen=True, slots=True)
+class _EntryDescriptor:
+    """Cheap per-entry metadata; payloads materialize only when selected."""
+
+    seq: int
+    message_index: int
+    kind: AgentTranscriptEntryKind
+    component: str
+    identity: str | None
+    call_position: int | None = None
+
+    def entry_id(self) -> str:
+        return _entry_id(self.identity, self.message_index, self.component)
+
+
+@dataclass(slots=True)
+class _TranscriptIndex:
+    """Entry descriptors in absolute order plus call/result pairing locations."""
+
+    descriptors: list[_EntryDescriptor]
+    calls_by_id: dict[str, tuple[int, int]]
+    results_by_id: dict[str, int]
+
+
+def _describe_live_messages(messages: Sequence[LLMMessage]) -> _TranscriptIndex:
+    descriptors: list[_EntryDescriptor] = []
+    calls_by_id: dict[str, tuple[int, int]] = {}
+    results_by_id: dict[str, int] = {}
+    for message_index, message in enumerate(messages):
+        role = message.role
+        if role is Role.user:
+            if message.content is not None:
+                descriptors.append(
+                    _EntryDescriptor(
+                        len(descriptors),
+                        message_index,
+                        AgentTranscriptEntryKind.USER_TEXT,
+                        "text",
+                        message.message_id,
+                    )
+                )
+        elif role is Role.assistant:
+            if message.reasoning_content is not None:
+                descriptors.append(
+                    _EntryDescriptor(
+                        len(descriptors),
+                        message_index,
+                        AgentTranscriptEntryKind.REASONING,
+                        "reasoning",
+                        message.reasoning_message_id or message.message_id,
+                    )
+                )
+            if message.content is not None:
+                descriptors.append(
+                    _EntryDescriptor(
+                        len(descriptors),
+                        message_index,
+                        AgentTranscriptEntryKind.ASSISTANT_TEXT,
+                        "text",
+                        message.message_id,
+                    )
+                )
+            for call_position, call in enumerate(message.tool_calls or []):
+                call_id = call.id if call.id else None
+                descriptors.append(
+                    _EntryDescriptor(
+                        len(descriptors),
+                        message_index,
+                        AgentTranscriptEntryKind.TOOL_CALL,
+                        f"call:{call_position}",
+                        message.message_id,
+                        call_position,
+                    )
+                )
+                if call_id is not None:
+                    calls_by_id[call_id] = (message_index, call_position)
+        elif role is Role.tool:
+            call_id = message.tool_call_id if message.tool_call_id else None
+            descriptors.append(
+                _EntryDescriptor(
+                    len(descriptors),
+                    message_index,
+                    AgentTranscriptEntryKind.TOOL_RESULT,
+                    "result",
+                    message.message_id,
+                )
+            )
+            if call_id is not None:
+                results_by_id[call_id] = message_index
+    return _TranscriptIndex(descriptors, calls_by_id, results_by_id)
+
+
+def _describe_saved_messages(messages: Sequence[dict[str, Any]]) -> _TranscriptIndex:
+    descriptors: list[_EntryDescriptor] = []
+    calls_by_id: dict[str, tuple[int, int]] = {}
+    results_by_id: dict[str, int] = {}
+    for message_index, message in enumerate(messages):
+        role = message.get("role")
+        if role == "user":
+            if _text_content(message.get("content")) is not None:
+                descriptors.append(
+                    _EntryDescriptor(
+                        len(descriptors),
+                        message_index,
+                        AgentTranscriptEntryKind.USER_TEXT,
+                        "text",
+                        _message_identity(message),
+                    )
+                )
+        elif role == "assistant":
+            if _text_content(message.get("reasoning_content")) is not None:
+                reasoning_id = message.get("reasoning_message_id")
+                identity = (
+                    reasoning_id
+                    if isinstance(reasoning_id, str) and reasoning_id
+                    else None
+                )
+                descriptors.append(
+                    _EntryDescriptor(
+                        len(descriptors),
+                        message_index,
+                        AgentTranscriptEntryKind.REASONING,
+                        "reasoning",
+                        identity or _message_identity(message),
+                    )
+                )
+            if _text_content(message.get("content")) is not None:
+                descriptors.append(
+                    _EntryDescriptor(
+                        len(descriptors),
+                        message_index,
+                        AgentTranscriptEntryKind.ASSISTANT_TEXT,
+                        "text",
+                        _message_identity(message),
+                    )
+                )
+            for call_position, call in enumerate(message.get("tool_calls") or []):
+                if not isinstance(call, dict):
+                    continue
+                call_id = call.get("id")
+                call_id = call_id if isinstance(call_id, str) and call_id else None
+                descriptors.append(
+                    _EntryDescriptor(
+                        len(descriptors),
+                        message_index,
+                        AgentTranscriptEntryKind.TOOL_CALL,
+                        f"call:{call_position}",
+                        _message_identity(message),
+                        call_position,
+                    )
+                )
+                if call_id is not None:
+                    calls_by_id[call_id] = (message_index, call_position)
+        elif role == "tool":
+            source_id = message.get("tool_call_id")
+            call_id = source_id if isinstance(source_id, str) and source_id else None
+            descriptors.append(
+                _EntryDescriptor(
+                    len(descriptors),
+                    message_index,
+                    AgentTranscriptEntryKind.TOOL_RESULT,
+                    "result",
+                    _message_identity(message),
+                )
+            )
+            if call_id is not None:
+                results_by_id[call_id] = message_index
+    return _TranscriptIndex(descriptors, calls_by_id, results_by_id)
+
+
+class _EntryMaterializer:
+    """Materialize selected entries, dumping each message at most once."""
+
+    def __init__(
+        self,
+        index: _TranscriptIndex,
+        messages: Sequence[LLMMessage | dict[str, Any]],
+        *,
+        live: bool,
+    ) -> None:
+        self._index = index
+        self._messages = messages
+        self._live = live
+        self._dumped: dict[int, dict[str, Any]] = {}
+
+    def _message(self, message_index: int) -> dict[str, Any]:
+        if not self._live:
+            return cast(dict[str, Any], self._messages[message_index])
+        dumped = self._dumped.get(message_index)
+        if dumped is None:
+            dumped = cast(LLMMessage, self._messages[message_index]).model_dump(
+                exclude_none=True, mode="json"
+            )
+            self._dumped[message_index] = dumped
+        return dumped
+
+    def materialize(self, descriptor: _EntryDescriptor) -> AgentTranscriptEntry | None:
+        message = self._message(descriptor.message_index)
+        match descriptor.kind:
+            case AgentTranscriptEntryKind.USER_TEXT:
+                return _project_user_entry(
+                    message, descriptor.message_index, descriptor.seq
+                )
+            case AgentTranscriptEntryKind.ASSISTANT_TEXT:
+                return _project_assistant_text_entry(
+                    message, descriptor.message_index, descriptor.seq
+                )
+            case AgentTranscriptEntryKind.REASONING:
+                return _project_reasoning_entry(
+                    message, descriptor.message_index, descriptor.seq
+                )
+            case AgentTranscriptEntryKind.TOOL_CALL:
+                return self._materialize_call(descriptor, message)
+            case AgentTranscriptEntryKind.TOOL_RESULT:
+                return self._materialize_result(descriptor, message)
+        return None
+
+    def _materialize_call(
+        self, descriptor: _EntryDescriptor, message: dict[str, Any]
+    ) -> AgentTranscriptEntry | None:
+        if descriptor.call_position is None:
+            return None
+        calls = message.get("tool_calls") or []
+        if descriptor.call_position >= len(calls):
+            return None
+        call = calls[descriptor.call_position]
+        if not isinstance(call, dict):
+            return None
+        projection = _project_tool_call(call)
+        call_id = call.get("id")
+        call_id = call_id if isinstance(call_id, str) and call_id else None
+        result_index = self._index.results_by_id.get(call_id) if call_id else None
+        result_message = (
+            self._message(result_index) if result_index is not None else None
+        )
+        tool_result = _tool_result_payload(
+            projection.tool_name, projection.detail, result_message
+        )
+        return _project_tool_call_entry(
+            message,
+            descriptor.message_index,
+            descriptor.seq,
+            descriptor.call_position,
+            call,
+            projection,
+            call_id,
+            result_message,
+            tool_result,
+        )
+
+    def _materialize_result(
+        self, descriptor: _EntryDescriptor, message: dict[str, Any]
+    ) -> AgentTranscriptEntry | None:
+        source_id = message.get("tool_call_id")
+        call_id = (
+            source_id
+            if isinstance(source_id, str) and source_id
+            else f"tool:{descriptor.message_index}"
+        )
+        projection = None
+        location = self._index.calls_by_id.get(call_id)
+        if location is not None:
+            assistant = self._message(location[0])
+            calls = assistant.get("tool_calls") or []
+            call = calls[location[1]] if location[1] < len(calls) else None
+            if isinstance(call, dict):
+                projection = _project_tool_call(call)
+        return _build_tool_result_entry(
+            message, descriptor.message_index, descriptor.seq, call_id, projection
+        )
+
+
+def _read_selected_entries(
+    index: _TranscriptIndex,
+    materializer: _EntryMaterializer,
+    *,
+    before: str | None,
+    limit: int,
+) -> AgentTranscriptGetResponse:
+    if before is not None:
+        boundary = _decode_cursor(before)
+        if boundary is None:
+            return _state(AgentTranscriptState.CHANGED)
+        boundary_id, boundary_digest = boundary
+        boundary_descriptor = next(
+            (
+                descriptor
+                for descriptor in index.descriptors
+                if descriptor.entry_id() == boundary_id
+            ),
+            None,
+        )
+        if boundary_descriptor is None:
+            return _state(AgentTranscriptState.CHANGED)
+        boundary_entry = materializer.materialize(boundary_descriptor)
+        if boundary_entry is None or boundary_entry.digest != boundary_digest:
+            return _state(AgentTranscriptState.CHANGED)
+        candidates = index.descriptors[: boundary_descriptor.seq]
+    else:
+        candidates = index.descriptors
+    candidate_count = len(candidates)
+    selected: list[AgentTranscriptEntry] = []
+    for descriptor in reversed(candidates):
+        if len(selected) == limit:
+            break
+        entry = materializer.materialize(descriptor)
+        if entry is None:
+            continue
+        prospective = [entry, *selected]
+        response = _available_response(prospective, candidate_count > len(prospective))
+        if _wire_size(response) > _RESPONSE_BYTE_LIMIT:
+            break
+        selected = prospective
+    return _available_response(selected, candidate_count > len(selected))
 
 
 def _read_projected_entries(
-    entries: list[tuple[AgentTranscriptEntry, str]], before: str | None, limit: int
+    entries: list[AgentTranscriptEntry], before: str | None, limit: int
 ) -> AgentTranscriptGetResponse:
+    """Reference full-projection read used as the equivalence-test oracle."""
     boundary_index = len(entries)
     if before is not None:
         boundary = _decode_cursor(before)
@@ -175,11 +491,10 @@ class _EntryPayload:
     attachment_count: int = 0
 
 
-def _project_entries(
-    messages: list[dict[str, Any]],
-) -> list[tuple[AgentTranscriptEntry, str]]:
+def _project_entries(messages: list[dict[str, Any]]) -> list[AgentTranscriptEntry]:
+    """Reference full-transcript projection used as the equivalence-test oracle."""
     calls_by_index, calls_by_id, results_by_id = _tool_message_indexes(messages)
-    entries: list[tuple[AgentTranscriptEntry, str]] = []
+    entries: list[AgentTranscriptEntry] = []
     for message_index, message in enumerate(messages):
         match message.get("role"):
             case "user":
@@ -247,7 +562,7 @@ def _project_tool_call(call: dict[str, Any]) -> _ToolCallProjection:
 
 def _project_user_entry(
     message: dict[str, Any], message_index: int, timestamp: int
-) -> tuple[AgentTranscriptEntry, str] | None:
+) -> AgentTranscriptEntry | None:
     text = _text_content(message.get("content"))
     if text is None:
         return None
@@ -269,8 +584,8 @@ def _project_assistant_entries(
     timestamp: int,
     calls_by_index: dict[tuple[int, int], _ToolCallProjection],
     results_by_id: dict[str, dict[str, Any]],
-) -> list[tuple[AgentTranscriptEntry, str]]:
-    entries: list[tuple[AgentTranscriptEntry, str]] = []
+) -> list[AgentTranscriptEntry]:
+    entries: list[AgentTranscriptEntry] = []
     reasoning_entry = _project_reasoning_entry(message, message_index, timestamp)
     if reasoning_entry is not None:
         entries.append(reasoning_entry)
@@ -309,7 +624,7 @@ def _project_assistant_entries(
 
 def _project_reasoning_entry(
     message: dict[str, Any], message_index: int, timestamp: int
-) -> tuple[AgentTranscriptEntry, str] | None:
+) -> AgentTranscriptEntry | None:
     reasoning = _text_content(message.get("reasoning_content"))
     if reasoning is None:
         return None
@@ -327,7 +642,7 @@ def _project_reasoning_entry(
 
 def _project_assistant_text_entry(
     message: dict[str, Any], message_index: int, timestamp: int
-) -> tuple[AgentTranscriptEntry, str] | None:
+) -> AgentTranscriptEntry | None:
     text = _text_content(message.get("content"))
     if text is None:
         return None
@@ -350,7 +665,7 @@ def _project_tool_call_entry(
     call_id: str | None,
     result_message: dict[str, Any] | None,
     tool_result: _ToolResultProjection,
-) -> tuple[AgentTranscriptEntry, str]:
+) -> AgentTranscriptEntry:
     function = call.get("function")
     raw_arguments = function.get("arguments") if isinstance(function, dict) else None
     display = raw_arguments if isinstance(raw_arguments, str) else ""
@@ -375,14 +690,25 @@ def _project_tool_result_entry(
     message_index: int,
     timestamp: int,
     calls_by_id: dict[str, _ToolCallProjection],
-) -> tuple[AgentTranscriptEntry, str]:
+) -> AgentTranscriptEntry:
     source_id = message.get("tool_call_id")
     call_id = (
         source_id
         if isinstance(source_id, str) and source_id
         else f"tool:{message_index}"
     )
-    projection = calls_by_id.get(call_id)
+    return _build_tool_result_entry(
+        message, message_index, timestamp, call_id, calls_by_id.get(call_id)
+    )
+
+
+def _build_tool_result_entry(
+    message: dict[str, Any],
+    message_index: int,
+    timestamp: int,
+    call_id: str,
+    projection: _ToolCallProjection | None,
+) -> AgentTranscriptEntry:
     name = projection.tool_name if projection is not None else message.get("name")
     tool_name = _bounded_identity(name if isinstance(name, str) and name else "unknown")
     arguments = projection.arguments if projection is not None else None
@@ -713,7 +1039,7 @@ def _entry(
     *,
     timestamp: int,
     payload: _EntryPayload,
-) -> tuple[AgentTranscriptEntry, str]:
+) -> AgentTranscriptEntry:
     bounded_text, truncated = _truncate_utf8(display_text, _DISPLAY_TEXT_LIMIT)
     entry = AgentTranscriptEntry(
         entry_id=entry_id,
@@ -745,7 +1071,7 @@ def _entry(
         )
     )
     digest = hashlib.sha256(canonical.encode()).hexdigest()
-    return entry.model_copy(update={"digest": digest}), digest
+    return entry.model_copy(update={"digest": digest})
 
 
 def _truncate_utf8(text: str, byte_limit: int) -> tuple[str, bool]:
@@ -804,19 +1130,19 @@ def _decode_cursor(cursor: str) -> tuple[str, str] | None:
 
 
 def _find_boundary(
-    entries: list[tuple[AgentTranscriptEntry, str]], boundary: tuple[str, str]
+    entries: list[AgentTranscriptEntry], boundary: tuple[str, str]
 ) -> int | None:
     entry_id, digest = boundary
-    for index, (entry, current_digest) in enumerate(entries):
+    for index, entry in enumerate(entries):
         if entry.entry_id == entry_id:
-            return index if current_digest == digest else None
+            return index if entry.digest == digest else None
     return None
 
 
 def _page(
-    candidates: list[tuple[AgentTranscriptEntry, str]], limit: int
+    candidates: list[AgentTranscriptEntry], limit: int
 ) -> AgentTranscriptGetResponse:
-    selected: list[tuple[AgentTranscriptEntry, str]] = []
+    selected: list[AgentTranscriptEntry] = []
     for candidate in reversed(candidates):
         if len(selected) == limit:
             break
@@ -836,14 +1162,14 @@ def _wire_size(response: AgentTranscriptGetResponse) -> int:
 
 
 def _available_response(
-    selected: list[tuple[AgentTranscriptEntry, str]], has_more: bool
+    selected: list[AgentTranscriptEntry], has_more: bool
 ) -> AgentTranscriptGetResponse:
     cursor = (
-        _encode_cursor(selected[0][0].entry_id, selected[0][1]) if selected else None
+        _encode_cursor(selected[0].entry_id, selected[0].digest) if selected else None
     )
     return AgentTranscriptGetResponse(
         state=AgentTranscriptState.AVAILABLE,
-        entries=[entry for entry, _digest in selected],
+        entries=selected,
         oldest_cursor=cursor,
         has_more=has_more,
     )

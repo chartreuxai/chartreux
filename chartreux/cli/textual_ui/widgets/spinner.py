@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 from textual.timer import Timer
 
+from chartreux.ui.chrome_glyphs import ascii_chrome_enabled, chrome_glyph
 from chartreux.ui.widgets.braille_renderer import render_braille
 
 if TYPE_CHECKING:
@@ -30,10 +31,14 @@ class Spinner(ABC):
     def next_frame(self) -> str:
         frame = self.FRAMES[self._position]
         self._position = (self._position + 1) % len(self.FRAMES)
-        return frame
+        return chrome_glyph("running") if ascii_chrome_enabled() else frame
 
     def current_frame(self) -> str:
-        return self.FRAMES[self._position]
+        return (
+            chrome_glyph("running")
+            if ascii_chrome_enabled()
+            else self.FRAMES[self._position]
+        )
 
     def reset(self) -> None:
         self._position = 0
@@ -118,6 +123,8 @@ class SnakeSpinner(Spinner):
         return [head_position + direction] + self._positions[:-1]
 
     def current_frame(self) -> str:
+        if ascii_chrome_enabled():
+            return chrome_glyph("running")
         return render_braille(self._positions, self.MAP_WIDTH, self.MAP_HEIGHT)
 
     def next_frame(self) -> str:
@@ -181,10 +188,10 @@ class SpinnerMixin:
             self._spinner_timer = None
         if self._indicator_widget:
             if success:
-                self._indicator_widget.update("✓")
+                self._indicator_widget.update(chrome_glyph("success"))
                 self._indicator_widget.add_class("success")
             else:
-                self._indicator_widget.update("✕")
+                self._indicator_widget.update(chrome_glyph("error"))
                 self._indicator_widget.add_class("error")
         if self._status_text_widget and self.COMPLETED_TEXT:
             self._status_text_widget.update(self.COMPLETED_TEXT)

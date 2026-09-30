@@ -61,7 +61,7 @@ WORKER = AgentProfile(
     agent_type=AgentType.SUBAGENT,
     overrides={"system_prompt_id": "worker"},
     instructions=None,
-    role="small-worker",
+    role="medium",
 )
 
 ADVISOR = AgentProfile(
@@ -72,11 +72,11 @@ ADVISOR = AgentProfile(
     agent_type=AgentType.SUBAGENT,
     overrides={
         "system_prompt_id": "advisor",
-        "enabled_tools": ["read_file", "grep", "web_search", "web_fetch"],
+        "enabled_tools": ["read_file", "grep", "web_search", "web_fetch", "skill"],
     },
     instructions=None,
     idle_ttl_seconds=0,
-    role="advisor",
+    role="large",
 )
 
 REVIEWER = AgentProfile(
@@ -87,7 +87,7 @@ REVIEWER = AgentProfile(
     agent_type=AgentType.SUBAGENT,
     overrides={"system_prompt_id": "reviewer"},
     instructions=None,
-    role="small-reviewer",
+    role="medium",
 )
 
 BUILTIN_SUBAGENTS: dict[str, AgentProfile] = {

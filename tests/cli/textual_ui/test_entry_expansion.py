@@ -279,3 +279,20 @@ async def test_app_session_replacement_resets_expansion() -> None:
         await app._reset_presentation_after_resume()
         assert app._entry_expansion_state.is_collapsed("old-id")
         assert not app._entry_expansion_state.entry_ids
+
+
+@pytest.mark.asyncio
+async def test_reasoning_body_click_does_not_toggle_disclosure() -> None:
+    app = _HistoryApp()
+    async with app.run_test() as pilot:
+        message = ReasoningMessage("Reasoning body", collapsed=False, completed=True)
+        await app.query_one("#history", Vertical).mount(message)
+        await pilot.pause()
+
+        await pilot.click(message.query_one(".reasoning-message-content"))
+        await pilot.pause()
+        assert message.collapsed is False
+
+        await pilot.click(message.query_one(".reasoning-message-header"))
+        await pilot.pause()
+        assert message.collapsed is True

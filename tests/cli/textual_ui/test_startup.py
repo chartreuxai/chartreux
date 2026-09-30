@@ -42,7 +42,9 @@ async def test_trust_is_resolved_before_session_open(
     )
     host.read_config = AsyncMock(
         return_value=ConfigReadResponse(
-            config=build_test_app_config().model_copy(update={"theme": "dark"})
+            config=build_test_app_config().model_copy(
+                update={"theme": "dark", "ascii_chrome": True}
+            )
         )
     )
     dialog = MagicMock()
@@ -71,6 +73,7 @@ async def test_trust_is_resolved_before_session_open(
     assert calls == ["trust_status", "trust_decision", "open_session"]
     host.read_config.assert_awaited_once_with()
     assert trust_folder_app.call_args.kwargs["theme"] == "dark"
+    assert trust_folder_app.call_args.kwargs["ascii_chrome"] is True
 
 
 @pytest.mark.asyncio

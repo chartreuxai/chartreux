@@ -1560,12 +1560,9 @@ async def test_resume_rebinds_session_in_place(monkeypatch: pytest.MonkeyPatch) 
 
 def test_resume_identity_compares_provider_and_wire_name() -> None:
     original = CommittedModelIdentity(
-        base_model="base",
-        provider="one/default",
-        wire_name="wire",
-        catalog_revision="a",
+        base_model="base", provider="one", wire_name="wire", catalog_revision="a"
     )
-    changed_provider = original.model_copy(update={"provider": "two/default"})
+    changed_provider = original.model_copy(update={"provider": "two"})
     changed_revision = original.model_copy(update={"catalog_revision": "b"})
 
     assert _same_concrete_identity(original, changed_provider) is False

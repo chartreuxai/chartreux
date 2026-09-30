@@ -21,6 +21,7 @@ from weakref import WeakKeyDictionary
 import webbrowser
 
 from rich import print as rprint
+from rich.cells import cell_len
 from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, VerticalGroup, VerticalScroll
@@ -28,8 +29,9 @@ from textual.dom import NoScreen
 from textual.driver import Driver
 from textual.events import AppBlur, AppFocus, MouseScrollDown, MouseScrollUp, MouseUp
 from textual.screen import Screen
+from textual.timer import Timer
 from textual.widget import Widget
-from textual.widgets import Static
+from textual.widgets import OptionList, Static
 from textual.worker import Worker, WorkerError, WorkerFailed, WorkerState
 
 from chartreux import __version__ as CORE_VERSION
@@ -100,7 +102,11 @@ from chartreux.cli.textual_ui.notifications import (
     NotificationContext,
     TextualNotificationAdapter,
 )
-from chartreux.cli.textual_ui.quit_manager import QuitManager
+from chartreux.cli.textual_ui.quit_manager import (
+    ExitConsequencesScreen,
+    QuitConfirmKey,
+    QuitManager,
+)
 from chartreux.cli.textual_ui.scheduled_loop_runner import ScheduledLoopCommands
 from chartreux.cli.textual_ui.widgets.agent_bar import AgentBar, agent_state
 from chartreux.cli.textual_ui.widgets.agent_transcript import AgentTranscriptViewer
@@ -174,14 +180,19 @@ from chartreux.cli.textual_ui.windowing import (
     should_resume_history,
     sync_backfill_state,
 )
-from chartreux.cli.textual_ui.windowing.transcript import TranscriptWindow
+from chartreux.cli.textual_ui.windowing.transcript import (
+    TranscriptAnchor,
+    TranscriptWindow,
+)
 from chartreux.config_values import FALLBACK_THEME
 from chartreux.observability.logging import (
+    get_effective_log_level,
     get_log_level_chain,
     logger,
     set_config_log_level,
     set_session_override,
 )
+from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.clipboard import (
     NATIVE_COPY_HINT,
     ClipboardCopyResult,
@@ -215,32 +226,16 @@ _RETRYABLE_TURN_ERROR_CODES = {
 _MAX_INCOMPLETE_STREAM_RETRIES = 2
 _INTERRUPT_WAIT_TIMEOUT = 2.0
 _INTERRUPT_SETTLE_TIMEOUT = 30.0
+_DIAGNOSTIC_HEARTBEAT_DRIFT_WARNING_SECONDS = 0.25
 _INTERRUPT_STILL_STOPPING_WARNING = (
     "The turn is still stopping. New turns will wait until it has fully stopped."
 )
 
-# Written by `/config` when the user config file does not exist yet. Every
-# setting is commented out so the file stays empty until the user edits it.
-_CONFIG_FILE_TEMPLATE = """\
-# Chartreux user configuration.
-#
-# Chartreux uses its built-in defaults until you uncomment or add entries here.
-# Configuration is layered, lowest to highest precedence: built-in defaults,
-# this file, a trusted project `.chartreux/config.toml`, `CHARTREUX_`
-# environment variables, the active agent profile, and runtime override.
-#
-# See docs/reference/configuration.md for the full list of settings. Examples:
-#
-# active_model = "@orchestrator"
-# theme = "auto"  # auto, light, or dark
-# log_level = "INFO"  # DEBUG, INFO, WARNING, or ERROR
-# ask_confirmation_on_exit = true
-"""
-
-
 if TYPE_CHECKING:
     from chartreux.app_server.host import AppServerHost
     from chartreux.app_server.session import AppServerSession, SessionExitSummary
+    from chartreux.cli.textual_ui.screens.settings import SettingsScreen
+    from chartreux.cli.textual_ui.screens.web_search import WebSearchScreen
     from chartreux.cli.textual_ui.widgets.debug_console import DebugConsole
     from chartreux.cli.textual_ui.widgets.log_level_picker import LogLevelPickerApp
     from chartreux.cli.textual_ui.widgets.mcp_app import MCPApp
@@ -294,6 +289,18 @@ def _get_theme_picker_app_class() -> type[ThemePickerApp]:
     from chartreux.ui.widgets.theme_picker import ThemePickerApp
 
     return ThemePickerApp
+
+
+def _get_settings_screen_class() -> type[SettingsScreen]:
+    from chartreux.cli.textual_ui.screens.settings import SettingsScreen
+
+    return SettingsScreen
+
+
+def _get_web_search_screen_class() -> type[WebSearchScreen]:
+    from chartreux.cli.textual_ui.screens.web_search import WebSearchScreen
+
+    return WebSearchScreen
 
 
 def _get_proxy_setup_app_class() -> type[ProxySetupApp]:
@@ -441,9 +448,7 @@ def persist_api_key_for_provider(env_var: str, key: str) -> str:
 
     return persist_api_key(
         provider_config(
-            name="provider/default",
-            api_base="https://localhost",
-            api_key_env_var=env_var,
+            name="provider", api_base="https://localhost", api_key_env_var=env_var
         ),
         key,
     )
@@ -518,6 +523,12 @@ class ChatScroll(VerticalScroll):
             )
             if not (engine_scroll or layout_clamp):
                 engine._scroll_revision += 1
+                if (
+                    not self.app._picker.previewing
+                    and not self.app._picker_origin_restoring
+                ):
+                    self.app._transcript_following = self.scroll_y >= self.max_scroll_y
+                    self.call_after_refresh(self.app._remember_transcript_anchor)
             self.app._request_transcript_reconcile(scroll_driven=True)
 
     def release_anchor(self) -> None:
@@ -680,6 +691,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
     PAUSE_GC_ON_SCROLL: ClassVar[bool] = True
 
     BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("f1", "show_help", "Help", show=False),
         Binding("ctrl+c", "interrupt_or_quit", "Quit", show=False),
         Binding("ctrl+d", "delete_right_or_quit", "Quit", show=False, priority=True),
         Binding("ctrl+z", "suspend_with_message", "Suspend", show=False, priority=True),
@@ -723,7 +735,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         """
         super().open_url(normalize_url(url), new_tab=new_tab)
 
-    def __init__(
+    def __init__(  # noqa: PLR0915
         self,
         history_file: Path,
         app_server: AppServerSource,
@@ -779,15 +791,28 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._agent_task: asyncio.Task | None = None
         self._bash_task: asyncio.Task | None = None
         self._app_server_events_worker: Worker[None] | None = None
+        self._settings_worker: Worker[None] | None = None
+        self._settings_return_bottom_app: BottomApp | None = None
+        self._settings_return_providers = False
+        self._settings_return_web_search = False
+        self._settings_return_state: tuple[str, str | None, int, str | None] | None = (
+            None
+        )
         self._provider_management_worker: Worker[None] | None = None
+        self._web_search_worker: Worker[None] | None = None
         self._shutdown_started = False
+        self._resume_adopted = False
         self._app_server_event_handler_lock = asyncio.Lock()
         self._init_controllers()
 
         self._loading_widget: LoadingWidget | None = None
         self._active_callback: PublicCallbackEntry | None = None
         self._pending_callbacks: deque[PublicCallbackEntry] = deque()
+        self._callback_submitting = False
+        self._callback_delivery_uncertain = False
         self._pending_local_question: asyncio.Future[UserQuestionResult] | None = None
+        self._secondary_returned = asyncio.Event()
+        self._secondary_returned.set()
 
         self.event_handler: EventHandler | None = None
 
@@ -807,6 +832,13 @@ class ChartreuxApp(App):  # noqa: PLR0904
             entry_expansion_state=self._entry_expansion_state,
         )
         self._active_turn_start: int | None = None
+        self._turn_has_final_prose = False
+        self._recovery_issues: dict[str, tuple[str, str]] = {}
+        self._startup_issue_resolved = False
+        self._pending_theme_selection: str | None = None
+        self._pending_picker_reload: tuple[str, str] | None = None
+        self._picker_update_pending = False
+        self._proxy_save_pending = False
         self._load_more = HistoryLoadMoreManager()
         self._history_widget_indices: WeakKeyDictionary[Widget, int] = (
             WeakKeyDictionary()
@@ -832,8 +864,16 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._agent_transcript_viewer: AgentTranscriptViewer | None = None
         self._agent_transcript_focus_target: Widget | None = None
         self._agent_transcript_epoch = 0
+        self._agent_selection_target: str | None = None
+        self._agent_selection_generation = 0
+        self._agent_transition_task: asyncio.Task[None] | None = None
+        self._agent_close_restore_focus = True
+        self._diagnostic_heartbeat_timer: Timer | None = None
+        self._diagnostic_last_heartbeat = 0.0
+        self._diagnostic_max_heartbeat_drift = 0.0
         self._agent_transcript_parent_id: str | None = None
         self._debug_console: DebugConsole | None = None
+        self._debug_console_focus_target: Widget | None = None
         self._rewind_mode = False
         self._rewind_highlighted_widget: UserMessage | None = None
         self._queue_selected_widget: Widget | None = None
@@ -907,6 +947,13 @@ class ChartreuxApp(App):  # noqa: PLR0904
         # crashing on the unbound property.
         self._session_ready = asyncio.Event()
         self._picker = _PickerState()
+        self._transcript_following = True
+        self._resize_anchor_task: asyncio.Task[None] | None = None
+        self._last_transcript_anchor: TranscriptAnchor | None = None
+        self._picker_origin_anchor: TranscriptAnchor | None = None
+        self._picker_origin_restoring = False
+        self._picker_origin_range: tuple[int, int] | None = None
+        self._picker_origin_focus: Widget | None = None
         # Guards against double-display of MCP/startup notices across the
         # readiness-watch and finish-resume-notices race; unrelated to picker preview.
         self._post_init_notices_shown: bool = False
@@ -955,6 +1002,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
     def _begin_pending_turn(self) -> None:
         """Enter the 'turn in flight' state for a just-submitted idle prompt."""
         self._pending_turn = True
+        self._turn_has_final_prose = False
+        if hasattr(self, "_turn_outcome_notice"):
+            self._turn_outcome_notice.hide()
         if self._active_turn_start is None:
             self._active_turn_start = self._transcript.admitted_end_index
         self._turn_started_event.clear()
@@ -1026,23 +1076,35 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     async def _run_settings_update(
         self, description: str, update: Callable[[], Awaitable[None]]
-    ) -> None:
+    ) -> tuple[bool, str]:
         try:
             await update()
         except Exception as exc:
             logger.warning("Settings update failed: %s", description, exc_info=exc)
-            await self._mount_and_scroll(
-                ErrorMessage(f"Failed to apply: {description} — {exc}")
-            )
+            return False, str(exc)
+        return True, ""
 
     def _build_command_registry(self) -> CommandRegistry:
         return CommandRegistry(context=self._command_context())
 
     def _command_context(self) -> CommandContext:
-        return CommandContext()
+        return CommandContext(
+            retry_available=bool(
+                self.event_handler is not None
+                and self.event_handler._retry_presentation is not None
+                and not self.event_handler._retry_presentation.active
+            )
+        )
 
     def _refresh_command_registry(self) -> None:
         self.commands.refresh(self._command_context())
+
+    def _sync_retry_command_availability(self) -> None:
+        if (
+            self.commands.has_command("retry")
+            != self._command_context().retry_available
+        ):
+            self._refresh_command_registry()
 
     async def on_load(self) -> None:
         if (
@@ -1092,10 +1154,20 @@ class ChartreuxApp(App):  # noqa: PLR0904
             yield self._banner
             yield VerticalGroup(id="messages")
 
+        self._recovery_notice = InlineNotice(id="recovery-notice")
+        self._recovery_notice.styles.width = "100%"
+        self._recovery_notice.styles.height = "auto"
+        yield self._recovery_notice
+
         with Horizontal(id="loading-area"):
             yield Static(id="loading-area-content")
             self._inline_notice = InlineNotice(id="inline-notice")
             yield self._inline_notice
+
+        self._turn_outcome_notice = InlineNotice(id="turn-outcome-notice")
+        self._turn_outcome_notice.styles.width = "100%"
+        self._turn_outcome_notice.styles.height = 1
+        yield self._turn_outcome_notice
 
         self._agent_bar = AgentBar()
         yield self._agent_bar
@@ -1111,10 +1183,20 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 queue_items_getter=self._queue.queue_item_texts,
                 queue_selected_index_getter=self._queue_selected_queue_index,
             )
+            pending = NoMarkupStatic(
+                "! Action pending · finish this task, then Esc to answer",
+                id="bottom-pending-action",
+            )
+            pending.display = False
+            yield pending
 
         with Horizontal(id="bottom-bar"):
-            yield PathDisplay(self.app_server.cwd if has_session else str(Path.cwd()))
-            yield NoMarkupStatic(process_id_label(), id="process-title")
+            self._path_display = PathDisplay(
+                self.app_server.cwd if has_session else str(Path.cwd())
+            )
+            yield self._path_display
+            self._process_title = NoMarkupStatic(process_id_label(), id="process-title")
+            yield self._process_title
             yield NoMarkupStatic(id="spacer")
             self._context_progress = ContextProgress()
             if has_session:
@@ -1144,6 +1226,13 @@ class ChartreuxApp(App):  # noqa: PLR0904
         return self._cached_loading_area
 
     async def on_mount(self) -> None:
+        # /log-level changes after mount affect the handler immediately, but
+        # heartbeat creation is mount-time only; remount to change timer state.
+        if get_effective_log_level() == "DEBUG":
+            self._diagnostic_last_heartbeat = time.monotonic()
+            self._diagnostic_heartbeat_timer = self.set_interval(
+                0.5, self._record_diagnostic_heartbeat
+            )
         if self._app_server is None and self._start_app_server is not None:
             init = self._initial_config_response
             initial_theme = init.config.theme if init is not None else FALLBACK_THEME
@@ -1155,6 +1244,29 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 self._start_bootstrap_session()
             return
         await self._mount_after_session_ready()
+
+    def _record_diagnostic_heartbeat(self) -> None:
+        now = time.monotonic()
+        drift = now - self._diagnostic_last_heartbeat - 0.5
+        self._diagnostic_last_heartbeat = now
+        self._diagnostic_max_heartbeat_drift = max(
+            self._diagnostic_max_heartbeat_drift, drift
+        )
+        if drift > _DIAGNOSTIC_HEARTBEAT_DRIFT_WARNING_SECONDS:
+            logger.debug(
+                "App heartbeat drift: %.3fs selection_generation=%d target=%s",
+                drift,
+                self._agent_selection_generation,
+                self._agent_selection_target,
+            )
+
+    def on_unmount(self) -> None:
+        if self._diagnostic_heartbeat_timer is not None:
+            self._diagnostic_heartbeat_timer.stop()
+            self._diagnostic_heartbeat_timer = None
+            logger.debug(
+                "App max heartbeat drift: %.3fs", self._diagnostic_max_heartbeat_drift
+            )
 
     def _start_bootstrap_session(self) -> None:
         self.run_worker(self._bootstrap_session(), exclusive=False)
@@ -1169,6 +1281,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._refresh_command_registry()
         self._refresh_banner()
         self._refresh_context_progress()
+        self.call_after_refresh(self._layout_status_line)
         # Ready now unless a resume/continue/picker flow is pending — those mark
         # ready at their own return-to-input points to avoid dispatching against
         # a half-rebound session.
@@ -1267,6 +1380,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             max_tokens=event.params.context_window,
             current_tokens=event.params.stats.context_tokens,
         )
+        self._layout_status_line()
 
     def _start_post_ready_startup(self) -> None:
         self.run_worker(self._complete_post_ready_startup(), exclusive=False)
@@ -1299,18 +1413,64 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if self._initial_prompt:
             self._process_initial_prompt()
 
+    def _set_recovery_issue(
+        self, key: str, message: str | None, *, severity: str = "warning"
+    ) -> None:
+        if message is None:
+            self._recovery_issues.pop(key, None)
+        else:
+            self._recovery_issues[key] = (severity, message)
+        if not self._recovery_issues:
+            self._recovery_notice.hide()
+            return
+        issues = list(self._recovery_issues.values())
+        combined = " · ".join(text for _, text in issues)
+        self._recovery_notice.show(
+            combined,
+            severity="error"
+            if any(kind == "error" for kind, _ in issues)
+            else "warning",
+            timeout=None,
+        )
+
     def _show_config_issues(self) -> None:
-        for issue in self.app_server.resources.runtime.issues:
-            self._show_config_issue(issue)
-        for warning in self.app_server.resources.config.current.validation_warnings:
-            self.notify(warning, severity="warning", markup=False, timeout=10)
+        issues = self.app_server.resources.runtime.issues
+        warnings = self.app_server.resources.config.current.validation_warnings
+        current = {
+            f"config:{issue.file}:{issue.message}": (
+                f"Config {issue.file}: {issue.message}. Fix the file and run /reload."
+            )
+            for issue in issues
+        }
+        startup_issue = (
+            self._initial_config_response.startup_issue
+            if self._initial_config_response is not None
+            and not self._startup_issue_resolved
+            else None
+        )
+        if startup_issue is not None:
+            current[f"config:{startup_issue.file}:{startup_issue.message}"] = (
+                f"Config {startup_issue.file}: {startup_issue.message}. "
+                "Fix the file and run /reload."
+            )
+        current.update({
+            f"config-warning:{warning}": (
+                f"Config: {warning}"
+                if "/web-search" in warning
+                else f"Config: {warning}. Review the config and run /reload."
+            )
+            for warning in warnings
+        })
+        for key in list(self._recovery_issues):
+            if key.startswith(("config:", "config-warning:")) and key not in current:
+                self._set_recovery_issue(key, None)
+        for key, message in current.items():
+            self._set_recovery_issue(key, message)
 
     def _show_config_issue(self, issue: ConfigIssue) -> None:
-        self.notify(
-            f"{issue.file}\n{issue.message}",
-            severity="warning",
-            markup=False,
-            timeout=10,
+        self._set_recovery_issue(
+            f"config:{issue.file}:{issue.message}",
+            f"Config {issue.file}: {issue.message}. Fix the file and run /reload.",
         )
 
     async def _watch_init_completion(self) -> None:
@@ -1393,14 +1553,15 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return None
 
     def _show_mcp_discovery_failures(self) -> None:
-        for server_name, error in sorted(
-            self.app_server.resources.runtime.mcp.discovery_errors.items()
-        ):
-            self.notify(
-                f"MCP server '{server_name}' failed to connect: {error}",
-                severity="warning",
-                markup=False,
-                timeout=10,
+        errors = self.app_server.resources.runtime.mcp.discovery_errors
+        for key in list(self._recovery_issues):
+            if key.startswith("mcp:") and key.removeprefix("mcp:") not in errors:
+                self._set_recovery_issue(key, None)
+        for server_name, error in sorted(errors.items()):
+            self._set_recovery_issue(
+                f"mcp:{server_name}",
+                f"MCP server '{server_name}' failed to connect: {error}. "
+                "Other servers remain usable; run /mcp to inspect or reconnect.",
             )
 
     async def _show_mcp_auth_required_notice(self) -> None:
@@ -1741,6 +1902,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._pending_local_question.set_result(result)
 
     async def on_question_app_cancelled(self, message: QuestionApp.Cancelled) -> None:
+        if self._active_callback is not None and (
+            self._callback_submitting or self._callback_delivery_uncertain
+        ):
+            return
         result = UserQuestionResult(answers=[], cancelled=True)
         if self._active_callback is not None:
             await self._respond_to_active_callback(
@@ -1892,6 +2057,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         except Exception:
             return
         loading = LoadingWidget(status=status, show_hint=show_hint)
+        loading.set_hint_suppressed(self._current_bottom_app == BottomApp.Question)
         self._loading_widget = loading
         await loading_area.mount(loading)
 
@@ -1911,6 +2077,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def on_model_picker_app_model_selected(
         self, message: ModelPickerApp.ModelSelected
     ) -> None:
+        if self._current_bottom_app != BottomApp.ModelPicker:
+            return
         if await self._is_active_model_enforced():
             self.notify(
                 "'active_model' is enforced by your administrator. "
@@ -1920,34 +2088,82 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
             await self._switch_to_input_app()
             return
-        await self._run_settings_update(
-            f"model {message.alias}", partial(self._persist_model, message.alias)
-        )
-        await self._switch_to_input_app()
+        picker = self.query_one(_get_model_picker_app_class())
+        if await self._apply_picker_update(
+            "model", message.alias, partial(self._persist_model, message.alias), picker
+        ):
+            await self._switch_to_input_app()
 
     async def _persist_model(self, alias: str) -> None:
         await self.app_server.resources.config.update({"active_model": alias})
-        await self._reload_config()
 
     async def on_model_picker_app_cancelled(
         self, _event: ModelPickerApp.Cancelled
     ) -> None:
+        self._pending_picker_reload = None
         await self._switch_to_input_app()
 
     async def on_thinking_picker_app_thinking_selected(
         self, message: ThinkingPickerApp.ThinkingSelected
     ) -> None:
-        await self._run_settings_update(
-            f"thinking {message.level}", partial(self._persist_thinking, message.level)
-        )
-        await self._switch_to_input_app()
+        if self._current_bottom_app != BottomApp.ThinkingPicker:
+            return
+        picker = self.query_one(_get_thinking_picker_app_class())
+        if await self._apply_picker_update(
+            "thinking",
+            message.level,
+            partial(self._persist_thinking, message.level),
+            picker,
+        ):
+            await self._switch_to_input_app()
 
     async def _persist_thinking(self, level: ThinkingLevel) -> None:
         await self.app_server.resources.config.set_thinking(level)
-        await self._reload_config()
+
+    async def _apply_picker_update(
+        self,
+        kind: str,
+        value: str,
+        update: Callable[[], Awaitable[None]],
+        picker: ModelPickerApp | ThinkingPickerApp,
+    ) -> bool:
+        if self._picker_update_pending:
+            return False
+        self._picker_update_pending = True
+        try:
+            picker.clear_error()
+            if self._pending_picker_reload != (kind, value):
+                saved, error = await self._run_settings_update(
+                    f"{kind} {value}", update
+                )
+                if not saved:
+                    picker.show_error(
+                        f"Could not save for this session: {error}. "
+                        "Enter retries; Esc closes."
+                    )
+                    return False
+                self._pending_picker_reload = (kind, value)
+            reload_error = await self._reload_config()
+            if reload_error is not None:
+                picker.show_error(
+                    "Setting saved, but this session may still use its previous "
+                    f"value: runtime reload failed ({reload_error}). "
+                    "Enter retries reload; Esc closes."
+                )
+                return False
+            self._pending_picker_reload = None
+            return True
+        finally:
+            self._picker_update_pending = False
 
     async def on_thinking_picker_app_cancelled(
         self, _event: ThinkingPickerApp.Cancelled
+    ) -> None:
+        self._pending_picker_reload = None
+        await self._switch_to_input_app()
+
+    async def on_log_level_picker_app_cancelled(
+        self, _event: LogLevelPickerApp.Cancelled
     ) -> None:
         await self._switch_to_input_app()
 
@@ -1975,14 +2191,22 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 config_feedback = "config.toml cleared"
         except Exception as exc:
             logger.warning("Failed to persist log-level config", exc_info=exc)
-            await self._switch_to_input_app()
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    f"Failed to persist log-level config: {exc}",
-                    collapsed=self._tools_collapsed,
-                )
+            chain = get_log_level_chain()
+            session = (
+                f"session override {chain.session} applied"
+                if chain.session
+                else "session override cleared"
             )
+            self._set_recovery_issue(
+                "log-level-save",
+                f"Log-level config.toml save failed: {exc}; {session} "
+                f"(effective: {chain.effective}). Config change was not saved; "
+                "run /log-level to retry the config change.",
+                severity="error",
+            )
+            await self._switch_to_input_app()
             return
+        self._set_recovery_issue("log-level-save", None)
         if config_feedback is not None:
             parts.append(config_feedback)
         chain = get_log_level_chain()
@@ -2011,19 +2235,31 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self, message: ThemePickerApp.ThemeSelected
     ) -> None:
         await self._apply_theme(message.theme)
-        await self._run_settings_update(
-            f"theme {message.theme}", partial(self._persist_theme, message.theme)
-        )
+        if not await self._persist_theme(message.theme):
+            # Keep the selected row and picker alive so Enter can retry; only
+            # the speculative visual preview is reverted to the saved theme.
+            return
+        self._pending_theme_selection = None
+        self._set_recovery_issue("theme-save", None)
         await self._switch_to_input_app()
 
-    async def _persist_theme(self, theme: str) -> None:
+    async def _persist_theme(self, theme: str) -> bool:
         try:
             await self.app_server.resources.config.update({"theme": theme})
-        except Exception:
-            # On failure the persisted theme is unchanged, so revert the
-            # visual theme that was applied speculatively at selection time.
-            logger.exception("Failed to persist theme %s", theme)
+        except Exception as exc:
+            logger.warning("Failed to persist theme %s", theme, exc_info=exc)
+            self._pending_theme_selection = theme
             await self._apply_theme(self.config.theme)
+            self._set_recovery_issue(
+                "theme-save",
+                f"Theme '{theme}' save failed: {exc}. The saved theme "
+                f"'{self.config.theme}' is restored and usable; selection is "
+                "retained in the picker. Press Enter to retry or Esc to leave; "
+                "run /theme to reopen it later.",
+                severity="error",
+            )
+            return False
+        return True
 
     async def on_theme_picker_app_cancelled(
         self, message: ThemePickerApp.Cancelled
@@ -2059,7 +2295,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def on_mcpapp_mcpoauth_requested(
         self, message: MCPApp.MCPOAuthRequested
     ) -> None:
-        await self._switch_to_input_app()
+        await self._switch_to_input_app(return_to_settings=False)
         await self._switch_from_input(
             _get_mcp_oauth_app_class()(
                 server_name=message.server_name, mcp=self.app_server.resources.mcp
@@ -2071,25 +2307,39 @@ class ChartreuxApp(App):  # noqa: PLR0904
     ) -> None:
         if message.refreshed:
             await self._refresh_mcp_browser()
-        await self._switch_to_input_app()
-        await self._show_mcp(cmd_args=message.server_name)
+        await self._switch_to_input_app(return_to_settings=False)
+        await self._show_mcp(cmd_args=message.server_name if message.refreshed else "")
 
     async def on_proxy_setup_app_proxy_setup_closed(
         self, message: ProxySetupApp.ProxySetupClosed
     ) -> None:
+        if self._proxy_save_pending:
+            return
         if not message.saved:
             await self._mount_and_scroll(UserCommandMessage("Proxy setup cancelled."))
         else:
+            self._proxy_save_pending = True
             try:
                 await self._persist_proxy(message.changes)
             except Exception as exc:
                 logger.warning("Proxy settings update was rejected: %s", exc)
-                self.query_one(_get_proxy_setup_app_class()).show_error(str(exc))
+                proxy = self.query_one(_get_proxy_setup_app_class())
+                proxy.finish_save(success=False)
+                proxy.show_error(str(exc))
+                self._proxy_save_pending = False
                 return
 
         await self._switch_to_input_app()
 
     async def _handle_command(self, user_input: str) -> bool:
+        self._refresh_command_registry()
+        if user_input.strip().split(maxsplit=1)[0:1] == [
+            "/retry"
+        ] and not self.commands.has_command("retry"):
+            await self._mount_and_scroll(
+                UserCommandMessage("No interrupted response is available to retry.")
+            )
+            return True
         resolved = self.commands.parse_command(user_input)
         if not resolved:
             return False
@@ -2204,6 +2454,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             input_widget.value = message
 
     def _reset_ui_state(self) -> None:
+        self._last_transcript_anchor = None
         self._windowing.reset()
         self._transcript.reset()
         self._active_turn_start = None
@@ -2224,6 +2475,30 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 await self._resume_history_from_messages()
             self._custom_tools_deprecation_message = None
         await self._show_custom_tools_deprecation_warning()
+
+    async def _restore_picker_history_range(self) -> None:
+        """Re-admit the origin's inspected pages before restoring its viewport."""
+        if self._picker_origin_range is None or not self._transcript.unit_ids:
+            return
+        start, _ = self._picker_origin_range
+        current = self._transcript.admitted_start_index
+        if start >= current:
+            return
+        history = self.app_server.history
+        # The timeline may have changed during preview; admit only available rows.
+        prefix = history[max(0, start) : min(current, len(history))]
+        if prefix:
+            await self._mount_history_batch(
+                prefix, self._messages_area, start_index=max(0, start), before=0
+            )
+            self._windowing.recompute_backfill(
+                history, admitted_start_index=self._transcript.admitted_start_index
+            )
+            await self._load_more.set_visible(
+                self._messages_area,
+                visible=self._has_older_history,
+                remaining=self._history_backfill_remaining,
+            )
 
     async def _deferred_resume_and_start(self) -> None:
         logger.debug("Startup resume stage=initial-history-started")
@@ -2519,8 +2794,66 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     selected.add(key)
         return frozenset(selected)
 
+    def _remember_transcript_anchor(self) -> None:
+        if not self._picker.previewing and (
+            self._resize_anchor_task is None or self._resize_anchor_task.done()
+        ):
+            self._last_transcript_anchor = self._transcript.capture_anchor(
+                self._messages_area, following=self._transcript_following
+            )
+
     def on_resize(self) -> None:
+        if (
+            self._transcript.unit_ids
+            and not self._picker.previewing
+            and (self._resize_anchor_task is None or self._resize_anchor_task.done())
+        ):
+            anchor = self._last_transcript_anchor or self._transcript.capture_anchor(
+                self._messages_area, following=self._transcript_following
+            )
+            if anchor is not None:
+                anchor = replace(
+                    anchor, scroll_revision=self._transcript._scroll_revision
+                )
+
+                async def restore_after_reflow() -> None:
+                    ready: asyncio.Future[None] = (
+                        asyncio.get_running_loop().create_future()
+                    )
+                    self.call_after_refresh(lambda: ready.set_result(None))
+                    await ready
+                    self._messages_area.refresh(layout=True)
+                    await self._transcript._layout_pass(self._messages_area)
+                    await self._transcript.restore_anchor(self._messages_area, anchor)
+                    self._request_transcript_reconcile()
+
+                self._resize_anchor_task = asyncio.create_task(restore_after_reflow())
+                self._resize_anchor_task.add_done_callback(
+                    lambda _: self.call_after_refresh(self._remember_transcript_anchor)
+                )
         self._request_transcript_reconcile()
+        self._layout_status_line()
+
+    def _layout_status_line(self) -> None:
+        """Reserve context capacity before spending width on optional identities."""
+        path = getattr(self, "_path_display", None)
+        process = getattr(self, "_process_title", None)
+        context = self._context_progress
+        if path is None or process is None or context is None:
+            return
+        width = self.size.width
+        usage = str(context.render())
+        reserve = cell_len(usage) + (1 if usage else 0)
+        path.compact(False)
+        process.display = True
+        if (
+            cell_len(str(path.render())) + cell_len(str(process.render())) + 1 + reserve
+            > width
+        ):
+            process.display = False
+        if cell_len(str(path.render())) + reserve > width:
+            path.compact(True)
+        path.styles.max_width = max(0, width - reserve)
 
     def _is_tool_enabled_in_main_agent(self, tool: str) -> bool:
         return self.app_server.resources.runtime.has_tool(tool)
@@ -2554,35 +2887,85 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if self._active_callback is not None:
             raise RuntimeError("Cannot open local input while a callback is active")
         self._pending_local_question = asyncio.get_running_loop().create_future()
+        opened = False
         try:
             await self._wait_for_typing_pause()
+            if self._secondary_surface_active():
+                self._secondary_returned.clear()
+                self._indicate_pending_action()
+                await self._secondary_returned.wait()
             self._terminal_notifier.notify(NotificationContext.ACTION_REQUIRED)
             with paused_timer(self._loading_widget):
                 await self._switch_to_question_app(request)
+                opened = True
                 return await self._pending_local_question
         finally:
             self._pending_local_question = None
-            if self._pending_callbacks and self._active_callback is None:
-                await self._show_callback(self._pending_callbacks.popleft())
-            else:
-                await self._switch_to_input_app()
+            if opened:
+                if self._pending_callbacks and self._active_callback is None:
+                    await self._show_callback(self._pending_callbacks.popleft())
+                else:
+                    await self._switch_to_input_app()
+
+    def _secondary_surface_active(self) -> bool:
+        return (
+            self._agent_transcript_viewer is not None
+            or self._agent_selection_target is not None
+            or self._current_bottom_app not in {BottomApp.Input, BottomApp.Question}
+            or any(
+                screen.id in {"settings-screen", "websearch-screen"}
+                or screen.__class__.__name__ == "ProviderWorkbenchScreen"
+                for screen in self.screen_stack
+            )
+        )
+
+    def _indicate_pending_action(self) -> None:
+        pending = bool(self._pending_callbacks or self._pending_local_question)
+        for indication in (
+            "#settings-pending-action",
+            "#wb-pending-action",
+            "#agent-transcript-pending-action",
+        ):
+            for screen in self.screen_stack:
+                for widget in screen.query(indication):
+                    widget.display = pending
+        # The transcript viewer is mounted directly on the app, not on a screen.
+        for widget in self.query("#agent-transcript-pending-action"):
+            widget.display = pending
+        for widget in self.query("#bottom-pending-action"):
+            widget.display = pending and self._current_bottom_app not in {
+                BottomApp.Input,
+                BottomApp.Question,
+            }
+
+    async def _present_pending_callback(self) -> None:
+        if self._secondary_surface_active():
+            self._indicate_pending_action()
+            return
+        self._secondary_returned.set()
+        if (
+            self._pending_callbacks
+            and self._active_callback is None
+            and self._pending_local_question is None
+        ):
+            await self._show_callback(self._pending_callbacks.popleft())
+        self._indicate_pending_action()
 
     async def _show_callback(self, callback: PublicCallbackEntry) -> None:
         if (
             self._active_callback is not None
+            and self._active_callback.callback_id == callback.callback_id
+        ) or any(
+            pending.callback_id == callback.callback_id
+            for pending in self._pending_callbacks
+        ):
+            return
+        if self._secondary_surface_active() or (
+            self._active_callback is not None
             or self._pending_local_question is not None
         ):
-            if (
-                self._active_callback is not None
-                and self._active_callback.callback_id == callback.callback_id
-            ):
-                return
-            if any(
-                pending.callback_id == callback.callback_id
-                for pending in self._pending_callbacks
-            ):
-                return
             self._pending_callbacks.append(callback)
+            self._indicate_pending_action()
             return
         self._active_callback = callback
         try:
@@ -2593,6 +2976,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
             if loading is not None:
                 loading.begin_action_required(callback.title)
             await self._wait_for_typing_pause()
+            if self._secondary_surface_active():
+                self._active_callback = None
+                self._pending_callbacks.appendleft(callback)
+                self._indicate_pending_action()
+                return
             self._terminal_notifier.notify(NotificationContext.ACTION_REQUIRED)
             await self._switch_to_question_app(callback.detail.request)
         except BaseException:
@@ -2603,12 +2991,49 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def _respond_to_active_callback(
         self, output: UserInputCallbackOutput
     ) -> None:
+        from chartreux.app_server import AppServerConnectionClosed
+
         callback = self._active_callback
-        if callback is None:
+        if (
+            callback is None
+            or self._callback_submitting
+            or self._callback_delivery_uncertain
+        ):
             return
-        await self.app_server.respond_to_callback(callback.callback_id, output)
+        self._callback_submitting = True
+        question = self.query_one(_get_question_app_class())
+        question.set_submission_status("Running: Sending answer")
+        try:
+            await self.app_server.respond_to_callback(callback.callback_id, output)
+        except AppServerResponseError as exc:
+            # A protocol rejection is definite: the same draft may be corrected
+            # and submitted again without guessing whether the server accepted it.
+            question.set_submission_status(
+                f"Failed: Answer rejected ({exc}). Draft kept; edit and submit again, or Esc to cancel."
+            )
+            return
+        except (AppServerConnectionClosed, OSError, TimeoutError) as exc:
+            self._callback_delivery_uncertain = True
+            question.set_submission_status(
+                "Warning: Answer delivery is uncertain. Draft kept; do not resend. "
+                "Ctrl+D exits; inspect the session before deciding what to do next. "
+                f"({exc})"
+            )
+            return
+        except Exception as exc:
+            self._callback_delivery_uncertain = True
+            logger.warning("Callback delivery outcome unknown", exc_info=exc)
+            question.set_submission_status(
+                "Warning: Answer delivery is uncertain. Draft kept; do not resend. "
+                "Ctrl+D exits; inspect the session before deciding what to do next."
+            )
+            return
+        finally:
+            self._callback_submitting = False
         if self._active_callback is callback:
+            question.disabled = True
             self._active_callback = None
+            self._callback_delivery_uncertain = False
             if self._pending_callbacks:
                 await self._show_callback(self._pending_callbacks.popleft())
                 return
@@ -2642,16 +3067,52 @@ class ChartreuxApp(App):  # noqa: PLR0904
         async for event in events:
             await self._handle_turn_event(event)
 
+    def _show_no_output_outcome(self) -> None:
+        agents_running = any(
+            agent_state(agent) == "running" for agent in self._agent_summaries
+        )
+        self._turn_outcome_notice.show(
+            "Info: Main turn completed without a final response; "
+            + (
+                "background agents are still running."
+                if agents_running
+                else "ready for another prompt."
+            ),
+            timeout=None,
+        )
+
+    def _track_turn_outcome(self, event: AppServerEvent) -> None:
+        if isinstance(event, TurnStarted):
+            self._turn_has_final_prose = False
+            self._turn_outcome_notice.hide()
+        elif isinstance(event, (HistoryEntryAdded, HistoryEntryUpdated)):
+            entry = _public_entry(event)
+            if isinstance(entry, PublicMessageEntry) and entry.role == "assistant":
+                self._turn_has_final_prose |= bool(entry.text.strip())
+        elif isinstance(event, TurnCompleted):
+            if (
+                event.turn.next_turn_id is None
+                and event.turn.status is PublicTurnStatus.COMPLETED
+                and not self._turn_has_final_prose
+            ):
+                self._show_no_output_outcome()
+
     async def _handle_turn_event(self, event: AppServerEvent) -> None:
+        self._track_turn_outcome(event)
         if isinstance(event, AgentsUpdate):
             viewer = self._agent_transcript_viewer
-            if viewer is not None and not any(
-                agent.agent_id == viewer.agent_id for agent in event.agents
+            selected_id = self._agent_selection_target or (
+                viewer.agent_id if viewer is not None else None
+            )
+            if selected_id is not None and not any(
+                agent.agent_id == selected_id for agent in event.agents
             ):
                 # Releases remove the agent from published summaries. Evictions
                 # remain tombstones in that list and therefore stay browsable.
-                await self._close_agent_transcript_viewer(restore_focus=True)
+                await self._request_agent_transcript_close(restore_focus=True)
             self._agent_summaries = event.agents
+            if self._turn_outcome_notice.display:
+                self._show_no_output_outcome()
             self._agent_evictions.update({
                 eviction.agent_id: eviction for eviction in event.evictions
             })
@@ -2682,6 +3143,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 viewer.set_live(
                     selected is not None and agent_state(selected) == "running"
                 )
+                if selected is not None and self._agent_bar is not None:
+                    viewer.set_metadata(self._agent_bar.full_metadata(selected))
             return
         if isinstance(event, TurnQueueUpdated):
             await self._queue.sync_server_queue(event.queue)
@@ -2709,6 +3172,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             await self.event_handler.handle_event(
                 event, loading_widget=self._loading_widget
             )
+            self._sync_retry_command_availability()
 
     async def _shutdown(self) -> None:
         # Stop consuming app-server events before Textual tears down the DOM.
@@ -2748,7 +3212,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
                                 if self._active_turn_start is not None
                                 else self._transcript.admitted_end_index
                             )
-                            await self._prepare_main_turn_view()
+                            # A server-started turn updates the transcript behind the
+                            # current task; it must not change inspection or focus.
                             # The in-flight turn surfaced: leave the pending state and
                             # wake any interrupt waiting for it.
                             self._clear_pending_turn()
@@ -2761,13 +3226,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
         except AppServerConnectionClosed:
             if not self._shutdown_started:
                 raise
-
-    async def _prepare_main_turn_view(self) -> None:
-        """Return to the conversation before a newly started main turn streams."""
-        if self._agent_transcript_viewer is not None:
-            await self._close_agent_transcript_viewer(restore_focus=False)
-            if self._chat_input_container is not None:
-                self._chat_input_container.focus_input()
 
     def _turn_ui_lock(self) -> asyncio.Lock:
         if self._turn_ui_mutex is None:
@@ -2944,6 +3402,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             and error.error.code in _RETRYABLE_TURN_ERROR_CODES
         ):
             self.event_handler.offer_retry(widget)
+            self._refresh_command_registry()
 
     async def _retry(
         self,
@@ -2958,6 +3417,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             command_message
         ):
             return
+        self._refresh_command_registry()
         self._agent_task = asyncio.create_task(
             self._handle_turn(
                 build_retry_prompt(cmd_args),
@@ -2994,6 +3454,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 self.event_handler.escalate_unresolved_errors()
             self._queue.notify_busy_changed()
             if not notify_complete:
+                self._sync_retry_command_availability()
                 return
             if self.event_handler:
                 self.event_handler.clear_tool_call_anchors()
@@ -3003,6 +3464,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 logger.exception("Failed to admit live history while finalizing turn")
             if self.event_handler:
                 self.event_handler.settle_turn()
+            self._sync_retry_command_availability()
             await self._refresh_windowing_from_history()
             self._clear_active_turn_pins()
             self._request_transcript_reconcile()
@@ -3030,8 +3492,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
     @staticmethod
     def _retry_hint() -> str:
         return (
-            "\n\nRun /retry [additional instructions] to continue the interrupted "
-            "response."
+            "\n\nRun /retry [additional instructions] to start a new turn. "
+            "Completed tool results are kept; recent actions may repeat."
         )
 
     def _rate_limit_message(self) -> str:
@@ -3097,7 +3559,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._loading_widget.set_status(INTERRUPTING_LOADING_STATUS)
 
         self._active_callback = None
+        self._callback_delivery_uncertain = False
         self._pending_callbacks.clear()
+        self._indicate_pending_action()
         if self._pending_local_question and not self._pending_local_question.done():
             self._pending_local_question.set_result(
                 UserQuestionResult(answers=[], cancelled=True)
@@ -3204,7 +3668,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._queue.notify_busy_changed()
             self._maybe_settle_interrupt()
 
+    async def action_show_help(self) -> None:
+        await self._show_help()
+
     async def _show_help(self, **kwargs: Any) -> None:
+        self._refresh_command_registry()
         help_text = self.commands.get_help_text()
         await self._mount_and_scroll(UserCommandMessage(help_text))
 
@@ -3264,7 +3732,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         statuses = (await self.app_server.resources.mcp.read()).statuses
         if not statuses:
             await self._mount_and_scroll(
-                UserCommandMessage("No MCP servers configured.")
+                UserCommandMessage(
+                    "No MCP servers configured. Run `/mcp add <url>` to add one."
+                )
             )
             return
         lines = ["### MCP auth status", ""]
@@ -3368,7 +3838,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         state = await self.app_server.resources.mcp.read()
         if not state.sources:
             await self._mount_and_scroll(
-                UserCommandMessage("No MCP servers configured.")
+                UserCommandMessage(
+                    "No MCP servers configured. Run `/mcp add <url>` to add one."
+                )
             )
             return
 
@@ -3435,17 +3907,78 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return
         await self._switch_to_theme_picker_app()
 
+    async def _show_settings(self, **kwargs: Any) -> None:
+        if (
+            self._settings_worker is not None and not self._settings_worker.is_finished
+        ) or any(
+            isinstance(screen, _get_settings_screen_class())
+            for screen in self.screen_stack
+        ):
+            return
+        self._settings_worker = self.run_worker(
+            self._wait_for_settings(), exclusive=False, name="settings"
+        )
+
     async def _show_proxy_setup(self, **kwargs: Any) -> None:
         if self._current_bottom_app == BottomApp.ProxySetup:
             return
         await self._switch_to_proxy_setup_app()
 
-    async def _show_providers(self, **kwargs: Any) -> None:
-        """Open one host-neutral provider flow only while the session is idle."""
+    async def _show_web_search(self, **kwargs: Any) -> None:
+        """Open the dedicated web search settings editor while idle."""
         if self._is_busy():
             await self._mount_and_scroll(
                 ErrorMessage(
-                    "Provider management is only available while no turn is active.",
+                    "Web search settings are available while no turn is active.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+        if (
+            self._web_search_worker is not None
+            and not self._web_search_worker.is_finished
+        ):
+            return
+        self._web_search_worker = self.run_worker(
+            self._wait_for_web_search_from_settings(),
+            exclusive=False,
+            name="web-search-settings",
+        )
+
+    async def _wait_for_web_search_from_settings(self) -> None:
+        try:
+            from chartreux.cli.textual_ui.settings_service import SettingsService
+
+            service = SettingsService(
+                self.app_server.resources.config, apply_ui=self._apply_config_to_ui
+            )
+            snapshot = await service.read()
+            if snapshot.web_search is None:
+                raise RuntimeError("Web search settings are unavailable")
+            await self.push_screen_wait(
+                _get_web_search_screen_class()(
+                    service, snapshot, credentials=_ProviderCredentials()
+                )
+            )
+        except Exception as exc:
+            logger.warning("Could not open web search settings", exc_info=True)
+            await self._mount_and_scroll(
+                ErrorMessage(f"Could not open web search settings: {exc}")
+            )
+        finally:
+            self._web_search_worker = None
+            if self._settings_return_web_search:
+                self._settings_return_web_search = False
+                await self._show_settings()
+            else:
+                await self._present_pending_callback()
+
+    async def _show_providers(self, **kwargs: Any) -> None:
+        """Open Provider Settings only while the session is idle."""
+        if self._is_busy():
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Provider Settings is only available while no turn is active.",
                     collapsed=self._tools_collapsed,
                 )
             )
@@ -3455,42 +3988,53 @@ class ChartreuxApp(App):  # noqa: PLR0904
             and not self._provider_management_worker.is_finished
         ):
             await self._mount_and_scroll(
-                ErrorMessage("Provider management is already open.")
+                ErrorMessage("Provider Settings is already open.")
             )
             return
         self._provider_management_worker = self.run_worker(
-            self._wait_for_provider_management(),
+            self._wait_for_provider_management_from_settings(),
             exclusive=False,
             name="provider-management",
         )
 
+    async def _wait_for_provider_management_from_settings(self) -> None:
+        try:
+            await self._wait_for_provider_management()
+        finally:
+            if self._settings_return_providers:
+                self._settings_return_providers = False
+                await self._show_settings()
+            else:
+                await self._present_pending_callback()
+
     async def _wait_for_provider_management(self) -> None:
         """Wait outside the dismissed screen, then explicitly report adoption."""
         try:
-            flow = import_module("chartreux.ui.providers.flow")
+            workbench = import_module("chartreux.ui.providers.workbench")
             contracts = import_module("chartreux.ui.providers.contracts")
             catalog_loader = import_module("chartreux.core.model_catalog.loader")
             discovery_module = import_module("chartreux.core.model_catalog.discovery")
-            screen = flow.ProviderManagementScreen(
-                discovery=discovery_module.discover_models,
-                catalog_writer=catalog_loader.CatalogStore(),
-                credentials=_ProviderCredentials(),
-                config=_ProviderConfigService(self),
-                snapshot=catalog_loader.load_catalog(),
-                management=True,
-                validate_selection=_ProviderConfigService(
-                    self
-                ).validate_active_selection,
-                initial_active_model=self.config.active_model_expression,
-                tls=contracts.TLSConfig(
-                    enable_system_trust_store=self.config.enable_system_trust_store
-                ),
+            credentials = _ProviderCredentials()
+            config = _ProviderConfigService(self)
+            result = await self.push_screen_wait(
+                workbench.ProviderWorkbenchScreen(
+                    discovery=discovery_module.discover_models,
+                    catalog_writer=catalog_loader.CatalogStore(),
+                    credentials=credentials,
+                    credential_resolver=credentials.resolve_key,
+                    config=config,
+                    snapshot=catalog_loader.load_catalog(),
+                    tls=contracts.TLSConfig(
+                        enable_system_trust_store=self.config.enable_system_trust_store
+                    ),
+                )
             )
-            result = await self.push_screen_wait(screen)
+            if not isinstance(result, contracts.ProviderWorkbenchResult):
+                raise TypeError("Provider workbench returned an invalid result")
         except Exception:
             logger.warning("Could not open provider management", exc_info=True)
             await self._mount_and_scroll(
-                ErrorMessage("Could not open provider management. Please try again.")
+                ErrorMessage("Could not open Provider Settings. Please try again.")
             )
             return
         if result.warning:
@@ -3508,15 +4052,12 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 )
                 return
         if result.status == "completed":
-            active_model = result.active_model or "the selected model"
             await self._mount_and_scroll(
-                UserCommandMessage(
-                    f"Provider changes adopted. Active model: {active_model}."
-                )
+                UserCommandMessage("Provider changes adopted.")
             )
         else:
             await self._mount_and_scroll(
-                UserCommandMessage("Provider management closed.")
+                UserCommandMessage("Provider Settings closed.")
             )
 
     async def _rename_session(self, cmd_args: str = "", **kwargs: Any) -> None:
@@ -3585,6 +4126,17 @@ class ChartreuxApp(App):  # noqa: PLR0904
         # Mount the picker and erase the slash command message in one repaint so
         # the transition from command menu → picker is visually instant.
         picker = self._build_picker([], loading=True)
+        self._picker_origin_anchor = self._transcript.capture_anchor(
+            self._messages_area,
+            following=self._transcript_following
+            and self._chat_widget.scroll_y >= self._chat_widget.max_scroll_y,
+        )
+        self._picker_origin_range = (
+            (self._transcript.admitted_start_index, self._transcript.admitted_end_index)
+            if self._transcript.unit_ids
+            else None
+        )
+        self._picker_origin_focus = self.screen.focused
         with self.batch_update():
             if command_message is not None:
                 await command_message.remove()
@@ -3625,12 +4177,32 @@ class ChartreuxApp(App):  # noqa: PLR0904
         # Record the intended preview target so a slower earlier request can't
         # overwrite the screen after the highlight moved on or resume started.
         self._picker.preview_session_id = session_id
+        self._picker.previewing = True
+        self._reset_ui_state()
+        with self.batch_update():
+            await self._load_more.hide()
+            await self._messages_area.remove_children()
+            await self._messages_area.mount(
+                UserCommandMessage(f"Preview `{session_id[:8]}` loading (not active)…")
+            )
         try:
             history = await self.app_server.resources.sessions.get_session_history(
                 session_id
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("get_session_history failed for %s", session_id)
+            if self._picker.preview_is_current(session_id):
+                self._picker.previewing = True
+                self._reset_ui_state()
+                with self.batch_update():
+                    await self._load_more.hide()
+                    await self._messages_area.remove_children()
+                    await self._messages_area.mount(
+                        ErrorMessage(
+                            f"Preview `{session_id[:8]}` failed to load: {exc}. "
+                            "No history is shown; choose another session or cancel."
+                        )
+                    )
             return
         if not self._picker.preview_is_current(session_id):
             return
@@ -3653,6 +4225,12 @@ class ChartreuxApp(App):  # noqa: PLR0904
             await self._messages_area.remove_children()
             if not self._picker.preview_is_current(session_id):
                 return
+            await self._messages_area.mount(
+                UserCommandMessage(
+                    f"Preview `{session_id[:8]}` (not active): "
+                    + ("history loaded" if history else "empty history")
+                )
+            )
             if plan is not None:
                 await self._mount_history_batch(
                     plan.tail_entries,
@@ -3690,23 +4268,20 @@ class ChartreuxApp(App):  # noqa: PLR0904
             if self._show_resume_picker:
                 self._show_resume_picker = False
                 self._startup_prompt_processed = True
-            # Resume failed before rebinding, so the session is unchanged; drop a
-            # stale preview so it isn't left on screen desynced from session_id.
-            if was_previewing:
+            if not self._resume_adopted and was_previewing:
                 try:
                     await self._rebuild_transcript_from_current_session()
                 except Exception:
                     logger.exception(
                         "Failed to rebuild transcript after resume failure"
                     )
-            else:
-                self.run_worker(
-                    self._show_custom_tools_deprecation_warning_after_initial_history(),
-                    exclusive=False,
-                )
+            if self._resume_adopted:
+                # Recovery is installed by _resume_local_session, not the old preview.
+                return
             await self._mount_and_scroll(
                 ErrorMessage(
-                    f"Failed to load session: {e}", collapsed=self._tools_collapsed
+                    f"Session not changed; failed to load `{event.session_id[:8]}`: {e}",
+                    collapsed=self._tools_collapsed,
                 )
             )
             return
@@ -3776,6 +4351,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._startup_prompt_processed = True
         if self._exit_picker_preview():
             await self._rebuild_transcript_from_current_session()
+            await self._restore_picker_history_range()
             return
         self.run_worker(
             self._show_custom_tools_deprecation_warning_after_initial_history(),
@@ -3785,42 +4361,90 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def on_session_picker_app_cancelled(
         self, event: SessionPickerApp.Cancelled
     ) -> None:
-        await self._exit_picker_to_input()
-        await self._mount_and_scroll(UserCommandMessage("Resume cancelled."))
+        self._picker_origin_restoring = True
+        try:
+            await self._exit_picker_to_input()
+            await self._mount_and_scroll(UserCommandMessage("Resume cancelled."))
+            await self._restore_picker_origin()
+        finally:
+            self.call_after_refresh(self._finish_picker_origin_restore)
+
+    def _finish_picker_origin_restore(self) -> None:
+        self._picker_origin_restoring = False
+        self._remember_transcript_anchor()
+
+    async def _restore_picker_origin(self) -> None:
+        anchor = self._picker_origin_anchor
+        self._picker_origin_anchor = None
+        self._picker_origin_range = None
+        if anchor is not None:
+            self._transcript_following = anchor.following
+            await self._transcript.restore_anchor(
+                self._messages_area, anchor, check_revision=False
+            )
+        target = self._picker_origin_focus
+        self._picker_origin_focus = None
+        if target is not None and target.is_mounted and target.display:
+            target.focus()
 
     async def _resume_local_session(self, session_id: str) -> None:
         self._exit_picker_preview()
-        await self._close_agent_transcript_viewer(restore_focus=False)
+        await self._request_agent_transcript_close(restore_focus=False)
+        self._resume_adopted = False
         self._resume_ui_ready.clear()
         try:
-            await self.app_server.resume(session_id)
+            await self.app_server.resume(
+                session_id, on_adopt=lambda: setattr(self, "_resume_adopted", True)
+            )
             logger.debug("Resume stage=rpc-returned session_id=%s", session_id)
             await self._reset_presentation_after_resume()
             logger.debug("Resume stage=presentation-reset session_id=%s", session_id)
+            if self._chat_input_container:
+                self._chat_input_container.set_custom_border(None)
+            self._refresh_banner()
+            self._refresh_context_progress()
+            await self._rebuild_transcript_from_current_session()
+            logger.debug("Resume stage=transcript-rebuilt session_id=%s", session_id)
+            await self._queue.sync_server_queue(self.app_server.turn_queue)
+            logger.debug("Resume stage=queue-synced session_id=%s", session_id)
+            await self._mount_and_scroll(
+                UserCommandMessage(f"Resumed session `{session_id[:8]}`")
+            )
+            await self._surface_committed_model_recovery()
+            self.run_worker(self._finish_resume_notices(), exclusive=False)
+        except BaseException as exc:
+            if self._resume_adopted:
+                # Adoption is not reversible. Remove old-session presentation even
+                # when resource refresh, rebuild, queue sync or cancellation fails.
+                try:
+                    await self._show_adopted_resume_recovery(exc)
+                except Exception:
+                    logger.exception("Failed to display adopted-session recovery")
+            raise
         finally:
-            # A failed resume leaves the attached session and its presentation
-            # untouched. Either way, release events that arrived during the RPC.
             self._resume_ui_ready.set()
-        if self._chat_input_container:
-            self._chat_input_container.set_custom_border(None)
+
+    async def _show_adopted_resume_recovery(self, exc: BaseException) -> None:
+        self._active_callback = None
+        self._pending_callbacks.clear()
+        self._indicate_pending_action()
+        try:
+            await self._queue.clear_server_queue()
+        except Exception:
+            logger.exception("Failed to clear old-session queue presentation")
+        self._reset_ui_state()
+        with self.batch_update():
+            await self._load_more.hide()
+            await self._messages_area.remove_children()
+            await self._messages_area.mount(
+                ErrorMessage(
+                    f"Session `{self.app_server.session_id[:8]}` is active, but its "
+                    f"presentation did not finish loading: {exc}. "
+                    "Do not rely on old content. Reopen /sessions to retry loading "
+                    "or restart to recover this session."
+                )
+            )
         self._refresh_banner()
-        self._refresh_context_progress()
-        # Rebuild the transcript from the resumed session instead of trusting the
-        # picker preview, which may have been skipped, may have failed, or may show
-        # a different session than the one that was confirmed.
-        await self._rebuild_transcript_from_current_session()
-        logger.debug("Resume stage=transcript-rebuilt session_id=%s", session_id)
-        await self._queue.sync_server_queue(self.app_server.turn_queue)
-        logger.debug("Resume stage=queue-synced session_id=%s", session_id)
-        await self._mount_and_scroll(
-            UserCommandMessage(f"Resumed session `{session_id[:8]}`")
-        )
-        logger.debug("Resume stage=mounted session_id=%s", session_id)
-        await self._surface_committed_model_recovery()
-        # Fast resume returns from the resume RPC before MCP init
-        # finishes, so defer post-init notices to the background until the
-        # resumed runtime settles instead of racing incomplete state here.
-        self.run_worker(self._finish_resume_notices(), exclusive=False)
 
     async def _surface_committed_model_recovery(self) -> None:
         """Surface a resumed session whose committed model left the catalog.
@@ -3866,7 +4490,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._clear_pending_turn()
 
             self._active_callback = None
+            self._callback_delivery_uncertain = False
             self._pending_callbacks.clear()
+            self._indicate_pending_action()
             if (
                 self._pending_local_question is not None
                 and not self._pending_local_question.done()
@@ -3922,7 +4548,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._refresh_banner()
 
     async def _auto_resume_on_startup(self) -> None:
-        await self._mount_and_scroll(UserCommandMessage("Resuming session…"))
+        await self._mount_and_scroll(
+            UserCommandMessage(f"Resuming session{chrome_glyph('truncation')}")
+        )
         session_id: str | None = None
         try:
             session_id = self._resume_session_id
@@ -3947,16 +4575,22 @@ class ChartreuxApp(App):  # noqa: PLR0904
             logger.exception(
                 "Failed to auto-resume session %s", session_id or "<unknown>"
             )
-            try:
-                await self._rebuild_transcript_from_current_session()
-            except Exception:
-                # Rebuilding can itself fail when the resume lost its connection
-                # or the UI is reconciling queued events. Always mount the resume
-                # failure so startup cannot leave an empty chat screen.
-                logger.exception("Failed to rebuild transcript after resume failure")
+            if not self._resume_adopted:
+                try:
+                    await self._rebuild_transcript_from_current_session()
+                except Exception:
+                    logger.exception(
+                        "Failed to rebuild transcript after resume failure"
+                    )
             await self._mount_and_scroll(
                 ErrorMessage(
-                    f"Failed to resume session: {e}", collapsed=self._tools_collapsed
+                    (
+                        f"Session `{self.app_server.session_id[:8]}` is active but "
+                        f"presentation is incomplete: {e}"
+                        if self._resume_adopted
+                        else f"Session not changed; failed to resume: {e}"
+                    ),
+                    collapsed=self._tools_collapsed,
                 )
             )
         finally:
@@ -3984,8 +4618,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 hooks_count=self.app_server.resources.runtime.hooks_count,
             )
         self._show_config_issues()
+        self._show_mcp_discovery_failures()
 
-    async def _reload_config(self, **kwargs: Any) -> None:
+    async def _reload_config(self, **kwargs: Any) -> str | None:
         from chartreux.app_server import AppServerConnectionClosed
 
         reload_message = ReloadConfigMessage()
@@ -3996,6 +4631,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             reload_result = await self.app_server.resources.config.reload(
                 reload_runtime=True
             )
+            self._startup_issue_resolved = True
             await self._apply_config_to_ui()
             reload_message.set_complete()
             if not reload_result.launch_metadata_persisted:
@@ -4022,6 +4658,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
             raise
         except Exception as e:
             reload_message.set_error(str(e))
+            return str(e)
+        return None
 
     async def _config_command(self, **kwargs: Any) -> None:
         """Open the user config file in an external editor, then reload on change."""
@@ -4052,7 +4690,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     pass  # Another writer (or an existing user file) wins.
                 else:
                     with os.fdopen(fd, "w", encoding="utf-8") as config_file:
-                        config_file.write(_CONFIG_FILE_TEMPLATE)
+                        config_file.write(
+                            import_module(
+                                "chartreux.core.config.settings_catalog"
+                            ).render_initial_user_config()
+                        )
             finally:
                 os.close(directory_fd)
             if config_path.is_symlink():
@@ -4126,7 +4768,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         await self._messages_area.remove_children()
 
     async def _clear_history(self, cmd_args: str = "", **kwargs: Any) -> None:
-        await self._close_agent_transcript_viewer(restore_focus=False)
+        await self._request_agent_transcript_close(restore_focus=False)
         old_session_id = self.app_server.session_id
         session_log = self.app_server.resources.runtime.session_log
         resumable = session_log.enabled and session_log.persisted
@@ -4276,14 +4918,55 @@ class ChartreuxApp(App):  # noqa: PLR0904
         return self.app_server.exit_summary()
 
     async def _exit_app(self, **kwargs: Any) -> None:
-        try:
-            await self._begin_shutdown()
-            if self._agent_task and not self._agent_task.done():
-                self._agent_task.cancel()
-            if self._bash_task and not self._bash_task.done():
-                self._bash_task.cancel()
-        finally:
-            self.exit(result=self._get_session_exit_summary())
+        self._request_intentional_exit("/exit")
+
+    def _exit_consequences(self) -> tuple[bool, str]:
+        if self._app_server is None:
+            return False, "No session is attached."
+        main = self._agent_job_active() or (
+            self._bash_task is not None and not self._bash_task.done()
+        )
+        agents = any(agent_state(agent) == "running" for agent in self._agent_summaries)
+        decisions = bool(
+            self._active_callback
+            or self._pending_callbacks
+            or self._pending_local_question is not None
+        )
+        queued = self._queue.has_removable or self._queue.has_server_work
+        return main or agents or decisions or queued, (
+            f"Main work: {'shutdown requests its stop' if main else 'none active'}; "
+            f"background agents: {'shutdown requests their stop' if agents else 'none running'}; "
+            f"pending decisions: {'left unanswered' if decisions else 'none'}; "
+            f"queued input: {'not run after exit' if queued else 'none'}. "
+            "Completed effects are not rolled back."
+        )
+
+    def _request_intentional_exit(self, key: QuitConfirmKey) -> None:
+        consequential, consequences = self._exit_consequences()
+        if consequential and self.is_running:
+            if not any(
+                isinstance(screen, ExitConsequencesScreen)
+                for screen in self.screen_stack
+            ):
+                self.push_screen(
+                    ExitConsequencesScreen(consequences),
+                    callback=lambda confirmed: (
+                        self._force_quit() if confirmed else None
+                    ),
+                )
+            return
+        if self._quit_manager.is_confirmed(key):
+            self._quit_manager.cancel_confirmation()
+            self._force_quit()
+            return
+        if consequential or (
+            key != "/exit"
+            and self._app_server is not None
+            and self.config.ask_confirmation_on_exit
+        ):
+            self._quit_manager.request_confirmation(key, consequences)
+            return
+        self._force_quit()
 
     async def _switch_from_input(self, widget: Widget, scroll: bool = False) -> None:
         bottom_container = self.query_one("#bottom-app-container")
@@ -4304,6 +4987,12 @@ class ChartreuxApp(App):  # noqa: PLR0904
             ]
             await bottom_container.mount(widget)
 
+        if self._loading_widget is not None:
+            self._loading_widget.set_hint_suppressed(
+                self._current_bottom_app == BottomApp.Question
+            )
+
+        self._indicate_pending_action()
         self.call_after_refresh(widget.focus)
         if should_scroll:
             self.call_after_refresh(chat.anchor)
@@ -4344,6 +5033,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
             for old_widget in old_widgets:
                 await old_widget.remove()
 
+        if self._loading_widget is not None:
+            self._loading_widget.set_hint_suppressed(
+                self._current_bottom_app == BottomApp.Question
+            )
+
         self.call_after_refresh(widget.focus)
         if should_anchor or scroll:
             self.call_after_refresh(chat.anchor)
@@ -4356,6 +5050,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def _switch_to_model_picker_app(self) -> None:
         if self._current_bottom_app == BottomApp.ModelPicker:
             return
+
+        self._pending_picker_reload = None
 
         from chartreux.cli.textual_ui.widgets.model_picker import ModelOption
 
@@ -4375,6 +5071,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def _switch_to_thinking_picker_app(self) -> None:
         if self._current_bottom_app == BottomApp.ThinkingPicker:
             return
+
+        self._pending_picker_reload = None
 
         await self._switch_from_input(
             _get_thinking_picker_app_class()(
@@ -4396,11 +5094,14 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
         from chartreux.ui.widgets.theme_picker import sorted_theme_names
 
-        await self._switch_from_input(
-            _get_theme_picker_app_class()(
-                theme_names=sorted_theme_names(), current_theme=self.config.theme
-            )
+        picker = _get_theme_picker_app_class()(
+            theme_names=sorted_theme_names(), current_theme=self.config.theme
         )
+        await self._switch_from_input(picker)
+        if self._pending_theme_selection in sorted_theme_names():
+            picker.query_one(OptionList).highlighted = sorted_theme_names().index(
+                self._pending_theme_selection
+            )
 
     async def _apply_theme(self, theme: str) -> None:
         resolved_theme = resolve_theme(resolve_theme_name(theme))
@@ -4416,6 +5117,62 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 ansi=current_diff_theme[0], dark=current_diff_theme[1]
             )
 
+    async def _wait_for_settings(self) -> None:
+        from chartreux.cli.textual_ui.settings_service import SettingsService
+
+        service = SettingsService(
+            self.app_server.resources.config, apply_ui=self._apply_config_to_ui
+        )
+        try:
+            snapshot = await service.read()
+            screen = _get_settings_screen_class()(service, snapshot)
+            screen.return_state = self._settings_return_state
+            self._settings_return_state = None
+            command_name = await self.push_screen_wait(screen)
+            if command_name:
+                self._settings_return_state = screen.return_state
+        except Exception as exc:
+            self._settings_worker = None
+            await self._mount_and_scroll(
+                ErrorMessage(f"Failed to open settings: {exc}")
+            )
+            return
+        self._settings_worker = None
+        if command_name:
+            command = self.commands.parse_command(command_name)
+            if command is not None:
+                name, resolved, args = command
+                bottom_targets = {
+                    "theme": BottomApp.ThemePicker,
+                    "log-level": BottomApp.LogLevelPicker,
+                    "mcp": BottomApp.MCP,
+                    "proxy-setup": BottomApp.ProxySetup,
+                }
+                self._settings_return_bottom_app = bottom_targets.get(name)
+                self._settings_return_providers = name == "providers"
+                self._settings_return_web_search = name == "web-search"
+                await self._invoke_resolved_command(name, resolved, args, name)
+                if (
+                    name in bottom_targets
+                    and self._current_bottom_app == BottomApp.Input
+                ):
+                    self._settings_return_bottom_app = None
+                    await self._show_settings()
+                elif name == "providers" and (
+                    self._provider_management_worker is None
+                    or self._provider_management_worker.is_finished
+                ):
+                    self._settings_return_providers = False
+                    await self._show_settings()
+                elif name == "web-search" and (
+                    self._web_search_worker is None
+                    or self._web_search_worker.is_finished
+                ):
+                    self._settings_return_web_search = False
+                    await self._show_settings()
+        else:
+            await self._present_pending_callback()
+
     async def _switch_to_proxy_setup_app(self) -> None:
         if self._current_bottom_app == BottomApp.ProxySetup:
             return
@@ -4428,16 +5185,27 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
             return
         await self._mount_and_scroll(UserCommandMessage("Proxy setup opened..."))
+        self._proxy_save_pending = False
         await self._switch_from_input(_get_proxy_setup_app_class()(settings))
 
     async def _switch_to_question_app(self, args: UserQuestionRequest) -> None:
         await self._switch_from_input(_get_question_app_class()(args=args), scroll=True)
 
-    async def _switch_to_input_app(self) -> None:
+    async def _switch_to_input_app(self, *, return_to_settings: bool = True) -> None:
+        previous = self._current_bottom_app
+        if previous == BottomApp.MCP:
+            self._show_mcp_discovery_failures()
+        if return_to_settings and previous == self._settings_return_bottom_app:
+            self._settings_return_bottom_app = None
+            reopen_settings = True
+        else:
+            reopen_settings = False
         if self._chat_input_container:
             self._chat_input_container.disabled = False
             self._chat_input_container.display = True
             self._current_bottom_app = BottomApp.Input
+        if self._loading_widget is not None:
+            self._loading_widget.set_hint_suppressed(False)
 
         for app in BottomApp:
             if app != BottomApp.Input:
@@ -4450,6 +5218,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self.call_after_refresh(self._chat_input_container.focus_input)
             if self._chat_widget.is_at_bottom:
                 self.call_after_refresh(self._chat_widget.anchor)
+        if reopen_settings:
+            await self._show_settings()
+        else:
+            await self._present_pending_callback()
 
     def _focus_current_bottom_app(self) -> None:
         focus_widget_by_app: dict[BottomApp, type[Widget]] = {
@@ -4484,7 +5256,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
     def _handle_log_level_picker_app_escape(self) -> None:
         try:
             log_level_picker = self.query_one(_get_log_level_picker_app_class())
-            log_level_picker.action_apply()
+            log_level_picker.action_cancel()
         except Exception:
             pass
         self._last_escape_time = None
@@ -4716,7 +5488,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return
 
         old_session_id = self.app_server.session_id
-        await self._close_agent_transcript_viewer(restore_focus=False)
+        await self._request_agent_transcript_close(restore_focus=False)
         try:
             result = await self.app_server.resources.sessions.rewind(
                 entry_id, restore_files=restore_files, inplace=inplace
@@ -4863,12 +5635,12 @@ class ChartreuxApp(App):  # noqa: PLR0904
     def _try_interrupt_no_job_steps(self) -> bool:
         if self._chat_input_container:
             dismissed = self._chat_input_container.dismiss_completion()
-            # A leading-slash input is cleared on Escape regardless of whether a
-            # completion popup was visible (independent of completion state).
-            clears_slash_input = self._chat_input_container.value.startswith("/")
-            if dismissed or clears_slash_input:
-                if clears_slash_input:
-                    self._chat_input_container.value = ""
+            if dismissed:
+                self._last_escape_time = None
+                return True
+
+            if self._chat_input_container.value.startswith("/"):
+                self._chat_input_container.value = ""
                 self._last_escape_time = None
                 return True
 
@@ -4903,6 +5675,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
         """Let Escape fall through while the input queue selection is active."""
         if action != "interrupt":
             return True
+        if (
+            self.screen.id in {"settings-screen", "websearch-screen"}
+            or self.screen.__class__.__name__ == "ProviderWorkbenchScreen"
+        ):
+            return False
         if self._agent_transcript_viewer is not None:
             # Route priority Escape to the mounted overlay rather than the
             # parent interrupt action.
@@ -4916,6 +5693,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         return True
 
     def action_interrupt(self) -> None:
+        if self.is_running and isinstance(self.screen, ExitConsequencesScreen):
+            self.screen.action_cancel()
+            return
         if viewer := self._agent_transcript_viewer:
             viewer.action_close()
             return
@@ -5099,66 +5879,209 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def action_toggle_agent_browser(self, **kwargs: Any) -> None:
         if self._agent_bar is None:
             return
+        if not self._agent_bar.agents:
+            await self._mount_and_scroll(
+                UserCommandMessage("No background agents to inspect yet.")
+            )
+            return
+        if self._current_bottom_app == BottomApp.Question:
+            await self._mount_and_scroll(
+                UserCommandMessage("Finish or cancel this question first.")
+            )
+            return
         self._agent_bar.toggle()
         if self._agent_bar.expanded:
             self._agent_bar.focus()
         elif self._chat_input_container is not None:
             self._chat_input_container.focus_input()
 
-    async def on_agent_bar_selection_requested(
+    def on_agent_bar_selection_requested(
         self, message: AgentBar.SelectionRequested
     ) -> None:
-        if message.agent_id is None:
-            await self._close_agent_transcript_viewer(restore_focus=True)
+        self._submit_agent_selection(message.agent_id)
+
+    def _submit_agent_selection(self, agent_id: str | None) -> None:
+        if agent_id is not None and self._current_bottom_app == BottomApp.Question:
+            self.notify("Finish or cancel this question first", severity="warning")
             return
-        if self._app_server is None:
-            return
-        agent = next(
-            (
-                item
-                for item in self._agent_summaries
-                if item.agent_id == message.agent_id
-            ),
-            None,
+        self._agent_selection_generation += 1
+        self._agent_selection_target = agent_id
+        logger.debug(
+            "Agent selection phase=submitted generation=%d target=%s",
+            self._agent_selection_generation,
+            agent_id,
         )
-        if agent is None:
-            return
-        await self._close_agent_transcript_viewer(restore_focus=False)
-        self._agent_transcript_focus_target = self.screen.focused
-        self._agent_transcript_epoch += 1
-        self._agent_transcript_parent_id = self.app_server.session_id
-        viewer = AgentTranscriptViewer(
-            _AgentTranscriptSource(
-                self,
-                self.app_server.resources.sessions,
-                self._agent_transcript_epoch,
-                self._agent_transcript_parent_id,
-            ),
-            agent.agent_id,
-            profile=agent.profile,
-            live=agent_state(agent) == "running",
+        self._ensure_agent_transition()
+
+    def _ensure_agent_transition(self) -> None:
+        if self._agent_transition_task is None or self._agent_transition_task.done():
+            self._agent_transition_task = asyncio.create_task(
+                self._converge_agent_selection()
+            )
+
+    async def _converge_agent_selection(self) -> None:  # noqa: PLR0915
+        while True:
+            generation = self._agent_selection_generation
+            target = self._agent_selection_target
+            logger.debug(
+                "Agent selection phase=transition-start generation=%d target=%s",
+                generation,
+                target,
+            )
+            try:
+                if target is None:
+                    await self._close_agent_transcript_viewer(
+                        restore_focus=self._agent_close_restore_focus, show_chat=True
+                    )
+                    if generation != self._agent_selection_generation:
+                        continue
+                    logger.debug(
+                        "Agent selection phase=closed generation=%d", generation
+                    )
+                    return
+                if self._app_server is None or not self.is_running:
+                    return
+                current = self._agent_transcript_viewer
+                if (
+                    current is not None
+                    and current.agent_id == target
+                    and current.is_mounted
+                ):
+                    break
+                agent = next(
+                    (item for item in self._agent_summaries if item.agent_id == target),
+                    None,
+                )
+                if agent is None:
+                    return
+                debug_timings = get_effective_log_level() == "DEBUG"
+                await self._close_agent_transcript_viewer(
+                    restore_focus=False, show_chat=False
+                )
+                if (
+                    generation != self._agent_selection_generation
+                    or not self.is_running
+                ):
+                    continue
+                self._agent_transcript_focus_target = self.screen.focused
+                self._agent_transcript_epoch += 1
+                self._agent_transcript_parent_id = self.app_server.session_id
+                viewer = AgentTranscriptViewer(
+                    _AgentTranscriptSource(
+                        self,
+                        self.app_server.resources.sessions,
+                        self._agent_transcript_epoch,
+                        self._agent_transcript_parent_id,
+                    ),
+                    agent.agent_id,
+                    profile=agent.profile,
+                    metadata=(
+                        self._agent_bar.full_metadata(agent)
+                        if self._agent_bar is not None
+                        else ""
+                    ),
+                    live=agent_state(agent) == "running",
+                )
+                self._agent_transcript_viewer = viewer
+                self._chat_widget.display = False
+                self._hide_conversation_chrome()
+                self._indicate_pending_action()
+                try:
+                    logger.debug(
+                        "Agent selection phase=mount-start generation=%d target=%s",
+                        generation,
+                        target,
+                    )
+                    mount_start = time.perf_counter() if debug_timings else 0.0
+                    await self.mount(viewer, before="#chat")
+                    self._indicate_pending_action()
+                    if debug_timings:
+                        logger.debug(
+                            "Agent transcript mount took %.3fs generation=%d target=%s",
+                            time.perf_counter() - mount_start,
+                            generation,
+                            target,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to mount agent transcript viewer", exc_info=exc
+                    )
+                    self._agent_transcript_viewer = None
+                    self._agent_transcript_epoch += 1
+                    self._agent_transcript_parent_id = None
+                    self._recover_agent_mount_failure()
+                    if generation != self._agent_selection_generation:
+                        continue
+                    return
+                await asyncio.sleep(0)
+                if generation != self._agent_selection_generation:
+                    continue
+                viewer.focus()
+                logger.debug(
+                    "Agent selection phase=ready generation=%d target=%s",
+                    generation,
+                    target,
+                )
+                return
+            except Exception as exc:
+                logger.warning("Agent selection transition failed", exc_info=exc)
+                if generation != self._agent_selection_generation:
+                    continue
+                return
+
+    async def _request_agent_transcript_close(
+        self, *, restore_focus: bool = True
+    ) -> None:
+        self._agent_selection_generation += 1
+        self._agent_selection_target = None
+        logger.debug(
+            "Agent selection phase=close-requested generation=%d",
+            self._agent_selection_generation,
         )
-        self._agent_transcript_viewer = viewer
-        self._chat_widget.display = False
-        await self.mount(viewer, before="#loading-area")
-        await asyncio.sleep(0)
-        viewer.focus()
+        self._agent_close_restore_focus = restore_focus
+        self._ensure_agent_transition()
+        task = self._agent_transition_task
+        if task is not None and task is not asyncio.current_task():
+            await task
 
     async def on_agent_transcript_viewer_closed(
         self, message: AgentTranscriptViewer.Closed
     ) -> None:
         if message.viewer is self._agent_transcript_viewer:
-            await self._close_agent_transcript_viewer(restore_focus=True)
+            await self._request_agent_transcript_close(restore_focus=True)
 
-    async def _close_agent_transcript_viewer(self, *, restore_focus: bool) -> None:
+    async def _close_agent_transcript_viewer(
+        self, *, restore_focus: bool, show_chat: bool = True
+    ) -> None:
         viewer = self._agent_transcript_viewer
         self._agent_transcript_epoch += 1
         self._agent_transcript_viewer = None
         self._agent_transcript_parent_id = None
         if viewer is not None and viewer.is_mounted:
-            await viewer.remove()
-        if self._cached_chat is not None:
-            self._cached_chat.display = True
+            debug = get_effective_log_level() == "DEBUG"
+            start = time.perf_counter() if debug else 0.0
+            if debug:
+                logger.debug(
+                    "Agent transcript teardown phase=start generation=%d agent=%s",
+                    self._agent_selection_generation,
+                    viewer.agent_id,
+                )
+            try:
+                await viewer.dispose()
+                if viewer.is_mounted:
+                    await viewer.remove()
+            finally:
+                if debug:
+                    logger.debug(
+                        "Agent transcript teardown took %.3fs generation=%d agent=%s",
+                        time.perf_counter() - start,
+                        self._agent_selection_generation,
+                        viewer.agent_id,
+                    )
+        if show_chat:
+            if self._cached_chat is not None:
+                self._cached_chat.display = True
+            self._restore_conversation_chrome()
         if not restore_focus:
             self._agent_transcript_focus_target = None
             return
@@ -5172,6 +6095,28 @@ class ChartreuxApp(App):  # noqa: PLR0904
             if input_widget := self._chat_input_container.input_widget:
                 input_widget.set_app_focus(True)
             self.call_after_refresh(self._chat_input_container.focus_input)
+        if show_chat and self._agent_selection_target is None:
+            await self._present_pending_callback()
+
+    def _recover_agent_mount_failure(self) -> None:
+        if self._cached_chat is not None:
+            self._cached_chat.display = True
+        self._restore_conversation_chrome()
+
+    def _hide_conversation_chrome(self) -> None:
+        for chrome_id in (
+            "loading-area",
+            "agent-bar",
+            "bottom-app-container",
+            "bottom-bar",
+        ):
+            self.query_one(f"#{chrome_id}").display = False
+
+    def _restore_conversation_chrome(self) -> None:
+        for chrome_id in ("loading-area", "bottom-app-container", "bottom-bar"):
+            self.query_one(f"#{chrome_id}").display = True
+        if self._agent_bar is not None:
+            self._agent_bar.display = bool(self._agent_bar.agents)
 
     async def action_toggle_debug_console(self, **kwargs: Any) -> None:
         if self._app_server is None:
@@ -5179,13 +6124,21 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if self._debug_console is not None:
             await self._debug_console.remove()
             self._debug_console = None
+            target = self._debug_console_focus_target
+            self._debug_console_focus_target = None
+            if target is not None and target.is_mounted and target.display:
+                self.call_after_refresh(target.focus)
         else:
             from chartreux.cli.textual_ui.widgets.debug_console import DebugConsole
 
+            self._debug_console_focus_target = self.screen.focused
             self._debug_console = DebugConsole(
                 log_source=self.app_server.resources.runtime
             )
             await self.mount(self._debug_console)
+            if self._debug_console.has_class("-fullscreen"):
+                log_view = self._debug_console.query_one("#debug-console-log")
+                self.call_after_refresh(lambda: self.screen.set_focus(log_view))
 
     def _get_chat_input(self) -> ChatInputContainer | None:
         input_widgets = self.query(ChatInputContainer)
@@ -5193,17 +6146,19 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return input_widgets.first()
         return None
 
-    def action_interrupt_or_quit(self) -> None:
+    def action_interrupt_or_quit(self) -> None:  # noqa: PLR0911
+        if self.is_running and isinstance(self.screen, ExitConsequencesScreen):
+            return
         # Ctrl+C priority ladder: clear input → second-press quit → bottom-app/etc
         # no-op steps → pop last queued item (LIFO) → cancel running job → request quit.
         if self._app_server is None:
-            self._force_quit()
+            self._request_intentional_exit("Ctrl+C")
             return
         if (container := self._get_chat_input()) and container.value:
             container.value = ""
             return
         if self._quit_manager.is_confirmed("Ctrl+C"):
-            self._force_quit()
+            self._request_intentional_exit("Ctrl+C")
             return
         if self._try_interrupt_no_job_steps():
             return
@@ -5212,33 +6167,24 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return
         if self._try_interrupt_running_job():
             return
-        self._quit_manager.request_confirmation(
-            "Ctrl+C", self._queue.quit_warning_extra()
-        )
+        self._request_intentional_exit("Ctrl+C")
 
     def action_delete_right_or_quit(self) -> None:
+        if self.is_running and isinstance(self.screen, ExitConsequencesScreen):
+            return
         if self._app_server is None:
-            self._force_quit()
+            self._request_intentional_exit("Ctrl+D")
             return
         if (container := self._get_chat_input()) and container.value:
             if container.input_widget:
                 container.input_widget.action_delete_right()
             return
 
-        if not self.config.ask_confirmation_on_exit:
-            self._force_quit()
-            return
-
-        if self._quit_manager.is_confirmed("Ctrl+D"):
-            self._force_quit()
-            return
-        self._quit_manager.request_confirmation(
-            "Ctrl+D", self._queue.quit_warning_extra()
-        )
+        self._request_intentional_exit("Ctrl+D")
 
     async def _begin_shutdown(self) -> None:
         self._shutdown_started = True
-        await self._close_agent_transcript_viewer(restore_focus=False)
+        await self._request_agent_transcript_close(restore_focus=False)
         if self._app_server is not None:
             # Signal shutdown before waiting for or cancelling UI work, so a
             # pending attach or runtime refresh treats a dropped connection as

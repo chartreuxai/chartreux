@@ -5,9 +5,11 @@ from chartreux.utils import VIBE_WARNING_TAG
 
 def build_retry_prompt(additional_instructions: str) -> str:
     message = (
-        "The previous model stream ended before reaching its end. Continue the "
-        "response exactly where it stopped without repeating text already produced. "
-        "If no response text was produced, answer the pending user request normally."
+        "The previous model stream ended before reaching its end. This retry starts "
+        "a new turn. Completed tool results remain in the conversation; check them "
+        "before taking action, because recent actions may repeat. Continue the "
+        "unfinished response without repeating text already produced. If no "
+        "response text was produced, answer the pending user request normally."
     )
     if instructions := additional_instructions.strip():
         message += (

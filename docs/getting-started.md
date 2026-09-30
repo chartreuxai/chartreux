@@ -6,7 +6,7 @@ Chartreux is a local terminal coding harness. Run it from a project you trust so
 
 - Python 3.12 or later
 - [uv](https://docs.astral.sh/uv/)
-- A current Mistral API key for the default provider
+- An API key for a provider you want to use, or access to a keyless provider
 
 Linux is supported. macOS is not validated and Windows is unsupported.
 
@@ -39,16 +39,32 @@ cd /path/to/project
 chartreux
 ```
 
-On its first run, Chartreux creates `~/.chartreux/config.toml` for your
-selections; built-in defaults remain effective until you add overrides. It also
-creates `~/.chartreux/.env`. Interactive onboarding presents a welcome and theme
-selection, then uses the shared provider-management flow to select a provider
-and enter its credentials; Mistral is the default route. It then probes the
-provider for available chat models and lets you choose from a searchable list,
-with already-configured models preselected and non-chat models such as embeddings
-filtered out. Finally, select the active model; the current selection is
-preselected, and `Default` is available when none is set. Entered credentials are
-stored in that `.env` file. You can run the onboarding explicitly with:
+On its first run, Chartreux creates `~/.chartreux/config.toml` for ordinary
+settings and `~/.chartreux/.env` for credentials. The saved main and subagent
+presets live in `~/.chartreux/models.toml`. Interactive onboarding presents a
+welcome, then follows **Connect provider → Configure models → Add another
+provider or continue → Choose default presets → [optional Web search] →
+Finish**. Mistral is the initial model-provider route. Discovery filters out
+non-chat models such as embeddings; you can also configure a model manually.
+Each provider and model save advances without requiring a return to an earlier
+screen. Presets assign
+one model and thinking level to the main assistant and each subagent role.
+Ready preset choices stay selected. When a current preset is not runnable,
+setup suggests a model from a configured provider only when its deployment is
+enabled, its supported thinking level is valid, and the credential resolver
+finds any required key. Saving presets persists that choice. If web search is
+already ready, onboarding preserves the current search choice and skips that
+step. Otherwise the optional Web search step offers Exa, Brave, and DuckDuckGo;
+it does not offer `auto` or a second Mistral choice. Standalone Settings shows
+one Mistral choice; `auto` remains a supported configuration alias for Mistral.
+The Web search step lets you save settings and finish, go back to presets, or
+choose **Skip for now**. Skipping leaves web-search settings unchanged and does
+not disable the tool. Finishing checks required presets and, if the search
+step is shown, web-search configuration and credentials; it does not test live
+connectivity. Entered
+credentials are saved in the `.env` file when possible; setup reports if a key
+is available only for the current session. You can run onboarding explicitly
+with:
 
 ```bash
 chartreux --setup

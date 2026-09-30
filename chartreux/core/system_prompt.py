@@ -232,6 +232,57 @@ def _get_available_subagents_section(agent_manager: AgentManager) -> str:
     return "\n".join(lines)
 
 
+def _markdown_cell(value: str | None) -> str:
+    return " ".join((value or "").splitlines()).replace("|", r"\|")
+
+
+def _get_model_catalog_section(config: ChartreuxConfigSchema) -> str | None:
+    snapshot = config.catalog_snapshot
+    if snapshot is None:
+        return None
+
+    models = config.available_models()
+    if not models:
+        return None
+    lines = [
+        "# Model catalog",
+        "",
+        "Models (use canonical names in `config.model`):",
+        "| Canonical name | Display name | Provider |",
+        "| --- | --- | --- |",
+    ]
+    for name, model in models.items():
+        lines.append(
+            f"| {_markdown_cell(name)} | {_markdown_cell(model.display_name)} | {_markdown_cell(model.provider)} |"
+        )
+
+    lines.extend([
+        "",
+        "Default presets (use `@role` in `config.model`):",
+        "| Preset | Canonical model | Thinking | Description |",
+        "| --- | --- | --- | --- |",
+    ])
+    for name, role in snapshot.catalog.roles.items():
+        if role.model in models:
+            lines.append(
+                f"| @{_markdown_cell(name)} | {_markdown_cell(role.model)} | {_markdown_cell(role.thinking)} | {_markdown_cell(role.description)} |"
+            )
+    return "\n".join(lines)
+
+
+def _get_model_info_sections(
+    config: ChartreuxConfigSchema, role_instructions: str | None, is_subagent: bool
+) -> list[str]:
+    if not config.include_model_info or config.catalog_snapshot is None:
+        return []
+    sections = [f"Your model name is: `{config.get_active_model().alias}`"]
+    if not is_subagent and role_instructions is None:
+        catalog_section = _get_model_catalog_section(config)
+        if catalog_section:
+            sections.append(catalog_section)
+    return sections
+
+
 def _get_scratchpad_section(scratchpad_dir: Path | None) -> str | None:
     if not scratchpad_dir:
         return None
@@ -276,6 +327,7 @@ def get_universal_system_prompt(
     harness_files: HarnessFilesManager | None = None,
     tool_manager: ToolManager | None = None,
     role_instructions: str | None = None,
+    is_subagent: bool = False,
 ) -> str:
     cwd = (cwd or Path.cwd()).resolve()
     harness_files = harness_files or get_harness_files_manager()
@@ -290,8 +342,7 @@ def get_universal_system_prompt(
     if config.include_commit_signature:
         sections.append(_add_commit_signature())
 
-    if config.include_model_info:
-        sections.append(f"Your model name is: `{config.get_active_model().alias}`")
+    sections.extend(_get_model_info_sections(config, role_instructions, is_subagent))
 
     if config.include_prompt_detail:
         sections.append(_get_tool_aware_os_system_prompt(tool_manager))

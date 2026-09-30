@@ -24,6 +24,7 @@ from chartreux.core.model_catalog.schema import (
     ModelCatalog,
     ProviderDefinition,
     RoleDefinition,
+    valid_provider_name,
 )
 from chartreux.ui.providers.contracts import (
     CatalogChanges,
@@ -47,6 +48,7 @@ class CatalogSnapshot:
 
     catalog: ModelCatalog
     revision: str
+    overlaid_providers: frozenset[str] = frozenset()
 
 
 def _require_mapping(value: Any, location: str) -> dict[str, Any]:
@@ -56,6 +58,11 @@ def _require_mapping(value: Any, location: str) -> dict[str, Any]:
 
 
 def _check_keys(raw: Mapping[str, Any], fields: set[str], location: str) -> None:
+    if location.startswith("roles.") and "models" in raw:
+        raise ValueError(
+            f"{location}.models is obsolete; set one {location}.model and "
+            f"{location}.thinking for this preset"
+        )
     unknown = set(raw) - fields
     if unknown:
         migration_hints = {
@@ -139,11 +146,13 @@ def merge_catalog_overlay(
     return ModelCatalog.model_validate(result)
 
 
-def _snapshot(catalog: ModelCatalog) -> CatalogSnapshot:
+def _snapshot(
+    catalog: ModelCatalog, overlaid_providers: frozenset[str] = frozenset()
+) -> CatalogSnapshot:
     encoded = json.dumps(
         catalog.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
     ).encode()
-    return CatalogSnapshot(catalog, sha256(encoded).hexdigest())
+    return CatalogSnapshot(catalog, sha256(encoded).hexdigest(), overlaid_providers)
 
 
 def load_catalog(path: Path | None = None) -> CatalogSnapshot:
@@ -158,7 +167,12 @@ def load_catalog(path: Path | None = None) -> CatalogSnapshot:
         raise CatalogLoadError(catalog_path, str(exc)) from exc
 
     try:
-        return _snapshot(merge_catalog_overlay(SHIPPED_CATALOG, overlay))
+        return _snapshot(
+            merge_catalog_overlay(SHIPPED_CATALOG, overlay),
+            frozenset(
+                valid_provider_name(name) for name in overlay.get("providers", {})
+            ),
+        )
     except (ValidationError, ValueError) as exc:
         raise CatalogLoadError(catalog_path, str(exc)) from exc
 
@@ -201,7 +215,7 @@ class CatalogStore:
     def apply_changes(
         self, changes: CatalogChanges
     ) -> CatalogWriteResult | CatalogValidationError:
-        """Apply one provider batch without widening the overlay's authority.
+        """Apply one catalog-wide batch without widening the overlay's authority.
 
         Model deployment patches are additions or edits keyed by provider.  Because
         the overlay loader treats deployment arrays as replacements, a changed array
@@ -211,8 +225,21 @@ class CatalogStore:
             overlay = self._read_overlay()
             try:
                 current = merge_catalog_overlay(SHIPPED_CATALOG, overlay)
+                if (
+                    changes.expected_revision is not None
+                    and _snapshot(current).revision != changes.expected_revision
+                ):
+                    return CatalogValidationError(
+                        "Catalog changed since this draft was opened; reload before saving."
+                    )
                 candidate = _apply_catalog_changes(overlay, current, changes)
-                snapshot = _snapshot(merge_catalog_overlay(SHIPPED_CATALOG, candidate))
+                snapshot = _snapshot(
+                    merge_catalog_overlay(SHIPPED_CATALOG, candidate),
+                    frozenset(
+                        valid_provider_name(name)
+                        for name in candidate.get("providers", {})
+                    ),
+                )
             except (ValidationError, ValueError, TypeError) as exc:
                 return CatalogValidationError(str(exc))
 
@@ -227,7 +254,9 @@ class CatalogStore:
 
     def upsert_provider(self, provider: dict[str, Any], provider_id: str) -> None:
         """Compatibility wrapper for callers that only persist a provider."""
-        result = self.apply_changes(CatalogChanges(provider_id, provider))
+        result = self.apply_changes(
+            CatalogChanges(provider_id, {}, providers={provider_id: provider})
+        )
         if isinstance(result, CatalogValidationError):
             raise CatalogLoadError(self.path, result.message)
 
@@ -282,7 +311,8 @@ def _apply_catalog_changes(
     """Return a candidate raw overlay after applying a provider-management batch."""
     candidate = _copy_catalog_value(overlay)
     providers = _table(candidate, "providers")
-    _patch_table(providers, changes.provider_id, changes.provider, "providers")
+    for provider_id, patch in changes.provider_patches.items():
+        _patch_table(providers, provider_id, patch, "providers")
 
     if changes.models:
         models = _table(candidate, "models")

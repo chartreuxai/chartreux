@@ -6,6 +6,7 @@ from pydantic import JsonValue
 import pytest
 
 from chartreux.app_server.models import (
+    CancelledEffectState,
     CompletedEffectState,
     FailedEffectState,
     RunningEffectState,
@@ -222,7 +223,7 @@ async def test_ui_shows_command_immediately_in_pending_state(
         assert message._entry is not None
         assert message._entry.detail.input == ShellEffectInput(command="sleep 10")
         assert message._entry.detail.display.verb == "Running"
-        assert message.get_content() == "sleep 10"
+        assert message.get_content() == "Running: sleep 10"
 
         # clean up: cancel the background task
         if chartreux_app._bash_task and not chartreux_app._bash_task.done():
@@ -278,6 +279,16 @@ async def test_ui_rejects_bash_submitted_while_command_running(
                 raise AssertionError("Timed out waiting for the shell task to stop")
             await pilot.pause(0.05)
 
-        # Cancelling the shell stream does not synthesize a completed result.
-        assert not _shell_results(chartreux_app)
-        assert len(_shell_calls(chartreux_app)) == 1
+        # Cancellation settles the original effect, not the rejected command.
+        results = _shell_results(chartreux_app)
+        assert len(results) == 1
+        result = results[0]
+        assert result._entry is not None
+        assert isinstance(result._entry.state, CancelledEffectState)
+        assert result._entry.state.reason == "Command interrupted"
+        assert result.has_class("warning-text")
+        calls = _shell_calls(chartreux_app)
+        assert len(calls) == 1
+        assert calls[0]._entry is not None
+        assert result._entry.id == calls[0]._entry.id
+        assert chat_input.value == "!echo done"

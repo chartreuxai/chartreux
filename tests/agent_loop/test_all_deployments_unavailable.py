@@ -27,14 +27,14 @@ def _snapshot() -> CatalogSnapshot:
     return CatalogSnapshot(
         ModelCatalog.model_validate({
             "providers": {
-                "test/first": {"api_base": "https://first.invalid"},
-                "test/second": {"api_base": "https://second.invalid"},
+                "test-first": {"api_base": "https://first.invalid"},
+                "test-second": {"api_base": "https://second.invalid"},
             },
             "models": {
                 "base": {
                     "deployments": [
-                        {"provider": "test/first", "name": "first"},
-                        {"provider": "test/second", "name": "second"},
+                        {"provider": "test-first", "name": "first"},
+                        {"provider": "test-second", "name": "second"},
                     ]
                 }
             },
@@ -58,8 +58,8 @@ async def test_all_deployments_unavailable_turn_surfaces_dedicated_error() -> No
     registry = agent.config_orchestrator.availability_registry
     # Every deployment of the committed base is in cooldown, so the turn has
     # no eligible candidate left.
-    registry.record_failure("base", "test/first")
-    registry.record_failure("base", "test/second")
+    registry.record_failure("base", "test-first")
+    registry.record_failure("base", "test-second")
 
     with pytest.raises(AllDeploymentsUnavailableError) as exc_info:
         async for _ in agent.act("Hello"):
@@ -70,8 +70,8 @@ async def test_all_deployments_unavailable_turn_surfaces_dedicated_error() -> No
     # The user-facing message names the model and each deployment's exclusion
     # reason, rather than surfacing as a generic internal ValueError.
     assert "'base'" in surfaced.message
-    assert "test/first" in surfaced.message
-    assert "test/second" in surfaced.message
+    assert "test-first" in surfaced.message
+    assert "test-second" in surfaced.message
     assert surfaced.message.count("cooldown") == 2
     details = surfaced.details
     assert isinstance(details, dict)
@@ -79,6 +79,6 @@ async def test_all_deployments_unavailable_turn_surfaces_dedicated_error() -> No
     exclusions = cast("list[dict[str, str]]", details["exclusions"])
     assert {exclusion["reason"] for exclusion in exclusions} == {"cooldown"}
     assert {exclusion["provider"] for exclusion in exclusions} == {
-        "test/first",
-        "test/second",
+        "test-first",
+        "test-second",
     }

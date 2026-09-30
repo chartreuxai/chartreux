@@ -11,7 +11,7 @@ def test_utility_completion_uses_shipped_active_model() -> None:
     model, provider = select_utility_model(build_test_vibe_config())
     assert model.alias == "glm-5-3"
     assert model.name == "zai-glm-5-3"
-    assert provider.name == "mistral/default"
+    assert provider.name == "mistral"
 
 
 def test_shipped_default_is_not_fast_utility_model() -> None:

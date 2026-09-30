@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 from textual.app import App, ComposeResult
+from textual.widget import Widget
 from textual.widgets import Static
 
 from chartreux.app_server.models import (
@@ -27,6 +29,7 @@ from chartreux.app_server.protocol import (
     AgentTranscriptToolStatus,
     AgentTranscriptTruncation,
 )
+from chartreux.cli.textual_ui.widgets import agent_transcript
 from chartreux.cli.textual_ui.widgets.agent_transcript import AgentTranscriptViewer
 from chartreux.cli.textual_ui.widgets.messages import (
     AssistantMessage,
@@ -726,27 +729,198 @@ async def test_response_states_and_request_failures_are_visible() -> None:
         await pilot.pause()
         source.responses[1].set_exception(RuntimeError("offline"))
         await pilot.pause()
+        assert "Failed: Could not read agent transcript" in str(
+            app.viewer.query_one("#agent-transcript-feedback", Static).render()
+        )
         assert "Unable to load saved transcript." in str(
             app.viewer._status_widget.render()  # pyright: ignore[reportOptionalMemberAccess]
         )
 
 
-@pytest.mark.asyncio
-async def test_close_and_unmount_invalidate_late_completions() -> None:
-    for invalidate in ("action_close", "on_unmount"):
-        source = _FakeSource()
-        viewer = AgentTranscriptViewer(source, "agent-1")
-        viewer._is_current = lambda epoch, viewer=viewer: (
-            not viewer._viewer_closed and epoch == 0
-        )  # type: ignore[method-assign]
-        task = asyncio.create_task(viewer._load_page(0, before=None, replace=True))
-        await asyncio.sleep(0)
+class _GatedSource(AgentTranscriptSource):
+    def __init__(self, response: AgentTranscriptGetResponse) -> None:
+        self.response = response
+        self.release = asyncio.Event()
+        self.entered = asyncio.Event()
+        self.requests = 0
+        self.active = 0
+        self.max_active = 0
 
-        with patch.object(viewer, "post_message"):
-            getattr(viewer, invalidate)()
-        source.respond(0, _available(_entry("late", "late response")))
-        await task
-        assert viewer._units == []
+    async def read_agent_transcript(
+        self, agent_id: str, *, before: str | None = None, limit: int = 50
+    ) -> AgentTranscriptGetResponse:
+        self.requests += 1
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        self.entered.set()
+        try:
+            await self.release.wait()
+            return self.response
+        finally:
+            self.active -= 1
+
+
+async def _wait_for_rest(viewer: AgentTranscriptViewer) -> None:
+    async with asyncio.timeout(5):
+        while viewer._operation_active:
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_single_flight_drains_latest_request() -> None:
+    source = _GatedSource(_available(_entry("one", "text")))
+    app = _ViewerApp(source, live=True)
+    async with app.run_test() as pilot:
+        await source.entered.wait()
+        app.viewer.action_refresh()
+        app.viewer._append_live_output()
+        assert source.requests == 1
+        assert app.viewer._reading_page
+        source.release.set()
+        await _wait_for_rest(app.viewer)
+        await pilot.pause()
+        assert source.requests == 2
+        assert source.max_active == 1
+        assert not app.viewer._reading_page
+
+
+@pytest.mark.asyncio
+async def test_close_during_fetch_does_not_mount_late_entries() -> None:
+    source = _GatedSource(_available(_entry("late", "late response")))
+    app = _ViewerApp(source)
+    async with app.run_test() as pilot:
+        await source.entered.wait()
+        content = app.viewer._content
+        assert content is not None
+        children = tuple(content.children)
+        app.viewer.action_close()
+        source.release.set()
+        await _wait_for_rest(app.viewer)
+        assert app.viewer._units == []
+        assert tuple(content.children) == children or not content.is_attached
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_live_to_saved_queues_terminal_fetch() -> None:
+    source = _GatedSource(_available(_entry("live", "text")))
+    app = _ViewerApp(source, live=True)
+    async with app.run_test() as pilot:
+        await source.entered.wait()
+        app.viewer.set_live(False)
+        assert app.viewer._live_timer is None
+        source.release.set()
+        await _wait_for_rest(app.viewer)
+        await pilot.pause()
+        assert source.requests == 2
+        assert source.max_active == 1
+        assert not app.viewer._reading_page
+        assert app.viewer._live_timer is None
+
+
+@pytest.mark.asyncio
+async def test_chunked_mount_matches_normal_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entries = []
+    for index in range(36):
+        kind = (
+            AgentTranscriptEntryKind.TOOL_CALL
+            if index % 9 in (2, 3)
+            else AgentTranscriptEntryKind.TOOL_RESULT
+            if index % 9 == 4
+            else AgentTranscriptEntryKind.REASONING
+            if index % 9 == 5
+            else AgentTranscriptEntryKind.ASSISTANT_TEXT
+            if index % 9 == 6
+            else AgentTranscriptEntryKind.USER_TEXT
+        )
+        entries.append(
+            _entry(
+                f"entry-{index}",
+                f"text {index}",
+                kind=kind,
+                created_at=index,
+                tool_call_id=(
+                    f"call-entry-{index - 1}"
+                    if kind is AgentTranscriptEntryKind.TOOL_RESULT
+                    else None
+                ),
+            )
+        )
+
+    async def render() -> tuple[list[list[str]], list[str], list[bool], set[str]]:
+        source = _FakeSource()
+        app = _ViewerApp(source, page_size=50)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            source.respond(0, _available(*entries))
+            await _wait_for_rest(app.viewer)
+            await pilot.pause()
+            viewer = app.viewer
+            assert viewer._content is not None
+            widget_ids = {
+                widget: unit.entry_ids[0]
+                for unit in viewer._units
+                for widget in unit.widgets
+            }
+            return (
+                [unit.entry_ids[:] for unit in viewer._units],
+                [widget_ids[widget] for widget in viewer._content.children],
+                [unit.group is not None for unit in viewer._units],
+                set(viewer._known_entries),
+            )
+
+    normal = await render()
+    monkeypatch.setattr(agent_transcript, "_MOUNT_YIELD_BUDGET_SECONDS", 0.0)
+    chunked = await render()
+    assert normal == chunked
+
+
+@pytest.mark.asyncio
+async def test_epoch_abort_during_mount_does_not_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(agent_transcript, "_MOUNT_YIELD_BUDGET_SECONDS", 0.0)
+    source = _FakeSource()
+    app = _ViewerApp(source)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        viewer = app.viewer
+        content = viewer._content
+        assert content is not None
+        original_mount = content.mount
+        mounted = 0
+
+        def aborting_mount(
+            *widgets: Widget,
+            before: int | str | Widget | None = None,
+            after: int | str | Widget | None = None,
+        ):  # type: ignore[no-untyped-def]
+            nonlocal mounted
+            result = original_mount(*widgets, before=before, after=after)
+            mounted += 1
+            if mounted == 1:
+                viewer._viewer_closed = True
+                viewer._request_epoch += 1
+            return result
+
+        monkeypatch.setattr(content, "mount", aborting_mount)
+        source.respond(
+            0,
+            _available(
+                *(
+                    _entry(f"entry-{index}", f"text {index}", created_at=index)
+                    for index in range(5)
+                ),
+                cursor="advanced",
+            ),
+        )
+        await _wait_for_rest(viewer)
+        assert mounted == 1
+        assert len(viewer._units) == 1
+        assert viewer._known_entries == {}
+        assert viewer._cursor is None
 
 
 def test_escape_key_stops_event_and_posts_close_message() -> None:
@@ -759,3 +933,245 @@ def test_escape_key_stops_event_and_posts_close_message() -> None:
     assert isinstance(post_message.call_args.args[0], AgentTranscriptViewer.Closed)
     event.stop.assert_called_once()
     event.prevent_default.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_dispose_during_mount_waits_for_worker_before_draining(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _FakeSource()
+    app = _ViewerApp(source)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        viewer = app.viewer
+        content = viewer._content
+        assert content is not None
+        original_mount = content.mount
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def gated_mount(*widgets: Widget, **kwargs: Any) -> object:
+            result = original_mount(*widgets, **kwargs)
+            await result
+            entered.set()
+            await release.wait()
+            return result
+
+        monkeypatch.setattr(content, "mount", gated_mount)
+        source.respond(0, _available(_entry("one", "text", created_at=0)))
+        await asyncio.wait_for(entered.wait(), 2)
+        task = asyncio.create_task(viewer.dispose())
+        await asyncio.wait_for(task, 2)
+        assert viewer._viewer_closed
+        assert not viewer._operation_active
+        assert viewer._pending_request is None
+        assert not content.children
+        release.set()
+        await viewer.dispose()
+        await viewer.remove()
+
+
+@pytest.mark.asyncio
+async def test_dispose_during_refresh_clears_queued_requests() -> None:
+    source = _FakeSource()
+    app = _ViewerApp(source, live=True)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        source.respond(0, _available(_entry("old", "old")))
+        await _wait_for_rest(app.viewer)
+        app.viewer.action_refresh()
+        await pilot.pause()
+        assert len(source.requests) == 2
+        app.viewer._append_live_output()
+        assert app.viewer._pending_request is not None
+        await app.viewer.dispose()
+        assert app.viewer._pending_request is None
+        assert app.viewer._live_timer is None
+        assert not app.viewer._operation_active
+        assert len(source.requests) == 2
+        await app.viewer.remove()
+
+
+@pytest.mark.asyncio
+async def test_dispose_drains_cross_page_merged_group_in_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(agent_transcript, "_DISPOSAL_BATCH_SIZE", 2)
+    monkeypatch.setattr(agent_transcript, "_DISPOSAL_YIELD_BUDGET_SECONDS", 10.0)
+    source = _FakeSource()
+    app = _ViewerApp(source, tools_collapsed=False)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        source.respond(
+            0,
+            _available(
+                _entry(
+                    "new", "{}", kind=AgentTranscriptEntryKind.TOOL_CALL, created_at=2
+                ),
+                cursor="older",
+                has_more=True,
+            ),
+        )
+        await _wait_for_rest(app.viewer)
+        app.viewer.action_older_page()
+        await pilot.pause()
+        source.respond(
+            1,
+            _available(
+                _entry(
+                    "old", "{}", kind=AgentTranscriptEntryKind.TOOL_CALL, created_at=1
+                )
+            ),
+        )
+        await _wait_for_rest(app.viewer)
+        group = app.viewer.query_one(ToolGroup)
+        assert app.viewer._units[0].entry_ids == ["old", "new"]
+        children = tuple(group.content_container.children)
+        assert len(children) == 4
+        remove_order: list[Widget] = []
+        original_remove = Widget.remove
+
+        async def recording_remove(widget: Widget) -> None:
+            remove_order.append(widget)
+            await original_remove(widget)
+
+        monkeypatch.setattr(Widget, "remove", recording_remove)
+        await app.viewer.dispose()
+        assert remove_order[:4] == list(children)
+        assert remove_order.index(group) >= 4
+        assert all(not child.is_attached for child in children)
+        await app.viewer.dispose()
+        await app.viewer.remove()
+
+
+@pytest.mark.asyncio
+async def test_scroll_away_survives_in_flight_poll_until_explicit_latest() -> None:
+    source = _FakeSource()
+    app = _ViewerApp(source, live=True, page_size=30)
+    async with app.run_test(size=(60, 16)) as pilot:
+        await pilot.pause()
+        assert app.viewer._live_timer is not None
+        app.viewer._live_timer.stop()
+        entries = [_entry(f"row-{i}", f"row {i}", created_at=i) for i in range(24)]
+        source.respond(0, _available(*entries))
+        await _wait_for_rest(app.viewer)
+        await pilot.pause()
+        scroll = app.viewer._content_scroll
+        assert scroll is not None and scroll.max_scroll_y > 0
+        app.viewer._append_live_output()
+        await pilot.pause()
+        await pilot.press("up")
+        await pilot.pause()
+        assert not app.viewer._following_latest and app.viewer._on_newest_page
+        y = scroll.scroll_y
+        assert y < scroll.max_scroll_y
+        source.respond(1, _available(*entries, _entry("new", "new", created_at=24)))
+        await _wait_for_rest(app.viewer)
+        await pilot.pause()
+        assert scroll.scroll_y == y
+        assert not app.viewer._following_latest
+        app.viewer._append_live_output()
+        await pilot.pause()
+        source.respond(2, _available(*entries, _entry("new", "new", created_at=24)))
+        await _wait_for_rest(app.viewer)
+        await pilot.pause()
+        assert scroll.scroll_y == y
+        await pilot.press("end")
+        await pilot.pause()
+        assert app.viewer._following_latest
+        source.respond(3, _available(*entries, _entry("new", "new", created_at=24)))
+        await _wait_for_rest(app.viewer)
+        await pilot.pause()
+        assert scroll.scroll_y == scroll.max_scroll_y
+
+
+@pytest.mark.asyncio
+async def test_older_page_refresh_failures_retain_window_until_latest() -> None:
+    source = _FakeSource()
+    app = _ViewerApp(source, live=True)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        newest = _entry("new", "new", created_at=2)
+        older = _entry("old", "old", created_at=1)
+        source.respond(0, _available(newest, cursor="older-cursor", has_more=True))
+        await _wait_for_rest(app.viewer)
+        app.viewer.action_older_page()
+        await pilot.pause()
+        source.respond(1, _available(older, cursor="oldest"))
+        await _wait_for_rest(app.viewer)
+        app.viewer.action_refresh()
+        await pilot.pause()
+        assert source.requests[2] == ("agent-1", "older-cursor", 2)
+        source.responses[2].set_exception(RuntimeError("offline"))
+        await _wait_for_rest(app.viewer)
+        assert [unit.entry_ids for unit in app.viewer._units] == [["old"], ["new"]]
+        assert app.viewer._cursor == "oldest"
+        assert "Failed:" in str(
+            app.viewer.query_one("#agent-transcript-feedback", Static).render()
+        )
+        app.viewer.action_refresh()
+        await pilot.pause()
+        source.respond(
+            3, AgentTranscriptGetResponse(state=AgentTranscriptState.CHANGED)
+        )
+        await _wait_for_rest(app.viewer)
+        assert [unit.entry_ids for unit in app.viewer._units] == [["old"], ["new"]]
+        assert "Warning:" in str(
+            app.viewer.query_one("#agent-transcript-feedback", Static).render()
+        )
+        app.viewer.action_refresh()
+        await pilot.pause()
+        source.respond(4, _available(older, cursor="oldest"))
+        await _wait_for_rest(app.viewer)
+        assert not app.viewer._on_newest_page and not app.viewer._following_latest
+        assert [unit.entry_ids for unit in app.viewer._units] == [["old"]]
+        assert not app.viewer.query_one("#agent-transcript-feedback", Static).display
+        app.viewer.action_latest()
+        await pilot.pause()
+        assert source.requests[5] == ("agent-1", None, 2)
+        source.respond(5, _available(newest))
+        await _wait_for_rest(app.viewer)
+        assert app.viewer._on_newest_page and app.viewer._following_latest
+        assert [unit.entry_ids for unit in app.viewer._units] == [["new"]]
+
+
+@pytest.mark.asyncio
+async def test_wheel_scroll_away_suspends_following() -> None:
+    source = _FakeSource()
+    app = _ViewerApp(source, live=True, page_size=30)
+    async with app.run_test(size=(60, 16)) as pilot:
+        await pilot.pause()
+        source.respond(
+            0,
+            _available(
+                *(_entry(f"row-{i}", f"row {i}", created_at=i) for i in range(24))
+            ),
+        )
+        await _wait_for_rest(app.viewer)
+        await pilot.pause()
+        scroll = app.viewer._content_scroll
+        assert scroll is not None and scroll.max_scroll_y > 0
+        from textual import events
+
+        scroll._on_mouse_scroll_up(
+            events.MouseScrollUp(scroll, 1, 1, 0, -1, 0, False, False, False)
+        )
+        assert not app.viewer._following_latest
+        assert app.viewer._on_newest_page
+
+
+@pytest.mark.asyncio
+async def test_closed_viewer_ignores_late_read_failure() -> None:
+    source = _FakeSource()
+    app = _ViewerApp(source)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        source.respond(0, _available(_entry("old", "old")))
+        await _wait_for_rest(app.viewer)
+        app.viewer.action_refresh()
+        await pilot.pause()
+        app.viewer.action_close()
+        source.responses[1].set_exception(RuntimeError("offline"))
+        await _wait_for_rest(app.viewer)
+        assert "old" in app.viewer._known_entries
+        assert app.viewer._feedback is None

@@ -1,0 +1,24 @@
+  ⡠⣒⠄  ⡔⢄⠔⡄                                                                    ▁
+ ⢸⠸⣀⡔⢉⠱⣃⡢⣂⡣                                                                     
+  ⠉⠒⠣⠤⠵⠤⠬⠮⠆                                                                     
+                                                                                
+Chartreux v0.2.0 · mistral/zai-glm-5-3[high]                                    
+1 model · 0 MCP servers · 0 skills                                              
+F1 Help · /help                                                                 
+                                                                                
+  ⎣ Proxy setup opened...                                                       
+                                                                                
+                                                                                
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ Proxy Configuration                                                          │
+│ Proxy URL for HTTP requests                                                ▁ │
+│ HTTPS_PROXY                                                                  │
+│ ┌─────────────────────────────────────────────────────────────────────────┐▄ │
+│ │ invalid-proxy:8443                                                      │  │
+│ └─────────────────────────────────────────────────────────────────────────┘  │
+│ ✗ Error: HTTPS_PROXY must start with http:// or https:// (got                │
+│ Proxy URL for HTTPS requests                                                 │
+│   Apply changes     Cancel                                                   │
+│ Tab next field  Enter accept field  Esc cancel                               │
+└──────────────────────────────────────────────────────────────────────────────┘
+/test/workdir [PID 5]                                                           

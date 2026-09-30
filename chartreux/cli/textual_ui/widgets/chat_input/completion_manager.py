@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from textual import events
 
@@ -20,6 +20,11 @@ class CompletionController(Protocol):
     def is_showing(self) -> bool: ...
 
     def reset(self) -> None: ...
+
+
+@runtime_checkable
+class ClickableCompletionController(Protocol):
+    def accept_suggestion(self, index: int, text: str, cursor_index: int) -> bool: ...
 
 
 class MultiCompletionManager:
@@ -58,6 +63,12 @@ class MultiCompletionManager:
         return (
             self._active_controller is not None and self._active_controller.is_showing()
         )
+
+    def accept_suggestion(self, index: int, text: str, cursor_index: int) -> bool:
+        controller = self._active_controller
+        if not isinstance(controller, ClickableCompletionController):
+            return False
+        return controller.accept_suggestion(index, text, cursor_index)
 
     def dismiss(self) -> bool:
         # Always reset — even when nothing is visible yet, the active controller

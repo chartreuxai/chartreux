@@ -46,16 +46,39 @@ A provider declares the name of its credential variable. For example, the shippe
 export MISTRAL_API_KEY="your-api-key"
 ```
 
-Run `chartreux --setup` from an interactive terminal to select a theme,
-provider, credentials, and models, then save the configured provider key in
-`$CHARTREUX_HOME/.env`; otherwise, setup prints actionable guidance instead of
+Run `chartreux --setup` from an interactive terminal to configure a provider,
+credentials, and models, then choose the default presets. It uses the theme
+already configured for Chartreux (`auto` by default); setup does not ask for or
+save a theme choice. Provider and model screens show explicit Save and Continue
+actions, so advancing does not require returning to an earlier screen. After
+presets, setup checks whether web search is already ready. If Mistral's
+automatic search or an explicit saved search provider is ready, it preserves
+that choice and skips the Web search step. Otherwise the step offers Exa,
+Brave, and DuckDuckGo; it does not offer `auto` or a second Mistral choice.
+Standalone Settings presents one Mistral choice, while `auto` remains an
+accepted Mistral configuration alias. Readiness uses the configured credential
+variable through the credential resolver; a provider or model merely appearing
+in the catalog does not establish readiness. **Save and finish** saves and
+applies edited search settings, then completes only when the resulting
+configuration and any required key are ready; otherwise setup stays open with
+a repair cue. **Finish setup** completes when the current configuration and any
+required key are ready. **Skip for now** leaves web-search settings unchanged and does not
+disable the tool.
+**Back to presets** returns to the preset editor. Unsaved search edits require
+an explicit discard before leaving, while an API key already saved separately
+remains saved. Setup saves configured provider keys in `$CHARTREUX_HOME/.env`;
+if disk persistence fails, it reports when a key is available only for the
+current session.
+Without an interactive terminal, setup prints actionable guidance instead of
 launching the TUI. You can also create that file yourself:
 
 ```dotenv
 MISTRAL_API_KEY=your-api-key
 ```
 
-Credential precedence is precise: a **non-empty** value already present in the process environment wins. If that variable is unset or empty, Chartreux loads a non-empty value from `.env`. At runtime, API-key lookup falls back to the keyring only when no non-empty environment value is available. Keep `.env` private and do not commit it.
+Credential precedence is precise: a **non-empty** value already present in the process environment wins. If that variable is unset or empty, Chartreux loads a non-empty value from `.env`. At runtime, API-key lookup falls back to the keyring only when no non-empty environment value is available. Setup and the Web Search editor save keys to `.env` when possible, with a session-only outcome if disk persistence fails; they do not save onboarding credentials to the keyring. The keyring is only a runtime lookup fallback. Keep `.env` private and do not commit it.
+
+For web search, use Settings > Web search or `/web-search` to select a provider and manage its credential separately from search settings. A key may be saved or kept for the current session; see [Tools and safety](tools-safety.md) for provider, readiness, and retry behavior.
 
 ## Logging and diagnostics
 

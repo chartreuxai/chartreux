@@ -1,17 +1,53 @@
 from __future__ import annotations
 
 import time
-from typing import Literal
+from typing import ClassVar, Literal
 
-from textual.app import App
+from textual.app import App, ComposeResult
+from textual.screen import ModalScreen
 from textual.timer import Timer
+from textual.widgets import Static
 
 from chartreux.cli.textual_ui.widgets.path_display import PathDisplay
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 
-QuitConfirmKey = Literal["Ctrl+C", "Ctrl+D"]
+QuitConfirmKey = Literal["Ctrl+C", "Ctrl+D", "/exit"]
 
-QUIT_CONFIRM_DELAY = 1.0
+QUIT_CONFIRM_DELAY = 30.0
+
+
+class ExitConsequencesScreen(ModalScreen[bool]):
+    """Reachable full consequence text, including from a picker or inspection."""
+
+    BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
+        ("enter", "confirm", "Confirm exit"),
+        ("escape", "cancel", "Keep working"),
+    ]
+    DEFAULT_CSS = """
+    ExitConsequencesScreen { align: center middle; background: $background 85%; }
+    ExitConsequencesScreen Static {
+        width: 90%; max-width: 76; height: auto;
+        padding: 1 2; border: round $warning;
+        background: $surface; color: $foreground;
+    }
+    """
+
+    def __init__(self, consequences: str) -> None:
+        super().__init__()
+        self._consequences = consequences
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            "Exit consequences\n\n"
+            + self._consequences
+            + "\n\nEnter: confirm exit    Esc: keep working"
+        )
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 class QuitManager:
@@ -38,7 +74,7 @@ class QuitManager:
             self._confirm_timer = None
         self._confirm_time = time.monotonic()
         self._confirm_key = key
-        prompt = f"Press {shortcut(key)} again to quit"
+        prompt = f"Press {shortcut(key) if key != '/exit' else '/exit'} again to quit"
         if extra:
             prompt = f"{prompt} ({extra})"
         try:

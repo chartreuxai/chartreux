@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" data-cols="80" data-rows="24" viewBox="0 0 960 576" role="img">
+<title>Model detail with eight navigable rows</title>
+<desc>Conceptual 80 by 24 dark terminal frame. The model's Default thinking is distinct from role preset thinking; arrows reach six scalar fields, image support, and Save model edits.</desc>
+<rect width="960" height="576" fill="#171a1f"/>
+<g fill="#e4e8ee" font-family="monospace" font-size="18">
+<text x="16" y="28" font-weight="bold">Provider Settings / Configure models / Model detail</text>
+<text x="16" y="56" fill="#aab2bd">glm-5-3 · Mistral deployment · 8 rows</text>
+<rect x="0" y="72" width="960" height="29" fill="#dce3ed"/>
+<text x="16" y="95" fill="#10151c" font-weight="bold">▸ Default thinking       medium</text>
+<text x="16" y="125">  Temperature            0.7</text>
+<text x="16" y="155">  Auto compact threshold Not set</text>
+<text x="16" y="185">  Input price            Unknown</text>
+<text x="16" y="215">  Output price           Unknown</text>
+<text x="16" y="245">  Cached input price     Unknown</text>
+<text x="16" y="275">  Image support          Disabled · Space toggles</text>
+<text x="16" y="305">  Save model edits</text>
+<text x="16" y="358" fill="#aab2bd">Default thinking applies to direct model selection.</text>
+<text x="16" y="388" fill="#aab2bd">Role thinking is selected later under Default presets.</text>
+<text x="16" y="552" fill="#aab2bd">↑/↓ Navigate   Enter Edit/save   Space Toggle   Esc Models</text>
+</g>
+</svg>

@@ -35,9 +35,8 @@
     .terminal-r1 { fill: #c5c8c6 }
 .terminal-r2 { fill: #b87333 }
 .terminal-r3 { fill: #b87333;font-weight: bold }
-.terminal-r4 { fill: #68a0b3 }
-.terminal-r5 { fill: #d0b344 }
-.terminal-r6 { fill: #868887 }
+.terminal-r4 { fill: #608ab1 }
+.terminal-r5 { fill: #c5c8c6;font-weight: bold }
     </style>
 
     <defs>
@@ -157,9 +156,9 @@
             <circle cx="22" cy="0" r="7" fill="#febc2e"/>
             <circle cx="44" cy="0" r="7" fill="#28c840"/>
             </g>
-        
+
     <g transform="translate(9, 41)" clip-path="url(#terminal-clip-terminal)">
-    <rect fill="#4b4e55" x="719.8" y="635.9" width="12.2" height="24.65" shape-rendering="crispEdges"/><rect fill="#4b4e55" x="732" y="635.9" width="707.6" height="24.65" shape-rendering="crispEdges"/><rect fill="#4b4e55" x="719.8" y="660.3" width="12.2" height="24.65" shape-rendering="crispEdges"/><rect fill="#4b4e55" x="732" y="660.3" width="12.2" height="24.65" shape-rendering="crispEdges"/><rect fill="#4b4e55" x="744.2" y="660.3" width="414.8" height="24.65" shape-rendering="crispEdges"/><rect fill="#4b4e55" x="1159" y="660.3" width="280.6" height="24.65" shape-rendering="crispEdges"/><rect fill="#4b4e55" x="719.8" y="684.7" width="12.2" height="24.65" shape-rendering="crispEdges"/><rect fill="#4b4e55" x="732" y="684.7" width="12.2" height="24.65" shape-rendering="crispEdges"/><rect fill="#4b4e55" x="744.2" y="684.7" width="634.4" height="24.65" shape-rendering="crispEdges"/><rect fill="#4b4e55" x="1378.6" y="684.7" width="61" height="24.65" shape-rendering="crispEdges"/><rect fill="#4b4e55" x="719.8" y="709.1" width="12.2" height="24.65" shape-rendering="crispEdges"/><rect fill="#4b4e55" x="732" y="709.1" width="707.6" height="24.65" shape-rendering="crispEdges"/>
+
     <g class="terminal-matrix">
     <text class="terminal-r1" x="1464" y="20" textLength="12.2" clip-path="url(#terminal-line-0)">
 </text><text class="terminal-r1" x="1464" y="44.4" textLength="12.2" clip-path="url(#terminal-line-1)">
@@ -185,18 +184,18 @@
 </text><text class="terminal-r1" x="0" y="532.4" textLength="97.6" clip-path="url(#terminal-line-21)">&#160;⢸⠸⣀⡔⢉⠱⣃</text><text class="terminal-r2" x="97.6" y="532.4" textLength="12.2" clip-path="url(#terminal-line-21)">⡢</text><text class="terminal-r2" x="109.8" y="532.4" textLength="12.2" clip-path="url(#terminal-line-21)">⣂</text><text class="terminal-r1" x="122" y="532.4" textLength="12.2" clip-path="url(#terminal-line-21)">⡣</text><text class="terminal-r1" x="1464" y="532.4" textLength="12.2" clip-path="url(#terminal-line-21)">
 </text><text class="terminal-r1" x="0" y="556.8" textLength="134.2" clip-path="url(#terminal-line-22)">&#160;&#160;⠉⠒⠣⠤⠵⠤⠬⠮⠆</text><text class="terminal-r1" x="1464" y="556.8" textLength="12.2" clip-path="url(#terminal-line-22)">
 </text><text class="terminal-r1" x="1464" y="581.2" textLength="12.2" clip-path="url(#terminal-line-23)">
-</text><text class="terminal-r3" x="0" y="605.6" textLength="109.8" clip-path="url(#terminal-line-24)">Chartreux</text><text class="terminal-r1" x="109.8" y="605.6" textLength="524.6" clip-path="url(#terminal-line-24)">&#160;v0.0.0&#160;·&#160;mistral/default/zai-glm-5-3[high]</text><text class="terminal-r1" x="1464" y="605.6" textLength="12.2" clip-path="url(#terminal-line-24)">
+</text><text class="terminal-r3" x="0" y="605.6" textLength="109.8" clip-path="url(#terminal-line-24)">Chartreux</text><text class="terminal-r1" x="109.8" y="605.6" textLength="427" clip-path="url(#terminal-line-24)">&#160;v0.0.0&#160;·&#160;mistral/zai-glm-5-3[high]</text><text class="terminal-r1" x="1464" y="605.6" textLength="12.2" clip-path="url(#terminal-line-24)">
 </text><text class="terminal-r1" x="0" y="630" textLength="414.8" clip-path="url(#terminal-line-25)">1&#160;model&#160;·&#160;0&#160;MCP&#160;servers&#160;·&#160;0&#160;skills</text><text class="terminal-r1" x="1464" y="630" textLength="12.2" clip-path="url(#terminal-line-25)">
-</text><text class="terminal-r1" x="0" y="654.4" textLength="61" clip-path="url(#terminal-line-26)">Type&#160;</text><text class="terminal-r4" x="61" y="654.4" textLength="61" clip-path="url(#terminal-line-26)">/help</text><text class="terminal-r1" x="122" y="654.4" textLength="256.2" clip-path="url(#terminal-line-26)">&#160;for&#160;more&#160;information</text><text class="terminal-r5" x="719.8" y="654.4" textLength="12.2" clip-path="url(#terminal-line-26)">▌</text><text class="terminal-r1" x="1464" y="654.4" textLength="12.2" clip-path="url(#terminal-line-26)">
-</text><text class="terminal-r5" x="719.8" y="678.8" textLength="12.2" clip-path="url(#terminal-line-27)">▌</text><text class="terminal-r1" x="744.2" y="678.8" textLength="414.8" clip-path="url(#terminal-line-27)">/test/skills/broken-skill/SKILL.md</text><text class="terminal-r1" x="1464" y="678.8" textLength="12.2" clip-path="url(#terminal-line-27)">
-</text><text class="terminal-r5" x="719.8" y="703.2" textLength="12.2" clip-path="url(#terminal-line-28)">▌</text><text class="terminal-r1" x="744.2" y="703.2" textLength="634.4" clip-path="url(#terminal-line-28)">Failed&#160;to&#160;load:&#160;missing&#160;required&#160;field&#160;&#x27;description&#x27;</text><text class="terminal-r1" x="1464" y="703.2" textLength="12.2" clip-path="url(#terminal-line-28)">
-</text><text class="terminal-r5" x="719.8" y="727.6" textLength="12.2" clip-path="url(#terminal-line-29)">▌</text><text class="terminal-r1" x="1464" y="727.6" textLength="12.2" clip-path="url(#terminal-line-29)">
-</text><text class="terminal-r1" x="0" y="752" textLength="1464" clip-path="url(#terminal-line-30)">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1464" y="752" textLength="12.2" clip-path="url(#terminal-line-30)">
-</text><text class="terminal-r3" x="0" y="776.4" textLength="12.2" clip-path="url(#terminal-line-31)">&gt;</text><text class="terminal-r1" x="1464" y="776.4" textLength="12.2" clip-path="url(#terminal-line-31)">
-</text><text class="terminal-r1" x="1464" y="800.8" textLength="12.2" clip-path="url(#terminal-line-32)">
-</text><text class="terminal-r1" x="1464" y="825.2" textLength="12.2" clip-path="url(#terminal-line-33)">
-</text><text class="terminal-r1" x="0" y="849.6" textLength="1464" clip-path="url(#terminal-line-34)">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1464" y="849.6" textLength="12.2" clip-path="url(#terminal-line-34)">
-</text><text class="terminal-r6" x="0" y="874" textLength="158.6" clip-path="url(#terminal-line-35)">/test/workdir</text><text class="terminal-r6" x="170.8" y="874" textLength="134.2" clip-path="url(#terminal-line-35)">[PID&#160;00000]</text><text class="terminal-r6" x="1244.4" y="874" textLength="219.6" clip-path="url(#terminal-line-35)">0/400k&#160;tokens&#160;(0%)</text>
+</text><text class="terminal-r1" x="0" y="654.4" textLength="183" clip-path="url(#terminal-line-26)">F1&#160;Help&#160;·&#160;/help</text><text class="terminal-r1" x="1464" y="654.4" textLength="12.2" clip-path="url(#terminal-line-26)">
+</text><text class="terminal-r1" x="1464" y="678.8" textLength="12.2" clip-path="url(#terminal-line-27)">
+</text><text class="terminal-r1" x="0" y="703.2" textLength="1464" clip-path="url(#terminal-line-28)">!&#160;Warning:&#160;Config&#160;/test/skills/broken-skill/SKILL.md:&#160;Failed&#160;to&#160;load:&#160;missing&#160;required&#160;field&#160;&#x27;description&#x27;.&#160;Fix&#160;the&#160;file</text><text class="terminal-r1" x="1464" y="703.2" textLength="12.2" clip-path="url(#terminal-line-28)">
+</text><text class="terminal-r1" x="0" y="727.6" textLength="195.2" clip-path="url(#terminal-line-29)">and&#160;run&#160;/reload.</text><text class="terminal-r1" x="1464" y="727.6" textLength="12.2" clip-path="url(#terminal-line-29)">
+</text><text class="terminal-r1" x="1464" y="752" textLength="12.2" clip-path="url(#terminal-line-30)">
+</text><text class="terminal-r1" x="1464" y="776.4" textLength="12.2" clip-path="url(#terminal-line-31)">
+</text><text class="terminal-r4" x="0" y="800.8" textLength="1464" clip-path="url(#terminal-line-32)">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1464" y="800.8" textLength="12.2" clip-path="url(#terminal-line-32)">
+</text><text class="terminal-r5" x="0" y="825.2" textLength="12.2" clip-path="url(#terminal-line-33)">&gt;</text><text class="terminal-r1" x="1464" y="825.2" textLength="12.2" clip-path="url(#terminal-line-33)">
+</text><text class="terminal-r4" x="0" y="849.6" textLength="1464" clip-path="url(#terminal-line-34)">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1464" y="849.6" textLength="12.2" clip-path="url(#terminal-line-34)">
+</text><text class="terminal-r1" x="0" y="874" textLength="158.6" clip-path="url(#terminal-line-35)">/test/workdir</text><text class="terminal-r1" x="170.8" y="874" textLength="134.2" clip-path="url(#terminal-line-35)">[PID&#160;00000]</text>
     </g>
     </g>
 </svg>

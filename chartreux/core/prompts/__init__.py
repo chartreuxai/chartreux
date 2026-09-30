@@ -75,6 +75,17 @@ def _validate_prompt_id(prompt_id: str, setting_name: str) -> None:
         )
 
 
+def custom_prompt_ids() -> set[str]:
+    """Enumerate the same custom prompt directories used by load_prompt."""
+    mgr = get_harness_files_manager()
+    return {
+        p.stem
+        for d in (*mgr.project_prompts_dirs, *mgr.user_prompts_dirs)
+        for p in d.glob("*.md")
+        if p.is_file()
+    }
+
+
 def load_prompt(
     prompt_id: str, *, setting_name: str, builtins: Mapping[str, Path]
 ) -> str:
@@ -90,7 +101,7 @@ def load_prompt(
     if builtin_path is not None and builtin_path.is_file():
         return read_safe(builtin_path).text.strip()
 
-    custom_ids = sorted({p.stem for d in custom_dirs for p in d.glob("*.md")})
+    custom_ids = sorted(custom_prompt_ids())
     raise MissingPromptFileError(
         setting_name, prompt_id, tuple(builtins), custom_dirs, custom_ids
     )
@@ -107,6 +118,7 @@ __all__ = [
     "Prompt",
     "SystemPrompt",
     "UtilityPrompt",
+    "custom_prompt_ids",
     "load_prompt",
     "load_system_prompt",
 ]

@@ -19,7 +19,7 @@ from chartreux.ui.providers.contracts import (
 def _provider(style: str = "openai", **kwargs: object) -> ProviderDraft:
     defaults: dict[str, object] = {
         "preset": None,
-        "provider_id": "test/default",
+        "provider_id": "test",
         "name": "test",
         "api_base": "https://gateway.example/proxy/v1",
         "api_style": style,

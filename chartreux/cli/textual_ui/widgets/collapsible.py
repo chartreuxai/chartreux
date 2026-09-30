@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+import inspect
 import re
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
 from textual import events
 from textual.app import ComposeResult
+from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.widget import Widget
@@ -13,6 +15,7 @@ from textual.widget import Widget
 if TYPE_CHECKING:
     from chartreux.cli.textual_ui.app import ChatScroll
 
+from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic, NonSelectableStatic
 
 # Control chars (incl. ESC) that must never reach the terminal via a header.
@@ -81,6 +84,30 @@ class ClickWithoutDragMixin:
         self._had_selection_at_press = False
 
 
+class DisclosureHeader(Horizontal):
+    """The only tab stop for a disclosure; Enter/Space use its owner's toggle."""
+
+    can_focus = True
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("enter", "activate", "Expand or collapse", show=False),
+        Binding("space", "activate", "Expand or collapse", show=False),
+    ]
+
+    def __init__(
+        self,
+        *children: Widget,
+        activate: Callable[[], None | Awaitable[None]],
+        classes: str,
+    ) -> None:
+        super().__init__(*children, classes=classes)
+        self._activate = activate
+
+    async def action_activate(self) -> None:
+        result = self._activate()
+        if inspect.isawaitable(result):
+            await result
+
+
 class CollapsibleSection(ClickWithoutDragMixin, Vertical):
     """Shared fold/click machinery for a disclosable body.
 
@@ -120,7 +147,9 @@ class CollapsibleSection(ClickWithoutDragMixin, Vertical):
             body.display = False
         self._is_collapsed = True
         self.on_collapse_changed: Callable[[bool], None] | None = None
-        self._triangle = NonSelectableStatic("⏵", classes="collapsible-triangle")
+        self._triangle = NonSelectableStatic(
+            chrome_glyph("disclosure_closed"), classes="collapsible-triangle"
+        )
 
     @property
     def is_collapsed(self) -> bool:
@@ -140,6 +169,12 @@ class CollapsibleSection(ClickWithoutDragMixin, Vertical):
     def _hide_body(self) -> None:
         if self._body is None:
             return
+        if (
+            self._body.is_mounted
+            and self._body.screen.focused is not None
+            and self._body in self._body.screen.focused.ancestors_with_self
+        ):
+            self._toggle_row.focus()
         if self._body_factory is not None:
             # Lazy: drop the subtree entirely so a collapsed section costs nothing
             # beyond its header. It is rebuilt from the factory on the next expand.
@@ -163,7 +198,11 @@ class CollapsibleSection(ClickWithoutDragMixin, Vertical):
             self._hide_body()
         else:
             self._show_body()
-        self._triangle.update("⏵" if self._is_collapsed else "⏷")
+        self._triangle.update(
+            chrome_glyph(
+                "disclosure_closed" if self._is_collapsed else "disclosure_open"
+            )
+        )
         self._on_toggled(self._is_collapsed)
         if self.on_collapse_changed is not None:
             self.on_collapse_changed(self._is_collapsed)
@@ -183,7 +222,7 @@ class CollapsibleSection(ClickWithoutDragMixin, Vertical):
         return self._is_click_within(event, self._toggle_row)
 
     async def on_click(self, event: events.Click) -> None:
-        if not self._collapsible:
+        if not self._collapsible or not self._is_click_on_toggle(event):
             return
         if self._click_is_passive(event):
             return
@@ -221,9 +260,8 @@ class HeaderCollapsibleSection(CollapsibleSection):
         self._expanded_text = _multi_line(header_text)
         self._header_text = self._collapsed_text
         if not collapsible:
-            # No body to open: show a muted, non-caret marker in the disclosure slot so
-            # the row keeps its verb and alignment but nothing signals it can unfold.
-            self._triangle.update("▪")
+            # Keep the disclosure slot for alignment without implying an action.
+            self._triangle.update(" ")
         elif not header_muted:
             self._triangle.add_class("success" if header_success else "error")
 
@@ -246,7 +284,10 @@ class HeaderCollapsibleSection(CollapsibleSection):
         toggle_classes = "collapsible-toggle header"
         if header_suffix:
             toggle_classes += " has-suffix"
-        self._toggle_row = Horizontal(*children, classes=toggle_classes)
+        self._toggle_row = DisclosureHeader(
+            *children, activate=self.toggle, classes=toggle_classes
+        )
+        self._toggle_row.can_focus = collapsible
 
     def compose(self) -> ComposeResult:
         yield self._toggle_row
@@ -292,8 +333,11 @@ class OverflowCollapsibleSection(CollapsibleSection):
         self._label = NoMarkupStatic(
             collapsed_label, classes="collapsible-toggle-label"
         )
-        self._toggle_row = Horizontal(
-            self._triangle, self._label, classes="collapsible-toggle"
+        self._toggle_row = DisclosureHeader(
+            self._triangle,
+            self._label,
+            activate=self.toggle,
+            classes="collapsible-toggle",
         )
 
     def compose(self) -> ComposeResult:

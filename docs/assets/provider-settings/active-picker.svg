@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" data-cols="80" data-rows="24" viewBox="0 0 976 585.6" role="img">
+<title>Choose Active model</title>
+<desc>Active model picker shown only when more than one runnable @orchestrator model is configured. The semantic default and two concrete models are selectable; the persisted Active label stays on glm-5-3 while another row has focus.</desc>
+<rect width="976" height="585.6" fill="#171a1f"/>
+<text data-row="0" x="12.2" y="18.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee" font-weight="bold">Provider Settings  /  Choose active model</text>
+<text data-row="1" x="12.2" y="42.4" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Two ready @orchestrator models available</text>
+<text data-row="2" x="12.2" y="66.8" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Choose the semantic default or a concrete model</text>
+<text data-row="3" x="12.2" y="91.2" font-family="Fira Code,monospace" font-size="20" fill="#8ab4f8">PERSISTED: glm-5-3 · Mistral</text>
+<text data-row="4" x="12.2" y="115.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="5" x="12.2" y="140.0" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">RUNNABLE @ORCHESTRATOR CHOICES</text>
+<rect data-focus-row="6" x="0" y="146.4" width="976" height="24.4" fill="#dce3ed"/>
+<text data-row="6" x="12.2" y="164.4" font-family="Fira Code,monospace" font-size="20" fill="#10151c" font-weight="bold">▸ @orchestrator (default) → glm-5-3 · Mistral</text>
+<text data-row="7" x="12.2" y="188.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  glm-5-3 · Mistral · @orchestrator [Active]</text>
+<text data-row="8" x="12.2" y="213.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  claude-sonnet · Anthropic · @orchestrator</text>
+<text data-row="9" x="12.2" y="237.6" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Focus previews a choice; persisted Active is unchanged.</text>
+<text data-row="10" x="12.2" y="262.0" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Enter commits the focused choice; Esc keeps Active.</text>
+<text data-row="11" x="12.2" y="286.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="12" x="12.2" y="310.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="13" x="12.2" y="335.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="14" x="12.2" y="359.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="15" x="12.2" y="384.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="16" x="12.2" y="408.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="17" x="12.2" y="432.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="18" x="12.2" y="457.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="19" x="12.2" y="481.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="20" x="12.2" y="506.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="21" x="12.2" y="530.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="22" x="12.2" y="554.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="23" x="12.2" y="579.2" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Enter Choose active   Esc Leave unchanged</text>
+</svg>

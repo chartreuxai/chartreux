@@ -83,4 +83,4 @@ async def test_truly_empty_result_is_inert() -> None:
         assert result is not None
         section = result.query_one(HeaderCollapsibleSection)
         assert section._collapsible is False
-        assert str(section._triangle.render()) == "▪"
+        assert str(section._triangle.render()) == " "

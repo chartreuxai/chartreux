@@ -25,7 +25,7 @@ class OnboardingContext:
     theme: str = DEFAULT_THEME
     has_provider_credentials: bool = False
     enable_system_trust_store: bool = False
-    repair_active_model: bool = False
+    repair_default_preset: bool = False
 
     @staticmethod
     def _fallback_provider(config: ChartreuxConfigSchema) -> ProviderConfig:
@@ -36,7 +36,7 @@ class OnboardingContext:
                     return config.get_provider_for_model(
                         ModelConfig(name="", provider=provider_id, alias="")
                     )
-        return ProviderConfig(name="onboarding/default", api_base="https://localhost")
+        return ProviderConfig(name="onboarding", api_base="https://localhost")
 
     @staticmethod
     def _has_usable_model(config: ChartreuxConfigSchema) -> bool:
@@ -56,19 +56,19 @@ class OnboardingContext:
 
     @classmethod
     def from_config(cls, config: ChartreuxConfigSchema) -> OnboardingContext:
-        repair_active_model = False
+        repair_default_preset = False
         try:
             provider = config.get_active_provider()
         except ValueError:
             provider = cls._fallback_provider(config)
-            repair_active_model = cls._has_usable_model(config)
+            repair_default_preset = cls._has_usable_model(config)
         return cls(
             provider=provider,
             theme=config.theme,
             has_provider_credentials=not provider.api_key_env_var
             or bool(os.environ.get(provider.api_key_env_var)),
             enable_system_trust_store=config.enable_system_trust_store,
-            repair_active_model=repair_active_model,
+            repair_default_preset=repair_default_preset,
         )
 
     @classmethod

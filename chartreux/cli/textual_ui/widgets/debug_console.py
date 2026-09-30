@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import bisect
 from collections.abc import Callable
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 from rich.markup import escape
 from rich.segment import Segment
@@ -10,25 +10,29 @@ from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
+from textual.binding import Binding, BindingType
 from textual.cache import LRUCache
 from textual.containers import Vertical
 from textual.geometry import Size
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
+from textual.widget import Widget
 from textual.widgets import Static
 
 from chartreux.app_server.models import DebugLogEntry, DebugLogPage
 from chartreux.observability.logging import decode_log_message
 
-LOG_LEVEL_COLORS: dict[str, str] = {
-    "DEBUG": "dim",
-    "INFO": "cyan",
-    "WARNING": "yellow",
-    "ERROR": "red",
-    "CRITICAL": "bold red",
+LOG_LEVEL_ROLES: dict[str, str] = {
+    "DEBUG": "$text-muted",
+    "INFO": "$foreground",
+    "WARNING": "$warning",
+    "ERROR": "$error",
+    "CRITICAL": "$error",
 }
 
 DEFAULT_LOG_PAGE_SIZE = 30
+DEBUG_DOCK_MIN_WIDTH = 120
+DEBUG_DOCK_WIDTH = 40
 LOG_POLL_INTERVAL = 0.5
 _EMPTY_STYLE = Style()
 
@@ -38,6 +42,10 @@ class DebugLogSource(Protocol):
 
 
 class _LogView(ScrollView, can_focus=True):
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("c", "copy_selected_line", "Copy selected log line", show=False)
+    ]
+
     def __init__(
         self,
         load_page: Callable[[], None],
@@ -47,6 +55,7 @@ class _LogView(ScrollView, can_focus=True):
     ) -> None:
         super().__init__(id=id)
         self._lines: list[str] = []
+        self._selected_line: int | None = None
         self._wrap_counts: list[int] = []
         self._wrap_prefix: list[int] = [0]
         self._total_visual: int = 0
@@ -107,6 +116,8 @@ class _LogView(ScrollView, can_focus=True):
         new_visual = sum(new_counts)
 
         self._lines[0:0] = markups
+        if self._selected_line is not None:
+            self._selected_line += len(markups)
         self._wrap_counts[0:0] = new_counts
         self._recompute_prefix()
         self._render_line_cache.clear()
@@ -128,6 +139,10 @@ class _LogView(ScrollView, can_focus=True):
         logical_idx = bisect.bisect_right(self._wrap_prefix, abs_y) - 1
         text = Text.from_markup(self._lines[logical_idx], style=rich_style)
         wrapped = text.wrap(self.app.console, wrap_width)
+
+        if logical_idx == self._selected_line:
+            for line_text in wrapped:
+                line_text.stylize(Style(bold=True, reverse=True))
 
         base = self._wrap_prefix[logical_idx]
         for i, line_text in enumerate(wrapped):
@@ -159,9 +174,22 @@ class _LogView(ScrollView, can_focus=True):
         visual_y = scroll_y + event.y
         logical_idx = bisect.bisect_right(self._wrap_prefix, visual_y) - 1
         if 0 <= logical_idx < len(self._lines):
-            plain = Text.from_markup(self._lines[logical_idx]).plain
-            self.app.copy_to_clipboard(plain)
-            self.app.notify("Copied to clipboard", timeout=2.0)
+            self._selected_line = logical_idx
+            self.focus()
+            self._render_line_cache.clear()
+            self.refresh()
+            self.app.query_one("#debug-console-footer", Static).update(
+                "Log row selected · c Copy selected · Ctrl+\\ Close"
+            )
+            event.stop()
+
+    def action_copy_selected_line(self) -> None:
+        if self._selected_line is None:
+            self.app.notify("Select a log row before copying", timeout=2.0)
+            return
+        plain = Text.from_markup(self._lines[self._selected_line]).plain
+        self.app.copy_to_clipboard(plain)
+        self.app.notify("Log row copied", timeout=2.0)
 
     def _try_load_previous(self) -> None:
         if not self._has_more() or self.scroll_y > 0:
@@ -197,21 +225,87 @@ class DebugConsole(Vertical):
         self._page_size = page_size
         self._seen_entry_ids: set[str] = set()
         self._reading = False
+        self._state_row: Static | None = None
+        self._input_focus_target: Widget | None = None
+        self._input_can_focus: bool | None = None
 
     def compose(self) -> ComposeResult:
-        yield Static(
-            "Debug Console  [dim](ctrl+\\ to close)[/dim]", id="debug-console-header"
+        yield Static("Debug console", id="debug-console-header")
+        self._state_row = Static(
+            "Running: Loading debug logs", id="debug-console-state"
         )
+        self._state_row.styles.height = 1
+        self._state_row.styles.width = "100%"
+        self._state_row.styles.color = self.app.theme_variables["text-muted"]
+        yield self._state_row
         self._log_view = _LogView(
             load_page=self._schedule_load_page,
             has_more=lambda: self._has_more and self._cursor is not None,
             id="debug-console-log",
         )
         yield self._log_view
+        footer = Static(
+            "Click row to select · c Copy selected · Ctrl+\\ Close",
+            id="debug-console-footer",
+        )
+        footer.styles.height = "auto"
+        yield footer
 
     def on_mount(self) -> None:
+        self._update_geometry()
         self._schedule_load_page()
         self.set_interval(LOG_POLL_INTERVAL, self._schedule_poll)
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._update_geometry()
+
+    def _update_geometry(self) -> None:
+        fullscreen = self.app.size.width < DEBUG_DOCK_MIN_WIDTH
+        promoted = fullscreen and not self.has_class("-fullscreen")
+        self.set_class(fullscreen, "-fullscreen")
+        self.styles.width = self.app.size.width if fullscreen else DEBUG_DOCK_WIDTH
+        if promoted:
+            self._input_focus_target = self.app.query_one("#input", Widget)
+            self._input_can_focus = self._input_focus_target.can_focus
+            self._input_focus_target.can_focus = False
+            self.set_timer(0.05, self._focus_fullscreen_log)
+        elif not fullscreen:
+            self._restore_input_focusability()
+
+    def on_unmount(self) -> None:
+        self._restore_input_focusability()
+
+    def _restore_input_focusability(self) -> None:
+        if self._input_focus_target is not None and self._input_can_focus is not None:
+            self._input_focus_target.can_focus = self._input_can_focus
+        self._input_focus_target = None
+        self._input_can_focus = None
+
+    def _focus_fullscreen_log(self) -> None:
+        if (
+            self.is_mounted
+            and self.has_class("-fullscreen")
+            and self._log_view is not None
+        ):
+            self.screen.set_focus(self._log_view)
+
+    def _show_state(self, text: str | None, *, failed: bool = False) -> None:
+        if self._state_row is None:
+            return
+        self._state_row.display = text is not None
+        if text is not None:
+            self._state_row.update(text)
+            self._state_row.styles.color = self.app.theme_variables[
+                "error" if failed else "text-muted"
+            ]
+
+    def _update_loaded_state(self) -> None:
+        if self._log_view is not None and not self._log_view._lines:
+            self._show_state(
+                "Info: No debug logs yet. New logs appear here automatically."
+            )
+        else:
+            self._show_state(None)
 
     def _schedule_load_page(self) -> None:
         if self._reading:
@@ -236,7 +330,14 @@ class DebugConsole(Vertical):
             self._seen_entry_ids.update(entry.id for entry in entries)
             markups = [self._format_entry(entry) for entry in reversed(entries)]
             self._log_view.prepend_lines(markups)
+            self._update_loaded_state()
             self._fill_viewport()
+        except Exception as exc:
+            self._show_state(
+                f"Failed: Could not load debug logs ({exc}). Existing logs remain "
+                "visible; close and reopen the console to retry.",
+                failed=True,
+            )
         finally:
             self._reading = False
 
@@ -257,12 +358,20 @@ class DebugConsole(Vertical):
                 if entry.id not in self._seen_entry_ids
             ]
             if not entries:
+                self._update_loaded_state()
                 return
             self._seen_entry_ids.update(entry.id for entry in entries)
             if self._cursor is not None:
                 self._cursor += len(entries)
             for entry in reversed(entries):
                 self._log_view.write_line(self._format_entry(entry))
+            self._update_loaded_state()
+        except Exception as exc:
+            self._show_state(
+                f"Failed: Could not refresh debug logs ({exc}). Existing logs "
+                "remain visible; close and reopen the console to retry.",
+                failed=True,
+            )
         finally:
             self._reading = False
 
@@ -280,10 +389,11 @@ class DebugConsole(Vertical):
         else:
             self._log_view.scroll_end(animate=False)
 
-    @staticmethod
-    def _format_entry(entry: DebugLogEntry) -> str:
-        color = LOG_LEVEL_COLORS.get(entry.level, "dim")
+    def _format_entry(self, entry: DebugLogEntry) -> str:
+        role = LOG_LEVEL_ROLES.get(entry.level, "$text-muted").lstrip("$")
+        color = self.app.theme_variables[role]
+        muted = self.app.theme_variables["text-muted"]
         ts = entry.timestamp.astimezone().strftime("%Y-%m-%d %H:%M:%S")
         message = decode_log_message(entry.message)
         safe_message = escape(message)
-        return f"[dim]{ts}[/dim] [{color}]{entry.level:<8}[/{color}] {safe_message}"
+        return f"[{muted}]{ts}[/] [{color}]{entry.level:<8}[/] {safe_message}"

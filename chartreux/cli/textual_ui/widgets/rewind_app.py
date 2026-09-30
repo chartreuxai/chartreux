@@ -12,6 +12,7 @@ from textual.message import Message
 from textual.widgets import Static
 
 from chartreux.cli.textual_ui.widgets.vim_navigation import VimNavigationMixin
+from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
@@ -22,6 +23,7 @@ class _RewindStep(StrEnum):
 
 
 class _RewindAction(StrEnum):
+    CANCEL = auto()
     EDIT_AND_RESTORE = auto()
     EDIT_ONLY = auto()
 
@@ -33,7 +35,11 @@ class _RewindPersistence(StrEnum):
 
 type _RewindChoice = _RewindAction | _RewindPersistence
 
-_MAX_OPTIONS = 2
+_MAX_OPTIONS = 3
+
+
+class _RewindOption(NoMarkupStatic):
+    ALLOW_SELECT = False
 
 
 class RewindApp(VimNavigationMixin, Container):
@@ -56,6 +62,7 @@ class RewindApp(VimNavigationMixin, Container):
         Binding("enter", "select", "Select", show=False),
         Binding("1", "select_1", "Option 1", show=False),
         Binding("2", "select_2", "Option 2", show=False),
+        Binding("3", "select_3", "Option 3", show=False),
     ]
 
     class RewindConfirmed(Message):
@@ -88,7 +95,9 @@ class RewindApp(VimNavigationMixin, Container):
         self._options = self._build_action_options()
 
     def _build_action_options(self) -> list[tuple[str, _RewindChoice]]:
-        options: list[tuple[str, _RewindChoice]] = []
+        options: list[tuple[str, _RewindChoice]] = [
+            ("Cancel rewind", _RewindAction.CANCEL)
+        ]
         if self._has_file_changes:
             options.append((
                 "Edit & restore files to this point",
@@ -142,7 +151,7 @@ class RewindApp(VimNavigationMixin, Container):
             yield self._title_widget
             yield NoMarkupStatic("")
             for _ in range(_MAX_OPTIONS):
-                widget = NoMarkupStatic("", classes="rewind-option")
+                widget = _RewindOption("", classes="rewind-option")
                 self.option_widgets.append(widget)
                 yield widget
             yield NoMarkupStatic("")
@@ -163,7 +172,7 @@ class RewindApp(VimNavigationMixin, Container):
             widget.display = True
             text, _choice = self._options[idx]
             is_selected = idx == self.selected_option
-            cursor = "› " if is_selected else "  "
+            cursor = f"{chrome_glyph('cursor')} " if is_selected else "  "
             widget.update(f"{cursor}{idx + 1}. {text}")
 
             widget.remove_class("rewind-cursor-selected")
@@ -223,6 +232,11 @@ class RewindApp(VimNavigationMixin, Container):
             self.selected_option = 1
             self._handle_selection(1)
 
+    def action_select_3(self) -> None:
+        if self._option_count() >= _MAX_OPTIONS:
+            self.selected_option = 2
+            self._handle_selection(2)
+
     def action_edit_prev(self) -> None:
         self.post_message(self.EditPrev())
 
@@ -237,6 +251,8 @@ class RewindApp(VimNavigationMixin, Container):
             return
         _label, choice = self._options[option]
         match choice:
+            case _RewindAction.CANCEL:
+                self.post_message(self.Quit())
             case _RewindAction.EDIT_AND_RESTORE:
                 self._advance_to_persistence(restore_files=True)
             case _RewindAction.EDIT_ONLY:
@@ -256,6 +272,24 @@ class RewindApp(VimNavigationMixin, Container):
 
     def on_key(self, event: events.Key) -> None:
         self._handle_vim_navigation_key(event)
+
+    def on_click(self, event: events.Click) -> None:
+        # The second click of a double click may land on a newly rendered
+        # persistence choice at the same position. Only the first click may
+        # advance the rewind flow.
+        if event.chain > 1:
+            event.stop()
+            event.prevent_default()
+            return
+        if event.widget is None:
+            return
+        for index, widget in enumerate(self.option_widgets[: self._option_count()]):
+            if widget in event.widget.ancestors_with_self:
+                event.stop()
+                self.selected_option = index
+                self._update_options()
+                self._handle_selection(index)
+                return
 
     def on_blur(self, event: events.Blur) -> None:
         self.call_after_refresh(self.focus)

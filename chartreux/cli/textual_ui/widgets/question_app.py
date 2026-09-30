@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, ClassVar
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Input
@@ -20,6 +20,7 @@ from chartreux.app_server.models import (
 )
 from chartreux.cli.textual_ui.widgets.vim_navigation import VimNavigationMixin
 from chartreux.cli.textual_ui.widgets.vscode_compat import VscodeCompatInput
+from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
@@ -37,9 +38,10 @@ class QuestionApp(VimNavigationMixin, Container):
     selected_option: reactive[int] = reactive(0)
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("up", "move_up", "Up", show=False),
-        Binding("down", "move_down", "Down", show=False),
+        Binding("up", "move_up", "Up", show=False, priority=True),
+        Binding("down", "move_down", "Down", show=False, priority=True),
         Binding("enter", "select", "Select", show=False),
+        Binding("space", "toggle_option", "Toggle", show=False),
         Binding("escape", "cancel", "Cancel", show=False),
     ]
 
@@ -70,6 +72,18 @@ class QuestionApp(VimNavigationMixin, Container):
         self.help_widget: NoMarkupStatic | None = None
         self.tabs_widget: NoMarkupStatic | None = None
         self._mount_time: float = 0.0
+        self._submission_status: str | None = None
+        self._body_max_height: int | None = None
+
+    def set_submission_status(self, status: str) -> None:
+        self._submission_status = status
+        if self.help_widget is not None:
+            self.help_widget.set_class(
+                status.startswith("Warning:"), "submission-warning"
+            )
+            self.help_widget.set_class(status.startswith("Failed:"), "submission-error")
+        self._update_help()
+        self._schedule_body_max_height()
 
     @property
     def _current_question(self) -> UserQuestion:
@@ -115,37 +129,41 @@ class QuestionApp(VimNavigationMixin, Container):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="question-content"):
+            self.title_widget = NoMarkupStatic("", classes="question-title")
+            yield self.title_widget
+
             if len(self.questions) > 1:
                 self.tabs_widget = NoMarkupStatic("", classes="question-tabs")
                 yield self.tabs_widget
 
-            self.title_widget = NoMarkupStatic("", classes="question-title")
-            yield self.title_widget
+            with VerticalScroll(id="question-body"):
+                for _ in range(self.max_options):
+                    widget = NoMarkupStatic("", classes="question-option")
+                    self.option_widgets.append(widget)
+                    yield widget
 
-            for _ in range(self.max_options):
-                widget = NoMarkupStatic("", classes="question-option")
-                self.option_widgets.append(widget)
-                yield widget
+                with Horizontal(classes="question-other-row"):
+                    self.other_prefix = NoMarkupStatic(
+                        "", classes="question-other-prefix"
+                    )
+                    yield self.other_prefix
+                    self.other_input = VscodeCompatInput(
+                        placeholder="Type your answer...",
+                        classes="question-other-input",
+                    )
+                    yield self.other_input
+                    self.other_static = NoMarkupStatic(
+                        "Type your answer...", classes="question-other-static"
+                    )
+                    yield self.other_static
 
-            with Horizontal(classes="question-other-row"):
-                self.other_prefix = NoMarkupStatic("", classes="question-other-prefix")
-                yield self.other_prefix
-                self.other_input = VscodeCompatInput(
-                    placeholder="Type your answer...", classes="question-other-input"
-                )
-                yield self.other_input
-                self.other_static = NoMarkupStatic(
-                    "Type your answer...", classes="question-other-static"
-                )
-                yield self.other_static
+                self.submit_widget = NoMarkupStatic("", classes="question-submit")
+                yield self.submit_widget
 
-            self.submit_widget = NoMarkupStatic("", classes="question-submit")
-            yield self.submit_widget
-
-            if self.args.footer_note:
-                yield NoMarkupStatic(
-                    self.args.footer_note, classes="question-footer-note"
-                )
+                if self.args.footer_note:
+                    yield NoMarkupStatic(
+                        self.args.footer_note, classes="question-footer-note"
+                    )
 
             self.help_widget = NoMarkupStatic("", classes="question-help")
             yield self.help_widget
@@ -154,6 +172,27 @@ class QuestionApp(VimNavigationMixin, Container):
         self._mount_time = time.monotonic()
         self._update_display()
         self.focus()
+        self._schedule_body_max_height()
+
+    def on_resize(self, _event: events.Resize) -> None:
+        self._schedule_body_max_height()
+
+    def _schedule_body_max_height(self) -> None:
+        if self.is_mounted:
+            self.call_after_refresh(self._set_body_max_height)
+
+    def _set_body_max_height(self) -> None:
+        content = self.query_one("#question-content", Vertical)
+        body = self.query_one("#question-body", VerticalScroll)
+        fixed_chrome = (
+            self.styles.gutter.height
+            + content.virtual_size.height
+            - body.outer_size.height
+        )
+        max_height = max(1, self.app.size.height // 2 - fixed_chrome)
+        if max_height != self._body_max_height:
+            self._body_max_height = max_height
+            body.styles.max_height = max_height
 
     def is_within_grace_period(self) -> bool:
         return (time.monotonic() - self._mount_time) < _INPUT_GRACE_PERIOD_S
@@ -163,6 +202,20 @@ class QuestionApp(VimNavigationMixin, Container):
 
     def _watch_selected_option(self) -> None:
         self._update_display()
+        if self.is_mounted:
+            self.call_after_refresh(self._scroll_to_current_option)
+
+    def _scroll_to_current_option(self) -> None:
+        if self._is_submit_selected:
+            target = self.submit_widget
+        elif self._is_other_selected:
+            target = self.other_prefix
+        elif self.selected_option < len(self.option_widgets):
+            target = self.option_widgets[self.selected_option]
+        else:
+            target = None
+        if target is not None and target.is_mounted:
+            target.scroll_visible(animate=False)
 
     def _update_display(self) -> None:
         self._update_tabs()
@@ -171,6 +224,7 @@ class QuestionApp(VimNavigationMixin, Container):
         self._update_other_row()
         self._update_submit()
         self._update_help()
+        self._schedule_body_max_height()
 
     def _update_tabs(self) -> None:
         if not self.tabs_widget or len(self.questions) <= 1:
@@ -179,7 +233,7 @@ class QuestionApp(VimNavigationMixin, Container):
         for i, question in enumerate(self.questions):
             header = question.header or f"Q{i + 1}"
             if i in self.answers:
-                header += " ✓"
+                header += " answered"
             if i == self.current_question_idx:
                 tabs.append(f"[{header}]")
             else:
@@ -211,10 +265,14 @@ class QuestionApp(VimNavigationMixin, Container):
         self, idx: int, is_focused: bool, is_multi: bool, is_selected: bool
     ) -> str:
         """Format the prefix for an option line (cursor + number + checkbox if multi)."""
-        cursor = "› " if is_focused else "  "
         if is_multi:
-            check = "[x]" if is_selected else "[ ]"
-            return f"{cursor}{idx + 1}. {check} "
+            check = (
+                f"[{chrome_glyph('checked')}]"
+                if is_selected
+                else f"[{chrome_glyph('unchecked')}]"
+            )
+            return f"  {check} "
+        cursor = f"{chrome_glyph('cursor')} " if is_focused else "  "
         return f"{cursor}{idx + 1}. "
 
     def _render_option(
@@ -258,7 +316,7 @@ class QuestionApp(VimNavigationMixin, Container):
         prefix = self._format_option_prefix(
             other_idx, is_focused, is_multi, is_selected
         )
-        self.other_prefix.update(prefix)
+        self.other_prefix.update(f"{prefix}Other: ")
 
         stored_text = self.other_texts.get(self.current_question_idx, "")
         if self.other_input.value != stored_text:
@@ -290,7 +348,7 @@ class QuestionApp(VimNavigationMixin, Container):
 
         self.submit_widget.display = True
         is_focused = self._is_submit_selected
-        cursor = "› " if is_focused else "  "
+        cursor = f"{chrome_glyph('cursor')} " if is_focused else "  "
 
         text = (
             "Submit"
@@ -298,7 +356,7 @@ class QuestionApp(VimNavigationMixin, Container):
             == len(self.questions)
             else "Next"
         )
-        self.submit_widget.update(f"{cursor}   {text} →")
+        self.submit_widget.update(f"{cursor}   {text} {chrome_glyph('forward')}")
         self.submit_widget.remove_class("question-option-selected")
         if is_focused:
             self.submit_widget.add_class("question-option-selected")
@@ -309,7 +367,7 @@ class QuestionApp(VimNavigationMixin, Container):
             return
         if self._current_question.multi_select:
             help_text = (
-                f"{shortcut('↑↓/jk')} navigate  {shortcut('Enter')} toggle  "
+                f"{shortcut('↑↓/jk')} navigate  {shortcut('Space')} toggle  {shortcut('Enter')} accept  "
                 f"{shortcut('Esc')} cancel"
             )
         else:
@@ -319,6 +377,14 @@ class QuestionApp(VimNavigationMixin, Container):
             )
         if len(self.questions) > 1:
             help_text = f"{shortcut('←→')} questions  {help_text}"
+        if self._submission_status:
+            if self._submission_status.startswith(
+                "Warning: Answer delivery is uncertain"
+            ):
+                help_text = f"{shortcut('Ctrl+D')} Exit"
+            elif self._submission_status.startswith("Running: Sending answer"):
+                help_text = "Sending answer; please wait"
+            help_text = f"{self._submission_status}\n{help_text}"
         self.help_widget.update(shortcut_hint(help_text))
 
     def _store_other_text(self) -> None:
@@ -378,15 +444,22 @@ class QuestionApp(VimNavigationMixin, Container):
         else:
             self._handle_single_select_action()
 
+    def action_toggle_option(self) -> None:
+        if (
+            self.is_within_grace_period()
+            or not self._current_question.multi_select
+            or self._is_submit_selected
+        ):
+            return
+        self._toggle_selection(self.selected_option)
+
     def _handle_multi_select_action(self) -> None:
-        """Handle Enter key in multi-select mode: toggle option or submit."""
-        if self._is_submit_selected:
-            self._save_current_answer()
-            if self.current_question_idx not in self.answers:
-                return
+        """Accept the selected options and advance on Enter."""
+        if not self._is_submit_selected:
+            self._select_option(self.selected_option)
+        self._save_current_answer()
+        if self.current_question_idx in self.answers:
             self._advance_or_submit()
-        else:
-            self._toggle_selection(self.selected_option)
 
     def _handle_single_select_action(self) -> None:
         """Handle Enter key in single-select mode: select and advance."""
@@ -433,8 +506,6 @@ class QuestionApp(VimNavigationMixin, Container):
             self._switch_question(new_idx)
 
     def action_cancel(self) -> None:
-        if self.is_within_grace_period():
-            return
         self.post_message(self.Cancelled())
 
     def on_input_submitted(self, _event: Input.Submitted) -> None:
@@ -576,6 +647,7 @@ class QuestionApp(VimNavigationMixin, Container):
             return
         self.selected_option = idx
         if not self._current_question.multi_select:
+            self.action_select()
             return
         if idx == self._other_option_idx:
             self._select_option(idx)

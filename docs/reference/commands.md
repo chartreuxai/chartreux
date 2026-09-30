@@ -17,7 +17,7 @@ prompt, prints a response, and exits.
 | `--enabled-tools TOOL` | Repeatable exact, glob, or `re:` tool filter; in programmatic mode it disables other tools. |
 | `--disabled-tools TOOL` | Repeatable exact, glob, or `re:` tool filter applied after `--enabled-tools`. |
 | `--output {text,json,streaming}` | Programmatic output: human text (default), one JSON result, or newline-delimited JSON. |
-| `--setup` | Run interactive setup—theme, provider, credentials, and model selection—then exit. Requires an interactive terminal; otherwise, it prints actionable guidance instead of launching the TUI. |
+| `--setup` | Run interactive setup—provider, credentials, and model selection—then exit. Requires an interactive terminal; otherwise, it prints actionable guidance instead of launching the TUI. |
 | `--workdir DIR` | Change to this directory before launch. |
 | `--worktree [NAME]` | Run in a managed Git worktree. With a name, create or reuse it; without one, create a name from the prompt or a random slug. Ignored with `--setup`. |
 | `--add-dir DIR` | Repeatable additional workspace root; trusted for this session. |
@@ -45,10 +45,11 @@ can add commands.
 | Command | Action |
 | --- | --- |
 | `/help` | Show command and shortcut help. |
-| `/model` | Select the active model. |
-| `/thinking` | Select the session thinking level. |
+| `/model` | Override the main model for this session; the saved orchestrator preset remains unchanged. |
+| `/thinking` | Override the thinking level for this session; the saved orchestrator preset remains unchanged. |
 | `/reload` | Reload configuration, instructions, and skills from disk. |
-| `/config` | Open the user config file in your editor; creates the file with a commented template if absent, and reloads after editing if it changed. |
+| `/open-config-file` | Open the user config file in your editor; creates the file with a commented template if absent, and reloads after editing if it changed. |
+| `/settings` | Browse and edit curated user settings. |
 | `/clear`, `/new` | Start a new conversation; optionally provide a seed prompt. |
 | `/copy` | Copy the last agent message. |
 | `/paste-image` | Paste a clipboard image into the prompt (available on supported systems). |
@@ -57,10 +58,10 @@ can add commands.
 | `/debug` | Toggle the debug console. |
 | `/agents` | Toggle the expanded retained-background-agent list above the input. |
 | `/compact [instructions]` | Summarize the conversation context. |
-| `/exit`, `exit`, `quit`, `:q`, `:quit` | Exit. |
+| `/exit`, `exit`, `quit`, `:q`, `:quit` | Exit immediately while idle. During consequential active work, opens the exit confirmation dialog. |
 | `/status` | Display agent statistics. |
 | `/proxy-setup` | Configure proxy and certificate settings. See [networking](../integrations/networking.md). |
-| `/providers` | Add or manage model providers. |
+| `/providers` | Open Provider Settings to add or manage model providers. |
 | `/resume`, `/continue` | Browse, resume, or delete saved sessions. |
 | `/rename` | Rename the current session. |
 | `/mcp` | Show MCP servers; supports `add`, `status`, `login`, and `logout` operations. |
@@ -69,6 +70,7 @@ can add commands.
 | `/retry [instructions]` | Continue an interrupted model response. |
 | `/loop <interval> <prompt>` | Schedule a recurring prompt; `/loop list` and `/loop cancel <id\|all>` manage it. |
 | `/theme` | Select `auto`, `light`, or `dark`. |
+| `/web-search` | Configure the web-search provider, credential, and search settings. |
 
 ## Key shortcuts
 
@@ -77,8 +79,8 @@ can add commands.
 | `Enter` | Submit input. |
 | `Ctrl+J` or `Shift+Enter` | Insert a newline. |
 | `Escape` | Interrupt an agent or close a dialog; `Esc Esc` opens rewind when input is empty. |
-| `Ctrl+C` | Interrupt or quit; clears non-empty input before quitting. |
-| `Ctrl+D` | Delete right, or quit according to `ask_confirmation_on_exit`. |
+| `Ctrl+C` | Interrupt active work or quit while idle; clears non-empty input before quitting. Idle quit confirmation follows `ask_confirmation_on_exit`. |
+| `Ctrl+D` | Delete right, or quit while idle according to `ask_confirmation_on_exit`. |
 | `Ctrl+Z` | Suspend with a message. |
 | `Ctrl+G` | Open the current plan/input in an external editor. |
 | `Ctrl+O` | Toggle tool output. |

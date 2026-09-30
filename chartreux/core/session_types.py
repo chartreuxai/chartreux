@@ -35,6 +35,7 @@ class CommittedModelIdentity(BaseModel):
     provider: str
     wire_name: str
     catalog_revision: str
+    thinking: str | None = None
 
 
 class LaunchMetadataV1(BaseModel):

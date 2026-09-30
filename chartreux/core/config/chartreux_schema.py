@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, MutableMapping
 import os
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 from dotenv import dotenv_values
 from pydantic import (
@@ -43,6 +43,9 @@ from chartreux.core.config.models import (
     ThinkingLevel,
     normalize_authorized_roots,
 )
+
+if TYPE_CHECKING:
+    from chartreux.core.model_catalog.resolver import ResolvedModel
 from chartreux.core.config.schema import (
     ConfigSchema,
     WithConcatMerge,
@@ -85,7 +88,7 @@ def load_dotenv_values(
 
 
 DEFAULT_ACTIVE_MODEL_CONFIG = ModelConfig(
-    name="zai-glm-5-3", provider="mistral/default", alias="glm-5-3", thinking="high"
+    name="zai-glm-5-3", provider="mistral", alias="glm-5-3", thinking="high"
 )
 
 # The catalog is deliberately not a field of ChartreuxConfigSchema.  It is loaded
@@ -374,6 +377,7 @@ class ChartreuxConfigSchema(ConfigSchema):
     displayed_workdir: Annotated[str, WithReplaceMerge()] = ""
     context_warnings: Annotated[bool, WithReplaceMerge()] = False
     show_thinking_nodes: Annotated[bool, WithReplaceMerge()] = False
+    ascii_chrome: Annotated[bool, WithReplaceMerge()] = False
     raise_on_compaction_failure: Annotated[bool, WithReplaceMerge()] = False
     system_prompt_id: Annotated[str, WithReplaceMerge()] = SystemPrompt.CLI
     compaction_prompt_id: Annotated[str, WithReplaceMerge()] = UtilityPrompt.COMPACT
@@ -407,14 +411,21 @@ class ChartreuxConfigSchema(ConfigSchema):
         default_factory=SessionLoggingConfig
     )
 
-    def resolve_default_model_alias(self) -> str:
+    def _resolve_orchestrator_model(self) -> ResolvedModel:
+        """Resolve the one configured default model and thinking level."""
         from chartreux.core.model_catalog.resolver import resolver_for
 
-        return (
-            resolver_for(self)
-            .resolve("@orchestrator", allowed_models=self.allowed_models)
-            .base_model
+        role = self.catalog_snapshot.catalog.roles.get("orchestrator")
+        return resolver_for(self).resolve(
+            "@orchestrator",
+            allowed_models=self.allowed_models,
+            thinking_override=(
+                self.thinking_overrides.get(role.model) if role is not None else None
+            ),
         )
+
+    def resolve_default_model_alias(self) -> str:
+        return self._resolve_orchestrator_model().base_model
 
     def available_models(self) -> dict[str, ModelConfig]:
         from chartreux.core.model_catalog.resolver import (
@@ -439,15 +450,28 @@ class ChartreuxConfigSchema(ConfigSchema):
         from chartreux.core.model_catalog.resolver import resolver_for
 
         resolver = resolver_for(self)
-        resolved = (
-            resolver.resolve_committed(
+        expression = self.active_model or "@orchestrator"
+        if self._committed_model is not None:
+            resolved = resolver.resolve_committed(
                 self._committed_model, allowed_models=self.allowed_models
             )
-            if self._committed_model is not None
-            else resolver.resolve(
-                self.active_model or "@orchestrator", allowed_models=self.allowed_models
+        elif expression == "@orchestrator":
+            resolved = self._resolve_orchestrator_model()
+        else:
+            role = (
+                self.catalog_snapshot.catalog.roles.get(expression[1:])
+                if expression.startswith("@")
+                else None
             )
-        )
+            resolved = resolver.resolve(
+                expression,
+                allowed_models=self.allowed_models,
+                thinking_override=(
+                    self.thinking_overrides.get(role.model)
+                    if role is not None
+                    else None
+                ),
+            )
         return resolved.materialize(
             auto_compact_threshold=self.auto_compact_threshold,
             thinking=self.thinking_overrides.get(resolved.base_model),

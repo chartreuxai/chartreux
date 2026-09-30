@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" data-cols="80" data-rows="24" viewBox="0 0 976 585.6" role="img">
+<title>Mistral setup — Leave Connection?</title>
+<desc>Bounded confirmation panel over a dimmed Mistral Connection screen. Keep editing is the default; Continue keeps local fields and continues setup, while Discard removes those fields. The saved credential remains.</desc>
+<rect width="976" height="585.6" fill="#171a1f"/>
+<text data-row="0" x="12.2" y="18.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee" font-weight="bold">Provider Settings  /  Connection</text>
+<text data-row="1" x="12.2" y="42.4" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Mistral · local connection fields changed</text>
+<text data-row="2" x="12.2" y="66.8" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Provider name  Mistral (built-in) [read-only]</text>
+<text data-row="3" x="12.2" y="91.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">API base       [https://gateway.example/v1]</text>
+<text data-row="4" x="12.2" y="115.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Protocol       [OpenAI-compatible]</text>
+<text data-row="5" x="12.2" y="140.0" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Credential     [saved key available]</text>
+<text data-row="6" x="12.2" y="164.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="7" x="12.2" y="188.8" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">ACTIONS</text>
+<text data-row="8" x="12.2" y="213.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  Save credential</text>
+<text data-row="9" x="12.2" y="237.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">  Continue to Models (keep fields; continue setup)</text>
+<text data-row="10" x="12.2" y="262.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="11" x="12.2" y="286.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="12" x="12.2" y="310.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="13" x="12.2" y="335.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="14" x="12.2" y="359.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="15" x="12.2" y="384.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="16" x="12.2" y="408.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="17" x="12.2" y="432.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="18" x="12.2" y="457.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="19" x="12.2" y="481.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="20" x="12.2" y="506.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="21" x="12.2" y="530.4" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="22" x="12.2" y="554.8" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee"></text>
+<text data-row="23" x="12.2" y="579.2" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd"></text>
+<rect x="0" y="0" width="976" height="585.6" fill="#000000" opacity="0.58"/>
+<rect x="134.2" y="195.2" width="707.6" height="195.2" rx="4" fill="#222831" stroke="#aab2bd" stroke-width="2"/>
+<text x="146.4" y="213.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee" font-weight="bold">Leave Connection?</text>
+<text x="146.4" y="237.6" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">Discard local endpoint, protocol, and name fields?</text>
+<text x="146.4" y="262.0" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee">The saved credential remains available.</text>
+<rect data-focus-row="dialog" x="134.2" y="292.8" width="707.6" height="24.4" fill="#dce3ed"/>
+<text x="146.4" y="310.8" font-family="Fira Code,monospace" font-size="20" fill="#10151c" font-weight="bold">▸ Keep editing</text>
+<text x="146.4" y="335.2" font-family="Fira Code,monospace" font-size="20" fill="#e4e8ee" font-weight="bold">  Continue to Models (keep fields; continue setup)</text>
+<text x="146.4" y="359.6" font-family="Fira Code,monospace" font-size="20" fill="#ff9292" font-weight="bold">  Discard local fields</text>
+<text class="dialog-footer" x="12.2" y="579.2" font-family="Fira Code,monospace" font-size="20" fill="#aab2bd">Up/Down Choose   Enter Confirm   Esc Keep editing</text>
+</svg>

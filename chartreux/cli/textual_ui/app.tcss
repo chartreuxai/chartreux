@@ -49,26 +49,58 @@ TextArea > .text-area--cursor {
     width: auto;
     height: 1;
     color: $text-muted;
-    &:ansi {
-        text-style: dim;
-    }
+}
+
+#inline-notice.-warning {
+    color: $warning;
+}
+
+#inline-notice.-error {
+    color: $error;
 }
 
 #agent-bar {
     width: 100%;
     height: 1;
     max-height: 10;
-    overflow-y: auto;
-    text-wrap: nowrap;
     color: $text-muted;
 }
 
+#agent-bar-title, #agent-bar-detail, #agent-bar-footer {
+    width: 100%;
+    height: 1;
+    text-overflow: ellipsis;
+}
+
+#agent-bar.-expanded #agent-bar-title {
+    text-style: bold;
+    color: $foreground;
+}
+
+#agent-bar-rows, #agent-bar-full-details {
+    width: 100%;
+    height: 1fr;
+    overflow-y: auto;
+}
+
+#agent-bar-full-content {
+    width: 100%;
+    height: auto;
+    text-wrap: wrap;
+}
+
+#agent-bar-content {
+    width: 100%;
+    height: auto;
+}
+
 #agent-bar:focus {
-    border-left: solid $primary;
+    color: $foreground;
 }
 
 #agent-bar.-expanded {
     height: auto;
+    max-height: 10;
 }
 
 #bottom-app-container,
@@ -76,6 +108,14 @@ TextArea > .text-area--cursor {
     height: auto;
     width: 100%;
     background: transparent;
+}
+
+#bottom-pending-action {
+    height: 1;
+    width: 100%;
+    color: $warning;
+    background: $surface;
+    text-overflow: ellipsis;
 }
 
 .queue-header-message {
@@ -93,8 +133,8 @@ TextArea > .text-area--cursor {
 .queue-header-content {
     width: auto;
     height: auto;
-    text-style: bold italic;
-    color: $chartreux_copper;
+    text-style: none;
+    color: $text-muted;
 }
 
 .queue-header-separator {
@@ -102,9 +142,6 @@ TextArea > .text-area--cursor {
     height: 1;
     color: $text-muted;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 #bottom-bar {
@@ -114,6 +151,12 @@ TextArea > .text-area--cursor {
     padding: 0;
     align: left middle;
     layout: horizontal;
+}
+
+#bottom-bar PathDisplay {
+    height: 1;
+    text-overflow: ellipsis;
+    overflow-x: hidden;
 }
 
 #spacer {
@@ -130,9 +173,6 @@ TextArea > .text-area--cursor {
     margin: 0 0 0 1;
     color: $text-muted;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 #messages {
@@ -151,10 +191,11 @@ TextArea > .text-area--cursor {
 
 #completion-popup {
     display: none;
-    width: 100%;
+    width: auto;
+    max-width: 92;
     height: auto;
     color: $foreground;
-    background: $background;
+    background: $surface;
     border: solid $foreground-muted;
     overflow-y: auto;
     scrollbar-size-vertical: 1;
@@ -167,12 +208,15 @@ OptionList, OptionList:focus {
 }
 
 #completion-popup _CompletionRow {
-    height: auto;
+    height: 1;
     width: 1fr;
+    text-wrap: nowrap;
 }
 
 #completion-popup _CompletionItem {
-    height: auto;
+    height: 1;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
 }
 
 #completion-popup .completion-command {
@@ -185,10 +229,6 @@ OptionList, OptionList:focus {
 #completion-popup .completion-description {
     width: 1fr;
     color: $text-muted;
-
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 #completion-popup.completion-no-description .completion-command {
@@ -201,13 +241,21 @@ OptionList, OptionList:focus {
     display: none;
 }
 
-#completion-popup _CompletionRow.completion-selected .completion-command {
+#completion-popup _CompletionRow.completion-selected {
+    height: auto;
+    text-style: bold reverse;
+}
+
+#completion-popup _CompletionRow.completion-selected _CompletionItem {
+    background: transparent;
+    color: $foreground;
     text-style: bold reverse;
 }
 
 #completion-popup _CompletionRow.completion-selected .completion-description {
-    color: $foreground;
-    text-style: italic;
+    height: auto;
+    text-wrap: wrap;
+    text-overflow: clip;
 }
 
 #input-box {
@@ -220,6 +268,11 @@ OptionList, OptionList:focus {
     border-title-align: right;
     border-title-color: $text-muted;
 
+    &:focus-within {
+        border-top: solid $primary;
+        border-bottom: solid $primary;
+    }
+
     &.border-warning {
         border-top: solid $warning;
         border-bottom: solid $warning;
@@ -227,9 +280,9 @@ OptionList, OptionList:focus {
     }
 
     &.border-safe {
-        border-top: solid $success;
-        border-bottom: solid $success;
-        border-title-color: $success;
+        border-top: solid $foreground;
+        border-bottom: solid $foreground;
+        border-title-color: $foreground;
     }
 
     &.border-error {
@@ -239,13 +292,23 @@ OptionList, OptionList:focus {
     }
 
     &.border-recording {
-        border-top: solid $chartreux_copper;
-        border-bottom: solid $chartreux_copper;
-        border-title-color: $chartreux_copper;
+        border-top: solid $primary;
+        border-bottom: solid $primary;
+        border-title-color: $primary;
     }
 }
 
+#queue-mode-footer {
+    height: 1;
+    color: $text-muted;
+}
+
 #input-body {
+    height: auto;
+}
+
+.input-body-layout {
+    width: 100%;
     height: auto;
 }
 
@@ -254,7 +317,7 @@ OptionList, OptionList:focus {
 .recording-indicator {
     width: auto;
     background: transparent;
-    color: $chartreux_copper;
+    color: $foreground;
     text-style: bold;
     padding: 0 1 0 0;
 }
@@ -262,8 +325,8 @@ OptionList, OptionList:focus {
 #input {
     width: 1fr;
     height: auto;
-    min-height: 3;
-    max-height: 50vh;
+    min-height: 1;
+    max-height: 4;
     background: transparent;
     color: $foreground;
     border: none;
@@ -272,10 +335,6 @@ OptionList, OptionList:focus {
 
     &.recording {
         color: $text-muted;
-
-        &:ansi {
-            text-style: dim;
-        }
     }
 
     & .text-area--suggestion {
@@ -337,11 +396,6 @@ Markdown {
 
     &.pending {
         margin-top: 0;
-
-        .user-message-prompt,
-        .user-message-content {
-            text-style: italic;
-        }
         .user-message-separator {
             display: none;
         }
@@ -364,7 +418,6 @@ Markdown {
 }
 
 .user-message-wrapper {
-    margin-top: 1;
     width: 100%;
     height: auto;
 }
@@ -385,9 +438,6 @@ Markdown {
     padding: 0 2 0 2;
     color: $text-muted;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 .user-message-attachment-line {
@@ -408,30 +458,30 @@ Markdown {
 .user-message-prompt {
     width: auto;
     height: auto;
-    color: $chartreux_copper;
+    color: $foreground;
     text-style: bold;
 }
 
 .user-message-content {
     width: 1fr;
     height: auto;
-    text-style: bold;
+    text-style: none;
 }
 
-.slash-command-message {
-    .user-message-content {
-        color: $chartreux_copper;
-    }
+.slash-command-message .user-message-content {
+    color: $foreground;
+}
+
+.assistant-message-label {
+    color: $foreground;
+    text-style: bold;
+    height: 1;
 }
 
 .user-message-separator {
     width: 100%;
     height: 1;
     color: $text-muted;
-
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 .assistant-message {
@@ -439,7 +489,7 @@ Markdown {
     margin-top: 1;
     width: 100%;
     height: auto;
-    padding: 0 2 0 2;
+    padding: 0;
 
     Markdown {
         width: 100%;
@@ -470,25 +520,42 @@ Markdown {
     pointer: pointer;
 }
 
+.reasoning-message-header:focus,
+.collapsible-toggle:focus,
+.tool-group-header:focus,
+.tool-call-header:focus {
+    background: $primary;
+    color: $background;
+    text-style: bold;
+}
+
+.reasoning-message-header:focus .reasoning-collapsed-text,
+.collapsible-toggle:focus .status-indicator-text,
+.collapsible-toggle:focus .collapsible-header-verb,
+.collapsible-toggle:focus .collapsible-toggle-label,
+.tool-group-header:focus .status-indicator-text,
+.tool-call-header:focus .status-indicator-text {
+    color: $background;
+    text-opacity: 100%;
+    text-style: bold;
+}
+
 .reasoning-indicator {
     width: auto;
     height: auto;
     color: $text-muted;
     margin-right: 1;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 .reasoning-collapsed-text {
     width: auto;
     height: auto;
     color: $text-muted;
-    text-style: italic;
+    text-style: none;
 
     &:ansi {
-        text-style: dim;
+        text-style: none;
     }
 }
 
@@ -499,19 +566,11 @@ Markdown {
     padding: 0 2 0 2;
     margin: 0;
     color: $text-muted;
-    text-style: italic;
-
-    &:ansi {
-        text-style: dim;
-    }
+    text-style: none;
 
     * {
         color: $text-muted;
-        text-style: italic;
-
-        &:ansi {
-            text-style: dim;
-        }
+        text-style: none;
     }
 
     & > MarkdownBlock:last-child {
@@ -664,25 +723,14 @@ Markdown {
     }
 }
 
-/* Dim the collapsed summary (verb + message) so an expanded tool call stands
-   out. text-opacity handles truecolor themes; ANSI themes can't blend colours,
-   so they fall back to `text-style: dim`. The triangle keeps its full colour as
-   the status affordance. Set per child because Textual styles don't cascade
-   into child widgets. */
+/* Folded summaries retain full contrast; severity and focus must stay legible. */
 .collapsible-toggle.header .status-indicator-text {
-    text-opacity: 55%;
-
-    &:ansi {
-        text-style: dim;
-    }
+    text-opacity: 100%;
 }
 
 .collapsible-toggle.header .collapsible-header-verb {
-    text-opacity: 55%;
-
-    &:ansi {
-        text-style: bold dim;
-    }
+    text-opacity: 100%;
+    text-style: bold;
 }
 
 .collapsible-toggle.header.expanded .collapsible-header-verb {
@@ -698,12 +746,6 @@ Markdown {
     height: auto;
     color: $text-muted;
     margin-right: 1;
-
-    /* Muted arrow (classic overflow, held error/skip): keep the muted intent
-       under ANSI themes. success/error carry meaning, so clear the dim there. */
-    &:ansi {
-        text-style: dim;
-    }
 
     &.success {
         color: $success;
@@ -726,8 +768,8 @@ Markdown {
     width: auto;
     height: auto;
     margin-right: 1;
-    text-style: bold;
-    color: $primary;
+    text-style: none;
+    color: $foreground;
 }
 
 .collapsible-toggle-label {
@@ -735,9 +777,6 @@ Markdown {
     height: auto;
     color: $text-muted;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 StatusMessage {
@@ -753,7 +792,7 @@ StatusMessage {
 .status-indicator-icon {
     width: auto;
     height: auto;
-    color: $foreground;
+    color: $primary;
     margin-right: 1;
 
     &.success {
@@ -766,10 +805,6 @@ StatusMessage {
 
     &.muted {
         color: $text-muted;
-
-        &:ansi {
-            text-style: dim;
-        }
     }
 }
 
@@ -785,9 +820,6 @@ StatusMessage {
     margin-left: 1;
     color: $text-muted;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 .compact-message,
@@ -833,16 +865,15 @@ StatusMessage {
 .tool-group-header {
     width: 100%;
     height: auto;
-    background: $surface;
+    background: $background;
     padding: 0 1;
 }
 
 .tool-group-header .status-indicator-text {
-    text-opacity: 55%;
-
-    &:ansi {
-        text-style: dim;
-    }
+    width: 1fr;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+    text-opacity: 100%;
 }
 
 .tool-group-body {
@@ -867,6 +898,13 @@ StatusMessage {
     text-style: bold;
 }
 
+.tool-call-label {
+    width: auto;
+    height: auto;
+    margin-right: 1;
+    color: $text-muted;
+}
+
 .tool-call-header .status-indicator-text {
     /* 1fr (not auto) gives a definite width so long text wraps to the
        available space instead of measuring unwrapped and overflowing. */
@@ -882,20 +920,20 @@ StatusMessage {
     text-wrap: nowrap;
 }
 
-.tool-call-header.running.collapsible-result .status-indicator-text {
-    text-opacity: 55%;
-
-    &:ansi {
-        text-style: dim;
-    }
+.tool-call-header.running.collapsible-result .status-indicator-text,
+.tool-call-header.running.collapsible-result .collapsible-header-verb {
+    text-opacity: 100%;
 }
 
-.tool-call-header.running.collapsible-result .collapsible-header-verb {
-    text-opacity: 55%;
-
-    &:ansi {
-        text-style: bold dim;
-    }
+/* Focus styling wins over folded/resting color rules. */
+.collapsible-toggle:focus .status-indicator-text,
+.collapsible-toggle:focus .collapsible-header-verb,
+.tool-group-header:focus .status-indicator-text,
+.tool-call-header:focus .status-indicator-text,
+.tool-call-header:focus .collapsible-header-verb {
+    color: $background;
+    text-opacity: 100%;
+    text-style: bold;
 }
 
 /* Children of a group are packed with no vertical gaps between them. */
@@ -916,9 +954,6 @@ StatusMessage {
     color: $text-muted;
     padding: 0 2 0 2;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 .tool-result {
@@ -956,9 +991,6 @@ StatusMessage {
     padding: 0 1 0 2;
     color: $text-muted;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 .tool-result-content {
@@ -996,17 +1028,14 @@ StatusMessage {
     max-width: 100%;
 }
 
-.tool-call-detail,
-.tool-result-detail {
+.tool-call-detail {
     height: auto;
     color: $text-muted;
-
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 .tool-result-detail {
+    height: auto;
+    color: $foreground;
     margin-top: 0;
 }
 
@@ -1075,9 +1104,6 @@ StatusMessage {
     height: auto;
     color: $text-muted;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 .todo-pending {
@@ -1111,9 +1137,11 @@ StatusMessage {
 
 .loading-indicator {
     margin-right: 1;
+    color: $primary;
 }
 
 .loading-status {
+    color: $primary;
     width: auto;
     height: auto;
 }
@@ -1128,9 +1156,6 @@ StatusMessage {
     height: auto;
     color: $text-muted;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 .loading-debounce {
@@ -1169,10 +1194,23 @@ StatusMessage {
 #mcp-app, #mcpoauth-app {
     width: 100%;
     height: auto;
-    background: transparent;
+    max-height: 50vh;
+    background: $surface;
     border: solid $foreground-muted;
     padding: 0 1;
     margin: 0;
+}
+
+.settings-title {
+    height: auto;
+    text-style: bold;
+    color: $foreground;
+}
+
+.settings-help {
+    height: auto;
+    color: $text-muted;
+
 }
 
 #mcp-content, #mcpoauth-content {
@@ -1180,16 +1218,22 @@ StatusMessage {
     height: auto;
 }
 
-.settings-title {
-    height: auto;
-    text-style: bold;
-    color: $primary;
-}
-
 #mcp-options, #mcpoauth-options {
     width: 100%;
     max-height: 50vh;
     border: none;
+}
+
+#mcp-options:focus > .option-list--option-highlighted,
+#mcpoauth-options:focus > .option-list--option-highlighted,
+#modelpicker-options:focus > .option-list--option-highlighted,
+#thinkingpicker-options:focus > .option-list--option-highlighted,
+#loglevelpicker-options:focus > .option-list--option-highlighted,
+#themepicker-options:focus > .option-list--option-highlighted,
+#sessionpicker-options:focus > .option-list--option-highlighted {
+    background: $foreground;
+    color: $surface;
+    text-style: bold;
 }
 
 #mcp-search-row {
@@ -1200,22 +1244,23 @@ StatusMessage {
 }
 
 #mcp-search-icon {
-    width: 2;
+    width: 7;
     height: 1;
     color: $text-muted;
     margin-right: 1;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 #mcp-search {
     width: 1fr;
-    height: 1;
-    background: transparent;
-    border: none;
-    padding: 0;
+    height: auto;
+    background: $surface;
+    border: solid $foreground-muted;
+    padding: 0 1;
+}
+
+#mcp-search:focus {
+    border: solid $primary;
 }
 
 #mcp-options:focus, #mcpoauth-options:focus {
@@ -1226,19 +1271,11 @@ StatusMessage {
     margin: 1 0;
 }
 
-.settings-help {
-    height: auto;
-    color: $text-muted;
-
-    &:ansi {
-        text-style: dim;
-    }
-}
-
 #proxysetup-app {
     width: 100%;
     height: auto;
-    background: transparent;
+    max-height: 50vh;
+    background: $surface;
     border: solid $foreground-muted;
     padding: 0 1;
     margin: 0;
@@ -1247,6 +1284,19 @@ StatusMessage {
 #proxysetup-content {
     width: 100%;
     height: auto;
+    max-height: 100%;
+}
+
+#proxysetup-form {
+    width: 100%;
+    height: auto;
+    overflow-y: auto;
+}
+
+.proxy-field-error {
+    width: 100%;
+    height: 1;
+    color: $error;
 }
 
 .proxy-label-line {
@@ -1256,9 +1306,68 @@ StatusMessage {
 .proxy-input {
     width: 100%;
     height: auto;
+    border: solid $foreground-muted;
+    padding: 0 1;
+}
+
+
+.proxy-input:focus {
+    border: solid $primary;
+}
+
+.proxy-input.-invalid {
+    border: solid $error;
+}
+
+#proxysetup-error {
+    color: $error;
+}
+
+.proxy-actions {
+    height: auto;
+    width: 100%;
+}
+
+.proxy-actions Button,
+#sessionpicker-delete Button {
+    width: auto;
+    min-width: 0;
+    height: 1;
+    background: $surface;
     border: none;
-    border-left: wide $foreground-muted;
-    padding: 0 0 0 1;
+    color: $foreground;
+    padding: 0 1;
+    margin-right: 1;
+}
+
+.proxy-actions Button:focus,
+#sessionpicker-delete Button:focus {
+    text-style: bold reverse;
+}
+
+#proxysetup-discard,
+#sessionpicker-confirm-delete {
+    color: $error;
+}
+
+#proxysetup-discard-confirm {
+    width: 100%;
+    height: auto;
+}
+
+#proxysetup-discard-message {
+    color: $warning;
+    height: auto;
+}
+
+#sessionpicker-delete {
+    height: auto;
+    width: 100%;
+}
+
+#sessionpicker-delete NoMarkupStatic {
+    height: auto;
+    color: $warning;
 }
 
 .code-block {
@@ -1271,8 +1380,8 @@ StatusMessage {
 #question-app {
     width: 100%;
     height: auto;
-    max-height: 70vh;
-    background: transparent;
+    max-height: 50vh;
+    background: $surface;
     border: solid $foreground-muted;
     padding: 0 1;
     margin: 0;
@@ -1281,29 +1390,37 @@ StatusMessage {
 #question-content {
     width: 100%;
     height: auto;
+    max-height: 100%;
+}
+
+#question-body {
+    width: 100%;
+    height: auto;
+    overflow-y: auto;
 }
 
 .question-tabs {
     height: auto;
-    color: $primary;
+    color: $text-muted;
     margin-bottom: 1;
 }
 
 .question-title {
     height: auto;
     text-style: bold;
-    color: $primary;
-    margin-bottom: 1;
+    color: $foreground;
+    margin-bottom: 0;
 }
 
 .question-option {
+    width: 100%;
     height: auto;
     color: $foreground;
 }
 
 .question-option-selected {
-    color: $primary;
-    text-style: bold;
+    color: $foreground;
+    text-style: bold reverse;
 }
 
 .question-other-row {
@@ -1314,15 +1431,19 @@ StatusMessage {
 .question-other-prefix {
     width: auto;
     height: auto;
-    color: $foreground;
+    color: $text-muted;
 }
 
 .question-other-input {
     width: 1fr;
     height: auto;
-    background: transparent;
-    border: none;
-    padding: 0;
+    background: $surface;
+    border: solid $foreground-muted;
+    padding: 0 1;
+}
+
+.question-other-input:focus {
+    border: solid $primary;
 }
 
 .question-other-static {
@@ -1330,12 +1451,10 @@ StatusMessage {
     height: auto;
     color: $text-muted;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 .question-submit {
+    width: 100%;
     height: auto;
     color: $foreground;
     margin-top: 1;
@@ -1344,12 +1463,8 @@ StatusMessage {
 .question-footer-note {
     height: auto;
     color: $text-muted;
-    text-style: italic;
     margin-top: 1;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 .question-help {
@@ -1357,9 +1472,14 @@ StatusMessage {
     color: $text-muted;
     margin-top: 1;
 
-    &:ansi {
-        text-style: dim;
-    }
+}
+
+.question-help.submission-warning {
+    color: $warning;
+}
+
+.question-help.submission-error {
+    color: $error;
 }
 
 ExpandingBorder {
@@ -1376,10 +1496,6 @@ ContextProgress {
     padding: 0;
     margin: 0;
     color: $text-muted;
-
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 NarratorStatus {
@@ -1446,7 +1562,7 @@ NarratorStatus {
 }
 
 .banner-cmd {
-    color: $secondary;
+    color: $foreground;
     width: auto;
 }
 
@@ -1457,7 +1573,7 @@ NarratorStatus {
 }
 
 .whats-new-message {
-    border-left: heavy $chartreux_copper;
+    border-left: solid $foreground-muted;
     margin-bottom: 1;
 
     Markdown {
@@ -1495,7 +1611,7 @@ NarratorStatus {
 }
 
 .custom-tools-deprecation-message {
-    border-left: heavy $warning;
+    border-left: solid $foreground-muted;
     margin-bottom: 1;
 
     Markdown {
@@ -1515,7 +1631,7 @@ NarratorStatus {
 #sessionpicker-app {
     width: 100%;
     height: auto;
-    background: transparent;
+    background: $surface;
     border: solid $foreground-muted;
     padding: 0 1;
     margin: 0;
@@ -1568,173 +1684,32 @@ NarratorStatus {
     color: $text-muted;
     margin-top: 1;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
-#vibecodeprojectpicker-app {
-    width: 100%;
-    height: auto;
-    background: transparent;
-    border: solid $foreground-muted;
-    padding: 0 1;
-    margin: 0;
+
+#sessionpicker-loading.-failed {
+    color: $error;
 }
-
-#vibecodeprojectpicker-content {
-    width: 100%;
-    height: auto;
-}
-
-.vibecodeprojectpicker-title {
-    height: auto;
-    text-style: bold;
-    color: $primary;
-}
-
-.vibecodeprojectpicker-repo {
-    width: 100%;
-    height: auto;
-    text-wrap: nowrap;
-    text-overflow: ellipsis;
-}
-
-.vibecodeprojectpicker-scope {
-    width: 100%;
-    height: auto;
-    color: $text-muted;
-    margin-bottom: 1;
-
-    &:ansi {
-        text-style: dim;
-    }
-}
-
-.vibecodeprojectpicker-search-row {
-    width: 100%;
-    height: auto;
-    margin-bottom: 1;
-}
-
-.vibecodeprojectpicker-search-label {
-    width: auto;
-    height: auto;
-    color: $text-muted;
-    margin-right: 1;
-
-    &:ansi {
-        text-style: dim;
-    }
-}
-
-#vibecodeprojectpicker-search {
-    width: 1fr;
-    height: auto;
-    background: transparent;
-    border: none;
-    padding: 0;
-}
-
-#vibecodeprojectpicker-options {
-    width: 100%;
-    max-height: 50vh;
-    text-wrap: nowrap;
-    text-overflow: ellipsis;
-    border: none;
-}
-
-#vibecodeprojectpicker-options:focus {
-    border: none;
-}
-
-.vibecodeprojectpicker-help {
-    width: 100%;
-    height: auto;
-    color: $text-muted;
-    margin-top: 1;
-
-    &:ansi {
-        text-style: dim;
-    }
-}
-
-#vibecodeprojectcreate-app {
-    width: 100%;
-    height: auto;
-    background: transparent;
-    border: solid $foreground-muted;
-    padding: 0 1;
-    margin: 0;
-}
-
-#vibecodeprojectcreate-content {
-    width: 100%;
-    height: auto;
-}
-
-.vibecodeprojectcreate-title {
-    height: auto;
-    text-style: bold;
-    color: $primary;
-}
-
-.vibecodeprojectcreate-repo {
-    width: 100%;
-    height: auto;
-    text-wrap: nowrap;
-    text-overflow: ellipsis;
-    margin-bottom: 1;
-}
-
-.vibecodeprojectcreate-input-row {
-    width: 100%;
-    height: auto;
-    margin-bottom: 1;
-}
-
-.vibecodeprojectcreate-input-label {
-    width: 15;
-    height: auto;
-    color: $text-muted;
-    margin-right: 1;
-
-    &:ansi {
-        text-style: dim;
-    }
-}
-
-#vibecodeprojectcreate-name,
-#vibecodeprojectcreate-default-branch {
-    width: 1fr;
-    height: auto;
-    background: transparent;
-    border: none;
-    padding: 0;
-}
-
-.vibecodeprojectcreate-help {
-    width: 100%;
-    height: auto;
-    color: $text-muted;
-    margin-top: 1;
-
-    &:ansi {
-        text-style: dim;
-    }
-}
-
 /* Debug Console */
 
 #debug-console {
     dock: right;
-    width: 40%;
-    max-width: 80;
-    min-width: 40;
+    width: 40;
     height: 100%;
-    background: transparent;
+    background: $surface;
     border-left: solid $foreground-muted;
     padding: 0 1;
+}
+
+#debug-console.-fullscreen {
+    dock: none;
+    position: absolute;
+    width: 100vw;
+    height: 100vh;
+    offset: 0 0;
+    background: $background;
+    border: none;
+    layer: overlay;
 }
 
 #debug-console-header {
@@ -1743,6 +1718,12 @@ NarratorStatus {
     color: $foreground;
     padding: 0 0 1 0;
     text-align: left;
+    text-style: bold;
+}
+
+#debug-console-footer {
+    height: 1;
+    color: $text-muted;
 }
 
 #debug-console-log {
@@ -1756,7 +1737,7 @@ NarratorStatus {
 #modelpicker-app {
     width: 100%;
     height: auto;
-    background: transparent;
+    background: $surface;
     border: solid $foreground-muted;
     padding: 0 1;
     margin: 0;
@@ -1770,7 +1751,7 @@ NarratorStatus {
 .modelpicker-title {
     height: auto;
     text-style: bold;
-    color: $primary;
+    color: $foreground;
 }
 
 #modelpicker-options {
@@ -1791,15 +1772,12 @@ NarratorStatus {
     color: $text-muted;
     margin-top: 1;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 #thinkingpicker-app {
     width: 100%;
     height: auto;
-    background: transparent;
+    background: $surface;
     border: solid $foreground-muted;
     padding: 0 1;
     margin: 0;
@@ -1813,7 +1791,7 @@ NarratorStatus {
 .thinkingpicker-title {
     height: auto;
     text-style: bold;
-    color: $primary;
+    color: $foreground;
 }
 
 #thinkingpicker-options {
@@ -1834,15 +1812,12 @@ NarratorStatus {
     color: $text-muted;
     margin-top: 1;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 #loglevelpicker-app {
     width: 100%;
     height: auto;
-    background: transparent;
+    background: $surface;
     border: solid $foreground-muted;
     padding: 0 1;
     margin: 0;
@@ -1856,7 +1831,7 @@ NarratorStatus {
 .loglevelpicker-title {
     height: auto;
     text-style: bold;
-    color: $primary;
+    color: $foreground;
 }
 
 .loglevelpicker-subtitle {
@@ -1864,9 +1839,6 @@ NarratorStatus {
     color: $text-muted;
     margin-bottom: 1;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 #loglevelpicker-options {
@@ -1887,21 +1859,47 @@ NarratorStatus {
     margin-top: 1;
 }
 
+#loglevelpicker-discard {
+    width: 100%;
+    height: auto;
+}
+
+#loglevelpicker-discard NoMarkupStatic {
+    height: auto;
+    color: $warning;
+}
+
+#loglevelpicker-discard Button {
+    width: auto;
+    min-width: 0;
+    height: 1;
+    background: $surface;
+    border: none;
+    color: $foreground;
+    padding: 0 1;
+    margin-right: 1;
+}
+
+#loglevelpicker-discard Button:focus {
+    text-style: bold reverse;
+}
+
+#loglevelpicker-confirm-discard {
+    color: $error;
+}
+
 .loglevelpicker-help {
     width: 100%;
     height: auto;
     color: $text-muted;
     margin-top: 1;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 #themepicker-app {
     width: 100%;
     height: auto;
-    background: transparent;
+    background: $surface;
     border: solid $foreground-muted;
     padding: 0 1;
     margin: 0;
@@ -1915,7 +1913,7 @@ NarratorStatus {
 .themepicker-title {
     height: auto;
     text-style: bold;
-    color: $primary;
+    color: $foreground;
 }
 
 #themepicker-options {
@@ -1936,9 +1934,6 @@ NarratorStatus {
     color: $text-muted;
     margin-top: 1;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 .user-message.rewind-selected {
@@ -1956,7 +1951,7 @@ NarratorStatus {
 #rewind-app {
     width: 100%;
     height: auto;
-    background: transparent;
+    background: $surface;
     border: solid $foreground-muted;
     padding: 0 1;
     margin: 0;
@@ -1970,17 +1965,18 @@ NarratorStatus {
 .rewind-title {
     height: auto;
     text-style: bold;
-    color: $primary;
+    color: $foreground;
 }
 
 .rewind-option {
+    width: 100%;
     height: auto;
     color: $foreground;
 }
 
 .rewind-cursor-selected {
-    color: $primary;
-    text-style: bold;
+    color: $foreground;
+    text-style: bold reverse;
 }
 
 .rewind-option-unselected {
@@ -1991,9 +1987,60 @@ NarratorStatus {
     height: auto;
     color: $text-muted;
 
-    &:ansi {
-        text-style: dim;
+}
+
+/* Limit the complete task surface, including borders, titles and help, to half
+   the terminal height; the list/body scrolls within the remaining space. */
+#sessionpicker-app, #modelpicker-app, #thinkingpicker-app,
+#loglevelpicker-app, #themepicker-app, #rewind-app {
+    max-height: 50vh;
+}
+
+#sessionpicker-content, #modelpicker-content, #thinkingpicker-content,
+#loglevelpicker-content, #themepicker-content, #rewind-content,
+#mcp-content, #mcpoauth-content {
+    max-height: 100%;
+    overflow-y: auto;
+}
+
+#sessionpicker-options, #modelpicker-options, #thinkingpicker-options,
+#loglevelpicker-options, #themepicker-options, #mcp-options,
+#mcpoauth-options {
+    max-height: 7;
+}
+
+/* Textual's default block-cursor fill must not sit beneath reverse video. */
+#mcp-options, #mcpoauth-options, #modelpicker-options,
+#thinkingpicker-options, #loglevelpicker-options,
+#themepicker-options, #sessionpicker-options {
+    & > .option-list--option-highlighted {
+        background: transparent;
+        color: $foreground;
+        text-style: none;
     }
+    &:focus > .option-list--option-highlighted {
+        background: $foreground;
+        color: $surface;
+        text-style: bold;
+    }
+}
+
+#mcp-options:ansi:focus > .option-list--option-highlighted,
+#mcpoauth-options:ansi:focus > .option-list--option-highlighted,
+#modelpicker-options:ansi:focus > .option-list--option-highlighted,
+#thinkingpicker-options:ansi:focus > .option-list--option-highlighted,
+#loglevelpicker-options:ansi:focus > .option-list--option-highlighted,
+#themepicker-options:ansi:focus > .option-list--option-highlighted,
+#sessionpicker-options:ansi:focus > .option-list--option-highlighted {
+    background: $ansi-foreground;
+    color: $ansi-background;
+    text-style: bold;
+}
+
+.question-option-selected, .rewind-cursor-selected {
+    background: $foreground;
+    color: $surface;
+    text-style: bold;
 }
 
 .hook-system-message {
@@ -2036,9 +2083,6 @@ NarratorStatus {
     overflow: hidden;
     color: $text-muted;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 .hook-severity-ok .hook-system-icon {

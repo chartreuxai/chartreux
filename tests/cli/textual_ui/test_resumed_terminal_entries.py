@@ -125,7 +125,7 @@ async def test_resumed_completed_reasoning_starts_settled() -> None:
 
         assert not message._is_spinning
         assert message._spinner_timer is None
-        assert _text(message._indicator_widget) == "⏵"
+        assert _text(message._indicator_widget) == "+"
         assert _text(message._status_text_widget) == "Thought"
         assert message._stream is None
 
@@ -140,7 +140,7 @@ async def test_resumed_completed_reasoning_starts_settled() -> None:
                 output_text="transient output",
                 display=EffectResultDisplay(success=True, message="Done"),
             ),
-            "⏵",
+            "✓",
         ),
         (
             CancelledEffectState(
@@ -148,7 +148,7 @@ async def test_resumed_completed_reasoning_starts_settled() -> None:
                 output_text="transient output",
                 display=EffectResultDisplay(success=False, message="Cancelled"),
             ),
-            "⏵",
+            "□",
         ),
     ],
 )

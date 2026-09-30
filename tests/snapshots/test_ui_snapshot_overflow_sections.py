@@ -14,6 +14,7 @@ from chartreux.cli.textual_ui.widgets.tool_widgets import EditResultWidget
 from chartreux.core.events import ToolCallEvent, ToolResultEvent
 from chartreux.core.tools.builtins.edit import Edit, EditArgs, EditResult
 from tests.snapshots.snap_compare import SnapCompare
+from tests.snapshots.snapshot_event_loop import install_snapshot_wake
 from tests.stubs.app_server import CoreEventProjection
 
 
@@ -52,6 +53,9 @@ class _SnapshotApp(App):
 
     async def populate(self) -> None:
         raise NotImplementedError
+
+    async def on_load(self) -> None:
+        install_snapshot_wake()
 
 
 class EditResultApp(_SnapshotApp):

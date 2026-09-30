@@ -131,7 +131,7 @@ async def test_read_error_header_uses_settled_call_display() -> None:
         verb = result_widget.query_one(".collapsible-header-verb", NoMarkupStatic)
         message = result_widget.query_one(".status-indicator-text", NoMarkupStatic)
         assert _rendered(verb).plain == "Read"
-        assert _rendered(message).plain == file_path
+        assert _rendered(message).plain == f"Failed: {file_path}"
 
 
 @pytest.mark.asyncio
@@ -145,7 +145,7 @@ async def test_generic_error_header_uses_ran_fallback() -> None:
         verb = result_widget.query_one(".collapsible-header-verb", NoMarkupStatic)
         message = result_widget.query_one(".status-indicator-text", NoMarkupStatic)
         assert _rendered(verb).plain == "Ran"
-        assert _rendered(message).plain == "stub_tool(text='')"
+        assert _rendered(message).plain == "Failed: stub_tool(text='')"
 
 
 @pytest.mark.asyncio

@@ -104,9 +104,22 @@ class ScrubPolicy:
 
     @classmethod
     def from_config(cls, config: Any) -> ScrubPolicy:
+        snapshot = getattr(config, "catalog_snapshot", None)
+        catalog = getattr(snapshot, "catalog", None)
+        provider_names = (
+            frozenset(
+                provider.api_key_env_var
+                for provider in catalog.providers.values()
+                if provider.api_key_env_var
+            )
+            if catalog is not None
+            else frozenset()
+        )
         return cls(
             frozenset(config.credential_env_passthrough),
-            mcp_static_auth_env_names(config) | _configured_search_env_names(config),
+            provider_names
+            | mcp_static_auth_env_names(config)
+            | _configured_search_env_names(config),
             frozenset(
                 f"mcp-oauth:{server.name}:tokens"
                 for server in getattr(config, "mcp_servers", None) or ()

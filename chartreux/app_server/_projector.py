@@ -94,7 +94,6 @@ class EventProjector:
         self._effect_entries: dict[str, str] = {}
         self._checkpoint_entries: dict[str, str] = {}
         self._callback_entries: dict[str, str] = {}
-        self._fan_out_member_effects: set[str] = set()
 
     def project(
         self,
@@ -143,18 +142,6 @@ class EventProjector:
         self.session_id = session_id
         self.history = rebind_history(self.history, session_id)
         self._entries = {entry.id: entry for entry in self.history}
-
-    def start_fan_out_member_effect(
-        self, parent_tool_call_id: str, member_tool_call_id: str
-    ) -> ProjectedUpdate:
-        """Project a synthetic fan-out member as a separately linkable task effect."""
-        _entry_id, parent, _detail = self._subagent_effect(parent_tool_call_id)
-        self._fan_out_member_effects.add(member_tool_call_id)
-        return self.start_effect(
-            member_tool_call_id,
-            title=parent.title,
-            detail=parent.detail.model_copy(update={"child_session_id": None}),
-        )
 
     def link_subagent(
         self, tool_call_id: str, child_session_id: str
@@ -283,7 +270,6 @@ class EventProjector:
         )
 
     def complete_effect(self, entry_id: str, state: EffectState) -> ProjectedUpdate:
-        self._fan_out_member_effects.discard(entry_id)
         effect_id = self._effect_entries.get(entry_id)
         if effect_id is None:
             raise ValueError(f"Effect not found: {entry_id}")
@@ -405,9 +391,7 @@ class EventProjector:
     def finalize(self, *, cancelled: bool = False) -> list[ProjectedUpdate]:
         updates: list[ProjectedUpdate] = []
         for entry in list(self._entries.values()):
-            if entry.generation_status is PublicEntryGenerationStatus.COMPLETED or (
-                entry.id in self._fan_out_member_effects and not cancelled
-            ):
+            if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
                 continue
             operations: list[JsonPatchOperation] = []
             if isinstance(entry, PublicEffectEntry):

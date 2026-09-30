@@ -75,10 +75,11 @@ class TestBuildDiffLine:
             # "  10 - x = 1": the gutter is 5 chars, so "-" sits at index 5.
             assert any("$text-error" in s for s in _styles_at(content, 5))
 
-    def test_line_number_dimmed_uncolored_in_non_ansi(self) -> None:
+    def test_line_number_muted_uncolored_in_non_ansi(self) -> None:
         content = _build("x = 1", "-", 10, "py", ansi=False)
         styles = _styles_at(content, 0)
-        assert any("dim" in s and "$text-muted" in s for s in styles)
+        assert "$text-muted" in styles
+        assert all("dim" not in s for s in styles)
         assert all("$text-error" not in s for s in styles)
 
     def test_added_line_number_colored_undimmed_in_ansi(self) -> None:
@@ -102,10 +103,11 @@ class TestBuildDiffLine:
         assert all("bold" not in s for s in sign_styles)
         assert all("dim" not in s for s in sign_styles)
 
-    def test_line_number_dimmed_for_unchanged_rows_in_ansi(self) -> None:
+    def test_line_number_muted_for_unchanged_rows_in_ansi(self) -> None:
         content = _build("x = 1", " ", 10, "py", ansi=True)
         styles = _styles_at(content, 0)
-        assert any("dim" in s and "$text-muted" in s for s in styles)
+        assert "$text-muted" in styles
+        assert all("dim" not in s for s in styles)
 
     def test_removed_body_dimmed_in_ansi(self) -> None:
         content = _build("foo", "-", 10, "py", ansi=True)

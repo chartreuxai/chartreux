@@ -146,7 +146,7 @@ async def read_safe_async(
 ) -> ReadSafeResult:
     """Async :func:`read_safe` (``anyio``)."""
     raw = await anyio.Path(path).read_bytes()
-    return decode_safe(raw, raise_on_error=raise_on_error)
+    return await asyncio.to_thread(decode_safe, raw, raise_on_error=raise_on_error)
 
 
 class BoundedReadResult(NamedTuple):

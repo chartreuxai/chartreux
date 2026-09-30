@@ -80,12 +80,12 @@ def test_public_all_deployments_unavailable_maps_to_dedicated_acp_code() -> None
                 "base_model": "base",
                 "exclusions": [
                     {
-                        "provider": "test/first",
+                        "provider": "test-first",
                         "wire_name": "first",
                         "reason": "cooldown",
                     },
                     {
-                        "provider": "test/second",
+                        "provider": "test-second",
                         "wire_name": "second",
                         "reason": "cooldown",
                     },
@@ -101,7 +101,7 @@ def test_public_all_deployments_unavailable_maps_to_dedicated_acp_code() -> None
     assert error.data == {
         "base_model": "base",
         "exclusions": [
-            {"provider": "test/first", "wire_name": "first", "reason": "cooldown"},
-            {"provider": "test/second", "wire_name": "second", "reason": "cooldown"},
+            {"provider": "test-first", "wire_name": "first", "reason": "cooldown"},
+            {"provider": "test-second", "wire_name": "second", "reason": "cooldown"},
         ],
     }

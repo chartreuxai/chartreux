@@ -24,10 +24,17 @@ from chartreux.app_server.models import (
     UserQuestionResult,
     WorkspaceTrustDetails,
 )
-from chartreux.app_server.protocol import WorkspaceTrustStatusResponse
+from chartreux.app_server.protocol import (
+    AppServerResponseError,
+    ProtocolError,
+    ProtocolErrorCode,
+    WorkspaceTrustStatusResponse,
+)
 from chartreux.app_server.session import AppServerTurnError
 from chartreux.cli.textual_ui import startup
 from chartreux.cli.textual_ui.app import ChartreuxApp
+from chartreux.cli.textual_ui.screens.settings import SettingsScreen
+from chartreux.cli.textual_ui.widgets.agent_transcript import AgentTranscriptViewer
 from chartreux.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
 from chartreux.cli.textual_ui.widgets.context_progress import ContextProgress
 from chartreux.cli.textual_ui.widgets.loading import (
@@ -39,6 +46,7 @@ from chartreux.cli.textual_ui.widgets.messages import (
     ErrorMessage,
     ReasoningMessage,
     SlashCommandMessage,
+    UserCommandMessage,
     UserMessage,
 )
 from chartreux.cli.textual_ui.widgets.question_app import QuestionApp
@@ -88,13 +96,18 @@ def _turn_error(code: TurnErrorCode) -> AppServerTurnError:
 async def _wait_for_retry_error(app: ChartreuxApp, pilot) -> None:
     await _wait_until(
         pilot,
-        lambda: any("/retry" in str(error._error) for error in app.query(ErrorMessage)),
+        lambda: (
+            any("/retry" in str(error._error) for error in app.query(ErrorMessage))
+            and app.event_handler is not None
+            and app.event_handler._retry_presentation is not None
+        ),
     )
 
 
 @pytest.mark.asyncio
 async def test_question_callback_opens_from_public_protocol() -> None:
     app = MagicMock()
+    app._secondary_surface_active.return_value = False
     app._active_callback = None
     app._pending_local_question = None
     app._pending_callbacks = deque()
@@ -160,6 +173,7 @@ async def test_callback_claim_is_atomic_during_typing_debounce() -> None:
     )
     release = asyncio.Event()
     app._active_callback = None
+    app._secondary_surface_active.return_value = False
     app._pending_local_question = None
     app._pending_callbacks = deque()
     app._wait_for_typing_pause = AsyncMock(side_effect=release.wait)
@@ -225,6 +239,8 @@ async def test_answering_active_callback_opens_the_next_queued_callback() -> Non
         update={"id": "callback:callback-2", "callback_id": "callback-2"}
     )
     app._active_callback = first
+    app._callback_submitting = False
+    app._callback_delivery_uncertain = False
     app._pending_callbacks = deque([second])
     app.app_server.respond_to_callback = AsyncMock()
     app._show_callback = AsyncMock()
@@ -298,6 +314,7 @@ async def test_question_callback_replaces_loading_status_before_typing_pause() -
     loading = LoadingWidget(status=DEFAULT_LOADING_STATUS)
     release_typing_pause = asyncio.Event()
     app._active_callback = None
+    app._secondary_surface_active.return_value = False
     app._pending_local_question = None
     app._pending_callbacks = deque()
     app._loading_widget = loading
@@ -323,6 +340,8 @@ async def test_answering_final_callback_restores_loading_progress() -> None:
     loading = LoadingWidget(status="Running command")
     loading.begin_action_required("Input required")
     app._active_callback = callback
+    app._callback_submitting = False
+    app._callback_delivery_uncertain = False
     app._pending_callbacks = deque()
     app._loading_widget = loading
     app.app_server.respond_to_callback = AsyncMock()
@@ -336,6 +355,120 @@ async def test_answering_final_callback_restores_loading_progress() -> None:
     assert loading.base_status == "Running command"
     assert loading._pause_start is None
     app._switch_to_input_app.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_local_question_waits_for_settings_draft_to_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
+
+    async def preview_candidate(self: FakeConfigOrchestrator):
+        return SimpleNamespace(config=self.config)
+
+    monkeypatch.setattr(FakeConfigOrchestrator, "preview_candidate", preview_candidate)
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        await app._show_settings()
+        await _wait_until(pilot, lambda: isinstance(app.screen, SettingsScreen))
+        screen = app.screen
+        request = _question_callback("local-settings").detail.request
+        task = asyncio.create_task(app._request_local_user_input(request))
+        await _wait_until(
+            pilot,
+            lambda: (
+                bool(screen.query("#settings-pending-action"))
+                and screen.query_one("#settings-pending-action").display
+            ),
+        )
+        assert app.screen is screen
+        assert not app.query(QuestionApp)
+        await pilot.press("escape")
+        await _wait_until(pilot, lambda: bool(app.query(QuestionApp)))
+        app.query_one(QuestionApp).action_cancel()
+        assert (await task).cancelled
+
+
+@pytest.mark.asyncio
+async def test_settings_defers_incoming_decision_without_replacing_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
+
+    async def preview_candidate(self: FakeConfigOrchestrator):
+        return SimpleNamespace(config=self.config)
+
+    monkeypatch.setattr(FakeConfigOrchestrator, "preview_candidate", preview_candidate)
+    app = build_test_chartreux_app()
+    callback = _question_callback("callback-settings")
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app._session_ready.wait()
+        await app._show_settings()
+        await _wait_until(pilot, lambda: isinstance(app.screen, SettingsScreen))
+        screen = app.screen
+        assert isinstance(screen, SettingsScreen)
+        await pilot.press("m", "o", "d", "e", "l")
+        await pilot.pause()
+        draft = screen._filter
+        await app._handle_turn_event(CallbackRequested(callback))
+        await pilot.pause()
+        assert app.screen is screen
+        assert screen._filter == draft
+        assert screen.query_one("#settings-pending-action").display
+        assert not app.query(QuestionApp)
+        await pilot.press("escape", "escape")
+        await _wait_until(pilot, lambda: app._active_callback is callback)
+        assert app.query(QuestionApp)
+        response = AsyncMock()
+        monkeypatch.setattr(app.app_server, "respond_to_callback", response)
+        await app._respond_to_active_callback(
+            UserInputCallbackOutput(
+                result=UserQuestionResult(
+                    answers=[UserAnswer(question="Ship it?", answer="No")],
+                    cancelled=False,
+                )
+            )
+        )
+        response.assert_awaited_once()
+        assert app._active_callback is None
+
+
+@pytest.mark.asyncio
+async def test_transcript_defers_incoming_decision_until_close() -> None:
+    from chartreux.app_server.events import AgentsUpdate
+    from chartreux.app_server.protocol import (
+        AgentSummaryModel,
+        AgentTranscriptGetResponse,
+        AgentTranscriptState,
+    )
+
+    app = build_test_chartreux_app()
+    callback = _question_callback("callback-agent")
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        app.app_server.resources.sessions.read_agent_transcript = AsyncMock(
+            return_value=AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+            )
+        )
+        await app._handle_turn_event(
+            AgentsUpdate([
+                AgentSummaryModel(agent_id="one", profile="worker", availability="idle")
+            ])
+        )
+        await pilot.press("ctrl+shift+a", "down", "enter")
+        await _wait_until(pilot, lambda: bool(app.query(AgentTranscriptViewer)))
+        await app._handle_turn_event(CallbackRequested(callback))
+        assert app.query_one("#agent-transcript-pending-action").display
+        assert app._active_callback is None
+        await pilot.press("escape")
+        await _wait_until(pilot, lambda: app._active_callback is callback)
+        assert app.query(QuestionApp)
 
 
 @pytest.mark.asyncio
@@ -906,3 +1039,199 @@ async def test_retry_command_keeps_diagnostics_until_retry_progress() -> None:
         ]
         assert len(app.query(ErrorMessage)) == 2
         assert len(app.query(SlashCommandMessage)) == 1
+
+
+@pytest.mark.asyncio
+async def test_dirty_proxy_preserved_until_ordered_decisions_present() -> None:
+    from chartreux.cli.textual_ui.widgets.proxy_setup_app import ProxySetupApp
+
+    app = build_test_chartreux_app()
+    first = _question_callback("proxy-first")
+    second = _question_callback("proxy-second")
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        await app._show_proxy_setup()
+        proxy = app.query_one(ProxySetupApp)
+        field = next(iter(proxy.inputs.values()))
+        field.value = "http://dirty.example"
+        await app._handle_turn_event(CallbackRequested(first))
+        await app._handle_turn_event(CallbackRequested(first))
+        await app._handle_turn_event(CallbackRequested(second))
+        assert app.query_one(ProxySetupApp) is proxy
+        assert field.value == "http://dirty.example"
+        assert app.query_one("#bottom-pending-action").display
+        assert [item.callback_id for item in app._pending_callbacks] == [
+            "proxy-first",
+            "proxy-second",
+        ]
+        proxy.post_message(ProxySetupApp.ProxySetupClosed(saved=False))
+        await _wait_until(pilot, lambda: app._active_callback is first)
+        assert not app.query(ProxySetupApp)
+        assert app.query_one(QuestionApp).args is first.detail.request
+        assert [item.callback_id for item in app._pending_callbacks] == ["proxy-second"]
+
+
+@pytest.mark.asyncio
+async def test_proxy_apply_waits_for_one_production_write_and_blocks_cancel() -> None:
+    from textual.widgets import Button
+
+    from chartreux.cli.textual_ui.widgets.proxy_setup_app import ProxySetupApp
+
+    app = build_test_chartreux_app()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_update(_changes: dict[str, str | None]) -> None:
+        started.set()
+        await release.wait()
+
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        await app._show_proxy_setup()
+        proxy = app.query_one(ProxySetupApp)
+        next(iter(proxy.inputs.values())).value = "http://proxy.example"
+        update = AsyncMock(side_effect=slow_update)
+        app.app_server.resources.config.update_proxy = update
+
+        proxy._save_and_close()
+        await asyncio.wait_for(started.wait(), timeout=2)
+        assert proxy.query_one("#proxysetup-save", Button).disabled
+        assert proxy.query_one("#proxysetup-cancel", Button).disabled
+        proxy._save_and_close()
+        proxy.action_close()
+        proxy.post_message(ProxySetupApp.ProxySetupClosed(saved=False))
+        await asyncio.sleep(0)
+        assert app.query_one(ProxySetupApp) is proxy
+        assert update.await_count == 1
+
+        release.set()
+        await _wait_until(pilot, lambda: not app.query(ProxySetupApp))
+        assert update.await_count == 1
+        assert not any(
+            "Proxy setup cancelled" in str(message._content)
+            for message in app.query(UserCommandMessage)
+        )
+
+
+@pytest.mark.asyncio
+async def test_question_focus_hides_global_loading_shortcuts() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        await app._handle_turn_event(CallbackRequested(_question_callback("hints")))
+        await _wait_until(pilot, lambda: bool(app.query(QuestionApp)))
+        loading = app.query_one(LoadingWidget)
+        assert loading.hint_widget is not None
+        assert not loading.hint_widget.display
+
+        await app._switch_to_input_app()
+        assert loading.hint_widget.display
+
+
+@pytest.mark.asyncio
+async def test_inspection_rejected_while_question_draft_is_visible() -> None:
+    from chartreux.app_server.events import AgentsUpdate
+    from chartreux.app_server.protocol import AgentSummaryModel
+
+    app = build_test_chartreux_app()
+    callback = _question_callback("inspection")
+    async with app.run_test():
+        await app._handle_turn_event(
+            AgentsUpdate([
+                AgentSummaryModel(agent_id="one", profile="worker", availability="idle")
+            ])
+        )
+        await app._handle_turn_event(CallbackRequested(callback))
+        question = app.query_one(QuestionApp)
+        question.selected_option = 1
+        await app.action_toggle_agent_browser()
+        app._submit_agent_selection("one")
+        assert app.query_one(QuestionApp) is question
+        assert question.selected_option == 1
+        assert not app.query(AgentTranscriptViewer)
+        assert any(
+            "Finish or cancel this question first" in str(item._content)
+            for item in app.query(UserCommandMessage)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uncertain", [False, True])
+async def test_callback_failure_retains_draft_and_blocks_uncertain_resend(
+    uncertain: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from chartreux.app_server import AppServerConnectionClosed
+
+    app = build_test_chartreux_app()
+    callback = _question_callback("failed-answer")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    failure = (
+        AppServerConnectionClosed("disconnected")
+        if uncertain
+        else AppServerResponseError(
+            ProtocolError(code=ProtocolErrorCode.INVALID_PARAMS, message="rejected")
+        )
+    )
+
+    async def respond(*_args: object) -> None:
+        entered.set()
+        await release.wait()
+        raise failure
+
+    async with app.run_test():
+        response = AsyncMock(side_effect=respond)
+        monkeypatch.setattr(app.app_server, "respond_to_callback", response)
+        await app._handle_turn_event(CallbackRequested(callback))
+        question = app.query_one(QuestionApp)
+        question.selected_option = 1
+        answer = UserInputCallbackOutput(
+            result=UserQuestionResult(
+                answers=[UserAnswer(question="Ship it?", answer="No")], cancelled=False
+            )
+        )
+        submitting = asyncio.create_task(app._respond_to_active_callback(answer))
+        await entered.wait()
+        await app._respond_to_active_callback(answer)
+        assert response.await_count == 1
+        release.set()
+        await submitting
+        assert app._active_callback is callback
+        assert app.query_one(QuestionApp) is question
+        assert question.selected_option == 1
+        assert question._submission_status is not None
+        assert ("Warning:" if uncertain else "Failed:") in question._submission_status
+        if uncertain:
+            await app._respond_to_active_callback(answer)
+            assert response.await_count == 1
+        else:
+            monkeypatch.setattr(app.app_server, "respond_to_callback", AsyncMock())
+            await app._respond_to_active_callback(answer)
+            assert app._active_callback is None
+
+
+def test_retry_and_empty_mcp_copy_and_availability() -> None:
+    from chartreux.cli.commands import CommandContext, CommandRegistry
+
+    registry = CommandRegistry()
+    assert not registry.has_command("retry")
+    registry.refresh(CommandContext(retry_available=True))
+    assert registry.has_command("retry")
+    assert "new turn" in registry.get_help_text()
+    assert "new turn" in ChartreuxApp._retry_hint()
+    assert "may repeat" in build_retry_prompt("")
+
+
+@pytest.mark.asyncio
+async def test_empty_mcp_and_agents_show_supported_next_action() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test():
+        app.app_server.resources.mcp.read = AsyncMock(
+            return_value=MagicMock(sources=[], statuses={})
+        )
+        await app._show_mcp()
+        await app._show_mcp_status()
+        await app.action_toggle_agent_browser()
+        messages = [str(message._content) for message in app.query(UserCommandMessage)]
+        assert sum("/mcp add <url>" in text for text in messages) == 2
+        assert any("No background agents" in text for text in messages)

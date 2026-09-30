@@ -8,7 +8,8 @@ from chartreux.agents import AgentSafety, AgentType
 from chartreux.core.agents.launch import FrozenPersona, resolve_launch
 from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
-from chartreux.core.config.models import ModelConfig, ProviderConfig
+from chartreux.core.config.layers.overrides import OverridesLayer
+from chartreux.core.config.models import ModelConfig, ProviderConfig, ThinkingLevel
 from chartreux.core.llm_models import Backend, LLMMessage, Role
 from chartreux.core.model_catalog.schema import RoleDefinition
 from chartreux.core.session_types import CommittedModelIdentity
@@ -86,10 +87,11 @@ def resolve(
     launch: LaunchConfig | None = None,
     **kwargs: Any,
 ):
+    parent_orchestrator = kwargs.pop("parent_orchestrator", None)
     return resolve_launch(
         profile_name="worker",
         config=launch,
-        parent_orchestrator=FakeConfigOrchestrator(config),
+        parent_orchestrator=parent_orchestrator or FakeConfigOrchestrator(config),
         tool_inventory={"bash": object(), "read_file": object()},
         profile_lookup=lambda _: profile,
         **kwargs,
@@ -97,13 +99,27 @@ def resolve(
 
 
 def _with_role(
-    config: ChartreuxConfigSchema, name: str, models: tuple[str, ...]
+    config: ChartreuxConfigSchema,
+    name: str,
+    models: tuple[str, ...],
+    thinking: ThinkingLevel | None = None,
 ) -> ChartreuxConfigSchema:
     assert config.catalog_snapshot is not None
+    assert len(models) == 1
+    model = models[0]
     config.attach_catalog_snapshot(
         config.catalog_snapshot.__class__(
             config.catalog_snapshot.catalog.model_copy(
-                update={"roles": {name: RoleDefinition(models=models)}}
+                update={
+                    "roles": {
+                        **config.catalog_snapshot.catalog.roles,
+                        name: RoleDefinition(
+                            model=model,
+                            thinking=thinking
+                            or ("high" if model == "large" else "off"),
+                        ),
+                    }
+                }
             ),
             config.catalog_snapshot.revision,
         )
@@ -202,6 +218,27 @@ def test_unknown_and_disallowed_catalog_models_are_typed(
             profile,
             LaunchConfig(model="large"),
         )
+
+
+def test_task_launch_unknown_model_lists_canonical_choices(
+    config: ChartreuxConfigSchema, profile: AgentProfile
+) -> None:
+    with pytest.raises(InvalidLaunchModelError) as raised:
+        resolve(config, profile, LaunchConfig(model="luna"))
+    assert raised.value.field == "config.model"
+    assert "Unknown model expression 'luna'" in str(raised.value)
+    assert "Valid canonical models: glm-5-3, large, small" in str(raised.value)
+
+    config = _with_role(config, "specialist", ("small",))
+    with pytest.raises(InvalidLaunchModelError) as raised:
+        resolve(config, profile, LaunchConfig(model="@luna"))
+    assert "@specialist" in str(raised.value)
+
+
+def test_launch_model_schema_describes_accepted_expression() -> None:
+    assert LaunchConfig.model_json_schema()["properties"]["model"]["description"] == (
+        "canonical model name or `@role`"
+    )
 
 
 def test_thinking_validation_honors_catalog_declaration(
@@ -329,14 +366,16 @@ def test_child_launch_inherits_parent_committed_deployment(
 ) -> None:
     parent_identity = CommittedModelIdentity(
         base_model="large",
-        provider="provider/default",
+        provider="provider",
         wire_name="large",
         catalog_revision="test-fixture",
     )
 
     candidate = resolve(config, profile, committed_model=parent_identity)
 
-    assert candidate.committed_model == parent_identity
+    assert candidate.committed_model.base_model == parent_identity.base_model
+    assert candidate.committed_model.provider == parent_identity.provider
+    assert candidate.committed_model.thinking == "high"
     assert candidate.effective_model.name == "large"
 
 
@@ -346,7 +385,7 @@ def test_new_child_profile_role_beats_parent_committed_identity(
     config = _with_role(config, "specialist", ("small",))
     parent_identity = CommittedModelIdentity(
         base_model="large",
-        provider="provider/default",
+        provider="provider",
         wire_name="large",
         catalog_revision="test-fixture",
     )
@@ -373,14 +412,14 @@ def test_new_child_profile_role_beats_parent_committed_identity(
 def test_default_profile_role_beats_parent_committed_identity(
     config: ChartreuxConfigSchema, profile: AgentProfile
 ) -> None:
-    config = _with_role(config, "small-worker", ("small",))
+    config = _with_role(config, "small", ("small",))
     parent_identity = CommittedModelIdentity(
         base_model="large",
-        provider="provider/default",
+        provider="provider",
         wire_name="large",
         catalog_revision="test-fixture",
     )
-    default_worker = AgentProfile(**{**profile.__dict__, "role": "small-worker"})
+    default_worker = AgentProfile(**{**profile.__dict__, "role": "small"})
 
     candidate = resolve_launch(
         profile_name=None,
@@ -391,7 +430,7 @@ def test_default_profile_role_beats_parent_committed_identity(
         committed_model=parent_identity,
     )
 
-    assert candidate.orchestrator.config.active_model == "@small-worker"
+    assert candidate.orchestrator.config.active_model == "@small"
     assert candidate.effective_model.alias == "small"
     assert candidate.committed_model.base_model == "small"
 
@@ -405,6 +444,58 @@ def test_role_launch_thinking_uses_resolved_base_override(
 
     assert candidate.effective_model.alias == "large"
     assert candidate.effective_thinking == "high"
+
+
+def test_shared_model_roles_keep_distinct_thinking_and_explicit_override(
+    config: ChartreuxConfigSchema, profile: AgentProfile
+) -> None:
+    _with_role(config, "brief", ("small",), "off")
+    _with_role(config, "deep", ("small",), "high")
+    parent = FakeConfigOrchestrator(config)
+    parent.insert_layer(
+        OverridesLayer(data={"thinking_overrides": {"small": "low"}}), 0
+    )
+    parent.rebuild()
+
+    brief = resolve(
+        config, profile, LaunchConfig(model="@brief"), parent_orchestrator=parent
+    )
+    deep = resolve(
+        config, profile, LaunchConfig(model="@deep"), parent_orchestrator=parent
+    )
+    explicit = resolve(
+        config,
+        profile,
+        LaunchConfig(model="@brief", thinking="high"),
+        parent_orchestrator=parent,
+    )
+
+    assert (brief.effective_thinking, deep.effective_thinking) == ("off", "high")
+    assert (brief.committed_model.thinking, deep.committed_model.thinking) == (
+        "off",
+        "high",
+    )
+    assert brief.orchestrator.config.get_active_model().thinking == "off"
+    assert deep.orchestrator.config.get_active_model().thinking == "high"
+    assert explicit.effective_thinking == "high"
+    assert explicit.committed_model.thinking == "high"
+    assert explicit.orchestrator.config.get_active_model().thinking == "high"
+
+
+def test_explicit_thinking_can_repair_unavailable_preset_level_for_spawn(
+    config: ChartreuxConfigSchema, profile: AgentProfile
+) -> None:
+    _with_role(config, "unavailable", ("small",), "max")
+
+    with pytest.raises(InvalidLaunchModelError, match="thinking"):
+        resolve(config, profile, LaunchConfig(model="@unavailable"))
+
+    repaired = resolve(
+        config, profile, LaunchConfig(model="@unavailable", thinking="high")
+    )
+    assert repaired.effective_thinking == "high"
+    assert repaired.committed_model.thinking == "high"
+    assert repaired.orchestrator.config.get_active_model().thinking == "high"
 
 
 def test_missing_profile_is_typed(config: ChartreuxConfigSchema) -> None:

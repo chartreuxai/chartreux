@@ -12,7 +12,7 @@ from textual.widgets import OptionList
 from textual.widgets.option_list import Option
 
 from chartreux.cli.textual_ui.constants import UNPINNED_ACTIVE_MODEL
-from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
+from chartreux.ui.shortcut_hints import rich_theme_style, shortcut, shortcut_hint
 from chartreux.ui.widgets.navigable_option_list import NavigableOptionList
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
@@ -29,13 +29,16 @@ class ModelOption:
     display_name: str
 
 
-def _build_option_text(label: str, is_current: bool, *, hint: str = "") -> Text:
+def _build_option_text(
+    label: str, is_current: bool, *, hint: str = "", muted_style: str = ""
+) -> Text:
     text = Text(no_wrap=True)
-    marker = "› " if is_current else "  "
-    text.append(marker, style="green" if is_current else "")
-    text.append(label, style="bold" if is_current else "")
+    text.append("  ")
+    text.append(label)
+    if is_current:
+        text.append("  This session", style=muted_style)
     if hint:
-        text.append(f"  {hint}", style="dim")
+        text.append(f"  {hint}", style=muted_style)
     return text
 
 
@@ -70,6 +73,7 @@ class ModelPickerApp(Container):
         self._current_model = current_model
         self._is_pinned = is_pinned
         self._default_display_name = default_display_name
+        self._selection_pending = False
 
     def _is_alias_current(self, alias: str) -> bool:
         return self._is_pinned and alias == self._current_model
@@ -81,13 +85,20 @@ class ModelPickerApp(Container):
                     "Default",
                     not self._is_pinned,
                     hint=f"(currently {self._default_display_name})",
+                    muted_style=rich_theme_style(
+                        self.app.theme_variables["text-muted"]
+                    ),
                 ),
                 id=DEFAULT_OPTION_ID,
             ),
             *(
                 Option(
                     _build_option_text(
-                        model.display_name, self._is_alias_current(model.alias)
+                        model.display_name,
+                        self._is_alias_current(model.alias),
+                        muted_style=rich_theme_style(
+                            self.app.theme_variables["text-muted"]
+                        ),
                     ),
                     id=model.alias,
                 )
@@ -95,11 +106,16 @@ class ModelPickerApp(Container):
             ),
         ]
         with Vertical(id="modelpicker-content"):
-            yield NoMarkupStatic("Select Model", classes="modelpicker-title")
+            yield NoMarkupStatic("Model for this session", classes="modelpicker-title")
             yield NavigableOptionList(*options, id="modelpicker-options")
+            error = NoMarkupStatic(
+                "", id="modelpicker-error", classes="modelpicker-help"
+            )
+            error.display = False
+            yield error
             yield NoMarkupStatic(
                 shortcut_hint(
-                    f"{shortcut('↑↓/jk')} Navigate  {shortcut('Enter')} Select  "
+                    f"{shortcut('↑↓/jk')} Navigate  {shortcut('Enter')} Apply  "
                     f"{shortcut('Esc')} Cancel"
                 ),
                 classes="modelpicker-help",
@@ -118,8 +134,9 @@ class ModelPickerApp(Container):
         option_list.focus()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        if not event.option.id:
+        if not event.option.id or self._selection_pending:
             return
+        self._selection_pending = True
         alias = (
             UNPINNED_ACTIVE_MODEL
             if event.option.id == DEFAULT_OPTION_ID
@@ -129,3 +146,13 @@ class ModelPickerApp(Container):
 
     def action_cancel(self) -> None:
         self.post_message(self.Cancelled())
+
+    def show_error(self, message: str) -> None:
+        self._selection_pending = False
+        error = self.query_one("#modelpicker-error", NoMarkupStatic)
+        error.update(message)
+        error.display = True
+        self.query_one(OptionList).focus()
+
+    def clear_error(self) -> None:
+        self.query_one("#modelpicker-error", NoMarkupStatic).display = False

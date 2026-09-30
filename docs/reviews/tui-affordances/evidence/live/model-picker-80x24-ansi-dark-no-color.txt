@@ -1,0 +1,24 @@
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ Select Model                                                                 │
+│    Default  (currently Devstral)                                             │
+│    Mistral Large                                                             │
+│    Devstral  Active                                                          │
+│    Codestral                                                                 │
+│                                                                              │
+│ ↑↓/jk Navigate  Enter Select  Esc Cancel                                     │
+└──────────────────────────────────────────────────────────────────────────────┘

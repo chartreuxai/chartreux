@@ -237,12 +237,14 @@ class _SwappableConfigSource:
 
     def __init__(self, getter: Callable[[], ChartreuxConfigSchema]) -> None:
         self._getter = getter
+        self.live = False
 
     def get(self) -> ChartreuxConfigSchema:
         return self._getter()
 
     def point_to(self, getter: Callable[[], ChartreuxConfigSchema]) -> None:
         self._getter = getter
+        self.live = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -471,11 +473,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if self.committed_model is None and config.catalog_snapshot is not None:
             from chartreux.core.model_catalog.resolver import resolver_for
 
-            selection = config.active_model or config.resolve_default_model_alias()
-            self.committed_model = (
-                resolver_for(config)
-                .resolve(selection, allowed_models=config.allowed_models)
-                .identity
+            selection = config.active_model or "@orchestrator"
+            resolved = resolver_for(config).resolve(
+                selection, allowed_models=config.allowed_models
+            )
+            self.committed_model = resolved.identity.model_copy(
+                update={"thinking": config.get_active_model().thinking}
             )
         if self.committed_model is not None:
             config.attach_committed_model(self.committed_model)
@@ -484,6 +487,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             mcp_registry=self.mcp_registry,
             defer_mcp=True,
             restriction_getter=lambda: self.config_orchestrator.restrictions,
+            accepted_token_getter=lambda: self.config_orchestrator.accepted_token,
             inherited_restrictions=self._inherited_restrictions,
             inherited_workspace=self._inherited_workspace,
             inherited_plan_write_scopes=self._inherited_plan_write_scopes,
@@ -995,6 +999,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             harness_files=self.harness_files,
             tool_manager=tool_manager or self.tool_manager,
             role_instructions=self.frozen_instructions,
+            is_subagent=self.frozen_system_prompt_id is not None,
         )
 
     def _build_system_prompt(self) -> str:
@@ -1106,6 +1111,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 defer_mcp=True,
                 discovery_source=self.tool_manager,
                 restriction_getter=lambda: self.config_orchestrator.restrictions,
+                accepted_token_getter=lambda: (
+                    self.config_orchestrator.accepted_token
+                    if config_source.live
+                    else None
+                ),
                 inherited_restrictions=self._inherited_restrictions,
                 inherited_workspace=self._inherited_workspace,
                 inherited_plan_write_scopes=self._inherited_plan_write_scopes,
@@ -2940,10 +2950,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     )
 
                 previous_identity = self.committed_model
+                failover_identity = resolved.identity.model_copy(
+                    update={"thinking": self.config.get_active_model().thinking}
+                )
 
                 def transcript_sink(
                     outcome: TranscriptAppend,
-                    identity: CommittedModelIdentity = resolved.identity,
+                    identity: CommittedModelIdentity = failover_identity,
                 ) -> None:
                     self._append_transcript(replace(outcome, committed_model=identity))
 
@@ -2953,7 +2966,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     publication = self._backend_lifetime.publish_reversible(replacement)
                     attempted.add(provider_name)
                     providers_used.append(provider_name)
-                    self.committed_model = resolved.identity
+                    self.committed_model = failover_identity
                     self.config.attach_committed_model(self.committed_model)
                     with self._backend_lifetime.borrow() as backend:
                         resources = self._call_resources(backend)
@@ -3661,6 +3674,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             defer_mcp=True,
             discovery_source=previous_manager,
             restriction_getter=lambda: authority().restrictions,
+            accepted_token_getter=lambda: authority().accepted_token,
             inherited_restrictions=inherited,
             inherited_workspace=inherited_workspace,
             inherited_plan_write_scopes=self._inherited_plan_write_scopes,
@@ -3734,13 +3748,37 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             resolved = resolver_for(target_config).resolve_committed(
                 self.committed_model, allowed_models=target_config.allowed_models
             )
-            target_config.attach_committed_model(resolved.identity)
+            target_config.attach_committed_model(
+                resolved.identity.model_copy(
+                    update={
+                        "thinking": self._thinking_for_committed_reload(
+                            target_config, resolved.identity
+                        )
+                    }
+                )
+            )
         # Load both configured prompts before any runtime mutation or client IO.
         _ = target_config.system_prompt, target_config.compaction_prompt
         # The candidate trust policy is carried by the backend being prepared.
         return self._prepare_reload_consumers(
             target_config, reload_hooks, mcp_registry=mcp_registry
         )
+
+    def _thinking_for_committed_reload(
+        self, config: ChartreuxConfigSchema, identity: CommittedModelIdentity
+    ) -> str:
+        override = config.thinking_overrides.get(identity.base_model)
+        if override is not None:
+            return override
+        if self._is_subagent and identity.thinking is not None:
+            return identity.thinking
+        catalog = config.catalog_snapshot.catalog
+        selection = config.active_model or "@orchestrator"
+        if selection.startswith("@"):
+            role = catalog.roles.get(selection[1:])
+            if role is not None and role.model == identity.base_model:
+                return role.thinking
+        return catalog.models[identity.base_model].thinking
 
     def _prepare_reload_consumers(
         self,
@@ -3761,6 +3799,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             defer_mcp=discovery_source is not None,
             discovery_source=discovery_source,
             restriction_getter=lambda: self.config_orchestrator.restrictions,
+            accepted_token_getter=lambda: (
+                self.config_orchestrator.accepted_token if config_source.live else None
+            ),
             inherited_restrictions=self._inherited_restrictions,
             inherited_workspace=self._inherited_workspace,
             inherited_plan_write_scopes=self._inherited_plan_write_scopes,
@@ -3815,7 +3856,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         ):
             identity = resolver.resolve_committed(
                 self.committed_model, allowed_models=prepared.config.allowed_models
-            ).identity
+            ).identity.model_copy(
+                update={
+                    "thinking": self._thinking_for_committed_reload(
+                        prepared.config, self.committed_model
+                    )
+                }
+            )
         elif (
             self.committed_model is None
             and self._model_choice_pending()
@@ -3827,10 +3874,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             identity = None
         else:
             identity = resolver.resolve(
-                prepared.config.active_model
-                or prepared.config.resolve_default_model_alias(),
+                prepared.config.active_model or "@orchestrator",
                 allowed_models=prepared.config.allowed_models,
-            ).identity
+            ).identity.model_copy(
+                update={"thinking": prepared.config.get_active_model().thinking}
+            )
         prepared.config.attach_committed_model(identity)
         # Finish fallible rendering and hook construction before retiring authority
         # or replacing any runtime object. A failed candidate leaves the old loop live.

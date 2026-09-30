@@ -28,7 +28,7 @@ from chartreux.core.model_catalog.migration import (
 )
 from chartreux.setup.auth.api_key_persistence import apply_provider_to_config
 
-_LEGACY = b"""active_model = "friendly"\ncompaction_model = "friendly"\ntheme = "dark"\n[thinking_overrides]\nfriendly = "low"\n[[providers]]\nname = "test"\napi_base = "https://example.test/v1"\napi_key_env_var = "TEST_API_KEY"\n[[models]]\nname = "base"\nprovider = "test"\nalias = "friendly"\ntemperature = 0.3\nthinking = "low"\n"""
+_LEGACY = b"""compaction_model = "friendly"\ntheme = "dark"\n[[providers]]\nname = "test"\napi_base = "https://example.test/v1"\napi_key_env_var = "TEST_API_KEY"\n[[models]]\nname = "base"\nprovider = "test"\nalias = "friendly"\ntemperature = 0.3\nthinking = "low"\n"""
 
 # These provider and model fields are emitted by main's create_default_config(),
 # including the empty Vertex-era provider values.
@@ -82,7 +82,18 @@ def test_migration_preview_makes_no_changes_and_shows_plan(
     assert "Preview: would write" in capsys.readouterr().out
 
 
-def test_migration_apply_round_trip_writes_catalog_and_canonicalizes_selections(
+def test_migration_reports_slash_provider_as_migration_error(tmp_path: Path) -> None:
+    config, catalog = _paths(tmp_path)
+    config.write_bytes(_LEGACY.replace(b'name = "test"', b'name = "test/local"'))
+
+    with pytest.raises(
+        MigrationError, match="Invalid legacy provider name 'test/local'"
+    ):
+        plan_migration(config, catalog)
+    assert not catalog.exists()
+
+
+def test_migration_apply_round_trip_writes_catalog_and_canonicalizes_compaction_model(
     tmp_path: Path,
 ) -> None:
     config, catalog = _paths(tmp_path)
@@ -91,16 +102,13 @@ def test_migration_apply_round_trip_writes_catalog_and_canonicalizes_selections(
     apply_migration(plan_migration(config, catalog))
 
     migrated = tomllib.loads(catalog.read_text())
-    assert (
-        migrated["providers"]["test/default"]["api_base"] == "https://example.test/v1"
-    )
+    assert migrated["providers"]["test"]["api_base"] == "https://example.test/v1"
     assert "aliases" not in migrated["models"]["base"]
     assert migrated["models"]["base"]["deployments"][0]["name"] == "base"
     cleaned = config.read_text()
     assert "providers" not in cleaned and "[[models]]" not in cleaned
-    assert 'active_model = "base"' in cleaned
     assert 'compaction_model = "base"' in cleaned
-    assert 'base = "low"' in cleaned
+    assert "thinking_overrides" not in cleaned
 
 
 def test_migration_canonicalizes_exact_aliases_in_allowed_models(
@@ -138,7 +146,8 @@ def test_migration_tags_only_config_migrates_tags_to_roles(tmp_path: Path) -> No
 
     assert tomllib.loads(catalog.read_text())["roles"]["worker"] == {
         "description": "",
-        "models": ["glm-5-3"],
+        "model": "glm-5-3",
+        "thinking": "high",
     }
     assert "tags" not in tomllib.loads(config.read_text())
 
@@ -148,7 +157,6 @@ def test_migration_warns_about_retargeted_references_and_orphaned_preserved_tabl
 ) -> None:
     config, catalog = _paths(tmp_path)
     config.write_text(
-        'active_model = "glm-5-2"\n'
         "[tags]\n"
         'worker = ["glm-5-2"]\n'
         "[[providers]]\n"
@@ -163,36 +171,51 @@ def test_migration_warns_about_retargeted_references_and_orphaned_preserved_tabl
     plan = plan_migration(config, catalog)
 
     assert plan.warnings == (
-        "active_model selection 'glm-5-2' was retargeted to 'glm-5-3'.",
         "role 'worker' member 'glm-5-2' was retargeted to 'glm-5-3'.",
         "Preserved user model table 'glm-5-2' is no longer referenced after canonicalization.",
     )
 
 
-def test_migration_preserves_user_owned_gpt_56_terra_selection(tmp_path: Path) -> None:
+def test_migration_rejects_persisted_active_model_without_writing(
+    tmp_path: Path,
+) -> None:
     config, catalog = _paths(tmp_path)
-    # Keep the legacy name split so the repo-wide model-name grep audit stays clean.
-    legacy_name = "gpt-5." + "6-terra"
-    config.write_text(
-        f'active_model = "{legacy_name}"\n'
-        "[[providers]]\n"
-        'name = "test"\n'
-        'api_base = "https://example.test/v1"\n'
-        f'[models."{legacy_name}"]\n'
-        f'name = "{legacy_name}"\n'
-        'provider = "test"\n'
-    )
+    config.write_bytes(_LEGACY.replace(b"compaction_model", b"active_model"))
+    original = config.read_bytes()
 
-    plan = plan_migration(config, catalog)
+    with pytest.raises(MigrationError, match="Persisted active_model selections"):
+        plan_migration(config, catalog)
 
-    assert tomllib.loads(plan.cleaned_config.decode())["active_model"] == legacy_name
-    assert legacy_name in plan.catalog["models"]
-    assert plan.warnings == ()
+    assert config.read_bytes() == original
+    assert not catalog.exists()
 
-    apply_migration(plan)
 
-    assert tomllib.loads(config.read_text())["active_model"] == legacy_name
-    assert legacy_name in tomllib.loads(catalog.read_text())["models"]
+def test_migration_rejects_persisted_thinking_overrides_without_writing(
+    tmp_path: Path,
+) -> None:
+    config, catalog = _paths(tmp_path)
+    config.write_bytes(_LEGACY + b'\n[thinking_overrides]\nbase = "low"\n')
+    original = config.read_bytes()
+
+    with pytest.raises(MigrationError, match="Persisted \\[thinking_overrides\\]"):
+        plan_migration(config, catalog)
+
+    assert config.read_bytes() == original
+    assert not catalog.exists()
+
+
+def test_migration_rejects_ambiguous_multi_model_role_without_writing(
+    tmp_path: Path,
+) -> None:
+    config, catalog = _paths(tmp_path)
+    config.write_bytes(_LEGACY + b'\n[tags]\nworker = ["friendly", "base"]\n')
+    original = config.read_bytes()
+
+    with pytest.raises(MigrationError, match="Legacy role 'worker'.*Choose one model"):
+        plan_migration(config, catalog)
+
+    assert config.read_bytes() == original
+    assert not catalog.exists()
 
 
 def test_migration_deduplicates_equal_references_through_user_aliases(
@@ -206,7 +229,7 @@ def test_migration_deduplicates_equal_references_through_user_aliases(
 
     cleaned = tomllib.loads(plan.cleaned_config.decode())
     assert cleaned["allowed_models"] == ["base"]
-    assert cleaned["thinking_overrides"] == {"base": "low"}
+    assert "thinking_overrides" not in cleaned
 
 
 def test_migration_rejects_role_member_without_a_model_table(tmp_path: Path) -> None:
@@ -222,11 +245,8 @@ def test_migration_preserves_explicit_removed_shipped_model_but_canonicalizes_re
 ) -> None:
     config, catalog = _paths(tmp_path)
     config.write_text(
-        'active_model = "glm-5-2"\n'
         'compaction_model = "glm-5-2"\n'
         'allowed_models = ["glm-5-2"]\n'
-        "[thinking_overrides]\n"
-        'glm-5-2 = "high"\n'
         "[tags]\n"
         'worker = ["glm-5-2"]\n'
         "[[providers]]\n"
@@ -242,12 +262,14 @@ def test_migration_preserves_explicit_removed_shipped_model_but_canonicalizes_re
 
     migrated = tomllib.loads(catalog.read_text())
     assert "glm-5-2" in migrated["models"]
-    assert migrated["roles"]["worker"]["models"] == ["glm-5-3"]
+    assert migrated["roles"]["worker"] == {
+        "description": "",
+        "model": "glm-5-3",
+        "thinking": "high",
+    }
     cleaned = tomllib.loads(config.read_text())
-    assert cleaned["active_model"] == "glm-5-3"
     assert cleaned["compaction_model"] == "glm-5-3"
     assert cleaned["allowed_models"] == ["glm-5-3"]
-    assert cleaned["thinking_overrides"] == {"glm-5-3": "high"}
 
 
 def test_migration_preserves_explicit_removed_mistral_small_model(
@@ -270,7 +292,11 @@ def test_migration_preserves_explicit_removed_mistral_small_model(
 
     migrated = tomllib.loads(catalog.read_text())
     assert "mistral-small-latest" in migrated["models"]
-    assert migrated["roles"]["worker"]["models"] == ["mistral-small-latest"]
+    assert migrated["roles"]["worker"] == {
+        "description": "",
+        "model": "mistral-small-latest",
+        "thinking": "off",
+    }
 
 
 def test_migration_main_generated_default_config_drops_empty_vertex_fields(
@@ -282,9 +308,9 @@ def test_migration_main_generated_default_config_drops_empty_vertex_fields(
     apply_migration(plan_migration(config, catalog))
 
     migrated = tomllib.loads(catalog.read_text())
-    provider = migrated["providers"]["mistral/default"]
+    provider = migrated["providers"]["mistral"]
     assert "project_id" not in provider and "region" not in provider
-    assert tomllib.loads(config.read_text())["active_model"] == ""
+    assert "active_model" not in tomllib.loads(config.read_text())
 
 
 def test_migration_nonempty_legacy_project_id_is_actionable_conflict(
@@ -328,7 +354,7 @@ def test_migration_reconciles_shipped_wire_name_and_preserves_overrides(
     assert "aliases" not in migrated[base_name]
     assert migrated[base_name]["deployments"] == [
         {
-            "provider": "mistral/default",
+            "provider": "mistral",
             "prices": {"input": 1.2, "output": 3.4, "cached_input": 0.5},
         }
     ]
@@ -423,7 +449,7 @@ def test_migration_recovery_rejects_changed_models_toml(tmp_path: Path) -> None:
         with pytest.raises(KeyboardInterrupt):
             apply_migration(plan)
 
-    catalog.write_text("[providers.replaced/default]\n")
+    catalog.write_text("[providers.replaced]\n")
 
     with pytest.raises(MigrationConflictError, match="changed models.toml"):
         apply_migration(plan)
@@ -553,18 +579,6 @@ def test_migration_ambiguous_inference_identity_is_conflict(tmp_path: Path) -> N
         plan_migration(config, catalog)
 
 
-def test_migration_ambiguous_thinking_override_aliases_are_conflict(
-    tmp_path: Path,
-) -> None:
-    config, catalog = _paths(tmp_path)
-    config.write_bytes(
-        _LEGACY.replace(b'friendly = "low"', b'friendly = "low"\nbase = "high"')
-    )
-
-    with pytest.raises(MigrationConflictError, match="multiple thinking overrides"):
-        plan_migration(config, catalog)
-
-
 def test_migration_preserves_unrelated_settings(tmp_path: Path) -> None:
     config, catalog = _paths(tmp_path)
     config.write_bytes(_LEGACY + b'\n[tools.bash]\ndenylist = ["pwd"]\n')
@@ -590,10 +604,9 @@ def test_migration_special_character_alias_round_trips_as_valid_toml(
 ) -> None:
     config, catalog = _paths(tmp_path)
     config.write_text(
-        'active_model = "friendly\\"\\\\path"\n'
         'compaction_model = "friendly\\"\\\\path"\n'
-        "[thinking_overrides]\n"
-        '"friendly\\"\\\\path" = "low"\n'
+        "[tags]\n"
+        'worker = ["friendly\\"\\\\path"]\n'
         '[[providers]]\nname = "test"\napi_base = "https://example.test/v1"\n'
         '[[models]]\nname = "base"\nprovider = "test"\n'
         'alias = "friendly\\"\\\\path"\n'
@@ -602,8 +615,12 @@ def test_migration_special_character_alias_round_trips_as_valid_toml(
     apply_migration(plan_migration(config, catalog))
 
     cleaned = tomllib.loads(config.read_text())
-    assert cleaned["active_model"] == "base"
-    assert cleaned["thinking_overrides"] == {"base": "low"}
+    assert cleaned["compaction_model"] == "base"
+    assert tomllib.loads(catalog.read_text())["roles"]["worker"] == {
+        "description": "",
+        "model": "base",
+        "thinking": "off",
+    }
     assert "aliases" not in tomllib.loads(catalog.read_text())["models"]["base"]
 
 
@@ -670,7 +687,7 @@ def test_migration_interruption_at_each_write_step_finishes_forward(
 
     apply_migration(plan)
     assert not (tmp_path / ".models-migration-recovery.toml").exists()
-    assert tomllib.loads(config.read_text())["active_model"] == "base"
+    assert "active_model" not in tomllib.loads(config.read_text())
 
 
 @pytest.mark.asyncio
@@ -714,7 +731,7 @@ def test_api_key_persistence_writes_provider_to_models_toml(
     assert __import__("asyncio").run(apply_provider_to_config(None, provider))
 
     data = tomllib.loads((tmp_path / "models.toml").read_text())
-    assert data["providers"]["test/default"]["api_base"] == "https://example.test"
+    assert data["providers"]["test"]["api_base"] == "https://example.test"
     assert not (tmp_path / "config.toml").exists()
 
 
@@ -764,13 +781,8 @@ def test_m3_reconciles_each_deployment_and_materializes_new_provider_slot(
     apply_migration(plan_migration(config, catalog))
 
     deployments = tomllib.loads(catalog.read_text())["models"]["glm-5-2"]["deployments"]
-    assert {entry["provider"] for entry in deployments} == {
-        "mistral/default",
-        "second/default",
-    }
-    second = next(
-        entry for entry in deployments if entry["provider"] == "second/default"
-    )
+    assert {entry["provider"] for entry in deployments} == {"mistral", "second"}
+    second = next(entry for entry in deployments if entry["provider"] == "second")
     assert second["name"] == "glm-5-2" and second["supports_images"] is False
 
 
@@ -825,7 +837,7 @@ def test_migration_converts_legacy_tags_to_roles(tmp_path: Path) -> None:
     apply_migration(plan_migration(config, catalog))
 
     assert tomllib.loads(catalog.read_text())["roles"] == {
-        "preferred": {"description": "", "models": ["base"]}
+        "preferred": {"description": "", "model": "base", "thinking": "low"}
     }
 
 

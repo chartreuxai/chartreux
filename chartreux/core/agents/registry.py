@@ -108,6 +108,27 @@ def build_child_orchestrator(
     ``None`` preserves the source's captured profile layer for retained agents.
     """
     candidate = source._copy_for_child()
+    selected_expression = launch_overrides.get("active_model")
+    if profile_role is not None or (
+        isinstance(selected_expression, str) and selected_expression.startswith("@")
+    ):
+        # Main-session thinking choices are local to the main assistant. A role
+        # starts with its own preset even when it shares the selected model.
+        for index, layer in enumerate(candidate.layers):
+            if not isinstance(layer, OverridesLayer):
+                continue
+            data = (
+                dict(layer.cached_data.model_dump(exclude_unset=True))
+                if layer.cached_data
+                else {}
+            )
+            if "thinking_overrides" in data:
+                data.pop("thinking_overrides")
+                candidate.remove_layer(index)
+                candidate.insert_layer(
+                    OverridesLayer(data=data, name=layer.name), index
+                )
+            break
     if profile_overrides is not None:
         apply_profile_overrides(candidate, profile_overrides, role=profile_role)
     apply_launch_overrides(candidate, dict(launch_overrides))

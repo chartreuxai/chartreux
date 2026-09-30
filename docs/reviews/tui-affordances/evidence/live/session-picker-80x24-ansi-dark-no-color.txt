@@ -1,0 +1,24 @@
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ local /test/workdir                                                          │
+│                                                                              │
+│  unknown     local-se  Refactor the auth module                              │
+│  unknown     local-se  Add unit tests for the API                            │
+│                                                                              │
+│ ↑↓/jk Navigate  Enter Select  d Delete  Esc Cancel                           │
+└──────────────────────────────────────────────────────────────────────────────┘

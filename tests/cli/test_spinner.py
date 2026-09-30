@@ -50,7 +50,7 @@ async def test_loading_initial_status_is_present_during_first_layout() -> None:
         status = app.query_one(".loading-status", Static)
         content = status.content
         assert isinstance(content, str)
-        assert Content.from_markup(content).plain == "Initializing… "
+        assert Content.from_markup(content).plain == "Running: Initializing…"
         assert status.size.width > 0
 
 

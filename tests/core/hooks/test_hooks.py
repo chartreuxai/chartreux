@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import shlex
 import sys
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 from pydantic import ValidationError
 import pytest
@@ -352,6 +354,40 @@ class TestConfigLoading:
 
 
 class TestHookExecutor:
+    @pytest.mark.asyncio
+    async def test_cancellation_cleans_up_exited_leader(
+        self, sample_invocation: PostAgentInvocation, monkeypatch
+    ) -> None:
+        import chartreux.core.hooks.executor as executor_module
+
+        process = Mock(pid=12345, returncode=0)
+        monkeypatch.setattr(
+            executor_module.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(return_value=process),
+        )
+        cleanup = AsyncMock()
+        monkeypatch.setattr(executor_module, "kill_async_subprocess", cleanup)
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+        executor = HookExecutor()
+
+        async def run_process(*args):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        monkeypatch.setattr(executor, "_run_process", run_process)
+        task = asyncio.create_task(executor.run(_make_hook(), sample_invocation))
+        await asyncio.wait_for(started.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        cleanup.assert_awaited_once_with(process)
+        assert stopped.is_set()
+
     @pytest.mark.asyncio
     async def test_exit_0_success(self, sample_invocation: PostAgentInvocation) -> None:
         hook = _make_hook(command="echo success")

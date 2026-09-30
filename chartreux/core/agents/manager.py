@@ -47,6 +47,11 @@ class AgentManager:
         return self._orchestrator.config
 
     @property
+    def settings_inventory(self) -> list[str]:
+        """Builtin and discovered profiles, before allow/deny filtering."""
+        return sorted(self._discovered)
+
+    @property
     def available_agents(self) -> dict[str, AgentProfile]:
         return {
             name: profile

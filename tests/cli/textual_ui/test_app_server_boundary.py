@@ -55,6 +55,16 @@ SERVER_ONLY_APP_SERVER_MODULES = (
     "chartreux.app_server.server",
     "chartreux.app_server.stdio",
 )
+# protocol is a public app_server module, so its core dependency is legal.
+ALLOWED_CORE_IMPORTS = {
+    "chartreux.app_server.protocol": {"chartreux.core.config.settings_catalog"},
+    "chartreux.core.config.settings_catalog": {
+        "chartreux.core.config.chartreux_schema",
+        "chartreux.core.config.models",
+    },
+}
+# Schema/model implementations are leaf boundaries, not an exempt runtime closure.
+SCHEMA_LEAVES = ALLOWED_CORE_IMPORTS["chartreux.core.config.settings_catalog"]
 
 
 def _production_files() -> list[Path]:
@@ -117,18 +127,36 @@ def test_textual_has_no_transitive_core_dependency() -> None:
     while pending:
         module, chain = pending.popleft()
         for imported in imports[module]:
-            if imported == "chartreux.core" or imported.startswith("chartreux.core."):
+            if (
+                imported == "chartreux.core" or imported.startswith("chartreux.core.")
+            ) and imported not in ALLOWED_CORE_IMPORTS.get(module, set()):
                 violations.append(" -> ".join([*chain, imported]))
                 continue
             resolved = imported
             while resolved and resolved not in modules:
                 resolved = resolved.rpartition(".")[0]
-            if not resolved or resolved in visited:
+            if not resolved or resolved in visited or resolved in SCHEMA_LEAVES:
                 continue
             visited.add(resolved)
             pending.append((resolved, [*chain, resolved]))
 
     assert not violations, "\n".join(sorted(violations))
+
+
+def test_boundary_rejects_runtime_import_from_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_imports = _imports
+    catalog = CHARTREUX_ROOT / "core" / "config" / "settings_catalog.py"
+
+    def injected_imports(source_path: Path) -> Iterator[tuple[int, str]]:
+        yield from original_imports(source_path)
+        if source_path == catalog:
+            yield 1, "chartreux.core.tools.manager"
+
+    monkeypatch.setattr(__name__ + "._imports", injected_imports)
+    with pytest.raises(AssertionError, match="chartreux.core.tools.manager"):
+        test_textual_has_no_transitive_core_dependency()
 
 
 def test_textual_does_not_reference_agent_loop() -> None:
@@ -170,7 +198,8 @@ def test_app_server_clients_do_not_import_core(source_path: Path) -> None:
     violations = [
         f"{source_path.relative_to(CHARTREUX_ROOT)}:{line}: {module}"
         for line, module in _imports(source_path)
-        if module == "chartreux.core" or module.startswith("chartreux.core.")
+        if (module == "chartreux.core" or module.startswith("chartreux.core."))
+        and module not in ALLOWED_CORE_IMPORTS.get(_module_name(source_path), set())
     ]
 
     assert not violations, "\n".join(violations)

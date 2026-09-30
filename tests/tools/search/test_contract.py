@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import socket
+import ssl
 
 import httpx
 import pytest
@@ -266,3 +268,143 @@ async def test_fetch_json_enforces_an_overall_deadline(
     with pytest.raises(SearchProviderError, match="timed out"):
         await fetch_json("https://search.example/api", timeout=0.01)
     assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_type", "nested_cause", "expected_message"),
+    [
+        (
+            httpx.ConnectError,
+            socket.gaierror("secret DNS detail"),
+            "Search request failed: hostname could not be resolved",
+        ),
+        (
+            httpx.ConnectError,
+            ssl.SSLCertVerificationError("secret certificate detail"),
+            "Search request failed: TLS certificate verification failed",
+        ),
+        (httpx.ProxyError, None, "Search request failed: proxy connection failed"),
+        (
+            httpx.ProxyError,
+            socket.gaierror("secret proxy hostname"),
+            "Search request failed: hostname could not be resolved",
+        ),
+        (
+            httpx.UnsupportedProtocol,
+            None,
+            "Search request failed: provider endpoint URL is invalid",
+        ),
+        (
+            httpx.ConnectError,
+            None,
+            "Search request failed: could not connect to provider",
+        ),
+        (
+            httpx.RemoteProtocolError,
+            None,
+            "Search request failed: response transfer or protocol error",
+        ),
+        (
+            httpx.LocalProtocolError,
+            None,
+            "Search request failed: response transfer or protocol error",
+        ),
+        (
+            httpx.ReadError,
+            None,
+            "Search request failed: response transfer or protocol error",
+        ),
+        (
+            httpx.WriteError,
+            None,
+            "Search request failed: response transfer or protocol error",
+        ),
+        (
+            httpx.DecodingError,
+            None,
+            "Search request failed: provider response could not be decoded",
+        ),
+        (httpx.RequestError, None, "Search request failed"),
+    ],
+)
+async def test_fetch_json_classifies_transport_errors_without_leaking_details(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[httpx.RequestError],
+    nested_cause: BaseException | None,
+    expected_message: str,
+) -> None:
+    secret = "secret-url-token"
+    request = httpx.Request("GET", f"https://search.example/{secret}")
+    error = error_type(f"secret error detail {secret}", request=request)
+    if nested_cause is not None:
+        error.__cause__ = nested_cause
+
+    async def fail_request(*args: object, **kwargs: object) -> bytes:
+        raise error
+
+    monkeypatch.setattr(
+        "chartreux.core.tools.search.provider._request_with_checked_redirects",
+        fail_request,
+    )
+
+    with pytest.raises(SearchProviderError) as caught:
+        await fetch_json(str(request.url), timeout=1)
+
+    assert str(caught.value) == expected_message
+    assert secret not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_fetch_json_classifies_cyclic_context_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = httpx.ConnectError("secret proxy address")
+    nested = RuntimeError("secret context")
+    root.__context__ = nested
+    nested.__context__ = root
+    nested.__cause__ = socket.gaierror("secret resolver output")
+
+    async def fail_request(*args: object, **kwargs: object) -> bytes:
+        raise root
+
+    monkeypatch.setattr(
+        "chartreux.core.tools.search.provider._request_with_checked_redirects",
+        fail_request,
+    )
+
+    with pytest.raises(SearchProviderError) as caught:
+        await fetch_json("https://search.example/api", timeout=1)
+
+    assert str(caught.value) == (
+        "Search request failed: hostname could not be resolved"
+    )
+    assert "secret" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suppress_context", [False, True])
+async def test_fetch_json_ignores_unrelated_or_suppressed_context(
+    monkeypatch: pytest.MonkeyPatch, suppress_context: bool
+) -> None:
+    error = httpx.UnsupportedProtocol("secret endpoint URL")
+    error.__context__ = socket.gaierror("secret DNS context")
+    error.__suppress_context__ = suppress_context
+    if not suppress_context:
+        error.__cause__ = RuntimeError("secret explicit cause")
+
+    async def fail_request(*args: object, **kwargs: object) -> bytes:
+        raise error
+
+    monkeypatch.setattr(
+        "chartreux.core.tools.search.provider._request_with_checked_redirects",
+        fail_request,
+    )
+
+    with pytest.raises(SearchProviderError) as caught:
+        await fetch_json("https://search.example/api", timeout=1)
+
+    assert (
+        str(caught.value) == "Search request failed: provider endpoint URL is invalid"
+    )
+    assert "secret" not in str(caught.value)

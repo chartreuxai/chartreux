@@ -5,16 +5,16 @@ from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
-import tomli_w
 
+from chartreux.app_server._runtime import AgentRuntimeFactory
 from chartreux.app_server.config import ThinkingLevel
 from chartreux.app_server.protocol import AppServerResponseError, ConfigWriteOpWire
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.config.layers.user import UserConfigLayer
-from chartreux.core.config.models import ModelConfig
+from chartreux.core.config.models import ModelConfig, SessionLoggingConfig
 from chartreux.core.config.orchestrator import ConfigOrchestrator
-from tests.conftest import build_test_agent_loop, build_test_vibe_config
+from tests.conftest import FakeBackend, build_test_agent_loop, build_test_vibe_config
 from tests.stubs.app_server import create_test_app_server_session
 
 
@@ -100,6 +100,60 @@ async def test_thinking_choices_survive_model_switch_and_session_remove_falls_ba
         assert session.resources.config.current.active_model.thinking == "low"
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_thinking_choice_survives_session_resume_without_changing_preset(
+    tmp_path: Path,
+) -> None:
+    logging = SessionLoggingConfig(enabled=True, save_dir=str(tmp_path / "sessions"))
+    config = build_test_vibe_config(
+        active_model="alpha",
+        models=[
+            ModelConfig(
+                name="alpha-model", provider="mistral", alias="alpha", thinking="low"
+            )
+        ],
+        session_logging=logging,
+    )
+    saved = build_test_agent_loop(config=config, backend=FakeBackend(), cwd=tmp_path)
+    default_preset = saved.config.catalog_snapshot.catalog.roles["orchestrator"]
+    await saved.persist_empty_session()
+    session_id = saved.session_id
+    session = await create_test_app_server_session(saved)
+    try:
+        await session.resources.config.set_thinking("high")
+        _ = [event async for event in session.act("remember the thinking choice")]
+        assert saved.config.get_active_model().thinking == "high"
+        assert (
+            saved.config.catalog_snapshot.catalog.roles["orchestrator"]
+            == default_preset
+        )
+    finally:
+        await session.close()
+
+    resumed = build_test_agent_loop(
+        config=build_test_vibe_config(
+            active_model="alpha",
+            models=[
+                ModelConfig(
+                    name="alpha-model",
+                    provider="mistral",
+                    alias="alpha",
+                    thinking="low",
+                )
+            ],
+            session_logging=logging,
+        ),
+        backend=FakeBackend(),
+        cwd=tmp_path,
+    )
+    try:
+        await AgentRuntimeFactory().resume_root(resumed, session_id)
+        assert resumed.config.get_active_model().thinking == "high"
+        assert resumed.config.thinking_overrides == {"alpha": "high"}
+    finally:
+        await resumed.aclose()
 
 
 @pytest.mark.asyncio
@@ -205,13 +259,11 @@ async def test_public_thinking_failure_redaction(
         config: ChartreuxConfigSchema,
     ) -> ConfigOrchestrator[ChartreuxConfigSchema]:
         definition_path = tmp_path / "definition.toml"
-        definition_path.write_text(
-            tomli_w.dumps(config.model_dump(mode="json", exclude_none=True))
-        )
+        definition_path.write_text('theme = "dark"\n')
         user = UserConfigLayer(path=definition_path, name="definition")
         return await ConfigOrchestrator.create(
             schema=ChartreuxConfigSchema,
-            layers=[user, OverridesLayer(data={})],
+            layers=[user, OverridesLayer(data={"active_model": config.active_model})],
             default_layer_resolver=lambda: user,
             catalog_snapshot=config.catalog_snapshot,
         )

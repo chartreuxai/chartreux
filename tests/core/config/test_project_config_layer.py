@@ -19,11 +19,11 @@ async def test_reads_toml_when_trusted(tmp_working_directory: Path) -> None:
     trusted_folders_manager.add_trusted(tmp_working_directory)
     config_path = tmp_working_directory / ".chartreux" / "config.toml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text('active_model = "project-model"\n')
+    config_path.write_text('theme = "dark"\n')
 
     layer = ProjectConfigLayer(path=tmp_working_directory)
     data = await layer.load()
-    assert data.model_extra == {"active_model": "project-model"}
+    assert data.model_extra == {"theme": "dark"}
     fp1 = layer.fingerprint
     assert isinstance(fp1, str)
     assert fp1
@@ -67,7 +67,7 @@ async def test_untrusted_raises(tmp_working_directory: Path) -> None:
     trusted_folders_manager.add_untrusted(tmp_working_directory)
     config_path = tmp_working_directory / ".chartreux" / "config.toml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text('active_model = "project-model"\n')
+    config_path.write_text('theme = "dark"\n')
 
     layer = ProjectConfigLayer(path=tmp_working_directory)
     with pytest.raises(UntrustedLayerError):
@@ -100,7 +100,7 @@ async def test_resolve_and_load_never_mutate_trust_store_when_untrusted(
     """
     config_path = tmp_working_directory / ".chartreux" / "config.toml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text('active_model = "project-model"\n')
+    config_path.write_text('theme = "dark"\n')
 
     trusted_before = list(trusted_folders_manager._trusted)
     untrusted_before = list(trusted_folders_manager._untrusted)
@@ -127,7 +127,7 @@ async def test_resolve_and_load_do_not_untrust_vibe_dir_under_untrusted_parent(
     trusted_folders_manager.add_untrusted(tmp_working_directory)
     config_path = tmp_working_directory / ".chartreux" / "config.toml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text('active_model = "project-model"\n')
+    config_path.write_text('theme = "dark"\n')
 
     untrusted_before = list(trusted_folders_manager._untrusted)
 
@@ -214,7 +214,7 @@ async def test_is_file_discovered_reflects_cached_discovery_state(
     trusted_folders_manager.add_trusted(tmp_working_directory)
     config_path = tmp_working_directory / ".chartreux" / "config.toml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text('active_model = "project-model"\n')
+    config_path.write_text('theme = "dark"\n')
 
     layer = ProjectConfigLayer(path=tmp_working_directory)
 
@@ -237,7 +237,7 @@ async def test_config_file_added_after_first_search_is_not_detected(
 
     config_path = tmp_working_directory / ".chartreux" / "config.toml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text('active_model = "new-model"\n')
+    config_path.write_text('theme = "dark"\n')
 
     await layer._find_config_file()
 
@@ -249,14 +249,14 @@ async def test_finds_config_in_parent_directory(tmp_working_directory: Path) -> 
     trusted_folders_manager.add_trusted(tmp_working_directory)
     config_path = tmp_working_directory / ".chartreux" / "config.toml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text('active_model = "parent-model"\n')
+    config_path.write_text('theme = "dark"\n')
 
     subdir = tmp_working_directory / "sub" / "project"
     subdir.mkdir(parents=True)
 
     layer = ProjectConfigLayer(path=subdir)
     data = await layer.load()
-    assert data.model_extra == {"active_model": "parent-model"}
+    assert data.model_extra == {"theme": "dark"}
 
 
 @pytest.mark.asyncio
@@ -272,11 +272,11 @@ async def test_trusted_ancestor_satisfies_trust_check(
 
     config_path = child / ".chartreux" / "config.toml"
     config_path.parent.mkdir(parents=True)
-    config_path.write_text('active_model = "child-model"\n')
+    config_path.write_text('theme = "dark"\n')
 
     layer = ProjectConfigLayer(path=child)
     data = await layer.load()
-    assert data.model_extra == {"active_model": "child-model"}
+    assert data.model_extra == {"theme": "dark"}
 
 
 @pytest.mark.asyncio
@@ -294,7 +294,7 @@ async def test_walk_stops_at_vibe_home_parent(
 
     # Place a config at tmp_root/.chartreux/config.toml — should NOT be picked up
     home_config = fake_vibe_home / "config.toml"
-    home_config.write_text('active_model = "home-model"\n')
+    home_config.write_text('theme = "dark"\n')
 
     # subdir lives inside tmp_root so the walk would reach the config without the stop guard
     subdir = tmp_root / "vibe-test-project"
@@ -317,14 +317,14 @@ async def test_apply_creates_file_when_none_discovered(
 
     await layer.apply(
         ConfigPatch(
-            AddOperationPatch(path="/active_model", value="created"),
+            AddOperationPatch(path="/theme", value="dark"),
             fingerprint=MISSING_BACKING_STORE_DATA_FINGERPRINT,
         )
     )
 
     created_path = tmp_working_directory / ".chartreux" / "config.toml"
     with created_path.open("rb") as file:
-        assert tomllib.load(file) == {"active_model": "created"}
+        assert tomllib.load(file) == {"theme": "dark"}
         assert layer.fingerprint == create_file_fingerprint(file)
 
     assert layer.is_file_discovered

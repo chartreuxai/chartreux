@@ -44,7 +44,7 @@ The available flags are:
 | --- | --- |
 | `-h`, `--help` | Show help. |
 | `-v`, `--version` | Show the version. |
-| `--setup` | Run interactive setup—theme, provider, credentials, and model selection—then exit instead of serving ACP. Requires an interactive terminal; otherwise, it prints actionable guidance instead of launching the TUI. |
+| `--setup` | Run interactive setup—provider, credentials, and model selection—then exit instead of serving ACP. Requires an interactive terminal; otherwise, it prints actionable guidance instead of launching the TUI. |
 
 ACP proxy configuration uses the in-session `/proxy-setup` command or the
 process environment. Changes to `$CHARTREUX_HOME/.env` take effect only when the

@@ -31,7 +31,13 @@ async def _write_model_ops(
 ) -> dict[str, Any]:
     client_transport, server_transport = memory_transport_pair()
     Path(UserConfigLayer().source_locator).write_text(
-        tomli_w.dumps(config.model_dump(mode="json", exclude_none=True))
+        tomli_w.dumps(
+            config.model_dump(
+                mode="json",
+                exclude_none=True,
+                exclude={"active_model", "thinking_overrides"},
+            )
+        )
     )
     orchestrator = await build_default_orchestrator()
     agent_loop = AgentLoop(

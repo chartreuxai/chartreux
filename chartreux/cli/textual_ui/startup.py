@@ -43,11 +43,10 @@ async def resolve_session_open_plan(
     showed_trust_prompt = False
     try:
         if prompt_for_workspace_trust:
-            configured_theme = theme
-            if configured_theme is None:
-                configured_theme = (await host.read_config()).config.theme
+            config = (await host.read_config()).config
+            configured_theme = theme if theme is not None else config.theme
             trust_granted, showed_trust_prompt = await _resolve_workspace_trust(
-                host, theme=configured_theme
+                host, theme=configured_theme, ascii_chrome=config.ascii_chrome
             )
             if not trust_granted:
                 await host.close()
@@ -114,7 +113,7 @@ async def open_textual_session(
 
 
 async def _resolve_workspace_trust(
-    host: AppServerHost, *, theme: str | None = None
+    host: AppServerHost, *, theme: str | None = None, ascii_chrome: bool = False
 ) -> tuple[bool, bool]:
     """Returns (trust_granted, prompt_shown)."""
     status = await host.trust_status(host.cwd)
@@ -130,6 +129,7 @@ async def _resolve_workspace_trust(
         repo_explicitly_untrusted=details.repo_explicitly_untrusted,
         settings_path=details.settings_path,
         theme=(resolve_theme(resolve_theme_name(theme)) if theme is not None else None),
+        ascii_chrome=ascii_chrome,
     )
     try:
         decision = await dialog.run_trust_dialog_async()

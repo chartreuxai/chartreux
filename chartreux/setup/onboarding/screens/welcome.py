@@ -19,8 +19,10 @@ WELCOME_SUFFIX = " - Let's get you started!"
 WELCOME_TEXT = WELCOME_PREFIX + WELCOME_HIGHLIGHT + WELCOME_SUFFIX
 HIGHLIGHT_START = len(WELCOME_PREFIX)
 HIGHLIGHT_END = HIGHLIGHT_START + len(WELCOME_HIGHLIGHT)
-BUTTON_TEXT = "Press Enter ↵"
-BUTTON_TEXT_MARKUP = f"Press {shortcut('Enter')} ↵"
+BUTTON_TEXT = "Enter Next  Esc/Ctrl+C Exit"
+BUTTON_TEXT_MARKUP = (
+    f"{shortcut('Enter')} Next  {shortcut('Esc')}/{shortcut('Ctrl+C')} Exit"
+)
 
 
 class WelcomeScreen(OnboardingScreen):
@@ -64,7 +66,9 @@ class WelcomeScreen(OnboardingScreen):
         prefix = text[:HIGHLIGHT_START]
         highlight_len = min(length, HIGHLIGHT_END) - HIGHLIGHT_START
         highlight = gradient_markup(
-            WELCOME_HIGHLIGHT[:highlight_len], self._gradient_offset
+            WELCOME_HIGHLIGHT[:highlight_len],
+            self._gradient_offset,
+            truecolor=self.app.console.color_system == "truecolor",
         )
         return (
             prefix
@@ -133,4 +137,4 @@ class WelcomeScreen(OnboardingScreen):
         if not self._prompt_visible:
             self._complete_animation()
             return
-        self.host.show_theme()
+        self.host.show_providers()

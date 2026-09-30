@@ -19,48 +19,53 @@ from chartreux.core.model_catalog.availability import (
     eligible_deployments,
 )
 from chartreux.core.model_catalog.loader import CatalogSnapshot
-from chartreux.core.model_catalog.resolver import ModelResolver
+from chartreux.core.model_catalog.resolver import ModelResolutionError, ModelResolver
 from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.session_types import CommittedModelIdentity
 from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
 
 
-def test_resolver_skips_incompatible_or_cooled_tag_members() -> None:
+def test_resolver_does_not_substitute_another_model_for_role_preset() -> None:
     snapshot = CatalogSnapshot(
         ModelCatalog.model_validate({
             "providers": {
-                "test/first": {"api_base": "https://first.test"},
-                "test/second": {"api_base": "https://second.test"},
+                "test-first": {"api_base": "https://first.test"},
+                "test-second": {"api_base": "https://second.test"},
             },
             "models": {
                 "incompatible": {
-                    "deployments": [{"provider": "test/first", "name": "first"}]
+                    "deployments": [{"provider": "test-first", "name": "first"}]
                 },
                 "available": {
-                    "deployments": [{"provider": "test/second", "name": "second"}]
+                    "deployments": [{"provider": "test-second", "name": "second"}]
                 },
             },
-            "roles": {"preferred": {"models": ["incompatible", "available"]}},
+            "roles": {
+                "preferred": {
+                    "description": "Preferred preset",
+                    "model": "incompatible",
+                    "thinking": "high",
+                }
+            },
         }),
         "selection",
     )
     resolver = ModelResolver(snapshot)
     accepted = lambda candidate: candidate.base_model == "available"
-    assert (
-        resolver.resolve("@preferred", candidate_filter=accepted).base_model
-        == "available"
-    )
+    with pytest.raises(ModelResolutionError, match="Model 'incompatible'") as error:
+        resolver.resolve("@preferred", candidate_filter=accepted)
+    assert error.value.code == "no_compatible_deployment"
 
 
 def test_compaction_checks_actual_destination_deployment_capabilities() -> None:
     snapshot = CatalogSnapshot(
         ModelCatalog.model_validate({
-            "providers": {"test/first": {"api_base": "https://first.test"}},
+            "providers": {"test-first": {"api_base": "https://first.test"}},
             "models": {
                 "base": {
                     "deployments": [
                         {
-                            "provider": "test/first",
+                            "provider": "test-first",
                             "name": "base",
                             "supports_images": True,
                         }
@@ -69,7 +74,7 @@ def test_compaction_checks_actual_destination_deployment_capabilities() -> None:
                 "compact": {
                     "deployments": [
                         {
-                            "provider": "test/first",
+                            "provider": "test-first",
                             "name": "compact",
                             "supports_images": False,
                         }
@@ -97,7 +102,7 @@ def test_compaction_checks_actual_destination_deployment_capabilities() -> None:
             snapshot=snapshot,
             committed=CommittedModelIdentity(
                 base_model="base",
-                provider="test/first",
+                provider="test-first",
                 wire_name="base",
                 catalog_revision="compaction",
             ),
@@ -118,13 +123,13 @@ def test_compaction_destination_declared_thinking_restriction_excludes_requested
 ):
     snapshot = CatalogSnapshot(
         ModelCatalog.model_validate({
-            "providers": {"test/first": {"api_base": "https://first.test"}},
+            "providers": {"test-first": {"api_base": "https://first.test"}},
             "models": {
-                "base": {"deployments": [{"provider": "test/first", "name": "base"}]},
+                "base": {"deployments": [{"provider": "test-first", "name": "base"}]},
                 "compact": {
                     "deployments": [
                         {
-                            "provider": "test/first",
+                            "provider": "test-first",
                             "name": "compact",
                             "supported_thinking_levels": ["off"],
                         }
@@ -142,7 +147,7 @@ def test_compaction_destination_declared_thinking_restriction_excludes_requested
             snapshot=snapshot,
             committed=CommittedModelIdentity(
                 base_model="base",
-                provider="test/first",
+                provider="test-first",
                 wire_name="base",
                 catalog_revision="compaction",
             ),
@@ -161,8 +166,8 @@ def test_compaction_destination_declared_thinking_restriction_excludes_requested
 def test_compaction_canonical_base_for_eligibility() -> None:
     raw = _catalog().catalog.model_dump()
     raw["models"]["compact"]["deployments"] = [  # type: ignore[index]
-        {"provider": "test/first", "name": "compact-first"},
-        {"provider": "test/second", "name": "compact-second"},
+        {"provider": "test-first", "name": "compact-first"},
+        {"provider": "test-second", "name": "compact-second"},
     ]
     snapshot = CatalogSnapshot(ModelCatalog.model_validate(raw), "alias")
 
@@ -176,8 +181,8 @@ def test_compaction_canonical_base_for_eligibility() -> None:
     )
 
     assert [item.resolved.deployment.provider for item in result.candidates] == [
-        "test/first",
-        "test/second",
+        "test-first",
+        "test-second",
     ]
     assert ExclusionReason.COMPACTION_INCOMPATIBLE not in {
         item.reason for item in result.exclusions
@@ -198,9 +203,9 @@ def test_compaction_without_canonical_deployment_excludes_provider() -> None:
     )
 
     assert [item.resolved.deployment.provider for item in result.candidates] == [
-        "test/second"
+        "test-second"
     ]
-    assert ("test/first", ExclusionReason.COMPACTION_INCOMPATIBLE) in [
+    assert ("test-first", ExclusionReason.COMPACTION_INCOMPATIBLE) in [
         (item.provider, item.reason) for item in result.exclusions
     ]
 
@@ -291,9 +296,9 @@ def _catalog() -> CatalogSnapshot:
     return CatalogSnapshot(
         ModelCatalog.model_validate({
             "providers": {
-                "test/first": {"api_base": "https://first.test"},
-                "test/second": {"api_base": "https://second.test"},
-                "test/disabled": {
+                "test-first": {"api_base": "https://first.test"},
+                "test-second": {"api_base": "https://second.test"},
+                "test-disabled": {
                     "api_base": "https://disabled.test",
                     "disabled": True,
                 },
@@ -302,21 +307,21 @@ def _catalog() -> CatalogSnapshot:
                 "base": {
                     "deployments": [
                         {
-                            "provider": "test/first",
+                            "provider": "test-first",
                             "name": "first",
                             "supported_thinking_levels": ["off"],
                         },
                         {
-                            "provider": "test/second",
+                            "provider": "test-second",
                             "name": "second",
                             "supported_thinking_levels": ["off"],
                         },
-                        {"provider": "test/disabled", "name": "disabled"},
+                        {"provider": "test-disabled", "name": "disabled"},
                     ]
                 },
                 "compact": {
                     "deployments": [
-                        {"provider": "test/second", "name": "compact-second"}
+                        {"provider": "test-second", "name": "compact-second"}
                     ]
                 },
             },
@@ -327,13 +332,15 @@ def _catalog() -> CatalogSnapshot:
 
 
 def _config(snapshot: CatalogSnapshot, **updates: object) -> ChartreuxConfigSchema:
-    return ChartreuxConfigSchema(**cast(Any, updates)).attach_catalog_snapshot(snapshot)
+    return ChartreuxConfigSchema(
+        active_model="base", **cast(Any, updates)
+    ).attach_catalog_snapshot(snapshot)
 
 
 def _committed() -> CommittedModelIdentity:
     return CommittedModelIdentity(
         base_model="base",
-        provider="test/first",
+        provider="test-first",
         wire_name="first",
         catalog_revision="test",
     )
@@ -342,8 +349,8 @@ def _committed() -> CommittedModelIdentity:
 def test_all_unavailable_names_base_and_returns_structured_exclusions() -> None:
     snapshot = _catalog()
     registry = AvailabilityRegistry()
-    registry.record_failure("base", "test/first")
-    registry.record_failure("base", "test/second")
+    registry.record_failure("base", "test-first")
+    registry.record_failure("base", "test-second")
     with pytest.raises(AllDeploymentsUnavailableError) as error:
         eligible_deployments(
             snapshot=snapshot,
@@ -362,7 +369,7 @@ def test_all_unavailable_names_base_and_returns_structured_exclusions() -> None:
 def test_candidate_priority_cooldown_filtering_and_disabled_skip_are_data() -> None:
     snapshot = _catalog()
     registry = AvailabilityRegistry()
-    registry.record_failure("base", "test/first")
+    registry.record_failure("base", "test-first")
     result = eligible_deployments(
         snapshot=snapshot,
         committed=_committed(),
@@ -371,11 +378,11 @@ def test_candidate_priority_cooldown_filtering_and_disabled_skip_are_data() -> N
         thinking="off",
     )
     assert [item.resolved.deployment.provider for item in result.candidates] == [
-        "test/second"
+        "test-second"
     ]
     assert [(item.provider, item.reason) for item in result.exclusions] == [
-        ("test/first", ExclusionReason.COOLDOWN),
-        ("test/disabled", ExclusionReason.DISABLED),
+        ("test-first", ExclusionReason.COOLDOWN),
+        ("test-disabled", ExclusionReason.DISABLED),
     ]
 
 
@@ -473,9 +480,9 @@ def test_revalidation_matrix_never_strips_history_or_lowers_thinking(
         compaction_base="compact",
     )
     assert [item.resolved.deployment.provider for item in result.candidates] == [
-        "test/second"
+        "test-second"
     ]
     assert [(item.provider, item.reason) for item in result.exclusions] == [
-        ("test/first", ExclusionReason.COMPACTION_INCOMPATIBLE),
-        ("test/disabled", ExclusionReason.DISABLED),
+        ("test-first", ExclusionReason.COMPACTION_INCOMPATIBLE),
+        ("test-disabled", ExclusionReason.DISABLED),
     ]

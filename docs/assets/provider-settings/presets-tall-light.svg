@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" data-cols="80" data-rows="48" viewBox="0 0 960 1152" role="img">
+<title>Default presets at 80 by 48, light theme</title>
+<desc>Conceptual light terminal frame showing a focused preset editor, supported thinking levels, and a forward Finish action.</desc>
+<rect width="960" height="1152" fill="#f6f7f8"/>
+<g fill="#17212c" font-family="monospace" font-size="18">
+<text x="16" y="28" font-weight="bold">Provider Settings / Default presets / Large</text>
+<text x="16" y="56" fill="#586471">Step 3 · Saved providers: Mistral, local</text>
+<text x="16" y="100">Preset: Large (@large)</text>
+<text x="16" y="130">Model: glm-5-3                  [configured, runnable]</text>
+<rect x="0" y="144" width="960" height="29" fill="#c9d8e9"/>
+<text x="16" y="167" font-weight="bold">▸ Thinking: max</text>
+<text x="16" y="198" fill="#586471">Available: off · low · medium · high · max</text>
+<text x="16" y="244">  Save preset and return to presets</text>
+<text x="16" y="286" fill="#586471">The same model can use low for Small and max for Large.</text>
+<text x="16" y="328" fill="#586471">Saved Main default: glm-5-3 · high</text>
+<text x="16" y="370" fill="#586471">Session overrides, when selected, appear separately.</text>
+<text x="16" y="450">After all required presets are runnable:</text>
+<text x="16" y="480">  Finish setup</text>
+<text x="16" y="1128" fill="#586471">↑/↓ Navigate   Enter Edit/save   Esc Presets opener</text>
+</g>
+</svg>

@@ -37,7 +37,7 @@ def test_cli_real_provider_and_direct_mcp_without_product_services(
     (home / "models.toml").write_text(
         tomli_w.dumps({
             "providers": {
-                "contract/default": {
+                "contract": {
                     "api_base": api_base,
                     "api_key_env_var": key_variable,
                     "api_style": "openai",
@@ -46,18 +46,21 @@ def test_cli_real_provider_and_direct_mcp_without_product_services(
             },
             "models": {
                 "contract-model": {
-                    "deployments": [
-                        {"provider": "contract/default", "name": "contract-model"}
-                    ]
+                    "deployments": [{"provider": "contract", "name": "contract-model"}]
                 }
             },
-            "roles": {},
+            "roles": {
+                "orchestrator": {
+                    "description": "Network contract test preset",
+                    "model": "contract-model",
+                    "thinking": "off",
+                }
+            },
         }),
         encoding="utf-8",
     )
     (home / "config.toml").write_text(
         tomli_w.dumps({
-            "active_model": "contract-model",
             "mcp_servers": [
                 {
                     "name": "direct",

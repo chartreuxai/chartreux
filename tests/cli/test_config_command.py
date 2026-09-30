@@ -10,6 +10,7 @@ import pytest
 
 from chartreux.cli.textual_ui.external_editor import ExternalEditor
 from chartreux.cli.textual_ui.widgets.messages import ErrorMessage, UserCommandMessage
+from chartreux.core.config.settings_catalog import render_initial_user_config
 from tests.conftest import build_test_chartreux_app, build_test_vibe_config
 
 
@@ -47,12 +48,12 @@ async def test_config_command_creates_missing_file_and_reloads_on_change(
     async with app.run_test() as pilot:
         monkeypatch.setattr(app, "suspend", mock_suspend)
         reload_mock = _stub_reload(app)
-        handled = await app._handle_command("/config")
+        handled = await app._handle_command("/open-config-file")
         await pilot.pause()
 
     assert handled is True
     content = config_file.read_text("utf-8")
-    assert content.startswith("# Chartreux user configuration.")
+    assert content.startswith(render_initial_user_config())
     assert 'theme = "dark"' in content
     reload_mock.assert_awaited_once()
 
@@ -72,7 +73,7 @@ async def test_config_command_skips_reload_when_file_unchanged(
     async with app.run_test() as pilot:
         monkeypatch.setattr(app, "suspend", mock_suspend)
         reload_mock = _stub_reload(app)
-        handled = await app._handle_command("/config")
+        handled = await app._handle_command("/open-config-file")
         await pilot.pause()
         unchanged = [
             message._content
@@ -101,7 +102,7 @@ async def test_config_command_reports_editor_failure(
     async with app.run_test() as pilot:
         monkeypatch.setattr(app, "suspend", mock_suspend)
         reload_mock = _stub_reload(app)
-        handled = await app._handle_command("/config")
+        handled = await app._handle_command("/open-config-file")
         await pilot.pause()
         error = app.query_one(ErrorMessage)
 
@@ -128,7 +129,7 @@ async def test_config_command_does_not_follow_config_symlink(
     async with app.run_test() as pilot:
         monkeypatch.setattr(app, "suspend", mock_suspend)
         reload_mock = _stub_reload(app)
-        handled = await app._handle_command("/config")
+        handled = await app._handle_command("/open-config-file")
         await pilot.pause()
         errors = list(app.query(ErrorMessage))
 
@@ -167,7 +168,7 @@ async def test_config_command_concurrent_create_preserves_winner(
     app = build_test_chartreux_app(config=build_test_vibe_config())
     async with app.run_test() as pilot:
         monkeypatch.setattr(app, "suspend", mock_suspend)
-        await app._handle_command("/config")
+        await app._handle_command("/open-config-file")
         await pilot.pause()
     assert config_file.read_text() == "winner"
 
@@ -187,7 +188,7 @@ async def test_config_command_reports_invalid_input(
     async with app.run_test() as pilot:
         monkeypatch.setattr(app, "suspend", mock_suspend)
         reload_mock = _stub_reload(app)
-        await app._handle_command("/config")
+        await app._handle_command("/open-config-file")
         await pilot.pause()
         errors = list(app.query(ErrorMessage))
     assert len(errors) == 1

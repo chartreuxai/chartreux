@@ -9,6 +9,7 @@ from chartreux.core.hooks.config import HookConfig
 from chartreux.core.hooks.models import HookExecutionResult, HookInvocation
 from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils import kill_async_subprocess
+from chartreux.core.utils.async_subprocess import spawn_registered_process
 from chartreux.utils.io import decode_console_safe
 
 _MAX_OUTPUT_BYTES = 1024 * 1024
@@ -64,16 +65,18 @@ class HookExecutor:
             )
 
         try:
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-                cwd=self._cwd,
-                # Hooks load from project-writable config, so an injected hook
-                # must not inherit chartreux's credential variables.
-                env=scrub_child_env(os.environ),
+            process = await spawn_registered_process(
+                asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                    cwd=self._cwd,
+                    # Hooks load from project-writable config, so an injected hook
+                    # must not inherit chartreux's credential variables.
+                    env=scrub_child_env(os.environ),
+                )
             )
         except (OSError, ValueError) as e:
             return HookExecutionResult(
@@ -119,8 +122,7 @@ class HookExecutor:
                 timed_out=True,
             )
         except BaseException:
-            if process.returncode is None:
-                await kill_async_subprocess(process)
+            await kill_async_subprocess(process)
             raise
 
     async def _run_process(

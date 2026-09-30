@@ -2,17 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
-import random
 from time import time
-from typing import ClassVar
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal
 from textual.widgets import Static
 
-from chartreux.cli.textual_ui.constants import ChartreuxColors
 from chartreux.cli.textual_ui.widgets.spinner import SpinnerMixin, SpinnerType
+from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
@@ -21,8 +18,6 @@ THINKING_LOADING_STATUS = "Thinking"
 RETRYING_LOADING_STATUS = "Retrying"
 INTERRUPTING_LOADING_STATUS = "Interrupting"
 INITIALIZING_LOADING_STATUS = "Initializing"
-_DEBOUNCE_HINT_TEXT = "[dim italic]typing detected, waiting…[/]"
-_REPLACEABLE_STATUSES = frozenset({DEFAULT_LOADING_STATUS, THINKING_LOADING_STATUS})
 
 
 def _format_elapsed(seconds: int) -> str:
@@ -38,60 +33,18 @@ def _format_elapsed(seconds: int) -> str:
 
 
 class LoadingWidget(SpinnerMixin, Static):
-    TARGET_COLORS = (
-        ChartreuxColors.BLUE_GREY,
-        ChartreuxColors.BLUE_GREY_LIGHT,
-        ChartreuxColors.COPPER_LIGHT,
-        ChartreuxColors.COPPER,
-        ChartreuxColors.COPPER_DARK,
-    )
     SPINNER_TYPE = SpinnerType.SNAKE
-
-    EASTER_EGGS: ClassVar[list[str]] = [
-        "Eating a chocolatine",
-        "Eating a pain au chocolat",
-        "Réflexion",
-        "Analyse",
-        "Contemplation",
-        "Synthèse",
-        "Reading Proust",
-        "Oui oui baguette",
-        "Counting Rs in strawberry",
-        "Warming up the model",
-        "Purring",
-        "Sending good purrs",
-        "Petting le chat",
-    ]
-
-    EASTER_EGGS_HALLOWEEN: ClassVar[list[str]] = [
-        "Trick or treating",
-        "Carving pumpkins",
-        "Summoning spirits",
-        "Brewing potions",
-        "Haunting the terminal",
-        "Petting le chat noir",
-    ]
-
-    EASTER_EGGS_DECEMBER: ClassVar[list[str]] = [
-        "Wrapping presents",
-        "Decorating the tree",
-        "Drinking hot chocolate",
-        "Building snowmen",
-        "Writing holiday cards",
-    ]
 
     def __init__(self, status: str | None = None, *, show_hint: bool = True) -> None:
         super().__init__(classes="loading-widget")
         self.init_spinner()
         self._base_status = status or DEFAULT_LOADING_STATUS
-        self.status = self._with_easter_egg(self._base_status)
-        self.current_color_index = 0
-        self._color_direction = 1
-        self.transition_progress = 0
+        self.status = self._base_status
         self._indicator_widget: Static | None = None
         self._status_widget: Static | None = None
         self.hint_widget: Static | None = None
         self._show_hint = show_hint
+        self._hint_suppressed = False
         self.debounce_widget: Static | None = None
         self.start_time: float | None = None
         self._last_elapsed: int = -1
@@ -103,37 +56,16 @@ class LoadingWidget(SpinnerMixin, Static):
         self._queued_count: int = 0
         self._interrupting = False
 
-    def _get_easter_egg(self) -> str | None:
-        EASTER_EGG_PROBABILITY = 0.10
-        if random.random() < EASTER_EGG_PROBABILITY:
-            available_eggs = list(self.EASTER_EGGS)
-
-            OCTOBER = 10
-            HALLOWEEN_DAY = 31
-            DECEMBER = 12
-            now = datetime.now()
-            if now.month == OCTOBER and now.day == HALLOWEEN_DAY:
-                available_eggs.extend(self.EASTER_EGGS_HALLOWEEN)
-            if now.month == DECEMBER:
-                available_eggs.extend(self.EASTER_EGGS_DECEMBER)
-
-            return random.choice(available_eggs)
-        return None
-
     @property
     def base_status(self) -> str:
-        """The semantic status label (without easter-egg substitution)."""
+        """The semantic status label."""
         return self._base_status
-
-    def _with_easter_egg(self, status: str) -> str:
-        """Only generic labels are replaceable; other statuses carry information."""
-        if status not in _REPLACEABLE_STATUSES:
-            return status
-        return self._get_easter_egg() or status
 
     def show_debounce_hint(self) -> None:
         if self.debounce_widget:
-            self.debounce_widget.update(_DEBOUNCE_HINT_TEXT)
+            self.debounce_widget.update(
+                f"typing detected, waiting{chrome_glyph('truncation')}"
+            )
             self.debounce_widget.display = True
 
     def hide_debounce_hint(self) -> None:
@@ -186,13 +118,11 @@ class LoadingWidget(SpinnerMixin, Static):
         self._set_status(status)
 
     def _set_status(self, status: str) -> None:
-        # Idempotent on the semantic status: re-setting the same status is a
-        # no-op so callers can drive it on every event without re-rolling the
-        # easter egg or flickering the label.
+        # Repeated semantic status updates must not flicker the label.
         if status == self._base_status:
             return
         self._base_status = status
-        self.status = self._with_easter_egg(status)
+        self.status = status
         if self._status_widget:
             self._status_widget.update(self._build_status_text())
 
@@ -207,6 +137,12 @@ class LoadingWidget(SpinnerMixin, Static):
             return
         self._queued_count = count
         self._update_hint(max(self._last_elapsed, 0))
+
+    def set_hint_suppressed(self, suppressed: bool) -> None:
+        """Hide keyboard shortcuts while another control owns the keys."""
+        self._hint_suppressed = suppressed
+        if self.hint_widget is not None:
+            self.hint_widget.display = not suppressed
 
     def _update_hint(self, elapsed: int) -> None:
         if self.hint_widget is None:
@@ -224,10 +160,13 @@ class LoadingWidget(SpinnerMixin, Static):
         if self._queued_count > 0:
             return (
                 f"({elapsed_str} {shortcut('Esc')} to interrupt · "
-                f"{shortcut('Enter')} to steer · "
+                f"{shortcut('Enter')} queues next turn · "
                 f"{shortcut('Ctrl+C')} to cancel last queued message)"
             )
-        return f"({elapsed_str} {shortcut('Esc/Ctrl+C')} to interrupt)"
+        return (
+            f"({elapsed_str} {shortcut('Esc/Ctrl+C')} to interrupt · "
+            f"{shortcut('Enter')} queues next turn)"
+        )
 
     def compose(self) -> ComposeResult:
         with Horizontal(classes="loading-container"):
@@ -242,11 +181,10 @@ class LoadingWidget(SpinnerMixin, Static):
             yield self._status_widget
 
             if self._show_hint:
-                initial_hint = shortcut_hint(
-                    f"(0s {shortcut('Esc/Ctrl+C')} to interrupt)"
-                )
+                initial_hint = shortcut_hint(self._format_hint(0))
                 self._last_hint_width = initial_hint.cell_length
                 self.hint_widget = NoMarkupStatic(initial_hint, classes="loading-hint")
+                self.hint_widget.display = not self._hint_suppressed
                 yield self.hint_widget
 
             self.debounce_widget = Static("", classes="loading-debounce")
@@ -266,45 +204,16 @@ class LoadingWidget(SpinnerMixin, Static):
             return
         self._update_animation()
 
-    def _next_color_index(self) -> int:
-        return self.current_color_index + self._color_direction
-
-    def _get_color_for_position(self, position: int) -> str:
-        current_color = self.TARGET_COLORS[self.current_color_index]
-        next_color = self.TARGET_COLORS[self._next_color_index()]
-        if position < self.transition_progress:
-            return next_color
-        return current_color
-
     def _build_status_text(self) -> str:
-        parts = []
-        for i, char in enumerate(self.status):
-            color = self._get_color_for_position(1 + i)
-            parts.append(f"[{color}]{char}[/]")
-        ellipsis_start = 1 + len(self.status)
-        color_ellipsis = self._get_color_for_position(ellipsis_start)
-        parts.append(f"[{color_ellipsis}]… [/]")
-        return "".join(parts)
+        from rich.markup import escape
+
+        return f"Running: {escape(self.status)}{chrome_glyph('truncation')}"
 
     def _update_animation(self) -> None:
-        total_elements = 1 + len(self.status) + 1
-
-        # Both the spinner frame and status gradient keep the same width from
-        # tick to tick, so skip the whole-screen relayout.
+        # The spinner and text share the active theme's interactive role.
         if self._indicator_widget:
             spinner_char = self._spinner.next_frame()
-            color = self._get_color_for_position(0)
-            self._indicator_widget.update(f"[{color}]{spinner_char}[/]", layout=False)
-
-        if self._status_widget:
-            self._status_widget.update(self._build_status_text(), layout=False)
-
-        self.transition_progress += 1
-        if self.transition_progress > total_elements:
-            self.current_color_index = self._next_color_index()
-            if not 0 < self.current_color_index < len(self.TARGET_COLORS) - 1:
-                self._color_direction *= -1
-            self.transition_progress = 0
+            self._indicator_widget.update(spinner_char, layout=False)
 
         if self.hint_widget and self.start_time is not None:
             paused = self._paused_total + (

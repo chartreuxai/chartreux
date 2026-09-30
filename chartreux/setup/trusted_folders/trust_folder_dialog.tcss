@@ -8,26 +8,41 @@ Screen {
 }
 
 #trust-dialog {
-    max-width: 70;
+    max-width: 60;
     overflow-y: auto;
-    border: round $border-blurred;
-    background: transparent;
+    border: solid $foreground-muted;
+    border-title-align: left;
+    border-title-color: $foreground;
+    border-title-style: bold;
+    background: $surface;
     height: auto;
     max-height: 1fr;
-    padding: 1 5;
+    padding: 0 1;
+}
+
+.ascii-chrome {
+    border: ascii $foreground-muted;
+}
+
+#trust-dialog.ascii-chrome {
+    border: ascii $foreground-muted;
 }
 
 #trust-dialog-content {
     width: 100%;
     height: auto;
     min-height: 3;
-    max-height: 10;
+    max-height: 30vh;
+}
+
+#trust-dialog-content:focus {
+    border-left: solid $primary;
 }
 
 #trust-dialog-path {
     width: 100%;
     height: auto;
-    color: $primary;
+    color: $foreground;
     text-align: center;
     text-wrap: wrap;
     margin-bottom: 1;
@@ -43,12 +58,8 @@ Screen {
     color: $text-muted;
     text-align: center;
     text-wrap: wrap;
-    text-style: italic;
     margin-bottom: 1;
 
-    &:ansi {
-        text-style: italic dim;
-    }
 }
 
 .trust-dialog-repo-untrusted {
@@ -57,7 +68,6 @@ Screen {
     color: $warning;
     text-align: center;
     text-wrap: wrap;
-    text-style: italic;
     margin-bottom: 1;
 }
 
@@ -85,30 +95,14 @@ Screen {
     width: 100%;
     height: auto;
     color: $text-muted;
-    text-style: bold;
-    text-align: center;
+    text-align: left;
     margin-bottom: 0;
 
-    &:ansi {
-        text-style: bold dim;
-    }
 }
 
 .trust-dialog-file-list {
     width: 100%;
     text-align: center;
-}
-
-.trust-dialog-footer-warning {
-    width: 100%;
-    height: auto;
-    color: $warning;
-    text-align: center;
-    text-style: bold;
-    border-top: solid $border-blurred;
-    border-bottom: solid $border-blurred;
-    margin-bottom: 1;
-    padding: 0 1;
 }
 
 #trust-options-container {
@@ -122,12 +116,12 @@ Screen {
     height: auto;
     width: 100%;
     color: $foreground;
-    content-align: center middle;
+    text-align: left;
 }
 
 .trust-cursor-selected {
     color: $foreground;
-    text-style: bold;
+    text-style: bold reverse;
 }
 
 .trust-option-selected {
@@ -141,9 +135,6 @@ Screen {
     text-align: center;
     margin-bottom: 1;
 
-    &:ansi {
-        text-style: dim;
-    }
 }
 
 .trust-dialog-save-info {
@@ -151,10 +142,6 @@ Screen {
     height: auto;
     color: $text-muted;
     text-align: center;
-    text-style: italic;
     text-wrap: wrap;
 
-    &:ansi {
-        text-style: dim;
-    }
 }

@@ -4,10 +4,16 @@ from pathlib import Path
 import tomllib
 
 import pytest
+from textual.widgets import OptionList
 
+from chartreux.app_server.config import THINKING_LEVELS
 from chartreux.cli.textual_ui.widgets.thinking_picker import ThinkingPickerApp
 from chartreux.core.config import ModelConfig
-from tests.conftest import build_test_chartreux_app, build_test_vibe_config_schema
+from tests.conftest import (
+    build_test_chartreux_app,
+    build_test_vibe_config_schema,
+    wait_until,
+)
 
 
 def _persisted_config(config_dir: Path) -> dict[str, object]:
@@ -23,10 +29,13 @@ async def test_thinking_change_survives_later_config_change(config_dir: Path) ->
     )
     app = build_test_chartreux_app(config=config)
 
-    async with app.run_test():
-        await app.on_thinking_picker_app_thinking_selected(
-            ThinkingPickerApp.ThinkingSelected("high")
-        )
+    async with app.run_test() as pilot:
+        await app._show_thinking()
+        picker = app.query_one(ThinkingPickerApp)
+        await wait_until(pilot, lambda: picker.query_one(OptionList).has_focus)
+        await pilot.press("home", *["down"] * THINKING_LEVELS.index("high"), "enter")
+        await wait_until(pilot, lambda: not app.query(ThinkingPickerApp))
+        assert app.app_server.resources.config.current.active_model.thinking == "high"
         await app._persist_config_changes({"autocopy_to_clipboard": False})
         assert app.app_server.resources.config.current.active_model.thinking == "high"
 

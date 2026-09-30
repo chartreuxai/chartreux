@@ -1,22 +1,22 @@
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import pytest
-from textual.widgets import Button, Static
+from textual.widgets import Static
 
 from chartreux.setup.onboarding import OnboardingApp
-from chartreux.setup.onboarding.screens.theme_selection import (
-    THEME_EXPLANATIONS,
-    ThemeSelectionScreen,
-)
+from chartreux.setup.onboarding.base import OnboardingHost
 from chartreux.setup.onboarding.screens.welcome import WelcomeScreen
-from chartreux.ui.providers.contracts import ModelSelectionDraft
 from tests.conftest import build_test_vibe_config
-from tests.ui.providers.test_flow import make_flow, wait_for
+from tests.ui.providers.test_workbench import Host, setup
 
 
 @pytest.mark.asyncio
-async def test_enter_completes_welcome_animation_before_advancing() -> None:
+async def test_enter_completes_welcome_animation_then_opens_providers() -> None:
     app = OnboardingApp(config=build_test_vibe_config())
+    show_providers = Mock()
+    app._host = OnboardingHost(show_providers, Mock())
 
     async with app.run_test() as pilot:
         welcome = app.get_screen("welcome")
@@ -29,53 +29,16 @@ async def test_enter_completes_welcome_animation_before_advancing() -> None:
         assert not welcome.query_one("#enter-hint", Static).has_class("hidden")
 
         await pilot.press("enter")
-        assert app.screen is app.get_screen("theme_selection")
+        show_providers.assert_called_once_with()
+        assert app.screen is welcome
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("size", [(80, 24), (60, 24), (40, 24)])
-async def test_theme_screen_explains_choices_and_adapts_to_narrow_terminals(
-    size: tuple[int, int],
-) -> None:
-    app = OnboardingApp(config=build_test_vibe_config())
-
-    async with app.run_test(size=size) as pilot:
-        app.switch_screen("theme_selection")
-        await pilot.pause()
-
-        screen = app.get_screen("theme_selection")
-        assert isinstance(screen, ThemeSelectionScreen)
-        explanations = screen.query_one("#theme-explanations", Static).content
-        assert str(explanations) == "\n".join(THEME_EXPLANATIONS)
-
-        row = screen.query_one("#theme-row")
-        preview = screen.query_one("#preview")
-        assert row.region.width <= size[0]
-        assert preview.region.width <= size[0]
-        assert row.has_class("narrow") is (size[0] < 62)
-
-        await pilot.press("down")
-        assert screen.selected_theme == "light"
-
-
-@pytest.mark.asyncio
-async def test_provider_review_actions_fit_onboarding_at_80_by_24() -> None:
-    app = OnboardingApp(config=build_test_vibe_config())
-    flow, _ = make_flow()
-    flow._selected_models = {"wire": ModelSelectionDraft("wire", "wire")}
-    flow._detail_wire = "wire"
-
-    async with app.run_test(size=(80, 24)) as pilot:
-        app.push_screen(flow)
-        await wait_for(pilot, lambda: bool(flow.query("#flow-content")))
-        flow._show("review")
-        await pilot.pause()
-
-        content = flow.query_one("#flow-content")
-        actions = flow.query_one("#provider-actions")
-        continue_button = flow.query_one("#continue", Button)
-        assert content.region.height > 0
-        assert actions.region.y + actions.region.height <= app.size.height
-        assert (
-            continue_button.region.y + continue_button.region.height <= app.size.height
-        )
+async def test_provider_workbench_is_keyboard_reachable_at_80_by_24() -> None:
+    screen, _ = setup()
+    async with Host(screen).run_test(size=(80, 24)) as pilot:
+        assert screen.query_one("#workbench").display
+        await pilot.press("enter")
+        assert screen.state is not None
+        assert screen.query_one("#wb-actions").region.height > 0
+        assert screen.query_one("#wb-actions").region.bottom <= screen.app.size.height

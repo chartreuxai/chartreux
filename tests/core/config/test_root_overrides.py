@@ -90,18 +90,16 @@ async def test_overlay_survives_all_rebuilds_without_writes(
     for expected in (canonical, {}):
         if not expected:
             await install(orchestrator, {})
-        assert (
-            await orchestrator.set_field("/active_model", "", reason="ordinary") == []
-        )
+        assert await orchestrator.set_field("/theme", "dark", reason="ordinary") == []
         # Previewing an ordinary user-targeted edit exercises the shadowed backing
         # roots without writing the file (session writes above are in memory).
         await orchestrator._preview_patch([
             AddOperationPatch(
-                path="/active_model", value="", target_layer_name="renamed-user"
+                path="/theme", value="dark", target_layer_name="renamed-user"
             )
         ])
         orchestrator.replace_or_append_layer(
-            "agent-profile", AgentProfileLayer(data={"active_model": ""})
+            "agent-profile", AgentProfileLayer(data={"theme": "dark"})
         )
         orchestrator.rebuild()
         assert orchestrator.config.authorized_roots_by_project == expected
@@ -160,7 +158,7 @@ async def test_stale_prepare_commit_and_inherited_owner_rejected(
     staged = await orchestrator._prepare_root_replacement(
         source="renamed-user", roots={}, expected_token=old
     )
-    await orchestrator.set_field("/active_model", "", reason="ordinary")
+    await orchestrator.set_field("/theme", "dark", reason="ordinary")
     before = orchestrator.restrictions
     with pytest.raises(ValueError, match="Stale"):
         orchestrator._commit_policy_replacement(staged, expected_token=old)

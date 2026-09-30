@@ -120,6 +120,7 @@ def _resolved_model(
     expression: str,
     committed: CommittedModelIdentity | None = None,
     candidate_filter: Callable[[Any], bool] | None = None,
+    thinking: ThinkingLevel | None = None,
 ) -> tuple[ModelConfig, CommittedModelIdentity]:
     if config.catalog_snapshot is not None:
         from chartreux.core.model_catalog.resolver import (
@@ -138,17 +139,22 @@ def _resolved_model(
                     expression,
                     allowed_models=config.allowed_models,
                     candidate_filter=candidate_filter,
+                    thinking_override=thinking,
                 )
+            )
+            selected_thinking = (
+                thinking
+                or resolved.thinking
+                or (committed.thinking if committed is not None else None)
+                or config.thinking_overrides.get(resolved.base_model)
+            )
+            model = resolved.materialize(
+                auto_compact_threshold=config.auto_compact_threshold,
+                thinking=selected_thinking,
             )
         except ModelResolutionError as exc:
             raise InvalidLaunchModelError("config.model", str(exc)) from exc
-        return (
-            resolved.materialize(
-                auto_compact_threshold=config.auto_compact_threshold,
-                thinking=config.thinking_overrides.get(resolved.base_model),
-            ),
-            resolved.identity,
-        )
+        return model, resolved.identity.model_copy(update={"thinking": model.thinking})
     raise InvalidLaunchModelError(
         "config.model", "No model catalog is attached to this configuration"
     )
@@ -382,6 +388,8 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
         )
     profile_overrides = None if retained_profile is not None else profile.overrides
     profile_role = None if retained_profile is not None else profile.role
+    if profile_role is not None and not explicit_model:
+        inputs["active_model"] = f"@{profile_role}"
     orchestrator = build_child_orchestrator(
         source, profile_overrides, inputs, profile_role=profile_role
     )
@@ -437,7 +445,7 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
 
     selected_alias = staged_config.active_model
     if not selected_alias:
-        selected_alias = staged_config.resolve_default_model_alias()
+        selected_alias = "@orchestrator"
     explicit_thinking = "thinking" in semantic.model_fields_set
 
     def assignment_candidate(candidate: Any) -> bool:
@@ -447,21 +455,17 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
             candidate.base_model, candidate.deployment.provider
         ):
             return False
-        candidate_model = candidate.materialize(
-            auto_compact_threshold=staged_config.auto_compact_threshold,
-            thinking=(
-                selected_thinking
-                if selected_thinking is not None
-                else staged_config.thinking_overrides.get(candidate.base_model)
-            ),
-        )
         candidate_thinking = (
             selected_thinking
-            if selected_thinking is not None
-            else staged_config.thinking_overrides.get(
-                candidate.base_model, candidate_model.thinking
-            )
+            or candidate.thinking
+            or (committed_model.thinking if committed_model is not None else None)
+            or staged_config.thinking_overrides.get(candidate.base_model)
         )
+        candidate_model = candidate.materialize(
+            auto_compact_threshold=staged_config.auto_compact_threshold,
+            thinking=candidate_thinking,
+        )
+        candidate_thinking = candidate_model.thinking
         assert candidate_thinking is not None
         return (
             compatibility_exclusion(
@@ -483,31 +487,24 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
         None
         if committed_model is not None and not explicit_model and not explicit_profile
         else assignment_candidate,
+        selected_thinking,
     )
+    # Explicit spawn thinking is a child-only override. Role thinking remains
+    # attached to the selected preset and committed identity.
     if selected_thinking is not None:
-        # Roles resolve at assignment; overrides are keyed by their resolved base.
         inputs["thinking_overrides"] = {model.alias: selected_thinking}
         orchestrator = build_child_orchestrator(
             source, profile_overrides, inputs, profile_role=profile_role
         )
         staged_config = orchestrator.config
-        model, identity = _resolved_model(
-            staged_config,
-            selected_alias,
-            committed_model
-            if committed_model is not None
-            and not explicit_model
-            and not explicit_profile
-            else None,
-            None
-            if committed_model is not None
-            and not explicit_model
-            and not explicit_profile
-            else assignment_candidate,
-        )
-    thinking = staged_config.thinking_overrides.get(model.alias, model.thinking)
+    thinking = model.thinking
     assert thinking is not None
-    _validate_thinking(staged_config, model, thinking, explicit=explicit_thinking)
+    _validate_thinking(
+        staged_config,
+        model,
+        thinking,
+        explicit=explicit_thinking or identity.thinking is not None,
+    )
     _validate_history(staged_config, model, history)
 
     known_tools = frozenset(tool_inventory)

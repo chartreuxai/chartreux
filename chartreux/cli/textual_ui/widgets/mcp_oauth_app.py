@@ -17,10 +17,19 @@ from textual.widgets.option_list import Option
 from textual.worker import Worker
 
 from chartreux.app_server.protocol import MCPAuthUrlParams
+from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.clipboard import copy_text_to_clipboard
+from chartreux.ui.shortcut_hints import rich_theme_style, shortcut, shortcut_hint
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
-_HELP = "R Retry  Backspace Back"
+_HELP_RETRY = (
+    f"{shortcut('R')} Retry  {shortcut('Backspace')} Close  {shortcut('Esc')} Close"
+)
+_HELP_RUNNING = f"Login in progress  {shortcut('Esc')} Close"
+_STATUS_FEEDBACK_RUNNING = "Login is in progress. Press Esc to close."
+_STATUS_FEEDBACK_FAILED = (
+    "This status row cannot be activated. Use R to retry or Esc to close."
+)
 _OPTION_PADDING = "  "
 
 
@@ -44,7 +53,7 @@ class MCPOAuthApp(Container):
     can_focus_children = True
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "close", "Close", show=False),
-        Binding("backspace", "close", "Back", show=False),
+        Binding("backspace", "close", "Close", show=False),
         Binding("r", "refresh", "Retry", show=False),
     ]
 
@@ -66,7 +75,6 @@ class MCPOAuthApp(Container):
     def compose(self) -> ComposeResult:
         with Vertical(id="mcpoauth-content"):
             yield NoMarkupStatic("", id="mcpoauth-title", classes="settings-title")
-            yield NoMarkupStatic("")
             yield OptionList(id="mcpoauth-options")
             yield NoMarkupStatic("", id="mcpoauth-detail")
             yield NoMarkupStatic("", id="mcpoauth-help", classes="settings-help")
@@ -83,6 +91,13 @@ class MCPOAuthApp(Container):
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         option_id = event.option.id or ""
+        if option_id.startswith("status:"):
+            self._set_help_text(
+                _STATUS_FEEDBACK_RUNNING
+                if self._logging_in
+                else _STATUS_FEEDBACK_FAILED
+            )
+            return
         if option_id == _OAuthOptionId.OPEN:
             self._open_browser()
         elif option_id == _OAuthOptionId.COPY:
@@ -98,16 +113,29 @@ class MCPOAuthApp(Container):
             return
         self._start_login()
 
+    def _theme_style(self, role: str) -> str:
+        return (
+            rich_theme_style(self.app.theme_variables[role]) if self.is_attached else ""
+        )
+
     def _start_login(self) -> None:
         self._auth_url = None
         self._auth_url_visible = False
         self._logging_in = True
-        self._status_message = "Preparing authentication..."
+        self._status_message = "Running: Preparing authentication"
         option_list = self.query_one(OptionList)
         option_list.clear_options()
-        option_list.add_option(Option("Starting OAuth login...", disabled=True))
+        option_list.add_option(
+            Option(
+                Text(
+                    f"{chrome_glyph('running')} Running: Starting OAuth login",
+                    style=self._theme_style("primary"),
+                ),
+                id="status:running",
+            )
+        )
         self.query_one("#mcpoauth-detail", NoMarkupStatic).update("")
-        self._set_help_text(_HELP)
+        self._set_help_text(_HELP_RUNNING)
         self.run_worker(self._run_login(), exclusive=True, group="mcp_oauth_login")
 
     async def _run_login(self) -> _LoginResult:
@@ -117,6 +145,11 @@ class MCPOAuthApp(Container):
         except Exception as exc:
             return _LoginResult(authenticated=False, error=str(exc))
         return _LoginResult(authenticated=True)
+
+    def on_option_list_option_highlighted(
+        self, _event: OptionList.OptionHighlighted
+    ) -> None:
+        self._set_help_text(_HELP_RUNNING if self._logging_in else _HELP_RETRY)
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         if event.worker.group != "mcp_oauth_login" or not event.worker.is_finished:
@@ -137,16 +170,19 @@ class MCPOAuthApp(Container):
 
     def _on_auth_url_available(self, url: str) -> None:
         self._auth_url = url
-        self._status_message = "Waiting for browser sign-in..."
+        self._status_message = "Running: Waiting for browser sign-in"
         option_list = self.query_one(OptionList)
         option_list.clear_options()
         option_list.add_option(
             Option(
-                Text("This MCP server requires authentication", no_wrap=True),
-                disabled=True,
+                Text(
+                    f"{chrome_glyph('running')} Running: Waiting for browser sign-in",
+                    no_wrap=True,
+                    style=self._theme_style("primary"),
+                ),
+                id="status:waiting",
             )
         )
-        option_list.add_option(Option("", disabled=True))
         option_list.add_option(
             Option(
                 Text(
@@ -170,24 +206,38 @@ class MCPOAuthApp(Container):
         )
         option_list.highlighted = option_list.get_option_index(_OAuthOptionId.OPEN)
         self._update_detail_text()
-        self._set_help_text(_HELP)
+        self._set_help_text(_HELP_RUNNING)
 
     def _on_login_failed(self, message: str) -> None:
-        self._status_message = message
+        self._status_message = f"Failed: {message}"
         option_list = self.query_one(OptionList)
         option_list.clear_options()
         option_list.add_option(
-            Option("Authentication failed. Press R to retry.", disabled=True)
+            Option(
+                Text(
+                    f"{chrome_glyph('error')} Failed: {message}",
+                    style=self._theme_style("error"),
+                ),
+                id="status:failed",
+            )
         )
         self.query_one("#mcpoauth-detail", NoMarkupStatic).update("")
-        self._set_help_text(_HELP)
+        self._set_help_text(_HELP_RETRY)
 
     def _open_browser(self) -> None:
         if self._auth_url is None:
             return
-        webbrowser.open(self._auth_url)
-        self._status_message = "Opened in browser."
-        self._set_help_text(_HELP)
+        try:
+            opened = webbrowser.open(self._auth_url)
+        except Exception:
+            opened = False
+        self._status_message = (
+            "Opened in browser"
+            if opened
+            else "Browser could not be opened; copy or show the URL below"
+        )
+        self._update_detail_text()
+        self._set_help_text(_HELP_RUNNING if self._logging_in else _HELP_RETRY)
 
     def _copy_url(self) -> None:
         if self._auth_url is None:
@@ -204,14 +254,24 @@ class MCPOAuthApp(Container):
 
     def _update_detail_text(self) -> None:
         detail = self.query_one("#mcpoauth-detail", NoMarkupStatic)
-        parts: list[str] = []
+        text = Text()
+        status_message = self._status_message
+        if status_message == "Opened in browser":
+            text.append(
+                f"{chrome_glyph('success')} Opened in browser\n",
+                style=self._theme_style("success"),
+            )
+        elif status_message is not None and status_message.startswith(
+            "Browser could not"
+        ):
+            text.append(
+                f"{chrome_glyph('error')} {status_message}\n",
+                style=self._theme_style("error"),
+            )
         if self._auth_url_visible and self._auth_url:
-            parts.append(self._auth_url)
-            parts.append("")
-        parts.append("Once authenticated in your browser, return to Chartreux")
-        detail.update("\n".join(parts))
+            text.append(f"{self._auth_url}\n\n")
+        text.append("Once authenticated in your browser, return to Chartreux")
+        detail.update(text)
 
     def _set_help_text(self, text: str) -> None:
-        if self._status_message:
-            text = f"{self._status_message}  {text}"
-        self.query_one("#mcpoauth-help", NoMarkupStatic).update(text)
+        self.query_one("#mcpoauth-help", NoMarkupStatic).update(shortcut_hint(text))

@@ -1,0 +1,48 @@
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ MCP Server: fake-oauth                                                       │
+│  … Running: Waiting for browser sign-in                                      │
+│    Press enter to open auth in your browser                                  │
+│    Copy URL to clipboard                                                     │
+│    Manually show the URL                                                     │
+│                                                                              │
+│ ✓ Opened in browser                                                          │
+│ Once authenticated in your browser, return to Chartreux                      │
+│                                                                              │
+│ R Retry  Backspace Close  Esc Close                                          │
+└──────────────────────────────────────────────────────────────────────────────┘

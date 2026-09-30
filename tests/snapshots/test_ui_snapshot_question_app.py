@@ -73,6 +73,30 @@ def multi_select_args() -> UserQuestionRequest:
     )
 
 
+def narrow_multi_select_args() -> UserQuestionRequest:
+    return UserQuestionRequest(
+        questions=[
+            UserQuestion(
+                question=(
+                    "Choose the features for this project and review every "
+                    "available option."
+                ),
+                options=[
+                    QuestionChoice(
+                        label=f"Feature {index}",
+                        description=(
+                            "A deliberately long description that wraps at a "
+                            "narrow terminal width."
+                        ),
+                    )
+                    for index in range(1, 9)
+                ],
+                multi_select=True,
+            )
+        ]
+    )
+
+
 class QuestionAppTestApp(App):
     CSS_PATH = "../../chartreux/cli/textual_ui/app.tcss"
 
@@ -98,6 +122,11 @@ class MultiQuestionApp(QuestionAppTestApp):
 class MultiSelectApp(QuestionAppTestApp):
     def __init__(self):
         super().__init__(multi_select_args())
+
+
+class NarrowMultiSelectApp(QuestionAppTestApp):
+    def __init__(self):
+        super().__init__(narrow_multi_select_args())
 
 
 # Single question tests
@@ -285,10 +314,23 @@ def test_snapshot_multi_select_initial(snap_compare: SnapCompare) -> None:
     )
 
 
+def test_snapshot_multi_select_narrow_panel_help_visible(
+    snap_compare: SnapCompare,
+) -> None:
+    async def run_before(pilot: Pilot) -> None:
+        await pilot.pause(0.1)
+
+    assert snap_compare(
+        "test_ui_snapshot_question_app.py:NarrowMultiSelectApp",
+        terminal_size=(80, 24),
+        run_before=run_before,
+    )
+
+
 def test_snapshot_multi_select_toggle_first(snap_compare: SnapCompare) -> None:
     async def run_before(pilot: Pilot) -> None:
         await pilot.pause(0.1)
-        await pilot.press("enter")
+        await pilot.press("space")
         await pilot.pause(0.1)
 
     assert snap_compare(
@@ -301,9 +343,9 @@ def test_snapshot_multi_select_toggle_first(snap_compare: SnapCompare) -> None:
 def test_snapshot_multi_select_toggle_multiple(snap_compare: SnapCompare) -> None:
     async def run_before(pilot: Pilot) -> None:
         await pilot.pause(0.1)
-        await pilot.press("enter")
+        await pilot.press("space")
         await pilot.press("down", "down")
-        await pilot.press("enter")
+        await pilot.press("space")
         await pilot.pause(0.1)
 
     assert snap_compare(
@@ -330,7 +372,6 @@ def test_snapshot_multi_select_other_with_text(snap_compare: SnapCompare) -> Non
     async def run_before(pilot: Pilot) -> None:
         await pilot.pause(0.1)
         await pilot.press("down", "down", "down")
-        await pilot.press("enter")
         await pilot.pause(0.1)
         await pilot.press(*"Custom feature")
         await pilot.pause(0.1)
@@ -345,11 +386,10 @@ def test_snapshot_multi_select_other_with_text(snap_compare: SnapCompare) -> Non
 def test_snapshot_multi_select_mixed_selection(snap_compare: SnapCompare) -> None:
     async def run_before(pilot: Pilot) -> None:
         await pilot.pause(0.1)
-        await pilot.press("enter")
+        await pilot.press("space")
         await pilot.press("down", "down")
-        await pilot.press("enter")
+        await pilot.press("space")
         await pilot.press("down")
-        await pilot.press("enter")
         await pilot.pause(0.1)
         await pilot.press(*"Extra")
         await pilot.pause(0.1)
@@ -364,8 +404,8 @@ def test_snapshot_multi_select_mixed_selection(snap_compare: SnapCompare) -> Non
 def test_snapshot_multi_select_untoggle(snap_compare: SnapCompare) -> None:
     async def run_before(pilot: Pilot) -> None:
         await pilot.pause(0.1)
-        await pilot.press("enter")
-        await pilot.press("enter")
+        await pilot.press("space")
+        await pilot.press("space")
         await pilot.pause(0.1)
 
     assert snap_compare(

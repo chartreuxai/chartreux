@@ -15,7 +15,6 @@ from chartreux.core.llm.format import (
     ParsedMessage,
     ParsedToolCall,
 )
-from chartreux.core.subagents import TaskMemberResult
 from chartreux.core.tools.base import (
     BaseToolState,
     InvokeContext,
@@ -69,15 +68,21 @@ class TestTaskArgs:
         assert "providers_used" in prompt
         assert "committed base model" in prompt
 
-    def test_task_prompt_documents_fan_out_semantics(self) -> None:
+    def test_task_prompt_documents_single_preset_semantics(self) -> None:
         prompt = (
             Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/task.md"
         ).read_text()
+        prompt = " ".join(prompt.split())
 
-        assert "fan_out" in prompt
-        assert "@role" in prompt
-        assert "forbids `agent_id`" in prompt
-        assert "preflights every ordered role member" in prompt
+        assert '"model": "@large"' in prompt
+        assert '"model": "strong"' not in prompt
+        assert "A role such as `@large`" in prompt
+        assert "@reviewers" not in prompt
+        assert "one default model and thinking level" in prompt
+        assert (
+            "Roles are single presets. Launch separate tasks with explicit "
+            "presets/models for multiple agents."
+        ) in prompt
 
     def test_default_subagent_is_worker(self) -> None:
         args = TaskArgs(task="do something")
@@ -446,30 +451,15 @@ async def test_nested_task_is_rejected_by_tool_and_direct_runner(
         await anext(registry.run(args, nested_context))
 
 
-def test_fan_out_result_display_uses_member_status_for_launch_state() -> None:
+def test_background_task_result_display_uses_launch_handle() -> None:
     result = TaskResult(
         response="",
         turns_used=0,
         completed=True,
-        members=[
-            TaskMemberResult(
-                index=0,
-                base_model="base",
-                provider="provider",
-                display_name="provider/base",
-                status="running",
-                agent_id="agent-1",
-                run_id="run-1",
-            ),
-            TaskMemberResult(
-                index=1,
-                base_model="unavailable",
-                provider="provider",
-                display_name="provider/unavailable",
-                status="skipped",
-                error={"code": "preflight_rejected", "message": "model disabled"},
-            ),
-        ],
+        status="launched",
+        agent_id="agent-1",
+        run_id="run-1",
+        metadata={"base_model": "base", "active_provider": "provider"},
     )
     event = ToolResultEvent(
         tool_name="task", tool_class=Task, tool_call_id="task-1", result=result
@@ -478,9 +468,5 @@ def test_fan_out_result_display_uses_member_status_for_launch_state() -> None:
     display = Task.get_result_display(event)
 
     assert display.verb == "Launched"
-    assert display.message.startswith("1 agents, 1 skipped")
-    assert "Skipped unavailable: model disabled" in display.message
-    assert Task.project_result(result) == {
-        "models": ["provider/base"],
-        "skipped": ["Skipped unavailable: model disabled"],
-    }
+    assert display.message == "agent agent-1 (run run-1): provider/base"
+    assert Task.project_result(result) == {"models": ["provider/base"]}

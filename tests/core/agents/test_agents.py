@@ -31,16 +31,16 @@ class TestAgentProfile:
             "thinking",
         ),
         [
-            (WORKER, "small-worker", "worker", None, None, None),
+            (WORKER, "medium", "worker", None, None, None),
             (
                 ADVISOR,
+                "large",
                 "advisor",
-                "advisor",
-                ["read_file", "grep", "web_search", "web_fetch"],
+                ["read_file", "grep", "web_search", "web_fetch", "skill"],
                 0,
                 None,
             ),
-            (REVIEWER, "small-reviewer", "reviewer", None, None, None),
+            (REVIEWER, "medium", "reviewer", None, None, None),
         ],
     )
     def test_builtin_profiles_have_role_prompt_and_tools(
@@ -71,11 +71,11 @@ class TestAgentProfile:
 
     def test_profile_role_is_metadata_not_an_override(self, tmp_path: Path) -> None:
         profile_path = tmp_path / "worker.toml"
-        profile_path.write_text('role = "small-worker"\n', encoding="utf-8")
+        profile_path.write_text('role = "custom-worker"\n', encoding="utf-8")
 
         profile = AgentProfile.from_toml(profile_path)
 
-        assert profile.role == "small-worker"
+        assert profile.role == "custom-worker"
         assert profile.overrides == {}
 
     def test_profile_role_with_at_sign_is_rejected(self, tmp_path: Path) -> None:
