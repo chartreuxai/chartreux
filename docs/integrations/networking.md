@@ -42,7 +42,9 @@ trust store.
 
 ## Applying changes
 
-A newly started CLI process reads its environment and `.env` values at startup.
+Normal CLI startup reads its environment and `.env` values. Bare
+`chartreux doctor` does not load `.env` or make network requests; `--live` and
+`--smoke` load it as normal startup does before their opt-in requests.
 The ACP entrypoint also loads dotenv at startup, so changing `.env` requires
 restarting the ACP process or having the ACP client launch a new one. This is not
 a browser sign-in flow. See [ACP](acp.md) and the [configuration reference](../reference/configuration.md#environment-variables-and-env).

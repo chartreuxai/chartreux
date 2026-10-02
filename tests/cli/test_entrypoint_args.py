@@ -114,6 +114,19 @@ def test_suggest_worktree_name_reads_the_dotenv_before_asking(
     get_harness_files_manager()
 
 
+def test_doctor_dispatches_before_interactive_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr("sys.argv", ["chartreux", "doctor", "--json"])
+    monkeypatch.setattr("chartreux.cli.doctor_command.run_doctor_cli", calls.append)
+    monkeypatch.setattr(
+        entrypoint, "parse_arguments", lambda: pytest.fail("interactive startup")
+    )
+    entrypoint.main()
+    assert calls == [["--json"]]
+
+
 def test_suggest_worktree_name_skips_the_model_without_a_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -125,3 +138,28 @@ def test_suggest_worktree_name_skips_the_model_without_a_prompt(
     )
 
     assert entrypoint._suggest_worktree_name(None) is None
+
+
+def test_doctor_help_stays_light_in_fresh_process() -> None:
+    import subprocess
+    import sys
+
+    code = """
+import sys
+from chartreux.cli.entrypoint import main
+sys.argv = ["chartreux", "doctor", "--help"]
+try:
+    main()
+except SystemExit as exc:
+    assert exc.code == 0
+assert not any(n == "pydantic" or n.startswith("chartreux.core.config") for n in sys.modules)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "billable" in result.stdout

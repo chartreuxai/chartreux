@@ -267,6 +267,7 @@ class TrustedFoldersManager:
         self._untrusted: list[str] = []
         self._session_trusted: list[str] = []
         self._session_trust_grants: dict[str, list[str]] = {}
+        self.load_error: str | None = None
         self._load()
 
     def trust_for_session(
@@ -323,21 +324,32 @@ class TrustedFoldersManager:
             raise ValueError("Workspace changed before trust could be persisted")
 
     def _load(self) -> None:
+        # Imports and diagnostic config loading must never create or repair files.
+        # Only explicit trust decisions persist through _save().
+        self.load_error = None
         if not self._file_path.is_file():
             self._trusted = []
             self._untrusted = []
-            self._save()
+            self.load_error = "trust store missing"
             return
 
         try:
             with self._file_path.open("rb") as f:
                 data = tomllib.load(f)
-            self._trusted = list(data.get("trusted", []))
-            self._untrusted = list(data.get("untrusted", []))
-        except (OSError, tomllib.TOMLDecodeError):
+            trusted = data.get("trusted", [])
+            untrusted = data.get("untrusted", [])
+            if not all(
+                isinstance(entries, list)
+                and all(isinstance(entry, str) for entry in entries)
+                for entries in (trusted, untrusted)
+            ):
+                raise ValueError("invalid trust decisions")
+            self._trusted = list(trusted)
+            self._untrusted = list(untrusted)
+        except (OSError, ValueError):
             self._trusted = []
             self._untrusted = []
-            self._save()
+            self.load_error = "trust store invalid or unreadable"
 
     def _save(self) -> None:
         self._file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -347,6 +359,8 @@ class TrustedFoldersManager:
                 tomli_w.dump(data, f)
         except OSError:
             pass
+        else:
+            self.load_error = None
 
     def _closest_decision(self, path: Path) -> tuple[bool, Path] | None:
         """``(trusted, ancestor)`` for the closest decision, ``None`` if undecided."""

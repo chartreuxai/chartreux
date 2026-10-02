@@ -30,8 +30,38 @@ prompt, prints a response, and exits.
 | Command | Options |
 | --- | --- |
 | `chartreux models migrate [--preview \| --apply]` | Preview (default) or move legacy catalog tables to `models.toml`. |
+| `chartreux doctor [--live] [--smoke] [--provider ID] [--model BASE] [--json]` | Read-only diagnostics; see tiers below. |
 | `chartreux mcp remove NAME` | Remove a user-configured MCP server. |
 | `chartreux mcp add NAME` | `--transport {streamable-http,stdio}` (default `streamable-http`), `--url`, `--command`, repeatable `--arg VALUE`, repeatable `--env NAME=VALUE`, repeatable `--header NAME=VALUE`, `--api-key-env VAR` (also `--bearer-token-env-var`), `--api-key-header HEADER`, `--api-key-format FORMAT`, `--no-login`, `--startup-timeout-sec SECONDS`, `--tool-timeout-sec SECONDS`. Remote servers require `--url`; stdio servers require `--command`. |
+
+### Doctor
+
+Bare `chartreux doctor` validates local trusted configuration, the catalog,
+model selection, credential provenance, and MCP configuration. It makes no
+network requests, launches no processes, does not read the app's `.env`, and does
+not inspect keyring credentials. Untrusted project configuration is ignored and reported.
+Both `--live` and `--smoke` load the app's `.env` into the process environment as
+normal startup does, including normalizing its permissions to owner-only; existing
+non-empty process environment values take precedence.
+`--live` lists provider metadata and initializes/lists tools from configured MCP
+servers (including launching stdio servers). It may read keyring credentials;
+OAuth checks inspect stored fingerprint/expiry only, never refresh or log in,
+and skip runtime listing. Empty MCP tool lists are healthy.
+`--smoke` sends billable tool, thinking, and image capability probes to **one**
+enabled deployment. Supply `--provider ID` and/or `--model BASE`; these options
+require `--smoke`, and ambiguous selections are rejected with candidates.
+Explicit `--provider`/`--model` selection
+bypasses `config.allowed_models`: diagnostics probe the selected deployment
+regardless of the agent-allowed set. `--live` and `--smoke` are independent.
+No mode creates or repairs configuration, persists trust, or writes sessions.
+Skipped, unsupported, and unverified results are not passes or failures.
+`--json` emits only JSON on stdout: a `checks` array of objects with `name`,
+`status`, and `reason`, plus `exit_code`. Exit codes: `0` no failed checks,
+`1` failed checks, `2` invalid invocation. Redirected stdio is supported.
+For worked checks and capability verdicts, see [Troubleshooting](../guides/troubleshooting.md#run-diagnostics)
+and [Smoke-testing a deployment](../guides/models.md#smoke-testing-a-deployment).
+
+### Other entry points
 
 `chartreux-acp` accepts no argument for stdio operation, plus `-h`/`--help`,
 `-v`/`--version`, and `--setup`. `chartreux-app-server` is a stdio JSON-RPC

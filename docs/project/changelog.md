@@ -2,6 +2,29 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.4.1 (unreleased)
+
+### Added
+
+- A `[subagents].max_running_subagents` configuration setting for the active-work
+  admission cap, also available through the standard environment override.
+- `chartreux doctor` with local bare checks, opt-in `--live` readiness checks,
+  billable `--smoke` probes, and `--json` output. Exit codes are 0 for no failed
+  checks, 1 for failed checks, and 2 for invalid invocations.
+- Provider smoke probes with tool, thinking, and image capability verdicts.
+- Retry-budget audit regression tests.
+
+### Changed
+
+- Backends accept an optional pre-resolved credential for isolated diagnostics.
+
+### Fixed
+
+- OpenAI Responses non-streaming truncation is surfaced as `StopInfo`.
+- Doctor validates runtime provider configuration, suppresses credential-bearing
+  MCP SDK logs, and matches runtime environment-only MCP static authentication.
+- Successful trust-store repairs clear stale load-error state.
+
 ## 0.4.0 (unreleased)
 
 ### Added

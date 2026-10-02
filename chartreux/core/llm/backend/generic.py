@@ -15,6 +15,7 @@ from chartreux.core.config._defaults import (
     DEFAULT_API_TIMEOUT,
     DEFAULT_API_WRITE_TIMEOUT,
 )
+from chartreux.core.config.models import MissingAPIKeyError
 from chartreux.core.llm.backend._image import to_data_uri as _to_data_uri
 from chartreux.core.llm.backend._tool_images import has_tool_images, project_tool_images
 from chartreux.core.llm.backend.anthropic import AnthropicAdapter
@@ -26,6 +27,7 @@ from chartreux.core.llm.backend.base import (
     build_chat_payload,
     finalize_chat_request,
 )
+from chartreux.core.llm.backend.factory import CredentialResolution, ResolvedCredential
 from chartreux.core.llm.backend.openai_responses import (
     OpenAIResponsesAdapter,
     OpenAIResponsesStreamError,
@@ -294,6 +296,7 @@ class GenericBackend:
         enable_system_trust_store: bool = False,
         on_retry: RetryObserver | None = None,
         pacer: AdaptivePacer | None = None,
+        resolved_credential: ResolvedCredential = CredentialResolution.UNRESOLVED,
     ) -> None:
         """Initialize the backend.
 
@@ -309,6 +312,9 @@ class GenericBackend:
                 one to tune the schedule or to stub timing in tests.
         """
         validate_api_style(provider.api_style)
+        if resolved_credential is None and provider.api_key_env_var:
+            raise MissingAPIKeyError(provider.api_key_env_var, provider.name)
+        self._resolved_credential = resolved_credential
         self._client = client
         self._owns_client = client is None
         self._enable_system_trust_store = enable_system_trust_store
@@ -431,7 +437,11 @@ class GenericBackend:
         extra_headers: dict[str, str] | None = None,
         metadata: dict[str, str] | None = None,
     ) -> LLMChunk:
-        resolved_api_key = resolve_api_key_with_origin(self._provider.api_key_env_var)
+        resolved_api_key = (
+            resolve_api_key_with_origin(self._provider.api_key_env_var)
+            if isinstance(self._resolved_credential, CredentialResolution)
+            else self._resolved_credential
+        )
         api_key, api_key_origin = resolved_api_key or (None, None)
 
         api_style = getattr(self._provider, "api_style", "openai")
@@ -537,7 +547,11 @@ class GenericBackend:
         extra_headers: dict[str, str] | None = None,
         metadata: dict[str, str] | None = None,
     ) -> AsyncGenerator[LLMChunk, None]:
-        resolved_api_key = resolve_api_key_with_origin(self._provider.api_key_env_var)
+        resolved_api_key = (
+            resolve_api_key_with_origin(self._provider.api_key_env_var)
+            if isinstance(self._resolved_credential, CredentialResolution)
+            else self._resolved_credential
+        )
         api_key, api_key_origin = resolved_api_key or (None, None)
 
         api_style = getattr(self._provider, "api_style", "openai")

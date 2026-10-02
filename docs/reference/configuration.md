@@ -61,6 +61,9 @@ The built-in read/edit/write/image/grep configurations include sensitive pattern
 | `disabled_skills` | `[]` | Skill-name patterns; ignored when `enabled_skills` is set. |
 | `[subagents].idle_ttl_seconds` | `3600` | Integer seconds, at least 0. |
 | `[subagents].max_idle_agents` | `16` | Integer, at least 0. |
+| `[subagents].max_running_subagents` | `16` | Strict positive integer, at least 1. Active-work admission cap set in `config.toml` or via `CHARTREUX_SUBAGENTS__MAX_RUNNING_SUBAGENTS`; excluded from the settings-UI catalog. |
+
+The active-work cap counts foreground and background runs, including reuse and pending child creation, but not idle retained agents. The root session's effective configuration controls admission; child configuration does not. Accepted configuration changes affect later admissions without stopping existing work. Completion, cancellation, release, or failed creation frees capacity.
 
 ### Interface, prompts, and project context
 
@@ -179,7 +182,7 @@ thinking = "high"
 
 ## Environment variables and `.env`
 
-`$CHARTREUX_HOME/.env` is loaded at entrypoint startup. A non-empty process environment value wins; an unset or empty process value may be filled by a non-empty `.env` value. Restart a long-running client after changing `.env`.
+`$CHARTREUX_HOME/.env` is loaded at normal entrypoint startup and by `chartreux doctor --live` or `--smoke`, but never by bare `chartreux doctor`. A non-empty process environment value wins; an unset or empty process value may be filled by a non-empty `.env` value. Restart a long-running client after changing `.env`.
 
 | Variable | Purpose |
 | --- | --- |

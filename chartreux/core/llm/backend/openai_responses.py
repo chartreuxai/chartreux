@@ -784,6 +784,9 @@ class OpenAIResponsesAdapter(APIAdapter):
                 usage=self._stream_parser._usage_from_response(
                     response_data.get("usage")
                 ),
+                stop=StopInfo(reason="incomplete")
+                if response_data.get("status") == "incomplete"
+                else None,
             )
 
         return self._stream_parser.parse(data)

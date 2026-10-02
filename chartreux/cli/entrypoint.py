@@ -33,6 +33,7 @@ def parse_arguments() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Commands:\n"
+            "  doctor         Run read-only diagnostics (chartreux doctor --help).\n"
             "  mcp            Manage MCP server configuration (chartreux mcp --help).\n"
             "  models         Manage the model catalog (chartreux models --help).\n"
             "\n"
@@ -393,6 +394,12 @@ def _set_process_title() -> None:
 
 def main() -> None:
     _set_process_title()
+
+    if sys.argv[1:2] == ["doctor"]:
+        from chartreux.cli.doctor_command import run_doctor_cli
+
+        run_doctor_cli(sys.argv[2:])
+        return
 
     if sys.argv[1:2] == ["models"]:
         from chartreux.core.model_catalog.migration import run_models_cli

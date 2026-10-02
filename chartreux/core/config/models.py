@@ -81,6 +81,7 @@ class SubagentsConfig(BaseModel):
 
     idle_ttl_seconds: int = Field(default=3600, ge=0, strict=True)
     max_idle_agents: int = Field(default=16, ge=0, strict=True)
+    max_running_subagents: int = Field(default=16, ge=1, strict=True)
 
 
 class SessionLoggingConfig(BaseSettings):

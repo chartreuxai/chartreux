@@ -50,6 +50,17 @@ MCP OAuth remains supported. Use `/mcp login <name>` to authenticate or retry au
 
 For command options, use `chartreux mcp add --help` and see the [command reference](../reference/commands.md).
 
+## Checking readiness
+
+`chartreux doctor` validates MCP configuration locally without connecting or
+starting processes. To opt in to initialization and tool listing, run
+`chartreux doctor --live`. It loads the app's `.env`, connects to enabled
+static-auth HTTP servers, and launches enabled stdio servers. An empty tool
+list is healthy. OAuth servers only have stored fingerprint/expiry inspected;
+doctor does not log in, refresh tokens, or list their tools. Use `/mcp login`
+for authentication repair. See [Troubleshooting](troubleshooting.md#run-diagnostics)
+for the diagnostic tiers and exit codes.
+
 ## Runtime behavior
 
 HTTP calls are one-shot. Stdio connections are persistent and serialized for the current session. A transport failure is ambiguous: Chartreux does not automatically replay the operation, and cancellation cannot undo a remote effect that already happened. Anonymous HTTP descriptor information may be cached; authenticated HTTP and all stdio contexts are session-only.

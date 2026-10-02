@@ -5,7 +5,7 @@ Chartreux is an independent, local-first derivative of Mistral Vibe v2.25.5. It 
 ## Removed or no longer offered
 
 - There is no Chartreux provider account flow or application-level sign-in/sign-out. MCP OAuth login and logout remain available for MCP servers.
-- Configuration is file-based; Chartreux has no general settings UI.
+- Configuration remains file-based; `/settings` edits curated settings. Some keys, including `subagents.max_running_subagents`, require TOML or environment overrides.
 - The Vertex provider and the dedicated reasoning adapter are removed. Use a supported Mistral, generic OpenAI-style, OpenAI Responses, or Anthropic-style provider definition instead.
 - OpenRouter and OpenCode Zen presets are not shipped; the OpenCode Go preset remains available.
 - Extra upstream themes are gone: use `auto`, `light`, or `dark`.

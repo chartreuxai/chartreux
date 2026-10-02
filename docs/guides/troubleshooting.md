@@ -1,5 +1,43 @@
 # Troubleshooting
 
+## Run diagnostics
+
+Start with local checks from the project directory:
+
+```bash
+chartreux doctor
+```
+
+This validates the catalog, trusted configuration, model resolution, credential
+provenance, and MCP configuration without network requests, subprocesses, or
+paid inference. It never reads `.env` or keyring credentials. A credential marked
+`unverified` may still be available through one of those sources at startup.
+Untrusted project configuration is ignored and reported; doctor does not grant
+trust or repair configuration.
+
+To check provider metadata and MCP runtime readiness, opt in explicitly:
+
+```bash
+chartreux doctor --live
+```
+
+This loads the app's `.env` as normal startup does and may resolve keyring
+credentials. It makes provider metadata requests and initializes/lists tools
+from enabled MCP servers, including launching configured stdio processes.
+OAuth servers only have stored fingerprint/expiry checked: doctor does not log
+in, refresh tokens, or list their tools. An empty MCP tool list is healthy;
+unsupported provider model listing is `unverified`, not a failure.
+
+Metadata listing does not establish inference capability. For a billable probe
+of one configured deployment, see [Smoke-testing a deployment](models.md#smoke-testing-a-deployment).
+`--live` and `--smoke` are independent; neither implies the other.
+
+Use `--json` for machine-readable output. Exit codes are `0` for no failed
+checks, `1` for failed checks, and `2` for an invalid invocation or ambiguous
+smoke target. Exit `0` does not turn skipped, unsupported, or unverified checks
+into passes. See the [doctor reference](../reference/commands.md#doctor) for
+options and side effects.
+
 ## Check the local state
 
 Chartreux keeps its local state under `~/.chartreux` by default (or the path in

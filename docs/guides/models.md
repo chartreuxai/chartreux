@@ -46,6 +46,42 @@ Provider definitions may supply extra headers and mark an endpoint as not emitti
 
 Legacy catalog tables in `config.toml` are rejected. Preview migration with `chartreux models migrate`; apply it with `chartreux models migrate --apply`.
 
+## Smoke-testing a deployment
+
+After configuring a provider and model, use doctor to test inference capability:
+
+```bash
+chartreux doctor --smoke --provider example-openai --model example-model
+```
+
+Replace the example names with your provider ID and canonical base-model name,
+not the deployment's wire name or a role expression. `--provider` and/or
+`--model` must select exactly one enabled deployment; ambiguous targets are
+rejected with candidates. This explicit diagnostic selection bypasses
+`allowed_models` by design.
+
+**Smoke probes send billable inference requests.** They load the app's `.env`
+as normal startup does and may resolve keyring credentials. The probe uses
+synthetic prompts, a synthetic tool that is never executed, and an in-memory
+image fixture, not project files. It tests the selected deployment directly,
+without retries, failover, or saving catalog changes or sessions. It does not
+list provider metadata or launch MCP servers unless `--live` is also supplied.
+
+Each capability (`tool`, `thinking`, and `image`) has a separate verdict:
+
+| Verdict | Meaning |
+| --- | --- |
+| `pass` | The expected tool call or image answer was observed, or thinking returned observable reasoning. |
+| `fail` | The request failed, timed out, was truncated, or did not return the expected tool/image result. |
+| `unsupported` | The deployment declares no image support, or no non-off thinking level can be encoded within its declared supported levels. That capability is not requested. |
+| `unverified` | The thinking request was accepted without observable reasoning; opaque/encrypted reasoning alone does not verify it. |
+
+Image and thinking checks respect the deployment's declared capabilities; a
+smoke result does not discover or update them. A successful metadata listing
+with `chartreux doctor --live` is not evidence that these inference capabilities
+work. See [Troubleshooting](troubleshooting.md#run-diagnostics) for local and
+live checks, JSON output, and exit codes.
+
 ## Linked deployments, priority, and failover
 
 Give one base model deployments at more than one provider to represent the same model across endpoints. Their order is the provider-preference order. A completion remains committed to its selected base model and may fail over only to another eligible deployment of that same model after a transient failure.

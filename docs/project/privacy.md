@@ -28,6 +28,15 @@ MCP OAuth can also open a browser for the configured server's authorization flow
 
 ## Local diagnostics
 
+Bare `chartreux doctor` makes no network requests, launches no subprocesses,
+and never reads `.env` or keyring credentials. Opt-in `--live` checks request
+provider metadata and initialize/list tools from configured MCP servers;
+`--smoke` sends billable synthetic inference probes to one selected deployment.
+Both opt-in modes load the app's `.env` as normal startup does and may read
+keyring credentials. Doctor does not write sessions or persist trust. See
+[Troubleshooting](../guides/troubleshooting.md#run-diagnostics) for the limits
+and OAuth exceptions.
+
 Local session and diagnostic logs, plus token and cost accounting, remain available so you can inspect failures and usage without a hosted analytics service. Adjust logging through `log_level` in `config.toml` or the `/log-level` command. Treat logs and session transcripts as potentially sensitive project and prompt data when choosing backups, sharing diagnostics, or deleting local storage.
 
 For the governing design decision, see [ADR 0008: Feature instrumentation](../adr/0008-feature-instrumentation.md).

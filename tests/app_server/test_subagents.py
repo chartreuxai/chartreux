@@ -224,13 +224,15 @@ async def test_running_subagent_cap_excludes_idle_and_frees_capacity(
     monkeypatch.setattr(
         "chartreux.core.agent_loop._loop.create_backend", create_backend
     )
-    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
-    registry = SessionRuntimeRegistry(
-        AsyncMock(), AsyncMock(), lambda _: 0, max_running_subagents=1
-    )
+    config = _config()
+    config.subagents.max_running_subagents = 1
+    parent = build_test_agent_loop(config=config, backend=FakeBackend())
+    registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
     registry.bind_root(registry._build_child_runtime(parent))
     ctx = InvokeContext(tool_call_id="cap", session_id=parent.session_id)
     args = TaskArgs(task="work", agent="worker", background=True)
+    create_child = AsyncMock(wraps=registry._runtime_factory.create_child)
+    monkeypatch.setattr(registry._runtime_factory, "create_child", create_child)
     try:
         first = await _background_result(registry, args, ctx)
         assert first.agent_id is not None and first.run_id is not None
@@ -249,7 +251,7 @@ async def test_running_subagent_cap_excludes_idle_and_frees_capacity(
                     ),
                     timeout=1,
                 )
-        assert len(backends) == 1  # Rejection happens before allocating a child.
+        assert create_child.await_count == 1  # Rejected before child allocation.
 
         backends[0].release.set()
         await registry.wait_for_agent(first.agent_id, first.run_id)
@@ -263,6 +265,7 @@ async def test_running_subagent_cap_excludes_idle_and_frees_capacity(
             await _background_result(
                 registry, args.model_copy(update={"agent_id": first.agent_id}), ctx
             )
+        assert create_child.await_count == 2
         if finish == "release":
             await registry.release_agent(second.agent_id)
         else:
@@ -280,12 +283,15 @@ async def test_running_subagent_cap_excludes_idle_and_frees_capacity(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
 async def test_foreground_subagent_consumes_cap_until_completion(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, cancel: bool
 ) -> None:
     backend = BlockingBackend()
     registry, parent = await _foreground_registry(monkeypatch, backend)
-    registry._max_running_subagents = 1
+    config = parent.config.model_copy(deep=True)
+    config.subagents.max_running_subagents = 1
+    set_agent_config(parent, config)
     launch = asyncio.create_task(_foreground_result(registry, parent, "foreground"))
     try:
         await asyncio.wait_for(backend.started.wait(), timeout=5)
@@ -295,8 +301,15 @@ async def test_foreground_subagent_consumes_cap_until_completion(
                 TaskArgs(task="more", agent="worker", background=True),
                 InvokeContext(tool_call_id="more", session_id=parent.session_id),
             )
+        if cancel:
+            launch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await launch
+        else:
+            backend.release.set()
+            assert (await launch).completed
         backend.release.set()
-        assert (await launch).completed
+        await asyncio.gather(*registry._teardown_tasks)
         assert (await _foreground_result(registry, parent, "next")).completed
         assert not registry._active_work_slots
     finally:
@@ -307,13 +320,14 @@ async def test_foreground_subagent_consumes_cap_until_completion(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
 async def test_subagent_cap_reserves_pending_creation_and_rolls_back_failure(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, cancel: bool
 ) -> None:
-    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
-    registry = SessionRuntimeRegistry(
-        AsyncMock(), AsyncMock(), lambda _: 0, max_running_subagents=1
-    )
+    config = _config()
+    config.subagents.max_running_subagents = 1
+    parent = build_test_agent_loop(config=config, backend=FakeBackend())
+    registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
     registry.bind_root(registry._build_child_runtime(parent))
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -331,9 +345,16 @@ async def test_subagent_cap_reserves_pending_creation_and_rolls_back_failure(
         await asyncio.wait_for(entered.wait(), timeout=5)
         with pytest.raises(RuntimeError, match="cap 1"):
             await asyncio.wait_for(_background_result(registry, args, ctx), timeout=1)
+        if cancel:
+            launch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await launch
+        else:
+            release.set()
+            with pytest.raises(RuntimeError, match="creation failed"):
+                await launch
+        assert not registry._active_work_slots
         release.set()
-        with pytest.raises(RuntimeError, match="creation failed"):
-            await launch
         with pytest.raises(RuntimeError, match="creation failed"):
             await _background_result(registry, args, ctx)
         assert not registry._active_work_slots
@@ -342,6 +363,111 @@ async def test_subagent_cap_reserves_pending_creation_and_rolls_back_failure(
         await asyncio.gather(launch, return_exceptions=True)
         await registry.close()
         await parent.aclose()
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.0, "1"])
+def test_subagent_cap_constructor_rejects_invalid_overrides(value: Any) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        SessionRuntimeRegistry(
+            AsyncMock(), AsyncMock(), lambda _: 0, max_running_subagents=value
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [None, 16])
+async def test_subagent_cap_root_config_replacement_and_override_precedence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, override: int | None
+) -> None:
+    from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+    from chartreux.core.config.layers.overrides import OverridesLayer
+    from chartreux.core.config.layers.user import UserConfigLayer
+    from chartreux.core.config.orchestrator import ConfigOrchestrator
+    from tests.stubs.fake_mcp_registry import FakeMCPRegistry
+
+    backend = BlockingBackend()
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: backend
+    )
+    path = tmp_path / "config.toml"
+    path.write_text("[subagents]\nmax_running_subagents = 2\n")
+    user = UserConfigLayer(path=path)
+    orchestrator = await ConfigOrchestrator.create(
+        schema=ChartreuxConfigSchema,
+        layers=[OverridesLayer(data=_config().model_dump(exclude_unset=True)), user],
+        default_layer_resolver=lambda: user,
+    )
+    parent = AgentLoop(
+        config_orchestrator=orchestrator,
+        backend=FakeBackend(),
+        mcp_registry=FakeMCPRegistry(),
+    )
+    registry = SessionRuntimeRegistry(
+        AsyncMock(), AsyncMock(), lambda _: 0, max_running_subagents=override
+    )
+    registry.bind_root(registry._build_child_runtime(parent))
+    args = TaskArgs(task="work", agent="worker", background=True)
+    ctx = InvokeContext(tool_call_id="config-cap", session_id=parent.session_id)
+    try:
+        first = await _background_result(registry, args, ctx)
+        assert first.agent_id is not None and first.run_id is not None
+        await asyncio.wait_for(backend.started.wait(), timeout=5)
+        child = registry._agent_records[first.agent_id].runtime.agent_loop
+        child_config = child.config.model_copy(deep=True)
+        child_config.subagents.max_running_subagents = 1
+        set_agent_config(child, child_config)
+        # A child cap of one does not prevent a second root-admitted run.
+        second = await _background_result(registry, args, ctx)
+        assert second.agent_id is not None and second.run_id is not None
+        path.write_text("[subagents]\nmax_running_subagents = 1\n")
+        await orchestrator.reload()
+        assert len(registry._active_work_slots) == 2
+        assert not backend.stopped.is_set()
+        if override is None:
+            with pytest.raises(RuntimeError, match="cap 1"):
+                await _background_result(registry, args, ctx)
+            path.write_text("[subagents]\nmax_running_subagents = 3\n")
+            await orchestrator.reload()
+        # Explicit 16 remains distinct from the unset constructor sentinel.
+        third = await _background_result(registry, args, ctx)
+        assert third.agent_id is not None
+        assert len(registry._active_work_slots) == 3
+    finally:
+        backend.release.set()
+        await registry.close()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_bare_registry_subagent_cap_defaults_to_sixteen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    count = 0
+
+    async def admitted(self, args, ctx, slot, **kwargs):
+        nonlocal count
+        count += 1
+        if count == 16:
+            entered.set()
+        await release.wait()
+        yield TaskResult(completed=True, response="done", turns_used=1)
+
+    monkeypatch.setattr(SessionRuntimeRegistry, "_run_admitted", admitted)
+    args = TaskArgs(task="work", agent="worker", background=True)
+    ctx = InvokeContext(tool_call_id="bare", session_id="bare")
+    launches = [
+        asyncio.create_task(_background_result(registry, args, ctx)) for _ in range(16)
+    ]
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        with pytest.raises(RuntimeError, match=r"16 agents already running \(cap 16\)"):
+            await _background_result(registry, args, ctx)
+    finally:
+        release.set()
+        await asyncio.gather(*launches)
+    assert not registry._active_work_slots
 
 
 def _todo_call(call_id: str) -> ToolCall:
@@ -1915,6 +2041,7 @@ async def test_dispatch_and_eviction_race_has_a_deterministic_winner() -> None:
     clock = _ManualClock()
     registry = _retention_registry(clock)
     root = MagicMock()
+    root.agent_loop.config.subagents.max_running_subagents = 16
     root.agent_loop.session_id = "root"
     root.agent_loop._session_generation = 0
     root.turns._projector = None
@@ -2048,6 +2175,7 @@ async def test_wait_for_expired_run_raises_typed_error() -> None:
 async def test_reuse_lifecycle_errors_are_typed_and_do_not_substitute_agents() -> None:
     registry = _retention_registry()
     root = MagicMock()
+    root.agent_loop.config.subagents.max_running_subagents = 16
     root.agent_loop.session_id = "root"
     root.agent_loop._session_generation = 0
     root.turns._projector = None
@@ -2247,6 +2375,7 @@ def _reaper_registry(
         wakeup=wakeup or _GatedWakeup(),
     )
     root = MagicMock()
+    root.agent_loop.config.subagents.max_running_subagents = 16
     root.agent_loop.session_id = "root"
     root.agent_loop._session_generation = generation
     root.agent_loop.config.subagents.idle_ttl_seconds = ttl

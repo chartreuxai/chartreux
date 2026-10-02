@@ -78,6 +78,14 @@ using onboarding:
 export MISTRAL_API_KEY="your-api-key"
 ```
 
+## Check setup
+
+Run `chartreux doctor` from the project directory to validate local
+configuration and model selection without network requests or subprocesses.
+Bare doctor does not read `.env` or keyring credentials, so an `unverified`
+credential is not necessarily missing. For opt-in live checks and billable
+provider smoke probes, see [Troubleshooting](guides/troubleshooting.md#run-diagnostics).
+
 ## Next steps
 
 Type a request at the interactive prompt, for example: `Find the test that

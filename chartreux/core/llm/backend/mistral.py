@@ -45,12 +45,14 @@ from chartreux.core.config._defaults import (
     DEFAULT_API_TIMEOUT,
     DEFAULT_API_WRITE_TIMEOUT,
 )
+from chartreux.core.config.models import MissingAPIKeyError
 from chartreux.core.llm.backend._image import to_data_uri as _to_data_uri
 from chartreux.core.llm.backend._tool_images import has_tool_images, project_tool_images
 from chartreux.core.llm.backend.base import (
     MODEL_HTTP_KEEPALIVE_EXPIRY_SECONDS,
     get_thinking_wire_value,
 )
+from chartreux.core.llm.backend.factory import CredentialResolution, ResolvedCredential
 from chartreux.core.llm.exceptions import BackendError, BackendErrorBuilder
 from chartreux.core.llm.thinking_levels import (
     MISTRAL_THINKING_LEVELS,
@@ -310,6 +312,7 @@ class MistralBackend:
         pool_timeout: float = DEFAULT_API_POOL_TIMEOUT,
         enable_system_trust_store: bool = False,
         on_retry: RetryObserver | None = None,
+        resolved_credential: ResolvedCredential = CredentialResolution.UNRESOLVED,
     ) -> None:
         self._client: Mistral | None = None
         self._http_client: ChartreuxAsyncHTTPClient | None = None
@@ -323,7 +326,14 @@ class MistralBackend:
         self._on_retry = on_retry
         self._loop: asyncio.AbstractEventLoop | None = None
         self._mapper = MistralMapper()
-        resolved_api_key = resolve_api_key_with_origin(self._provider.api_key_env_var)
+        if resolved_credential is None and provider.api_key_env_var:
+            raise MissingAPIKeyError(provider.api_key_env_var, provider.name)
+        resolved_api_key = (
+            resolve_api_key_with_origin(self._provider.api_key_env_var)
+            if isinstance(resolved_credential, CredentialResolution)
+            else resolved_credential
+        )
+        self._credential_explicitly_absent = resolved_credential is None
         self._api_key = resolved_api_key[0] if resolved_api_key else None
         self._api_key_origin: ApiKeyOrigin | None = (
             resolved_api_key[1] if resolved_api_key else None
@@ -486,7 +496,11 @@ class MistralBackend:
             ),
         )
         client = Mistral(
-            api_key=self._api_key,
+            # A callable constructs explicit Security even when its key is absent,
+            # bypassing the SDK's environment fallback without sending a header.
+            api_key=(lambda: None)
+            if self._credential_explicitly_absent
+            else self._api_key,
             server_url=self._server_url,
             timeout_ms=int(self._timeout * 1000),
             # mistralai 2.6.0 accepts ``None`` as OptionalNullable and stores it

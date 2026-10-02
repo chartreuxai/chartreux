@@ -100,6 +100,7 @@ class DiscoveryError:
     code: DiscoveryErrorCode
     message: str
     diagnostics: tuple[str, ...] = ()
+    listing_unsupported: bool = False
 
 
 @dataclass(frozen=True, slots=True)

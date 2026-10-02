@@ -448,6 +448,30 @@ class TestPrepareRequest:
 
 
 class TestParseNonStreamingResponse:
+    @pytest.mark.parametrize("status", ["incomplete", "completed"])
+    def test_non_streaming_truncation_status(self, adapter, provider, status):
+        data = {
+            "object": "response",
+            "status": status,
+            "incomplete_details": {"reason": "max_output_tokens"}
+            if status == "incomplete"
+            else None,
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "red"}],
+                }
+            ],
+        }
+        chunk = adapter.parse_response(data, provider)
+        assert chunk.message.content == "red"
+        if status == "incomplete":
+            assert chunk.stop is not None
+            assert chunk.stop.reason == "incomplete"
+        else:
+            assert chunk.stop is None
+
     def test_simple_text_response(self, adapter, provider):
         data = {
             "id": "resp_123",

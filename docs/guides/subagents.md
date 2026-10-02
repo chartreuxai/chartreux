@@ -114,6 +114,32 @@ tombstone and stored results, so `get_agent_result` remains usable after
 eviction. Result expiry is separate: each root generation retains at most 32
 unreferenced stored results. Release subagents when you are done.
 
+## Active-work admission cap
+
+By default, at most 16 subagent runs can be active under a root session. The cap
+counts foreground and background work, including retasking idle agents and
+pending child creation; idle retained agents do not count. A launch or retask
+at capacity is rejected immediately rather than queued. Wait for active work
+to finish before trying again.
+
+Set the cap in `config.toml`:
+
+```toml
+[subagents]
+max_running_subagents = 16
+```
+
+The value must be a strict positive integer (at least 1); booleans, strings,
+and fractional values are invalid in TOML. The environment override is
+`CHARTREUX_SUBAGENTS__MAX_RUNNING_SUBAGENTS`. This setting is deliberately not
+available in the settings UI.
+
+The root session's effective configuration controls admission, not a child's
+configuration. Accepted changes apply to later admissions without stopping
+existing runs. Completion, cancellation, release, or failed creation frees
+capacity. The active-work cap is separate from the idle-retention limits above;
+see the [configuration reference](../reference/configuration.md#agents-and-skills).
+
 ## Parallel tasks
 
 A role selects one model and thinking level. To run independent investigations

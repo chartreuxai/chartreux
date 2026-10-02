@@ -64,7 +64,9 @@ def _error_for_status(status: int) -> DiscoveryError:
         )
     if status == httpx.codes.NOT_FOUND:
         return DiscoveryError(
-            "unsupported_listing", "This provider does not support model listing."
+            "unsupported_listing",
+            "This provider does not support model listing.",
+            listing_unsupported=True,
         )
     if status == httpx.codes.TOO_MANY_REQUESTS:
         return DiscoveryError("rate_limited", "Model listing is rate limited.")

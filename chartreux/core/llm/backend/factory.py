@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from chartreux.core.config import ProviderConfig
@@ -17,6 +18,16 @@ if TYPE_CHECKING:
 
     from chartreux.core.llm.types import BackendLike
     from chartreux.core.utils import RequestRetryBudget, RetryObserver
+    from chartreux.utils.api_keys import ApiKeyOrigin
+
+
+class CredentialResolution(Enum):
+    """Sentinel preserving the backend's default credential resolution behavior."""
+
+    UNRESOLVED = "unresolved"
+
+
+type ResolvedCredential = tuple[str, ApiKeyOrigin] | None | CredentialResolution
 
 
 def _create_mistral_backend(**kwargs: Any) -> BackendLike:
@@ -53,6 +64,7 @@ def create_backend(
     pool_timeout: float = DEFAULT_API_POOL_TIMEOUT,
     enable_system_trust_store: bool = False,
     on_retry: RetryObserver | None = None,
+    resolved_credential: ResolvedCredential = CredentialResolution.UNRESOLVED,
 ) -> BackendLike:
     backend = Backend(provider.backend)
     factory = BACKEND_FACTORY[backend]
@@ -69,6 +81,8 @@ def create_backend(
         "on_retry": on_retry,
         **transport_timeouts,
     }
+    if resolved_credential is not CredentialResolution.UNRESOLVED:
+        backend_kwargs["resolved_credential"] = resolved_credential
     if retry_budget is not None:
         backend_kwargs["retry_budget"] = retry_budget
     return factory(**backend_kwargs)

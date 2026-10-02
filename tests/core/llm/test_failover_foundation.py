@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncGenerator
 import json
 
 import httpx
@@ -9,7 +10,12 @@ import pytest
 from chartreux.core.llm.exceptions import BackendErrorBuilder
 from chartreux.core.llm.failures import FailureCategory, RequestRetryBudget, classify
 from chartreux.core.llm_models import LLMMessage, Role
-from chartreux.core.utils.retry import _next_delay, async_retry
+from chartreux.core.utils.retry import (
+    RetryReason,
+    _next_delay,
+    async_generator_retry,
+    async_retry,
+)
 
 
 def _http_error(
@@ -143,3 +149,99 @@ async def test_shared_budget_prevents_retry_sleep(
         await call()
     assert calls == 1
     assert budget.remaining == pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("stage", ["attempt", "observer", "sleep", "retry-after"])
+async def test_shared_budget_stops_before_another_attempt(
+    monkeypatch: pytest.MonkeyPatch, streaming: bool, stage: str
+) -> None:
+    now = [0.0]
+    monkeypatch.setattr("chartreux.core.llm.failures.time.monotonic", lambda: now[0])
+    budget = RequestRetryBudget(1.0)
+    calls = 0
+    sleeps: list[float] = []
+    notices: list[RetryReason] = []
+    error = _http_error(503, retry_after="7" if stage == "retry-after" else None)
+
+    async def attempt() -> None:
+        nonlocal calls
+        calls += 1
+        if stage == "attempt":
+            now[0] = 1.0
+        raise error
+
+    async def observe(reason: RetryReason) -> None:
+        notices.append(reason)
+        if stage == "observer":
+            now[0] = 1.0
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] = 1.0
+
+    monkeypatch.setattr("chartreux.core.utils.retry.asyncio.sleep", sleep)
+    if streaming:
+
+        async def stream() -> AsyncGenerator[None]:
+            await attempt()
+            yield None
+
+        retried = async_generator_retry(tries=None, budget=budget, on_retry=observe)(
+            stream
+        )
+        with pytest.raises(httpx.HTTPStatusError) as caught:
+            _ = [item async for item in retried()]
+    else:
+        call = async_retry(tries=None, budget=budget, on_retry=observe)(attempt)
+        with pytest.raises(httpx.HTTPStatusError) as caught:
+            await call()
+
+    assert caught.value is error
+    assert calls == 1
+    assert len(notices) == (1 if stage in {"observer", "sleep"} else 0)
+    assert sleeps == ([0.5] if stage == "sleep" else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    "code",
+    [
+        "invalid_api_key",
+        "billing_hard_limit",
+        "insufficient_quota",
+        "invalid_request_error",
+        "context_length_exceeded",
+    ],
+)
+async def test_permanent_structured_failure_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch, streaming: bool, code: str
+) -> None:
+    calls = 0
+    error = _http_error(500, code=code)
+
+    async def attempt() -> None:
+        nonlocal calls
+        calls += 1
+        raise error
+
+    async def no_sleep(_delay: float) -> None:
+        pytest.fail("permanent failures must not back off")
+
+    monkeypatch.setattr("chartreux.core.utils.retry.asyncio.sleep", no_sleep)
+    if streaming:
+
+        async def stream() -> AsyncGenerator[None]:
+            await attempt()
+            yield None
+
+        retried = async_generator_retry(tries=3)(stream)
+        with pytest.raises(httpx.HTTPStatusError) as caught:
+            _ = [item async for item in retried()]
+    else:
+        with pytest.raises(httpx.HTTPStatusError) as caught:
+            await async_retry(tries=3)(attempt)()
+    assert caught.value is error
+    assert calls == 1

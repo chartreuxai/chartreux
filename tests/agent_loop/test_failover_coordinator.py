@@ -35,6 +35,7 @@ from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.session_types import CommittedModelIdentity, LaunchMetadataV2
 from chartreux.core.subagents import AgentAvailability, AgentSummary, TaskResult
+from chartreux.core.utils.retry import async_retry
 from tests.conftest import build_test_agent_loop
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend, FakeInterruptedStreamingBackend
@@ -986,6 +987,119 @@ async def test_chat_and_streaming_share_attempt_transaction() -> None:
     await agent._chat()
     _ = [chunk async for chunk in agent._chat_streaming()]
     assert modes == [False, True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("elapsed", [3.0, 10.0])
+async def test_failover_keeps_remaining_deadline_and_stops_when_exhausted(
+    monkeypatch: pytest.MonkeyPatch, elapsed: float
+) -> None:
+    agent = _agent()
+    assert not await agent.config_orchestrator.set_field(
+        "/api_retry_max_elapsed_time",
+        10.0,
+        reason="bound audit retry window",
+        target_layer=OverridesLayer.NAME,
+    )
+    now = [0.0]
+    monkeypatch.setattr("chartreux.core.llm.failures.time.monotonic", lambda: now[0])
+    budgets: list[RequestRetryBudget] = []
+    calls: list[str] = []
+
+    def backend_for_attempt(
+        _self: AgentLoop, model: ModelConfig, budget: RequestRetryBudget
+    ) -> FakeBackend:
+        budgets.append(budget)
+        backend = FakeBackend()
+
+        async def complete(**_kwargs: object) -> LLMChunk:
+            calls.append(model.provider)
+            if model.provider == "test-first":
+                now[0] = elapsed
+                raise httpx.ConnectError("down")
+            assert budget.deadline == 10.0
+            assert budget.remaining == 7.0
+            return mock_llm_chunk(content="ok")
+
+        backend.complete = async_retry(tries=None, budget=budget)(complete)  # type: ignore[method-assign]
+        return backend
+
+    agent._backend_for_attempt = MethodType(backend_for_attempt, agent)  # type: ignore[method-assign]
+    if elapsed == 10.0:
+        with pytest.raises(RuntimeError, match="API error"):
+            await agent._chat()
+        assert calls == ["test-first"]
+    else:
+        assert (await agent._chat()).message.content == "ok"
+        assert calls == ["test-first", "test-second"]
+        assert len(budgets) == 2
+    assert budgets[0].exhausted
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("semantic", ["reasoning", "tool-call"])
+async def test_reasoning_or_tool_call_alone_prevents_stream_replay(
+    semantic: str,
+) -> None:
+    agent = _agent(streaming=True)
+    message = LLMMessage(role=Role.assistant, content="")
+    if semantic == "reasoning":
+        message.reasoning_content = "partial thought"
+    else:
+        message.tool_calls = [
+            ToolCall(id="partial", function=FunctionCall(name="todo", arguments="{"))
+        ]
+    _failover_backends(
+        agent,
+        _InterruptingBackend([LLMChunk(message=message)]),
+        FakeBackend([mock_llm_chunk(content="never")]),
+    )
+    with pytest.raises(RuntimeError, match="API error"):
+        _ = [chunk async for chunk in agent._chat_streaming()]
+    assert agent._completion_providers[-1] == ("test-first",)
+    assert agent.messages[-1].reasoning_content == message.reasoning_content
+    assert agent.messages[-1].tool_calls == message.tool_calls
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("preparation", [False, True])
+async def test_cancel_or_input_failure_releases_all_probe_claims_and_resources(
+    streaming: bool, preparation: bool
+) -> None:
+    agent = _agent(streaming=streaming)
+    registry = agent.config_orchestrator.availability_registry
+    registry.initial_cooldown = 0
+    for provider in ("test-first", "test-second"):
+        registry.record_failure("base", provider)
+    original = agent._backend_lifetime.active
+    original_identity = agent.committed_model
+    backend = _ClosingBackend()
+    _failover_backends(agent, backend, FakeBackend())
+    if preparation:
+
+        def fail_inputs(**_kwargs: object) -> object:
+            raise ValueError("input construction failed")
+
+        agent._completion_inputs = fail_inputs  # type: ignore[method-assign]
+    else:
+        backend._exception_to_raise = asyncio.CancelledError()
+
+    with pytest.raises(ValueError if preparation else asyncio.CancelledError):
+        if streaming:
+            _ = [chunk async for chunk in agent._chat_streaming()]
+        else:
+            await agent._chat()
+
+    assert agent.committed_model == original_identity
+    assert agent._backend_lifetime.active is original
+    assert agent._backend_lifetime._borrow_counts == {}
+    for provider in ("test-first", "test-second"):
+        assert registry.admission("base", provider)[:2] == (True, True)
+    await agent.aclose()
+    assert backend.closes == 1
 
 
 class _ClosingBackend(FakeBackend):

@@ -28,7 +28,8 @@ class TestTrustedFoldersManager:
 
         manager = TrustedFoldersManager()
         assert manager.is_trusted(tmp_path) is None
-        assert trusted_file.is_file()
+        assert manager.load_error == "trust store missing"
+        assert not trusted_file.exists()
 
     def test_loads_existing_file(self, tmp_path: Path) -> None:
         trusted_file = TRUSTED_FOLDERS_FILE.path
@@ -48,7 +49,33 @@ class TestTrustedFoldersManager:
         manager = TrustedFoldersManager()
 
         assert manager.is_trusted(tmp_path) is None
-        assert trusted_file.is_file()
+        assert manager.load_error == "trust store invalid or unreadable"
+        assert trusted_file.read_text(encoding="utf-8") == "invalid toml content {["
+
+    @pytest.mark.parametrize("contents", [None, "[malformed"])
+    @pytest.mark.parametrize("trusted", [False, True])
+    def test_successful_save_clears_load_error(
+        self, tmp_path: Path, contents: str | None, trusted: bool
+    ) -> None:
+        if contents is not None:
+            TRUSTED_FOLDERS_FILE.path.write_text(contents)
+        manager = TrustedFoldersManager()
+        assert manager.load_error is not None
+        if trusted:
+            manager.add_trusted(tmp_path)
+        else:
+            manager.add_untrusted(tmp_path)
+        assert manager.load_error is None
+        reloaded = TrustedFoldersManager()
+        assert reloaded.load_error is None
+        assert reloaded.is_trusted(tmp_path) is trusted
+
+    def test_failed_save_preserves_load_error(self, tmp_path: Path) -> None:
+        manager = TrustedFoldersManager()
+        error = manager.load_error
+        with patch.object(Path, "open", side_effect=OSError("cannot write")):
+            manager.add_trusted(tmp_path)
+        assert manager.load_error == error
 
     def test_normalizes_paths_to_absolute(
         self, tmp_working_directory, monkeypatch: pytest.MonkeyPatch

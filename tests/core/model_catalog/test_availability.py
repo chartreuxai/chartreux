@@ -5,6 +5,8 @@ from typing import Any, cast
 import pytest
 
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+from chartreux.core.config.layers import DefaultConfigLayer, OverridesLayer
+from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.llm.failures import FailureCategory, FailureInfo
 from chartreux.core.llm_models import (
     ImageAttachment,
@@ -223,6 +225,53 @@ def test_root_and_child_orchestrators_share_one_availability_registry() -> None:
         "base", "p2", FailureInfo(FailureCategory.RATE_LIMIT, retry_after=75.0)
     )
     assert registry.cooldown_until("base", "p2") == pytest.approx(175.0)
+
+
+@pytest.mark.asyncio
+async def test_real_root_child_and_sibling_filter_shared_cooldown_and_probe() -> None:
+    snapshot = _catalog()
+    overrides = OverridesLayer(data={"active_model": "base"})
+    root = await ConfigOrchestrator.create(
+        schema=ChartreuxConfigSchema,
+        layers=[DefaultConfigLayer(schema=ChartreuxConfigSchema), overrides],
+        default_layer_resolver=lambda: overrides,
+        catalog_snapshot=snapshot,
+    )
+    now = [0.0]
+    registry = AvailabilityRegistry(initial_cooldown=1.0, clock=lambda: now[0])
+    root._availability_registry = registry
+    child = root._copy_for_child()
+    sibling = root._copy_for_child()
+    child.availability_registry.record_failure("base", "test-first")
+
+    for runtime in (root, child, sibling):
+        assert runtime.availability_registry is registry
+        result = eligible_deployments(
+            snapshot=snapshot,
+            committed=_committed(),
+            registry=runtime.availability_registry,
+            config=runtime.config,
+            thinking="off",
+        )
+        assert [item.resolved.deployment.provider for item in result.candidates] == [
+            "test-second"
+        ]
+        assert result.exclusions[0].reason is ExclusionReason.COOLDOWN
+
+    now[0] = 2.0
+    admitted = eligible_deployments(
+        snapshot=snapshot,
+        committed=_committed(),
+        registry=child.availability_registry,
+        config=child.config,
+        thinking="off",
+    ).candidates[0]
+    assert admitted.recovery_probe
+    assert admitted.recovery_probe_token is not None
+    assert not sibling.availability_registry.is_available("base", "test-first")
+    assert registry.admission("base", "test-first")[:2] == (False, False)
+    registry.release_probe("base", "test-first", admitted.recovery_probe_token)
+    assert root.availability_registry.is_available("base", "test-first")
 
 
 def test_expiry_admits_exactly_one_probe_per_key() -> None:

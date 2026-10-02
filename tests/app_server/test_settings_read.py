@@ -76,6 +76,10 @@ def test_curated_registry_is_complete_and_validated() -> None:
     )
     assert EDITABLE_BY_PATH["subagents.max_idle_agents"].minimum == 0
     assert EDITABLE_BY_PATH["subagents.idle_ttl_seconds"].minimum == 0
+    assert "subagents.max_running_subagents" not in EDITABLE_BY_PATH
+    assert "subagents.max_running_subagents" not in {
+        item.path for item in VISIBLE_SETTINGS
+    }
     assert {item.path for item in EDITABLE_SETTINGS}.isdisjoint(EXCLUDED_SETTINGS)
     assert DEFERRED_SETTINGS == ()
     assert {item.command for item in LINK_SETTINGS} == {

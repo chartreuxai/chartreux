@@ -82,6 +82,11 @@ For web search, use Settings > Web search or `/web-search` to select a provider 
 
 ## Logging and diagnostics
 
+Use `chartreux doctor` to validate trusted configuration, catalog entries, and
+model selection locally. Bare doctor does not load `.env`, inspect keyring
+credentials, start subprocesses, or make network requests. For opt-in live
+checks and billable provider smoke probes, see [Troubleshooting](troubleshooting.md#run-diagnostics).
+
 Chartreux writes structured local logs to `$CHARTREUX_HOME/logs/chartreux.log`. Set `log_level` in `config.toml`, use `/log-level` for a session override or persisted setting, or set `LOG_LEVEL`. Valid levels are `DEBUG`, `INFO`, `WARNING`, `ERROR`, and `CRITICAL`; the default is `WARNING`.
 
 The effective level is chosen in this order: session override, `DEBUG_MODE=true` or a valid `LOG_LEVEL`, `log_level` in configuration, then the default. For local data and network-traffic policy, see [Privacy](../project/privacy.md). For the complete setting schema, see the [Configuration reference](../reference/configuration.md).

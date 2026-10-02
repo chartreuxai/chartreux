@@ -296,9 +296,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         notify_agents: NotifyAgents | None = None,
         clock: Callable[[], float] = time.monotonic,
         wakeup: Wakeup = asyncio.sleep,
-        max_running_subagents: int = _DEFAULT_MAX_RUNNING_SUBAGENTS,
+        max_running_subagents: int | None = None,
     ) -> None:
-        if (
+        if max_running_subagents is not None and (
             isinstance(max_running_subagents, bool)
             or not isinstance(max_running_subagents, int)
             or max_running_subagents < 1
@@ -1514,7 +1514,14 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         if not hasattr(self, "_active_work_slots"):
             self._active_work_slots = set()
         running = len(self._active_work_slots)
-        cap = getattr(self, "_max_running_subagents", _DEFAULT_MAX_RUNNING_SUBAGENTS)
+        cap = getattr(self, "_max_running_subagents", None)
+        if cap is None:
+            root = getattr(self, "_root", None)
+            cap = (
+                root.agent_loop.config.subagents.max_running_subagents
+                if root is not None
+                else _DEFAULT_MAX_RUNNING_SUBAGENTS
+            )
         if running >= cap:
             raise RuntimeError(
                 f"Subagent launch rejected: {running} agents already running "
