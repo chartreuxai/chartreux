@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from pydantic import ValidationError
 import pytest
 
 from chartreux.core.tools.base import BaseToolState, ToolPermission
@@ -31,14 +32,59 @@ from chartreux.core.tools.builtins.write_file import (
     WriteFileArgs,
     WriteFileConfig,
 )
+from chartreux.core.tools.manager import ToolManager
 from chartreux.core.tools.permissions import PermissionContext
 from chartreux.core.tools.utils import (
     DEFAULT_SENSITIVE_PATTERNS,
     matches_sensitive_pattern,
 )
+from tests.conftest import build_test_vibe_config
+
+
+@pytest.mark.parametrize(
+    "config_class",
+    [
+        BashToolConfig,
+        EditConfig,
+        GrepToolConfig,
+        ReadFileConfig,
+        WebFetchConfig,
+        WriteFileConfig,
+    ],
+)
+def test_removed_ask_permission_rejected_by_tool_config(config_class):
+    with pytest.raises(ValidationError, match="'always' or 'never'"):
+        config_class.model_validate({"permission": "ask"})
+
+
+def test_permission_enum_has_no_ask_value():
+    assert set(ToolPermission) == {ToolPermission.ALWAYS, ToolPermission.NEVER}
+    with pytest.raises(ValueError):
+        ToolPermission("ask")
 
 
 class TestBashGranularPermissions:
+    @pytest.mark.parametrize("allowlist", [[], ["*"], ["npm *"], ["/tmp/*"]])
+    def test_shell_allowlists_rejected_at_tool_and_session_config(self, allowlist):
+        with pytest.raises(ValidationError, match="allowlist was removed"):
+            BashToolConfig(allowlist=allowlist)
+        session_config = build_test_vibe_config(
+            tools={"bash": {"allowlist": allowlist}}
+        )
+        with pytest.raises(ValidationError, match="allowlist was removed"):
+            ToolManager(config_getter=lambda: session_config).get_tool_config("bash")
+        before = session_config.model_dump()
+        with pytest.raises(ValueError, match="allowlist was removed"):
+            session_config.build_tool_allowlist_update("bash", allowlist)
+        assert session_config.model_dump() == before
+        config = BashToolConfig()
+        assert config.allowlist == []
+        assert "allowlist" not in config.model_dump()
+
+    def test_historical_bypass_config_is_rejected(self):
+        with pytest.raises(ValidationError, match="bypass_tool_permissions.*removed"):
+            build_test_vibe_config(bypass_tool_permissions=True)
+
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -166,7 +212,9 @@ class TestBashGranularPermissions:
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ALWAYS
 
-    @pytest.mark.parametrize("permission", [ToolPermission.ASK, ToolPermission.ALWAYS])
+    @pytest.mark.parametrize(
+        "permission", [ToolPermission.ALWAYS, ToolPermission.NEVER]
+    )
     def test_sensitive_commands_remain_denied_under_configured_permission(
         self, permission
     ):
@@ -464,13 +512,13 @@ class TestWebFetchPermissions:
     def _make_webfetch(self) -> WebFetch:
         return WebFetch(config_getter=lambda: WebFetchConfig(), state=BaseToolState())
 
-    def test_ask_returns_ask(self):
+    def test_default_executes_automatically(self):
         wf = self._make_webfetch()
         result = wf.resolve_permission(
             WebFetchArgs(url="https://docs.python.org/3/library")
         )
         assert isinstance(result, PermissionContext)
-        assert result.permission is ToolPermission.ASK
+        assert result.permission is ToolPermission.ALWAYS
 
     def test_config_permission_always_honored(self):
         wf = WebFetch(

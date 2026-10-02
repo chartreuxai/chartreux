@@ -13,16 +13,16 @@ from chartreux.app_server.protocol import (
     SettingsReadResponse,
     WebSearchSettingsWire,
 )
-from chartreux.cli.textual_ui.screens.web_search import WebSearchScreen
-from chartreux.cli.textual_ui.settings_service import (
+from chartreux.core.model_catalog.contracts import CredentialSaveResult
+from chartreux.ui.settings_service import (
     SettingsReloadOutcome,
     SettingsSaveOutcome,
     SettingsService,
 )
-from chartreux.ui.providers.contracts import CredentialSaveResult
+from chartreux.ui.web_search import WebSearchScreen
 
 VALUES: dict[str, JsonValue] = {
-    "permission": "ask",
+    "permission": "always",
     "provider": "auto",
     "api_key_env_var": None,
     "base_url": None,

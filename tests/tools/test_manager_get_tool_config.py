@@ -34,7 +34,7 @@ def test_returns_default_config_when_no_overrides(tool_manager):
     )  # due to vibe's discover system isinstance would fail
     assert config.default_timeout == 300  # type: ignore[attr-defined]
     assert config.max_output_bytes == 16000  # type: ignore[attr-defined]
-    assert config.permission == ToolPermission.ASK
+    assert config.permission == ToolPermission.ALWAYS
 
 
 def test_removed_shell_builtins_are_not_discovered(tool_manager):
@@ -106,7 +106,7 @@ def test_merges_user_overrides_with_defaults():
 
 
 def test_preserves_tool_specific_fields_from_overrides():
-    vibe_config = build_test_vibe_config(tools={"bash": {"permission": "ask"}})
+    vibe_config = build_test_vibe_config(tools={"bash": {"permission": "always"}})
     vibe_config.tools["bash"]["default_timeout"] = 600
     manager = ToolManager(lambda: vibe_config)
 
@@ -120,7 +120,7 @@ def test_falls_back_to_base_config_for_unknown_tool(tool_manager):
     config = tool_manager.get_tool_config("nonexistent_tool")
 
     assert type(config) is BaseToolConfig
-    assert config.permission == ToolPermission.ASK
+    assert config.permission == ToolPermission.ALWAYS
 
 
 def test_partial_override_preserves_tool_defaults():
@@ -131,9 +131,7 @@ def test_partial_override_preserves_tool_defaults():
 
     config = manager.get_tool_config("read_file")
 
-    assert (
-        config.permission == ToolPermission.ALWAYS
-    )  # ReadConfig default, not BaseToolConfig.ASK
+    assert config.permission == ToolPermission.ALWAYS
     assert config.sensitive_patterns == ["**/*.key"]  # type: ignore[attr-defined]
 
 

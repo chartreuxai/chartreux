@@ -10,10 +10,10 @@ from textual.message import Message
 from textual.widgets import Button, Input, Static
 
 from chartreux.app_server.config import ProxySettingsView
-from chartreux.cli.textual_ui.widgets.vscode_compat import VscodeCompatInput
 from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
+from chartreux.ui.widgets.vscode_compat import VscodeCompatInput
 
 
 class ProxySetupApp(Container):

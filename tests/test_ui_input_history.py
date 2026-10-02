@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import json
 from pathlib import Path
+from threading import Event, get_ident
 
 import pytest
 
@@ -306,3 +309,56 @@ async def test_ui_down_at_visual_end_resumes_history_after_manual_cursor_move(
 
         await pilot.press("down")
         assert chat_input.value == "Hi there"
+
+
+@pytest.mark.asyncio
+async def test_ui_heartbeat_continues_while_history_worker_waits_for_lock(
+    chartreux_app: ChartreuxApp, history_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempting = Event()
+    worker_thread_ids: list[int] = []
+    original_flock = fcntl.flock
+    ui_thread_id = get_ident()
+    ticks = 0
+
+    def heartbeat() -> None:
+        nonlocal ticks
+        ticks += 1
+
+    def observed_flock(fd: int, operation: int) -> None:
+        if operation == fcntl.LOCK_EX:
+            worker_thread_ids.append(get_ident())
+            attempting.set()
+        original_flock(fd, operation)
+
+    lock_path = history_file.with_name(history_file.name + ".lock")
+    async with chartreux_app.run_test() as pilot:
+        inject_history_file(chartreux_app, history_file)
+        with lock_path.open("a") as lock_file:
+            original_flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                monkeypatch.setattr(fcntl, "flock", observed_flock)
+                timer = chartreux_app.set_interval(0.01, heartbeat)
+                chat_input = chartreux_app.query_one(ChatInputContainer)
+                chat_input.value = "new prompt"
+                await pilot.press("enter")
+                assert await asyncio.to_thread(attempting.wait, 5)
+                before = ticks
+                await asyncio.sleep(0.1)
+                assert ticks > before
+                assert len(worker_thread_ids) == 1
+                assert worker_thread_ids[0] != ui_thread_id
+                history_workers = [
+                    worker
+                    for worker in chartreux_app.workers
+                    if worker.group == "history_persist"
+                ]
+                assert len(history_workers) == 1
+                assert "new prompt" not in history_file.read_text()
+            finally:
+                original_flock(lock_file.fileno(), fcntl.LOCK_UN)
+            await asyncio.wait_for(
+                chartreux_app.workers.wait_for_complete(history_workers), 5
+            )
+            timer.stop()
+            assert "new prompt" in history_file.read_text()

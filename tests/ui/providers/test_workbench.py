@@ -15,16 +15,7 @@ from textual.app import App, ComposeResult
 from textual.widgets import Input, OptionList, SelectionList, Static
 from textual.widgets.selection_list import Selection
 
-from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
-from chartreux.core.model_catalog.loader import (
-    CatalogSnapshot,
-    CatalogStore,
-    load_catalog,
-    merge_catalog_overlay,
-)
-from chartreux.core.model_catalog.presets import FULLY_CUSTOM, MISTRAL, ProviderPreset
-from chartreux.core.model_catalog.schema import ModelCatalog
-from chartreux.ui.providers.contracts import (
+from chartreux.core.model_catalog.contracts import (
     CatalogChanges,
     CatalogValidationError,
     CatalogWriteResult,
@@ -40,6 +31,15 @@ from chartreux.ui.providers.contracts import (
     ProviderWorkbenchResult,
     TLSConfig,
 )
+from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
+from chartreux.core.model_catalog.loader import (
+    CatalogSnapshot,
+    CatalogStore,
+    load_catalog,
+    merge_catalog_overlay,
+)
+from chartreux.core.model_catalog.presets import FULLY_CUSTOM, MISTRAL, ProviderPreset
+from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.ui.providers.management_state import PendingModel
 from chartreux.ui.providers.workbench import ProviderWorkbenchScreen, WorkbenchView
 from tests.snapshots.snapshot_event_loop import install_snapshot_wake
@@ -1140,7 +1140,7 @@ async def test_new_provider_name_preserves_spelling_and_reports_collisions() -> 
 
 @pytest.mark.asyncio
 async def test_add_probe_failure_manual_retry_shared_key_and_stale() -> None:
-    from chartreux.ui.providers.contracts import DiscoveryError
+    from chartreux.core.model_catalog.contracts import DiscoveryError
 
     screen, services = setup()
     async with Host(screen).run_test(size=(80, 24)) as pilot:

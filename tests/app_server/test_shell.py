@@ -18,7 +18,10 @@ from chartreux.app_server.models import (
     PublicEffectEntry,
 )
 from chartreux.app_server.protocol import ShellRunParams, ShellRunResponse
+from chartreux.core.agent_loop._loop import ToolExecutionResponse
 from chartreux.core.llm_models import Role
+from chartreux.core.tools.base import ToolPermission
+from chartreux.core.tools.builtins.bash import BashArgs
 from chartreux.utils.tool_presentation import ToolEffectKind
 from tests.conftest import build_test_agent_loop
 from tests.stubs.app_server import create_test_app_server_session
@@ -47,6 +50,32 @@ def test_manual_shell_context_caps_stdout_and_stderr_independently() -> None:
     assert context.count("[truncated]") == 2
     assert "oooooo" not in context
     assert "eeeeee" not in context
+
+
+@pytest.mark.asyncio
+async def test_wp2_manual_shell_bypasses_model_outside_operand_denial(
+    tmp_path: Path,
+) -> None:
+    """Characterize WP2 GAP: manual shell is not the guarded model-tool path."""
+    project = tmp_path / "project"
+    project.mkdir()
+    target = tmp_path / "outside.txt"
+    target.write_text("unchanged")
+    agent_loop = build_test_agent_loop(cwd=project)
+    command = f"printf changed > {target}"
+    decision = await agent_loop._should_execute_tool(
+        agent_loop.tool_manager.get("bash"), BashArgs(command=command)
+    )
+    assert decision.verdict is ToolExecutionResponse.SKIP
+    assert decision.approval_type is ToolPermission.NEVER
+    session = await create_test_app_server_session(agent_loop)
+    try:
+        events = [event async for event in session.resources.shell.run(command)]
+        assert isinstance(_final_effect(events).state, CompletedEffectState)
+        assert target.read_text() == "changed"
+    finally:
+        await session.close()
+        await agent_loop.aclose()
 
 
 @pytest.mark.asyncio

@@ -597,6 +597,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             save_messages=self._save_messages,
             reset_session=self._reset_session,
             files=file_store,
+            fence_transcript=self._fence_rewind_transcript,
         )
         self.compaction_manager = CompactionManager(
             messages=self.messages,
@@ -1767,7 +1768,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if self._hooks_manager:
             self._hooks_manager.reset_retry_count()
 
-    async def _conversation_loop(  # noqa: PLR0912
+    async def _conversation_loop(  # noqa: PLR0912 - conversation lifecycle
         self,
         user_msg: str | None,
         client_message_id: str | None = None,
@@ -2227,6 +2228,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 ),
             )
 
+    @staticmethod
+    async def _join_tool_tasks(
+        tasks: list[asyncio.Task[None]],
+    ) -> list[None | BaseException]:
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _run_tools_concurrently(
         self, tool_calls: list[ResolvedToolCall]
     ) -> AsyncGenerator[BaseEvent]:
@@ -2251,7 +2258,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
         async def _signal_when_all_done() -> None:
             try:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                results = await self._join_tool_tasks(tasks)
                 for tool_call, result in zip(tool_calls, results, strict=True):
                     if not isinstance(result, BaseException):
                         continue
@@ -2549,8 +2556,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 feedback=(ctx.reason if ctx is not None else None)
                 or f"Tool '{tool_name}' is disabled by policy",
             )
-        # ASK is no longer an execution approval mechanism. Positive accident
-        # guards must return NEVER at their resolver; opaque extensions are
+        # Tools execute automatically unless denied. Positive accident guards
+        # must return NEVER at their resolver; opaque extensions are
         # trusted code, not proven filesystem-contained implementations.
         return ToolDecision(
             verdict=ToolExecutionResponse.EXECUTE, approval_type=ToolPermission.ALWAYS
@@ -3174,6 +3181,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
             i += 1
 
+    def _fence_rewind_transcript(self) -> None:
+        self._session_generation += 1
+        self.session_logger.invalidate_transcript_cursor()
+
     async def _reset_session(self, keep_parent: bool = True) -> None:
         old_session_id = self.session_id
         suffix = extract_suffix(self.session_id)
@@ -3248,7 +3259,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         the loop untouched. A bug in any commit step would leave the loop
         half-rebound; callers should treat an unexpected raise as fatal.
         """
-        # Prepare — no mutation of the live loop.
+        # Prepare without mutating the live loop.
         previous_scratchpad = self.scratchpad_dir
         scratchpad_dir = (
             self.prepare_scratchpad_for_session(session_id)
@@ -3523,12 +3534,19 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         reset_middleware: bool = True,
         reload_hooks: bool = False,
         reload_config: bool = False,
+        session_save_config: ChartreuxConfigSchema | None = None,
     ) -> None:
         self._reload_generation += 1
         generation = self._reload_generation
 
+        # Session switching may already have installed the target configuration
+        # while the messages and logger still belong to the departing session.
         await self.session_logger.save_interaction(
-            self.messages, self.stats, self.config, self.tool_manager, None
+            self.messages,
+            self.stats,
+            session_save_config if session_save_config is not None else self.config,
+            self.tool_manager,
+            None,
         )
 
         # A newer reload superseded us while we were saving; don't mutate state.

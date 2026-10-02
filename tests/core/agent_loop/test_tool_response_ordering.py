@@ -158,6 +158,11 @@ class _CancellingPreToolHooks:
     def reset_retry_count(self) -> None:
         return
 
+    def _matching_hooks(self, handler: object, invocation: object) -> list[object]:
+        return (
+            [self] if getattr(invocation, "hook_event_name", "") == "pre_tool" else []
+        )
+
     async def run(self, invocation: object) -> AsyncGenerator[object, None]:
         if (
             getattr(invocation, "hook_event_name", "") == "pre_tool"

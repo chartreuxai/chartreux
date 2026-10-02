@@ -31,7 +31,7 @@ Unless noted, list defaults are `[]`, map defaults are `{}`, and booleans shown 
 | `credential_env_passthrough` | `[]` | Environment-variable names exempt from credential scrubbing in child processes (shell commands, MCP stdio servers, hooks, client terminals). This setting is accepted only from the user configuration layer; project and other layers, including generic config patches, are rejected. |
 | `mcp_servers` | `[]` | Array of [MCP server tables](#mcp-server-tables). |
 
-Every `[tools.<name>]` table except `tools.bash` accepts `permission` (`always`, `ask`, or `never`), `allowlist`, `denylist`, and `sensitive_patterns`; defaults are `ask`, `[]`, `[]`, and `[]`. A tool implementation can accept additional fields. Shipped tool fields are:
+Every `[tools.<name>]` table except `tools.bash` accepts `permission` (`always` or `never`), `allowlist`, `denylist`, and `sensitive_patterns`; defaults are `always`, `[]`, `[]`, and `[]`. A tool implementation can accept additional fields. Shipped tool fields are:
 
 | Tool table | Additional fields and defaults |
 | --- | --- |
@@ -41,10 +41,10 @@ Every `[tools.<name>]` table except `tools.bash` accepts `permission` (`always`,
 | `tools.bash` | `max_output_bytes = 16000`, `default_timeout = 300`, `denylist`, `denylist_standalone`, and `sensitive_patterns`; it does not accept `allowlist`. |
 | `tools.web_fetch` | `default_timeout = 30`, `max_timeout = 120`, `max_content_bytes = 120000`, `user_agent` (the built-in browser-like value). |
 | `tools.web_search` | `provider = "auto"`, `api_key_env_var` and `base_url` unset, `timeout = 120` (> 0), `max_results = 5`, `model = "mistral-vibe-cli-with-tools"`. A blank or unset `base_url` uses the selected provider's default endpoint. Provider is `auto`, `mistral`, `exa`, `brave`, or `duckduckgo`; `auto` means Mistral only and never falls back. Configure it in Settings > Web search or with `/web-search`. `Configured; connection not verified` reflects configuration and credential availability, not a connectivity check. |
-| `tools.task` | `allowlist = ["worker"]`; permission `ask`. |
+| `tools.task` | `allowlist = ["worker"]`; permission `always`. |
 | `tools.todo` | `max_todos = 100`; permission `always`. |
 | `tools.read_image` | Permission `always`; no additional documented fields. |
-| `tools.edit` | Permission `ask`; no additional documented fields. |
+| `tools.edit` | Permission `always`; no additional documented fields. |
 | `tools.wait_for_agent`, `tools.ask_user_question`, `tools.get_agent_result`, `tools.skill`, `tools.check_agents`, `tools.release_agent` | Permission `always`; no additional documented fields. |
 
 The built-in read/edit/write/image/grep configurations include sensitive patterns for `.env`-style files. Do not remove those protections casually.

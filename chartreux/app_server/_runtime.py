@@ -374,8 +374,8 @@ class AgentRuntimeFactory:
         lease = await asyncio.to_thread(
             _acquire_session_lease, source.config, session_id
         )
+        previous_config = source.config.model_copy(deep=True)
         previous_model_override = override_active_model(source.config_orchestrator)
-        previous_thinking = dict(source.config.thinking_overrides)
         previous_identity = source.committed_model
         previous_session_pinned = source.session_logger.active_model is not None
         prepared_scratchpad: Path | None = None
@@ -424,7 +424,9 @@ class AgentRuntimeFactory:
             source.committed_model = resume_identity
             source._committed_selection = source.config.active_model
             if not _same_concrete_identity(source.committed_model, previous_identity):
-                await source.reload_with_initial_messages()
+                await source.reload_with_initial_messages(
+                    session_save_config=previous_config
+                )
             if resume_identity is None and not _is_legacy_root_metadata(
                 session_metadata
             ):
@@ -458,7 +460,7 @@ class AgentRuntimeFactory:
                     clear_existing=True,
                 )
                 await _restore_session_thinking(
-                    source.config_orchestrator, previous_thinking
+                    source.config_orchestrator, previous_config.thinking_overrides
                 )
             if lease is not None:
                 await asyncio.to_thread(lease.release)
@@ -1198,7 +1200,7 @@ async def _restore_session_active_model(
 
 async def _restore_session_thinking(
     orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
-    overrides: Mapping[str, str],
+    overrides: Mapping[str, str] | None,
 ) -> None:
     failures = await restore_session_thinking_overrides(
         orchestrator, overrides, reason="restore session thinking choices"

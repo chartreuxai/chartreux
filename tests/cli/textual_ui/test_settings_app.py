@@ -25,10 +25,6 @@ from chartreux.cli.textual_ui.screens.settings import (
     parse_setting_value,
     toggle_inventory_name,
 )
-from chartreux.cli.textual_ui.settings_service import (
-    SettingsSaveOutcome,
-    SettingsService,
-)
 from chartreux.core.config.settings_catalog import (
     DEFERRED_SETTINGS,
     EDITABLE_BY_PATH,
@@ -36,6 +32,7 @@ from chartreux.core.config.settings_catalog import (
     VISIBLE_SETTINGS,
 )
 from chartreux.core.utils.matching import name_matches
+from chartreux.ui.settings_service import SettingsSaveOutcome, SettingsService
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
 

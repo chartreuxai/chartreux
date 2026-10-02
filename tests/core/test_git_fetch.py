@@ -880,6 +880,256 @@ def test_repository_hooks_are_not_executed(
     assert not marker.exists()
 
 
+@pytest.mark.parametrize(
+    "refspec",
+    [
+        "--upload-pack=malicious",
+        "main",
+        "+refs/heads/main:",
+        "+refs/heads/main:--bad",
+        "+refs/heads/main:refs/remotes/origin/../bad",
+        "+refs/heads/*:refs/remotes/origin/main",
+        "+refs/heads/main:refs/remotes/origin/bad.lock",
+        "+refs/heads/main:refs/remotes/origin/bad\nref",
+        "+refs/heads/main:refs/remotes/origin/bad:ref",
+    ],
+)
+def test_invalid_refspec_is_rejected_before_any_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refspec: str
+) -> None:
+    repo = _repo_with_remote(tmp_path, "https://example.invalid/repo.git")
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("Invalid refspec launched a subprocess")
+
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(Git, "execute", forbidden)
+    with pytest.raises(UnsafeGitFetchError):
+        fetch_remote(repo, "origin", (refspec,))
+
+
+def test_gitpython_inline_environment_does_not_remove_inherited_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    intended = Repo.init(tmp_path / "intended")
+    decoy = Repo.init(tmp_path / "decoy")
+    monkeypatch.setenv("GIT_DIR", str(decoy.git_dir))
+    assert intended.git.rev_parse("--absolute-git-dir", env={}) == str(decoy.git_dir)
+    # Empty is a routing value, not removal, and None cannot reach Popen.
+    with pytest.raises(GitCommandError):
+        intended.git.rev_parse("--absolute-git-dir", env={"GIT_DIR": ""})
+    with pytest.raises(TypeError):
+        intended.git.rev_parse("--absolute-git-dir", env={"GIT_DIR": None})
+    intended.close()
+    decoy.close()
+
+
+@pytest.mark.parametrize("layout", ["checkout", "linked", "bare"])
+def test_repository_policy_contains_hostile_parent_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str
+) -> None:
+    from chartreux.core.git.repo import GitRepo
+
+    source = Repo.init(tmp_path / "source", initial_branch="main")
+    source.config_writer().set_value("user", "name", "Tester").set_value(
+        "user", "email", "tester@example.invalid"
+    ).release()
+    expected = source.index.commit("source commit").hexsha
+    checkout = Repo.clone_from(str(source.working_dir), tmp_path / "checkout")
+    if layout == "linked":
+        checkout.git.worktree("add", "-b", "linked", str(tmp_path / "linked"))
+        target = tmp_path / "linked"
+    elif layout == "bare":
+        bare = Repo.clone_from(
+            str(source.working_dir), tmp_path / "bare.git", bare=True
+        )
+        bare.close()
+        target = tmp_path / "bare.git"
+    else:
+        target = tmp_path / "checkout"
+    checkout.close()
+    decoy = Repo.init(tmp_path / "decoy", initial_branch="decoy")
+    decoy.config_writer().set_value("user", "name", "Decoy").set_value(
+        "user", "email", "decoy@example.invalid"
+    ).release()
+    decoy_commit = decoy.index.commit("decoy commit").hexsha
+    decoy.config_writer().set_value("http", "proxy", "hostile").release()
+    decoy_dir = str(decoy.git_dir)
+    decoy.close()
+    hostile = {
+        "GIT_DIR": decoy_dir,
+        "GIT_WORK_TREE": str(tmp_path / "decoy"),
+        "GIT_COMMON_DIR": decoy_dir,
+        "GIT_OBJECT_DIRECTORY": f"{decoy_dir}/objects",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": f"{decoy_dir}/objects",
+        "GIT_INDEX_FILE": f"{decoy_dir}/index",
+        "GIT_NAMESPACE": "decoy",
+        "GIT_CEILING_DIRECTORIES": str(tmp_path),
+        "GIT_CONFIG": f"{decoy_dir}/config",
+        "GIT_SHALLOW_FILE": str(tmp_path / "missing-shallow"),
+        "GIT_REPLACE_REF_BASE": "refs/decoy/",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.proxy",
+        "GIT_CONFIG_VALUE_0": "injected",
+    }
+    for key, value in hostile.items():
+        monkeypatch.setenv(key, value)
+    raw = Repo(target)
+    secure = prepare_secure_fetch(raw, "origin", allow_file=True)
+    assert secure.url == str(source.working_dir)
+    fetch_remote(
+        raw, "origin", ("refs/heads/main:refs/remotes/origin/direct",), allow_file=True
+    )
+    assert raw.git.rev_parse("--verify", "refs/remotes/origin/direct") == expected
+    raw.close()
+    with GitRepo.open(target) as intended:
+        # The real scoped config subprocess sees intended config, not decoy HTTP.
+        secure = prepare_secure_fetch(intended._repo, "origin", allow_file=True)
+        assert secure.url == str(source.working_dir)
+        assert "GIT_OBJECT_DIRECTORY" not in secure.env
+        assert "GIT_CONFIG" not in secure.env
+        assert intended.head_commit() == expected  # persistent cat-file child
+        assert intended.branch() == ("linked" if layout == "linked" else "main")
+        intended.fetch_branch("origin", "main")
+        assert (
+            intended._repo.git.rev_parse("--verify", "refs/remotes/origin/main")
+            == expected
+        )
+        intended._repo.git.branch("contained", "HEAD")
+        assert intended.branch_exists("contained")
+        intended.delete_branch("contained")
+        assert not intended.branch_exists("contained")
+        assert intended.head_commit() != decoy_commit
+        if layout == "linked":
+            assert intended.paths.common_git_dir == tmp_path / "checkout" / ".git"
+    # Policy never edits the parent environment or writes the decoy refs.
+    assert all(os.environ[key] == value for key, value in hostile.items())
+    clean_env = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    decoy_refs = subprocess.run(
+        [str(Git.GIT_PYTHON_GIT_EXECUTABLE), "--git-dir", decoy_dir, "show-ref"],
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "contained" not in decoy_refs
+    assert "refs/remotes/origin/main" not in decoy_refs
+    source.close()
+
+
+@pytest.mark.parametrize("url", ["backup", "./backup"])
+def test_relative_file_remote_cannot_select_another_configured_remote(
+    tmp_path: Path, url: str
+) -> None:
+    repo = _repo_with_remote(tmp_path / "checkout", url)
+    source = Repo.init(tmp_path / "checkout" / "backup", initial_branch="main")
+    expected = source.index.commit("initial").hexsha
+    marker, command = _marker_command(tmp_path, "backup-uploadpack")
+    repo.config_writer().set_value(
+        'remote "backup"', "url", str(source.working_dir)
+    ).set_value('remote "backup"', "uploadpack", command).release()
+
+    secure = prepare_secure_fetch(repo, "origin", allow_file=True)
+    assert secure.url == str(source.working_dir)
+    fetch_remote(
+        repo, "origin", ("refs/heads/main:refs/remotes/origin/main",), allow_file=True
+    )
+    assert repo.git.rev_parse("refs/remotes/origin/main") == expected
+    assert not marker.exists()
+    source.close()
+    repo.close()
+
+
+def test_absolute_file_remote_name_collision_is_rejected(tmp_path: Path) -> None:
+    source_path = tmp_path / "source"
+    repo = _repo_with_remote(tmp_path / "checkout", str(source_path))
+    repo.config_writer().set_value(
+        f'remote "{source_path}"', "url", "ssh://example.invalid/evil"
+    ).release()
+    with pytest.raises(UnsafeGitFetchError, match="collides"):
+        prepare_secure_fetch(repo, "origin", allow_file=True)
+    repo.close()
+
+
+@pytest.mark.parametrize("layout", ["checkout", "separate", "linked"])
+def test_core_worktree_cannot_relocate_fetch_executable_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str
+) -> None:
+    project = tmp_path / "checkout"
+    if layout == "separate":
+        repo = Repo.init(
+            project, separate_git_dir=tmp_path / "metadata", allow_unsafe_options=True
+        )
+    else:
+        repo = Repo.init(project)
+    repo.create_remote("origin", "ssh://example.invalid/repo.git")
+    if layout == "linked":
+        repo.index.commit("initial")
+        project = tmp_path / "linked"
+        repo.git.worktree("add", "-b", "linked", str(project))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    repo.config_writer().set_value("core", "worktree", str(outside)).release()
+    repo.close()
+    repo = Repo(project)
+    planted = _write_executable(project / "bin" / "ssh")
+    trusted = _write_executable(tmp_path / "trusted" / "ssh")
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join((str(planted.parent), str(trusted.parent)))
+    )
+
+    secure = prepare_secure_fetch(repo, "origin")
+
+    assert repo.working_dir == str(project)
+    assert str(planted.parent) not in secure.env["PATH"].split(os.pathsep)
+    assert secure.env["GIT_SSH_COMMAND"] == fetch_module._quote_ssh_command(
+        str(trusted)
+    )
+    repo.close()
+
+
+@pytest.mark.parametrize("symlink_target", ["checkout", "metadata", "trusted"])
+def test_credential_helper_symlink_targets_are_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, symlink_target: str
+) -> None:
+    project = tmp_path / "checkout"
+    repo = Repo.init(
+        project,
+        separate_git_dir=str(tmp_path / "repo-metadata"),
+        allow_unsafe_options=True,
+    )
+    repo.config_writer().set_value(
+        'remote "origin"', "url", "https://example.invalid/repo.git"
+    ).release()
+    marker = tmp_path / "symlink-helper-ran"
+    target = {
+        "checkout": project,
+        "metadata": Path(repo.git_dir),
+        "trusted": tmp_path / "trusted",
+    }[symlink_target]
+    payload = _write_marker_executable(target / "payload", marker)
+    links = tmp_path / "links"
+    links.mkdir()
+    (links / "git-credential-planted").symlink_to(payload)
+    _write_test_global_config(
+        tmp_path, monkeypatch, "[credential]\n\thelper = planted\n"
+    )
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join((str(links), os.environ.get("PATH", "")))
+    )
+
+    secure = prepare_secure_fetch(repo, "origin")
+    _run_credential_fill(repo, secure.env)
+
+    assert marker.exists() == (symlink_target == "trusted")
+    assert (str(links) in secure.env["PATH"].split(os.pathsep)) == (
+        symlink_target == "trusted"
+    )
+    repo.close()
+
+
 class _UnresolvableRepo:
     """Repository stub whose directories cannot be resolved."""
 

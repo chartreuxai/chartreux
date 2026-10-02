@@ -23,17 +23,17 @@ class FileStore:
         restored_paths: list[str] = []
         for path, state in plan.items():
             if state.data is None:
-                if not self._fs.exists(path):
-                    continue
                 try:
+                    if not self._fs.exists(path):
+                        continue
                     self._fs.remove(path)
                     restored_paths.append(path)
                 except Exception:
                     errors.append(f"Failed to delete file: {path}")
                 continue
-            if self.read(path) == state:
-                continue
             try:
+                if self.read(path) == state:
+                    continue
                 self._fs.write_bytes(path, state.data)
                 restored_paths.append(path)
             except Exception:

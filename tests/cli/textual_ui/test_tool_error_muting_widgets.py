@@ -8,11 +8,11 @@ from textual.widgets import Static
 
 from chartreux.app_server.models import PublicEffectEntry
 from chartreux.cli.textual_ui.widgets.collapsible import CollapsibleSection
-from chartreux.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
 from chartreux.core.events import ToolCallEvent, ToolResultEvent
 from chartreux.core.tools.builtins.edit import Edit, EditArgs
 from chartreux.core.tools.builtins.read_file import ReadFile, ReadFileArgs
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from tests.stubs.app_server import CoreEventProjection
 from tests.stubs.fake_tool import FakeTool, FakeToolArgs
 

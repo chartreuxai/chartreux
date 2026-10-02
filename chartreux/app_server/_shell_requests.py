@@ -34,6 +34,7 @@ from chartreux.app_server.protocol import (
 )
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.llm_models import ManualShellContext
+from chartreux.core.tools import secret_redaction
 from chartreux.core.tools.builtins.bash import BashToolConfig
 
 
@@ -101,7 +102,9 @@ class ShellRequestHandler:
                 detail=shell_effect_detail(command),
             )
             try:
-                response = await self._shell.run(run_params, observe_output)
+                response = secret_redaction.redact_model(
+                    await self._shell.run(run_params, observe_output)
+                )
             except asyncio.CancelledError:
                 await self._turns.complete_effect(
                     operation_id,

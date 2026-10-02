@@ -14,8 +14,8 @@ from chartreux.app_server.models import (
     PublicEntryGenerationStatus,
 )
 from chartreux.cli.textual_ui.widgets.collapsible import HeaderCollapsibleSection
-from chartreux.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.cli.textual_ui.widgets.tools import ToolResultMessage
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
 
 def _completed_entry(output: JsonValue, output_text: str) -> PublicEffectEntry:

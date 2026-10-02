@@ -8,12 +8,12 @@ import time
 import tomllib
 from typing import cast
 
-from chartreux.core.model_catalog.loader import CatalogStore, load_catalog
-from chartreux.ui.providers.contracts import (
+from chartreux.core.model_catalog.contracts import (
     CatalogChanges,
     CatalogValidationError,
     CatalogWriteResult,
 )
+from chartreux.core.model_catalog.loader import CatalogStore, load_catalog
 
 
 def test_overlay_provenance_includes_explicit_shipped_default(tmp_path: Path) -> None:

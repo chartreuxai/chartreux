@@ -54,16 +54,15 @@ enabled_tools = ["read_file", "grep", "web_*"]
 disabled_tools = ["web_fetch"]
 
 [tools.bash]
-permission = "ask"
+permission = "always"
 ```
 
-The current per-tool permission values are `always`, `ask`, and `never`:
+The current per-tool permission values are `always` and `never`:
 
-- `always` permits the tool subject to its other safety checks.
-- `ask` does not display an approval prompt; the tool executes automatically, subject to permission policy and runtime safety checks.
+- `always` executes the tool automatically, subject to permission policy and runtime safety checks.
 - `never` prevents the tool from running.
 
-These are tool permissions, not application-wide operating modes. The former `plan`, `ask`, `accept-edits`, and `auto-approve` mode set is not part of the current configuration. `ask` does not request interactive approval: execution remains governed by permission policy, denylists, sensitive-file and workspace checks, and other runtime safeguards. Child agents cannot receive authority beyond their parent. MCP tools use the same filtering and permission mechanisms; see [MCP](mcp.md).
+These are tool permissions, not application-wide operating modes. The former `plan`, `ask`, `accept-edits`, and `auto-approve` mode set is not part of the current configuration. Routine tool calls do not request interactive approval: execution remains governed by permission policy, denylists, sensitive-file and workspace checks, and other runtime safeguards. Child agents cannot receive authority beyond their parent. MCP tools use the same filtering and permission mechanisms; see [MCP](mcp.md).
 
 ## Trusted folders
 

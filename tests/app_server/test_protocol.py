@@ -204,6 +204,239 @@ async def test_response_boundary_is_ordered_without_blocking_nested_requests() -
 
 
 @pytest.mark.asyncio
+async def test_client_burst_does_not_block_in_flight_resync() -> None:
+    client_transport, peer_transport = memory_transport_pair()
+    client = AppServerClient(client_transport)
+    observed: list[int | str] = []
+    resynced = asyncio.Event()
+
+    async def consume() -> None:
+        incoming = client.incoming()
+        try:
+            trigger = await anext(incoming)
+            assert trigger.method == "test/gap"
+            assert await client.request("session/read") == {"snapshot": True}
+            observed.append("resynced")
+            resynced.set()
+            for _ in range(400):
+                message = await anext(incoming)
+                observed.append(cast(int, message.params["index"]))
+        finally:
+            await incoming.aclose()
+
+    await client.start()
+    consumer = asyncio.create_task(consume())
+    try:
+        await peer_transport.send({
+            "jsonrpc": "2.0",
+            "method": "test/gap",
+            "params": {},
+        })
+        request = await anext(peer_transport.messages())
+        assert request["method"] == "session/read"
+        request_future = client._pending[request["id"]]
+        for index in range(400):
+            await peer_transport.send({
+                "jsonrpc": "2.0",
+                "method": "test/notification",
+                "params": {"index": index},
+            })
+        await peer_transport.send({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {"snapshot": True},
+        })
+
+        await resynced.wait()
+        assert request_future.done()
+        assert request_future.result().result == {"snapshot": True}
+        await consumer
+        assert observed == ["resynced", *range(400)]
+    finally:
+        await client.close()
+        await peer_transport.close()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_client_slow_consumer_allows_sustained_rpc_and_ordered_drain() -> None:
+    client_transport, peer_transport = memory_transport_pair()
+    client = AppServerClient(client_transport)
+    paused = asyncio.Event()
+    resume = asyncio.Event()
+    observed: list[int] = []
+
+    async def consume() -> None:
+        async for message in client.incoming():
+            observed.append(cast(int, message.params["index"]))
+            if len(observed) == 1:
+                paused.set()
+                await resume.wait()
+
+    await client.start()
+    consumer = asyncio.create_task(consume())
+    try:
+        await peer_transport.send({
+            "jsonrpc": "2.0",
+            "method": "test/notification",
+            "params": {"index": 0},
+        })
+        await paused.wait()
+        for batch in range(3):
+            rpc = asyncio.create_task(client.request("test/ping"))
+            request = await anext(peer_transport.messages())
+            for index in range(1 + batch * 200, 1 + (batch + 1) * 200):
+                await peer_transport.send({
+                    "jsonrpc": "2.0",
+                    "method": "test/notification",
+                    "params": {"index": index},
+                })
+            await peer_transport.send({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"batch": batch},
+            })
+            assert await rpc == {"batch": batch}
+            assert observed == [0]
+            assert not resume.is_set()
+            assert client._incoming.qsize() == (batch + 1) * 200
+
+        # Production has stopped. Closing the transport must not discard the backlog.
+        await client.close()
+        resume.set()
+        await consumer
+        assert observed == list(range(601))
+        assert client._incoming.empty()
+    finally:
+        resume.set()
+        await client.close()
+        await peer_transport.close()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_client_backlog_preserves_session_snapshot_response_boundary() -> None:
+    client_transport, peer_transport = memory_transport_pair()
+    client = AppServerClient(client_transport)
+    observed: list[tuple[str, int | str]] = []
+    session_id = "old"
+
+    def adopt(result: dict[str, Any]) -> None:
+        nonlocal session_id
+        observed.append(("adopted", result["sessionId"]))
+        session_id = result["sessionId"]
+
+    attachment = asyncio.create_task(
+        client.request("session/resume", response_boundary=adopt)
+    )
+    try:
+        request = await anext(peer_transport.messages())
+        for index in range(400):
+            await peer_transport.send({
+                "jsonrpc": "2.0",
+                "method": "test/old",
+                "params": {"index": index},
+            })
+        await peer_transport.send({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {"sessionId": "new"},
+        })
+        await peer_transport.send({
+            "jsonrpc": "2.0",
+            "method": "test/new",
+            "params": {"index": 400},
+        })
+        # A plain RPC fences reader progress without draining the ordered stream.
+        fence = asyncio.create_task(client.request("test/fence"))
+        fence_request = await anext(peer_transport.messages())
+        await peer_transport.send({
+            "jsonrpc": "2.0",
+            "id": fence_request["id"],
+            "result": {},
+        })
+        assert await fence == {}
+        assert not attachment.done()
+        assert observed == []
+        assert session_id == "old"
+
+        incoming = client.incoming()
+        try:
+            for _ in range(401):
+                message = await anext(incoming)
+                assert message.method == f"test/{session_id}"
+                observed.append((session_id, cast(int, message.params["index"])))
+        finally:
+            await incoming.aclose()
+        assert await attachment == {"sessionId": "new"}
+        assert observed == [
+            *(("old", index) for index in range(400)),
+            ("adopted", "new"),
+            ("new", 400),
+        ]
+    finally:
+        await client.close()
+        await peer_transport.close()
+        await asyncio.gather(attachment, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_client_close_with_backlog_resolves_all_pending_requests() -> None:
+    initial_tasks = asyncio.all_tasks()
+    client_transport, peer_transport = memory_transport_pair()
+    client = AppServerClient(client_transport)
+    adopted = Mock()
+    attachment = asyncio.create_task(
+        client.request("session/resume", response_boundary=adopted)
+    )
+    pending = asyncio.create_task(client.request("test/pending"))
+    try:
+        requests = [await anext(peer_transport.messages()) for _ in range(2)]
+        request_futures = list(client._pending.values())
+        attachment_request = next(
+            request for request in requests if request["method"] == "session/resume"
+        )
+        for index in range(400):
+            await peer_transport.send({
+                "jsonrpc": "2.0",
+                "method": "test/notification",
+                "params": {"index": index},
+            })
+        await peer_transport.send({
+            "jsonrpc": "2.0",
+            "id": attachment_request["id"],
+            "result": {},
+        })
+        fence = asyncio.create_task(client.request("test/fence"))
+        fence_request = await anext(peer_transport.messages())
+        await peer_transport.send({
+            "jsonrpc": "2.0",
+            "id": fence_request["id"],
+            "result": {},
+        })
+        assert await fence == {}
+        assert client._incoming.qsize() == 401
+        assert all(not future.done() for future in request_futures)
+
+        await client.close()
+        outcomes = await asyncio.gather(attachment, pending, return_exceptions=True)
+        assert all(
+            isinstance(outcome, AppServerConnectionClosed) for outcome in outcomes
+        )
+        assert all(future.done() for future in request_futures)
+        assert client._pending == {}
+        assert client._response_boundaries == {}
+        assert client._reader_task is not None
+        assert client._reader_task.done()
+        adopted.assert_not_called()
+        assert asyncio.all_tasks() - initial_tasks == set()
+    finally:
+        await client.close()
+        await peer_transport.close()
+        await asyncio.gather(attachment, pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_server_rejects_unknown_response_id() -> None:
     client_transport, server_transport = memory_transport_pair()
     agent_loop = build_test_agent_loop()

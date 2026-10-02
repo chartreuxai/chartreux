@@ -269,7 +269,7 @@ disabled_tools = ["web_fetch"]
 
 # Per-tool configuration
 [tools.bash]
-permission = "ask"
+permission = "always"
 denylist = ["gdb", "pdb"]
 
 # Web search: provider is auto, mistral, exa, brave, or duckduckgo.
@@ -826,15 +826,15 @@ Image attachments:
   automatically prepends `@` (and quotes paths containing spaces).
   Non-image paths are pasted verbatim so non-image use cases are not
   affected.
-- **Image copy/paste from the clipboard** (**macOS only** for now):
-  writes the image to `<session_dir>/attachments/clipboard-<ts>.png`
-  (or the system temp dir when no session is active) and inserts an
-  `@<path>` token at the cursor. Two entry points:
+- **Image copy/paste from the clipboard** (macOS and Linux):
+  writes the image to the system temp dir as `clipboard-<ts>.png` or `.jpg`
+  and inserts an `@<path>` token at the cursor. Two entry points:
   1. `Ctrl+V` keybinding inside the prompt.
   2. `/paste-image` slash command.
 
-  Uses `osascript` with a TIFF→PNG fallback via `sips`. On Linux the binding and
-  the slash command are not registered, so the feature is invisible there.
+  Uses `osascript` with a TIFF→PNG fallback via `sips` on macOS.
+  Linux reads PNG/JPEG via `wl-paste` on Wayland or `xclip` on X11;
+  install the corresponding clipboard utility to enable image paste.
 - Rendered in the chat bubble as one dim `attached image:` footer line
   per image, linking each attachment to its snapshot. Clicking opens the
   file with the OS default image viewer.

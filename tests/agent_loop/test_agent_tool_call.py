@@ -253,9 +253,9 @@ async def test_single_tool_call_executes_when_permission_is_always() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_call_executes_without_approval_at_ask_permission() -> None:
+async def test_tool_call_executes_without_approval_at_always_permission() -> None:
     agent_loop = make_agent_loop(
-        todo_permission=ToolPermission.ASK,
+        todo_permission=ToolPermission.ALWAYS,
         backend=FakeBackend([
             [
                 mock_llm_chunk(
@@ -357,7 +357,7 @@ async def test_tool_call_skipped_when_permission_is_never() -> None:
 @pytest.mark.asyncio
 async def test_repeated_calls_do_not_mutate_configured_permission() -> None:
     agent_loop = make_agent_loop(
-        todo_permission=ToolPermission.ASK,
+        todo_permission=ToolPermission.ALWAYS,
         backend=FakeBackend([
             [
                 mock_llm_chunk(
@@ -381,9 +381,9 @@ async def test_repeated_calls_do_not_mutate_configured_permission() -> None:
     events2 = await act_and_collect_events(agent_loop, "Second request")
 
     tool_config_todo = agent_loop.tool_manager.get_tool_config("todo")
-    assert tool_config_todo.permission is ToolPermission.ASK
+    assert tool_config_todo.permission is ToolPermission.ALWAYS
     tool_config_help = agent_loop.tool_manager.get_tool_config("bash")
-    assert tool_config_help.permission is not ToolPermission.ALWAYS
+    assert tool_config_help.permission is ToolPermission.ALWAYS
     assert agent_loop.config.model_dump()["tools"] == original_tools
     assert isinstance(events1[0], UserMessageEvent)
     first_result = tool_result(events1)
@@ -527,6 +527,10 @@ class _RecordingHooksManager:
     def reset_retry_count(self) -> None:
         return
 
+    def _matching_hooks(self, handler: object, invocation: object) -> list[object]:
+        # This fixture records every invocation, regardless of hook type.
+        return [self]
+
     async def run(self, invocation: object) -> AsyncGenerator[object, None]:
         self.invoked.append(str(getattr(invocation, "hook_event_name", "")))
         if self.cancel_on_pre and self.invoked[-1] == "pre_tool":
@@ -546,7 +550,7 @@ async def test_post_tool_does_not_fire_when_cancel_lands_before_tool_execution()
     None
 ):
     agent_loop = make_agent_loop(
-        todo_permission=ToolPermission.ASK,
+        todo_permission=ToolPermission.ALWAYS,
         backend=FakeBackend([
             [
                 mock_llm_chunk(
@@ -908,7 +912,7 @@ async def test_parallel_calls_execute_without_approval_handler() -> None:
     tc1 = make_todo_tool_call("call_nc1", index=0)
     tc2 = make_todo_tool_call("call_nc2", index=1)
     agent_loop = make_agent_loop(
-        todo_permission=ToolPermission.ASK,
+        todo_permission=ToolPermission.ALWAYS,
         backend=FakeBackend([
             [mock_llm_chunk(content="Two tools.", tool_calls=[tc1, tc2])],
             [mock_llm_chunk(content="Cannot proceed.")],

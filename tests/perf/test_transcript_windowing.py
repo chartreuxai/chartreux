@@ -371,15 +371,19 @@ async def _measure_eviction_remount_anchor(
     )
     assert restored
     await pilot.pause(0)
+    # The retained reference keeps the evicted widget in the weak index map.
+    # Textual's is_mounted remains true after removal; only the attached remount
+    # has meaningful geometry. The reading anchor must still stay at the same row.
     restored_anchor = next(
         (
             widget
             for widget, index in app._history_widget_indices.items()
-            if index == entry_index and widget.is_mounted
+            if index == entry_index and widget.is_attached
         ),
         None,
     )
     assert restored_anchor is not None
+    assert restored_anchor is not anchor_widget
     after_row = _anchor_row(restored_anchor, chat)
     delta = after_row - before_row
     assert delta == 0, f"eviction/remount moved retained anchor by {delta} rows"
@@ -851,9 +855,14 @@ async def test_transcript_windowing_baseline(
     monkeypatch.setattr(Screen, "_refresh_layout", measure_refresh_layout)
 
     async def resume_fixture_session(
-        session: AppServerSession, session_id: str
+        session: AppServerSession,
+        session_id: str,
+        *,
+        on_adopt: Callable[[], None] | None = None,
     ) -> None:
         assert session_id == session.session_id
+        if on_adopt is not None:
+            on_adopt()
 
     # The fixture has no persisted session log; retain its client-side history
     # while exercising the same app event path as a picker selection.

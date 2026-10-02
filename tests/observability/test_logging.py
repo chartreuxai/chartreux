@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -22,6 +23,21 @@ from chartreux.observability.logging import (
     set_log_level,
     set_session_override,
 )
+
+
+@pytest.fixture(autouse=True)
+def reset_log_level_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    # TUI recovery feedback can leave a DEBUG session override behind. These
+    # tests exercise each precedence layer from a clean process-global baseline.
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    monkeypatch.delenv("DEBUG_MODE", raising=False)
+    set_session_override(None)
+    set_config_log_level(None)
+    try:
+        yield
+    finally:
+        set_session_override(None)
+        set_config_log_level(None)
 
 
 @pytest.fixture

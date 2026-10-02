@@ -25,11 +25,8 @@ from chartreux.cli.textual_ui.widgets.messages import (
     SlashCommandMessage,
     UserMessage,
 )
-from chartreux.cli.textual_ui.widgets.theme_picker import (
-    ThemePickerApp,
-    sorted_theme_names,
-)
 from chartreux.observability.logging import set_config_log_level, set_session_override
+from chartreux.ui.widgets.theme_picker import ThemePickerApp, sorted_theme_names
 from tests.conftest import build_test_agent_loop, build_test_chartreux_app
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend

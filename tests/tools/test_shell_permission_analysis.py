@@ -7,6 +7,81 @@ from chartreux.core.tools.builtins._shell_permission_analysis import (
 )
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "UV_WORKING_DIR",
+        "UV_WORKING_DIRECTORY",
+        "UV_PROJECT",
+        "PIP_LOG",
+        "PIP_SOURCE",
+        "PIP_SOURCE_DIR",
+        "PIP_SOURCE_DIRECTORY",
+        "PIP_DEST",
+        "PIP_DESTINATION_DIR",
+        "PIP_DESTINATION_DIRECTORY",
+        "PIP_REQUIREMENTS_FROM_SCRIPT",
+        "PIP_REPORT",
+        "PIPX_COMPLETION_DIR",
+        "PIPX_GLOBAL_COMPLETION_DIR",
+        "XDG_STATE_HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "SYSTEMDRIVE",
+        "UV_PYTHON_DOWNLOADS_JSON_URL",
+        "PIP_BUILD_TRACKER",
+        "PIP_DOWNLOAD_DIR",
+        "PIP_WHEEL_DIR",
+        "PIP_REQUIREMENT",
+        "PIP_CONSTRAINT",
+        "PIP_BUILD_CONSTRAINT",
+        "UV_CREDENTIALS_DIR",
+        "UV_INSTALL_DIR",
+        "UV_UNMANAGED_INSTALL",
+        "UV_PYTHON_BIN_DIR",
+        "UV_PYTHON_CACHE_DIR",
+        "UV_ENV_FILE",
+        "UV_BUILD_CONSTRAINT",
+        "UV_CONSTRAINT",
+        "UV_OVERRIDE",
+        "UV_EXCLUDE",
+        "PIPX_MAN_DIR",
+        "PIPX_SHARED_LIBS",
+        "PIPX_GLOBAL_HOME",
+        "PIPX_GLOBAL_BIN_DIR",
+        "PIPX_GLOBAL_MAN_DIR",
+        "POETRY_CACHE_DIR",
+        "POETRY_DATA_DIR",
+        "POETRY_HOME",
+        "POETRY_PYTHON_INSTALLATION_DIR",
+        "TRACING_DURATIONS_FILE",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+        "XDG_BIN_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CONFIG_DIRS",
+        "XDG_DATA_HOME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "USERPROFILE",
+        "NPM_CONFIG_USERCONFIG",
+        "NPM_CONFIG_GLOBALCONFIG",
+        "NPM_CONFIG_LOGS_DIR",
+    ],
+)
+def test_package_destination_environment_is_gated(name: str) -> None:
+    analysis = analyze_shell_command(f"{name}=../outside uv sync")
+    assert analysis.requires_approval
+    assert f"dangerous environment assignment ({name})" in analysis.approval_reasons
+
+
+@pytest.mark.parametrize("name", ["PIP_DISABLE_PIP_VERSION_CHECK", "UV_NO_SYNC"])
+def test_benign_package_environment_is_not_gated(name: str) -> None:
+    assert not analyze_shell_command(f"{name}=1 uv sync").requires_approval
+
+
 def test_simple_command_is_extracted_without_approval() -> None:
     analysis = analyze_shell_command("echo hello")
 
@@ -161,6 +236,46 @@ def test_pythonpath_dangerous_entries_require_approval(value: str) -> None:
 
     assert analysis.requires_approval
     assert "dangerous environment assignment (PYTHONPATH)" in analysis.approval_reasons
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        "{assignment} npm test",
+        "env {assignment} npm test",
+        "export {assignment}; npm test",
+    ],
+)
+@pytest.mark.parametrize("name", ["LESSOPEN", "LESSCLOSE", "LESSEDIT", "KSH_ENV"])
+def test_executable_environment_forms_are_gated(form: str, name: str) -> None:
+    analysis = analyze_shell_command(
+        form.format(assignment=f"{name}='|cat /outside/data %s'")
+    )
+    assert f"dangerous environment assignment ({name})" in analysis.approval_reasons
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        "{assignment} npm test",
+        "env {assignment} npm test",
+        "export {assignment}; npm test",
+    ],
+)
+@pytest.mark.parametrize("value", [r"\|cat", r"\`cat\`", r"\$\(cat\)"])
+def test_unquoted_assignment_execution_syntax_is_gated(form: str, value: str) -> None:
+    analysis = analyze_shell_command(form.format(assignment=f"FOO={value}"))
+    assert (
+        "dangerous environment assignment (FOO): command-execution syntax"
+        in analysis.approval_reasons
+    )
+
+
+@pytest.mark.parametrize("form", ["{assignment} npm test", "env {assignment} npm test"])
+@pytest.mark.parametrize("value", ["'|cat'", "'`cat`'", "'$(cat)'"])
+def test_quoted_non_executable_environment_is_literal(form: str, value: str) -> None:
+    analysis = analyze_shell_command(form.format(assignment=f"FOO={value}"))
+    assert not analysis.requires_approval
 
 
 def test_pythonpath_relative_entries_are_allowed() -> None:
@@ -353,5 +468,5 @@ def test_requires_approval_reflects_reasons() -> None:
 def test_approval_label_names_the_reasons() -> None:
     label = analyze_shell_command("echo $(whoami)").approval_label
 
-    assert label.startswith("shell syntax requiring approval: ")
+    assert label.startswith("unsupported shell syntax: ")
     assert "command substitution" in label

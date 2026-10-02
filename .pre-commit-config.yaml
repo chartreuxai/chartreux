@@ -1,5 +1,16 @@
 ---
 repos:
+  - repo: local
+    hooks:
+      - id: docs-build
+        name: Build documentation (strict)
+        entry: mkdocs build --strict
+        language: python
+        additional_dependencies: ["mkdocs>=1.6.1"]
+        files: ^(docs/|mkdocs\.yml$|README\.md$|CHANGELOG\.md$|ACKNOWLEDGEMENTS\.md$|\.pre-commit-config\.yaml$)
+        exclude: ^docs/reviews/
+        pass_filenames: false
+
   - repo: https://github.com/mpalmer/action-validator
     rev: 7fa61514fb806fc9afd664b909e83584aca84f78 # v0.7.0
     hooks:

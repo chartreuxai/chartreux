@@ -54,7 +54,7 @@ class GrepToolConfig(BaseToolConfig):
     permission: ToolPermission = ToolPermission.ALWAYS
     sensitive_patterns: list[str] = Field(
         default_factory=lambda: list(DEFAULT_SENSITIVE_PATTERNS),
-        description="File patterns that trigger ASK even when permission is ALWAYS.",
+        description="File patterns that deny execution even when permission is ALWAYS.",
     )
 
     max_output_bytes: int = Field(

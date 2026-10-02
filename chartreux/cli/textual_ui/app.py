@@ -235,7 +235,6 @@ if TYPE_CHECKING:
     from chartreux.app_server.host import AppServerHost
     from chartreux.app_server.session import AppServerSession, SessionExitSummary
     from chartreux.cli.textual_ui.screens.settings import SettingsScreen
-    from chartreux.cli.textual_ui.screens.web_search import WebSearchScreen
     from chartreux.cli.textual_ui.widgets.debug_console import DebugConsole
     from chartreux.cli.textual_ui.widgets.log_level_picker import LogLevelPickerApp
     from chartreux.cli.textual_ui.widgets.mcp_app import MCPApp
@@ -246,6 +245,7 @@ if TYPE_CHECKING:
     from chartreux.cli.textual_ui.widgets.rewind_app import RewindApp
     from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
     from chartreux.cli.textual_ui.widgets.thinking_picker import ThinkingPickerApp
+    from chartreux.ui.web_search import WebSearchScreen
     from chartreux.ui.widgets.theme_picker import ThemePickerApp
 
 
@@ -298,7 +298,7 @@ def _get_settings_screen_class() -> type[SettingsScreen]:
 
 
 def _get_web_search_screen_class() -> type[WebSearchScreen]:
-    from chartreux.cli.textual_ui.screens.web_search import WebSearchScreen
+    from chartreux.ui.web_search import WebSearchScreen
 
     return WebSearchScreen
 
@@ -346,7 +346,7 @@ class _ProviderCredentials:
     def save_key(self, env_var: str, key: str) -> Any:
         outcome = persist_api_key_for_provider(env_var, key)
         credential_save_result = import_module(
-            "chartreux.ui.providers.contracts"
+            "chartreux.core.model_catalog.contracts"
         ).CredentialSaveResult
         if outcome == "completed":
             return credential_save_result("saved")
@@ -368,7 +368,7 @@ class _ProviderConfigService:
 
     async def persist_theme(self, theme: str) -> Any:
         config_persist_result = import_module(
-            "chartreux.ui.providers.contracts"
+            "chartreux.core.model_catalog.contracts"
         ).ConfigPersistResult
         try:
             await self._app.app_server.resources.config.update({"theme": theme})
@@ -379,7 +379,7 @@ class _ProviderConfigService:
         return config_persist_result(True)
 
     async def reload_catalog_and_config(self) -> Any:
-        contracts = import_module("chartreux.ui.providers.contracts")
+        contracts = import_module("chartreux.core.model_catalog.contracts")
         config_reload_result = contracts.ConfigReloadResult
         load_catalog = import_module("chartreux.core.model_catalog.loader").load_catalog
         try:
@@ -395,7 +395,7 @@ class _ProviderConfigService:
 
     async def persist_active_model(self, expression: str) -> Any:
         config_persist_result = import_module(
-            "chartreux.ui.providers.contracts"
+            "chartreux.core.model_catalog.contracts"
         ).ConfigPersistResult
         try:
             await self._app.app_server.resources.config.update({
@@ -3947,7 +3947,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     async def _wait_for_web_search_from_settings(self) -> None:
         try:
-            from chartreux.cli.textual_ui.settings_service import SettingsService
+            from chartreux.ui.settings_service import SettingsService
 
             service = SettingsService(
                 self.app_server.resources.config, apply_ui=self._apply_config_to_ui
@@ -4011,7 +4011,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         """Wait outside the dismissed screen, then explicitly report adoption."""
         try:
             workbench = import_module("chartreux.ui.providers.workbench")
-            contracts = import_module("chartreux.ui.providers.contracts")
+            contracts = import_module("chartreux.core.model_catalog.contracts")
             catalog_loader = import_module("chartreux.core.model_catalog.loader")
             discovery_module = import_module("chartreux.core.model_catalog.discovery")
             credentials = _ProviderCredentials()
@@ -5118,7 +5118,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
 
     async def _wait_for_settings(self) -> None:
-        from chartreux.cli.textual_ui.settings_service import SettingsService
+        from chartreux.ui.settings_service import SettingsService
 
         service = SettingsService(
             self.app_server.resources.config, apply_ui=self._apply_config_to_ui

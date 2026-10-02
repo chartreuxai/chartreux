@@ -13,7 +13,6 @@ import logging
 import os
 from pathlib import Path
 import subprocess
-import tempfile
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
@@ -38,6 +37,7 @@ from chartreux.core.session_types import (
 )
 from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils import utc_now
+from chartreux.utils.durable_io import durable_append, durable_replace
 from chartreux.utils.io import read_safe, read_safe_async
 from chartreux.utils.platform import resolve_git_executable
 from chartreux.utils.session_id import shorten_session_id
@@ -415,22 +415,12 @@ class SessionLogger:  # noqa: PLR0904
 
     @staticmethod
     def _persist_metadata_sync(metadata: Any, session_dir: Path) -> None:
-        temp_metadata_filepath = None
         metadata_filepath = session_dir / METADATA_FILENAME
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=".json.tmp",
-                dir=str(session_dir),
-                delete=False,
-                encoding="utf-8",
-            ) as f:
-                temp_metadata_filepath = Path(f.name)
-                f.write(json.dumps(metadata, indent=2, ensure_ascii=False))
-                f.flush()
-                os.fsync(f.fileno())
-
-            os.replace(temp_metadata_filepath, str(metadata_filepath))
+            durable_replace(
+                metadata_filepath,
+                json.dumps(metadata, indent=2, ensure_ascii=False).encode("utf-8"),
+            )
         except Exception as e:
             if _is_enospc(e):
                 raise SessionDiskFullError(
@@ -439,13 +429,6 @@ class SessionLogger:  # noqa: PLR0904
             raise RuntimeError(
                 f"Failed to persist session metadata to {metadata_filepath}: {e}"
             ) from e
-        finally:
-            if (
-                temp_metadata_filepath
-                and temp_metadata_filepath.exists()
-                and temp_metadata_filepath.is_file()
-            ):
-                temp_metadata_filepath.unlink()
 
     @staticmethod
     async def persist_metadata(metadata: Any, session_dir: Path) -> None:
@@ -473,22 +456,13 @@ class SessionLogger:  # noqa: PLR0904
 
     @staticmethod
     def _persist_messages_sync(messages: list[dict], session_dir: Path) -> int:
-        messages_filepath = session_dir / "messages.jsonl"
+        messages_filepath = session_dir / MESSAGES_FILENAME
         try:
-            # Session logs hold raw tool results, so new files are owner-only.
-            # An existing file (a resumed session) keeps its current mode.
-            descriptor = os.open(
-                messages_filepath, os.O_APPEND | os.O_CREAT | os.O_RDWR, 0o600
+            durable_append(
+                messages_filepath,
+                SessionLogger._transcript_bytes(messages),
+                ensure_newline=True,
             )
-            if os.lseek(descriptor, 0, os.SEEK_END) > 0:
-                os.lseek(descriptor, -1, os.SEEK_END)
-                if os.read(descriptor, 1) != b"\n":
-                    os.write(descriptor, b"\n")
-            with os.fdopen(descriptor, "a", encoding="utf-8") as f:
-                for message in messages:
-                    f.write(json.dumps(message, ensure_ascii=False) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
             return messages_filepath.stat().st_size
         except Exception as e:
             if _is_enospc(e):
@@ -508,22 +482,10 @@ class SessionLogger:  # noqa: PLR0904
     @staticmethod
     def _overwrite_messages_sync(messages: list[dict], session_dir: Path) -> None:
         messages_filepath = session_dir / MESSAGES_FILENAME
-        temp_filepath = None
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=".jsonl.tmp",
-                dir=str(session_dir),
-                delete=False,
-                encoding="utf-8",
-            ) as f:
-                temp_filepath = Path(f.name)
-                for message in messages:
-                    f.write(json.dumps(message, ensure_ascii=False) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-
-            os.replace(temp_filepath, str(messages_filepath))
+            durable_replace(
+                messages_filepath, SessionLogger._transcript_bytes(messages)
+            )
         except Exception as e:
             if _is_enospc(e):
                 raise SessionDiskFullError(
@@ -532,9 +494,6 @@ class SessionLogger:  # noqa: PLR0904
             raise RuntimeError(
                 f"Failed to overwrite session messages at {messages_filepath}: {e}"
             ) from e
-        finally:
-            if temp_filepath and temp_filepath.exists() and temp_filepath.is_file():
-                temp_filepath.unlink()
 
     @staticmethod
     def _message_fingerprint(message: LLMMessage) -> str:
@@ -543,7 +502,8 @@ class SessionLogger:  # noqa: PLR0904
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    async def save_interaction(
+    # Keep cancellation draining and error handling in one lock scope.
+    async def save_interaction(  # noqa: PLR0915 - one serialized commit boundary
         self,
         messages: Sequence[LLMMessage],
         stats: AgentStats,
@@ -553,10 +513,12 @@ class SessionLogger:  # noqa: PLR0904
         *,
         allow_empty: bool = False,
     ) -> None:
+        """Save an ordinary snapshot, discarding stale snapshots."""
         session_info = self._get_session_info()
         if session_info is None:
             return
         session_dir, session_metadata = session_info
+        cursor_generation_snapshot = self._transcript_cursor_generation
 
         non_system_messages = [m for m in messages if m.role != Role.system]
 
@@ -570,15 +532,19 @@ class SessionLogger:  # noqa: PLR0904
         messages_snapshot = list(messages)
         config_snapshot = config.model_dump(mode="json")
         async with self._save_lock:
+            # Fence the entire write (transcript and metadata), not only the
+            # cursor update. Rewind/reset invalidates snapshots queued earlier.
+            if self._transcript_cursor_generation != cursor_generation_snapshot:
+                logger.debug("Discarding stale interaction save for %s", session_dir)
+                return
             session_metadata.config = config_snapshot
             launch_config_generation = self._launch_config_generation
             metadata_snapshot = session_metadata.model_copy(deep=True)
             cursor_snapshot = self._transcript_cursor
             saves_since_verify = self._transcript_saves_since_verify
-            cursor_generation_snapshot = self._transcript_cursor_generation
-            persistence = asyncio.create_task(
-                asyncio.to_thread(
-                    self._save_interaction_sync,
+
+            def persist() -> tuple[_TranscriptCursor | None, int] | None:
+                return self._save_interaction_sync(
                     messages_snapshot,
                     stats,
                     tool_manager,
@@ -590,7 +556,8 @@ class SessionLogger:  # noqa: PLR0904
                     cursor_snapshot,
                     saves_since_verify,
                 )
-            )
+
+            persistence = asyncio.create_task(asyncio.to_thread(persist))
             try:
                 save_result = await asyncio.shield(persistence)
             except SessionDiskFullError as disk_full:
@@ -892,6 +859,12 @@ class SessionLogger:  # noqa: PLR0904
             self.maybe_cleanup_tmp_files()
         return updated_cursor, saves_since_verify + 1
 
+    @staticmethod
+    def _transcript_bytes(messages: list[dict[str, Any]]) -> bytes:
+        return "".join(
+            json.dumps(message, ensure_ascii=False) + "\n" for message in messages
+        ).encode("utf-8")
+
     def _save_full_verify(
         self,
         messages: list[LLMMessage],
@@ -1181,8 +1154,7 @@ class SessionLogger:  # noqa: PLR0904
         self.session_dir = self.save_folder
         self.session_metadata = self._initialize_session_metadata()
         self._persisted = False
-        self._transcript_cursor = None
-        self._transcript_saves_since_verify = 0
+        self.invalidate_transcript_cursor()
         if parent_session_id is not None:
             self.session_metadata.parent_session_id = parent_session_id
 
@@ -1209,8 +1181,7 @@ class SessionLogger:  # noqa: PLR0904
         self.session_metadata = metadata
         self._title = metadata.title
         self._persisted = True
-        self._transcript_cursor = None
-        self._transcript_saves_since_verify = 0
+        self.invalidate_transcript_cursor()
 
         if metadata.start_time:
             self.session_start_time = metadata.start_time

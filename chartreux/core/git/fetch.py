@@ -11,6 +11,12 @@ import subprocess
 from typing import TYPE_CHECKING, Any
 from urllib.parse import SplitResult, unquote, urlsplit
 
+from chartreux.core.git.policy import (
+    bind_repository,
+    inherited_environment,
+    repository_environment,
+    validate_fetch_refspec,
+)
 from chartreux.utils.platform import resolve_ssh_executable
 
 if TYPE_CHECKING:
@@ -47,8 +53,16 @@ def prepare_secure_fetch(
     fetches use an explicit, allowlisted URL and command-scope overrides for
     every executable setting used by the supported SSH and HTTPS transports.
     """
+    bind_repository(repo)
     configured_url = _remote_url(repo, remote)
     protocol, url = _validated_fetch_url(configured_url, allow_file=allow_file)
+    if protocol == "file":
+        # Git resolves a bare relative spelling as a remote name before a path.
+        # Anchor paths to the bound checkout, never the process working directory.
+        try:
+            url = str((_resolved_project_dir(repo) / url).resolve())
+        except (OSError, RuntimeError) as e:
+            raise UnsafeGitFetchError("Cannot resolve the local fetch path") from e
     trusted_fetch_config = _inspect_fetch_config(
         repo, url=url, reject_repository_http=protocol != "file"
     )
@@ -69,9 +83,8 @@ def prepare_secure_fetch(
     ]
     if allow_file:
         config.append(("protocol.file.allow", "always"))
-    # GitPython merges this env over os.environ, so inherited GIT_DIR/GIT_WORK_TREE/GIT_OBJECT_DIRECTORY still apply;
-    # the inline GIT_CONFIG_COUNT block fully overrides the user GIT_CONFIG_* indices.
-    env = _config_environment(config)
+    env = repository_environment(repo)
+    env.update(_config_environment(config))
     env.update({
         "GCM_INTERACTIVE": "never",
         "GIT_ALLOW_PROTOCOL": "https:ssh:file" if allow_file else "https:ssh",
@@ -110,10 +123,18 @@ def fetch_remote(
     **kwargs: Any,
 ) -> Any:
     """Fetch an SSH/HTTPS remote under the shared untrusted-repository policy."""
+    try:
+        for refspec in refspecs:
+            validate_fetch_refspec(refspec)
+    except ValueError as e:
+        raise UnsafeGitFetchError(str(e)) from e
     secure = prepare_secure_fetch(repo, remote, allow_file=allow_file)
+    bind_repository(repo)
+    # fetch accepts the parse-options delimiter before repository/refspec operands.
     return repo.git.fetch(
         "--no-recurse-submodules",
         "--no-auto-maintenance",
+        "--",
         secure.url,
         *refspecs,
         env=secure.env,
@@ -227,8 +248,16 @@ def _trusted_ssh_executable(repo: Repo) -> str | None:
 
 
 def _trusted_path(repo: Repo) -> str:
-    """Drop relative and checkout-controlled entries from inherited PATH."""
+    """Drop relative, checkout-controlled, and metadata-controlled PATH entries."""
     project_dir = _resolved_project_dir(repo)
+    try:
+        protected = {
+            project_dir,
+            Path(repo.git_dir).resolve(),
+            Path(getattr(repo, "common_dir", repo.git_dir)).resolve(),
+        }
+    except (OSError, RuntimeError) as exc:
+        raise UnsafeGitFetchError("Cannot resolve repository metadata paths") from exc
     trusted: list[str] = []
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if not entry:
@@ -238,9 +267,20 @@ def _trusted_path(repo: Repo) -> str:
             continue
         try:
             resolved = candidate.resolve()
+            # Git discovers named credential helpers as git-credential-* on PATH.
+            # An external directory is not safe if a helper links into the checkout.
+            helper_targets = [
+                helper.resolve(strict=True)
+                for helper in resolved.glob("git-credential-*")
+                if helper.is_symlink() or helper.is_file()
+            ]
         except (OSError, RuntimeError):
             continue
-        if resolved == project_dir or project_dir in resolved.parents:
+        if any(
+            path == root or root in path.parents
+            for root in protected
+            for path in (resolved, *helper_targets)
+        ):
             continue
         trusted.append(str(resolved))
     return os.pathsep.join(trusted)
@@ -319,6 +359,14 @@ def _inspect_fetch_config(
         if not separator:
             raise UnsafeGitFetchError("Cannot inspect Git configuration for fetch")
         normalized_key = key.casefold()
+        # Even absolute paths/URLs can be configured as remote subsection names.
+        # Refuse any collision rather than letting Git re-resolve our operand.
+        if normalized_key.startswith("remote.") and (
+            normalized_key[7:].rsplit(".", 1)[0] == url.casefold()
+        ):
+            raise UnsafeGitFetchError(
+                "Fetch URL collides with a configured remote name"
+            )
         if (
             reject_repository_http
             and normalized_key.startswith(("http.", "https."))
@@ -410,14 +458,7 @@ def _check_fetch_config_origin(repo: Repo, origin: str) -> None:
 
 
 def _git_config_read_environment(repo: Repo) -> dict[str, str]:
-    env = os.environ.copy()
-    env.pop("GIT_CONFIG_GLOBAL", None)
-    env.pop("GIT_CONFIG_SYSTEM", None)
-    env.pop("GIT_CONFIG_PARAMETERS", None)
-    env.pop("GIT_CONFIG_COUNT", None)
-    for key in tuple(env):
-        if key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
-            del env[key]
+    env = repository_environment(repo)
     _ensure_global_config_paths_are_trusted(repo, env)
     return env
 
@@ -467,8 +508,7 @@ def _trusted_git_exec_path(repo: Repo) -> str:
 
 @cache
 def _resolve_trusted_git_exec_path(executable: str) -> str:
-    env = os.environ.copy()
-    env.pop("GIT_EXEC_PATH", None)
+    env = inherited_environment()
     try:
         result = subprocess.run(
             [executable, "--exec-path"],

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -22,11 +23,10 @@ class HistoryManager:
         self._entries: list[str] = self._read_entries() or []
 
     def _read_entries(self) -> list[str] | None:
-        if not self.history_file.exists():
-            return []
-
         try:
             text = read_safe(self.history_file).text
+        except FileNotFoundError:
+            return []
         except OSError:
             return None
 
@@ -86,23 +86,39 @@ class HistoryManager:
         if not text:
             return
 
+        # Lock order: _io_lock, then the stable sidecar flock. _entries_lock
+        # is held only briefly, never while waiting for filesystem work.
         with self._io_lock:
             with self._entries_lock:
                 entries_to_persist = list(self._pending_entries)
-                in_memory_entries = list(self._entries)
 
             if not entries_to_persist:
                 return
 
-            entries = self._read_entries()
-            if entries is None:
-                entries = in_memory_entries
-            else:
-                for entry in entries_to_persist:
-                    if not entries or entries[-1] != entry:
-                        entries.append(entry)
-            entries = entries[-self.max_entries :]
-            if not self._write_entries(entries):
+            try:
+                self.history_file.parent.mkdir(parents=True, exist_ok=True)
+                # Never unlink this sidecar or lock the replaceable history inode.
+                lock_path = self.history_file.with_name(
+                    self.history_file.name + ".lock"
+                )
+                # Closing the descriptor releases flock on every exit path.
+                with lock_path.open("a") as lock_file:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                    entries = self._read_entries()
+                    if entries is None:
+                        # An unreadable file is not an empty history. Keep both
+                        # it and the pending entries intact for a later retry.
+                        return
+                    for entry in entries_to_persist:
+                        if not entries or entries[-1] != entry:
+                            entries.append(entry)
+                    entries = entries[-self.max_entries :]
+                    if not self._write_entries(entries):
+                        return
+            except OSError as exc:
+                logger.warning(
+                    "history persist failed file=%s", self.history_file, exc_info=exc
+                )
                 return
 
             with self._entries_lock:

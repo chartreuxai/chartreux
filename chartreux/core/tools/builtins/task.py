@@ -61,7 +61,7 @@ def _result_display_names(result: TaskResult) -> list[str]:
 
 
 class TaskToolConfig(BaseToolConfig):
-    permission: ToolPermission = ToolPermission.ASK
+    permission: ToolPermission = ToolPermission.ALWAYS
     allowlist: list[str] = Field(default=["worker"])
 
 

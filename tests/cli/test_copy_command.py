@@ -4,8 +4,8 @@ from unittest.mock import patch
 
 import pytest
 
-from chartreux.cli.clipboard import ClipboardCopyResult
 from chartreux.cli.textual_ui.widgets.messages import AssistantMessage
+from chartreux.ui.clipboard import ClipboardCopyResult
 from tests.conftest import build_test_chartreux_app
 
 

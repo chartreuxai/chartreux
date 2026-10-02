@@ -55,6 +55,8 @@ Tools are the highest-risk extension point. Typed contracts make LLM calls, vali
   presentation-neutral backend adapter may use one closed mapping for
   product-owned built-ins as described above.
 - Do not treat `ASK` or compatibility bypass settings as a routine execution-approval UI or a durable approval store. Keep sensitive-file, denylist, outside-workspace, authorized-root, sudo, and shell semantic checks authoritative.
+
+    [Update: `ASK` has been removed. Tool permissions are now `always` (automatic execution subject to safety checks) and `never` (deny). The safety requirements above remain unchanged.]
 - Model genuine client participation (plan acceptance, user questions, and MCP
   OAuth) as typed callback entries. Do not install UI callbacks on ordinary tools
   or the agent loop.

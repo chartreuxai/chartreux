@@ -37,7 +37,7 @@ from chartreux.cli.textual_ui.widgets.mcp_app import (
     _tool_count_text,
 )
 from chartreux.cli.textual_ui.widgets.mcp_oauth_app import MCPOAuthApp
-from chartreux.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from tests.conftest import build_test_chartreux_app, wait_until
 from tests.snapshots.snapshot_event_loop import install_snapshot_wake
 

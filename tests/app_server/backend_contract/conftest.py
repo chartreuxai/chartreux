@@ -28,6 +28,11 @@ from tests.constants import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_recovery_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+
 @dataclass(frozen=True, slots=True)
 class BackendContractConnection:
     client: AppServerClient

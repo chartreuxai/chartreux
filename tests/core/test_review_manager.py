@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import patch
@@ -277,6 +278,44 @@ class TestReviewMutations:
         assert f1.read_text(encoding="utf-8") == "a\n"
         assert f2.read_text(encoding="utf-8") == "b\n"
         assert sh.review.review_state().files == []
+
+    def test_partial_restore_reports_earlier_successful_writes(
+        self, tmp_path: Path
+    ) -> None:
+        sh = _shells(_make_messages("m"))
+        f1 = tmp_path / "f1.txt"
+        f2 = tmp_path / "f2.txt"
+        f1.write_text("a\n", encoding="utf-8")
+        f2.write_text("b\n", encoding="utf-8")
+        sh.recorder.create_checkpoint()
+        sh.recorder.add_snapshot(_snap(f1))
+        sh.recorder.add_snapshot(_snap(f2))
+        f1.write_text("A\n", encoding="utf-8")
+        f2.write_text("B\n", encoding="utf-8")
+        sh.recorder.seal_turn()
+        replace = os.replace
+
+        def fail_second_replace(src: Path, dst: Path) -> None:
+            if dst == f2:
+                raise OSError("replacement failed")
+            replace(src, dst)
+
+        with (
+            patch(
+                "chartreux.core.checkpoints.fs.os.replace",
+                side_effect=fail_second_replace,
+            ),
+            pytest.raises(ReviewError) as exc_info,
+        ):
+            sh.review.revert_review(AllTarget())
+
+        assert str(exc_info.value) == (
+            f"Review persistence partially failed; wrote: {f1}; "
+            f"failed: {f2}: Failed to restore file: {f2}"
+        )
+        assert f1.read_text(encoding="utf-8") == "a\n"
+        assert f2.read_text(encoding="utf-8") == "B\n"
+        assert set(tmp_path.iterdir()) == {f1, f2}
 
     def test_all_target_resolves_pending_when_disk_matches_original(
         self, tmp_path: Path

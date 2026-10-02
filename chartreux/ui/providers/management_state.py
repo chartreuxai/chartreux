@@ -7,20 +7,20 @@ from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from chartreux.core.llm.thinking_levels import get_thinking_levels
-from chartreux.core.model_catalog.loader import CatalogSnapshot
-from chartreux.core.model_catalog.matching import MatchOutcome, match_discovered_model
-from chartreux.core.model_catalog.schema import (
-    DeploymentDefinition,
-    ModelCatalog,
-    ProviderDefinition,
-)
-from chartreux.ui.providers.contracts import (
+from chartreux.core.model_catalog.contracts import (
     ApiStyle,
     CatalogChanges,
     DiscoveryError,
     DiscoveryResult,
     ModelEdits,
     OptionalEdit,
+)
+from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.model_catalog.matching import MatchOutcome, match_discovered_model
+from chartreux.core.model_catalog.schema import (
+    DeploymentDefinition,
+    ModelCatalog,
+    ProviderDefinition,
 )
 
 type CredentialStatusResolver = Callable[[str], str | None]

@@ -8,6 +8,8 @@ import re
 from tree_sitter import Language, Node, Parser
 import tree_sitter_bash as tsbash
 
+from chartreux.core.tools.builtins._shell_command_policy import is_package_command
+
 _SUPPORTED_COMMAND_PARTS = {
     "command_name",
     "number",
@@ -22,7 +24,97 @@ _REDIRECTION_NODES = {"heredoc_redirect", "herestring_redirect"}
 # Assignment names that can alter command lookup, loading, startup, or runtime
 # behavior. Prefix families are checked separately below.
 DANGEROUS_ENV_NAMES = frozenset({
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "RUSTC_WRAPPER",
+    "RUSTC",
+    "CC",
+    "CXX",
+    "RUSTFLAGS",
+    "GOFLAGS",
+    "MAKEFLAGS",
+    "GNUMAKEFLAGS",
+    "PERLLIB",
+    "_JAVA_OPTIONS",
     "BASH_ENV",
+    "BUN_INSTALL",
+    "CARGO_HOME",
+    "GOBIN",
+    "GOPATH",
+    "PIPX_HOME",
+    "PIPX_BIN_DIR",
+    "PIPX_MAN_DIR",
+    "PIPX_COMPLETION_DIR",
+    "PIPX_SHARED_LIBS",
+    "PIPX_GLOBAL_HOME",
+    "PIPX_GLOBAL_BIN_DIR",
+    "PIPX_GLOBAL_MAN_DIR",
+    "PIPX_GLOBAL_COMPLETION_DIR",
+    "POETRY_CONFIG_DIR",
+    "POETRY_CACHE_DIR",
+    "POETRY_DATA_DIR",
+    "POETRY_HOME",
+    "POETRY_PYTHON_INSTALLATION_DIR",
+    "PIP_TARGET",
+    "PIP_PREFIX",
+    "PIP_CONFIG_FILE",
+    "PIP_CACHE_DIR",
+    "PIP_ROOT",
+    "PIP_SRC",
+    "PIP_SOURCE",
+    "PIP_SOURCE_DIR",
+    "PIP_SOURCE_DIRECTORY",
+    "PIP_DEST",
+    "PIP_DESTINATION_DIR",
+    "PIP_DESTINATION_DIRECTORY",
+    "PIP_REQUIREMENTS_FROM_SCRIPT",
+    "PIP_USER",
+    "PIP_LOG",
+    "PIP_REPORT",
+    "PIP_BUILD_TRACKER",
+    "PIP_DOWNLOAD_DIR",
+    "PIP_WHEEL_DIR",
+    "PIP_REQUIREMENT",
+    "PIP_CONSTRAINT",
+    "PIP_BUILD_CONSTRAINT",
+    "UV_CONFIG_FILE",
+    "UV_PROJECT",
+    "UV_CREDENTIALS_DIR",
+    "UV_INSTALL_DIR",
+    "UV_UNMANAGED_INSTALL",
+    "UV_PYTHON_BIN_DIR",
+    "UV_PYTHON_CACHE_DIR",
+    "UV_ENV_FILE",
+    "UV_BUILD_CONSTRAINT",
+    "UV_CONSTRAINT",
+    "UV_OVERRIDE",
+    "UV_EXCLUDE",
+    "TRACING_DURATIONS_FILE",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "XDG_BIN_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CONFIG_DIRS",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SYSTEMDRIVE",
+    "UV_PYTHON_DOWNLOADS_JSON_URL",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+    "UV_TARGET",
+    "UV_CACHE_DIR",
+    "UV_PROJECT_ENVIRONMENT",
+    "UV_PYTHON_INSTALL_DIR",
+    "UV_TOOL_DIR",
+    "UV_TOOL_BIN_DIR",
+    "UV_WORKING_DIR",
+    "UV_WORKING_DIRECTORY",  # Supported by uv as a backwards-compatible alias.
+    "POETRY_VIRTUALENVS_PATH",
     "BAT_PAGER",
     "CDPATH",
     "CORE_PAGER",
@@ -37,7 +129,11 @@ DANGEROUS_ENV_NAMES = frozenset({
     "LD_AUDIT",
     "LD_LIBRARY_PATH",
     "LD_PRELOAD",
+    "KSH_ENV",
     "LESS",
+    "LESSOPEN",
+    "LESSCLOSE",
+    "LESSEDIT",
     "LESSHISTFILE",
     "LESSSECURE",
     "LV",
@@ -60,7 +156,9 @@ DANGEROUS_ENV_NAMES = frozenset({
     "ZDOTDIR",
     "PATH",
 })
-_DANGEROUS_ENV_PREFIXES = ("DYLD_", "GIT_")
+# Package configuration can move installation/cache destinations or load an
+# uninspected config file. Gate these assignments before argv extraction drops them.
+_DANGEROUS_ENV_PREFIXES = ("DYLD_", "GIT_", "NPM_CONFIG_")
 
 # Reasons are noun phrases so they read as a list in the approval prompt.
 _DYNAMIC_NODES = {
@@ -142,10 +240,7 @@ def _descendants(node: Node) -> Iterator[Node]:
 
 
 def _literal_token(node: Node) -> str | None:
-    if (
-        node.type not in {"command_name", "number", "word", "string", "raw_string"}
-        or node.text is None
-    ):
+    if node.type not in _SUPPORTED_COMMAND_PARTS or node.text is None:
         return None
     if any(child.type in _DYNAMIC_NODES for child in _descendants(node)):
         return None
@@ -158,7 +253,7 @@ def _literal_token(node: Node) -> str | None:
     return values[0] if len(values) == 1 else None
 
 
-def _assignment_reason(node: Node) -> str | None:
+def _assignment_reason(node: Node) -> str | None:  # noqa: PLR0911
     if node.text is None:
         return "an environment assignment that cannot be inspected"
     raw = node.text.decode("utf-8")
@@ -174,6 +269,12 @@ def _assignment_reason(node: Node) -> str | None:
         literal_value = _literal_token(value)
         if literal_value is None:
             return "a non-literal environment assignment"
+        if value.type not in {"string", "raw_string"} and any(
+            syntax in literal_value for syntax in ("|", "`", "$(")
+        ):
+            return (
+                f"dangerous environment assignment ({name}): command-execution syntax"
+            )
     if name == "PYTHONPATH":
         from pathlib import PurePosixPath
 
@@ -243,6 +344,77 @@ def _executable_parts(node: Node) -> list[str]:
             break
         parts = parts[index:]
     return parts
+
+
+def _has_active_bracket_glob(value: bytes) -> bool:
+    """Recognize complete character classes, respecting shell quotes and escapes."""
+    characters: list[tuple[str, bool]] = []
+    text = value.decode("utf-8")
+    quote = ""
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character == "\\" and quote != "'" and index + 1 < len(text):
+            index += 1
+            characters.append((text[index], False))
+        elif character in {'"', "'"} and (not quote or character == quote):
+            quote = "" if quote else character
+        else:
+            characters.append((character, not quote))
+        index += 1
+    for index, (character, active) in enumerate(characters):
+        if character != "[" or not active:
+            continue
+        end = index + 1
+        if end < len(characters) and characters[end][0] in {"!", "^"}:
+            end += 1
+        start = end
+        # A leading ] is a member of the class, not its terminator.
+        if end < len(characters) and characters[end][0] == "]":
+            end += 1
+        while end < len(characters):
+            if characters[end] == ("]", True):
+                if end > start:
+                    return True
+                break
+            end += 1
+    return False
+
+
+def _command_allowance_reasons(node: Node) -> Iterator[str]:
+    """Check syntax before argv normalization discards quoting information."""
+    parts = _executable_parts(node)
+    # Only an actual env executable introduces assignment operands. Wrapper
+    # commands are inspected separately with their original shell spelling.
+    if parts and parts[0].rsplit("/", 1)[-1] == "env":
+        # env arguments are not assignment nodes in the original AST. Reparse
+        # their original spelling, rather than shlex-quoting normalized values.
+        env_seen = False
+        for child in node.children:
+            if not env_seen:
+                token = _literal_token(child)
+                env_seen = token is not None and token.rsplit("/", 1)[-1] == "env"
+                continue
+            if child.text is None:
+                continue
+            raw = child.text.decode("utf-8")
+            if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", raw) is None:
+                break
+            tree = _get_parser().parse(f"{raw} true".encode())
+            for assignment in _descendants(tree.root_node):
+                if assignment.type == "variable_assignment":
+                    if reason := _assignment_reason(assignment):
+                        yield reason
+        parts = parts[1:]
+        while parts and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", parts[0]):
+            parts = parts[1:]
+    if is_package_command(parts) and any(
+        child.type in _SUPPORTED_COMMAND_PARTS
+        and child.text is not None
+        and _has_active_bracket_glob(child.text)
+        for child in node.children
+    ):
+        yield "unquoted package bracket syntax may expand as a shell glob"
 
 
 def _command_name(node: Node) -> str | None:
@@ -316,7 +488,7 @@ class ShellPermissionAnalysis:
     @property
     def approval_label(self) -> str:
         """Prompt text naming what made the command unsafe to auto-approve."""
-        return f"shell syntax requiring approval: {', '.join(self.approval_reasons)}"
+        return f"unsupported shell syntax: {', '.join(self.approval_reasons)}"
 
 
 @lru_cache(maxsize=1)
@@ -369,6 +541,7 @@ def _analyze_shell_command(
             approval_reasons.add(reason)
 
         if node.type == "command":
+            approval_reasons.update(_command_allowance_reasons(node))
             if reason := _lookup_mutation_reason(node, nested_source):
                 approval_reasons.add(reason)
             parts: list[str] = []

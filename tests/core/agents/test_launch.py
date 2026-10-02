@@ -250,6 +250,13 @@ def test_thinking_validation_honors_catalog_declaration(
     )
 
 
+def test_launch_tool_override_rejects_removed_ask_permission() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="'always' or 'never'"):
+        LaunchToolOverride.model_validate({"permission": "ask"})
+
+
 def test_accumulated_launch_config_deep_merges_tools_without_mutating_input(
     config: ChartreuxConfigSchema, profile: AgentProfile
 ) -> None:
@@ -258,7 +265,7 @@ def test_accumulated_launch_config_deep_merges_tools_without_mutating_input(
         enabled_tools=["bash"],
         tools={
             "bash": LaunchToolOverride(
-                allowlist=["git *"], permission=ToolPermission.ASK
+                allowlist=["git *"], permission=ToolPermission.NEVER
             )
         },
     )
@@ -276,7 +283,7 @@ def test_accumulated_launch_config_deep_merges_tools_without_mutating_input(
     assert candidate.semantic_overrides.tools is not None
     assert candidate.semantic_overrides.tools["bash"].allowlist == ["git *"]
     assert candidate.semantic_overrides.tools["bash"].permission == "always"
-    assert first.tools is not None and first.tools["bash"].permission == "ask"
+    assert first.tools is not None and first.tools["bash"].permission == "never"
 
 
 def test_retained_persona_cannot_change_but_identical_value_is_idempotent(

@@ -248,7 +248,15 @@ class SessionLoader:
         current = (metadata.get("environment") or {}).get("working_directory")
         return any(
             SessionLoader._same_working_directory(stored, working_directory)
-            for stored in (metadata.get("origin_directory"), current)
+            for stored in (
+                metadata.get("origin_directory"),
+                current,
+                *(
+                    root.get("path")
+                    for root in metadata.get("authorized_roots", [])
+                    if isinstance(root, dict)
+                ),
+            )
         )
 
     @staticmethod
@@ -310,8 +318,6 @@ class SessionLoader:
         sessions_with_mtime: list[tuple[Path, float]] = []
         for session in session_dirs:
             messages_path = session / MESSAGES_FILENAME
-            if not messages_path.is_file():
-                continue
             try:
                 mtime = messages_path.stat().st_mtime
                 sessions_with_mtime.append((session, mtime))
@@ -336,9 +342,6 @@ class SessionLoader:
         config: SessionLoggingConfig, working_directory: Path | None = None
     ) -> Path | None:
         save_dir = Path(config.save_dir)
-        if not save_dir.exists():
-            return None
-
         pattern = f"{config.session_prefix}_*"
         session_dirs = list(save_dir.glob(pattern))
 
@@ -374,11 +377,9 @@ class SessionLoader:
         session_id: str, config: SessionLoggingConfig
     ) -> list[Path]:
         save_dir = Path(config.save_dir)
-        if not save_dir.exists():
-            return []
-
         short_id = shorten_session_id(session_id)
-        return list(save_dir.glob(f"{config.session_prefix}_*_{short_id}"))
+        matches = list(save_dir.glob(f"{config.session_prefix}_*_{short_id}"))
+        return list(dict.fromkeys(matches))
 
     @staticmethod
     def list_sessions(

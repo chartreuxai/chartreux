@@ -140,7 +140,7 @@ def _tool_message(agent: AgentLoop):
 
 
 @pytest.mark.asyncio
-async def test_tool_result_images_are_durable_and_excluded_from_output() -> None:
+async def test_tool_result_images_are_excluded_from_output() -> None:
     agent = _build_agent(ImageTool)
 
     events = await _act(agent)
@@ -164,6 +164,9 @@ class _TextReplacementHooks:
 
     def reset_retry_count(self) -> None:
         return
+
+    def _matching_hooks(self, handler: object, invocation: object) -> list[object]:
+        return [self] if isinstance(invocation, PostToolInvocation) else []
 
     async def run(
         self, invocation: object

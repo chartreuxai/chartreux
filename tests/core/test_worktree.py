@@ -1671,6 +1671,8 @@ def _fetch_with(git: _RecordingGit, git_dir: Path) -> None:
             (),
             {
                 "git_dir": git_dir,
+                "common_dir": git_dir,
+                "bare": True,
                 "git": git,
                 "remote": lambda self, _name: remote,
                 "config_reader": lambda self, _level: config,
@@ -1678,6 +1680,123 @@ def _fetch_with(git: _RecordingGit, git_dir: Path) -> None:
         )(),
     )
     git_repo_module.GitRepo(repo).fetch_branch("origin", "main")
+
+
+@pytest.mark.parametrize(
+    "branch",
+    ["--upload-pack=malicious", "-bad", "bad..ref", "bad.lock", "bad@{ref", "", "HEAD"],
+)
+@pytest.mark.parametrize("operation", ["validate", "exists", "delete", "fetch", "add"])
+def test_invalid_branch_fails_before_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, branch: str, operation: str
+) -> None:
+    repo = git_repo_module.GitRepo(_init_repo(tmp_path))
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("Invalid branch launched a subprocess")
+
+    monkeypatch.setattr(Git, "execute", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    with pytest.raises(GitError, match="Invalid branch"):
+        match operation:
+            case "validate":
+                repo.validate_branch(branch)
+            case "exists":
+                repo.branch_exists(branch)
+            case "delete":
+                repo.delete_branch(branch)
+            case "fetch":
+                repo.fetch_branch("origin", branch)
+            case "add":
+                repo.add_worktree(tmp_path / "new", branch, branch_created=True)
+    repo.close()
+
+
+@pytest.mark.parametrize(
+    "branch",
+    [
+        "main",
+        "feature/topic",
+        "a+b",
+        "@",
+        "a.locked",
+        "é",
+        "bad..ref",
+        ".bad",
+        "a/.bad",
+        "a.lock",
+        "a/b.lock",
+        "a//b",
+        "a/",
+        "a.",
+        "a?b",
+        "a[b",
+        "a*b",
+        "a\\b",
+        "HEAD",
+        "-bad",
+    ],
+)
+def test_literal_branch_validation_matches_git(tmp_path: Path, branch: str) -> None:
+    repo = git_repo_module.GitRepo(_init_repo(tmp_path))
+    result = subprocess.run(
+        [str(Git.GIT_PYTHON_GIT_EXECUTABLE), "check-ref-format", "--branch", branch],
+        capture_output=True,
+    )
+    if result.returncode:
+        with pytest.raises(GitError):
+            repo.validate_branch(branch)
+    else:
+        repo.validate_branch(branch)
+    repo.close()
+
+
+@pytest.mark.parametrize("start_point", ["HEAD~1", "-bad", "a:b"])
+@pytest.mark.parametrize("branch_created", [False, True])
+def test_invalid_worktree_start_point_fails_before_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start_point: str,
+    branch_created: bool,
+) -> None:
+    repo = git_repo_module.GitRepo(_init_repo(tmp_path))
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("Invalid start point launched a subprocess")
+
+    monkeypatch.setattr(Git, "execute", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    with pytest.raises(GitError, match="Invalid start point"):
+        repo.add_worktree(
+            tmp_path / "new",
+            "feature",
+            branch_created=branch_created,
+            start_point=start_point,
+        )
+    repo.close()
+
+
+@pytest.mark.parametrize("ref", [None, "-bad", "HEAD~1", "a:b", ""])
+def test_changes_on_invalid_ref_returns_none_without_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ref: str | None
+) -> None:
+    repo = git_repo_module.GitRepo(_init_repo(tmp_path))
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("Invalid comparison ref launched a subprocess")
+
+    monkeypatch.setattr(Git, "execute", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    assert repo.changes_on(ref) is None
+    repo.close()
+
+
+@pytest.mark.parametrize("branch", [None, 123, b"main"])
+def test_non_string_branch_validation_raises_value_error(branch: Any) -> None:
+    from chartreux.core.git.policy import validate_branch_name
+
+    with pytest.raises(ValueError):
+        validate_branch_name(branch)
 
 
 def test_fetch_kills_a_remote_that_never_answers(tmp_path: Path) -> None:

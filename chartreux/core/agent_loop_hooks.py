@@ -44,7 +44,7 @@ from chartreux.core.hooks.models import (
     ToolStatus,
 )
 from chartreux.core.llm.format import ResolvedToolCall
-from chartreux.core.llm_models import PersistedToolResult
+from chartreux.core.llm_models import ImageAttachment, PersistedToolResult
 from chartreux.core.utils import (
     CANCELLATION_TAG,
     TOOL_ERROR_TAG,
@@ -57,7 +57,7 @@ from chartreux.utils.tool_presentation import ToolResultPresentation
 if TYPE_CHECKING:
     from chartreux.core.agent_loop import ToolDecision
     from chartreux.core.hooks.manager import HooksManager
-    from chartreux.core.llm_models import ImageAttachment, LLMMessage
+    from chartreux.core.llm_models import LLMMessage
     from chartreux.core.message_list import MessageList
     from chartreux.core.session.session_logger import SessionLogger
     from chartreux.core.session_types import AgentStats

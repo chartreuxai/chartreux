@@ -171,7 +171,7 @@ role = "medium"
 disabled_tools = ["edit", "write_file"]
 
 [tools.bash]
-permission = "ask"
+permission = "always"
 ```
 
 Profile fields are validated during discovery; an invalid profile is not made

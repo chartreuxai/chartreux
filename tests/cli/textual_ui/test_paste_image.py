@@ -65,7 +65,7 @@ def _force_supported_platform(monkeypatch) -> None:
 
 async def _press_ctrl_v_under_platform(monkeypatch, system: str) -> tuple[bool, list]:
     # The ctrl+v binding is registered at ChatTextArea class-definition time only
-    # on macOS, so the result of pressing it depends on the OS. Reload the module
+    # on supported platforms, so the result depends on the OS. Reload the module
     # under a forced platform.system() to get a deterministically-defined class,
     # then exercise it in a minimal app (the full app shares binding maps across
     # instances via a shallow copy, which makes a host-dependent setup flaky).
@@ -140,6 +140,104 @@ def test_read_clipboard_image_swallows_reader_exceptions(
         paste_image, "_readers_for_platform", lambda: [_raises, lambda: _FAKE_PNG]
     )
     assert read_clipboard_image() == _FAKE_PNG
+
+
+@pytest.fixture
+def _linux_clipboard(monkeypatch) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setattr(paste_image.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+
+@pytest.mark.parametrize(
+    ("environment", "command"),
+    [
+        ("WAYLAND_DISPLAY", ["wl-paste", "--no-newline", "--type"]),
+        ("DISPLAY", ["xclip", "-selection", "clipboard", "-o", "-target"]),
+    ],
+)
+@pytest.mark.parametrize("data", [_FAKE_PNG, b"\xff\xd8\xfffake-jpeg"])
+def test_linux_clipboard_reads_png_and_jpeg(
+    monkeypatch, _linux_clipboard, environment, command, data
+) -> None:
+    monkeypatch.setenv(environment, "display")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        assert kwargs == {"capture_output": True, "timeout": 5.0, "check": False}
+        if cmd[-1] == "image/png" and not data.startswith(_PNG_HEADER):
+            return _completed(returncode=1)
+        return _completed(data)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert read_clipboard_image() == data
+    expected = [[*command, "image/png"]]
+    if not data.startswith(_PNG_HEADER):
+        expected.append([*command, "image/jpeg"])
+    assert calls == expected
+
+
+@pytest.mark.parametrize("failure", ["exit", "empty", "text", "missing", "timeout"])
+def test_linux_clipboard_falls_back_to_x11(
+    monkeypatch, _linux_clipboard, failure
+) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("DISPLAY", ":0")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd[0])
+        if cmd[0] == "xclip":
+            return _completed(_FAKE_PNG)
+        if failure == "missing":
+            raise FileNotFoundError("wl-paste")
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+        if failure == "text":
+            return _completed(b"clipboard text")
+        return _completed(returncode=1 if failure == "exit" else 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert read_clipboard_image() == _FAKE_PNG
+    assert calls == ["wl-paste", "wl-paste", "xclip"]
+
+
+@pytest.mark.parametrize("no_tools", [True, False])
+def test_linux_clipboard_without_tools_or_display_is_noop(
+    monkeypatch, _linux_clipboard, no_tools
+) -> None:
+    if no_tools:
+        monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+        monkeypatch.setenv("DISPLAY", ":0")
+        monkeypatch.setattr(paste_image.shutil, "which", lambda name: None)
+    with patch.object(subprocess, "run") as run:
+        assert read_clipboard_image() is None
+        run.assert_not_called()
+
+
+@pytest.mark.parametrize("system", ["Darwin", "Windows"])
+def test_linux_readers_are_not_selected_on_other_platforms(
+    monkeypatch, _linux_clipboard, system
+) -> None:
+    monkeypatch.setattr(platform, "system", lambda: system)
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("DISPLAY", ":0")
+    readers = paste_image._readers_for_platform()
+    assert readers == ([_read_macos] if system == "Darwin" else [])
+
+
+def test_write_clipboard_jpeg_preserves_extension_and_bytes(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    data = b"\xff\xd8\xfffake-jpeg"
+    first = write_clipboard_image(data)
+    second = write_clipboard_image(data)
+    assert first.suffix == second.suffix == ".jpg"
+    assert first != second
+    assert first.read_bytes() == second.read_bytes() == data
 
 
 def test_macos_class_reader_returns_bytes_when_osascript_succeeds(monkeypatch) -> None:
@@ -415,15 +513,18 @@ async def test_handle_clipboard_image_paste_rejects_oversize(monkeypatch) -> Non
 def test_paste_image_slash_command_hidden_on_unsupported_platform(monkeypatch) -> None:
     from chartreux.cli.commands import CommandRegistry
 
-    monkeypatch.setattr("platform.system", lambda: "Linux")
+    monkeypatch.setattr("platform.system", lambda: "Windows")
     registry = CommandRegistry()
     assert not registry.has_command("paste-image")
 
 
-def test_paste_image_slash_command_available_on_darwin(monkeypatch) -> None:
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+def test_paste_image_slash_command_available_on_supported_platform(
+    monkeypatch, system
+) -> None:
     from chartreux.cli.commands import CommandRegistry
 
-    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.system", lambda: system)
     registry = CommandRegistry()
     assert registry.has_command("paste-image")
 
@@ -437,7 +538,7 @@ def test_ctrl_v_binding_absent_on_unsupported_platform(monkeypatch) -> None:
         text_area as text_area_module,
     )
 
-    monkeypatch.setattr("platform.system", lambda: "Linux")
+    monkeypatch.setattr("platform.system", lambda: "Windows")
     reloaded = importlib.reload(text_area_module)
     try:
         assert all(b.key != "ctrl+v" for b in reloaded.ChatTextArea.BINDINGS)
@@ -478,8 +579,16 @@ async def test_ctrl_v_keybinding_triggers_image_paste_with_notify_on_darwin(
 
 
 @pytest.mark.asyncio
-async def test_ctrl_v_keybinding_does_not_paste_image_on_linux(monkeypatch) -> None:
+async def test_ctrl_v_keybinding_triggers_image_paste_on_linux(monkeypatch) -> None:
     has_binding, posted = await _press_ctrl_v_under_platform(monkeypatch, "Linux")
+    assert has_binding
+    assert len(posted) == 1
+    assert posted[0].notify_when_empty is True
+
+
+@pytest.mark.asyncio
+async def test_ctrl_v_keybinding_does_not_paste_image_on_windows(monkeypatch) -> None:
+    has_binding, posted = await _press_ctrl_v_under_platform(monkeypatch, "Windows")
     assert not has_binding
     assert posted == []
 

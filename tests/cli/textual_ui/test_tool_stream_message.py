@@ -20,10 +20,10 @@ from chartreux.app_server.models import (
     RunningEffectState,
     UserQuestionEffectDetail,
 )
-from chartreux.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
 from chartreux.core.events import ToolCallEvent
 from chartreux.core.tools.builtins.bash import Bash, BashArgs
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from tests.stubs.app_server import CoreEventProjection
 
 

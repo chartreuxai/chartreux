@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import platform
 
-from chartreux.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
+from chartreux.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEMS
 
 
 @dataclass(frozen=True)
@@ -87,7 +87,7 @@ class CommandRegistry:
                 handler="_paste_clipboard_image_command",
                 side_channel=True,
                 is_available=lambda _ctx: (
-                    platform.system() == CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
+                    platform.system() in CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEMS
                 ),
             ),
             "log": Command(

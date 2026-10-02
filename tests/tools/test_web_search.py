@@ -403,7 +403,7 @@ def test_invalid_web_search_config_falls_back_during_policy_validation():
     manager = ToolManager(lambda: config)
 
     assert manager.get_tool_config("web_search") == WebSearchConfig()
-    assert manager.get_tool_config("bash").permission.name == "ASK"
+    assert manager.get_tool_config("bash").permission.name == "ALWAYS"
     diagnostic = WebSearch.availability_diagnostic(config)
     assert diagnostic is not None
     assert diagnostic.config_key == "tools.web_search.provider"

@@ -321,7 +321,7 @@ class ConfigBuilder[S: ConfigSchema]:
         projected = copy.deepcopy(raw)
         for settings in projected.get("tools", {}).values():
             if settings.get("permission") == "never":
-                settings["permission"] = "ask"
+                settings["permission"] = "always"
         return projected
 
     def _merge_fields(

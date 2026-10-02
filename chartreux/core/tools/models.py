@@ -14,7 +14,6 @@ class ToolPermissionError(Exception):
 class ToolPermission(StrEnum):
     ALWAYS = auto()
     NEVER = auto()
-    ASK = auto()
 
     @classmethod
     def by_name(cls, name: str) -> ToolPermission:

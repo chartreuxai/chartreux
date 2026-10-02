@@ -15,6 +15,13 @@ from chartreux.core.config import (
 )
 from chartreux.core.config.default_orchestrator import build_default_orchestrator
 from chartreux.core.config.orchestrator import ConfigOrchestrator
+from chartreux.core.model_catalog.contracts import (
+    ConfigPersistResult,
+    ConfigReloadResult,
+    CredentialSaveResult,
+    ProviderWorkbenchResult,
+    TLSConfig,
+)
 from chartreux.core.model_catalog.discovery import discover_models
 from chartreux.core.model_catalog.loader import CatalogStore, load_catalog
 from chartreux.setup.auth.api_key_persistence import persist_api_key
@@ -22,13 +29,6 @@ from chartreux.setup.onboarding.base import OnboardingHost
 from chartreux.setup.onboarding.context import OnboardingContext
 from chartreux.setup.onboarding.screens import WelcomeScreen
 from chartreux.setup.onboarding.web_search_settings import OnboardingWebSearchSettings
-from chartreux.ui.providers.contracts import (
-    ConfigPersistResult,
-    ConfigReloadResult,
-    CredentialSaveResult,
-    ProviderWorkbenchResult,
-    TLSConfig,
-)
 from chartreux.ui.providers.workbench import ProviderWorkbenchScreen
 from chartreux.ui.theme import resolve_auto_theme, resolve_theme, resolve_theme_name
 from chartreux.ui.web_search import WebSearchScreen

@@ -8,8 +8,8 @@ from unittest.mock import patch
 import pytest
 from rich.console import Console
 
-from chartreux.cli.textual_ui.screens.web_search import WebSearchScreen
-from chartreux.cli.textual_ui.settings_service import SettingsService
+from chartreux.ui.settings_service import SettingsService
+from chartreux.ui.web_search import WebSearchScreen
 from tests.cli.textual_ui.web_search_fixture import WebSearchHarness
 from tests.snapshots.snap_compare import SnapCompare
 

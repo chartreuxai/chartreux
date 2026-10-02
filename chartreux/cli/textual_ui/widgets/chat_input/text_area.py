@@ -16,7 +16,7 @@ from textual.widgets.text_area import Location, Selection, TextAreaTheme
 
 from chartreux.cli.autocompletion.base import CompletionResult
 from chartreux.cli.commands import CommandRegistry
-from chartreux.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
+from chartreux.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEMS
 from chartreux.cli.input_modes import DEFAULT_MODE, InputMode
 from chartreux.cli.textual_ui.external_editor import ExternalEditor
 from chartreux.cli.textual_ui.widgets.chat_input.completion_manager import (
@@ -26,7 +26,7 @@ from chartreux.cli.textual_ui.widgets.chat_input.paste_path import (
     maybe_prepend_at_for_path,
     rewrite_bare_image_paths_in_text,
 )
-from chartreux.cli.textual_ui.widgets.vscode_compat import patch_vscode_space
+from chartreux.ui.widgets.vscode_compat import patch_vscode_space
 
 _WORD = re.compile(r"\w+")
 _TRAILING_WORD = re.compile(r"\w+$")
@@ -74,7 +74,7 @@ class ChatTextArea(TextArea):
                     priority=True,
                 )
             ]
-            if platform.system() == CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
+            if platform.system() in CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEMS
             else []
         ),
     ]

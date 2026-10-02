@@ -19,8 +19,8 @@ from chartreux.app_server.models import (
     TextContentBlock,
 )
 from chartreux.cli.textual_ui.widgets.messages import UserMessage
-from chartreux.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.cli.textual_ui.windowing.history import build_history_widgets
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
 
 def _att(path: Path, alias: str) -> ImageAttachment:

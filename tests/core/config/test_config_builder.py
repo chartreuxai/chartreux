@@ -58,6 +58,46 @@ class SampleSchema(ConfigSchema):
 
 
 @pytest.mark.asyncio
+async def test_removed_ask_permission_rejected_even_when_shadowed() -> None:
+    builder = ConfigBuilder(ChartreuxConfigSchema)
+    builder.add_layer(
+        FakeLayer(name="obsolete", data={"tools": {"bash": {"permission": "ask"}}})
+    )
+    builder.add_layer(
+        FakeLayer(name="override", data={"tools": {"bash": {"permission": "always"}}})
+    )
+    with pytest.raises(ValidationError, match="'ask' was removed") as raised:
+        await builder.build()
+    message = str(raised.value)
+    assert "obsolete" in message and ".tools" in message
+    assert "'always'" in message and "'never'" in message
+    assert "No approval prompt exists" in message
+
+
+def test_removed_ask_permission_rejected_by_config_schema() -> None:
+    with pytest.raises(ValidationError, match="'ask' was removed"):
+        ChartreuxConfigSchema.model_validate({
+            "tools": {"custom_tool": {"permission": "ask"}}
+        })
+
+
+@pytest.mark.asyncio
+async def test_removed_ask_permission_has_helpful_environment_error(
+    monkeypatch,
+) -> None:
+    from chartreux.core.config.layer import LayerImplementationError
+    from chartreux.core.config.layers.environment import EnvironmentLayer
+
+    monkeypatch.setenv("CHARTREUX_TOOLS__bash__PERMISSION", "ask")
+    with pytest.raises(LayerImplementationError) as raised:
+        await EnvironmentLayer(schema=ChartreuxConfigSchema).load()
+    assert isinstance(raised.value.__cause__, ValidationError)
+    message = str(raised.value.__cause__)
+    assert "'ask' was removed" in message
+    assert "'always'" in message and "'never'" in message
+
+
+@pytest.mark.asyncio
 async def test_replace_strategy_higher_layer_wins() -> None:
     builder = ConfigBuilder(SampleSchema)
     builder.add_layer(FakeLayer(name="low", data={"name": "low-name"}))
@@ -176,7 +216,7 @@ async def test_deep_merge_preserves_nested_tool_fields_across_layers() -> None:
             name="base",
             data={
                 "tools": {
-                    "bash": {"permission": "ask", "command_patterns": ["git status"]}
+                    "bash": {"permission": "always", "command_patterns": ["git status"]}
                 }
             },
         )
@@ -196,7 +236,7 @@ async def test_deep_merge_preserves_nested_tool_fields_across_layers() -> None:
     config = await builder.build()
 
     assert config.tools == {
-        "bash": {"permission": "ask", "command_patterns": ["git diff"]},
+        "bash": {"permission": "always", "command_patterns": ["git diff"]},
         "read_file": {"permission": "always"},
     }
 

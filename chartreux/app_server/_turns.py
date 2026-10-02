@@ -330,6 +330,9 @@ class TurnController:  # noqa: PLR0904
             raise TurnConflictError("A turn is already running")
         if queue_item_id is None and self._turn_queue:
             raise TurnConflictError("Resume queued turns before starting a new turn")
+        # Admission is synchronous: reject exclusive lifecycle/shell ownership
+        # before assigning live turn state.
+        self._execution.require_idle()
         self._retrying = None
         decoded = decode_input(
             params, session_dir=self._agent_loop.session_logger.session_dir
@@ -428,7 +431,10 @@ class TurnController:  # noqa: PLR0904
 
     def resume_queue(self) -> Callable[[], None] | None:
         self._require_policy_unreserved()
-        if not self._turn_queue.resume():
+        resumed = self._turn_queue.resume()
+        # Explicit resume also kicks promotion for pending work in an
+        # already-unpaused queue.
+        if not resumed and not self._turn_queue:
             return None
         return self._after_queue_response(promote=True)
 
@@ -1085,7 +1091,7 @@ class TurnController:  # noqa: PLR0904
             TurnStartParams(
                 session_id=self._agent_loop.session_id,
                 message=vibe_content_blocks(user_entry.content),
-                client_user_message_id=user_entry.entry_id,
+                client_user_message_id=user_entry.entry_id or record.queued_turn.id,
                 user_display_content=(
                     user_entry.annotations.chartreux_user_display_content
                 ),
@@ -1093,10 +1099,14 @@ class TurnController:  # noqa: PLR0904
             queue_item_id=record.queued_turn.id,
             queued_contexts=queued_contexts,
         )
-        promoted = self._turn_queue.pop_next()
-        if promoted is not record:
-            raise RuntimeError("Turn queue changed while promoting its next item")
-        await self._emit_queue_updated()
+        try:
+            promoted = self._turn_queue.pop_next()
+            if promoted is not record:
+                raise RuntimeError("Turn queue changed while promoting its next item")
+            await self._emit_queue_updated()
+        except BaseException:
+            start_turn.abort()
+            raise
         start_turn()
 
     def _decode_queued_content(

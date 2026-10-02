@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import errno
+import os
 from pathlib import Path
+from typing import IO, Any
+from unittest.mock import patch
 
 import pytest
 
@@ -72,6 +76,41 @@ class TestFileStoreApply:
         assert restored == []
         assert errors == ["Failed to delete file: a.txt"]
 
+    @pytest.mark.parametrize("error_type", [PermissionError, OSError])
+    def test_read_failure_is_reported_and_other_files_restore(
+        self, error_type: type[OSError]
+    ) -> None:
+        fs = FakeFilesystem({"bad.txt": b"old", "good.txt": b"old"})
+        read_bytes = fs.read_bytes
+
+        def read(path: str) -> bytes | None:
+            if path == "bad.txt":
+                raise error_type("read failed")
+            return read_bytes(path)
+
+        with patch.object(fs, "read_bytes", side_effect=read):
+            errors, restored = FileStore(fs).apply({
+                "bad.txt": FileState(b"new"),
+                "good.txt": FileState(b"new"),
+            })
+        assert errors == ["Failed to restore file: bad.txt"]
+        assert restored == ["good.txt"]
+        assert fs.files == {"bad.txt": b"old", "good.txt": b"new"}
+
+    @pytest.mark.parametrize("error_type", [PermissionError, OSError])
+    def test_stat_failure_is_reported_and_other_files_restore(
+        self, error_type: type[OSError]
+    ) -> None:
+        fs = FakeFilesystem({"bad.txt": b"old", "good.txt": b"old"})
+        with patch.object(fs, "exists", side_effect=error_type("stat failed")):
+            errors, restored = FileStore(fs).apply({
+                "bad.txt": FileState.absent(),
+                "good.txt": FileState(b"new"),
+            })
+        assert errors == ["Failed to delete file: bad.txt"]
+        assert restored == ["good.txt"]
+        assert fs.files == {"bad.txt": b"old", "good.txt": b"new"}
+
     def test_aggregates_across_a_mixed_plan(self) -> None:
         fs = FakeFilesystem({"keep.txt": b"v", "del.txt": b"x"})
         fs.fail_writes.add("boom.txt")
@@ -97,6 +136,108 @@ class TestDiskFilesystem:
         fs.write_bytes(str(target), b"payload")
         assert fs.read_bytes(str(target)) == b"payload"
         assert fs.exists(str(target))
+
+    def test_failed_staging_preserves_original_bytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "a.txt"
+        target.write_bytes(b"original")
+        open_file = open
+
+        def failing_open(path: Path, mode: str = "r", **kwargs: Any) -> IO[Any]:
+            staged = open_file(path, mode, **kwargs)
+            if mode == "xb":
+                write = staged.write
+
+                def fail_write(data: bytes) -> int:
+                    write(data[:2])
+                    raise OSError(errno.ENOSPC, "no space left")
+
+                monkeypatch.setattr(staged, "write", fail_write)
+            return staged
+
+        with patch("chartreux.core.checkpoints.fs.open", failing_open):
+            errors, restored = FileStore().apply({
+                str(target): FileState(b"replacement")
+            })
+        assert errors == [f"Failed to restore file: {target}"]
+        assert restored == []
+        assert target.read_bytes() == b"original"
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_failed_replacement_preserves_original_bytes(self, tmp_path: Path) -> None:
+        target = tmp_path / "a.txt"
+        target.write_bytes(b"original")
+        with patch(
+            "chartreux.core.checkpoints.fs.os.replace", side_effect=OSError("failed")
+        ):
+            errors, restored = FileStore().apply({
+                str(target): FileState(b"replacement")
+            })
+        assert errors == [f"Failed to restore file: {target}"]
+        assert restored == []
+        assert target.read_bytes() == b"original"
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_restore_replaces_content_and_preserves_mode(self, tmp_path: Path) -> None:
+        target = tmp_path / "a.txt"
+        target.write_bytes(b"original")
+        target.chmod(0o751)
+        errors, restored = FileStore().apply({str(target): FileState(b"replacement")})
+        assert errors == []
+        assert restored == [str(target)]
+        assert target.read_bytes() == b"replacement"
+        assert target.stat().st_mode & 0o777 == 0o751
+        assert list(tmp_path.iterdir()) == [target]
+
+    @pytest.mark.parametrize("umask", [0o022, 0o027, 0o077])
+    def test_restore_missing_file_uses_normal_creation_mode(
+        self, tmp_path: Path, umask: int
+    ) -> None:
+        target = tmp_path / "missing.txt"
+        previous_umask = os.umask(umask)
+        try:
+            errors, restored = FileStore().apply({str(target): FileState(b"restored")})
+        finally:
+            os.umask(previous_umask)
+        assert errors == []
+        assert restored == [str(target)]
+        assert target.read_bytes() == b"restored"
+        assert target.stat().st_mode & 0o777 == 0o666 & ~umask
+        assert list(tmp_path.iterdir()) == [target]
+
+    def test_private_staging_is_restricted_before_bytes_are_written(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "private.txt"
+        target.write_bytes(b"original")
+        target.chmod(0o600)
+        import shutil
+
+        copymode = shutil.copymode
+        observed = False
+
+        def check_mode(source: Path, staging: Path) -> None:
+            nonlocal observed
+            assert staging.stat().st_mode & 0o777 == 0o600
+            assert staging.read_bytes() == b""
+            observed = True
+            copymode(source, staging)
+
+        monkeypatch.setattr("chartreux.core.checkpoints.fs.shutil.copymode", check_mode)
+        DiskFilesystem().write_bytes(str(target), b"private replacement")
+        assert observed
+        assert target.read_bytes() == b"private replacement"
+        assert target.stat().st_mode & 0o777 == 0o600
+
+    def test_restore_name_max_basename(self, tmp_path: Path) -> None:
+        target = tmp_path / ("a" * os.pathconf(tmp_path, "PC_NAME_MAX"))
+        target.write_bytes(b"original")
+        errors, restored = FileStore().apply({str(target): FileState(b"replacement")})
+        assert errors == []
+        assert restored == [str(target)]
+        assert target.read_bytes() == b"replacement"
+        assert list(tmp_path.iterdir()) == [target]
 
     def test_read_missing_returns_none(self, tmp_path: Path) -> None:
         fs = DiskFilesystem()

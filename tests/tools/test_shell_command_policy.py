@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shlex
 
 import pytest
 
@@ -12,7 +13,438 @@ from chartreux.core.tools.builtins._shell_command_policy import (
     matches_command_prefix,
     path_candidates,
 )
-from chartreux.core.tools.builtins.bash import Bash, BashToolConfig
+from chartreux.core.tools.builtins.bash import Bash, BashArgs, BashToolConfig
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "npm install",
+        "pnpm add",
+        "yarn add",
+        "pip install",
+        "pip3 install",
+        "cargo install",
+        "go install",
+        "uv pip install",
+        "python -m pip install",
+        "python3 -m pip install",
+        "python3 -B -W ignore -m pip install",
+        "python3 -mpip install",
+        "python3 -umpip install",
+        "python3 -um pip install",
+        "poetry add",
+        "pipx install",
+        "bun add",
+        "npx",
+        "tee",
+    ],
+)
+@pytest.mark.parametrize("operand", ["package", "./package", "../package"])
+def test_package_and_tee_operands_are_workspace_scoped(
+    bash_tool: Bash, command: str, operand: str
+) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command=f"{command} {operand}"))
+    assert context is not None
+    assert context.permission is (
+        ToolPermission.NEVER if operand.startswith("../") else ToolPermission.ALWAYS
+    )
+    outside = bash_tool.cwd.parent / "outside-package"
+    context = bash_tool.resolve_permission(
+        BashArgs(command=f"{command} {shlex.quote(str(outside))}")
+    )
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+@pytest.mark.parametrize("command", ["npm install", "pip install", "uv pip install"])
+@pytest.mark.parametrize("prefix", ["file:", "file://", "file:///"])
+def test_package_url_absolute_paths_are_workspace_scoped(
+    bash_tool: Bash, command: str, prefix: str
+) -> None:
+    for path, expected in [
+        (bash_tool.cwd / "package", ToolPermission.ALWAYS),
+        (bash_tool.cwd.parent / "outside-package", ToolPermission.NEVER),
+        (bash_tool.cwd / ".env", ToolPermission.NEVER),
+    ]:
+        # file:// + an absolute path yields the conventional file:/// URL.
+        url = prefix + (str(path).lstrip("/") if prefix == "file:///" else str(path))
+        context = bash_tool.resolve_permission(BashArgs(command=f"{command} {url}"))
+        assert context is not None and context.permission is expected
+
+
+@pytest.mark.parametrize(
+    "operand, expected",
+    [
+        ("file:./package", ToolPermission.ALWAYS),
+        ("file:../../outside-package", ToolPermission.NEVER),
+        ("file:%2e%2e/outside-package", ToolPermission.NEVER),
+        ("fixture@file:../outside-package", ToolPermission.NEVER),
+        ("'fixture @ file:../outside-package'", ToolPermission.NEVER),
+        ("file://server/package", ToolPermission.NEVER),
+        ("file:./package?query", ToolPermission.NEVER),
+        ("file:./package#fragment", ToolPermission.NEVER),
+        ("file:%00package", ToolPermission.NEVER),
+        ("file:%invalid", ToolPermission.NEVER),
+        ("git+file:///tmp/package", ToolPermission.NEVER),
+        ("file:", ToolPermission.NEVER),
+    ],
+)
+def test_package_url_relative_and_unmodeled_forms(
+    bash_tool: Bash, operand: str, expected: ToolPermission
+) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command=f"npm install {operand}"))
+    assert context is not None and context.permission is expected
+
+
+def test_package_url_paths_are_normalized_before_resolution() -> None:
+    assert "../package" in path_candidates(
+        ["pip", "install", "file:%2e%2e/package"], inspect_positional_paths=False
+    )
+    assert "../package" in path_candidates(
+        ["pip", "install", "--editable=file:../package"], inspect_positional_paths=False
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "fsck",
+        "bundle list-heads",
+        "gc --auto",
+        "maintenance run",
+        "sparse-checkout list",
+    ],
+)
+def test_unmodeled_git_builtins_are_not_described_as_aliases(
+    bash_tool: Bash, command: str
+) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command=f"git {command}"))
+    assert context is not None and context.permission is ToolPermission.NEVER
+    assert context.reason and "unmodeled git builtin" in context.reason
+    assert "denied conservatively" in context.reason
+    assert "permission settings cannot override" in context.reason
+    assert "aliases" not in context.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'pip install "requests[socks]"',
+        r"pip install requests\[socks\]",
+        "pip install requests[socks",
+        "git log --format=[%h]",
+        "git log --format=[%h] -- go",
+        'printf "%s\\n" env LESSOPEN=fixture',
+        r'nohup p"ip" install requests\[socks\]',
+        'env CI=1 p"ip" install requests[socks',
+        'pip install -e ".[dev]"',
+        'uv pip install -e ".[dev]"',
+        'uv add "httpx[http2]"',
+        'poetry add "httpx[http2]"',
+        "pytest > /dev/null",
+        "pytest 2> /dev/stderr",
+        "pytest > /dev/stdout",
+        "ls src/*.py",
+        "ls *.md",
+        'env CI=1 pip install "requests[socks]"',
+        "env CI=1 npm test",
+        "env CI=1 git status",
+    ],
+)
+def test_benign_shell_forms(bash_tool: Bash, command: str) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'pip install -e "../outside[dev]"',
+        'uv pip install -e "/tmp/outside[dev]"',
+        'uv add "../outside[dev]"',
+        'poetry add "/tmp/outside[dev]"',
+        "pytest > /dev/random",
+        "pip install requests[socks]",
+        "pip install -e .[dev]",
+        "uv pip install -e .[dev]",
+        "uv add httpx[http2]",
+        "poetry add httpx[http2]",
+        "python -m pip install requests[socks]",
+        "env CI=1 pip install -e .[dev]",
+        "nohup pip install -e .[dev]",
+        'python -m p"ip" install -e .[dev]',
+        'nohup p"ip" install -e .[dev]',
+        'env CI=1 p"ip" install -e .[dev]',
+        'command nohup p"ip" install -e .[dev]',
+        'timeout 1 env CI=1 p"ip" install -e .[dev]',
+        "timeout 1 python -m pip install requests[socks]",
+        "ls .*",
+        "ls ..*",
+        "ls src/.*",
+        "ls -L .venv/bin/python[^x]",
+        "ls [.]?",
+        "ls ../*.py",
+        "ls /tmp/*.py",
+        "env PATH=/tmp npm test",
+        "env GIT_CONFIG_GLOBAL=fixture git status",
+        "env PYTHONPATH=../outside pytest",
+        "env ci=1 npm test",
+        "env CI=1 rm -rf src",
+    ],
+)
+def test_benign_shell_form_controls(bash_tool: Bash, command: str) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+def test_listing_glob_rejects_outside_symlink(bash_tool: Bash, tmp_path: Path) -> None:
+    (bash_tool.cwd / "escape.py").symlink_to(bash_tool.cwd.parent / "outside.py")
+    context = bash_tool.resolve_permission(BashArgs(command="ls *.py"))
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+def test_unquoted_local_extras_cannot_hide_outside_symlink(bash_tool: Bash) -> None:
+    (bash_tool.cwd / ".d").symlink_to(bash_tool.cwd.parent / "outside-package")
+    context = bash_tool.resolve_permission(BashArgs(command="pip install -e .[dev]"))
+    assert context is not None and context.permission is ToolPermission.NEVER
+    context = bash_tool.resolve_permission(BashArgs(command='pip install -e ".[dev]"'))
+    assert context is not None and context.permission is ToolPermission.ALWAYS
+
+
+def test_listing_bracket_glob_cannot_hide_outside_symlink(bash_tool: Bash) -> None:
+    bin_dir = bash_tool.cwd / ".venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "python3").symlink_to(bash_tool.cwd.parent / "outside-python")
+    context = bash_tool.resolve_permission(
+        BashArgs(command="ls -L .venv/bin/python[^x]")
+    )
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        "{assignment} less -FX AGENTS.md",
+        "env {assignment} less -FX AGENTS.md",
+        "export {assignment}; less -FX AGENTS.md",
+    ],
+)
+@pytest.mark.parametrize(
+    "name",
+    [
+        "LESSOPEN",
+        "LESSCLOSE",
+        "LESSEDIT",
+        "KSH_ENV",
+        "BASH_ENV",
+        "ENV",
+        "ZDOTDIR",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "PAGER",
+        "GIT_PAGER",
+        "PYTHONSTARTUP",
+        "RUBYOPT",
+        "PERL5OPT",
+        "NODE_OPTIONS",
+        "SSH_ASKPASS",
+        "SSH_ASKPASS_REQUIRE",
+        "RUSTC_WRAPPER",
+        "RUSTC",
+        "CC",
+        "CXX",
+        "RUSTFLAGS",
+        "GOFLAGS",
+        "MAKEFLAGS",
+        "GNUMAKEFLAGS",
+        "PERLLIB",
+        "_JAVA_OPTIONS",
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        "'|cat /outside/data %s'",
+        "'`cat /outside/data`'",
+        "'$(cat /outside/data)'",
+        "fixture",
+    ],
+)
+def test_executable_configuring_environment_is_denied(
+    bash_tool: Bash, form: str, name: str, value: str
+) -> None:
+    command = form.format(assignment=f"{name}={value}")
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+@pytest.mark.parametrize("prefix", ["", "env ", "nohup env "])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "LANG",
+        "LC_ALL",
+        "CI",
+        "TERM",
+        "NO_COLOR",
+        "PIP_DISABLE_PIP_VERSION_CHECK",
+        "UV_NO_SYNC",
+    ],
+)
+def test_benign_environment_controls(bash_tool: Bash, prefix: str, name: str) -> None:
+    context = bash_tool.resolve_permission(
+        BashArgs(command=f"{prefix}{name}=1 npm test")
+    )
+    assert context is not None and context.permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        "{assignment} npm test",
+        "env {assignment} npm test",
+        "command env {assignment} npm test",
+        "nohup env {assignment} npm test",
+        "export {assignment}; npm test",
+    ],
+)
+@pytest.mark.parametrize("value", [r"\|cat", r"\`cat\`", r"\$\(cat\)"])
+def test_unquoted_environment_execution_syntax_is_denied(
+    bash_tool: Bash, form: str, value: str
+) -> None:
+    context = bash_tool.resolve_permission(
+        BashArgs(command=form.format(assignment=f"FOO={value}"))
+    )
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+def test_unknown_git_subcommand_may_be_an_alias(bash_tool: Bash) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command="git fixture-alias"))
+    assert context is not None and context.permission is ToolPermission.NEVER
+    assert context.reason and "aliases and external helpers" in context.reason
+
+
+@pytest.mark.parametrize(
+    "options", ["-i", "-i.bak", "-ni", "--in-place", "--in-place=.bak", "--in-p"]
+)
+def test_sed_in_place_is_a_scoped_mutator(bash_tool: Bash, options: str) -> None:
+    tokens = shlex.split(f"sed {options} s/a/b/ input.txt")
+    policy = analyze_shell_command_policy(tokens)
+    assert policy.mutates_files
+    assert not policy.requires_approval
+    paths = path_candidates(tokens, inspect_positional_paths=False)
+    assert "input.txt" in paths
+    assert all(path.startswith("input.txt") for path in paths)
+    context = bash_tool.resolve_permission(BashArgs(command=shlex.join(tokens)))
+    assert context is not None and context.permission is ToolPermission.ALWAYS
+    tokens[-1] = "../outside.txt"
+    context = bash_tool.resolve_permission(BashArgs(command=shlex.join(tokens)))
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+@pytest.mark.parametrize(
+    "tokens,mutates,paths",
+    [
+        (["sed", "s/a/b/", "input.txt"], False, ("input.txt",)),
+        (["sed", "-e", "s/i/b/", "input.txt"], False, ("input.txt",)),
+        (["sed", "-es/i/b/", "input.txt"], False, ("input.txt",)),
+        (["sed", "-ie", "s/a/b/", "input.txt"], True, ("input.txte", "input.txt")),
+        (["sed", "--", "s/a/b/", "-i"], False, ("-i",)),
+    ],
+)
+def test_sed_options_do_not_reparse_scripts_or_suffixes(
+    tokens: list[str], mutates: bool, paths: tuple[str, ...]
+) -> None:
+    assert analyze_shell_command_policy(tokens).mutates_files is mutates
+    assert path_candidates(tokens, inspect_positional_paths=False) == paths
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "npm install --prefix=/etc pkg",
+        "npm install --prefix /etc pkg",
+        "pip install --target=/etc pkg",
+        "pip install -t/etc pkg",
+        "python3 -m pip install --target=/etc pkg",
+        "NPM_CONFIG_PREFIX=/etc npm install pkg",
+        "PIP_TARGET=/etc pip install pkg",
+        "PIP_PREFIX=/etc python -m pip install pkg",
+        "PIP_CONFIG_FILE=../pip.conf pip install pkg",
+        "export NPM_CONFIG_PREFIX=/etc; npm install pkg",
+        "sed 'r ~/.ssh/id_rsa' input.txt",
+        "sed 'w /etc/passwd' input.txt",
+        "sed -e '1,2r ../secret' input.txt",
+        "sed --expression='s/a/b/w /etc/passwd' input.txt",
+        "sed '/pattern/{w ../outside' input.txt",
+        "sed 'p; R ../outside' input.txt",
+        "gsed 'r ../outside' input.txt",
+        "gsed -i s/a/b/ ../outside.txt",
+        "dd of=../outside.txt",
+        "dd if=input of=.env",
+        "sed -iv s/a/b/ .en",
+        "sed --in-place=v s/a/b/ .en",
+        "gsed -iv s/a/b/ .en",
+    ],
+)
+def test_operand_bypass_vectors_are_denied(bash_tool: Bash, command: str) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pip install package",
+        "npm install pkg",
+        "npm install --prefix=local pkg",
+        "pip install --target=local pkg",
+        "python -m pip install package",
+        "sed -i s/a/b/ file.txt",
+        "sed -i.bak s/a/b/ file.txt",
+        "sed 'r local.txt' input.txt",
+        "sed 'w local.txt' input.txt",
+        "sed 's/a/b/w local.txt' input.txt",
+        "sed '/word/r local.txt' input.txt",
+        "gsed -i s/a/b/ file.txt",
+        "dd if=input of=workspace_out",
+        "LANG=C npm install pkg",
+        "python script.py -m pip ../argument",
+    ],
+)
+def test_operand_controls_remain_permitted(bash_tool: Bash, command: str) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission is ToolPermission.ALWAYS
+
+
+def test_sed_backup_and_script_paths_are_extracted() -> None:
+    assert path_candidates(
+        ["sed", "-iv", "w output.txt", ".en"], inspect_positional_paths=False
+    ) == ("output.txt", ".env", ".en")
+
+
+def test_sed_derived_backup_symlink_is_workspace_scoped(bash_tool: Bash) -> None:
+    (bash_tool.cwd / "input.txt.bak").symlink_to(bash_tool.cwd.parent / "outside")
+    context = bash_tool.resolve_permission(
+        BashArgs(command="sed -i.bak s/a/b/ input.txt")
+    )
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+def test_sed_filename_trailing_space_is_preserved(bash_tool: Bash) -> None:
+    (bash_tool.cwd / "output ").symlink_to(bash_tool.cwd.parent / "outside")
+    context = bash_tool.resolve_permission(
+        BashArgs(command="sed 'w output ' input.txt")
+    )
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+def test_sed_backup_directory_suffix_is_denied(bash_tool: Bash) -> None:
+    context = bash_tool.resolve_permission(
+        BashArgs(command="sed --in-place=../* s/a/b/ input.txt")
+    )
+    assert context is not None and context.permission is ToolPermission.NEVER
 
 
 def test_inline_interpreter_switch_scans_only_real_options() -> None:
@@ -978,3 +1410,263 @@ def test_no_pager_disables_only_pager_config_vector(tmp_path: Path) -> None:
     assert git_repository_config_risk(["git", "--no-pager", "log"], cwd=root) is None
     assert git_repository_config_risk(["git", "-P", "log"], cwd=root) is None
     assert git_repository_config_risk(["git", "--no-pager", "-p", "log"], cwd=root)
+
+
+@pytest.mark.parametrize("globals_", ["", "--no-pager ", "-C . "])
+def test_repository_alias_requires_approval(bash_tool: Bash, globals_: str) -> None:
+    git_dir = bash_tool.cwd / ".git"
+    git_dir.mkdir()
+    (git_dir / "config").write_text("[alias]\n planted = !touch payload\n")
+    command = f"git {globals_}planted"
+    assert analyze_shell_command_policy(shlex.split(command)).requires_approval
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission == ToolPermission.NEVER
+    assert not (bash_tool.cwd / "payload").exists()
+
+
+@pytest.mark.parametrize("command", ["git status", "git diff", "git stash list"])
+@pytest.mark.parametrize("custom", [False, True])
+def test_git_index_hooks_are_denied(
+    bash_tool: Bash, command: str, custom: bool
+) -> None:
+    git_dir = bash_tool.cwd / ".git"
+    git_dir.mkdir()
+    (git_dir / "config").write_text(
+        "[core]\n hooksPath = custom-hooks\n" if custom else "[core]\n bare = false\n"
+    )
+    hooks = bash_tool.cwd / "custom-hooks" if custom else git_dir / "hooks"
+    hooks.mkdir()
+    hook = hooks / "post-index-change"
+    hook.write_text("#!/bin/sh\ntouch payload\n")
+    hook.chmod(0o755)
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission == ToolPermission.NEVER
+    assert (
+        "hooksPath" in (context.reason or "")
+        if custom
+        else "post-index-change" in (context.reason or "")
+    )
+    assert not (bash_tool.cwd / "payload").exists()
+
+
+@pytest.mark.parametrize(
+    "target", [".git/config", ".git/hooks/post-index-change", "../outside"]
+)
+@pytest.mark.parametrize("operator", [">", ">>", "2>", "&>"])
+def test_git_reader_file_redirections_are_denied(
+    bash_tool: Bash, target: str, operator: str
+) -> None:
+    context = bash_tool.resolve_permission(
+        BashArgs(command=f"git log {operator} {target}")
+    )
+    assert context is not None and context.permission == ToolPermission.NEVER
+    assert "require approval" not in (context.reason or "")
+
+
+@pytest.mark.parametrize(
+    "operand", ["/outside/file", "../outside", ".env", ".env.local"]
+)
+@pytest.mark.parametrize("attached", [False, True])
+def test_git_blame_contents_is_workspace_scoped(
+    bash_tool: Bash, operand: str, attached: bool
+) -> None:
+    option = f"--contents={operand}" if attached else f"--contents {operand}"
+    command = f"git blame {option} tracked.txt"
+    assert operand in path_candidates(
+        shlex.split(command), inspect_positional_paths=False
+    )
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission == ToolPermission.NEVER
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git log",
+        "git status",
+        "git diff",
+        "git blame tracked.txt",
+        "git blame --contents=tracked.txt tracked.txt",
+        "git log 2>&1",
+    ],
+)
+def test_clean_git_readers_remain_permitted(bash_tool: Bash, command: str) -> None:
+    git_dir = bash_tool.cwd / ".git"
+    git_dir.mkdir()
+    (git_dir / "config").write_text("[core]\n bare = false\n")
+    hooks = git_dir / "hooks"
+    hooks.mkdir()
+    # Git ignores non-executable hook files, including the shipped samples.
+    (hooks / "post-index-change").write_text("#!/bin/sh\nexit 0\n")
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission == ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed 's/.*/touch pwned/e' input.txt",
+        "sed 's/a/b/ge' input.txt",
+        "sed 's/a/b/Z' input.txt",
+        "sed -f script.sed input.txt",
+        "sed -fscript.sed input.txt",
+        "sed --file=script.sed input.txt",
+        "sed 's/a/b/w .env' input.txt",
+        "python -m uv pip install --target=/etc pkg",
+        "python -m poetry add ../outside",
+        "python -O -m uv pip install --target=/etc pkg",
+        "python -S -m poetry add ../outside",
+        "python -b -m pip install ../outside",
+        "python -W ignore -m uv pip install -t/outside pkg",
+        "python3 --check-hash-based-pycs always -m pip install ../outside",
+        "python3 --check-hash-based-pycs=always -m uv pip install -t/outside pkg",
+        "uv pip install -t/outside pkg",
+        "uv pip install -e../outside",
+        "yarn install --cache-folder /tmp/ycache",
+        "pnpm install --store-dir /tmp/store",
+        "cargo build --target-dir /tmp/target",
+        "npm install --cache-dir ~/.npm pkg",
+        "PIP_TARGET=/etc pip install pkg",
+        "PIP_PREFIX=/etc pip install pkg",
+        "PIP_CACHE_DIR=/tmp/pip-cache pip install pkg",
+        "UV_PROJECT_ENVIRONMENT=/etc uv sync",
+        "UV_CACHE_DIR=/tmp/uv-cache uv sync",
+        "PIP_CONFIG_FILE=config pip install pkg",
+        "UV_CONFIG_FILE=config uv pip install pkg",
+        "UV_TARGET=/etc uv pip install pkg",
+        "POETRY_CONFIG_DIR=config poetry install",
+        "UV_WORKING_DIR=../outside uv pip install --target local pkg",
+        "UV_PROJECT=../outside uv sync",
+        "PIP_LOG=../outside pip install pkg",
+        "git unknown-command",
+    ],
+)
+def test_second_review_bypass_denials(bash_tool: Bash, command: str) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission == ToolPermission.NEVER
+    assert "require approval" not in (context.reason or "")
+    assert "side-effecting options" not in (context.reason or "")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed 's/a/b/2gip' input.txt",
+        "sed 's/a/b/IM' input.txt",
+        "sed '/a/{s/a/b/g}' input.txt",
+        "sed 's/a/b/g # comment' input.txt",
+        "sed 's/a/b/w result.txt' input.txt",
+        "sed -e 's/a/b/g' input.txt",
+        "git diff > patch.txt",
+        "git log 2> err.txt",
+        "echo ok > output.txt; git status",
+        "git log | grep foo > out.txt",
+        "git rev-parse HEAD",
+        "git ls-files",
+        "git describe --tags",
+        "git show-ref",
+        "git for-each-ref",
+        "git check-attr diff file.txt",
+        "git check-ignore file.txt",
+        "git check-ref-format refs/heads/main",
+        "git check-mailmap 'Example <example@example.org>'",
+        "git column",
+        "git get-tar-commit-id",
+        "git var GIT_EDITOR",
+        "git ls-tree HEAD",
+        "git rev-list HEAD",
+        "git cat-file -t HEAD",
+        "git count-objects",
+        "git diff-files",
+        "git diff-index HEAD",
+        "git diff-tree HEAD",
+        "git merge-base HEAD HEAD",
+        "git name-rev HEAD",
+        "git verify-pack objects/pack/example.idx",
+        "git submodule status",
+        "git help log",
+        "git version",
+        "git archive HEAD",
+        "git notes list",
+        "pipx install --python /usr/bin/python3 pkg",
+        "pipx install --python=../python pkg",
+        "npm install --cache-dir cache pkg",
+        "pip install --target target pkg",
+        "uv pip install -ttarget pkg",
+        "uv pip install -e./local",
+        "python -m uv pip install --target=target pkg",
+        "python -m poetry add ./local",
+        "python3 --check-hash-based-pycs always -m pip install ./local",
+        "yarn install --cache-folder cache",
+        "pnpm install --store-dir store",
+        "cargo build --target-dir target",
+        "PIP_DISABLE_PIP_VERSION_CHECK=1 pip install pkg",
+        "UV_NO_PROGRESS=1 uv pip install pkg",
+        "UV_NO_SYNC=1 uv sync",
+    ],
+)
+def test_second_review_benign_forms(bash_tool: Bash, command: str) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission == ToolPermission.ALWAYS, context
+
+
+@pytest.mark.parametrize(
+    "command,option",
+    [
+        ("pip install", "--target"),
+        ("pip install", "--prefix"),
+        ("pip install", "-t"),
+        ("pip install", "-e"),
+        ("uv pip install", "-t"),
+        ("uv pip install", "-e"),
+        ("npm install", "--cache-dir"),
+        ("yarn install", "--cache-folder"),
+        ("pnpm install", "--store-dir"),
+        ("cargo build", "--target-dir"),
+        ("uv pip install", "--config-file"),
+        ("uv python install", "--install-dir"),
+        ("pip install", "--log"),
+        ("pip install", "--report"),
+        ("pip install", "-r"),
+        ("pip install", "-c"),
+        ("pip wheel", "-w"),
+        ("pip download", "-d"),
+        ("uv pip compile", "-o"),
+        ("npm install", "--cache"),
+        ("npm install", "--userconfig"),
+        ("npm install", "--globalconfig"),
+        ("npm install", "--logs-dir"),
+        ("pip download", "--dest"),
+        ("pip download", "--destination-dir"),
+        ("pip download", "--destination-directory"),
+        ("pip install", "--source"),
+        ("pip install", "--source-dir"),
+        ("pip install", "--source-directory"),
+        ("pip install", "--requirements-from-script"),
+        ("npm pack", "--pack-destination"),
+        ("pip wheel", "--wheel-dir"),
+        ("uv build", "--out-dir"),
+        ("uv pip compile", "--output-file"),
+        ("poetry build", "--output"),
+        ("pip install", "--requirement"),
+        ("pip install", "--constraint"),
+        ("uv pip install", "--build-constraints"),
+        ("uv pip install", "--overrides"),
+        ("uv pip install", "--excludes"),
+        ("uv run", "--env-file"),
+    ],
+)
+@pytest.mark.parametrize("destination", ["local", "../outside", ".env"])
+@pytest.mark.parametrize("attached", [False, True])
+def test_package_destinations_are_consistently_scoped(
+    bash_tool: Bash, command: str, option: str, destination: str, attached: bool
+) -> None:
+    separator = "=" if option.startswith("--") else ""
+    argument = option + (separator if attached else " ") + destination
+    context = bash_tool.resolve_permission(
+        BashArgs(command=f"{command} {argument} pkg")
+    )
+    assert context is not None
+    assert context.permission == (
+        ToolPermission.ALWAYS if destination == "local" else ToolPermission.NEVER
+    )

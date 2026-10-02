@@ -226,10 +226,10 @@ async def test_selected_model_survives_exit_and_fresh_resume_without_new_turn(
     assert selected_identity is not None
     await saved.aclose()
 
-    durable_metadata = SessionLoader.load_metadata(session_dir)
-    assert durable_metadata.launch_config is not None
-    assert durable_metadata.launch_config.version == 2
-    assert durable_metadata.launch_config.committed_model == selected_identity
+    saved_metadata = SessionLoader.load_metadata(session_dir)
+    assert saved_metadata.launch_config is not None
+    assert saved_metadata.launch_config.version == 2
+    assert saved_metadata.launch_config.committed_model == selected_identity
 
     resumed_backend = _RecordingBackend()
     resumed = build_test_agent_loop(

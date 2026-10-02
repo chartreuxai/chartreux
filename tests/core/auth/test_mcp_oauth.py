@@ -1409,15 +1409,45 @@ class TestPerformOAuthLogin:
         assert memory_keyring.store == before
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("credential", ["absent", "empty", "expired"])
     async def test_success_without_credentials_does_not_publish_login_fingerprint(
-        self, memory_keyring: _MemoryKeyring, monkeypatch: pytest.MonkeyPatch
+        self,
+        credential: str,
+        memory_keyring: _MemoryKeyring,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         server = _oauth_server()
-        _mock_login_transport(monkeypatch, lambda _request: httpx.Response(200))
-        with pytest.raises(MCPOAuthLoginFailed):
-            await perform_oauth_login(server, on_url=AsyncMock())
-        assert await Fingerprint.load(server.name) is None
-        assert await KeyringTokenStorage(alias=server.name).get_tokens() is None
+        storage = KeyringTokenStorage(alias=server.name)
+        if credential != "absent":
+            await storage.set_tokens(
+                OAuthToken(
+                    access_token="" if credential == "empty" else "synthetic-expired",
+                    expires_in=0 if credential == "expired" else None,
+                )
+            )
+            # A matching existing identity allows the real SDK to inspect the
+            # credential; the 200 probe never supplies a replacement token.
+            await Fingerprint.compute(server).save(server.name)
+        before = dict(memory_keyring.store)
+        requests: list[httpx.Request] = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        _mock_login_transport(monkeypatch, respond)
+        save = AsyncMock()
+        on_url = AsyncMock()
+        with patch.object(Fingerprint, "save", save):
+            with pytest.raises(MCPOAuthLoginFailed, match="No valid OAuth credential"):
+                await perform_oauth_login(server, on_url=on_url)
+        assert requests
+        save.assert_not_awaited()
+        on_url.assert_not_awaited()
+        assert memory_keyring.store == before
+        if credential == "absent":
+            assert await Fingerprint.load(server.name) is None
+            assert await storage.get_tokens() is None
 
     @pytest.mark.asyncio
     async def test_matching_identity_reuses_saved_bearer_without_browser(

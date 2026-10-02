@@ -177,6 +177,13 @@ def _normalize_tool_configs(v: Any) -> dict[str, dict[str, Any]]:
     }
     if any(not isinstance(cfg, dict) for cfg in normalized.values()):
         raise ValueError("Tools must be a table of tool configuration tables")
+    for cfg in normalized.values():
+        if cfg.get("permission") == "ask":
+            raise PydanticCustomError(
+                "removed_tool_permission",
+                "Tool permission 'ask' was removed; use 'always' for automatic "
+                "execution or 'never' to disable the tool. No approval prompt exists.",
+            )
     return normalized
 
 
@@ -407,6 +414,7 @@ class ChartreuxConfigSchema(ConfigSchema):
     subagents: Annotated[SubagentsConfig, WithDeepMerge()] = Field(
         default_factory=SubagentsConfig
     )
+
     session_logging: Annotated[SessionLoggingConfig, WithDeepMerge()] = Field(
         default_factory=SessionLoggingConfig
     )

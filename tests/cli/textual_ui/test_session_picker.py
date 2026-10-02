@@ -15,13 +15,13 @@ from chartreux.app_server.models import (
     PublicSession,
     SavedSessionSummary,
 )
-from chartreux.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.cli.textual_ui.widgets.session_picker import (
     SessionPickerApp,
     _format_relative_time,
     _session_harness_tag,
 )
 from chartreux.cli.textual_ui.widgets.spinner_text import SpinnerText
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
 
 @pytest.fixture

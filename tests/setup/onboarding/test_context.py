@@ -6,8 +6,11 @@ import pytest
 
 from chartreux.app_server._web_search_settings import project_web_search_settings
 from chartreux.app_server.protocol import SettingsReadResponse
-from chartreux.cli.textual_ui.screens.web_search import WebSearchScreen
 from chartreux.core.config import ChartreuxConfigSchema, ModelConfig
+from chartreux.core.model_catalog.contracts import (
+    ConfigReloadResult,
+    ProviderWorkbenchResult,
+)
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.setup.onboarding import (
     OnboardingApp,
@@ -16,8 +19,8 @@ from chartreux.setup.onboarding import (
     run_onboarding,
 )
 from chartreux.setup.onboarding.context import OnboardingContext
-from chartreux.ui.providers.contracts import ConfigReloadResult, ProviderWorkbenchResult
 from chartreux.ui.providers.workbench import ProviderWorkbenchScreen
+from chartreux.ui.web_search import WebSearchScreen
 from tests.cli.textual_ui.web_search_fixture import make_snapshot
 from tests.conftest import build_test_vibe_config
 

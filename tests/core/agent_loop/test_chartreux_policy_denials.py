@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -16,7 +16,10 @@ import chartreux.core.events as event_module
 from chartreux.core.events import BaseEvent, ToolResultEvent
 from chartreux.core.llm_models import FunctionCall, Role, ToolCall
 from chartreux.core.tools.base import ToolPermission
-from chartreux.core.tools.builtins.bash import BashArgs
+from chartreux.core.tools.builtins._shell_command_policy import (
+    analyze_shell_command_policy,
+)
+from chartreux.core.tools.builtins.bash import BashArgs, BashToolConfig
 from chartreux.core.tools.builtins.read_file import ReadFileArgs
 from chartreux.core.tools.builtins.todo import TodoArgs
 from chartreux.core.tools.permissions import PermissionContext
@@ -90,7 +93,7 @@ async def test_direct_denial_no_approval_and_continued_work(
     target = tmp_path / "synthetic.private"
     target.write_text("harmless fixture")
     overrides = {
-        "permission": "never" if denial == "tool" else "ask",
+        "permission": "never" if denial == "tool" else "always",
         "sensitive_patterns": ["*.private"],
         "denylist": [str(target)] if denial != "tool" else [],
         "allowlist": [str(target)] if denial != "tool" else [],
@@ -231,3 +234,122 @@ async def test_child_current_snapshot_deny_wins(
     finally:
         await child.aclose()
         await parent.aclose()
+
+
+@pytest.mark.parametrize("pattern", ["*", "npm *", "/tmp/*"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat {target}",
+        "npm install {target}",
+        "npm install file:{target}",
+        "npm install file:../../outside-package",
+        "pip install file://{target}",
+        "uv pip install file://{target}",
+        "printf x > {target}",
+    ],
+)
+async def test_outside_shell_denial_survives_stale_allowlist_and_bypass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pattern: str, command: str
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    target = tmp_path / "outside.txt"
+    target.write_text("unchanged")
+    command = command.format(target=target)
+    agent = build_test_agent_loop(
+        cwd=project,
+        config=build_test_vibe_config(tools={"bash": {"permission": "always"}}),
+        backend=FakeBackend([
+            [
+                mock_llm_chunk(
+                    tool_calls=[_call("bash", {"command": command}, "outside")]
+                )
+            ],
+            [mock_llm_chunk(content="Denied safely")],
+        ]),
+    )
+    # Simulate old, already-deserialized state, bypassing current validators.
+    # There is no live grant store in this fork; these legacy fields are inert.
+    stale = BashToolConfig(permission=ToolPermission.ALWAYS).model_copy(
+        update={"allowlist": [pattern]}
+    )
+    monkeypatch.setattr(agent.tool_manager, "get_tool_config", lambda _: stale)
+    monkeypatch.setattr(agent, "_permission_store", MagicMock(), raising=False)
+    monkeypatch.setattr(agent, "bypass_tool_permissions", True, raising=False)
+    spawn = AsyncMock(side_effect=AssertionError("Denied command reached executor"))
+    monkeypatch.setattr("chartreux.core.tools.builtins.bash.spawn_shell_command", spawn)
+    try:
+        tool = agent.tool_manager.get("bash")
+        decision = await agent._should_execute_tool(tool, BashArgs(command=command))
+        assert decision.approval_type is ToolPermission.NEVER
+        assert decision.verdict is ToolExecutionResponse.SKIP
+        assert (
+            decision.feedback
+            and "outside the authorized workspace" in decision.feedback
+        )
+        events = await _collect(agent)
+        result = next(event for event in events if isinstance(event, ToolResultEvent))
+        assert result.skipped and result.result is None
+        spawn.assert_not_called()
+        assert target.read_text() == "unchanged"
+    finally:
+        await agent.aclose()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sed -i s/a/b/ input.txt",
+        "touch input.txt",
+        "npm install file:./package",
+        "pip install file:./package",
+        "uv pip install file:./package",
+    ],
+)
+async def test_in_workspace_mutators_are_allowed_not_readers(
+    command: str, tmp_path: Path
+) -> None:
+    agent = build_test_agent_loop(
+        cwd=tmp_path,
+        config=build_test_vibe_config(tools={"bash": {"permission": "always"}}),
+    )
+    try:
+        if command.startswith("sed "):
+            assert analyze_shell_command_policy(command.split()).mutates_files
+        decision = await agent._should_execute_tool(
+            agent.tool_manager.get("bash"), BashArgs(command=command)
+        )
+        assert decision.approval_type is ToolPermission.ALWAYS
+        assert decision.verdict is ToolExecutionResponse.EXECUTE
+    finally:
+        await agent.aclose()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sort --output=output.txt input.txt",
+        "sed -i s/a/b/ ../outside.txt",
+        "find . -exec printf fixture \\;",
+        "git diff --ext-diff",
+        "git diff --output=output.txt",
+        "cat input.txt > ../outside.txt",
+    ],
+)
+async def test_read_only_command_side_effect_guards_survive_loop(
+    command: str, tmp_path: Path
+) -> None:
+    agent = build_test_agent_loop(
+        cwd=tmp_path,
+        config=build_test_vibe_config(tools={"bash": {"permission": "always"}}),
+    )
+    try:
+        decision = await agent._should_execute_tool(
+            agent.tool_manager.get("bash"), BashArgs(command=command)
+        )
+        assert decision.approval_type is ToolPermission.NEVER
+        assert decision.verdict is ToolExecutionResponse.SKIP
+        assert decision.feedback
+    finally:
+        await agent.aclose()

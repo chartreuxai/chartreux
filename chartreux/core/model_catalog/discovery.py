@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from chartreux.ui.providers.contracts import (
+from chartreux.core.model_catalog.contracts import (
     DiscoveryError,
     DiscoveryItem,
     DiscoveryResult,

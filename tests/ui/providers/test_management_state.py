@@ -7,15 +7,15 @@ from typing import cast
 
 import pytest
 
-from chartreux.core.model_catalog.loader import CatalogSnapshot, merge_catalog_overlay
-from chartreux.core.model_catalog.schema import ModelCatalog, ProviderDefinition
-from chartreux.ui.providers.contracts import (
+from chartreux.core.model_catalog.contracts import (
     CatalogChanges,
     DiscoveryItem,
     DiscoveryResult,
     ModelEdits,
     OptionalEdit,
 )
+from chartreux.core.model_catalog.loader import CatalogSnapshot, merge_catalog_overlay
+from chartreux.core.model_catalog.schema import ModelCatalog, ProviderDefinition
 from chartreux.ui.providers.management_state import (
     ManagementState,
     PendingModel,

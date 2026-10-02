@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import stat
+from urllib.parse import unquote, urlsplit
 
 # Length of a single-character short option ("-i") and the minimum length of
 # an unambiguous combined short-option cluster ("-ic").
@@ -16,7 +18,11 @@ _MAX_LESS_RESUMED_OPTIONS = 256
 @dataclass(frozen=True)
 class ShellCommandPolicy:
     requires_approval: bool = False
+    denial_reason: str | None = None
     inspect_positional_paths: bool = False
+    # Test-only classification contract: runtime scopes all sed operands alike,
+    # including in-place writes; no reader exemption depends on this flag.
+    mutates_files: bool = False
     # The command is a Git reader whose repository-owned config may execute
     # code; the permission resolver inspects that config before permitting it.
     inspect_git_repository: bool = False
@@ -872,6 +878,7 @@ _GIT_SUBCOMMAND_TABLE = _OptionTable(
     frozenset({
         "--anchored",
         "--color-moved-ws",
+        "--contents",
         "--diff-filter",
         "--diff-algorithm",
         "--diff-merges",
@@ -1056,9 +1063,124 @@ _GIT_READER_SUBCOMMANDS = frozenset({
     "reflog",
     "stash",
     "shortlog",
+    "rev-parse",
+    "ls-files",
+    "ls-tree",
+    "describe",
+    "show-ref",
+    "for-each-ref",
+    "rev-list",
+    "cat-file",
+    "count-objects",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "merge-base",
+    "name-rev",
+    "verify-pack",
+    "check-attr",
+    "check-ignore",
+    "check-ref-format",
+    "check-mailmap",
+    "column",
+    "get-tar-commit-id",
+    "var",
 })
 
 _GIT_PAGING_SUBCOMMANDS = _GIT_READER_SUBCOMMANDS
+
+# Explicitly recognized non-reader builtins retain their existing policy.
+# Other subcommands remain gated, whether builtins or potential external helpers.
+_GIT_NONREADER_SUBCOMMANDS = frozenset({
+    "add",
+    "am",
+    "apply",
+    "bisect",
+    "checkout",
+    "cherry-pick",
+    "clean",
+    "clone",
+    "commit",
+    "config",
+    "fetch",
+    "init",
+    "merge",
+    "mv",
+    "pull",
+    "push",
+    "rebase",
+    "remote",
+    "reset",
+    "restore",
+    "revert",
+    "rm",
+    "switch",
+    "worktree",
+    "submodule",
+    "help",
+    "version",
+    "archive",
+    "notes",
+})
+
+
+# Known builtins without modeled operand/side-effect rules remain gated, but
+# are not aliases. Do not treat these as readers (e.g. fsck --lost-found writes).
+_GIT_UNMODELED_BUILTINS = frozenset({
+    "bundle",
+    "fsck",
+    "gc",
+    "maintenance",
+    "reflog",
+    "prune",
+    "repack",
+    "pack-objects",
+    "index-pack",
+    "unpack-objects",
+    "update-index",
+    "update-ref",
+    "symbolic-ref",
+    "hash-object",
+    "write-tree",
+    "read-tree",
+    "commit-tree",
+    "mktree",
+    "merge-base",
+    "merge-file",
+    "merge-index",
+    "merge-tree",
+    "name-rev",
+    "describe",
+    "fast-export",
+    "fast-import",
+    "filter-branch",
+    "format-patch",
+    "send-email",
+    "request-pull",
+    "shortlog",
+    "sparse-checkout",
+    "multi-pack-index",
+    "pack-refs",
+    "verify-pack",
+    "verify-commit",
+    "verify-tag",
+    "count-objects",
+    "rerere",
+    "replace",
+    "credential",
+    "credential-cache",
+    "credential-store",
+    "daemon",
+    "http-backend",
+    "upload-pack",
+    "receive-pack",
+    "upload-archive",
+    "for-each-repo",
+    "bugreport",
+    "diagnose",
+    "scalar",
+    "whatchanged",
+})
 
 
 def _git_global_options(args: list[str]) -> tuple[int, list[str]] | None:
@@ -1111,9 +1233,19 @@ def _git_policy(args: list[str]) -> ShellCommandPolicy:
     if globals_result is None:
         return ShellCommandPolicy(requires_approval=True)
     index, paths = globals_result
-    if index >= len(args) or args[index] not in _GIT_READER_SUBCOMMANDS:
+    if index >= len(args):
         return ShellCommandPolicy(option_path_values=tuple(paths))
     subcommand = args[index]
+    if subcommand not in _GIT_READER_SUBCOMMANDS:
+        return ShellCommandPolicy(
+            requires_approval=subcommand not in _GIT_NONREADER_SUBCOMMANDS,
+            denial_reason=(
+                f"unmodeled git builtin {subcommand!r}; denied conservatively; permission settings cannot override this guard"
+                if subcommand in _GIT_UNMODELED_BUILTINS
+                else f"unrecognized git subcommand {subcommand!r}; aliases and external helpers cannot be inspected"
+            ),
+            option_path_values=tuple(paths),
+        )
     parsed = _scan_options(args[index + 1 :], _GIT_SUBCOMMAND_TABLE)
     # --remerge-diff and --diff-merges=remerge re-run repository-configured
     # merge drivers; --show-signature runs the configured gpg program.
@@ -1136,9 +1268,8 @@ def _git_policy(args: list[str]) -> ShellCommandPolicy:
         or bool(diff_merge_values & {"r", "remerge"})
     )
     option_paths = list(paths)
-    option_paths.extend(parsed.values_for("--pathspec-from-file"))
-    if subcommand in {"diff", "log"}:
-        option_paths.extend(parsed.values_for("-O"))
+    option_paths.extend(parsed.values_for("--contents", "--pathspec-from-file"))
+    option_paths.extend(parsed.values_for("-O"))
     return ShellCommandPolicy(
         requires_approval=requires_approval,
         inspect_positional_paths=subcommand == "diff"
@@ -1213,6 +1344,66 @@ def _git_config_paths(cwd: Path) -> tuple[Path, ...] | None:  # noqa: PLR0911
     return ()
 
 
+def git_metadata_paths(tokens: list[str], *, cwd: Path) -> tuple[Path, ...] | None:
+    """Resolve repository metadata identity without running Git or its helpers.
+
+    Include the ambient repository as well as global-option overrides. An explicit
+    git-dir is protected even if it is not yet a complete repository.
+    """
+    roots = {cwd}
+    explicit_dirs: set[Path] = set()
+    override_values: list[tuple[str, str]] = []
+    if tokens and _command_name(tokens[0]) == "git":
+        current = cwd
+        index = 1
+        while index < len(tokens) and tokens[index].startswith("-"):
+            token = tokens[index]
+            name, separator, value = token.partition("=")
+            if token == "-C" or name in {"--git-dir", "--work-tree"}:
+                if not separator:
+                    index += 1
+                    if index >= len(tokens):
+                        return None
+                    value = tokens[index]
+                path = Path(value).expanduser()
+                path = (path if path.is_absolute() else current / path).resolve()
+                if token == "-C":
+                    current = path
+                elif name == "--git-dir":
+                    explicit_dirs.add(path)
+                    override_values.append((name, value))
+                else:
+                    roots.add(path)
+                    override_values.append((name, value))
+            elif token.startswith("-C"):
+                current = (current / token[2:]).resolve()
+            index += 1
+        roots.add(current)
+        # Git applies -C before resolving repository override paths, even when
+        # the override appeared earlier on the command line.
+        for name, value in override_values:
+            path = Path(value).expanduser()
+            path = (path if path.is_absolute() else current / path).resolve()
+            (explicit_dirs if name == "--git-dir" else roots).add(path)
+    metadata = set(explicit_dirs)
+    for root in roots:
+        configs = _git_config_paths(root)
+        if configs is None:
+            return None
+        metadata.update(config.parent.resolve() for config in configs)
+    # Follow commondir for explicit git-dir and symlinked .git directories too.
+    for git_dir in tuple(metadata):
+        try:
+            value = (git_dir / "commondir").read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError):
+            return None
+        common = Path(value)
+        metadata.add((common if common.is_absolute() else git_dir / common).resolve())
+    return tuple(metadata)
+
+
 def _git_config_entries(cwd: Path) -> tuple[tuple[str, str, str], ...] | None:
     """Parse repository-owned config entries without invoking Git.
 
@@ -1262,6 +1453,32 @@ def _git_config_entries(cwd: Path) -> tuple[tuple[str, str, str], ...] | None:
 
 def _git_value_is_active(value: str) -> bool:
     return value.casefold() not in _FALSE_GIT_CONFIG_VALUES
+
+
+def _git_index_hook_risk(
+    cwd: Path, entries: tuple[tuple[str, str, str], ...]
+) -> str | None:
+    # Readers such as status/diff can refresh and write the index. Conservatively
+    # inspect every modeled reader, including stash's index-writing operations.
+    # Do not interpret hooksPath quoting/expansion: any override fails closed.
+    if any(section == "core" and key == "hookspath" for section, key, _ in entries):
+        return "repository git config may execute arbitrary code via core.hooksPath"
+    config_paths = _git_config_paths(cwd)
+    if config_paths is None:
+        return "repository git hooks cannot be inspected; failing closed"
+    for config_path in config_paths:
+        hook = config_path.parent / "hooks" / "post-index-change"
+        try:
+            mode = hook.stat().st_mode
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return "repository git hooks cannot be inspected; failing closed"
+        if mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+            return (
+                "repository git hooks may execute arbitrary code via post-index-change"
+            )
+    return None
 
 
 def git_repository_config_risk(  # noqa: PLR0911, PLR0912
@@ -1343,7 +1560,282 @@ def git_repository_config_risk(  # noqa: PLR0911, PLR0912
                 return vector("merge.driver")
             if section == "gpg" and key == "program":
                 return vector("gpg.program")
+    if risk := _git_index_hook_risk(cwd, entries):
+        return risk
     return None
+
+
+_SED_TABLE = _OptionTable(
+    long_values=frozenset({"--expression", "--file", "--line-length"}),
+    short_values=frozenset("efl"),
+    optional_long_values=frozenset({"--in-place"}),
+    optional_short_values=frozenset("i"),
+    boolean_long=frozenset({
+        "--debug",
+        "--follow-symlinks",
+        "--help",
+        "--null-data",
+        "--posix",
+        "--quiet",
+        "--regexp-extended",
+        "--sandbox",
+        "--separate",
+        "--silent",
+        "--unbuffered",
+        "--version",
+    }),
+)
+
+
+def _sed_delimited_end(script: str, index: int, delimiter: str) -> int:
+    while index < len(script):
+        if script[index] == "\\":
+            index += 2
+        elif script[index] == delimiter:
+            return index + 1
+        else:
+            index += 1
+    raise ValueError("unterminated sed expression")
+
+
+def _sed_script_paths(script: str) -> tuple[str, ...]:  # noqa: PLR0912
+    """Inspect literal file commands without interpreting substitutions as code."""
+    paths: list[str] = []
+    index = 0
+    while index < len(script):
+        character = script[index]
+        if (
+            character.isspace()
+            or character in ";{},!"
+            or character.isdigit()
+            or character == "$"
+        ):
+            index += 1
+            continue
+        if character == "/":  # Regex address.
+            index = _sed_delimited_end(script, index + 1, "/")
+            continue
+        # Alternate address delimiter.
+        if character == "\\" and index + 1 < len(script):
+            delimiter = script[index + 1]
+            index = _sed_delimited_end(script, index + 2, delimiter)
+            continue
+        index += 1
+        if character in "sy":
+            if index >= len(script):
+                raise ValueError("missing sed delimiter")
+            delimiter = script[index]
+            index = _sed_delimited_end(script, index + 1, delimiter)
+            index = _sed_delimited_end(script, index, delimiter)
+            if character == "y":
+                continue
+            # Substitution flags include a file-writing 'w' selector.
+            while index < len(script) and script[index] not in ";\n}#":
+                if script[index] == "w":
+                    character = "w"
+                    index += 1
+                    break
+                if script[index] not in "0123456789giImMp \t\r":
+                    raise ValueError(
+                        "unmodeled sed substitution flag (shell execution is not permitted)"
+                    )
+                index += 1
+            else:
+                continue
+        if character in "rRwW":
+            # GNU sed consumes the rest of the line as the filename, even ';'.
+            end = script.find("\n", index)
+            end = len(script) if end == -1 else end
+            target = script[index:end].lstrip(" \t")
+            if "\\" in target:
+                raise ValueError("escaped sed filename cannot be safely inspected")
+            if target:
+                paths.append(target)
+            index = end
+        elif character in "aic#":
+            # Text and comments are not sed commands.
+            end = script.find("\n", index)
+            index = len(script) if end == -1 else end
+        elif character in "btT:":
+            while index < len(script) and script[index] not in ";\n":
+                index += 1
+        elif character not in "dDgGhHlnNpPqx=z":
+            # Unknown syntax may hide a file command; do not guess its boundary.
+            raise ValueError("unsupported sed script syntax")
+    return tuple(paths)
+
+
+def _sed_policy(args: list[str]) -> ShellCommandPolicy:
+    parsed = _scan_options(args, _SED_TABLE)
+    has_script_option = _has_long(parsed, "--expression", "--file") or _has_short(
+        parsed, frozenset("ef"), _SED_TABLE
+    )
+    inputs = parsed.positionals if has_script_option else parsed.positionals[1:]
+    scripts = parsed.values_for("--expression", "-e")
+    if not has_script_option:
+        scripts = parsed.positionals[:1]
+    if _has_long(parsed, "--file") or _has_short(parsed, frozenset("f"), _SED_TABLE):
+        return ShellCommandPolicy(
+            requires_approval=True,
+            denial_reason="external sed scripts cannot be analyzed; inline the script instead",
+        )
+    paths: list[str] = []
+    requires_approval = False
+    denial_reason = None
+    try:
+        for script in scripts:
+            paths.extend(_sed_script_paths(script))
+    except ValueError as exc:
+        requires_approval = True
+        denial_reason = str(exc)
+    for suffix in parsed.values_for("--in-place", "-i"):
+        if "/" in suffix:
+            requires_approval = True
+        paths.extend(
+            suffix.replace("*", operand) if "*" in suffix else operand + suffix
+            for operand in inputs
+            if suffix
+        )
+    return ShellCommandPolicy(
+        requires_approval=requires_approval,
+        denial_reason=denial_reason,
+        mutates_files=_has_long(parsed, "--in-place")
+        or _has_short(parsed, frozenset("i"), _SED_TABLE),
+        inspect_positional_paths=True,
+        option_path_values=tuple(paths),
+        positional_values=inputs,
+    )
+
+
+_PACKAGE_PATH_COMMANDS = frozenset({
+    "bun",
+    "cargo",
+    "go",
+    "npm",
+    "npx",
+    "pip",
+    "pip3",
+    "pipx",
+    "pnpm",
+    "poetry",
+    "uv",
+    "yarn",
+})
+_PACKAGE_PATH_OPTIONS = frozenset({
+    "--prefix",
+    "--target",
+    "--root",
+    "--cache-dir",
+    "--src",
+    "--path",
+    "--directory",
+    "--cwd",
+    "--project",
+    "--store-dir",
+    "--cache-folder",
+    "--target-dir",
+    "--global-dir",
+    "--modules-folder",
+    "--virtualenv",
+    "--dest",
+    "--editable",
+    "--config-file",
+    "--install-dir",
+    "--log",
+    "--report",
+    "--cache",
+    "--userconfig",
+    "--globalconfig",
+    "--logs-dir",
+    "--output",
+    "--output-file",
+    "--out-dir",
+    "--download",
+    "--download-dir",
+    "--wheel-dir",
+    "--requirements",
+    "--requirement",
+    "--requirements-from-script",
+    "--destination-dir",
+    "--destination-directory",
+    "--source",
+    "--source-dir",
+    "--source-directory",
+    "--pack-destination",
+    "--constraints",
+    "--constraint",
+    "--build-constraints",
+    "--build-constraint",
+    "--overrides",
+    "--excludes",
+    "--env-file",
+})
+
+
+def _package_local_path(value: str) -> str:
+    """Normalize local package URLs; fail closed on unmodeled URL syntax."""
+    # Extras on a local project are requirement syntax, not shell globs.
+    local = re.fullmatch(r"(\.{1,2}(?:/[^\[\]]*)?|/[^\[\]]+)\[[\w., -]+\]", value)
+    if local is not None:
+        value = local[1]
+    if "file:" not in value.casefold():
+        return value
+    # npm name@file: and pip's quoted 'name @ file:' direct references.
+    match = re.fullmatch(r"(?:[\w.@/\[\],-]+\s*@\s*)?(file:.*)", value, re.IGNORECASE)
+    if match is None:
+        raise ValueError("Unmodeled local package URL")
+    url = match[1]
+    parsed = urlsplit(url)
+    if (
+        any((parsed.netloc, parsed.query, parsed.fragment, not parsed.path))
+        or re.search(r"%(?![0-9a-fA-F]{2})", parsed.path)
+        or any(character in url for character in "\\\r\n\t")
+    ):
+        raise ValueError("Unmodeled local package URL")
+    path = unquote(parsed.path, errors="strict")
+    if "\x00" in path or path.startswith("//"):
+        raise ValueError("Unmodeled local package URL")
+    return path
+
+
+def _package_requirement_path(value: str) -> str | None:
+    # Named requirements (including extras and version constraints) are not paths.
+    if re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._-]+(?:\s*,\s*[A-Za-z0-9._-]+)*\])"
+        r"(?:\s*(?:===|==|~=|!=|<=|>=|<|>)\s*[A-Za-z0-9.*+!_-]+(?:\s*,\s*(?:==|~=|!=|<=|>=|<|>)\s*[A-Za-z0-9.*+!_-]+)*)?",
+        value,
+    ):
+        return None
+    return _package_local_path(value)
+
+
+def _package_policy(args: list[str], *, pip: bool = False) -> ShellCommandPolicy:
+    table = _OptionTable(
+        long_values=_PACKAGE_PATH_OPTIONS | frozenset({"--python"}),
+        short_values=frozenset("tercdwo") if pip else frozenset("o"),
+    )
+    parsed = _scan_options(args, table)
+    try:
+        option_paths = tuple(
+            _package_local_path(value)
+            for value in parsed.values_for(
+                *_PACKAGE_PATH_OPTIONS, "-t", "-e", "-r", "-c", "-d", "-w", "-o"
+            )
+        )
+        positional_paths = tuple(
+            path
+            for value in parsed.positionals
+            if (path := _package_requirement_path(value)) is not None
+        )
+    except ValueError:
+        return ShellCommandPolicy(
+            requires_approval=True, denial_reason="unmodeled local package URL"
+        )
+    return ShellCommandPolicy(
+        inspect_positional_paths=True,
+        option_path_values=option_paths,
+        positional_values=positional_paths,
+    )
 
 
 _COMMAND_POLICIES = {
@@ -1355,11 +1847,13 @@ _COMMAND_POLICIES = {
     "file": lambda args: _standard_policy("file", args),
     "find": _find_policy,
     "git": _git_policy,
+    "gsed": _sed_policy,
     "grep": lambda args: _standard_policy("grep", args),
     "less": _less_policy,
     "md5sum": _checksum_policy,
     "more": _less_policy,
     "rm": _rm_policy,
+    "sed": _sed_policy,
     "sha1sum": _checksum_policy,
     "sha256sum": _checksum_policy,
     "shasum": _checksum_policy,
@@ -1374,10 +1868,10 @@ _COMMAND_POLICIES = {
 # Only modeled options may advance the scan: an unknown option might consume
 # the next word, hiding an inline-code selector behind it.
 _INLINE_SWITCHES = {
-    "python": ("c", frozenset("BEsIiuqvVxR"), frozenset("WX"), {}),
-    "python3": ("c", frozenset("BEsIiuqvVxR"), frozenset("WX"), {}),
-    "pypy": ("c", frozenset("BEsIiuqvVxR"), frozenset("WX"), {}),
-    "pypy3": ("c", frozenset("BEsIiuqvVxR"), frozenset("WX"), {}),
+    "python": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
+    "python3": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
+    "pypy": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
+    "pypy3": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
     "node": (
         "e",
         frozenset("ip"),
@@ -1462,10 +1956,56 @@ def inline_interpreter_switch(tokens: list[str]) -> str | None:
     return None
 
 
+def _package_module_tokens(tokens: list[str]) -> list[str]:
+    """Recognize Python's module target, stopping before script arguments."""
+    name = _command_name(tokens[0]) if tokens else ""
+    if name not in {"python", "python3", "pypy", "pypy3"}:
+        return tokens
+    _, flags, values, _ = _INLINE_SWITCHES[name]
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--" or not token.startswith("-"):
+            return tokens
+        if token.startswith("--"):
+            option, separator, _ = token.partition("=")
+            if option == "--check-hash-based-pycs":
+                index += 1 if separator else 2
+                continue
+            break
+        consumed = _short_interpreter_option(token, "m", flags, values)
+        if consumed == -1:
+            offset = token.index("m") + 1
+            module = token[offset:] or (
+                tokens[index + 1] if index + 1 < len(tokens) else ""
+            )
+            package = module.removesuffix(".__main__")
+            if package in _PACKAGE_PATH_COMMANDS:
+                return [package, *tokens[index + (1 if token[offset:] else 2) :]]
+            return tokens
+        if consumed <= 0:
+            return tokens
+        index += consumed
+    return tokens
+
+
+def is_package_command(tokens: list[str]) -> bool:
+    """Identify commands whose requirement syntax needs quote-aware analysis."""
+    tokens = _package_module_tokens(tokens)
+    return bool(tokens) and _command_name(tokens[0]) in _PACKAGE_PATH_COMMANDS
+
+
 def analyze_shell_command_policy(tokens: list[str]) -> ShellCommandPolicy:
+    tokens = _package_module_tokens(tokens)
     if not tokens:
         return ShellCommandPolicy()
-    policy = _COMMAND_POLICIES.get(_command_name(tokens[0]))
+    name = _command_name(tokens[0])
+    if name in _PACKAGE_PATH_COMMANDS:
+        return _package_policy(
+            tokens[1:],
+            pip=name in {"pip", "pip3"} or (name == "uv" and "pip" in tokens[1:]),
+        )
+    policy = _COMMAND_POLICIES.get(name)
     return policy(tokens[1:]) if policy else ShellCommandPolicy()
 
 
@@ -1480,7 +2020,9 @@ def path_candidates(
         return tuple(candidates)
     command = _command_name(tokens[0])
     if command == "dd":
-        candidates.extend(token[3:] for token in tokens[1:] if token.startswith("if="))
+        candidates.extend(
+            token[3:] for token in tokens[1:] if token.startswith(("if=", "of="))
+        )
     if command == "tar":
         for index, token in enumerate(tokens[1:], 1):
             if token.startswith("--add-file="):
@@ -1491,11 +2033,6 @@ def path_candidates(
         candidates.extend(policy.positional_values)
         return tuple(candidates)
     options_ended = False
-    sed_script = command == "sed" and not any(
-        token in {"-e", "--expression", "-f", "--file"}
-        or token.startswith(("--expression=", "--file=", "-e", "-f"))
-        for token in tokens[1:]
-    )
     for token in tokens[1:]:
         if token == "--":
             options_ended = True
@@ -1503,9 +2040,6 @@ def path_candidates(
         if not options_ended and token.startswith("-"):
             continue
         if command == "chmod" and token.startswith("+"):
-            continue
-        if sed_script:
-            sed_script = False
             continue
         candidates.append(token)
     return tuple(candidates)

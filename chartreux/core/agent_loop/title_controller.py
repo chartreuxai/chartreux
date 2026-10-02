@@ -147,6 +147,11 @@ class TitleController:
         if task is not None and not task.done():
             task.cancel()
 
+    def rebind_writer(self, writer: AutoTitleWriter) -> None:
+        """Cancel stale work and bind title publication to a new session logger."""
+        self.reset()
+        self._writer = writer
+
     def reset(self) -> None:
         self.cancel()
         self._cadence.reset()

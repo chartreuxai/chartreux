@@ -31,7 +31,7 @@ class TestRetiredPermissionStore:
             function=FunctionCall(name="todo", arguments='{"action":"read"}'),
         )
         loop = build_test_agent_loop(
-            config=build_test_vibe_config(tools={"todo": {"permission": "ask"}}),
+            config=build_test_vibe_config(tools={"todo": {"permission": "always"}}),
             backend=FakeBackend([
                 [mock_llm_chunk(tool_calls=[tool_call])],
                 [mock_llm_chunk(content="Done")],

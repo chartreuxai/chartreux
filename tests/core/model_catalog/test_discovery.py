@@ -6,14 +6,14 @@ from collections.abc import Awaitable, Callable
 import httpx
 import pytest
 
-from chartreux.core.model_catalog.discovery import discover_models
-from chartreux.core.model_catalog.presets import PRESETS
-from chartreux.ui.providers.contracts import (
+from chartreux.core.model_catalog.contracts import (
     DiscoveryError,
     DiscoveryResult,
     ProviderDraft,
     TLSConfig,
 )
+from chartreux.core.model_catalog.discovery import discover_models
+from chartreux.core.model_catalog.presets import PRESETS
 
 
 def _provider(style: str = "openai", **kwargs: object) -> ProviderDraft:

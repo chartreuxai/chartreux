@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncGenerator, Iterator
 from dataclasses import dataclass
 from functools import lru_cache
+import glob
 from pathlib import Path
 import re
 import shlex
@@ -26,6 +27,7 @@ from chartreux.core.tools.base import (
 from chartreux.core.tools.builtins._shell_command_policy import (
     ShellCommandPolicy,
     analyze_shell_command_policy,
+    git_metadata_paths,
     git_repository_config_risk,
     inline_interpreter_switch,
     matches_command_prefix,
@@ -33,6 +35,8 @@ from chartreux.core.tools.builtins._shell_command_policy import (
 )
 from chartreux.core.tools.builtins._shell_permission_analysis import (
     DANGEROUS_ENV_NAMES,
+    ShellPermissionAnalysis,
+    _has_active_bracket_glob,
     analyze_shell_command,
 )
 from chartreux.core.tools.io_port import ShellCommandRequest
@@ -133,7 +137,34 @@ def _shell_source(tokens: list[str]) -> str | None:
     return None
 
 
-def _wrapper_executable(tokens: list[str], name: str) -> list[str]:
+def _original_argv_suffix(command: str, count: int) -> str:
+    """Retain shell quoting/escapes when exposing a wrapped executable."""
+    tree = _get_parser().parse(command.encode("utf-8"))
+
+    def command_nodes(node: Node) -> Iterator[Node]:
+        if node.type == "command":
+            yield node
+        else:
+            for child in node.children:
+                yield from command_nodes(child)
+
+    commands = list(command_nodes(tree.root_node))
+    if len(commands) != 1:
+        raise _UnsafeShellSyntax("cannot preserve wrapped executable syntax")
+    nodes = [
+        child
+        for child in commands[0].children
+        if child.type
+        in {"command_name", "number", "word", "string", "raw_string", "concatenation"}
+    ]
+    if count <= 0 or count > len(nodes):
+        raise _UnsafeShellSyntax("cannot preserve wrapped executable syntax")
+    return command.encode("utf-8")[
+        nodes[-count].start_byte : nodes[-1].end_byte
+    ].decode("utf-8")
+
+
+def _wrapper_executable(tokens: list[str], name: str, command: str) -> list[str]:
     """Locate the executable using only modeled wrapper argv forms."""
     values = {
         "timeout": {"-s", "--signal", "-k", "--kill-after"},
@@ -221,7 +252,7 @@ def _wrapper_executable(tokens: list[str], name: str) -> list[str]:
         index += 1  # lock file or descriptor
     if index >= len(tokens):
         raise _UnsafeShellSyntax(f"missing {name} wrapped executable")
-    return [shlex.join(tokens[index:])]
+    return [_original_argv_suffix(command, len(tokens) - index)]
 
 
 def _has_unrecognized_nested_shell(tokens: list[str]) -> bool:
@@ -239,7 +270,21 @@ def _has_unrecognized_nested_shell(tokens: list[str]) -> bool:
     )
 
 
-def _wrapped_guardrail_commands(command: str) -> tuple[list[str], str | None]:
+def _env_assignment_source(tokens: list[str]) -> str:
+    index = 1
+    assignments: list[str] = []
+    while index < len(tokens) and re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index], re.DOTALL
+    ):
+        key, _, value = tokens[index].partition("=")
+        assignments.append(f"{key}={shlex.quote(value)}")
+        index += 1
+    if index == 1 or index >= len(tokens) or tokens[index].startswith("-"):
+        raise _UnsafeShellSyntax("unsupported env wrapper form")
+    return " ".join([*assignments, shlex.join(tokens[index:])])
+
+
+def _wrapped_guardrail_commands(command: str) -> tuple[list[str], str | None]:  # noqa: PLR0911
     """Return actual executable positions, and literal nested shell source."""
     try:
         tokens = shlex.split(command)
@@ -248,6 +293,9 @@ def _wrapped_guardrail_commands(command: str) -> tuple[list[str], str | None]:
     if not tokens:
         return [], None
     name = Path(tokens[0]).name
+    if name == "env":
+        _env_assignment_source(tokens)  # Validate the supported wrapper form.
+        return [], _original_argv_suffix(command, len(tokens) - 1)
     if name == "eval":
         source = " ".join(tokens[1:])
         return list(analyze_shell_command(source).command_parts) if source else [], None
@@ -265,7 +313,11 @@ def _wrapped_guardrail_commands(command: str) -> tuple[list[str], str | None]:
                 index += 1
                 continue
             break
-        return ([shlex.join(tokens[index:])] if index < len(tokens) else []), None
+        return (
+            [_original_argv_suffix(command, len(tokens) - index)]
+            if index < len(tokens)
+            else []
+        ), None
     if name == "script" and "-c" in tokens[1:]:
         raise _UnsafeShellSyntax("unsupported script -c shell wrapper")
     if name == "busybox":
@@ -285,7 +337,7 @@ def _wrapped_guardrail_commands(command: str) -> tuple[list[str], str | None]:
         "time",
         "flock",
     }:
-        return _wrapper_executable(tokens, name), None
+        return _wrapper_executable(tokens, name, command), None
     if name not in _SHELLS and _has_unrecognized_nested_shell(tokens):
         raise _UnsafeShellSyntax(f"unsupported wrapper before shell -c ({name})")
     return [], _shell_source(tokens)
@@ -314,7 +366,7 @@ def _expand_guardrail_parts(
             if depth >= _MAX_SHELL_DEPTH:
                 raise _UnsafeShellSyntax("shell nesting depth limit exceeded")
             # Quoted source is parsed afresh: shlex cannot model substitutions.
-            analysis = analyze_shell_command(source, nested_source=True)
+            analysis = _analyze_guardrail_source(source, nested_source=True)
             if analysis.approval_reasons:
                 errors.extend(analysis.approval_reasons)
             redirects.extend(_extract_redirect_paths(source))
@@ -332,6 +384,7 @@ def _expand_guardrail_parts(
                 for reason in analyze_shell_command(child).approval_reasons
                 if "command lookup modification" in reason
                 or "dangerous environment assignment" in reason
+                or "unquoted package bracket syntax" in reason
             )
             visit(child, scope, depth + 1)
 
@@ -493,14 +546,42 @@ def _get_default_denylist_standalone() -> list[str]:
     ]
 
 
-_MUTATING_PATH_COMMANDS = {"cd", "chmod", "chown", "cp", "mkdir", "mv", "rm", "touch"}
+_MUTATING_PATH_COMMANDS = {
+    "cd",
+    "chmod",
+    "chown",
+    "cp",
+    "mkdir",
+    "mv",
+    "rm",
+    "tee",
+    "touch",
+}
 
-# File-content readers beyond the read-only set: dumpers, encoders, and
-# archivers whose positional operands name files. Inspected so the
-# sensitive-file deny fires on operands like `~/.chartreux/.env`; these tools
-# have legitimate uses, so the sensitive-path check, not a blanket deny, is
-# the gate. sed's leading script operand is excluded by path_candidates;
-# arbitrary awk scripts are not modeled here.
+# Package managers accept local package/directory operands as well as names.
+# Use the same bounded positional-path inspection as other path commands;
+# this does not model package scripts, manifests, or every option's operands.
+_PACKAGE_PATH_COMMANDS = {
+    "bun",
+    "cargo",
+    "go",
+    "npm",
+    "npx",
+    "pip",
+    "pip3",
+    "pipx",
+    "pnpm",
+    "poetry",
+    "uv",
+    "yarn",
+}
+
+# File-content commands beyond the read-only set, including encoders,
+# archivers, and mutators whose positional operands name files. Inspected so
+# sensitive and outside-workspace operands are denied rather than treating
+# the command name as evidence of read-only behavior. Sed's policy excludes
+# its script operand and inspects literal r/w targets and derived backups;
+# arbitrary awk script effects and external sed script contents remain opaque.
 _FILE_CONTENT_COMMANDS = {
     "base64",
     "gunzip",
@@ -522,7 +603,10 @@ _FILE_CONTENT_COMMANDS = {
 # Inspect recognized reader and mutator operands before permitting execution.
 # This bounded heuristic is not a containment promise for arbitrary programs.
 _PATH_COMMANDS = (
-    _MUTATING_PATH_COMMANDS | set(_READ_ONLY_COMMANDS_POSIX) | _FILE_CONTENT_COMMANDS
+    _MUTATING_PATH_COMMANDS
+    | _PACKAGE_PATH_COMMANDS
+    | set(_READ_ONLY_COMMANDS_POSIX)
+    | _FILE_CONTENT_COMMANDS
 )
 
 
@@ -584,6 +668,35 @@ def _collect_outside_dirs(
     return dirs
 
 
+_REDIRECTION_DEVICES = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
+
+
+def _analyze_guardrail_source(
+    command: str, *, nested_source: bool = False
+) -> ShellPermissionAnalysis:
+    """Treat only literal standard-device redirects as workspace-neutral sinks."""
+    try:
+        source = command.encode("utf-8")
+    except UnicodeEncodeError:
+        return analyze_shell_command(command, nested_source=nested_source)
+    replacements: list[tuple[int, int]] = []
+
+    def visit(node: Node) -> None:
+        if node.type == "file_redirect":
+            destination = node.child_by_field_name("destination")
+            if destination is not None and destination.text is not None:
+                tokens = _split_command_tokens(destination.text.decode("utf-8"))
+                if len(tokens) == 1 and tokens[0] in _REDIRECTION_DEVICES:
+                    replacements.append((destination.start_byte, destination.end_byte))
+        for child in node.children:
+            visit(child)
+
+    visit(_get_parser().parse(source).root_node)
+    for start, end in sorted(replacements, reverse=True):
+        source = source[:start] + b"__standard_device_sink__" + source[end:]
+    return analyze_shell_command(source.decode("utf-8"), nested_source=nested_source)
+
+
 def _extract_redirect_paths(command: str) -> list[str]:
     """Inspect literal file redirects using the existing Bash grammar.
 
@@ -635,7 +748,7 @@ class BashToolConfig(BaseToolConfig):
         exclude=True,
         description="Removed legacy field; excluded so internal defaults cannot reintroduce it.",
     )
-    permission: ToolPermission = ToolPermission.ASK
+    permission: ToolPermission = ToolPermission.ALWAYS
     max_output_bytes: int = Field(
         default=16_000, description="Maximum bytes to capture from stdout and stderr."
     )
@@ -858,11 +971,6 @@ class Bash(
                     permission=ToolPermission.NEVER,
                     reason="Command denied: unsetting a protected shell environment variable",
                 )
-            if tokens and Path(tokens[0]).name == "env":
-                return PermissionContext(
-                    permission=ToolPermission.NEVER,
-                    reason="Command denied: env wrapper cannot be safely inspected",
-                )
             try:
                 matched = self._find_denylist_match(part)
             except ValueError as exc:
@@ -893,7 +1001,7 @@ class Bash(
                 reason = (
                     "Command denied: find execution predicates are not permitted"
                     if tokens and Path(tokens[0]).name == "find"
-                    else f"Command denied: side-effecting options are not permitted: '{part}'"
+                    else f"Command denied: {policy.denial_reason or 'unsafe or unmodeled command options are not permitted'}: '{part}'"
                 )
                 return PermissionContext(permission=ToolPermission.NEVER, reason=reason)
             if not policy.inspect_git_repository:
@@ -939,8 +1047,8 @@ class Bash(
             ):
                 if token == "<redirect>":
                     continue
-                # Shell globs can expand into hidden sensitive files. Quoting is
-                # lost in shlex's argv view, so deny ambiguous patterns outright.
+                # Only listing globs with a literal, scoped parent and safe
+                # current matches are modeled; other path globs fail closed.
                 if (
                     command == "find"
                     and token in tokens[2:]
@@ -951,7 +1059,41 @@ class Bash(
                     )
                 ):
                     continue
-                if any(character in token for character in _SHELL_GLOB_CHARACTERS):
+                if any(
+                    character in token for character in "*?"
+                ) or _has_active_bracket_glob(token.encode()):
+                    # Python glob and shell bracket expressions differ. Dot-
+                    # leading patterns may also expand to . or .. in shells.
+                    supported_glob = "[" not in token and not Path(
+                        token
+                    ).name.startswith(".")
+                    if (
+                        command == "ls"
+                        and not cwd_unknown
+                        and not Path(token).is_absolute()
+                        and not token.startswith("~")
+                        and supported_glob
+                    ):
+                        parent = str(Path(token).parent)
+                        if not any(
+                            character in parent for character in _SHELL_GLOB_CHARACTERS
+                        ) and all(
+                            self.workspace.allows(resolve_tool_path(parent, cwd))
+                            and not matches_sensitive_pattern(
+                                str(resolve_tool_path(token, cwd)),
+                                DEFAULT_SENSITIVE_PATTERNS,
+                            )
+                            and all(
+                                self.workspace.allows(Path(match).resolve())
+                                and not matches_sensitive_pattern(
+                                    str(Path(match).resolve()),
+                                    DEFAULT_SENSITIVE_PATTERNS,
+                                )
+                                for match in glob.glob(str(cwd / token))
+                            )
+                            for cwd in possible_cwds
+                        ):
+                            continue
                     return PermissionContext(
                         permission=ToolPermission.NEVER,
                         reason="Shell path glob cannot be safely inspected",
@@ -995,6 +1137,38 @@ class Bash(
                     )
         return None
 
+    def _redirect_metadata_permission(
+        self, redirect_paths: list[str], expanded: list[_GuardrailPart]
+    ) -> PermissionContext | None:
+        if not redirect_paths:
+            return None
+        redirect_cwds = {self.cwd}
+        metadata: set[Path] = set()
+        # Include the shell's repository even for a redirect-only command or
+        # when the first command changes directories.
+        parts = [_GuardrailPart(""), *expanded]
+        for _, tokens, possible_cwds, _ in _scoped_guardrail_cwds(parts, self.cwd):
+            redirect_cwds.update(possible_cwds)
+            for cwd in possible_cwds:
+                directories = git_metadata_paths(tokens, cwd=cwd)
+                if directories is None:
+                    return PermissionContext(
+                        permission=ToolPermission.NEVER,
+                        reason="Command denied: protected Git metadata cannot be located",
+                    )
+                metadata.update(directories)
+        for path in redirect_paths:
+            if ".git" in Path(path).parts or any(
+                ".git" in (resolved := resolve_tool_path(path, cwd)).parts
+                or any(resolved.is_relative_to(directory) for directory in metadata)
+                for cwd in redirect_cwds
+            ):
+                return PermissionContext(
+                    permission=ToolPermission.NEVER,
+                    reason="Command denied: redirection to protected Git metadata",
+                )
+        return None
+
     def resolve_permission(self, args: BashArgs) -> PermissionContext | None:  # noqa: PLR0911
         precondition = self._resolve_preconditions()
         if precondition is not None:
@@ -1008,7 +1182,7 @@ class Bash(
                 permission=ToolPermission.NEVER,
                 reason="Command denied: shell analysis budget exceeded (bytes)",
             )
-        analysis = analyze_shell_command(args.command)
+        analysis = _analyze_guardrail_source(args.command)
         command_parts = list(analysis.command_parts)
         try:
             expanded, inner_redirects, inner_errors = _expand_guardrail_parts(
@@ -1033,7 +1207,7 @@ class Bash(
         if inner_errors:
             return PermissionContext(
                 permission=ToolPermission.NEVER,
-                reason=f"Command denied: nested shell syntax requiring approval: {', '.join(sorted(set(inner_errors)))}",
+                reason=f"Command denied: nested shell syntax cannot be safely inspected: {', '.join(sorted(set(inner_errors)))}",
             )
 
         if any(
@@ -1047,8 +1221,16 @@ class Bash(
             )
 
         redirect_paths = _extract_redirect_paths(args.command) + inner_redirects
+        # Redirection destinations are file operands, not a blanket veto on
+        # unrelated Git readers in the same pipeline or command list.
+        if metadata_permission := self._redirect_metadata_permission(
+            redirect_paths, expanded
+        ):
+            return metadata_permission
         path_parts = expanded + [
-            _GuardrailPart(f"cat {shlex.quote(path)}") for path in redirect_paths
+            _GuardrailPart(f"cat {shlex.quote(path)}")
+            for path in redirect_paths
+            if path not in _REDIRECTION_DEVICES
         ]
         path_permission = self._resolve_path_permission(path_parts)
         if path_permission is not None:

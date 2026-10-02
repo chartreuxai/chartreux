@@ -119,12 +119,12 @@ class BaseToolConfig(BaseModel):
         permission: The permission level required to use the tool.
         allowlist: Patterns that automatically allow tool execution.
         denylist: Patterns that automatically deny tool execution.
-        sensitive_patterns: Patterns that trigger ASK even when permission is ALWAYS.
+        sensitive_patterns: Patterns that deny execution even when permission is ALWAYS.
     """
 
     model_config = ConfigDict(extra="allow")
 
-    permission: ToolPermission = ToolPermission.ASK
+    permission: ToolPermission = ToolPermission.ALWAYS
     allowlist: list[str] = Field(default_factory=list)
     denylist: list[str] = Field(default_factory=list)
     sensitive_patterns: list[str] = Field(default_factory=list)
@@ -465,11 +465,10 @@ class BaseTool[
         """Per-invocation permission, subordinate to config-level NEVER.
 
         The agent loop checks tool-level NEVER first. Invocation NEVER also wins
-        over bypass and remembered granular grants; other results may override
-        config-level ASK/ALWAYS.
+        over config-level ALWAYS.
 
         Returns:
-            PermissionContext with a permission level (ALWAYS/NEVER/ASK), or
+            PermissionContext with a permission level (ALWAYS/NEVER), or
             None to fall through to config permission.
 
         Override in subclasses for domain-specific rules (e.g. workdir checks).

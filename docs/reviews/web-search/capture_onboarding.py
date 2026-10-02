@@ -28,8 +28,8 @@ from capture_web_search import (
 from textual.pilot import Pilot
 from textual.widgets import Button, Input, OptionList
 
-from chartreux.cli.textual_ui.screens.web_search import WebSearchExit, WebSearchScreen
-from chartreux.cli.textual_ui.settings_service import SettingsSaveOutcome
+from chartreux.ui.settings_service import SettingsSaveOutcome
+from chartreux.ui.web_search import WebSearchExit, WebSearchScreen
 from tests.cli.textual_ui.web_search_fixture import (
     FakeCredentials,
     FakeSettingsService,

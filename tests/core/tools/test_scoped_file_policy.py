@@ -22,7 +22,7 @@ from tests.stubs.fake_backend import FakeBackend
 
 
 @pytest.mark.parametrize("tool_class", [ReadFile, WriteFile, Edit, Grep])
-@pytest.mark.parametrize("configured", [ToolPermission.ASK, ToolPermission.ALWAYS])
+@pytest.mark.parametrize("configured", [ToolPermission.ALWAYS])
 @pytest.mark.parametrize(
     ("target", "denied", "sensitive", "expected"),
     [

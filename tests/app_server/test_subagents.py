@@ -211,6 +211,139 @@ async def _background_result(
     return cast(TaskResult, [result async for result in registry.run(args, ctx)][-1])
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish", ["completion", "release"])
+async def test_running_subagent_cap_excludes_idle_and_frees_capacity(
+    monkeypatch: pytest.MonkeyPatch, finish: str
+) -> None:
+    backends = [BlockingBackend()]
+
+    def create_backend(**_kwargs):
+        return backends[-1]
+
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", create_backend
+    )
+    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    registry = SessionRuntimeRegistry(
+        AsyncMock(), AsyncMock(), lambda _: 0, max_running_subagents=1
+    )
+    registry.bind_root(registry._build_child_runtime(parent))
+    ctx = InvokeContext(tool_call_id="cap", session_id=parent.session_id)
+    args = TaskArgs(task="work", agent="worker", background=True)
+    try:
+        first = await _background_result(registry, args, ctx)
+        assert first.agent_id is not None and first.run_id is not None
+        await asyncio.wait_for(backends[0].started.wait(), timeout=5)
+        for background in (True, False):
+            with pytest.raises(
+                RuntimeError,
+                match=r"Subagent launch rejected: 1 agents already running \(cap 1\); "
+                "wait for completion or release agents",
+            ):
+                await asyncio.wait_for(
+                    _background_result(
+                        registry,
+                        args.model_copy(update={"background": background}),
+                        ctx,
+                    ),
+                    timeout=1,
+                )
+        assert len(backends) == 1  # Rejection happens before allocating a child.
+
+        backends[0].release.set()
+        await registry.wait_for_agent(first.agent_id, first.run_id)
+        assert registry._agent_records[first.agent_id].state is _AgentState.IDLE
+        backends.append(BlockingBackend())
+        second = await _background_result(registry, args, ctx)
+        assert second.agent_id is not None and second.run_id is not None
+        await asyncio.wait_for(backends[1].started.wait(), timeout=5)
+        # An idle retained agent cannot bypass the active-work cap by being reused.
+        with pytest.raises(RuntimeError, match="cap 1"):
+            await _background_result(
+                registry, args.model_copy(update={"agent_id": first.agent_id}), ctx
+            )
+        if finish == "release":
+            await registry.release_agent(second.agent_id)
+        else:
+            backends[1].release.set()
+            await registry.wait_for_agent(second.agent_id, second.run_id)
+        third = await _background_result(
+            registry, args.model_copy(update={"agent_id": first.agent_id}), ctx
+        )
+        assert third.agent_id == first.agent_id
+    finally:
+        for backend in backends:
+            backend.release.set()
+        await registry.close()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_foreground_subagent_consumes_cap_until_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = BlockingBackend()
+    registry, parent = await _foreground_registry(monkeypatch, backend)
+    registry._max_running_subagents = 1
+    launch = asyncio.create_task(_foreground_result(registry, parent, "foreground"))
+    try:
+        await asyncio.wait_for(backend.started.wait(), timeout=5)
+        with pytest.raises(RuntimeError, match="cap 1"):
+            await _background_result(
+                registry,
+                TaskArgs(task="more", agent="worker", background=True),
+                InvokeContext(tool_call_id="more", session_id=parent.session_id),
+            )
+        backend.release.set()
+        assert (await launch).completed
+        assert (await _foreground_result(registry, parent, "next")).completed
+        assert not registry._active_work_slots
+    finally:
+        backend.release.set()
+        await asyncio.gather(launch, return_exceptions=True)
+        await registry.close()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_cap_reserves_pending_creation_and_rolls_back_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    registry = SessionRuntimeRegistry(
+        AsyncMock(), AsyncMock(), lambda _: 0, max_running_subagents=1
+    )
+    registry.bind_root(registry._build_child_runtime(parent))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fail_creation(*_args):
+        entered.set()
+        await release.wait()
+        raise RuntimeError("creation failed")
+
+    monkeypatch.setattr(registry._runtime_factory, "create_child", fail_creation)
+    args = TaskArgs(task="work", agent="worker", background=True)
+    ctx = InvokeContext(tool_call_id="cap", session_id=parent.session_id)
+    launch = asyncio.create_task(_background_result(registry, args, ctx))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        with pytest.raises(RuntimeError, match="cap 1"):
+            await asyncio.wait_for(_background_result(registry, args, ctx), timeout=1)
+        release.set()
+        with pytest.raises(RuntimeError, match="creation failed"):
+            await launch
+        with pytest.raises(RuntimeError, match="creation failed"):
+            await _background_result(registry, args, ctx)
+        assert not registry._active_work_slots
+    finally:
+        release.set()
+        await asyncio.gather(launch, return_exceptions=True)
+        await registry.close()
+        await parent.aclose()
+
+
 def _todo_call(call_id: str) -> ToolCall:
     return ToolCall(
         id=call_id,
@@ -577,7 +710,7 @@ async def test_child_callbacks_round_trip_using_child_session_id(
         enabled_tools=["task", "todo", "ask_user_question"],
         tools={
             "task": {"permission": ToolPermission.ALWAYS.value},
-            "todo": {"permission": ToolPermission.ASK.value},
+            "todo": {"permission": ToolPermission.ALWAYS.value},
         },
     )
     parent = build_test_agent_loop(
@@ -913,6 +1046,7 @@ async def test_background_agent_management_survives_wait_timeout(monkeypatch) ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(60)
 async def test_background_completion_during_parent_final_save_is_delivered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -949,19 +1083,21 @@ async def test_background_completion_during_parent_final_save_is_delivered(
     session = await attach_test_app_server_session(client)
 
     try:
+        # The gates enforce completion during final save, not a latency bound.
         action = asyncio.create_task(_consume(session.act("Delegate this")))
-        await asyncio.wait_for(child_backend.started.wait(), timeout=1)
-        await asyncio.wait_for(finalizing.wait(), timeout=1)
+        await asyncio.wait_for(child_backend.started.wait(), timeout=30)
+        await asyncio.wait_for(finalizing.wait(), timeout=30)
         registry = legacy_backend(server).children
         summary = (await registry.check_agents())[0]
         assert summary.current_run_id is not None
 
         child_backend.release.set()
         await asyncio.wait_for(
-            registry.wait_for_agent(summary.agent_id, summary.current_run_id), timeout=1
+            registry.wait_for_agent(summary.agent_id, summary.current_run_id),
+            timeout=30,
         )
         release_finalizer.set()
-        await asyncio.wait_for(action, timeout=1)
+        await asyncio.wait_for(action, timeout=30)
 
         assert len(parent_backend.requests_messages) == 3
         assert any(
@@ -1221,6 +1357,7 @@ async def test_background_lifecycle_allows_parent_turns_and_reuse(monkeypatch) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(60)
 async def test_background_progress_overflow_completes_without_a_consumer(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1270,8 +1407,10 @@ async def test_background_progress_overflow_completes_without_a_consumer(
         record = registry._agent_records["agent-1"]
         run_id = record.current_run.run_id if record.current_run is not None else None
         assert run_id is not None
+        # Overflow must not block completion without a consumer; this is not
+        # a speed assertion, so allow for durable writes under parallel load.
         result = await asyncio.wait_for(
-            registry.wait_for_agent("agent-1", run_id), timeout=2
+            registry.wait_for_agent("agent-1", run_id), timeout=30
         )
         assert result.completed
         assert result.response == "all progress complete"
@@ -4924,7 +5063,9 @@ async def test_retask_accumulation_round_trips_and_failed_patch_keeps_disk_state
                 background=True,
                 config=LaunchConfig(
                     tools={
-                        "read_file": LaunchToolOverride(permission=ToolPermission.ASK)
+                        "read_file": LaunchToolOverride(
+                            permission=ToolPermission.ALWAYS
+                        )
                     }
                 ),
             ),
@@ -4937,7 +5078,7 @@ async def test_retask_accumulation_round_trips_and_failed_patch_keeps_disk_state
         assert committed.overrides.tools is not None
         read_file = committed.overrides.tools["read_file"]
         assert read_file.allowlist == ["*.py"]
-        assert read_file.permission == "ask"
+        assert read_file.permission == "always"
 
         omitted = TaskArgs(
             task="no semantic patch", agent_id=record.agent_id, background=True

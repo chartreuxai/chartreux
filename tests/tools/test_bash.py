@@ -36,6 +36,70 @@ def bash(tmp_path, monkeypatch):
     return Bash(config_getter=lambda: config, state=BaseToolState())
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git --git-dir=metadata log > metadata/config",
+        "git --git-dir metadata --work-tree=. log > metadata/config",
+        "git -C sub --git-dir=../metadata log > metadata/config",
+        "git --git-dir=metadata log > shared/config",
+        "git --git-dir=metadata -C sub log > sub/metadata/config",
+        "cd sub; git --git-dir=../metadata log > ../metadata/config",
+        "sh -c 'git --git-dir=metadata log > metadata/config'",
+    ],
+)
+def test_redirection_protects_explicit_git_metadata(bash, tmp_path, command):
+    (tmp_path / "metadata").mkdir()
+    (tmp_path / "shared").mkdir()
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "metadata" / "commondir").write_text("../shared")
+    context = bash.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission == ToolPermission.NEVER
+    assert "protected Git metadata" in (context.reason or "")
+    context = bash.resolve_permission(
+        BashArgs(command="git --git-dir=metadata --work-tree=. diff > patch.txt")
+    )
+    assert context is not None and context.permission == ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize("layout", ["symlink", "gitfile", "worktree"])
+@pytest.mark.parametrize("target", ["metadata/config", "alias/config", ".git/config"])
+@pytest.mark.parametrize("command", ["git log", "echo text", ""])
+def test_redirection_protects_git_metadata_identity(
+    bash, tmp_path, layout, target, command
+):
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    (tmp_path / "alias").symlink_to(metadata, target_is_directory=True)
+    if layout == "symlink":
+        (tmp_path / ".git").symlink_to(metadata, target_is_directory=True)
+    elif layout == "gitfile":
+        (tmp_path / ".git").write_text("gitdir: metadata")
+    else:
+        worktree = tmp_path / "worktree-data"
+        worktree.mkdir()
+        (worktree / "commondir").write_text("../metadata")
+        (tmp_path / ".git").write_text("gitdir: worktree-data")
+    context = bash.resolve_permission(BashArgs(command=f"{command} > {target}"))
+    assert context is not None and context.permission == ToolPermission.NEVER
+    assert "protected Git metadata" in (context.reason or "")
+    context = bash.resolve_permission(BashArgs(command="git diff > patch.txt"))
+    assert context is not None and context.permission == ToolPermission.ALWAYS
+
+
+def test_redirection_protects_work_tree_override_metadata(bash, tmp_path):
+    worktree = tmp_path / "other"
+    worktree.mkdir()
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    (worktree / ".git").symlink_to(metadata, target_is_directory=True)
+    context = bash.resolve_permission(
+        BashArgs(command="git --work-tree=other log > metadata/config")
+    )
+    assert context is not None and context.permission == ToolPermission.NEVER
+    assert "protected Git metadata" in (context.reason or "")
+
+
 def _hide_standard_git_installs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ProgramFiles", raising=False)
     monkeypatch.delenv("ProgramFiles(x86)", raising=False)
@@ -240,7 +304,7 @@ def test_legacy_bash_quoted_outside_path_is_denied(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     outside = tmp_path.parent / "outside.txt"
     bash_tool = Bash(
-        config_getter=lambda: BashToolConfig(permission=ToolPermission.ASK),
+        config_getter=lambda: BashToolConfig(permission=ToolPermission.ALWAYS),
         state=BaseToolState(),
     )
 
@@ -482,10 +546,10 @@ def test_bash_redirected_commands_are_denied_for_syntax(command):
     result = bash_tool.resolve_permission(BashArgs(command=command))
     assert isinstance(result, PermissionContext)
     assert result.permission is ToolPermission.NEVER
-    assert "shell syntax requiring approval" in (result.reason or "")
+    assert "unsupported shell syntax" in (result.reason or "")
 
 
-@pytest.mark.parametrize("permission", [ToolPermission.ASK, ToolPermission.ALWAYS])
+@pytest.mark.parametrize("permission", [ToolPermission.ALWAYS])
 @pytest.mark.parametrize(
     ("command", "expected"),
     [
@@ -668,7 +732,7 @@ def test_sort_files0_from_requires_approval(command, tmp_path):
     assert result is not None
     assert result.permission is ToolPermission.NEVER
     assert (result.reason or "").startswith(
-        "Command denied: side-effecting options are not permitted:"
+        "Command denied: unsafe or unmodeled command options are not permitted:"
     )
 
 
@@ -734,7 +798,7 @@ def test_side_effecting_options_are_denied(command):
         )
     else:
         assert (result.reason or "").startswith(
-            "Command denied: side-effecting options are not permitted:"
+            "Command denied: unsafe or unmodeled command options are not permitted:"
         )
 
 
@@ -1129,11 +1193,14 @@ def test_command_wrapper_preserves_find_argument_boundaries():
         "env VAR=value command",
     ],
 )
-def test_env_wrappers_are_denied_without_unwrapping(command):
+def test_unmodeled_env_wrappers_are_denied(command):
     tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
     result = tool.resolve_permission(BashArgs(command=command))
     assert result is not None and result.permission is ToolPermission.NEVER
-    assert result.reason == "Command denied: env wrapper cannot be safely inspected"
+    assert result.reason and (
+        "unsupported env wrapper form" in result.reason
+        or "assignment-only statements" in result.reason
+    )
 
 
 @pytest.mark.parametrize("command", ["echo \0", "echo \ud800"])
@@ -1354,7 +1421,7 @@ def _w11_permission(command: str, tmp_path: Path) -> PermissionContext:
         ),
         ("bash -c \"sh -c 'curl http://attacker/'\"", "curl"),
         ('/usr/bin/dash -c "curl http://attacker/"', "curl"),
-        ('zsh -c "sort -o out input"', "side-effecting"),
+        ('zsh -c "sort -o out input"', "unsafe or unmodeled"),
         ('bash -ec "curl http://attacker/"', "curl"),
         ("bash --noprofile -i -c true", "bash -i"),
         ('bash -c "cat ~/.chartreux/.env"', "Sensitive file"),

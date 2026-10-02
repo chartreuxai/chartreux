@@ -95,6 +95,165 @@ def test_legacy_token_only_stats_are_cost_incomplete() -> None:
     assert stats.session_cost is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rewrite", [False, True])
+async def test_stale_save_is_fenced_before_transcript_and_metadata(
+    session_config: SessionLoggingConfig,
+    mock_vibe_config: ChartreuxConfigSchema,
+    mock_tool_manager: ToolManager,
+    rewrite: bool,
+) -> None:
+    logger = SessionLogger(session_config, "generation-fence")
+    first = LLMMessage(role=Role.user, content="first")
+    second = LLMMessage(role=Role.assistant, content="second")
+
+    async def save(messages: list[LLMMessage]) -> None:
+        await logger.save_interaction(
+            messages, AgentStats(), mock_vibe_config, mock_tool_manager, None
+        )
+
+    await save([first, second])
+    await logger._save_lock.acquire()
+    stale_messages = (
+        [LLMMessage(role=Role.user, content="edited")]
+        if rewrite
+        else [first, second, first]
+    )
+    stale = asyncio.create_task(save(stale_messages))
+    await asyncio.sleep(0)  # snapshot captured; queued behind rewind's lock
+    try:
+        logger.invalidate_transcript_cursor()
+        assert logger.session_metadata is not None
+        assert logger.session_dir is not None
+        # Commit the rewind while holding the same serialization lock.
+        await asyncio.to_thread(
+            logger._save_full_verify,
+            [first],
+            AgentStats(),
+            mock_tool_manager,
+            None,
+            logger.session_dir,
+            logger.session_metadata,
+            False,
+        )
+        transcript = logger.messages_filepath.read_bytes()
+        metadata = logger.metadata_filepath.read_bytes()
+    finally:
+        logger._save_lock.release()
+    await stale
+    assert logger.messages_filepath.read_bytes() == transcript
+    assert logger.metadata_filepath.read_bytes() == metadata
+    assert [json.loads(line)["content"] for line in transcript.splitlines()] == [
+        "first"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage", ["write", "flush", "file_fsync", "replace", "directory_fsync"]
+)
+async def test_default_disk_full_is_soft(
+    session_config: SessionLoggingConfig,
+    mock_vibe_config: ChartreuxConfigSchema,
+    mock_tool_manager: ToolManager,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    import errno
+    import stat
+    import tempfile
+
+    logger = SessionLogger(session_config, "disk-full")
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise OSError(errno.ENOSPC, "injected full disk")
+
+    if stage in {"write", "flush"}:
+        original_temp = tempfile.NamedTemporaryFile
+
+        def failing_temp(**kwargs: Any) -> Any:
+            stream = original_temp(**kwargs)
+            proxy = MagicMock(wraps=stream)
+            proxy.name = stream.name
+            proxy.__enter__.return_value = proxy
+            proxy.__exit__.side_effect = stream.__exit__
+            getattr(proxy, stage).side_effect = fail
+            return proxy
+
+        monkeypatch.setattr(tempfile, "NamedTemporaryFile", failing_temp)
+    elif stage == "replace":
+        monkeypatch.setattr(os, "replace", fail)
+    else:
+        original_fsync = os.fsync
+
+        def fsync(fd: int) -> None:
+            is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+            if is_dir == (stage == "directory_fsync"):
+                fail()
+            original_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+    save = logger.save_interaction(
+        [LLMMessage(role=Role.user, content="test")],
+        AgentStats(),
+        mock_vibe_config,
+        mock_tool_manager,
+        None,
+    )
+    await save
+    assert not logger.persisted
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_drains_worker_under_save_lock(
+    session_config: SessionLoggingConfig,
+    mock_vibe_config: ChartreuxConfigSchema,
+    mock_tool_manager: ToolManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = SessionLogger(session_config, "cancel-drain")
+    started, release = Event(), Event()
+    method = "_save_interaction_sync"
+    original = getattr(logger, method)
+    calls = 0
+
+    def gated(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            assert release.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(logger, method, gated)
+
+    async def save() -> None:
+        await logger.save_interaction(
+            [LLMMessage(role=Role.user, content="test")],
+            AgentStats(),
+            mock_vibe_config,
+            mock_tool_manager,
+            None,
+        )
+
+    first = asyncio.create_task(save())
+    assert await asyncio.to_thread(started.wait, 5)
+    second = asyncio.create_task(save())
+    try:
+        for _ in range(3):
+            first.cancel()
+            await asyncio.sleep(0)
+            assert logger._save_lock.locked()
+            assert calls == 1
+        assert not second.done()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await second
+    assert calls == 2
+
+
 class TestSessionLoggerInitialization:
     def test_enabled_session_logger_initialization(
         self, session_config: SessionLoggingConfig

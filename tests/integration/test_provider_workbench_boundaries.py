@@ -17,9 +17,7 @@ from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.layers.user import UserConfigLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.llm_models import LLMMessage, Role
-from chartreux.core.model_catalog.loader import CatalogStore, load_catalog
-from chartreux.core.model_catalog.presets import FULLY_CUSTOM
-from chartreux.ui.providers.contracts import (
+from chartreux.core.model_catalog.contracts import (
     CatalogChanges,
     CatalogValidationError,
     ConfigPersistResult,
@@ -31,6 +29,8 @@ from chartreux.ui.providers.contracts import (
     ProviderWorkbenchResult,
     TLSConfig,
 )
+from chartreux.core.model_catalog.loader import CatalogStore, load_catalog
+from chartreux.core.model_catalog.presets import FULLY_CUSTOM
 from chartreux.ui.providers.workbench import (
     ProviderWorkbenchScreen,
     WorkbenchList,

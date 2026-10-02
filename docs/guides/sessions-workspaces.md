@@ -29,6 +29,49 @@ validates and restores that identity rather than resolving a role again.
 creates a separate resumable copy. See the [command reference](../reference/commands.md)
 for the complete command surface.
 
+## Checkpoints and rewind
+
+Use `/rewind`, or press Escape twice with an empty input, to return to an earlier
+user message. Choose whether to restore files, then whether to keep the rewind
+in the current session or fork to a new one. The selected message and all later
+messages are removed from the active conversation; the selected prompt returns
+to the input for editing. A fork preserves the original conversation as its
+parent. An in-place rewind saves the shortened conversation under the same
+session ID, without creating a parent copy.
+
+Conversation and file restoration are separate choices. Editing without
+restoring files leaves disk contents unchanged. Restoring files applies the
+checkpoint states for the selected turn, including removing a captured file
+that did not exist at that point. A preserved parent conversation is not a
+separate copy of the workspace: both sessions still refer to the same files.
+
+### What is captured
+
+Checkpoints record file bytes or absence for paths supplied by snapshot-aware
+file tools. Known paths are re-read at turn boundaries, so later changes to
+those paths can be captured even when the tool making them supplies no snapshot.
+This is not a scan or backup of the whole workspace. A shell command, hook,
+external editor, or child agent can change an untracked path without giving
+rewind a file state to restore. File snapshots are memory-only and are cleared
+when switching or clearing sessions. After resume, new rewinds can restore only
+edits checkpointed in the current process, not files from the saved transcript.
+
+### File restoration and limits
+
+Rewind saves or forks the conversation first, then restores checkpointed files
+individually. Transcript generation fencing prevents a stale queued save from
+overwriting the retained conversation after rewind, reset, or session rebind.
+It does not make file restoration and transcript saving one atomic operation.
+
+Restoration writes are staged beside each target before single-file replacement,
+so a failed staging write does not truncate the target. Existing file permissions
+are preserved. Read, write, and deletion failures are contained per path and
+reported; other paths can still be restored. A failure can therefore leave a
+partially restored workspace while the conversation has already been shortened.
+There is no transaction-wide byte limit, compensation, or interrupted-transaction
+recovery. Stop other writers before restoring files; rewind is not a workspace
+backup and does not coordinate with external editors or processes.
+
 ## Compaction
 
 `/compact` summarizes older history to reduce the context sent in later model

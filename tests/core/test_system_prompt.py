@@ -119,3 +119,41 @@ def test_fetch_git_context_does_not_inspect_worktree_status(
     assert "Main branch (you will usually use this for PRs): master" in context
     assert "abc123 message" in context
     assert "Status:" not in context
+
+
+@pytest.mark.parametrize("filter_kind", ["clean", "process"])
+def test_automatic_context_never_executes_repository_filters(
+    tmp_path: Path, filter_kind: str
+) -> None:
+    repo = tmp_path / "project"
+    repo.mkdir()
+
+    def git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=check, capture_output=True, text=True
+        )
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    (repo / ".gitattributes").write_text("fixture.txt filter=wp2\n")
+    target = repo / "fixture.txt"
+    target.write_text("original\n")
+    git("add", ".")
+    git("commit", "-q", "-m", "fixture")
+    marker = tmp_path / "filter-executed"
+    git(
+        "config",
+        f"filter.wp2.{filter_kind}",
+        f"touch {marker}; cat" if filter_kind == "clean" else f"touch {marker}; exit 1",
+    )
+    target.write_text("modified\n")
+    provider = ProjectContextProvider(ProjectContextConfig(), root_path=repo)
+    context = provider.get_full_context()
+    assert "Current branch:" in context
+    assert "fixture" in context
+    assert not marker.exists()
+    # Positive control: the same dirty worktree really triggers the configured
+    # filter through status; the process fixture deliberately aborts its protocol.
+    git("status", "--porcelain", check=False)
+    assert marker.exists()

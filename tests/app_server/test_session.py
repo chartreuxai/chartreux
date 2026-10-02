@@ -140,6 +140,11 @@ from tests.stubs.app_server import (
 from tests.stubs.fake_backend import FakeBackend, FakeInterruptedStreamingBackend
 
 
+@pytest.fixture(autouse=True)
+def _isolate_recovery_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+
 def _wire_resume_request(session_id: str) -> dict:
     return SessionResumeParams(session_id=session_id).model_dump(
         mode="json", by_alias=True
@@ -1682,7 +1687,7 @@ async def test_cancellation_during_reload_preserves_old_session(
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def blocked_reload() -> None:
+    async def blocked_reload(**_kwargs: object) -> None:
         entered.set()
         await release.wait()
 

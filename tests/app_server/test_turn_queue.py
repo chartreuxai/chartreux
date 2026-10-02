@@ -172,6 +172,35 @@ def test_replace_preserves_queue_identity_position_and_idempotency_receipts() ->
     assert replayed_edit.record is replaced.record
 
 
+@pytest.mark.parametrize("replacement_key", [None, "replacement"])
+@pytest.mark.parametrize("retirement", [None, "promotion", "removal"])
+def test_live_replacement_retains_only_current_idempotency(
+    replacement_key: str | None, retirement: str | None
+) -> None:
+    live_ids = iter(("queue-original", "queue-new-original", "queue-new-intermediate"))
+    live = TurnQueue(item_id_factory=lambda: next(live_ids), clock_ms=lambda: 10)
+    live.enqueue(_params("original"))
+    live.replace("queue-original", _params("intermediate", "first edit"))
+    replacement = _params("replacement", "second edit").model_copy(
+        update={"idempotency_key": replacement_key}
+    )
+    live.replace("queue-original", replacement)
+    if retirement == "promotion":
+        live.pop_next()
+    elif retirement == "removal":
+        live.remove("queue-original")
+
+    if replacement_key is not None:
+        replay = live.enqueue(replacement)
+        assert replay.duplicate
+        assert replay.record.queued_turn.id == "queue-original"
+
+    for key in ("original", "intermediate"):
+        assert not live.enqueue(_params(key)).duplicate
+        with pytest.raises(TurnQueueIdempotencyConflictError):
+            live.enqueue(_params(key, "different input"))
+
+
 def test_replace_replay_rejects_a_queue_item_that_already_started() -> None:
     """*Prepare*: A queued turn is edited once, then promoted out of the queue.
     *Do*: Replay the accepted edit with the same idempotency key.

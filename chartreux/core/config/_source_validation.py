@@ -101,10 +101,18 @@ def _sanitized_validation_error(
     for error in exc.errors(include_input=False, include_context=False):
         kind = str(error["type"]).rsplit(".", 1)[-1]
         errors.append({
-            "type": PydanticCustomError(
-                "source_validation",
-                "Invalid environment configuration field ({kind})",
-                {"kind": kind},
+            "type": (
+                PydanticCustomError(
+                    "removed_tool_permission",
+                    "Tool permission 'ask' was removed; use 'always' for automatic "
+                    "execution or 'never' to disable the tool. No approval prompt exists.",
+                )
+                if kind == "removed_tool_permission"
+                else PydanticCustomError(
+                    "source_validation",
+                    "Invalid environment configuration field ({kind})",
+                    {"kind": kind},
+                )
             ),
             "loc": (source, *error["loc"]),
             "input": None,
@@ -222,6 +230,18 @@ def validate_source(
                     and meta is not None
                     and meta.merge_strategy == MergeStrategy.DEEP_MERGE
                 ):
+                    continue
+                if error["type"] == "removed_tool_permission":
+                    errors.append({
+                        "type": PydanticCustomError(
+                            "removed_tool_permission",
+                            "Tool permission 'ask' was removed; use 'always' for "
+                            "automatic execution or 'never' to disable the tool. "
+                            "No approval prompt exists.",
+                        ),
+                        "loc": (source, key, *error["loc"]),
+                        "input": None,
+                    })
                     continue
                 if (
                     key == "mcp_servers"

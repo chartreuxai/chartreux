@@ -10,9 +10,9 @@ from chartreux.cli.textual_ui.widgets.banner.banner import (
     BannerState,
     _pluralize,
 )
-from chartreux.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.cli.textual_ui.widgets.spinner import BrailleSpinner
 from chartreux.cli.textual_ui.widgets.spinner_text import SpinnerText
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from tests.stubs.app_config import build_test_app_config
 
 

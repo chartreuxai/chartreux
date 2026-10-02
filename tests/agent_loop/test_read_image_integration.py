@@ -191,6 +191,9 @@ class _ReplacementHooks:
     def reset_retry_count(self) -> None:
         pass
 
+    def _matching_hooks(self, handler: object, invocation: object) -> list[object]:
+        return [self]
+
     async def run(self, _invocation):
         yield HookTextReplacement(text="replaced")
 

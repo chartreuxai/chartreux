@@ -329,6 +329,56 @@ def _hook(repo: Repo, marker: Path, name: str) -> None:
     hook.chmod(0o755)
 
 
+@pytest.mark.parametrize("reader", ["cat-file", "persistent-odb"])
+def test_promisor_object_reads_never_launch_lazy_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str
+) -> None:
+    from git.exc import GitCommandError
+
+    from chartreux.core.git.repo import GitRepo
+
+    root = tmp_path / "repo"
+    repo = _init_repo(root)
+    commit = repo.head.commit.hexsha
+    blob = repo.head.commit.tree["file.txt"].hexsha
+    repo.close()
+    object_path = root / ".git" / "objects" / blob[:2] / blob[2:]
+    object_path.unlink()
+    marker = tmp_path / "lazy-fetch-ran"
+    payload = _executable(root / "payload", f'echo ran >> "{marker}"; exit 1')
+    repo = Repo(root)
+    repo.config_writer().set_value("extensions", "partialClone", "origin").set_value(
+        'remote "origin"', "promisor", True
+    ).set_value('remote "origin"', "url", str(tmp_path / "missing")).set_value(
+        'remote "origin"', "uploadpack", str(payload)
+    ).release()
+    # This security guarantee requires Git >= 2.45: older versions silently
+    # ignore GIT_NO_LAZY_FETCH (see core/git/policy.py's minimum-version warning).
+    # Prove the fixture really triggers Git's implicit transport without binding.
+    with pytest.raises(GitCommandError):
+        repo.git.cat_file(
+            "-p", blob, env={"GIT_NO_LAZY_FETCH": "0", "GIT_NO_REPAIR": "0"}
+        )
+    assert marker.exists()
+    marker.unlink()
+    repo.close()
+    monkeypatch.setenv("GIT_NO_LAZY_FETCH", "0")
+    monkeypatch.setenv("GIT_NO_REPAIR", "0")
+
+    with GitRepo.open(root) as bound:
+        # Present objects and ordinary status reads remain usable.
+        assert bound.head_commit() == commit
+        assert bound.status().root == root
+        bound._repo.git.update_environment(GIT_NO_LAZY_FETCH="0", GIT_NO_REPAIR="0")
+        if reader == "cat-file":
+            with pytest.raises(GitCommandError):
+                bound._repo.git.cat_file("-p", blob, env={"GIT_NO_LAZY_FETCH": "0"})
+        else:
+            with pytest.raises(ValueError):
+                bound._repo.odb.info(bytes.fromhex(blob))
+        assert not marker.exists()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="marker hooks use POSIX shell")
 def test_successive_worktree_snapshot_and_removal_commands_stay_sanitized(
     tmp_path: Path,

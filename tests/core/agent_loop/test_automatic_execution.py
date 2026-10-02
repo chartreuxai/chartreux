@@ -85,7 +85,7 @@ async def test_actual_file_shell_and_fake_mcp_continue_after_denial_without_appr
     )
     loop = build_test_agent_loop(
         config=build_test_vibe_config(
-            tools={name: {"permission": "ask"} for name, _ in calls},
+            tools={name: {"permission": "always"} for name, _ in calls},
             mcp_servers=[
                 MCPHttp(
                     name="fixture",

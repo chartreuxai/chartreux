@@ -171,7 +171,7 @@ class TestMerge:
 class TestDeepMerge:
     def test_dicts_merged_recursively(self) -> None:
         base = {
-            "bash": {"permission": "ask", "metadata": {"timeout": 30, "retries": 1}},
+            "bash": {"permission": "always", "metadata": {"timeout": 30, "retries": 1}},
             "read_file": {"permission": "always"},
         }
         override = {
@@ -182,7 +182,7 @@ class TestDeepMerge:
 
         assert result == {
             "bash": {
-                "permission": "ask",
+                "permission": "always",
                 "command_patterns": ["git status"],
                 "metadata": {"timeout": 60, "retries": 1},
             },
@@ -190,13 +190,13 @@ class TestDeepMerge:
         }
 
     def test_lists_are_replaced(self) -> None:
-        base = {"bash": {"command_patterns": ["git status"], "permission": "ask"}}
+        base = {"bash": {"command_patterns": ["git status"], "permission": "always"}}
         override = {"bash": {"command_patterns": ["git diff"]}}
 
         result = MergeStrategy.DEEP_MERGE.apply(base, override)
 
         assert result == {
-            "bash": {"command_patterns": ["git diff"], "permission": "ask"}
+            "bash": {"command_patterns": ["git diff"], "permission": "always"}
         }
 
     def test_base_none_returns_override(self) -> None:

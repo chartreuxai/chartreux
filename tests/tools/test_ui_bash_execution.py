@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import time
 
 from pydantic import JsonValue
@@ -88,6 +89,28 @@ def assert_no_command_error(chartreux_app: ChartreuxApp) -> None:
         and any(phrase in getattr(err, "_error", "") for phrase in disallowed)
     ]
     assert not offending, f"Unexpected command errors: {offending}"
+
+
+@pytest.mark.asyncio
+async def test_wp2_ui_manual_shell_writes_outside_workspace(tmp_path: Path) -> None:
+    """GAP-2 also reaches the manual executor through the CLI bang input."""
+    project = tmp_path / "project"
+    project.mkdir()
+    target = tmp_path / "outside.txt"
+    target.write_text("unchanged")
+    agent_loop = build_test_agent_loop(cwd=project)
+    chartreux_app = build_test_chartreux_app(agent_loop=agent_loop)
+    try:
+        async with chartreux_app.run_test() as pilot:
+            chat_input = chartreux_app.query_one(ChatInputContainer)
+            chat_input.value = f"!printf changed > {target}"
+            await pilot.press("enter")
+            message = await _wait_for_shell_result(chartreux_app, pilot)
+            assert message._entry is not None
+            assert isinstance(message._entry.state, CompletedEffectState)
+            assert target.read_text() == "changed"
+    finally:
+        await agent_loop.aclose()
 
 
 @pytest.mark.asyncio

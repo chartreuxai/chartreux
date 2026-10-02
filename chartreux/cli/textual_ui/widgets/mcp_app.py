@@ -15,11 +15,11 @@ from textual.worker import Worker
 
 from chartreux.app_server.models import MCPSourceStatus, MCPSourceSummary, MCPState
 from chartreux.cli.autocompletion.fuzzy import fuzzy_match
-from chartreux.cli.textual_ui.widgets.vscode_compat import VscodeCompatInput
 from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.shortcut_hints import rich_theme_style, shortcut, shortcut_hint
 from chartreux.ui.widgets.navigable_option_list import NavigableOptionList
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
+from chartreux.ui.widgets.vscode_compat import VscodeCompatInput
 
 _REFRESHING_LABEL = "Running: Refreshing servers"
 _LIST_VIEW_HELP_TOOLS = (

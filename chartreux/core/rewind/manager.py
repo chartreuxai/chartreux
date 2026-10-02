@@ -34,12 +34,15 @@ class RewindManager:
         save_messages: SaveMessages,
         reset_session: Callable[[], Awaitable[None]],
         files: FileStore | None = None,
+        *,
+        fence_transcript: Callable[[], None] = lambda: None,
     ) -> None:
         self._checkpointer = checkpointer
         self._messages = messages
         self._save_messages = save_messages
         self._reset_session = reset_session
         self._files = files or FileStore()
+        self._fence_transcript = fence_transcript
         self._is_rewinding = False
         self._messages.on_reset(self._on_messages_reset)
 
@@ -84,8 +87,10 @@ class RewindManager:
     ) -> tuple[str, list[str], list[str]]:
         """Rewind the session to the given user message index.
 
-        Optionally commits the conversation/session rewind, then restores files,
-        using one of two persistence strategies:
+        Commit the conversation/session rewind, then restore files.
+
+        File snapshots are memory-only. After resume, restoration covers only
+        edits checkpointed in this process, not the historical transcript.
 
         - ``inplace=False`` (default, fork): save the full history under the
           current session, truncate, then fork to a fresh session so the
@@ -99,6 +104,13 @@ class RewindManager:
         Raises:
             RewindError: If the message index is invalid or not a user message.
         """
+        return await self._rewind_legacy(
+            message_index, restore_files=restore_files, inplace=inplace
+        )
+
+    async def _rewind_legacy(
+        self, message_index: int, *, restore_files: bool, inplace: bool
+    ) -> tuple[str, list[str], list[str]]:
         messages: Sequence[LLMMessage] = self._messages
         if message_index < 0 or message_index >= len(messages):
             raise RewindError(f"Invalid message index: {message_index}")
@@ -148,6 +160,7 @@ class RewindManager:
         return message_content, restore_errors, restored_paths
 
     def _reset_messages(self, messages: Sequence[LLMMessage]) -> None:
+        self._fence_transcript()
         self._is_rewinding = True
         try:
             self._messages.reset(list(messages))

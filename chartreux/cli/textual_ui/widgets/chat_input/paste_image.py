@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from datetime import datetime
+from functools import partial
+import os
 from pathlib import Path
 import platform
 import shutil
@@ -12,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from humanize import naturalsize
 
-from chartreux.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
+from chartreux.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEMS
 from chartreux.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
 from chartreux.observability.logging import logger
 from chartreux.utils.images import MAX_IMAGE_BYTES
@@ -22,11 +24,12 @@ if TYPE_CHECKING:
 
 _READ_TIMEOUT_S = 5.0
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+_JPEG_MAGIC = b"\xff\xd8\xff"
 _MAX_SAME_SECOND_COLLISIONS = 1000
 
 
 def is_clipboard_image_paste_supported() -> bool:
-    return platform.system() == CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
+    return platform.system() in CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEMS
 
 
 def read_clipboard_image() -> bytes | None:
@@ -37,15 +40,44 @@ def read_clipboard_image() -> bytes | None:
             data = reader()
         except Exception:
             continue
-        if data and data.startswith(_PNG_MAGIC):
+        if data and data.startswith((_PNG_MAGIC, _JPEG_MAGIC)):
             return data
     return None
 
 
 def _readers_for_platform() -> list[Callable[[], bytes | None]]:
-    if platform.system() == CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM:
+    if platform.system() == "Darwin":
         return [_read_macos]
-    return []
+    readers: list[Callable[[], bytes | None]] = []
+    if platform.system() == "Linux":
+        if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-paste"):
+            readers.append(partial(_read_linux, ["wl-paste", "--no-newline", "--type"]))
+        if os.environ.get("DISPLAY") and shutil.which("xclip"):
+            readers.append(
+                partial(
+                    _read_linux, ["xclip", "-selection", "clipboard", "-o", "-target"]
+                )
+            )
+    return readers
+
+
+def _read_linux(command: list[str]) -> bytes | None:
+    for mime_type in ("image/png", "image/jpeg"):
+        try:
+            result = subprocess.run(
+                [*command, mime_type],
+                capture_output=True,
+                timeout=_READ_TIMEOUT_S,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0 and result.stdout.startswith((
+            _PNG_MAGIC,
+            _JPEG_MAGIC,
+        )):
+            return result.stdout
+    return None
 
 
 def _read_macos() -> bytes | None:
@@ -169,11 +201,12 @@ def write_clipboard_image(data: bytes) -> Path:
     target_dir = Path(tempfile.gettempdir()) / "vibe-pasted-images"
     target_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-    path = target_dir / f"clipboard-{timestamp}.png"
+    suffix = ".jpg" if data.startswith(_JPEG_MAGIC) else ".png"
+    path = target_dir / f"clipboard-{timestamp}{suffix}"
     # Same-second collision: append a short numeric suffix until free.
     if path.exists():
         for n in range(1, _MAX_SAME_SECOND_COLLISIONS):
-            candidate = target_dir / f"clipboard-{timestamp}-{n}.png"
+            candidate = target_dir / f"clipboard-{timestamp}-{n}{suffix}"
             if not candidate.exists():
                 path = candidate
                 break

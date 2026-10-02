@@ -1,4 +1,4 @@
-"""Actual factory inheritance; sensitive matching still has legacy ASK semantics."""
+"""Actual factory inheritance and child permission enforcement."""
 
 from __future__ import annotations
 

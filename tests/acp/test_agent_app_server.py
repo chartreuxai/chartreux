@@ -42,6 +42,8 @@ from chartreux.app_server.session import AppServerSession, AppServerTurnError
 from chartreux.core.config import SessionLoggingConfig
 from chartreux.core.llm_models import FunctionCall, ToolCall
 from chartreux.core.session_types import ScheduledLoop
+from chartreux.core.tools.base import ToolPermission
+from chartreux.core.tools.builtins.bash import BashToolConfig
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.app_server import start_test_app_server
@@ -478,6 +480,119 @@ async def test_conversation_limit_returns_max_turn_requests_stop_reason() -> Non
         assert response.stop_reason == "max_turn_requests"
     finally:
         await agent.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["bash", "read_file", "write_file", "bash_npm"])
+async def test_wp2_acp_outside_operand_denial_precedes_host_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    target = tmp_path / "outside.txt"
+    target.write_text("unchanged")
+    monkeypatch.chdir(project)
+    command = f"npm install {target}" if name == "bash_npm" else f"cat {target}"
+    if name == "bash_npm":
+        name = "bash"
+    args = (
+        {"command": command}
+        if name == "bash"
+        else {
+            "file_path": str(target),
+            **({"content": "changed"} if name == "write_file" else {}),
+        }
+    )
+    call = ToolCall(
+        id="outside",
+        index=0,
+        function=FunctionCall(name=name, arguments=json.dumps(args)),
+    )
+    loop = build_test_agent_loop(
+        cwd=project,
+        config=build_test_vibe_config(
+            tools={
+                name: {
+                    "permission": "always",
+                    **({"allowlist": ["*"]} if name != "bash" else {}),
+                }
+            }
+        ),
+        backend=FakeBackend([
+            [mock_llm_chunk(tool_calls=[call])],
+            [mock_llm_chunk(content="done")],
+        ]),
+        enable_streaming=True,
+    )
+    if name == "bash":
+        stale = BashToolConfig(permission=ToolPermission.ALWAYS).model_copy(
+            update={"allowlist": ["*", "npm *"]}
+        )
+        original = loop.tool_manager.get_tool_config
+        monkeypatch.setattr(
+            loop.tool_manager,
+            "get_tool_config",
+            lambda tool_name: stale if tool_name == "bash" else original(tool_name),
+        )
+
+    async def start_session(options: LocalHarnessOptions) -> AppServerSession:
+        return await AppServerSession.start(
+            start_test_app_server(loop),
+            client_info=options.client.info,
+            capabilities=options.client.capabilities,
+            session_options=options.session_options,
+            client_tool_handler=options.client_tool_handler,
+        )
+
+    agent = ChartreuxAcpAgent(session_starter=start_session)
+    client = FakeClient()
+    agent.on_connect(client)
+    client.on_connect(agent)
+    executors = [
+        AsyncMock(side_effect=AssertionError("Denied tool reached ACP host"))
+        for _ in range(3)
+    ]
+    if command.startswith("npm "):
+        executors[0].side_effect = None
+        executors[0].return_value = CreateTerminalResponse(terminal_id="wp2-terminal")
+        monkeypatch.setattr(
+            client,
+            "wait_for_terminal_exit",
+            AsyncMock(return_value=WaitForTerminalExitResponse(exit_code=0)),
+        )
+        monkeypatch.setattr(
+            client,
+            "terminal_output",
+            AsyncMock(
+                return_value=TerminalOutputResponse(output="fixture", truncated=False)
+            ),
+        )
+        monkeypatch.setattr(client, "release_terminal", AsyncMock())
+    for method, executor in zip(
+        ["create_terminal", "read_text_file", "write_text_file"], executors, strict=True
+    ):
+        monkeypatch.setattr(client, method, executor)
+    await agent.initialize(
+        protocol_version=PROTOCOL_VERSION,
+        client_capabilities=ClientCapabilities(
+            terminal=True,
+            fs=FileSystemCapabilities(read_text_file=True, write_text_file=True),
+        ),
+    )
+    try:
+        created = await agent.new_session(cwd=str(project), mcp_servers=[])
+        response = await agent.prompt(
+            session_id=created.session_id,
+            prompt=[TextContentBlock(type="text", text="exercise outside access")],
+        )
+        assert response.stop_reason == "end_turn"
+        assert loop.stats.tool_calls_rejected == 1
+        for executor in executors:
+            executor.assert_not_called()
+        assert target.read_text() == "unchanged"
+    finally:
+        await agent.close()
+        await loop.aclose()
 
 
 @pytest.mark.asyncio

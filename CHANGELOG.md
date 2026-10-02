@@ -2,6 +2,42 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.4.0 (unreleased)
+
+### Added
+
+- A fail-fast cap on active subagent work, defaulting to 16.
+- Linux clipboard image paste through `wl-paste` or `xclip`.
+- Checkpoint and rewind coverage documentation describing memory-only snapshots,
+  staged per-file restoration, and non-transactional failure handling.
+- Docs section indexes and strict link validation, and a strict docs build in
+  pre-commit.
+- CI runs on `development`.
+
+### Changed
+
+- Tool permissions now use only `always` and `never`; the vestigial `ask` mode
+  was removed. Configurations containing `"ask"` fail validation with guidance.
+- Model-catalog discovery contracts moved from UI to core, and CLI-to-UI
+  compatibility shims were retired.
+- Shell-command policy now checks npm, sed, dd and git operands, package URLs
+  and extras, git aliases, hooks and redirections, promisor fetches, and
+  repository-bound environment and trust boundaries more conservatively.
+
+### Fixed
+
+- Shell cancellation drains descendant processes by killing the process group.
+- Burst-completion freezes caused by a bounded app-server dispatch queue; the
+  queue is now unbounded.
+- Prompt-history persistence is serialized across processes, and per-session
+  thinking overrides restore without leaking into other sessions.
+- Checkpoint file-store failures are contained per path, with restoration
+  permissions preserved and writes staged before replacing targets.
+- Transcript generation fencing prevents stale queued saves from overwriting
+  the retained transcript after rewind, reset, or session rebind.
+- Tests use load-tolerant completion bounds and global logging-state isolation;
+  history-manager child spawns tolerate import delays.
+
 ## 0.3.0 (2026-09-30)
 
 ### Added

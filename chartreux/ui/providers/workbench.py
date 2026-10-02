@@ -26,23 +26,7 @@ from textual.widgets import Input, Label, OptionList, SelectionList
 from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
-from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
-from chartreux.core.model_catalog.loader import CatalogSnapshot
-from chartreux.core.model_catalog.matching import match_discovered_model
-from chartreux.core.model_catalog.presets import (
-    FULLY_CUSTOM,
-    MISTRAL,
-    PRESETS,
-    ProviderPreset,
-)
-from chartreux.core.model_catalog.schema import (
-    BaseModelDefinition,
-    DeploymentDefinition,
-    ProviderDefinition,
-    valid_provider_name,
-)
-from chartreux.ui.chrome_glyphs import ascii_chrome_enabled, chrome_glyph
-from chartreux.ui.providers.contracts import (
+from chartreux.core.model_catalog.contracts import (
     CatalogChanges,
     CatalogValidationError,
     CatalogWriter,
@@ -59,6 +43,22 @@ from chartreux.ui.providers.contracts import (
     ProviderWorkbenchResult,
     TLSConfig,
 )
+from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
+from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.model_catalog.matching import match_discovered_model
+from chartreux.core.model_catalog.presets import (
+    FULLY_CUSTOM,
+    MISTRAL,
+    PRESETS,
+    ProviderPreset,
+)
+from chartreux.core.model_catalog.schema import (
+    BaseModelDefinition,
+    DeploymentDefinition,
+    ProviderDefinition,
+    valid_provider_name,
+)
+from chartreux.ui.chrome_glyphs import ascii_chrome_enabled, chrome_glyph
 from chartreux.ui.providers.management_state import (
     ConnectionDraft,
     CredentialStatusResolver,

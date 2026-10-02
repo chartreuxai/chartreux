@@ -17,6 +17,11 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from chartreux.core.model_catalog.contracts import (
+    CatalogChanges,
+    CatalogValidationError,
+    CatalogWriteResult,
+)
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.schema import (
     BaseModelDefinition,
@@ -25,11 +30,6 @@ from chartreux.core.model_catalog.schema import (
     ProviderDefinition,
     RoleDefinition,
     valid_provider_name,
-)
-from chartreux.ui.providers.contracts import (
-    CatalogChanges,
-    CatalogValidationError,
-    CatalogWriteResult,
 )
 from chartreux.utils.paths import get_chartreux_home
 

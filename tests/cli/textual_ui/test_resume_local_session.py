@@ -22,8 +22,8 @@ from chartreux.cli.textual_ui.widgets.chat_input import ChatInputContainer
 from chartreux.cli.textual_ui.widgets.context_progress import ContextProgress
 from chartreux.cli.textual_ui.widgets.loading import LoadingWidget
 from chartreux.cli.textual_ui.widgets.messages import ErrorMessage, UserCommandMessage
-from chartreux.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from tests.cli.textual_ui.test_history_grouping import _message
 from tests.conftest import build_test_chartreux_app
 

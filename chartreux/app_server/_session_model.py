@@ -86,11 +86,17 @@ def config_active_model(metadata: Mapping[str, Any]) -> str | None:
     return stored_session_active_model(raw_config)
 
 
-def config_thinking_overrides(metadata: Mapping[str, Any]) -> dict[str, str]:
+def config_thinking_overrides(metadata: Mapping[str, Any]) -> dict[str, str] | None:
+    """Distinguish a historical omission from an explicit session map.
+
+    As with historical active-model parsing, malformed containers and entries
+    are filtered, not coerced. String keys and values still pass through the
+    orchestrator's canonical-model and thinking-level validation on restoration.
+    """
     raw_config = metadata.get("config")
-    if not isinstance(raw_config, dict):
-        return {}
-    value = raw_config.get("thinking_overrides")
+    if not isinstance(raw_config, dict) or "thinking_overrides" not in raw_config:
+        return None
+    value = raw_config["thinking_overrides"]
     if not isinstance(value, dict):
         return {}
     return {
@@ -102,7 +108,7 @@ def config_thinking_overrides(metadata: Mapping[str, Any]) -> dict[str, str]:
 
 async def restore_session_thinking_overrides(
     orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
-    overrides: Mapping[str, str],
+    overrides: Mapping[str, str] | None,
     *,
     reason: str,
 ) -> list[BaseException]:
@@ -111,7 +117,10 @@ async def restore_session_thinking_overrides(
         None,
     )
     current = getattr(layer.cached_data, "thinking_overrides", None) if layer else None
-    if current == overrides or (not current and not overrides):
+    # Omission removes the previous session's map, exposing the launch baseline
+    # in lower layers. An explicit empty map is retained as session state; shallow
+    # config merging still preserves lower-layer choices in the effective map.
+    if current == overrides:
         return []
     patch = (
         AddOperationPatch(
@@ -119,7 +128,7 @@ async def restore_session_thinking_overrides(
             value=dict(overrides),
             target_layer_name=OverridesLayer.NAME,
         )
-        if overrides
+        if overrides is not None
         else RemoveOperationPatch(
             path=THINKING_OVERRIDES_PATH, target_layer_name=OverridesLayer.NAME
         )

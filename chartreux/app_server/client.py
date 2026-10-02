@@ -74,7 +74,7 @@ class AppServerClient:
         self._pending: dict[str, asyncio.Future[_ClientResponse]] = {}
         self._response_boundaries: dict[str, Callable[[dict[str, Any]], None]] = {}
         self._abandoned_request_ids: set[str] = set()
-        self._incoming: asyncio.Queue[_IncomingMessage] = asyncio.Queue(maxsize=256)
+        self._incoming: asyncio.Queue[_IncomingMessage] = asyncio.Queue()
         self._incoming_closed = asyncio.Event()
         self._incoming_error: Exception | None = None
         self._received_sequence = 0

@@ -24,7 +24,7 @@ class _ToolRestrictionInput(BaseModel):
     # validates its complete effective config at the existing manager boundary.
     model_config = ConfigDict(extra="ignore")
 
-    permission: ToolPermission = ToolPermission.ASK
+    permission: ToolPermission = ToolPermission.ALWAYS
     denylist: tuple[str, ...] = ()
     sensitive_patterns: tuple[str, ...] = ()
 
@@ -90,7 +90,7 @@ class SourceRestrictions:
         tools = result.setdefault("tools", {})
         for settings in tools.values():
             if settings.get("permission") == ToolPermission.NEVER:
-                settings["permission"] = ToolPermission.ASK.value
+                settings["permission"] = ToolPermission.ALWAYS.value
             settings.pop("denylist", None)
             settings.pop("sensitive_patterns", None)
         for restriction in self.tools:

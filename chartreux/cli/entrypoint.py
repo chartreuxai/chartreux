@@ -34,7 +34,8 @@ def parse_arguments() -> argparse.Namespace:
         epilog=(
             "Commands:\n"
             "  mcp            Manage MCP server configuration (chartreux mcp --help).\n"
-            "  models         Manage the model catalog (chartreux models --help).\n\n"
+            "  models         Manage the model catalog (chartreux models --help).\n"
+            "\n"
             "Environment variables:\n"
             "  CHARTREUX_HOME       Override the Chartreux home directory (default: ~/.chartreux)\n"
             "  LOG_LEVEL       Logging level: DEBUG, INFO, WARNING (default), ERROR, CRITICAL.\n"

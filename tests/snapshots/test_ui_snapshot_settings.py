@@ -10,7 +10,7 @@ from chartreux.app_server.protocol import (
     SettingLeafWire,
 )
 from chartreux.cli.textual_ui.screens.settings import SettingsScreen
-from chartreux.cli.textual_ui.settings_service import SettingsService
+from chartreux.ui.settings_service import SettingsService
 from tests.cli.textual_ui.test_settings_app import FakeService
 from tests.snapshots.base_snapshot_test_app import BaseSnapshotTestApp
 from tests.snapshots.snap_compare import SnapCompare

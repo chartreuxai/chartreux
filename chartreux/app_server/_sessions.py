@@ -98,7 +98,14 @@ type EventWatermark = Callable[[str], int]
 _BACKGROUND_PROGRESS_LIMIT = 32
 _MAX_RUN_HISTORY = 32
 _MAX_STORED_RESULTS = 32
+# Per root-session registry; retained idle agents do not consume active-work slots.
+_DEFAULT_MAX_RUNNING_SUBAGENTS = 16
 _AGENT_ID_HIGH_WATER_MARK_KEY = "_app_server_agent_id_high_water_mark"
+
+
+@dataclass(eq=False, slots=True)
+class _ActiveWorkSlot:
+    transferred: bool = False
 
 
 class _AgentState(enum.StrEnum):
@@ -289,7 +296,16 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         notify_agents: NotifyAgents | None = None,
         clock: Callable[[], float] = time.monotonic,
         wakeup: Wakeup = asyncio.sleep,
+        max_running_subagents: int = _DEFAULT_MAX_RUNNING_SUBAGENTS,
     ) -> None:
+        if (
+            isinstance(max_running_subagents, bool)
+            or not isinstance(max_running_subagents, int)
+            or max_running_subagents < 1
+        ):
+            raise ValueError("max_running_subagents must be a positive integer")
+        self._max_running_subagents = max_running_subagents
+        self._active_work_slots: set[_ActiveWorkSlot] = set()
         self._notify_child = notify_child
         self._notify_agents = notify_agents
         self._deliver_callback = deliver_callback
@@ -1486,10 +1502,45 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         if any(fnmatch.fnmatch(profile, pattern) for pattern in config.denylist):
             raise ToolPermissionError(f"Task denied for agent profile: {profile}")
 
-    async def run(  # noqa: PLR0912, PLR0914, PLR0915
+    async def run(
         self,
         args: TaskArgs,
         ctx: InvokeContext,
+        *,
+        defer_launch_agents_update: bool = False,
+    ) -> AsyncGenerator[ToolStreamEvent | TaskResult, None]:
+        # Check and reserve without awaiting: concurrent creation/reuse attempts
+        # consume capacity before they can allocate runtimes or call providers.
+        if not hasattr(self, "_active_work_slots"):
+            self._active_work_slots = set()
+        running = len(self._active_work_slots)
+        cap = getattr(self, "_max_running_subagents", _DEFAULT_MAX_RUNNING_SUBAGENTS)
+        if running >= cap:
+            raise RuntimeError(
+                f"Subagent launch rejected: {running} agents already running "
+                f"(cap {cap}); "
+                "wait for completion or release agents before launching more"
+            )
+        slot = _ActiveWorkSlot()
+        self._active_work_slots.add(slot)
+        launch = SessionRuntimeRegistry._run_admitted(
+            self, args, ctx, slot, defer_launch_agents_update=defer_launch_agents_update
+        )
+        try:
+            async for event in launch:
+                yield event
+        finally:
+            try:
+                await launch.aclose()
+            finally:
+                if not slot.transferred:
+                    self._active_work_slots.discard(slot)
+
+    async def _run_admitted(  # noqa: PLR0912, PLR0914, PLR0915
+        self,
+        args: TaskArgs,
+        ctx: InvokeContext,
+        slot: _ActiveWorkSlot,
         *,
         defer_launch_agents_update: bool = False,
     ) -> AsyncGenerator[ToolStreamEvent | TaskResult, None]:
@@ -1731,6 +1782,15 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                             }
                         )
                     finally:
+                        active_task = runtime.turns._active_task
+                        if active_task is not None and not active_task.done():
+                            # Release/drain may cancel the monitor before provider
+                            # cancellation finishes; keep counting the actual work.
+                            active_task.add_done_callback(
+                                lambda _: self._active_work_slots.discard(slot)
+                            )
+                        else:
+                            self._active_work_slots.discard(slot)
                         runtime.turns._event_sink = previous_event_sink
                         if not committed:
                             return  # noqa: B012
@@ -1994,6 +2054,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     committed_model.provider if committed_model is not None else None
                 )
                 committed = True
+                slot.transferred = True
                 if prepared_reconfiguration is not None:
                     assert backend_publication is not None
                     runtime.agent_loop.finalize_launch_reconfiguration(
@@ -2118,6 +2179,8 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             runtime.turns.wait_for_operation(turn_id),
             name=f"vibe-subagent-turn:{child.session_id}",
         )
+        slot.transferred = True
+        completion.add_done_callback(lambda _: self._active_work_slots.discard(slot))
         result: TaskResult | None = None
 
         async def teardown_foreground() -> None:

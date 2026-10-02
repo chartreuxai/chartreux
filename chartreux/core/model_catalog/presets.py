@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from chartreux.ui.providers.contracts import ApiStyle
+from chartreux.core.model_catalog.contracts import ApiStyle
 
 
 @dataclass(frozen=True, slots=True)

@@ -30,7 +30,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from chartreux.cli.textual_ui.app import ChartreuxApp
 from chartreux.cli.textual_ui.screens.settings import SettingsScreen
-from chartreux.cli.textual_ui.settings_service import SettingsService
 from chartreux.cli.textual_ui.widgets.messages import AssistantMessage
 from chartreux.cli.textual_ui.widgets.model_picker import ModelOption, ModelPickerApp
 from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
@@ -38,6 +37,7 @@ from chartreux.core.config.harness_files import (
     init_harness_files_manager,
     reset_harness_files_manager,
 )
+from chartreux.ui.settings_service import SettingsService
 from tests.cli.textual_ui.test_settings_app import FakeService
 from tests.snapshots.test_ui_snapshot_basic_conversation import (
     SnapshotTestAppWithConversation,

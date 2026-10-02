@@ -12,8 +12,8 @@ from chartreux.app_server.protocol import (
     SettingLeafWire,
     SettingsReadResponse,
 )
-from chartreux.cli.textual_ui.settings_service import SettingsService
 from chartreux.core.config.settings_catalog import VISIBLE_SETTINGS
+from chartreux.ui.settings_service import SettingsService
 
 
 def snapshot(

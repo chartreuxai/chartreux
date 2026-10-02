@@ -10,7 +10,7 @@ from chartreux.cli.textual_ui.widgets.collapsible import (
     HeaderCollapsibleSection,
     _single_line,
 )
-from chartreux.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
 
 class _HeaderApp(App[None]):

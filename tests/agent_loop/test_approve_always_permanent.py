@@ -36,9 +36,9 @@ class TestRetiredApprovalSurface:
             await agent.aclose()
 
     @pytest.mark.asyncio
-    async def test_ask_policy_executes_without_approval_callback(self):
+    async def test_always_policy_executes_without_approval_callback(self):
         agent = build_test_agent_loop(
-            config=build_test_vibe_config(tools={"todo": {"permission": "ask"}}),
+            config=build_test_vibe_config(tools={"todo": {"permission": "always"}}),
             backend=FakeBackend([
                 [
                     mock_llm_chunk(
@@ -72,7 +72,10 @@ class TestRetiredApprovalSurface:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "config",
-        [{"permission": "never"}, {"permission": "ask", "denylist": ["*fixture.txt"]}],
+        [
+            {"permission": "never"},
+            {"permission": "always", "denylist": ["*fixture.txt"]},
+        ],
     )
     async def test_explicit_denial_skips_without_approval_callback(
         self, tmp_path, config

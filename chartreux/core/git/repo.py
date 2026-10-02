@@ -19,6 +19,11 @@ from chartreux.core.git.errors import (
     GitUnavailableError,
 )
 from chartreux.core.git.fetch import UnsafeGitFetchError, fetch_remote
+from chartreux.core.git.policy import (
+    bind_repository,
+    validate_branch_name,
+    validate_ref_name,
+)
 from chartreux.core.git.remote import find_remote_url
 from chartreux.utils.platform import configure_git_python_executable
 
@@ -113,14 +118,17 @@ def sanitized_git(repo: Repo) -> Git:
     command = repo.git
     if not callable(command):
         # Lightweight test doubles may expose only the command methods.
+        bind_repository(repo)
         return command
-    return command(c=["core.fsmonitor=", _NO_HOOKS_CONFIG])
+    bind_repository(repo)
+    return repo.git(c=["core.fsmonitor=", _NO_HOOKS_CONFIG])
 
 
 class GitRepo:
     """The one place GitPython is called and its failures become GitError."""
 
     def __init__(self, repo: Repo) -> None:
+        bind_repository(repo)
         self._repo = repo
 
     @classmethod
@@ -214,23 +222,34 @@ class GitRepo:
         """
         return self.changes_on("HEAD")
 
-    def changes_on(self, ref: str) -> BranchChanges | None:
+    def changes_on(self, ref: str | None) -> BranchChanges | None:
         """:meth:`branch_changes` for a branch this checkout is not on.
 
         Every worktree of a repository is a ref in the same object database, so
         one checkout can measure them all. That is the point: a picker listing
         five worktrees would otherwise open five GitPython repositories, each
         holding the ``cat-file`` handles this class exists to close once.
+        Missing or invalid branch names are "nothing to compare", including the
+        None reported by detached worktrees.
         """
+        if ref is None:
+            return None
+        if ref != "HEAD":
+            try:
+                validate_branch_name(ref)
+            except ValueError:
+                return None
         base_ref = self._base_ref()
         if base_ref is None:
             return None
         git = _git_python()
         try:
-            merge_base = self._repo.git.merge_base(ref, base_ref).strip()
+            merge_base = self._repo.git.merge_base("--", ref, base_ref).strip()
             if not merge_base:
                 return None
-            numstat = self._repo.git.diff("--numstat", f"{merge_base}..{ref}")
+            # diff's -- starts pathspecs, not revision operands; these revisions
+            # are validated literal branches and Git's own merge-base object ID.
+            numstat = self._repo.git.diff("--numstat", f"{merge_base}..{ref}", "--")
         except git.git_command_error:
             # An unborn HEAD, a ref that is gone, or a base that shares no
             # history with it. All are "nothing to compare" rather than a
@@ -308,9 +327,13 @@ class GitRepo:
         )
 
     def _has_ref(self, ref: str) -> bool:
+        try:
+            validate_ref_name(ref)
+        except ValueError:
+            return False
         git = _git_python()
         try:
-            self._repo.git.show_ref("--verify", "--quiet", ref)
+            self._repo.git.show_ref("--verify", "--quiet", "--", ref)
         except git.git_command_error:
             # Any failure here means the ref could not be confirmed, which for a
             # best-effort base-branch guess is the same as it not being there.
@@ -362,13 +385,14 @@ class GitRepo:
 
     def validate_branch(self, branch: str) -> None:
         try:
-            self._repo.git.check_ref_format("--branch", branch)
-        except (self._gitpy.git_command_error, ValueError) as e:
+            validate_branch_name(branch)
+        except ValueError as e:
             raise GitError(f"Invalid branch {branch!r}.") from e
 
     def branch_exists(self, branch: str) -> bool:
+        self.validate_branch(branch)
         try:
-            self._repo.git.show_ref("--verify", "--quiet", f"refs/heads/{branch}")
+            self._repo.git.show_ref("--verify", "--quiet", "--", f"refs/heads/{branch}")
         except self._gitpy.git_command_error as e:
             if e.status == 1:
                 return False
@@ -379,8 +403,9 @@ class GitRepo:
     # and only the caller knows whether the failure is worth reporting and in
     # what words.
     def delete_branch(self, branch: str, *, force: bool = False) -> None:
+        self.validate_branch(branch)
         try:
-            sanitized_git(self._repo).branch("-D" if force else "-d", branch)
+            sanitized_git(self._repo).branch("-D" if force else "-d", "--", branch)
         except self._gitpy.git_command_error as e:
             raise GitError(str(e)) from e
 
@@ -391,13 +416,17 @@ class GitRepo:
         locally, which is the case for clones made with --single-branch.
         """
         try:
-            ref = self._repo.git.symbolic_ref("--quiet", f"refs/remotes/{remote}/HEAD")
-        except self._gitpy.git_command_error:
+            validate_ref_name(f"refs/remotes/{remote}/HEAD")
+            ref = self._repo.git.symbolic_ref(
+                "--quiet", "--", f"refs/remotes/{remote}/HEAD"
+            )
+        except (self._gitpy.git_command_error, ValueError):
             return None
         prefix = "refs/remotes/"
         return ref[len(prefix) :] if ref.startswith(prefix) else None
 
     def fetch_branch(self, remote: str, branch: str) -> None:
+        self.validate_branch(branch)
         # Use an explicit destination refspec so callers see the fetched tip
         # without trusting the repository's remote.<name>.fetch configuration.
         #
@@ -440,10 +469,21 @@ class GitRepo:
         branch_created: bool,
         start_point: str | None = None,
     ) -> None:
+        self.validate_branch(branch)
+        if start_point is not None:
+            try:
+                # Callers use HEAD or a literal remote-tracking branch, not
+                # arbitrary revision expressions or command-line options.
+                if start_point != "HEAD":
+                    validate_ref_name(f"refs/remotes/{start_point}")
+                    if start_point.startswith("-"):
+                        raise ValueError("Option-like start point")
+            except ValueError as e:
+                raise GitError(f"Invalid start point {start_point!r}.") from e
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             if branch_created:
-                create = ["add", "-b", branch, str(target)]
+                create = ["add", "-b", branch, "--", str(target)]
                 # Omitted rather than defaulted, because git's own default is
                 # the invoking checkout's HEAD and that is the right answer for
                 # a repository with no remote to start from.
@@ -451,7 +491,7 @@ class GitRepo:
                     create.append(start_point)
                 sanitized_git(self._repo).worktree(*create)
             else:
-                sanitized_git(self._repo).worktree("add", str(target), branch)
+                sanitized_git(self._repo).worktree("add", "--", str(target), branch)
         except self._gitpy.git_command_error as e:
             raise GitError(
                 f"Failed to create worktree {target.name!r} for branch {branch!r}: {e}"
@@ -462,7 +502,7 @@ class GitRepo:
     # what words.
     def remove_worktree(self, target: Path) -> None:
         try:
-            sanitized_git(self._repo).worktree("remove", "--force", str(target))
+            sanitized_git(self._repo).worktree("remove", "--force", "--", str(target))
         except self._gitpy.git_command_error as e:
             raise GitError(str(e)) from e
 

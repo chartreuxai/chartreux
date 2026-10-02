@@ -69,7 +69,7 @@ class WebFetchResult(BaseModel):
 
 
 class WebFetchConfig(BaseToolConfig):
-    permission: ToolPermission = ToolPermission.ASK
+    permission: ToolPermission = ToolPermission.ALWAYS
 
     default_timeout: int = Field(default=30, description="Default timeout in seconds.")
     max_timeout: int = Field(default=120, description="Maximum allowed timeout.")
@@ -108,14 +108,11 @@ class WebFetch(
         return raw if raw.startswith(("http://", "https://")) else "https://" + raw
 
     def resolve_permission(self, args: WebFetchArgs) -> PermissionContext | None:
-        if self.config.permission in {ToolPermission.ALWAYS, ToolPermission.NEVER}:
-            return PermissionContext(permission=self.config.permission)
-
-        # Accepted design decision: web tools do no per-domain approval
-        # prompting; ASK auto-executes. Redaction removes Chartreux's own loaded
-        # credential values from tool output; it is not a general exfiltration or
-        # injection boundary. Fetched web content is framed as untrusted data.
-        return PermissionContext(permission=ToolPermission.ASK)
+        # Web tools do no per-domain approval prompting. Redaction removes
+        # Chartreux's own loaded credential values from tool output; it is not a
+        # general exfiltration or injection boundary. Fetched web content is
+        # framed as untrusted data.
+        return PermissionContext(permission=self.config.permission)
 
     @final
     async def run(

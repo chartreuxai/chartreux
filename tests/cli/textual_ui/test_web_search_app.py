@@ -7,13 +7,13 @@ from textual.widgets import Button, Input, OptionList
 
 from chartreux.cli.commands import CommandRegistry
 from chartreux.cli.textual_ui.screens.settings import SettingsOptionList, SettingsScreen
-from chartreux.cli.textual_ui.screens.web_search import WebSearchScreen
-from chartreux.cli.textual_ui.settings_service import (
+from chartreux.ui.settings_service import (
     SettingsConfigResource,
     SettingsReloadOutcome,
     SettingsSaveOutcome,
     SettingsService,
 )
+from chartreux.ui.web_search import WebSearchScreen
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from tests.cli.textual_ui.web_search_fixture import (
     FakeCredentials,

@@ -22,13 +22,13 @@ from textual.widgets import Input, OptionList, SelectionList
 from textual.widgets.option_list import Option, OptionDoesNotExist
 
 from chartreux.app_server.protocol import SettingDescriptorWire, SettingsReadResponse
-from chartreux.cli.textual_ui.settings_service import SettingsService
-from chartreux.cli.textual_ui.widgets.vscode_compat import VscodeCompatInput
 from chartreux.ui.chrome_glyphs import chrome_glyph
+from chartreux.ui.settings_service import SettingsService
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 from chartreux.ui.widgets.checklist import Checklist
 from chartreux.ui.widgets.navigable_option_list import NavigableOptionList
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
+from chartreux.ui.widgets.vscode_compat import VscodeCompatInput
 
 DOUBLE_CLICK = 2
 MIN_MODAL_WIDTH = 84

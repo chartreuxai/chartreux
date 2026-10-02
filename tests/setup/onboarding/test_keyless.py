@@ -6,10 +6,10 @@ import pytest
 import pytest_asyncio
 
 from chartreux.core.config import ModelConfig, ProviderConfig
+from chartreux.core.model_catalog.contracts import ProviderWorkbenchResult
 from chartreux.setup.auth.api_key_persistence import resolve_api_key_provider
 from chartreux.setup.onboarding import OnboardingApp, OnboardingCredentialService
 from chartreux.setup.onboarding.context import OnboardingContext
-from chartreux.ui.providers.contracts import ProviderWorkbenchResult
 from chartreux.ui.providers.workbench import ProviderWorkbenchScreen
 from tests.conftest import build_test_vibe_config
 from tests.snapshots.snapshot_event_loop import install_snapshot_wake

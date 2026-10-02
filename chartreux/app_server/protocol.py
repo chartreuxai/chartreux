@@ -887,7 +887,7 @@ class RootsReplaceResponse(ProtocolModel):
 
 
 class PolicyToolReplacement(ProtocolModel):
-    permission: Literal["ask", "always", "never"] = "ask"
+    permission: Literal["always", "never"] = "always"
     denylist: list[str] = Field(default_factory=list)
     sensitive_patterns: list[str] = Field(default_factory=list)
 

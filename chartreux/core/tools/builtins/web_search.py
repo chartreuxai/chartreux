@@ -64,7 +64,7 @@ class WebSearchResult(BaseModel):
 
 
 class WebSearchConfig(BaseToolConfig):
-    permission: ToolPermission = ToolPermission.ASK
+    permission: ToolPermission = ToolPermission.ALWAYS
     provider: SearchProviderName = "auto"
     api_key_env_var: str | None = None
     base_url: str | None = None

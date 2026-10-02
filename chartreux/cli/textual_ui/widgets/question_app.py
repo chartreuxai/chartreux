@@ -19,10 +19,10 @@ from chartreux.app_server.models import (
     UserQuestionRequest,
 )
 from chartreux.cli.textual_ui.widgets.vim_navigation import VimNavigationMixin
-from chartreux.cli.textual_ui.widgets.vscode_compat import VscodeCompatInput
 from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
+from chartreux.ui.widgets.vscode_compat import VscodeCompatInput
 
 _INPUT_GRACE_PERIOD_S = 0.5
 
