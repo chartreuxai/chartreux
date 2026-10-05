@@ -157,3 +157,64 @@ def test_automatic_context_never_executes_repository_filters(
     # filter through status; the process fixture deliberately aborts its protocol.
     git("status", "--porcelain", check=False)
     assert marker.exists()
+
+
+@pytest.mark.parametrize("sources", [("user", "project"), ("project",), ("user",), ()])
+@pytest.mark.parametrize("user_content", [None, "   \n", "user marker"])
+@pytest.mark.parametrize("include_context", [False, True])
+def test_prompt_instruction_provenance_tracks_only_loaded_documents(
+    tmp_path, config_dir, monkeypatch, sources, user_content, include_context
+):
+    from chartreux.core.agents import AgentManager
+    from chartreux.core.config.harness_files import HarnessFilesManager
+    from chartreux.core.skills.manager import SkillManager
+    from chartreux.core.system_prompt import get_universal_system_prompt
+    from chartreux.core.trusted_folders import TrustedFoldersManager
+    from tests.conftest import build_test_vibe_config
+    from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
+
+    project = tmp_path / "trusted" / "workspace"
+    project.mkdir(parents=True)
+    ancestor = project.parent / "AGENTS.md"
+    ancestor.write_text("ancestor marker")
+    project_doc = project / "AGENTS.md"
+    project_doc.write_text("project marker")
+    user_doc = config_dir / "AGENTS.md"
+    if user_content is not None:
+        user_doc.write_text(user_content)
+    trust = TrustedFoldersManager()
+    trust.trust_for_session(project.parent)
+    harness = HarnessFilesManager(sources=sources, cwd=project, trust_store=trust)
+    original = HarnessFilesManager.load_instruction_documents
+    loads = []
+
+    def load(self):
+        documents = original(self)
+        loads.append(documents)
+        # Prove provenance and text do not rediscover/read documents independently.
+        for doc in documents:
+            doc.path.write_text("changed after loading")
+        return documents
+
+    monkeypatch.setattr(HarnessFilesManager, "load_instruction_documents", load)
+    config = build_test_vibe_config(include_project_context=include_context)
+    prompt = get_universal_system_prompt(
+        config,
+        SkillManager(lambda: config, harness_files=harness),
+        AgentManager(FakeConfigOrchestrator(config), harness_files=harness),
+        cwd=project,
+        harness_files=harness,
+    )
+    expected = set()
+    if include_context:
+        assert len(loads) == 1
+        if "user" in sources and user_content and user_content.strip():
+            expected.add(user_doc.resolve())
+            assert "user marker" in prompt
+        if "project" in sources:
+            expected.update([ancestor.resolve(), project_doc.resolve()])
+            assert "ancestor marker" in prompt and "project marker" in prompt
+        assert "changed after loading" not in prompt
+    else:
+        assert not loads
+    assert prompt.instruction_read_files == frozenset(expected)

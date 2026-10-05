@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import AsyncGenerator, Callable, Generator, Sequence
 import contextlib
 import copy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum, auto
 from functools import wraps
 import inspect
@@ -71,8 +71,10 @@ from chartreux.core.events import (
     ReasoningEvent,
     SessionTitleUpdatedEvent,
     ToolCallEvent,
+    ToolCancellationOrigin,
     ToolResultEvent,
     ToolStreamEvent,
+    ToolWaitStateChangedEvent,
     UserMessageEvent,
 )
 from chartreux.core.git.errors import GitError
@@ -101,6 +103,7 @@ from chartreux.core.llm_models import (
     Role,
     StrToolChoice,
     ToolCall,
+    posting_time,
 )
 from chartreux.core.message_list import MessageList
 from chartreux.core.middleware import (
@@ -139,8 +142,10 @@ from chartreux.core.subagents import (
     LaunchConfig,
     SubagentManagementPort,
     SubagentRunnerPort,
+    TaskResult,
 )
 from chartreux.core.system_prompt import get_universal_system_prompt
+from chartreux.core.timing import CompletedTurnTiming, InvocationTiming
 from chartreux.core.tools import secret_redaction
 from chartreux.core.tools.base import (
     BaseTool,
@@ -158,9 +163,11 @@ from chartreux.core.tools.builtins.skill import (
     skill_content_marker,
 )
 from chartreux.core.tools.builtins.todo import TodoState
+from chartreux.core.tools.builtins.wait_for_agent import WaitForAgent
 from chartreux.core.tools.io_port import ToolIOPort
 from chartreux.core.tools.manager import NoSuchToolError, ToolManager
 from chartreux.core.tools.ui import ToolUIDataAdapter
+from chartreux.core.usage import AsyncUsageWriter, UsageAttribution, UsagePurpose
 from chartreux.core.utils import (
     TOOL_ERROR_TAG,
     VIBE_STOP_EVENT_TAG,
@@ -202,6 +209,21 @@ class ToolDecision(BaseModel):
     verdict: ToolExecutionResponse
     approval_type: ToolPermission
     feedback: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RootAccountingOwner:
+    """Immutable root identity and shared writer, independent of transcript logging.
+
+    Session bindings capture attribution per invocation. Writer retirement belongs
+    to the runtime, after all producers sharing this owner have settled.
+    """
+
+    root_session_id: str
+    project_key: str
+    writer: AsyncUsageWriter
+    # Runtime-owned allocation seam for clear/rewind, which mint root identities.
+    owner_factory: Callable[[str, str], RootAccountingOwner] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +304,7 @@ class _PreparedLaunchReconfiguration:
     previous_tool_manager: ToolManager
     previous_skill_manager: SkillManager
     previous_system_message: LLMMessage | None
+    previous_instruction_read_files: frozenset[Path]
     previous_prices: tuple[float, float, float | None]
     previous_launch_overrides: LaunchConfig | None
     previous_committed_model: CommittedModelIdentity | None
@@ -300,6 +323,7 @@ class _QueueTitleEventSink(TitleEventSink):
 
 @dataclass(frozen=True, slots=True)
 class AgentTurnOptions:
+    turn_id: str | None = None
     retry_sink: RetryObserver | None = None
     injected: bool = False
     user_initiated_retry: bool = False
@@ -309,9 +333,20 @@ class AgentTurnOptions:
 class _ActiveTurn:
     """Collaborators lent to the loop for one turn; its presence means one is running."""
 
+    turn_id: str = field(default_factory=lambda: str(uuid4()))
     subagent_runner: SubagentRunnerPort | None = None
     tool_io: ToolIOPort | None = None
     retry_sink: RetryObserver | None = None
+    timing: InvocationTiming = field(default_factory=InvocationTiming)
+    prose_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _ToolInvocation:
+    task: asyncio.Task[None]
+    is_wait: bool
+    wait_task: asyncio.Task[TaskResult] | None = None
+    steering_cancel_requested: bool = False
 
 
 _NO_TURN = _ActiveTurn()
@@ -396,7 +431,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         frozen_system_prompt_id: str | None = None,
         frozen_instructions: str | None = None,
         committed_model: CommittedModelIdentity | None = None,
+        accounting_owner: RootAccountingOwner | None = None,
     ) -> None:
+        self.accounting_owner = accounting_owner
+        self._detached_accounting_producers: set[asyncio.Task[None]] = set()
         self._inherited_restrictions = tuple(inherited_restrictions)
         self._inherited_mode_restrictions = tuple(inherited_mode_restrictions)
         self._inherited_plan_write_scopes = tuple(inherited_plan_write_scopes)
@@ -520,9 +558,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._setup_middleware()
 
         self.messages = MessageList()
+        # Only the active completion retains execution arguments; transcript
+        # copies are sanitized before insertion and never used for execution.
+        self._execution_message: LLMMessage | None = None
 
         self.stats = AgentStats()
         self._tool_event_queue: asyncio.Queue[BaseEvent | None] | None = None
+        self._tool_invocations: dict[tuple[str, str], _ToolInvocation] = {}
+        self._waiting_only = False
         # Retain admission names and resolved values only until outward emission.
         self._admitted_tool_policies: dict[str, secret_redaction.ScrubPolicy] = {}
         # Tool-response ordering: while a tool batch is active, response
@@ -533,6 +576,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._next_tool_response_index = 0
         self._request_broker = InteractionRequestBroker()
         self._active_turn: _ActiveTurn | None = None
+        self.completed_turn_timing: CompletedTurnTiming | None = None
         # Operations that are not turns but still hold the session: anything
         # reading the working directory or acting on its repository for longer
         # than an instant. They exclude each other through _take_session, so an
@@ -557,6 +601,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._is_user_prompt_call: bool = False
         self._reactive_recovery_used: bool = False
         self._pending_injected_messages: list[LLMMessage] = []
+        self._steering_injections: set[asyncio.Task[Any]] = set()
         self._pending_clear_context: bool = False
 
         self.session_logger = SessionLogger(
@@ -654,7 +699,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             with secret_redaction.bind_policy(self.scrub_policy):
                 self._ensure_remote_registries()
                 self.tool_manager.integrate_all(raise_on_mcp_failure=True)
-                self.messages.update_system_prompt(self._build_system_prompt())
+                self._publish_system_prompt(self._build_system_prompt())
         except Exception as exc:
             self._init_error = exc
 
@@ -1003,6 +1048,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             is_subagent=self.frozen_system_prompt_id is not None,
         )
 
+    def _publish_system_prompt(self, prompt: str) -> None:
+        """Install text and its loader provenance together, never during staging."""
+        self.messages.update_system_prompt(prompt)
+        self.tool_manager.set_instruction_read_files(
+            getattr(prompt, "instruction_read_files", frozenset())
+        )
+        self._authority_revision += 1
+
     def _build_system_prompt(self) -> str:
         return self._render_system_prompt(self.skill_manager)
 
@@ -1079,6 +1132,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             previous_tool_manager=self.tool_manager,
             previous_skill_manager=self.skill_manager,
             previous_system_message=system_message,
+            previous_instruction_read_files=self.tool_manager._instruction_read_files,
             previous_prices=(
                 self.stats.input_price_per_million,
                 self.stats.output_price_per_million,
@@ -1168,7 +1222,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.tool_manager = prepared.consumers.tool_manager
         self.skill_manager = prepared.consumers.skill_manager
         prepared.consumers.config_source.point_to(lambda: self.config)
-        self.messages.update_system_prompt(prepared.consumers.system_prompt)
+        self._publish_system_prompt(prepared.consumers.system_prompt)
         model = prepared.candidate.effective_model
         self.stats.update_pricing(
             model.input_price, model.output_price, model.cached_input_price
@@ -1189,6 +1243,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.agent_manager = prepared.previous_agent_manager
         self.tool_manager = prepared.previous_tool_manager
         self.skill_manager = prepared.previous_skill_manager
+        self.tool_manager.set_instruction_read_files(
+            prepared.previous_instruction_read_files
+        )
+        self._authority_revision += 1
         if prepared.previous_system_message is not None:
             self.messages.update_system_prompt(
                 str(prepared.previous_system_message.content or "")
@@ -1254,7 +1312,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
     async def refresh_system_prompt(self) -> None:
         """Rebuild and replace the system prompt with current tool/skill state."""
         prompt = await asyncio.to_thread(self._build_system_prompt)
-        self.messages.update_system_prompt(prompt)
+        self._publish_system_prompt(prompt)
 
     @property
     def backend(self) -> BackendLike:
@@ -1307,7 +1365,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         )
 
     @requires_init
-    async def inject_user_context(
+    async def inject_user_context(  # noqa: PLR0913
         self,
         content: str,
         *,
@@ -1318,6 +1376,48 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         resources: list[UserResource] | None = None,
         client_message_id: str | None = None,
         manual_shell: ManualShellContext | None = None,
+        before_commit: Callable[[], None] | None = None,
+        on_commit: Callable[[UserMessageEvent], None] | None = None,
+        on_injected_event: Callable[[BaseEvent], None] | None = None,
+        on_context_ready: Callable[[], object] | None = None,
+    ) -> list[BaseEvent]:
+        task = asyncio.current_task()
+        if on_context_ready is not None and task is not None:
+            self._steering_injections.add(task)
+        try:
+            return await self._inject_user_context(
+                content,
+                as_message=as_message,
+                inject_implicit=inject_implicit,
+                images=images,
+                input_text=input_text,
+                resources=resources,
+                client_message_id=client_message_id,
+                manual_shell=manual_shell,
+                before_commit=before_commit,
+                on_commit=on_commit,
+                on_injected_event=on_injected_event,
+                on_context_ready=on_context_ready,
+            )
+        finally:
+            if task is not None:
+                self._steering_injections.discard(task)
+
+    async def _inject_user_context(  # noqa: PLR0913
+        self,
+        content: str,
+        *,
+        as_message: bool,
+        inject_implicit: bool,
+        images: list[ImageAttachment] | None,
+        input_text: str | None,
+        resources: list[UserResource] | None,
+        client_message_id: str | None,
+        manual_shell: ManualShellContext | None,
+        before_commit: Callable[[], None] | None,
+        on_commit: Callable[[UserMessageEvent], None] | None,
+        on_injected_event: Callable[[BaseEvent], None] | None,
+        on_context_ready: Callable[[], object] | None,
     ) -> list[BaseEvent]:
         events: list[BaseEvent] = []
         if as_message:
@@ -1325,27 +1425,42 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 role=Role.user,
                 content=content,
                 message_id=client_message_id or str(uuid4()),
+                posted_at=posting_time(),
                 images=images or None,
                 input_text=input_text,
                 resources=resources or None,
                 manual_shell=manual_shell,
             )
-            self.messages.append(message)
             if message.message_id is None:
                 raise AgentLoopError("User message must have a message_id")
-            events.append(
-                UserMessageEvent(
-                    content=input_text if input_text is not None else content,
-                    message_id=message.message_id,
-                    images=list(message.images or []),
-                    resources=list(message.resources or []),
-                )
+            event = UserMessageEvent(
+                content=input_text if input_text is not None else content,
+                message_id=message.message_id,
+                posted_at=message.posted_at,
+                images=list(message.images or []),
+                resources=list(message.resources or []),
             )
-            if inject_implicit:
-                async for event in self._inject_invoked_skill(content):
-                    events.append(event)
-                async for event in self._inject_mentioned_files(content):
-                    events.append(event)
+            if before_commit is not None:
+                before_commit()
+            self.messages.append(message)
+            if on_commit is not None:
+                on_commit(event)
+            events.append(event)
+            try:
+                if inject_implicit:
+                    async for event in self._inject_invoked_skill(content):
+                        events.append(event)
+                        if on_injected_event is not None:
+                            on_injected_event(event)
+                    async for event in self._inject_mentioned_files(content):
+                        events.append(event)
+                        if on_injected_event is not None:
+                            on_injected_event(event)
+            finally:
+                # Only release the parent's waits after expansion has completed
+                # or unwound. The turn also joins this task before continuing.
+                if on_context_ready is not None:
+                    on_context_ready()
         else:
             self.messages.append(
                 LLMMessage(
@@ -1401,11 +1516,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 self.committed_model.base_model
             )
         self._admitted_tool_policies.clear()
+        self.completed_turn_timing = None
         self._active_turn = _ActiveTurn(
+            turn_id=options.turn_id or str(uuid4()),
             subagent_runner=subagent_runner,
             tool_io=tool_io,
             retry_sink=options.retry_sink,
         )
+        self._active_turn.timing.start()
         try:
             self._clean_message_history()
             self.checkpoint_recorder.create_checkpoint()
@@ -1425,11 +1543,42 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     async for event in self._sanitize_outward_events(conversation):
                         yield event
             finally:
-                self.checkpoint_recorder.seal_turn()
+                try:
+                    await self._finalize_turn_timing()
+                finally:
+                    self.checkpoint_recorder.seal_turn()
         finally:
             self._admitted_tool_policies.clear()
+            for key in tuple(self._tool_invocations):
+                if key[0] == self._turn.turn_id:
+                    del self._tool_invocations[key]
+            self._waiting_only = False
             self._active_turn = None
             self._backend_lifetime.drain(whole_turn_active=False)
+
+    async def _finalize_turn_timing(self) -> None:
+        turn = self._active_turn
+        if turn is None:
+            return
+        duration = turn.timing.finish()
+        if duration is None:
+            return
+        retained = {
+            message.message_id: message
+            for message in self.messages
+            if message.role is Role.assistant and message.content
+        }
+        for message_id in reversed(turn.prose_ids):
+            if (message := retained.get(message_id)) is not None:
+                message.turn_duration = duration
+                self.completed_turn_timing = CompletedTurnTiming(message_id, duration)
+                # The owner can precede the logger's last saved boundary message.
+                try:
+                    self.session_logger.invalidate_transcript_cursor()
+                    await self._save_messages()
+                except Exception:
+                    logger.warning("Could not persist turn timing", exc_info=True)
+                break
 
     async def _sanitize_outward_events(
         self, events: AsyncGenerator[BaseEvent]
@@ -1527,6 +1676,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
     def _sanitize_outward_event(self, event: BaseEvent) -> BaseEvent:
         """Sanitize tool and hook payloads before UI/ACP consumers see them."""
+        if isinstance(event, ToolCallEvent):
+            return self._recorded_tool_call_event(event)
         if not isinstance(event, (ToolResultEvent, HookEvent)):
             return event
         try:
@@ -1541,6 +1692,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     tool_class=None,
                     tool_call_id=secret_redaction.redact(event.tool_call_id),
                     error="Tool result unavailable",
+                    duration=event.duration,
+                    cancelled=event.cancelled,
                 )
             return HookEvent()
 
@@ -1596,6 +1749,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 yield AssistantEvent(
                     content=f"<{VIBE_STOP_EVENT_TAG}>{result.reason}</{VIBE_STOP_EVENT_TAG}>",
                     stopped_by_middleware=True,
+                    middleware_metadata=result.metadata,
                 )
 
             case MiddlewareAction.INJECT_MESSAGE:
@@ -1734,6 +1888,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             role=Role.user,
             content=user_msg,
             message_id=client_message_id,
+            posted_at=posting_time(),
             images=images or None,
             user_display_content=user_display_content,
             input_text=input_text,
@@ -1749,6 +1904,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         yield UserMessageEvent(
             content=input_text if input_text is not None else user_msg,
             message_id=user_message.message_id,
+            posted_at=user_message.posted_at,
             images=list(user_message.images or []),
             user_display_content=user_message.user_display_content,
             resources=list(user_message.resources or []),
@@ -1827,6 +1983,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 # A turn ran to completion: count it against the turn budget (so
                 # an overflow-and-retry never does) and mark later turns as
                 # follow-ups.
+                await self._settle_steering_injections()
                 self.stats.steps += 1
                 first_llm_turn = False
                 # Per-turn save so the on-disk log stays fresh; after the
@@ -1844,6 +2001,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 ):
                     yield event
 
+                await self._settle_steering_injections()
                 last_message = self.messages[-1]
                 drained = self._drain_pending_injections()
                 should_break_loop = last_message.role != Role.tool and not drained
@@ -1861,12 +2019,28 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     # no await remains between observing an empty queue and exit.
                     if should_break_loop:
                         await self._save_messages()
-                    if self._drain_pending_injections():
+                    had_steering = bool(self._steering_injections)
+                    await self._settle_steering_injections()
+                    if self._drain_pending_injections() or had_steering:
                         should_break_loop = False
             completed_normally = True
         finally:
             if not completed_normally:
+                await self._settle_steering_injections(cancel=True)
                 await self._save_messages()
+
+    async def _settle_steering_injections(self, *, cancel: bool = False) -> None:
+        while tasks := self._steering_injections.copy():
+            if cancel:
+                for task in tasks:
+                    task.cancel()
+            try:
+                await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
+            except asyncio.CancelledError:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
 
     def _queue_post_turn_retry(self, retry_msg: LLMMessage | None) -> bool:
         # Returns whether the loop should still break (no retry queued).
@@ -1894,6 +2068,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
     def _maybe_schedule_title_generation(
         self, *, turn_completing: bool
     ) -> ScheduledTitle | None:
+        resources = self._call_resources(
+            self.backend, RequestRetryBudget(self.config.api_retry_max_elapsed_time)
+        )
         return self._title_controller.schedule(
             TitleScheduleInputs(
                 messages=tuple(self.messages),
@@ -1906,6 +2083,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 logging_enabled=self.session_logger.enabled,
                 title_is_manual=self.session_logger.title_source == "manual",
                 periodic=is_fast_utility_model(self.config),
+                accounting_sink=resources.accounting_sink,
+                usage_attribution=resources.usage_attribution,
             )
         )
 
@@ -1943,9 +2122,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if skill_info is None:
             return
 
+        timing = InvocationTiming()
+        timing.start()
         result = await build_skill_result(
             skill_info, already_loaded=self._skill_already_loaded(parsed.name)
         )
+        duration = timing.finish()
         call_id = str(uuid4())
         tool_class = self.tool_manager.available_tools.get("skill", SkillTool)
         call_event = ToolCallEvent(
@@ -1966,6 +2148,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             tool_name="skill",
             tool_class=tool_class,
             result=result,
+            duration=duration,
             tool_call_id=call_id,
         )
         result_event = result_event.model_copy(
@@ -1976,18 +2159,22 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             }
         )
 
+        call_event = self._recorded_tool_call_event(call_event)
         self.messages.append(
             LLMMessage(
                 role=Role.assistant,
                 content="",
                 tool_calls=[
-                    ToolCall(
-                        id=call_id,
-                        index=0,
-                        function=FunctionCall(
-                            name="skill", arguments=json.dumps({"name": parsed.name})
-                        ),
-                        presentation=call_event.presentation,
+                    self._recorded_tool_call(
+                        ToolCall(
+                            id=call_id,
+                            index=0,
+                            function=FunctionCall(
+                                name="skill",
+                                arguments=json.dumps({"name": parsed.name}),
+                            ),
+                            presentation=call_event.presentation,
+                        )
                     )
                 ],
             )
@@ -2001,6 +2188,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 content=result_text,
                 tool_result=PersistedToolResult(
                     output=cast(dict[str, JsonValue], result.model_dump(mode="json")),
+                    duration=duration,
                     presentation=result_event.presentation,
                 ),
             )
@@ -2030,13 +2218,15 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     role=Role.assistant,
                     content="",
                     tool_calls=[
-                        ToolCall(
-                            id=call_id,
-                            index=0,
-                            function=FunctionCall(
-                                name="read_file",
-                                arguments=json.dumps({"file_path": file_path}),
-                            ),
+                        self._recorded_tool_call(
+                            ToolCall(
+                                id=call_id,
+                                index=0,
+                                function=FunctionCall(
+                                    name="read_file",
+                                    arguments=json.dumps({"file_path": file_path}),
+                                ),
+                            )
                         )
                     ],
                 )
@@ -2061,23 +2251,28 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     ).get_call_presentation(call_event)
                 }
             )
+            call_event = self._recorded_tool_call_event(call_event)
             self._record_tool_call_presentation(call_event)
             yield call_event
             async for event in self._process_one_tool_call(tool_call):
                 yield event
 
     async def _perform_llm_turn(self) -> AsyncGenerator[BaseEvent, None]:
-        if self.enable_streaming:
-            async for event in self._stream_assistant_events():
-                yield event
-        else:
-            assistant_event = await self._get_assistant_event()
-            if assistant_event.content:
-                yield assistant_event
+        await self._settle_steering_injections()
+        self._execution_message = None
+        try:
+            if self.enable_streaming:
+                async for event in self._stream_assistant_events():
+                    yield event
+            else:
+                assistant_event = await self._get_assistant_event()
+                if assistant_event.content:
+                    yield assistant_event
 
-        last_message = self.messages[-1]
-
-        parsed = self.format_handler.parse_message(last_message)
+            last_message = self._execution_message or self.messages[-1]
+            parsed = self.format_handler.parse_message(last_message)
+        finally:
+            self._execution_message = None
         resolved = self.format_handler.resolve_tool_calls(parsed, self.tool_manager)
 
         if not resolved.tool_calls and not resolved.failed_calls:
@@ -2106,12 +2301,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 tool_name=tc.function.name,
                 tool_class=tool_class,
             )
-            yield event.model_copy(
-                update={
-                    "presentation": ToolUIDataAdapter(
-                        tool_class, harness_files=self.harness_files
-                    ).get_call_presentation(event)
-                }
+            yield self._recorded_tool_call_event(
+                event.model_copy(
+                    update={
+                        "presentation": ToolUIDataAdapter(
+                            tool_class, harness_files=self.harness_files
+                        ).get_call_presentation(event)
+                    }
+                )
             )
 
     async def _stream_assistant_events(
@@ -2131,11 +2328,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 yield ReasoningEvent(
                     content=chunk.message.reasoning_content,
                     message_id=reasoning_message_id,
+                    posted_at=chunk.message.posted_at,
                 )
 
             if chunk.message.content:
                 yield AssistantEvent(
-                    content=chunk.message.content, message_id=message_id
+                    content=chunk.message.content,
+                    message_id=message_id,
+                    posted_at=chunk.message.posted_at,
                 )
 
             for event in self._build_tool_call_events(
@@ -2149,6 +2349,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         return AssistantEvent(
             content=llm_result.message.content or "",
             message_id=llm_result.message.message_id,
+            posted_at=llm_result.message.posted_at,
         )
 
     async def _handle_tool_calls(
@@ -2187,6 +2388,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     ).get_call_presentation(event)
                 }
             )
+            event = self._recorded_tool_call_event(event)
             self._record_tool_call_presentation(event)
             yield event
 
@@ -2195,6 +2397,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         ) as events:
             async for event in events:
                 yield event
+
+    def _recorded_tool_call(self, tool_call: ToolCall) -> ToolCall:
+        with secret_redaction.bind_policy(self.scrub_policy):
+            return secret_redaction.sanitize_recorded_tool_call(tool_call)
+
+    def _recorded_tool_call_event(self, event: ToolCallEvent) -> ToolCallEvent:
+        with secret_redaction.bind_policy(self.scrub_policy):
+            return secret_redaction.sanitize_recorded_tool_call(event)
 
     def _record_tool_call_presentation(self, event: ToolCallEvent) -> None:
         if event.presentation is None:
@@ -2234,6 +2444,94 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
     ) -> list[None | BaseException]:
         return await asyncio.gather(*tasks, return_exceptions=True)
 
+    def outstanding_wait_call_ids(self, turn_id: str) -> tuple[str, ...]:
+        return tuple(
+            call_id
+            for (identity, call_id), invocation in self._tool_invocations.items()
+            if identity == turn_id and invocation.is_wait and not invocation.task.done()
+        )
+
+    def is_waiting_only(self, turn_id: str) -> bool:
+        live = [
+            invocation
+            for (identity, _), invocation in self._tool_invocations.items()
+            if identity == turn_id and not invocation.task.done()
+        ]
+        return bool(live) and all(
+            invocation.is_wait
+            and not invocation.task.cancelling()
+            and not invocation.steering_cancel_requested
+            and invocation.wait_task is not None
+            and not invocation.wait_task.done()
+            and not invocation.wait_task.cancelling()
+            for invocation in live
+        )
+
+    def cancel_outstanding_waits_for_steering(self, turn_id: str) -> tuple[str, ...]:
+        cancelled = []
+        for (identity, call_id), invocation in self._tool_invocations.items():
+            wait = invocation.wait_task
+            if identity != turn_id or not invocation.is_wait:
+                continue
+            if invocation.task.done() or invocation.task.cancelling():
+                continue
+            if (
+                invocation.steering_cancel_requested
+                or wait is None
+                or wait.done()
+                or wait.cancelling()
+            ):
+                continue
+            invocation.steering_cancel_requested = True
+            wait.cancel()
+            cancelled.append(call_id)
+        self._publish_wait_state(turn_id)
+        return tuple(cancelled)
+
+    def _publish_wait_state(self, turn_id: str) -> None:
+        if turn_id != self._turn.turn_id:
+            return
+        waiting_only = self.is_waiting_only(turn_id)
+        if waiting_only != self._waiting_only:
+            self._waiting_only = waiting_only
+            if self._tool_event_queue is not None:
+                self._tool_event_queue.put_nowait(
+                    ToolWaitStateChangedEvent(
+                        turn_id=turn_id, waiting_only=waiting_only
+                    )
+                )
+
+    def _register_wait_task(
+        self, key: tuple[str, str], task: asyncio.Task[TaskResult] | None
+    ) -> None:
+        if (invocation := self._tool_invocations.get(key)) is not None:
+            invocation.wait_task = task
+            self._publish_wait_state(key[0])
+
+    def _is_steering_cancellation(self, call_id: str) -> bool:
+        invocation = self._tool_invocations.get((self._turn.turn_id, call_id))
+        task = asyncio.current_task()
+        return (
+            invocation is not None
+            and invocation.steering_cancel_requested
+            and task is not None
+            and not task.cancelling()
+        )
+
+    @staticmethod
+    async def _cancel_and_join_tool_tasks(tasks: list[asyncio.Task[None]]) -> bool:
+        for task in tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        joined = asyncio.gather(*tasks, return_exceptions=True)
+        interrupted = False
+        while not joined.done():
+            try:
+                await asyncio.shield(joined)
+            except asyncio.CancelledError:
+                interrupted = True
+        return interrupted
+
     async def _run_tools_concurrently(
         self, tool_calls: list[ResolvedToolCall]
     ) -> AsyncGenerator[BaseEvent]:
@@ -2251,10 +2549,17 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._admitted_tool_policies.update(
             (tc.call_id, redaction_snapshot) for tc in tool_calls
         )
-        tasks = [
-            asyncio.create_task(self._execute_tool_to_queue(tc, queue, admitted))
-            for tc in tool_calls
-        ]
+        turn_id = self._turn.turn_id
+        keys = [(turn_id, tc.call_id) for tc in tool_calls]
+        tasks = []
+        for tc, key in zip(tool_calls, keys, strict=True):
+            task = asyncio.create_task(
+                self._execute_tool_to_queue(tc, queue, admitted, key)
+            )
+            tasks.append(task)
+            self._tool_invocations[key] = _ToolInvocation(
+                task=task, is_wait=issubclass(tc.tool_class, WaitForAgent)
+            )
 
         async def _signal_when_all_done() -> None:
             try:
@@ -2291,28 +2596,37 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         finally:
             # Closing the event stream must join tools before act() releases its
             # active-turn guard, just as cancellation and normal completion do.
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            interrupted = await self._cancel_and_join_tool_tasks(tasks)
+            for key in keys:
+                self._tool_invocations.pop(key, None)
+            self._publish_wait_state(turn_id)
             self._request_broker.unbind(queue)
             self._tool_event_queue = None
             if not monitor.done():
                 monitor.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await monitor
+            if interrupted:
+                raise asyncio.CancelledError
 
     async def _execute_tool_to_queue(
         self,
         tc: ResolvedToolCall,
         queue: asyncio.Queue[BaseEvent | None],
         admitted: secret_redaction.ScrubPolicy,
+        key: tuple[str, str],
     ) -> None:
         """Run a single tool call under its admission policy, sending events to the queue."""
-        with secret_redaction.bind_policy(admitted):
-            async with contextlib.aclosing(self._process_one_tool_call(tc)) as events:
-                async for event in events:
-                    await queue.put(event)
+        try:
+            with secret_redaction.bind_policy(admitted):
+                async with contextlib.aclosing(
+                    self._process_one_tool_call(tc)
+                ) as events:
+                    async for event in events:
+                        await queue.put(event)
+        finally:
+            self._tool_invocations.pop(key, None)
+            self._publish_wait_state(key[0])
 
     async def _process_one_tool_call(
         self, tool_call: ResolvedToolCall
@@ -2352,6 +2666,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
         decision: ToolDecision | None = None
         tool_started = False
+        timing = InvocationTiming()
         try:
             decision = await self._should_execute_tool(
                 tool_instance, tool_call.validated_args
@@ -2364,11 +2679,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
             tool_started = True
             async for ev in self._invoke_tool(
-                tool_call, tool_instance, tool_input, decision
+                tool_call, tool_instance, tool_input, decision, timing
             ):
                 yield ev
 
         except asyncio.CancelledError:
+            steering = self._is_steering_cancellation(tool_call.call_id)
+            timing.finish()
             cancel = str(
                 get_user_cancellation_message(CancellationReason.TOOL_INTERRUPTED)
             )
@@ -2383,15 +2700,24 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 tool_class=tool_call.tool_class,
                 error=cancel,
                 cancelled=True,
+                cancellation_origin=(
+                    ToolCancellationOrigin.STEERING if steering else None
+                ),
+                duration=timing.duration,
                 tool_call_id=tool_call.call_id,
             )
             async for ev in self._finalize_cancelled_tool(
-                tool_call, tool_input, cancel, tool_started=tool_started
+                tool_call,
+                tool_input,
+                cancel,
+                tool_started=tool_started,
+                duration=timing.duration,
             ):
                 yield ev
             raise
 
         except Exception as exc:
+            timing.finish()
             # One prefix for both: the model reads `error`, the client `display`.
             failure = f"{tool_instance.get_name()} failed: "
             error_msg = f"<{TOOL_ERROR_TAG}>{failure}{exc}</{TOOL_ERROR_TAG}>"
@@ -2415,6 +2741,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 tool_name=tool_call.tool_name,
                 tool_class=tool_call.tool_class,
                 error=error_msg,
+                duration=timing.duration,
                 error_display=(
                     f"{failure}{exc.display}" if isinstance(exc, ToolError) else None
                 ),
@@ -2427,6 +2754,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     tool_status="failure",
                     response_status="failure",
                     tool_error=str(exc),
+                    duration_ms=timing.duration_ms,
+                    duration=timing.duration,
                     initial_text=error_msg,
                 ),
             ):
@@ -2438,6 +2767,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         tool_instance: BaseTool,
         tool_input: dict[str, Any],
         decision: ToolDecision,
+        timing: InvocationTiming,
     ) -> AsyncGenerator[ToolResultEvent | ToolStreamEvent | HookEvent]:
         self.stats.tool_calls_agreed += 1
 
@@ -2447,7 +2777,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if snapshot is not None:
             self.checkpoint_recorder.add_snapshot(snapshot)
 
-        start_time = time.perf_counter()
+        timing.start()
         logger.debug(
             "Tool call starting tool=%s tool_call_id=%s",
             tool_call.tool_name,
@@ -2477,6 +2807,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 mcp_pool=self._mcp_pool,
                 tool_io=self._turn.tool_io,
                 is_subagent=self._is_subagent,
+                register_wait_task=lambda task, key=(self._turn.turn_id, tool_call.call_id): (
+                    self._register_wait_task(key, task)
+                ),
             ),
             **tool_call.args_dict,
         ):
@@ -2485,7 +2818,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             else:
                 result_model = item
 
-        duration = time.perf_counter() - start_time
+        duration = timing.finish()
+        assert duration is not None
         if result_model is None:
             raise ToolError("Tool did not yield a result")
 
@@ -2527,6 +2861,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 tool_presentation=result_event.presentation,
                 images=images,
                 duration_ms=duration * 1000.0,
+                duration=duration,
                 initial_text=text,
             ),
         ):
@@ -2670,6 +3005,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         tools: list[AvailableTool] | None,
         tool_choice: StrToolChoice | AvailableTool | None,
         call_type: str | None = None,
+        account_conversation: bool = True,
+        purpose: UsagePurpose = UsagePurpose.CONVERSATION,
     ) -> CompletionInputs:
         provider = self.config.get_provider_for_model(model)
         return CompletionInputs(
@@ -2682,13 +3019,53 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             extra_headers=self._get_extra_headers(provider),
             metadata=self._build_backend_metadata(call_type),
             max_tokens=self._max_tokens,
+            account_conversation=account_conversation,
+            purpose=purpose,
         )
 
-    def _call_resources(self, backend: BackendLike) -> CallResources:
+    def _call_resources(
+        self, backend: BackendLike, budget: RequestRetryBudget | None = None
+    ) -> CallResources:
+        if budget is None:
+            budget = RequestRetryBudget(self.config.api_retry_max_elapsed_time)
+        owner = self.accounting_owner
+        sink = getattr(self, "_accounting_sink", None)
+        attribution = getattr(self, "_usage_attribution", None)
+        if owner is not None:
+            sink = owner.writer
+            model = self.config.get_active_model()
+            attribution = UsageAttribution(
+                root_session_id=owner.root_session_id,
+                session_id=self.session_id,
+                parent_session_id=self.parent_session_id,
+                agent_role="subagent" if self._is_subagent else "root",
+                agent_profile=self.launch_profile,
+                project_key=owner.project_key,
+                model=model.alias,
+                provider=model.provider,
+                wire_name=model.name,
+            )
+        # The gateway freezes the actual attempt's deployment, purpose and prices;
+        # this binding freezes session identity even if a later rebind replaces it.
         return CallResources(
             backend=backend,
             stats=self.stats,
             process_message=self.format_handler.process_api_response_message,
+            accounting_sink=sink,
+            usage_attribution=attribution,
+            retry_budget=budget,
+            on_retry=self.notice_retry,
+            admit_replay=self._admit_empty_replay,
+        )
+
+    def _admit_empty_replay(self) -> bool:
+        if self._max_session_tokens is not None and (
+            self.stats.session_total_llm_tokens > self._max_session_tokens
+        ):
+            return False
+        return self._max_price is None or (
+            self.stats.known_cost_total <= self._max_price
+            and not self.stats.has_unknown_cost
         )
 
     def _append_transcript(self, outcome: TranscriptAppend) -> None:
@@ -2697,7 +3074,23 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             message = message.model_copy(
                 update={"deployment_identity": outcome.committed_model.model_dump()}
             )
+        if message.tool_calls:
+            self._execution_message = message
+            message = message.model_copy(
+                update={
+                    "tool_calls": [
+                        self._recorded_tool_call(tc) for tc in message.tool_calls
+                    ]
+                }
+            )
         self.messages.append(message)
+        if (
+            self._active_turn is not None
+            and message.role is Role.assistant
+            and message.content
+            and message.message_id is not None
+        ):
+            self._active_turn.prose_ids.append(message.message_id)
 
     def completion_metadata_mark(self) -> tuple[int, int]:
         """Return a cursor for completion visibility produced after this point."""
@@ -2883,8 +3276,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         transcript: bool,
         streaming: bool,
         fallback_model: ModelConfig,
+        account_conversation: bool = True,
+        purpose: UsagePurpose = UsagePurpose.CONVERSATION,
     ) -> AsyncGenerator[LLMChunk]:
         """Run one shared preparation/publication/rollback attempt lifecycle."""
+        budget = RequestRetryBudget(self.config.api_retry_max_elapsed_time)
         candidates = self._failover_candidates(
             messages, fallback_model, call_type=call_type
         )
@@ -2895,11 +3291,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 tools=tools,
                 tool_choice=tool_choice,
                 call_type=call_type,
+                account_conversation=account_conversation,
+                purpose=purpose,
             )
             provider_name = self.config.get_provider_for_model(fallback_model).name
             try:
                 with self._backend_lifetime.borrow() as backend:
-                    resources = self._call_resources(backend)
+                    resources = self._call_resources(backend, budget)
                     if streaming:
                         stream = self._llm_gateway.chat_streaming(
                             inputs, resources, transcript=self._append_transcript
@@ -2917,7 +3315,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 self._record_completion_providers((provider_name,))
             return
 
-        budget = RequestRetryBudget(self.config.api_retry_max_elapsed_time)
         registry = self.config_orchestrator.availability_registry
         last_error: BaseException | None = None
         attempted: set[str] = set()
@@ -2944,6 +3341,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                         tools=tools,
                         tool_choice=tool_choice,
                         call_type=call_type,
+                        account_conversation=account_conversation,
+                        purpose=purpose,
                     )
                 except BaseException:
                     if replacement is not None:
@@ -2976,7 +3375,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     self.committed_model = failover_identity
                     self.config.attach_committed_model(self.committed_model)
                     with self._backend_lifetime.borrow() as backend:
-                        resources = self._call_resources(backend)
+                        resources = self._call_resources(backend, budget)
                         if streaming:
                             stream = self._llm_gateway.chat_streaming(
                                 inputs, resources, transcript=transcript_sink
@@ -3061,6 +3460,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         call_type: str | None,
         transcript: bool,
         fallback_model: ModelConfig,
+        account_conversation: bool = True,
+        purpose: UsagePurpose = UsagePurpose.CONVERSATION,
     ) -> LLMChunk:
         result: LLMChunk | None = None
         async for chunk in self._attempt_completion(
@@ -3071,6 +3472,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             transcript=transcript,
             streaming=False,
             fallback_model=fallback_model,
+            account_conversation=account_conversation,
+            purpose=purpose,
         ):
             result = chunk
         if result is None:
@@ -3085,6 +3488,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         tools: list[AvailableTool] | None,
         tool_choice: StrToolChoice | AvailableTool | None,
         call_type: str | None,
+        account_conversation: bool = True,
+        purpose: UsagePurpose = UsagePurpose.CONVERSATION,
     ) -> LLMChunk:
         return await self._attempt_nonstreaming(
             messages=messages,
@@ -3093,6 +3498,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             call_type=call_type,
             transcript=False,
             fallback_model=model,
+            account_conversation=account_conversation,
+            purpose=purpose,
         )
 
     async def _chat(
@@ -3207,6 +3614,17 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             else None
         )
         try:
+            owner = self.accounting_owner
+            if (
+                owner is not None
+                and not self._is_subagent
+                and owner.root_session_id != session_id
+            ):
+                if owner.owner_factory is None:
+                    raise ValueError(
+                        "Prepare accounting ownership before resetting a root"
+                    )
+                owner = owner.owner_factory(session_id, owner.project_key)
             self.session_logger.reset_session(
                 session_id, parent_session_id=parent_session_id
             )
@@ -3214,6 +3632,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             if lease is not None:
                 await asyncio.to_thread(lease.release)
             raise
+        # Old invocation resources remain bound to the old process-owned writer.
+        # Retain cancelled title producers just as on resume/rebind.
+        title_task = self._auto_title_task
+        if self.accounting_owner is not None and title_task is not None:
+            self._detached_accounting_producers.add(title_task)
+            title_task.add_done_callback(self._detached_accounting_producers.discard)
+        self.accounting_owner = owner
         self._session_generation += 1
         self.session_id = session_id
         self.parent_session_id = parent_session_id
@@ -3240,6 +3665,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         parent_session_id: str | None = None,
         stats: AgentStats | None = None,
         prepared_scratchpad: Path | None | _PrepareScratchpad = _PREPARE_SCRATCHPAD,
+        accounting_owner: RootAccountingOwner | None = None,
     ) -> None:
         """Swap session identity in-place, reusing expensive runtime infrastructure.
 
@@ -3259,7 +3685,17 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         the loop untouched. A bug in any commit step would leave the loop
         half-rebound; callers should treat an unexpected raise as fatal.
         """
-        # Prepare without mutating the live loop.
+        # Prepare without mutating the live loop. Enabled root accounting must
+        # have its replacement allocated by the runtime before this sync boundary.
+        owner = accounting_owner or self.accounting_owner
+        if owner is not None:
+            if not self._is_subagent and owner.root_session_id != session_id:
+                raise ValueError("Prepare accounting ownership before rebinding a root")
+            if (
+                self.accounting_owner is not None
+                and owner.root_session_id == self.accounting_owner.root_session_id
+            ):
+                owner = self.accounting_owner
         previous_scratchpad = self.scratchpad_dir
         scratchpad_dir = (
             self.prepare_scratchpad_for_session(session_id)
@@ -3267,7 +3703,20 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             else prepared_scratchpad
         )
 
+        # A child borrows access through ToolManager, never directory ownership.
+        if self._is_subagent and scratchpad_dir is not None:
+            raise ValueError("Child sessions cannot own a prepared scratchpad")
+
+        # Retain title work before reset drops its reference. Cancellation is not
+        # settlement: its frozen sink may still submit after this rebind. The old
+        # writer stays process-owned; retirement requires producer settlement.
+        title_task = self._auto_title_task
+        if self.accounting_owner is not None and title_task is not None:
+            self._detached_accounting_producers.add(title_task)
+            title_task.add_done_callback(self._detached_accounting_producers.discard)
+
         # Commit — assignments and in-place resets only, from here on infallible.
+        self.accounting_owner = owner
         self._session_generation += 1
         self.session_id = session_id
         self.parent_session_id = parent_session_id
@@ -3330,6 +3779,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         await self.session_logger.save_interaction(
             self.messages, self.stats, self.config, self.tool_manager, None
         )
+        # Prepare and commit the new root binding before clearing live history.
+        await self._reset_session(keep_parent=False)
         self.messages.reset(self.messages[:1])
 
         self.stats = AgentStats.create_fresh(self.stats)
@@ -3338,7 +3789,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
         self.middleware_pipeline.reset()
         self.tool_manager.reset_all()
-        await self._reset_session(keep_parent=False)
 
     @requires_init
     async def compact(self, extra_instructions: str = "") -> str:
@@ -3702,6 +4152,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             harness_files=self.harness_files,
             scratchpad_dir=self.scratchpad_dir,
         )
+        manager.set_instruction_read_files(previous_manager._instruction_read_files)
         for name in manager.registered_tools:
             manager.get_tool_config(name)
         for name in previous_manager._instances.keys() & manager.available_tools.keys():
@@ -3955,7 +4406,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             self._mcp_pool = self._create_mcp_pool()
         if adopt_skills:
             self.skill_manager = prepared.skill_manager
-        self.messages.update_system_prompt(system_prompt)
+        self._publish_system_prompt(system_prompt)
         self._hook_config_result = prepared.hook_config_result
         self._hooks_manager = hooks_manager
         self.hook_config_issues = (

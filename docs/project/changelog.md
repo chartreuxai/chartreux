@@ -2,7 +2,84 @@
 
 All notable changes to Chartreux are documented in this file.
 
-## 0.4.1 (unreleased)
+## 0.4.2
+
+### Added
+
+- A customizable bottom status line with ordered directory, PID, model, context,
+  cached Git branch, and spend segments. Settings includes a state-cycler editor
+  with reordering, a live example preview, batch Apply changes, and saved-override
+  removal.
+- An independent local usage ledger for conversation, subagent, compaction, title,
+  and pre-session worktree-naming calls, with captured USD catalog prices and
+  explicit unknown-cost and coverage states. Records survive session deletion
+  and logging-disabled sessions; linked worktrees count as one project.
+- A read-only `/usage` browser with local calendar Day/Week/Month windows,
+  All projects/Current project filters, token breakdowns, deployment details,
+  and explicit refresh. Status-line spend segments now show global recorded
+  estimates; host-level `usage/read` and `usage/updated` expose the same accounting.
+- Persisted message posting times, shown as absolute local times with a date for
+  older messages, plus settled per-tool durations and whole-turn totals on the
+  last assistant message. Timing displays are static and can be hidden together.
+- Run-scoped subagent cancellation through the orchestrator's `cancel_agent` tool
+  and retasking through `task(replace_run=True)`, retaining the same conversation
+  even at capacity. The agent browser offers C-key stopping with inline
+  `[Stop run][Cancel]` confirmation and a Stopping state. Typed stop reasons
+  distinguish user cancellation, orchestrator cancellation, and retasking, with
+  partial output preserved and no parent auto-wake on user cancellation.
+- Subagents can read their injected instruction files, including `AGENTS.md`,
+  through `read_file` and exact-file `grep`, even outside workspace roots. This
+  grants no directory or write access and preserves tool denials and sensitive-file
+  protections.
+- Immediate steering when the main agent is only waiting on subagents: submitted
+  messages cancel outstanding waits, not the subagents, and reach the model in
+  the same turn. Admission is server-enforced, delivery receipts are idempotent,
+  and recovery treats uncertain delivery conservatively.
+
+### Changed
+
+- The agent browser is a docked ten-row sheet with a retained Main row, stable
+  ordering, single-click output opening, two detail rows, full Details for Main
+  and subagents, local F1 help, and a keyboard-action footer.
+- Agent states use static markers and distinguish Running, Compacting, Finishing
+  with outcome, Idle, Failed, Cancelled, Budget stopped, and Evicted. Details
+  show running/last-run and idle durations.
+- Context usage displays without a label, for example `135k/400k (34%)`, using
+  the effective compaction threshold as the denominator. Deployment thresholds
+  must be positive whole integers.
+- Message headers contain metadata only, without role labels. User messages use
+  a `>` marker and accent tint; tool-group folding includes timing when enabled.
+- Chrome uses `+`/`-` disclosure glyphs only on actionable controls and `v` for
+  ASCII success markers.
+- The Task tool selects profiles through `agent_type` instead of `agent`, with
+  separate instance handles and explicit reuse guidance.
+- The navigation contract specifies bounded arrows within composite-browser
+  groups, Tab between groups, per-control Enter roles, Space toggles, single-owner
+  Escape, equivalent mouse outcomes, and identity-based focus repair.
+- Exit confirmation defaults to Cancel and requires explicit Exit. MCP has
+  bounded navigation, pointer enable/disable controls, and opener restoration;
+  Provider Settings adds Tab/Shift+Tab groups and separate Details click targets.
+- The log-level picker edits session and config drafts symmetrically with a
+  visible Apply action. The debug console supports keyboard row selection and
+  scoped Escape; question acceptance clicks follow the same guards as Enter.
+
+### Fixed
+
+- Compaction summary calls no longer overwrite conversation context usage.
+- Test failures no longer dump process environments.
+- Empty assistant responses receive one bounded replay before typed
+  `EmptyLLMResponseError` or `IncompleteLLMResponseError` terminal failures.
+  Streaming never replays after publication, and subagent runs without final
+  prose report `FAILED` with stop reason `ERROR` rather than empty success.
+- Subagents inherit scratchpad access through the parent-authority chain,
+  failing closed on broken authority, symlink escapes, or root retargeting.
+- Shell policy checks modeled executor boundaries through a shared registry.
+  Recursive `rm` remains gated, with diagnostics naming the offending option
+  and the file-by-file removal plus `rmdir` alternative.
+- Credential redaction covers tool events and child environments; fallback
+  logging never emits credential-bearing exception text.
+
+## 0.4.1
 
 ### Added
 

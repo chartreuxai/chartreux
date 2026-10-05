@@ -10,8 +10,8 @@ from chartreux.app_server.models import (
     SessionLogSummary,
 )
 from chartreux.cli.textual_ui.app import ChartreuxApp
-from chartreux.cli.textual_ui.widgets.context_progress import ContextProgress
 from chartreux.cli.textual_ui.widgets.messages import UserCommandMessage
+from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLine
 from tests.cli.textual_ui.test_history_grouping import _message
 from tests.conftest import build_test_chartreux_app
 
@@ -158,7 +158,7 @@ async def test_clear_history_empties_the_context_gauge(
         _set_session_log(chartreux_app, enabled=True, persisted=True)
         _fill_context_gauge(chartreux_app)
         assert (
-            chartreux_app.query_one(ContextProgress).tokens.current_tokens
+            chartreux_app.query_one(SessionStatusLine).state.context_tokens
             == _SPENT_TOKENS
         )
         chartreux_app.app_server.clear_history = AsyncMock(
@@ -172,9 +172,10 @@ async def test_clear_history_empties_the_context_gauge(
         await chartreux_app._clear_history()
 
         # Assert
-        widget = chartreux_app.query_one(ContextProgress)
-        assert widget.tokens.current_tokens == 0
-        assert widget.tokens.max_tokens == _CONTEXT_WINDOW
+        widget = chartreux_app.query_one(SessionStatusLine)
+        assert widget.state.context_tokens == 0
+        assert widget.state.auto_compact_threshold == _CONTEXT_WINDOW
+        assert "0/200k (0%)" in widget.render().plain
 
 
 @pytest.mark.asyncio
@@ -210,7 +211,7 @@ async def test_clear_history_leaves_the_gauge_alone_when_clear_fails(
         await chartreux_app._clear_history()
 
         assert (
-            chartreux_app.query_one(ContextProgress).tokens.current_tokens
+            chartreux_app.query_one(SessionStatusLine).state.context_tokens
             == _SPENT_TOKENS
         )
 

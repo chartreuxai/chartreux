@@ -1,18 +1,35 @@
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import pytest
 
+from chartreux.core.agent_loop.errors import EmptyLLMResponseError
+from chartreux.core.agent_loop.llm_gateway import apply_usage
 from chartreux.core.compaction import CompactionFailedError, CompactionManager
 from chartreux.core.compaction.context import (
     parse_previous_user_messages,
     render_compaction_context,
 )
 from chartreux.core.errors import ContextTooLongError
-from chartreux.core.llm_models import FunctionCall, LLMChunk, LLMMessage, Role, ToolCall
+from chartreux.core.llm_models import (
+    FunctionCall,
+    LLMChunk,
+    LLMMessage,
+    Role,
+    StopInfo,
+    ToolCall,
+)
 from chartreux.core.message_list import MessageList
 from chartreux.core.session_types import AgentStats
-from tests.conftest import build_test_vibe_config, make_test_models
+from chartreux.core.usage import UsagePurpose
+from tests.conftest import (
+    build_test_agent_loop,
+    build_test_vibe_config,
+    make_test_models,
+)
 from tests.mock.utils import mock_llm_chunk
+from tests.stubs.fake_backend import FakeBackend
 
 
 class _FakeComplete:
@@ -25,7 +42,18 @@ class _FakeComplete:
         self._stats = stats
         self.calls: list[dict] = []
 
-    async def __call__(self, *, model, messages, tools, tool_choice, call_type):
+    async def __call__(
+        self,
+        *,
+        model,
+        messages,
+        tools,
+        tool_choice,
+        call_type,
+        account_conversation,
+        purpose: UsagePurpose = UsagePurpose.CONVERSATION,
+    ):
+        assert account_conversation is False
         self.calls.append({
             "model": model,
             "messages": list(messages),
@@ -37,8 +65,13 @@ class _FakeComplete:
         if isinstance(item, Exception):
             raise item
         if item.usage is not None:
-            self._stats.session_prompt_tokens += item.usage.prompt_tokens
-            self._stats.session_completion_tokens += item.usage.completion_tokens
+            apply_usage(
+                self._stats,
+                item.usage,
+                time_seconds=1.0,
+                model=model,
+                account_conversation=account_conversation,
+            )
         return item
 
 
@@ -88,6 +121,112 @@ def _conversation() -> MessageList:
         LLMMessage(role=Role.assistant, content="work"),
         LLMMessage(role=Role.user, content="newest ask"),
     ])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict", [False, True])
+async def test_typed_empty_summary_preserves_existing_fallback(strict, monkeypatch):
+    stats = AgentStats(context_tokens=80, last_turn_prompt_tokens=70)
+    messages = _conversation()
+    manager, complete = _build_manager(
+        [
+            EmptyLLMResponseError("test", "test"),
+            mock_llm_chunk(content="<summary>recovered</summary>"),
+        ],
+        messages=messages,
+        stats=stats,
+        raise_on_failure=strict,
+    )
+    success = Mock()
+    monkeypatch.setattr(
+        "chartreux.core.compaction.manager.log_model_call_success", success
+    )
+    if strict:
+        with pytest.raises(CompactionFailedError, match="empty_summary"):
+            await manager.compact()
+        assert len(complete.calls) == 1
+        assert not success.called
+        assert stats.context_tokens == 80
+    else:
+        assert await manager.compact() == "recovered"
+        assert len(complete.calls) == 2
+        assert success.call_count == 1
+    assert stats.last_turn_prompt_tokens == 70
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover", [False, True])
+async def test_gateway_empty_primary_replays_then_uses_only_existing_fallback(
+    recover, monkeypatch
+):
+    terminal = "<summary>recovered</summary>" if recover else ""
+    backend = FakeBackend([
+        [mock_llm_chunk(content=" ")],
+        [mock_llm_chunk(content="")],
+        [mock_llm_chunk(content=terminal)],
+        [mock_llm_chunk(content="")],
+    ])
+    agent = build_test_agent_loop(
+        config=build_test_vibe_config(raise_on_compaction_failure=False),
+        backend=backend,
+    )
+    agent.stats.context_tokens = 80
+    agent.stats.last_turn_prompt_tokens = 70
+    agent.stats.last_turn_completion_tokens = 10
+    success = Mock()
+    monkeypatch.setattr(
+        "chartreux.core.compaction.manager.log_model_call_success", success
+    )
+    before = list(agent.messages)
+    if recover:
+        assert await agent.compact() == "recovered"
+        assert success.call_count == 1
+        assert len(backend.requests_messages) == 3
+    else:
+        with pytest.raises(CompactionFailedError, match="empty_summary"):
+            await agent.compact()
+        assert not success.called
+        assert list(agent.messages) == before
+        assert agent.stats.context_tokens == 80
+        assert len(backend.requests_messages) == 4
+        assert backend.requests_messages[2] == backend.requests_messages[3]
+    assert backend.requests_messages[0] == backend.requests_messages[1]
+    assert backend.requests_metadata[0] == backend.requests_metadata[1]
+    assert backend.requests_messages[0] != backend.requests_messages[2]
+    assert agent.stats.last_turn_prompt_tokens == 70
+    assert agent.stats.last_turn_completion_tokens == 10
+    assert agent.stats.session_prompt_tokens == 10 * len(backend.requests_messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover", [False, True])
+async def test_gateway_empty_incomplete_summary_uses_existing_fallback(recover):
+    incomplete = mock_llm_chunk(content="").model_copy(
+        update={"stop": StopInfo(reason="incomplete")}
+    )
+    fallback = (
+        mock_llm_chunk(content="<summary>recovered</summary>")
+        if recover
+        else incomplete
+    )
+    backend = FakeBackend([[incomplete], [fallback]])
+    agent = build_test_agent_loop(
+        config=build_test_vibe_config(raise_on_compaction_failure=False),
+        backend=backend,
+    )
+    agent.stats.context_tokens = 80
+    before = list(agent.messages)
+    if recover:
+        assert await agent.compact() == "recovered"
+    else:
+        with pytest.raises(CompactionFailedError) as exc_info:
+            await agent.compact()
+        assert exc_info.value.reason == "empty_summary"
+        assert list(agent.messages) == before
+        assert agent.stats.context_tokens == 80
+    assert len(backend.requests_messages) == 2
+    assert backend.requests_tools[1] is None
+    assert backend.requests_messages[0] != backend.requests_messages[1]
 
 
 @pytest.mark.asyncio
@@ -255,7 +394,7 @@ async def test_overflow_fails_when_only_compaction_boundary_is_trimmable() -> No
         LLMMessage(role=Role.user, content="latest ask"),
     ])
     original = list(messages)
-    stats = AgentStats()
+    stats = AgentStats(context_tokens=1234)
     manager, complete = _build_manager(
         [ContextTooLongError("p", "m")],
         messages=messages,
@@ -268,6 +407,7 @@ async def test_overflow_fails_when_only_compaction_boundary_is_trimmable() -> No
 
     assert len(complete.calls) == 1
     assert list(messages) == original
+    assert stats.context_tokens == 1234
 
 
 @pytest.mark.asyncio
@@ -324,7 +464,7 @@ async def test_compaction_does_not_consume_turn_budget() -> None:
 async def test_live_messages_untouched_on_failure() -> None:
     messages = _conversation()
     original = list(messages)
-    stats = AgentStats()
+    stats = AgentStats(context_tokens=1234)
     manager, _ = _build_manager([RuntimeError("boom")], messages=messages, stats=stats)
 
     with pytest.raises(RuntimeError, match="boom"):
@@ -332,13 +472,14 @@ async def test_live_messages_untouched_on_failure() -> None:
 
     # Snapshot-based generation must never mutate the live list on failure.
     assert list(messages) == original
+    assert stats.context_tokens == 1234
 
 
 @pytest.mark.asyncio
 async def test_strict_mode_raises_on_primary_failure() -> None:
     messages = _conversation()
     original = list(messages)
-    stats = AgentStats()
+    stats = AgentStats(context_tokens=1234)
     manager, complete = _build_manager(
         [_tool_call_chunk()], messages=messages, stats=stats, raise_on_failure=True
     )
@@ -349,13 +490,14 @@ async def test_strict_mode_raises_on_primary_failure() -> None:
     assert exc_info.value.reason == "tool_call"
     assert len(complete.calls) == 1  # strict: no fallback
     assert list(messages) == original
+    assert stats.context_tokens == 1234
 
 
 @pytest.mark.asyncio
 async def test_terminal_failure_after_tool_call_preserves_context() -> None:
     messages = _conversation()
     original = list(messages)
-    stats = AgentStats()
+    stats = AgentStats(context_tokens=1234)
     manager, complete = _build_manager(
         [_tool_call_chunk(), mock_llm_chunk(content="no tags here")],
         messages=messages,
@@ -368,13 +510,14 @@ async def test_terminal_failure_after_tool_call_preserves_context() -> None:
     assert exc_info.value.reason == "tool_call"
     assert len(complete.calls) == 2
     assert list(messages) == original
+    assert stats.context_tokens == 1234
 
 
 @pytest.mark.asyncio
 async def test_terminal_failure_after_empty_summary_preserves_context() -> None:
     messages = _conversation()
     original = list(messages)
-    stats = AgentStats()
+    stats = AgentStats(context_tokens=1234)
     manager, complete = _build_manager(
         [mock_llm_chunk(content="no tags"), mock_llm_chunk(content="still none")],
         messages=messages,
@@ -386,3 +529,4 @@ async def test_terminal_failure_after_empty_summary_preserves_context() -> None:
 
     assert exc_info.value.reason == "empty_summary"
     assert list(messages) == original
+    assert stats.context_tokens == 1234

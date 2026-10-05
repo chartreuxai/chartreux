@@ -9,6 +9,7 @@ from chartreux.core.llm.utility_completion import run_utility_completion
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.prompts import UtilityPrompt
 from chartreux.core.session.title_policy import DEFAULT_TITLE_POLICY, TitlePolicy
+from chartreux.core.usage import AccountingSink, UsageAttribution, UsagePurpose
 
 _ELISION = "\n\n[…]\n\n"
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -23,6 +24,8 @@ async def generate_session_title(
     config: ChartreuxConfigSchema,
     previous_title: str | None = None,
     policy: TitlePolicy = DEFAULT_TITLE_POLICY,
+    accounting_sink: AccountingSink | None = None,
+    usage_attribution: UsageAttribution | None = None,
 ) -> str | None:
     """Ask a model for a concise title describing the session.
 
@@ -44,6 +47,9 @@ async def generate_session_title(
             max_tokens=policy.max_tokens,
             request_timeout_seconds=policy.request_timeout_seconds,
             retry_budget_seconds=policy.retry_budget_seconds,
+            accounting_sink=accounting_sink,
+            usage_attribution=usage_attribution,
+            purpose=UsagePurpose.TITLE,
         )
     return _clean_title(content, policy=policy)
 

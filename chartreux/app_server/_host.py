@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from functools import lru_cache
 import hashlib
@@ -52,6 +52,11 @@ from chartreux.app_server.protocol import (
     SessionRelocateResponse,
     SessionTitleUpdateParams,
     SessionTitleUpdateResponse,
+    UsageReadParams,
+    UsageReadResponse,
+    UsageUpdatedParams,
+    WorkspaceBranchReadParams,
+    WorkspaceBranchReadResponse,
     WorkspaceGitBranchChanges,
     WorkspaceGitCheckout,
     WorkspaceGitCheckoutsParams,
@@ -97,9 +102,15 @@ from chartreux.core.session.session_loader import SessionLoader
 from chartreux.core.session_types import SessionMetadata
 from chartreux.core.skills.manager import SkillManager
 from chartreux.core.skills.models import SkillSource
+from chartreux.core.usage import (
+    UsageAggregateSnapshot,
+    UsageService,
+    UsageServiceSnapshot,
+)
 from chartreux.observability.logging import logger
 
 _HOST_METHODS = frozenset({
+    "usage/read",
     "config/read",
     "config/schema",
     "session/delete",
@@ -114,10 +125,90 @@ _HOST_METHODS = frozenset({
     "workspace/trust/decision",
     "workspace/trust/untrustedConfig",
     "workspace/trust/status",
+    "workspace/git/branch",
     "workspace/git/checkouts",
     "workspace/git/worktrees/list",
     "workspace/git/worktrees/remove",
 })
+
+
+def workspace_branch_response(
+    params: WorkspaceBranchReadParams,
+) -> WorkspaceBranchReadResponse:
+    """Best-effort local probe; the caller runs this outside the event loop."""
+    response = WorkspaceBranchReadResponse(
+        session_id=params.session_id, cwd=params.cwd, status="unknown"
+    )
+    try:
+        with GitRepo.open(Path(params.cwd)) as repo:
+            response.branch = repo.branch()
+            response.status = "branch" if response.branch is not None else "detached"
+    except GitRepositoryNotFoundError:
+        response.status = "not_repository"
+    except Exception:
+        # Chrome must remain usable even when Git is unavailable or HEAD is broken.
+        logger.debug("Workspace branch lookup failed", exc_info=True)
+        response.branch = None
+        response.status = "unknown"
+    return response
+
+
+def project_usage(
+    snapshot: UsageServiceSnapshot, project_key: str | None = None
+) -> UsageReadResponse:
+    """Translate immutable accounting snapshots into the public wire vocabulary."""
+
+    def totals(value: UsageAggregateSnapshot) -> dict[str, Any]:
+        data = value.model_dump(mode="json")
+        return {
+            key: data[key]
+            for key in (
+                "state",
+                "input_tokens",
+                "output_tokens",
+                "cached_input_tokens",
+                "has_unknown_tokens",
+                "known_cost_usd",
+                "has_known_cost",
+                "has_unknown_cost",
+            )
+        } | {"requests": value.request_count}
+
+    summaries = {}
+    for summary in (
+        snapshot.summaries.day,
+        snapshot.summaries.week,
+        snapshot.summaries.month,
+    ):
+        window = summary.boundaries.kind
+        summaries[window] = (
+            totals(summary.totals)
+            | asdict(summary.boundaries)
+            | {
+                "timezone": snapshot.calendar.zone_name,
+                "currency": "USD",
+                "degraded": bool(summary.totals.warnings),
+            }
+        )
+        summaries[window].pop("kind")
+    return UsageReadResponse.model_validate({
+        "as_of": snapshot.as_of,
+        "revision": snapshot.revision,
+        "summaries": summaries,
+        "window": snapshot.window,
+        "models": [
+            totals(row)
+            | {"model": row.model, "provider": row.provider, "wire_name": row.wire_name}
+            for row in snapshot.models
+        ],
+        "components": {
+            "uncached_input": snapshot.selected.input.model_dump(mode="json"),
+            "cached_input": snapshot.selected.cached_input.model_dump(mode="json"),
+            "output": snapshot.selected.output.model_dump(mode="json"),
+        },
+        "project_key": project_key,
+        "warnings": [warning.model_dump(mode="json") for warning in snapshot.warnings],
+    })
 
 
 class HostRequestHandler:
@@ -125,14 +216,57 @@ class HostRequestHandler:
         self,
         harness_files: HarnessFilesManager,
         startup_issue: ConfigIssue | None = None,
+        *,
+        usage_service: UsageService | None = None,
+        usage_project_key: Callable[[str], str | None] | None = None,
     ) -> None:
         self._harness_files = harness_files
         self._startup_issue = startup_issue
+        self._usage_service = usage_service
+        self._usage_project_key = usage_project_key or (lambda _session_id: None)
+
+    def subscribe_usage(
+        self, callback: Callable[[UsageUpdatedParams], None]
+    ) -> Callable[[], None]:
+        if self._usage_service is None:
+            return lambda: None
+
+        def updated(snapshot: UsageServiceSnapshot) -> None:
+            response = project_usage(snapshot)
+            callback(
+                UsageUpdatedParams(
+                    as_of=response.as_of,
+                    revision=response.revision,
+                    summaries=response.summaries,
+                    degraded=bool(response.warnings),
+                )
+            )
+
+        return self._usage_service.subscribe(updated)
+
+    async def read_usage(
+        self, raw_params: dict[str, Any], root_session_id: str | None = None
+    ) -> DispatchResult:
+        params = validate_wire(UsageReadParams, raw_params)
+        if self._usage_service is None:
+            raise RequestFailure(
+                ProtocolErrorCode.INTERNAL_ERROR, "Usage service unavailable"
+            )
+        await self._usage_service.reconcile()
+        snapshot = await self._usage_service.aread(params.window, params.project_key)
+        project_key = (
+            self._usage_project_key(root_session_id)
+            if root_session_id is not None
+            else None
+        )
+        return DispatchResult(project_usage(snapshot, project_key))
 
     def handles(self, method: str) -> bool:
         return method in _HOST_METHODS
 
     async def dispatch(self, method: str, raw_params: dict[str, Any]) -> DispatchResult:
+        if method == "usage/read":
+            return await self.read_usage(raw_params)
         try:
             response = await self._dispatch(method, raw_params)
         except WorkspaceTrustError as exc:
@@ -284,6 +418,11 @@ class HostRequestHandler:
                     read_untrusted_config_dirs,
                     self._cwd(params.cwd),
                     self._harness_files.trust_store,
+                )
+            case "workspace/git/branch":
+                response = await asyncio.to_thread(
+                    workspace_branch_response,
+                    validate_wire(WorkspaceBranchReadParams, raw_params),
                 )
             case "workspace/git/worktrees/list":
                 params = validate_wire(WorkspaceWorktreeListParams, raw_params)

@@ -21,7 +21,9 @@ class RewindSnapshotApp(BaseSnapshotTestApp):
 
     def __init__(self) -> None:
         fake_backend = FakeBackend([
-            mock_llm_chunk(content="Hello! How can I help you?")
+            [mock_llm_chunk(content="Hello! How can I help you?")],
+            [mock_llm_chunk(content="I received your second message.")],
+            [mock_llm_chunk(content="I received your third message.")],
         ])
         super().__init__(backend=fake_backend)
 

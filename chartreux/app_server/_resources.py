@@ -716,7 +716,7 @@ class ResourceRequestHandler:
             backing_settings={
                 path: SettingDescriptorWire.model_validate(asdict(descriptor))
                 for path, descriptor in EDITABLE_BY_PATH.items()
-                if path.startswith(("enabled_", "disabled_"))
+                if path.startswith(("enabled_", "disabled_", "status_line."))
             },
             inventories=inventory_data[0],
             inventory_states=inventory_data[1],
@@ -767,11 +767,11 @@ class ResourceRequestHandler:
             stats=project_stats(self._agent_loop), context_window=self._context_window()
         )
 
-    def _context_window(self) -> int:
+    def _context_window(self) -> int | None:
         try:
             return self._agent_loop.config.get_active_model().auto_compact_threshold
         except ValueError:
-            return 0
+            return None
 
     def _diagnostics_list(
         self, params: DiagnosticsListParams

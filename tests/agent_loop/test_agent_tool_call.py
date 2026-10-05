@@ -23,7 +23,9 @@ from chartreux.core.hooks.models import HookToolDenial, HookToolInputRewrite
 from chartreux.core.llm.format import ResolvedToolCall
 from chartreux.core.llm_models import FunctionCall, LLMMessage, Role, ToolCall
 from chartreux.core.session.session_logger import SessionLogger
+from chartreux.core.skills.models import ParsedSkillCommand, SkillInfo
 from chartreux.core.subagents import TaskArgs
+from chartreux.core.timing import InvocationTiming, use_elapsed_clock
 from chartreux.core.tools.base import ToolPermission
 from chartreux.core.tools.builtins.task import Task
 from chartreux.core.tools.builtins.todo import TodoItem
@@ -476,6 +478,105 @@ async def test_tool_call_with_exceeding_max_todos() -> None:
     assert events[3].result is None
     assert "100" in events[3].error
     assert agent_loop.stats.tool_calls_failed == 1
+
+
+@pytest.mark.asyncio
+async def test_synthetic_skill_load_duration_is_measured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = build_test_agent_loop(
+        config=build_test_vibe_config(enabled_tools=["skill"]),
+        backend=FakeBackend(mock_llm_chunk(content="Done.")),
+    )
+    skill = SkillInfo(name="timed-skill", description="test", prompt="Do the thing.")
+    monkeypatch.setattr(
+        loop.skill_manager,
+        "parse_skill_command",
+        lambda _text: ParsedSkillCommand(name=skill.name, content=skill.prompt),
+    )
+    monkeypatch.setattr(loop.skill_manager, "get_skill", lambda _name: skill)
+    ticks = iter([5.0, 8.25])
+    with use_elapsed_clock(lambda: next(ticks)):
+        events = [event async for event in loop._inject_invoked_skill("/timed-skill")]
+    result = tool_result(events)
+    persisted = loop.messages[-1].tool_result
+    assert persisted is not None
+    assert result.duration == persisted.duration == 3.25
+
+
+@pytest.mark.parametrize("duration", [0.0, 0.123456789, 3.25])
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+@pytest.mark.asyncio
+async def test_tool_duration_is_frozen_and_persisted(
+    duration: float, outcome: str
+) -> None:
+    call = ToolCall(
+        id="timed", index=0, function=FunctionCall(name="stub_tool", arguments="{}")
+    )
+    loop = build_test_agent_loop(
+        config=build_test_vibe_config(enabled_tools=["stub_tool"]),
+        backend=FakeBackend([
+            [mock_llm_chunk(content="Calling.", tool_calls=[call])],
+            [mock_llm_chunk(content="Done.")],
+        ]),
+    )
+    loop.tool_manager._all_tools["stub_tool"] = FakeTool
+    tool = loop.tool_manager.get("stub_tool")
+    assert isinstance(tool, FakeTool)
+    if outcome == "failure":
+        tool._exception_to_raise = RuntimeError("failed")
+    elif outcome == "cancelled":
+        tool._exception_to_raise = asyncio.CancelledError()
+
+    # Turn start, tool start/end, turn settlement; no late tool resampling.
+    ticks = iter([0.0, 0.0, duration, duration])
+    with use_elapsed_clock(lambda: next(ticks)):
+        events = await act_and_collect_events(loop, "Execute tool")
+    result = tool_result(events)
+    persisted = next(m for m in loop.messages if m.tool_call_id == "timed").tool_result
+    assert persisted is not None
+    assert result.duration == persisted.duration == duration
+    assert persisted.cancelled is (outcome == "cancelled")
+    if outcome != "success":
+        assert persisted.output == {}
+
+
+def test_invocation_timing_unknown_zero_and_idempotence() -> None:
+    timing = InvocationTiming()
+    assert timing.finish() is None
+    assert timing.duration_ms is None
+    with use_elapsed_clock(lambda: 0.0):
+        timing.start()
+        assert timing.finish() == 0.0
+    with use_elapsed_clock(lambda: pytest.fail("frozen timing sampled again")):
+        assert timing.finish() == timing.duration_ms == 0.0
+
+
+@pytest.mark.asyncio
+async def test_snapshot_cancellation_has_unknown_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call = ToolCall(
+        id="snapshot", index=0, function=FunctionCall(name="stub_tool", arguments="{}")
+    )
+    loop = build_test_agent_loop(
+        config=build_test_vibe_config(enabled_tools=["stub_tool"]),
+        backend=FakeBackend([[mock_llm_chunk(content="Calling.", tool_calls=[call])]]),
+    )
+    loop.tool_manager._all_tools["stub_tool"] = FakeTool
+
+    def cancel_snapshot(*_args: object) -> None:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(FakeTool, "get_file_snapshot", cancel_snapshot)
+    ticks = iter([0.0, 1.0])  # Only the whole turn may start/settle.
+    with use_elapsed_clock(lambda: next(ticks)):
+        events = await act_and_collect_events(loop, "Execute tool")
+    assert tool_result(events).duration is None
+    persisted = next(
+        m for m in loop.messages if m.tool_call_id == "snapshot"
+    ).tool_result
+    assert persisted is None
 
 
 @pytest.mark.asyncio

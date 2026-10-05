@@ -5,7 +5,14 @@ from enum import StrEnum, auto
 from functools import cache
 from typing import Annotated, Literal, Self
 
-from pydantic import AliasChoices, Field, JsonValue, TypeAdapter, model_validator
+from pydantic import (
+    AliasChoices,
+    AwareDatetime,
+    Field,
+    JsonValue,
+    TypeAdapter,
+    model_validator,
+)
 
 from chartreux.agents import AgentSafety, AgentType
 from chartreux.app_server._effect_models import (
@@ -287,6 +294,21 @@ class PublicTurnStatus(StrEnum):
 
 class PublicTurnStopReason(StrEnum):
     LIMIT = auto()
+    USER_CANCELLED = "user_cancelled"
+    ORCHESTRATOR_CANCELLED = "orchestrator_cancelled"
+    RETASKED = "retasked"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    BUDGET_UNVERIFIABLE = "budget_unverifiable"
+    ERROR = "error"
+
+
+class RunStopReason(StrEnum):
+    USER_CANCELLED = "user_cancelled"
+    ORCHESTRATOR_CANCELLED = "orchestrator_cancelled"
+    RETASKED = "retasked"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    BUDGET_UNVERIFIABLE = "budget_unverifiable"
+    ERROR = "error"
 
 
 class PublicRetryCategory(StrEnum):
@@ -312,6 +334,7 @@ class TurnErrorCode(StrEnum):
     IMAGES_NOT_SUPPORTED = auto()
     COMPACTION_FAILED = auto()
     INCOMPLETE_STREAM = auto()
+    EMPTY_LLM_RESPONSE = auto()
     BACKEND_ERROR = auto()
     INVALID_MODEL = auto()
     INVALID_API_KEY = auto()
@@ -397,6 +420,82 @@ class AgentStatsSnapshot(ProtocolModel):
             output_tokens=self.session_completion_tokens,
             total_tokens=self.session_total_llm_tokens,
         )
+
+
+type UsageWindow = Literal["day", "week", "month"]
+type UsageSnapshotState = Literal["loading", "ready", "unavailable"]
+
+
+class UsageCoverageWarning(ProtocolModel):
+    """Coverage degradation without raw exception text or ledger paths."""
+
+    code: Literal[
+        "write-failed",
+        "unreadable",
+        "malformed-record",
+        "torn-tail",
+        "unsupported-schema",
+    ]
+    root_session_id: str | None = None
+    record_id: str | None = None
+
+
+class UsageComponentSummary(ProtocolModel):
+    """Known lower bounds; priced zero is distinct from unknown cost."""
+
+    tokens: int = Field(default=0, ge=0, strict=True)
+    has_unknown_tokens: bool = False
+    known_cost_usd: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    has_known_cost: bool = False
+    has_unknown_cost: bool = False
+
+
+class UsageComponentBreakdown(ProtocolModel):
+    # Input excludes cached input here, unlike input_tokens in UsageTotals.
+    uncached_input: UsageComponentSummary = Field(default_factory=UsageComponentSummary)
+    cached_input: UsageComponentSummary = Field(default_factory=UsageComponentSummary)
+    output: UsageComponentSummary = Field(default_factory=UsageComponentSummary)
+
+
+class UsageTotals(ProtocolModel):
+    """Recorded totals with independent token and cost completeness flags."""
+
+    state: UsageSnapshotState = "ready"
+    requests: int = Field(default=0, ge=0, strict=True)
+    input_tokens: int = Field(default=0, ge=0, strict=True)
+    output_tokens: int = Field(default=0, ge=0, strict=True)
+    cached_input_tokens: int = Field(default=0, ge=0, strict=True)
+    has_unknown_tokens: bool = False
+    known_cost_usd: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    has_known_cost: bool = False
+    has_unknown_cost: bool = False
+
+
+class UsageWindowSummary(UsageTotals):
+    """Half-open calendar window, with local and UTC boundaries."""
+
+    # Coverage is independent of whether the recorded costs are fully priced.
+    degraded: bool = False
+    start_local: AwareDatetime
+    end_local: AwareDatetime
+    start_utc: AwareDatetime
+    end_utc: AwareDatetime
+    timezone: str
+    currency: Literal["USD"] = "USD"
+
+
+class UsageWindowSummaries(ProtocolModel):
+    day: UsageWindowSummary
+    week: UsageWindowSummary
+    month: UsageWindowSummary
+
+
+class UsageModelSummary(UsageTotals):
+    """Selected-window row grouped by deployment identity."""
+
+    model: str
+    provider: str
+    wire_name: str
 
 
 class ConfigIssue(ProtocolModel):
@@ -531,7 +630,7 @@ class CompletedEffectState(ProtocolModel):
     status: Literal["completed"] = "completed"
     output: JsonValue = None
     output_text: str = ""
-    duration_ms: float = 0.0
+    duration_ms: float | None = None
     display: EffectResultDisplay
 
 
@@ -540,7 +639,7 @@ class FailedEffectState(ProtocolModel):
     error: PublicError
     output: JsonValue = None
     output_text: str = ""
-    duration_ms: float = 0.0
+    duration_ms: float | None = None
     display: EffectResultDisplay
 
 
@@ -548,7 +647,7 @@ class CancelledEffectState(ProtocolModel):
     status: Literal["cancelled"] = "cancelled"
     reason: str
     output_text: str = ""
-    duration_ms: float = 0.0
+    duration_ms: float | None = None
     display: EffectResultDisplay | None = None
 
 
@@ -615,7 +714,11 @@ class PublicMessageEntry(_PublicHistoryEntryBase):
     type: Literal["message"] = "message"
     role: Literal["system", "user", "assistant"]
     content: list[ContentBlock]
+    posted_at: datetime | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     source: PublicMessageSource | None = None
+    turn_duration_ms: float | None = None
     user_display_content: UserDisplayContent | None = None
 
     @property
@@ -835,6 +938,7 @@ class PublicTurnQueue(ProtocolModel):
 
 
 class PublicTurn(ProtocolModel):
+    waiting_only: bool = False
     id: str
     session_id: str
     status: PublicTurnStatus

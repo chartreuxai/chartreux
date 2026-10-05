@@ -328,7 +328,7 @@ def _resolve_profile(
             return retained_profile
         if profile_name != retained_profile.name:
             raise MissingAgentProfileError(
-                "agent",
+                "agent_type",
                 f"Requested profile '{profile_name}' differs from retained agent",
             )
         return retained_profile
@@ -342,7 +342,7 @@ def _resolve_profile(
         return agent_manager.get_agent(profile_name)
     except ValueError as exc:
         raise MissingAgentProfileError(
-            "agent", f"Selected agent profile '{profile_name}' is unavailable"
+            "agent_type", f"Selected agent profile '{profile_name}' is unavailable"
         ) from exc
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import json
 from pathlib import Path
 import random
@@ -64,9 +65,13 @@ def _random_transcript(rng: random.Random, turns: int) -> list[LLMMessage]:
                         "mime_type": "image/png",
                     }
                 ]
+            if rng.random() < 0.5:
+                user_kwargs["posted_at"] = datetime(2026, 1, 2, 3, turn, tzinfo=UTC)
             messages.append(LLMMessage.model_validate(user_kwargs))
 
         assistant_kwargs: dict[str, Any] = {"role": "assistant"}
+        if rng.random() < 0.5:
+            assistant_kwargs["posted_at"] = datetime(2026, 1, 2, 4, turn, tzinfo=UTC)
         if rng.random() < 0.7:
             assistant_kwargs["message_id"] = f"assistant-{turn}"
         if rng.random() < 0.4:
@@ -170,6 +175,29 @@ def _assert_paging_equivalent(
     bogus = _encode_cursor("missing:entry", "0" * 64)
     assert read(bogus).state is AgentTranscriptState.CHANGED
     assert _oracle(dumped, bogus, limit).state is AgentTranscriptState.CHANGED
+
+
+def test_timestamps_agree_between_live_saved_and_oracle(tmp_path: Path) -> None:
+    posted = datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
+    messages = [
+        LLMMessage(role=Role.user, content="question", posted_at=posted),
+        LLMMessage(
+            role=Role.assistant,
+            reasoning_content="thinking",
+            content="answer",
+            posted_at=posted,
+        ),
+        LLMMessage(role=Role.user, content="old"),
+    ]
+    dumped = _dumped(messages)
+    _write_session(tmp_path, dumped)
+    live = read_live_agent_transcript(messages)
+    saved = read_agent_transcript(tmp_path, lambda: True)
+    assert live == saved == _oracle(dumped, None, 50)
+    assert live.entries is not None
+    assert [entry.posted_at for entry in live.entries] == [posted, None, posted, None]
+    assert [entry.created_at for entry in live.entries] == [0, 1, 2, 3]
+    assert all(entry.updated_at == entry.created_at for entry in live.entries)
 
 
 def test_live_equivalence_on_random_transcripts() -> None:

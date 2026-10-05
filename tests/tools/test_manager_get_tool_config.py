@@ -26,6 +26,22 @@ def tool_manager(vibe_config):
     return _manager(vibe_config)
 
 
+def test_cancel_agent_discovery_and_permission_configuration():
+    from chartreux.core.tools.builtins.cancel_agent import CancelAgent
+
+    config = build_test_vibe_config(
+        enabled_tools=["cancel_agent"], tools={"cancel_agent": {"permission": "never"}}
+    )
+    manager = _manager(config)
+    assert manager.registered_tools["cancel_agent"] is CancelAgent
+    assert manager.available_tools["cancel_agent"] is CancelAgent
+    assert manager.get_tool_config("cancel_agent").permission is ToolPermission.NEVER
+    spec = manager.available_tool_specs()[0]
+    assert spec.name == "cancel_agent"
+    assert set(spec.parameters["properties"]) == {"agent_id", "run_id"}
+    assert "stop_requested" in spec.description
+
+
 def test_returns_default_config_when_no_overrides(tool_manager):
     config = tool_manager.get_tool_config("bash")
 

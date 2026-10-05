@@ -55,6 +55,7 @@ def build_history_widgets(
     tools_collapsed: bool,
     expansion_state: ToolGroupExpansionState | None = None,
     entry_expansion_state: EntryExpansionState | None = None,
+    show_message_timestamps: bool = True,
 ) -> list[Widget]:
     """Build restored timeline widgets with the live tool-grouping policy.
 
@@ -72,7 +73,18 @@ def build_history_widgets(
         entry_expansion_state=entry_expansion_state,
     )
     window.admit(batch, start_index=start_index)
-    return window.flat_widgets(history_widget_indices)
+    widgets = window.flat_widgets(history_widget_indices)
+    for widget in widgets:
+        if isinstance(
+            widget,
+            UserMessage
+            | AssistantMessage
+            | ToolGroup
+            | ToolCallMessage
+            | ToolResultMessage,
+        ):
+            widget.set_show_message_timestamps(show_message_timestamps)
+    return widgets
 
 
 def _build_history_widgets_raw(
@@ -179,11 +191,24 @@ def _entry_widgets(
         case PublicMessageEntry(role="user"):
             return [
                 UserMessage(
-                    entry.text, history_entry_id=entry.id, images=entry.images or None
+                    entry.text,
+                    history_entry_id=entry.id,
+                    images=entry.images or None,
+                    posted_at=entry.posted_at,
                 )
             ]
         case PublicMessageEntry(role="assistant"):
-            return [AssistantMessage(entry.text)] if entry.text else []
+            return (
+                [
+                    AssistantMessage(
+                        entry.text,
+                        posted_at=entry.posted_at,
+                        turn_duration_ms=entry.turn_duration_ms,
+                    )
+                ]
+                if entry.text
+                else []
+            )
         case PublicReasoningEntry():
             return [
                 ReasoningMessage(

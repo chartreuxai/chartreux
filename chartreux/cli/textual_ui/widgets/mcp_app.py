@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from typing import ClassVar
 
 from rich.text import Text
@@ -9,7 +10,7 @@ from textual.binding import Binding, BindingType
 from textual.containers import Container, Horizontal, Vertical
 from textual.events import DescendantBlur, DescendantFocus
 from textual.message import Message
-from textual.widgets import Input, OptionList
+from textual.widgets import Button, Input, OptionList
 from textual.widgets.option_list import Option, OptionDoesNotExist
 from textual.worker import Worker
 
@@ -22,49 +23,88 @@ from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.ui.widgets.vscode_compat import VscodeCompatInput
 
 _REFRESHING_LABEL = "Running: Refreshing servers"
-_LIST_VIEW_HELP_TOOLS = (
-    f"{shortcut('↑↓')} Move  {shortcut('Tab')} Search  "
-    f"{shortcut('Enter')} Tools  {shortcut('d/e')} Disable/Enable  "
-    f"{shortcut('Esc')} Back/Close"
-)
-_LIST_VIEW_HELP_AUTH = (
-    f"{shortcut('↑↓')} Move  {shortcut('Tab')} Search  "
-    f"{shortcut('Enter')} Connect  {shortcut('d/e')} Disable/Enable  "
-    f"{shortcut('Esc')} Back/Close"
-)
-_LIST_VIEW_HELP_STATE = (
-    f"{shortcut('↑↓')} Move  {shortcut('Tab')} Search  {shortcut('Esc')} Back/Close"
-)
+_LIST_VIEW_HELP_TOOLS = {
+    "root": (
+        f"{shortcut('↑↓/jk')} Move  {shortcut('Tab/Shift+Tab')} Controls  "
+        f"{shortcut('Enter')} Tools  {shortcut('d/e')} Disable/Enable  "
+        f"{shortcut('Esc')} Close"
+    ),
+    "filtered": (
+        f"{shortcut('↑↓/jk')} Move  {shortcut('Tab/Shift+Tab')} Controls  "
+        f"{shortcut('Enter')} Tools  {shortcut('d/e')} Disable/Enable  "
+        f"{shortcut('Esc')} Clear filter"
+    ),
+}
+_LIST_VIEW_HELP_AUTH = {
+    "root": (
+        f"{shortcut('↑↓/jk')} Move  {shortcut('Tab/Shift+Tab')} Controls  "
+        f"{shortcut('Enter')} Connect  {shortcut('d/e')} Disable/Enable  "
+        f"{shortcut('Esc')} Close"
+    ),
+    "filtered": (
+        f"{shortcut('↑↓/jk')} Move  {shortcut('Tab/Shift+Tab')} Controls  "
+        f"{shortcut('Enter')} Connect  {shortcut('d/e')} Disable/Enable  "
+        f"{shortcut('Esc')} Clear filter"
+    ),
+}
+_LIST_VIEW_HELP_STATE = {
+    "root": f"{shortcut('↑↓/jk')} Move  {shortcut('Tab/Shift+Tab')} Controls  {shortcut('Esc')} Close",
+    "filtered": f"{shortcut('↑↓/jk')} Move  {shortcut('Tab/Shift+Tab')} Controls  {shortcut('Esc')} Clear filter",
+}
 _DETAIL_VIEW_HELP = (
-    f"{shortcut('↑↓/jk')} Navigate  {shortcut('d')} Disable  "
-    f"{shortcut('e')} Enable  {shortcut('Backspace')} Back  {shortcut('Esc')} Close"
+    f"{shortcut('↑↓/jk')} Navigate  {shortcut('Tab/Shift+Tab')} Controls  "
+    f"{shortcut('d/e')} Disable/Enable  {shortcut('Backspace')} Back  {shortcut('Esc')} Back"
 )
-_DETAIL_VIEW_HELP_NO_TOOLS = (
-    f"{shortcut('↑↓/jk')} Navigate  {shortcut('Backspace')} Back  "
-    f"{shortcut('Esc')} Back/Close"
+_DETAIL_VIEW_HELP_NO_TOOLS = f"{shortcut('↑↓/jk')} Navigate  {shortcut('Backspace')} Back  {shortcut('Esc')} Back"
+_MCP_STATE_FEEDBACK = {
+    "root": f"This status row is informational.  {shortcut('Esc')} Close",
+    "filtered": f"This status row is informational.  {shortcut('Esc')} Clear filter",
+    "detail": f"This status row is informational.  {shortcut('Esc')} Back",
+}
+_MCP_STATE_TOGGLE_FEEDBACK = {
+    "root": f"No MCP server is available to toggle.  {shortcut('Esc')} Close",
+    "filtered": f"No MCP server is available to toggle.  {shortcut('Esc')} Clear filter",
+}
+_MCP_TOOL_FEEDBACK = (
+    f"Use d to disable or e to enable this tool.  {shortcut('Esc')} Back"
 )
-_MCP_STATE_FEEDBACK = "This status row is informational. Press Esc to go back or close."
-_MCP_STATE_TOGGLE_FEEDBACK = (
-    "No MCP server is available to toggle. Press Esc to go back or close."
-)
-_MCP_TOOL_FEEDBACK = "Use d to disable or e to enable this tool."
 _BACKGROUND_REFRESH_INTERVAL_SECONDS = 60.0
 
 
 class MCPOptionList(NavigableOptionList):
-    """MCP options stay in the list; Tab moves to the search control."""
+    """Bounded navigation local to the MCP composite browser."""
 
-    BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("tab", "focus_search", "Search", show=False)
-    ]
+    def _move(self, step: int) -> None:
+        index = self.highlighted
+        if index is None:
+            index = -1 if step > 0 else self.option_count
+        for candidate in range(
+            index + step, self.option_count if step > 0 else -1, step
+        ):
+            if not self.get_option_at_index(candidate).disabled:
+                self.highlighted = candidate
+                return
 
-    def action_focus_search(self) -> None:
-        self.app.query_one("#mcp-search", Input).focus()
+    def action_cursor_up(self) -> None:
+        self._move(-1)
+
+    def action_cursor_down(self) -> None:
+        self._move(1)
+
+
+@dataclass
+class _ListPosition:
+    identities: list[str]
+    index: int
+    scroll_y: float
+    focus_id: str | None
 
 
 class MCPApp(Container):
     can_focus_children = True
     BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("tab", "cycle_focus(1)", "Next control", show=False),
+        Binding("shift+tab", "cycle_focus(-1)", "Previous control", show=False),
         Binding("escape", "close", "Close", show=False),
         Binding("backspace", "back", "Back", show=False),
         Binding("d", "disable", "Disable", show=False),
@@ -102,6 +142,7 @@ class MCPApp(Container):
         self._refresh_callback = refresh_callback
         self._refreshing = False
         self._query = ""
+        self._opener: _ListPosition | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="mcp-content"):
@@ -110,7 +151,33 @@ class MCPApp(Container):
                 yield NoMarkupStatic("Search", id="mcp-search-icon")
                 yield VscodeCompatInput(placeholder="Search servers", id="mcp-search")
             yield MCPOptionList(id="mcp-options")
+            with Horizontal(id="mcp-actions"):
+                yield Button("Disable (d)", id="mcp-disable", compact=True)
+                yield Button("Enable (e)", id="mcp-enable", compact=True)
             yield NoMarkupStatic("", id="mcp-help", classes="settings-help")
+
+    def action_cycle_focus(self, step: int) -> None:
+        controls = [
+            control
+            for control in self.query("Input, OptionList, Button")
+            if control.display
+            and control.visible
+            and not control.disabled
+            and (not isinstance(control, Input) or self._viewing_name is None)
+        ]
+        if not controls:
+            return
+        focused = self.screen.focused
+        index = controls.index(focused) if focused in controls else -1
+        controls[(index + step) % len(controls)].focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "mcp-disable":
+            event.stop()
+            self.action_disable()
+        elif event.button.id == "mcp-enable":
+            event.stop()
+            self.action_enable()
 
     def on_mount(self) -> None:
         self._refresh_view(self._viewing_name)
@@ -126,26 +193,20 @@ class MCPApp(Container):
     def on_descendant_blur(self, _event: DescendantBlur) -> None:
         if self._viewing_name is None:
             self.call_after_refresh(self._update_source_cursors)
-        if self.screen.focused in {self.query_one(Input), self.query_one(OptionList)}:
+        if self.screen.focused in set(self.query("Input, OptionList, Button")):
             return
         self.query_one(OptionList).focus()
 
-    def on_descendant_focus(self, event: DescendantFocus) -> None:
+    def on_descendant_focus(self, _event: DescendantFocus) -> None:
         if self._viewing_name is None:
             self.call_after_refresh(self._update_source_cursors)
-        search = self.query_one(Input)
-        if event.control is not search:
-            return
-        self.query_one(OptionList).scroll_to(
-            y=0, animate=False, force=True, immediate=True
-        )
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "mcp-search":
             return
         self._query = event.value
         if self._viewing_name is None:
-            self._refresh_view(None)
+            self._rebuild_preserving_scroll()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         option_id = event.option.id
@@ -161,7 +222,9 @@ class MCPApp(Container):
             return
         name = _source_from_option_id(option_id if isinstance(option_id, str) else "")
         if name is not None:
+            self._opener = self._capture_position()
             self._refresh_view(name)
+            self.query_one(OptionList).focus()
 
     def on_option_list_option_highlighted(
         self, event: OptionList.OptionHighlighted
@@ -202,10 +265,13 @@ class MCPApp(Container):
     def action_back(self) -> None:
         if self._viewing_name is not None:
             self._refresh_view(None)
+            if self._opener is not None:
+                self._restore_position(self._opener, restore_focus=True)
+            self._opener = None
 
     def action_close(self) -> None:
         if self._viewing_name is not None:
-            self._refresh_view(None)
+            self.action_back()
         elif self._query:
             self.query_one("#mcp-search", Input).value = ""
         else:
@@ -289,19 +355,75 @@ class MCPApp(Container):
         )
         self._rebuild_preserving_scroll()
 
-    def _rebuild_preserving_scroll(self) -> None:
+    def _capture_position(self) -> _ListPosition:
         option_list = self.query_one(OptionList)
-        selected_id: str | None = None
-        if (index := option_list.highlighted) is not None:
-            selected_id = option_list.get_option_at_index(index).id
-        scroll_y = option_list.scroll_offset.y
-        self._refresh_view(self._viewing_name)
-        if selected_id is not None:
+        identities = [
+            option.id for option in option_list.options if option.id is not None
+        ]
+        selected = option_list.highlighted_option
+        index = (
+            identities.index(selected.id)
+            if selected and selected.id in identities
+            else 0
+        )
+        focused = self.screen.focused
+        return _ListPosition(
+            identities,
+            index,
+            option_list.scroll_offset.y,
+            focused.id if focused is not None else None,
+        )
+
+    def _restore_position(
+        self, position: _ListPosition, *, restore_focus: bool = False
+    ) -> None:
+        option_list = self.query_one(OptionList)
+        # Prefer the same identity, then the nearest surviving old neighbour;
+        # ties choose the following row. New-only lists use the old ordinal.
+        for index in sorted(
+            range(len(position.identities)),
+            key=lambda index: (abs(index - position.index), index < position.index),
+        ):
             try:
-                option_list.highlighted = option_list.get_option_index(selected_id)
+                option_list.highlighted = option_list.get_option_index(
+                    position.identities[index]
+                )
+                break
             except OptionDoesNotExist:
-                pass
-        option_list.scroll_to(y=scroll_y, animate=False, force=True, immediate=True)
+                continue
+        else:
+            valid = [
+                index
+                for index, option in enumerate(option_list.options)
+                if not option.disabled
+            ]
+            option_list.highlighted = (
+                valid[min(position.index, len(valid) - 1)] if valid else None
+            )
+        if restore_focus:
+            controls = list(self.query("Input, OptionList, Button"))
+            target = next(
+                (control for control in controls if control.id == position.focus_id),
+                option_list,
+            )
+            target.focus()
+        self.call_after_refresh(
+            option_list.scroll_to,
+            y=position.scroll_y,
+            animate=False,
+            force=True,
+            immediate=True,
+        )
+
+    def _rebuild_preserving_scroll(self) -> None:
+        position = self._capture_position()
+        was_detail = self._viewing_name is not None
+        self._refresh_view(self._viewing_name)
+        if was_detail and self._viewing_name is None and self._opener is not None:
+            self._restore_position(self._opener, restore_focus=True)
+            self._opener = None
+        else:
+            self._restore_position(position)
 
     def _refresh_view(self, name: str | None) -> None:
         option_list = self.query_one(OptionList)
@@ -546,7 +668,16 @@ class MCPApp(Container):
         target = _source_from_option_id(option.id or "")
         return self._find_source(target) if target is not None else None
 
-    def _set_help_text(self, text: str) -> None:
+    def _set_help_text(self, text: str | dict[str, str]) -> None:
+        if isinstance(text, dict):
+            state = (
+                "detail"
+                if self._viewing_name is not None
+                else "filtered"
+                if self._query
+                else "root"
+            )
+            text = text[state]
         self.query_one("#mcp-help", NoMarkupStatic).update(shortcut_hint(text))
 
 

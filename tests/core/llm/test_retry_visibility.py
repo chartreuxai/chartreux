@@ -9,8 +9,11 @@ import pytest
 from chartreux.core.config import ProviderConfig
 from chartreux.core.llm.backend.generic import GenericBackend
 from chartreux.core.llm.backend.mistral import MistralBackend
+from chartreux.core.llm.exceptions import BackendError
+from chartreux.core.llm.failures import RequestRetryBudget
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.utils import RetryCategory, RetryReason
+from chartreux.core.utils.retry import bind_retry_budget
 
 _COMPLETION = {
     "id": "cmpl-test",
@@ -283,6 +286,49 @@ async def test_generic_backend_paces_subsequent_calls_after_a_rate_limit(
     # The pacing wait (~0.01s) appears on calls 2 and 3, not call 1.
     assert len(waits) >= 2
     assert all(w == pytest.approx(0.01, abs=0.01) for w in waits)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", ["generic", "mistral"])
+@pytest.mark.parametrize("explicit_seconds", [None, 0.0, 10.0])
+async def test_backend_resolves_bound_budget_at_call_time(
+    monkeypatch: pytest.MonkeyPatch, family: str, explicit_seconds: float | None
+) -> None:
+    recorder = Recorder()
+    handler = _responder([503, 503])
+    explicit_budget = (
+        RequestRetryBudget(explicit_seconds) if explicit_seconds is not None else None
+    )
+    if family == "generic":
+        backend = GenericBackend(
+            client=_vibe_client(httpx.MockTransport(handler)),
+            provider=_provider(family),
+            retry_budget=explicit_budget,
+            on_retry=recorder,
+        )
+    else:
+        _patch_client_transport(monkeypatch, httpx.MockTransport(handler))
+        backend = MistralBackend(
+            provider=_provider(family), retry_budget=explicit_budget, on_retry=recorder
+        )
+
+    async with backend:
+        with bind_retry_budget(
+            RequestRetryBudget(10.0 if explicit_seconds == 0 else 0.0)
+        ):
+            if explicit_seconds == 10.0:
+                await _complete(backend)
+                assert handler.calls["n"] == 3
+                assert recorder.details == ["HTTP 503", "HTTP 503"]
+            else:
+                with pytest.raises(BackendError):
+                    await _complete(backend)
+                assert handler.calls["n"] == 1
+                assert recorder.reasons == []
+        if explicit_seconds is None:
+            await _complete(backend)
+            assert handler.calls["n"] == 3
+            assert recorder.details == ["HTTP 503"]
 
 
 def _vibe_client(transport: httpx.MockTransport) -> Any:

@@ -1,22 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
 from chartreux.core.agents.manager import AgentManager
 from chartreux.core.config import ChartreuxConfigSchema
+from chartreux.core.events import ToolResultEvent
 from chartreux.core.subagents import (
     AgentAvailability,
     AgentResultExpiredError,
     AgentSummary,
+    CancelOutcome,
+    CancelResult,
     ReleaseAgentOutcome,
     RunStatus,
+    RunStopReason,
     TaskArgs,
     TaskResult,
     UnknownAgentError,
 )
 from chartreux.core.tools.base import BaseToolState, InvokeContext, ToolError
+from chartreux.core.tools.builtins.cancel_agent import (
+    CancelAgent,
+    CancelAgentArgs,
+    CancelAgentConfig,
+)
 from chartreux.core.tools.builtins.check_agents import (
     CheckAgents,
     CheckAgentsArgs,
@@ -77,6 +87,16 @@ class FakeSubagentManager:
             await asyncio.wait_for(event.wait(), timeout)
         return self.results[key]
 
+    async def cancel_run(
+        self,
+        agent_id: str,
+        run_id: str | None = None,
+        *,
+        reason: RunStopReason,
+        requester_session_id: str,
+    ) -> CancelResult:
+        return CancelResult(outcome=CancelOutcome.NOT_RUNNING, run_id=run_id)
+
     async def release_agent(self, agent_id: str) -> ReleaseAgentOutcome:
         if self.release_error is not None:
             raise self.release_error
@@ -91,6 +111,109 @@ class FakeSubagentManager:
             if agent.availability is AgentAvailability.EVICTED
             else ReleaseAgentOutcome.RELEASED
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", list(CancelOutcome))
+@pytest.mark.parametrize("run_id", [None, "pinned-run"])
+async def test_cancel_agent_forwards_requester_and_displays_disposition(
+    outcome: CancelOutcome, run_id: str | None
+) -> None:
+    tool = CancelAgent(config_getter=lambda: CancelAgentConfig(), state=BaseToolState())
+    manager = FakeSubagentManager()
+    expected = CancelResult(
+        outcome=outcome,
+        run_id="resolved",
+        stop_reason=RunStopReason.ORCHESTRATOR_CANCELLED,
+    )
+    manager.cancel_run = AsyncMock(return_value=expected)
+    ctx = InvokeContext(
+        tool_call_id="stop", session_id="parent", subagent_manager=manager
+    )
+    result = await collect_result(
+        tool.run(CancelAgentArgs(agent_id="agent-1", run_id=run_id), ctx)
+    )
+    assert result == expected
+    manager.cancel_run.assert_awaited_once_with(
+        "agent-1",
+        run_id,
+        reason=RunStopReason.ORCHESTRATOR_CANCELLED,
+        requester_session_id="parent",
+    )
+    display = tool.get_result_display(
+        ToolResultEvent(
+            tool_name="cancel_agent",
+            tool_class=CancelAgent,
+            result=result,
+            tool_call_id="stop",
+        )
+    )
+    assert display.verb == outcome.value.replace("_", " ").capitalize()
+    assert "resolved" in display.message and display.verb != "Cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_agent_surfaces_foreground_rejection() -> None:
+    tool = CancelAgent(config_getter=lambda: CancelAgentConfig(), state=BaseToolState())
+    manager = FakeSubagentManager()
+    manager.cancel_run = AsyncMock(
+        side_effect=ValueError("Foreground agents cannot be stopped with cancel_agent")
+    )
+    ctx = InvokeContext(
+        tool_call_id="stop", session_id="parent", subagent_manager=manager
+    )
+    with pytest.raises(ToolError, match="Foreground agents cannot be stopped"):
+        await collect_result(tool.run(CancelAgentArgs(agent_id="child-session"), ctx))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context", ["missing", "manager", "requester", "subagent"])
+async def test_cancel_agent_context_guards(context: str) -> None:
+    tool = CancelAgent(config_getter=lambda: CancelAgentConfig(), state=BaseToolState())
+    manager = FakeSubagentManager()
+    manager.cancel_run = AsyncMock()
+    ctx = InvokeContext(
+        tool_call_id="stop", session_id="parent", subagent_manager=manager
+    )
+    if context == "missing":
+        ctx = None
+    elif context == "manager":
+        ctx.subagent_manager = None
+    elif context == "requester":
+        ctx.session_id = None
+    else:
+        ctx.is_subagent = True
+    with pytest.raises(ToolError):
+        await collect_result(tool.run(CancelAgentArgs(agent_id="agent-1"), ctx))
+    manager.cancel_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wait_tool_returns_cancelled_partial_result() -> None:
+    manager = FakeSubagentManager([
+        AgentSummary(
+            agent_id="agent-1",
+            profile="worker",
+            availability=AgentAvailability.IDLE,
+            current_run_id=None,
+            current_run_status=None,
+        )
+    ])
+    expected = TaskResult(
+        response="partial",
+        turns_used=1,
+        completed=False,
+        stop_reason=RunStopReason.ORCHESTRATOR_CANCELLED,
+    )
+    manager.results[("agent-1", "run-1")] = expected
+    manager.completed[("agent-1", "run-1")] = asyncio.Event()
+    manager.completed[("agent-1", "run-1")].set()
+    result = await collect_result(
+        _wait_for_agent_tool().run(
+            WaitForAgentArgs(agent_id="agent-1", run_id="run-1"), _context(manager)
+        )
+    )
+    assert result.result == expected
 
 
 def _context(manager: FakeSubagentManager | None = None) -> InvokeContext:
@@ -126,6 +249,7 @@ async def test_check_agents_returns_empty_list_when_no_agents() -> None:
     )
 
     assert result.agents == []
+    assert "task(agent_id=..." in result.model_dump(mode="json")["reuse_guidance"]
 
 
 @pytest.mark.asyncio
@@ -144,6 +268,10 @@ async def test_check_agents_returns_agent_summaries() -> None:
         base_model="base",
         active_provider="test-provider",
         effective_thinking="high",
+        context_tokens=12_500,
+        context_window=200_000,
+        compacting=False,
+        stop_reason=RunStopReason.BUDGET_EXCEEDED,
     )
     result = await collect_result(
         _check_agents_tool().run(
@@ -162,6 +290,8 @@ async def test_check_agents_returns_agent_summaries() -> None:
         "initial_task_summary": "Inspect agent management",
         "current_task_summary": None,
         "idle_seconds": 3.5,
+        "run_elapsed_seconds": None,
+        "latest_run_id": None,
         "ttl_remaining_seconds": None,
         "effective_model": "strong",
         "base_model": "base",
@@ -169,6 +299,10 @@ async def test_check_agents_returns_agent_summaries() -> None:
         "effective_thinking": "high",
         "result_expired": False,
         "last_run_status": None,
+        "context_tokens": 12_500,
+        "context_window": 200_000,
+        "compacting": False,
+        "stop_reason": "budget_exceeded",
     }
 
 
@@ -408,7 +542,10 @@ async def test_task_validates_background_agent_id_usage(
         await collect_result(
             task.run(
                 TaskArgs(
-                    task="work", agent="worker", background=False, agent_id="agent-1"
+                    task="work",
+                    agent_type="worker",
+                    background=False,
+                    agent_id="agent-1",
                 ),
                 ctx,
             )
@@ -419,7 +556,10 @@ async def test_task_validates_background_agent_id_usage(
         await collect_result(
             task.run(
                 TaskArgs(
-                    task="work", agent="worker", background=True, agent_id="agent-1"
+                    task="work",
+                    agent_type="worker",
+                    background=True,
+                    agent_id="agent-1",
                 ),
                 ctx,
             )

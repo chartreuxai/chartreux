@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from chartreux.core.agent_loop.errors import EmptyLLMResponseError
 from chartreux.core.agent_loop.llm_gateway import (
     CallResources,
     CompletionInputs,
@@ -32,6 +33,8 @@ from chartreux.core.llm_models import (
     Role,
     ToolCall,
 )
+from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.session_types import AgentStats
 from chartreux.core.tools.base import ToolPermission
 from tests.conftest import (
@@ -110,6 +113,43 @@ def make_config(
         enabled_tools=enabled_tools or [],
         tools={"todo": {"permission": todo_permission.value}},
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("cap", ["tokens", "price", "unknown", "missing", "unpriced"])
+async def test_empty_replay_admission_checks_only_cost_and_token_caps(streaming, cap):
+    chunk = mock_llm_chunk(content="")
+    if cap == "missing":
+        chunk = chunk.model_copy(update={"usage": None})
+    backend = FakeBackend([[chunk], [mock_llm_chunk(content="must not replay")]])
+    config = make_config()
+    if cap == "unpriced":
+        assert config.catalog_snapshot is not None
+        raw = config.catalog_snapshot.catalog.model_dump(mode="json")
+        raw["models"]["devstral-latest"]["deployments"][0]["prices"]["input"] = None
+        config.attach_catalog_snapshot(
+            CatalogSnapshot(ModelCatalog.model_validate(raw), "unpriced")
+        )
+    agent = build_test_agent_loop(
+        config=config, backend=backend, enable_streaming=streaming
+    )
+    if cap == "tokens":
+        agent._max_session_tokens = 1
+    else:
+        agent._max_price = 0 if cap == "price" else 1
+    if cap == "unknown":
+        agent.stats.has_unknown_cost = True
+    with pytest.raises(EmptyLLMResponseError):
+        if streaming:
+            [_ async for _ in agent._chat_streaming()]
+        else:
+            await agent._chat()
+    assert len(backend.requests_messages) == 1
+    assert not any(m.role is Role.assistant for m in agent.messages)
+    assert agent.stats.session_prompt_tokens == (0 if cap == "missing" else 10)
+    if cap in {"unknown", "missing", "unpriced"}:
+        assert agent.stats.has_unknown_cost
 
 
 class TestAgentStatsHelpers:
@@ -198,6 +238,40 @@ def test_unknown_prices_preserve_known_cost_lower_bound_without_cached_fallback(
     assert stats.has_unknown_cost is True
 
 
+@pytest.mark.parametrize("context_tokens", [1234, -1])
+def test_sideband_usage_preserves_conversation_measurement(context_tokens: int) -> None:
+    stats = AgentStats(
+        context_tokens=context_tokens,
+        last_turn_prompt_tokens=700,
+        last_turn_completion_tokens=30,
+        last_turn_cached_tokens=100,
+        last_turn_duration=3.0,
+        tokens_per_second=10.0,
+    )
+    model = make_config(
+        input_price=2.0, output_price=4.0, cached_input_price=1.0
+    ).get_active_model()
+    usage = LLMUsage(prompt_tokens=100, completion_tokens=50, cached_tokens=20)
+
+    apply_usage(stats, usage, time_seconds=1.0, model=model, account_conversation=False)
+
+    assert stats.context_tokens == context_tokens
+    assert stats.last_turn_prompt_tokens == 700
+    assert stats.last_turn_completion_tokens == 30
+    assert stats.last_turn_cached_tokens == 100
+    assert stats.last_turn_duration == 3.0
+    assert stats.tokens_per_second == 10.0
+    assert stats.session_prompt_tokens == 100
+    assert stats.session_completion_tokens == 50
+    assert stats.session_cached_tokens == 20
+    assert stats.session_total_llm_tokens == 150
+    assert stats.known_cost_total == pytest.approx(0.00038)
+
+    apply_usage(stats, usage, time_seconds=1.0, model=model)
+    assert stats.context_tokens == 150
+    assert stats.session_total_llm_tokens == 300
+
+
 def test_fresh_stats_have_a_complete_zero_cost_ledger() -> None:
     stats = AgentStats()
 
@@ -213,11 +287,12 @@ def test_token_only_legacy_stats_are_incomplete() -> None:
 
 
 @pytest.mark.asyncio
-async def test_interrupted_stream_usage_is_accounted_and_transcript_is_appended() -> (
-    None
-):
+@pytest.mark.parametrize("account_conversation", [True, False])
+async def test_interrupted_stream_usage_is_accounted_and_transcript_is_appended(
+    account_conversation: bool,
+) -> None:
     model = make_config().get_active_model()
-    stats = AgentStats()
+    stats = AgentStats(context_tokens=1234)
     transcript: list[TranscriptAppend] = []
     stream = LLMGateway().chat_streaming(
         CompletionInputs(
@@ -230,6 +305,7 @@ async def test_interrupted_stream_usage_is_accounted_and_transcript_is_appended(
             extra_headers={},
             metadata={},
             max_tokens=None,
+            account_conversation=account_conversation,
         ),
         CallResources(
             backend=FakeInterruptedStreamingBackend([
@@ -245,6 +321,7 @@ async def test_interrupted_stream_usage_is_accounted_and_transcript_is_appended(
     with pytest.raises(RuntimeError, match="API error"):
         await anext(stream)
 
+    assert stats.context_tokens == (15 if account_conversation else 1234)
     assert stats.session_prompt_tokens == 10
     assert stats.session_completion_tokens == 5
     assert transcript[-1].kind == "interrupted"
@@ -419,19 +496,21 @@ class TestReloadPreservesStats:
     @pytest.mark.asyncio
     async def test_reload_preserves_tool_call_stats(self) -> None:
         backend = FakeBackend([
-            mock_llm_chunk(
-                content="Calling tool",
-                tool_calls=[
-                    ToolCall(
-                        id="tc1",
-                        index=0,
-                        function=FunctionCall(
-                            name="todo", arguments='{"action": "read"}'
-                        ),
-                    )
-                ],
-            ),
-            mock_llm_chunk(content="Done"),
+            [
+                mock_llm_chunk(
+                    content="Calling tool",
+                    tool_calls=[
+                        ToolCall(
+                            id="tc1",
+                            index=0,
+                            function=FunctionCall(
+                                name="todo", arguments='{"action": "read"}'
+                            ),
+                        )
+                    ],
+                )
+            ],
+            [mock_llm_chunk(content="Done")],
         ])
         config = make_config(enabled_tools=["todo"])
         agent = build_test_agent_loop(config=config, backend=backend)

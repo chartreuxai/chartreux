@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable, Sequence
 import time
 from typing import TYPE_CHECKING, Literal, Protocol
 
+from chartreux.core.agent_loop.errors import EmptyLLMResponseError
 from chartreux.core.compaction.context import (
     collect_prior_user_messages,
     drop_oldest_round,
@@ -16,6 +17,7 @@ from chartreux.core.llm.thinking_levels import get_thinking_levels
 from chartreux.core.llm_models import LLMMessage, PersistedToolResult, Role
 from chartreux.core.prompts import UtilityPrompt
 from chartreux.core.tools.builtins.todo import TodoState
+from chartreux.core.usage import UsagePurpose
 from chartreux.observability.logging import log_model_call_success
 
 if TYPE_CHECKING:
@@ -47,6 +49,8 @@ class CompletionFn(Protocol):
         tools: list[AvailableTool] | None,
         tool_choice: StrToolChoice | AvailableTool | None,
         call_type: str | None,
+        account_conversation: bool,
+        purpose: UsagePurpose = UsagePurpose.CONVERSATION,
     ) -> LLMChunk: ...
 
 
@@ -136,6 +140,8 @@ class CompactionManager:
             tools=self._available_tools(),
             tool_choice=self._tool_choice(),
         )
+        if result is None:
+            return None, working, "empty_summary"
         if result.message.tool_calls:
             return None, working, "tool_call"
         summary = extract_summary(result.message.content or "")
@@ -185,7 +191,11 @@ class CompactionManager:
             tools=None,
             tool_choice=None,
         )
-        return extract_summary(result.message.content or "")
+        return (
+            extract_summary(result.message.content or "")
+            if result is not None
+            else None
+        )
 
     async def _summarize_call(
         self,
@@ -195,7 +205,10 @@ class CompactionManager:
         model: ModelConfig,
         tools: list[AvailableTool] | None,
         tool_choice: StrToolChoice | AvailableTool | None,
-    ) -> tuple[LLMChunk, list[LLMMessage]]:
+    ) -> tuple[LLMChunk | None, list[LLMMessage]]:
+        # The gateway imports compaction context, so defer this import to avoid a cycle.
+        from chartreux.core.agent_loop.llm_gateway import IncompleteLLMResponseError
+
         # Summarize `working`; on overflow drop the oldest round and retry.
         # Returns the model result and the (possibly trimmed) history it used.
         tries_left = _COMPACTION_PTL_RETRIES
@@ -208,6 +221,8 @@ class CompactionManager:
                     tools=tools,
                     tool_choice=tool_choice,
                     call_type="secondary_call",
+                    account_conversation=False,
+                    purpose=UsagePurpose.COMPACTION,
                 )
                 _usage = result.usage
                 log_model_call_success(
@@ -218,6 +233,8 @@ class CompactionManager:
                     cached_tokens=_usage.cached_tokens if _usage else 0,
                 )
                 return result, working
+            except (EmptyLLMResponseError, IncompleteLLMResponseError):
+                return None, working
             except ContextTooLongError:
                 trimmed = drop_oldest_round(working)
                 if tries_left == 0 or trimmed is None:

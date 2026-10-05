@@ -4,7 +4,73 @@ import pytest
 
 from chartreux.core.tools.builtins._shell_permission_analysis import (
     analyze_shell_command,
+    argv_permission_reasons,
 )
+
+
+def test_analysis_diagnostics_retain_original_source() -> None:
+    analysis = analyze_shell_command("cat $FIXTURE")
+    assert analysis.requires_approval
+    diagnostic = next(
+        item for item in analysis.diagnostics if item.offending_token == "$FIXTURE"
+    )
+    assert diagnostic.code == "analysis"
+    assert diagnostic.command_part == "cat $FIXTURE"
+    assert (
+        tuple(item.detail for item in analysis.diagnostics) == analysis.approval_reasons
+    )
+    assert analysis.approval_diagnostic.related == analysis.diagnostics
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'uv run python -c "print(1 * 2)"',
+        "uv run python -c \"print('[abc]')\"",
+        "env CI=1 uv run python -c \"print('[abc]')\"",
+    ],
+)
+def test_executor_payload_and_native_arguments_are_not_package_globs(
+    command: str,
+) -> None:
+    assert not analyze_shell_command(command).requires_approval
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uv run pip install fixture[extra]",
+        "env CI=1 uv run pip install fixture[extra]",
+        "npx fixture[extra]",
+        "uv run npx fixture[extra]",
+        "cargo run -- [abc]",
+        "go run main.go [abc]",
+    ],
+)
+def test_nested_package_operands_keep_original_quote_checks(command: str) -> None:
+    assert (
+        "unquoted package bracket syntax may expand as a shell glob"
+        in analyze_shell_command(command).approval_reasons
+    )
+
+
+@pytest.mark.parametrize(
+    "argv,reason",
+    [
+        (["env", "PATH=/outside", "echo", "hi"], "dangerous environment assignment"),
+        (
+            ["env", "PYTHONPATH=../outside", "python", "-c", "code"],
+            "dangerous environment assignment",
+        ),
+        (["hash", "-p", "./fake", "git"], "command lookup modification"),
+        (["alias", "git=./fake"], "command lookup modification"),
+    ],
+)
+def test_recursive_argv_security_checks_without_shell_reparse(
+    argv: list[str], reason: str
+) -> None:
+    assert any(reason in value for value in argv_permission_reasons(argv))
+    assert argv_permission_reasons(["echo", *argv]) == ()
 
 
 @pytest.mark.parametrize(

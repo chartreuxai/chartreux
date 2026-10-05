@@ -77,7 +77,7 @@ class AgentManager:
             return self.get_agent(name)
         except ValueError as exc:
             raise MissingAgentProfileError(
-                "agent", f"Selected agent profile '{name}' is unavailable"
+                "agent_type", f"Selected agent profile '{name}' is unavailable"
             ) from exc
 
     def get_subagents(self) -> list[AgentProfile]:

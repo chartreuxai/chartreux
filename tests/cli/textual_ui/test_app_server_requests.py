@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from chartreux.app_server.events import CallbackRequested
+from chartreux.app_server.events import AgentsUpdate, CallbackRequested
 from chartreux.app_server.models import (
     OpenCallbackState,
     PublicCallbackEntry,
@@ -25,7 +25,10 @@ from chartreux.app_server.models import (
     WorkspaceTrustDetails,
 )
 from chartreux.app_server.protocol import (
+    AgentsCancelResponse,
+    AgentSummaryModel,
     AppServerResponseError,
+    CancelOutcome,
     ProtocolError,
     ProtocolErrorCode,
     WorkspaceTrustStatusResponse,
@@ -36,7 +39,6 @@ from chartreux.cli.textual_ui.app import ChartreuxApp
 from chartreux.cli.textual_ui.screens.settings import SettingsScreen
 from chartreux.cli.textual_ui.widgets.agent_transcript import AgentTranscriptViewer
 from chartreux.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
-from chartreux.cli.textual_ui.widgets.context_progress import ContextProgress
 from chartreux.cli.textual_ui.widgets.loading import (
     DEFAULT_LOADING_STATUS,
     LoadingWidget,
@@ -50,6 +52,7 @@ from chartreux.cli.textual_ui.widgets.messages import (
     UserMessage,
 )
 from chartreux.cli.textual_ui.widgets.question_app import QuestionApp
+from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLine
 from chartreux.core.config import SessionLoggingConfig
 from chartreux.core.events import UserMessageEvent
 from chartreux.core.llm_models import Role
@@ -909,7 +912,7 @@ async def test_incomplete_stream_does_not_retry_ahead_of_queued_prompts(
         await _wait_until(
             pilot,
             lambda: (
-                app.query_one(ContextProgress).tokens.current_tokens
+                app.query_one(SessionStatusLine).state.context_tokens
                 == agent_loop.stats.context_tokens
             ),
         )
@@ -1235,3 +1238,160 @@ async def test_empty_mcp_and_agents_show_supported_next_action() -> None:
         messages = [str(message._content) for message in app.query(UserCommandMessage)]
         assert sum("/mcp add <url>" in text for text in messages) == 2
         assert any("No background agents" in text for text in messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mouse", [False, True])
+@pytest.mark.parametrize("parent_running", [False, True])
+async def test_confirmed_stop_calls_client_with_pinned_run_only(
+    mouse: bool, parent_running: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent_loop = build_test_agent_loop()
+    parent_started, parent_interrupted = asyncio.Event(), asyncio.Event()
+
+    async def blocking_act(msg: str, **_kwargs):
+        yield UserMessageEvent(content=msg, message_id="parent-user")
+        parent_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            parent_interrupted.set()
+
+    agent_loop.act = blocking_act
+    app = build_test_chartreux_app(agent_loop=agent_loop)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def cancel(agent_id: str, run_id: str) -> AgentsCancelResponse:
+        entered.set()
+        await release.wait()
+        return AgentsCancelResponse(outcome=CancelOutcome.STOP_REQUESTED, run_id=run_id)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app._session_ready.wait()
+        request = AsyncMock(side_effect=cancel)
+        interrupt = AsyncMock()
+        monkeypatch.setattr(app.app_server, "cancel_agent", request)
+        monkeypatch.setattr(app.app_server, "interrupt", interrupt)
+        if parent_running:
+            app.query_one(ChatInputContainer).post_message(
+                ChatInputContainer.Submitted("parent work")
+            )
+            await asyncio.wait_for(parent_started.wait(), 2)
+            await _wait_until(pilot, lambda: app.app_server.turn_active)
+        target = AgentSummaryModel(
+            agent_id="one",
+            profile="worker",
+            availability="running",
+            current_run_id="r1",
+        )
+        sibling = target.model_copy(update={"agent_id": "two", "current_run_id": "s1"})
+        await app._handle_turn_event(AgentsUpdate([target, sibling]))
+        parent_active = app.app_server.turn_active
+        assert parent_active is parent_running
+        await pilot.press("ctrl+shift+a", "down", "c")
+        request.assert_not_awaited()
+        assert not app.query(AgentTranscriptViewer)
+        if mouse:
+            await pilot.click("#agent-stop-submit")
+        else:
+            await pilot.press("left", "enter")
+        await asyncio.wait_for(entered.wait(), 2)
+        bar = app._agent_bar
+        assert bar is not None and app.screen.focused is bar
+        assert bar.stop_is_pending("one", "r1")
+        assert not bar.stop_is_pending("two", "s1")
+        assert bar.agents == (target, sibling)
+        await pilot.press("c")
+        assert bar._stop_confirmation is None
+        # Authoritative replacement arrives before the old RPC response.
+        replacement = target.model_copy(update={"current_run_id": "r2"})
+        await app._handle_turn_event(AgentsUpdate([replacement, sibling]))
+        release.set()
+        await pilot.pause()
+        request.assert_awaited_once_with("one", "r1")
+        assert not bar.stop_is_pending("one", "r2")
+        assert bar.agents == (replacement, sibling)
+        assert app.app_server.turn_active is parent_active
+        assert not parent_interrupted.is_set()
+        interrupt.assert_not_awaited()
+        assert not app.query(AgentTranscriptViewer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["transport", "forbidden"])
+async def test_stop_failure_surfaces_toast_and_restores_browser(
+    failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        request = AsyncMock(
+            side_effect=RuntimeError("connection lost")
+            if failure == "transport"
+            else None,
+            return_value=AgentsCancelResponse(
+                outcome=CancelOutcome.FORBIDDEN, run_id="r1"
+            ),
+        )
+        notify = MagicMock()
+        monkeypatch.setattr(app.app_server, "cancel_agent", request)
+        monkeypatch.setattr(app, "notify", notify)
+        await app._handle_turn_event(
+            AgentsUpdate([
+                AgentSummaryModel(
+                    agent_id="one",
+                    profile="worker",
+                    availability="running",
+                    current_run_id="r1",
+                )
+            ])
+        )
+        await pilot.press("ctrl+shift+a", "down", "c", "left", "enter")
+        await _wait_until(pilot, lambda: notify.called)
+        request.assert_awaited_once_with("one", "r1")
+        notify.assert_called_once()
+        text = notify.call_args.args[0]
+        assert (
+            "connection lost" if failure == "transport" else "Stop forbidden"
+        ) in text
+        assert "one, run r1" in text and "Retained output remains inspectable" in text
+        assert notify.call_args.kwargs == {"severity": "error", "markup": False}
+        bar = app._agent_bar
+        assert bar is not None and bar.expanded and app.screen.focused is bar
+        assert not bar.stop_is_pending("one", "r1")
+        assert not app.query(AgentTranscriptViewer)
+        await pilot.press("c")
+        assert bar._stop_confirmation == ("one", "r1")
+
+
+@pytest.mark.asyncio
+async def test_escape_dismisses_stop_confirmation_before_browser_and_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = build_test_chartreux_app()
+    interrupt, cancel = MagicMock(), AsyncMock()
+    monkeypatch.setattr(app, "_try_interrupt", interrupt)
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        monkeypatch.setattr(app.app_server, "cancel_agent", cancel)
+        await app._handle_turn_event(
+            AgentsUpdate([
+                AgentSummaryModel(
+                    agent_id="one",
+                    profile="worker",
+                    availability="running",
+                    current_run_id="r1",
+                )
+            ])
+        )
+        await pilot.press("ctrl+shift+a", "down", "c", "left", "escape")
+        bar = app._agent_bar
+        assert bar is not None and bar.expanded
+        assert bar._stop_confirmation is None and app.screen.focused is bar
+        cancel.assert_not_awaited()
+        interrupt.assert_not_called()
+        await pilot.press("escape")
+        assert not bar.expanded
+        interrupt.assert_not_called()
+        await pilot.press("escape")
+        interrupt.assert_called_once()

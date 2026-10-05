@@ -113,7 +113,9 @@ Use these tools directly for orchestration only:
 - `bash` — read-only orchestration metadata only, not exploration, tests, builds, or mutation. Delegate searches and verification instead of using direct `grep` or shell commands.
 - `skill` and `todo` — procedures and task tracking.
 - `web_search` / `web_fetch` — quick single-question lookups; delegate multi-step research.
-- `check_agents`, `get_agent_result`, `wait_for_agent`, and `release_agent` — background-agent lifecycle, not specialist work.
+- `check_agents`, `get_agent_result`, `wait_for_agent`, `cancel_agent`, and `release_agent` — background-agent lifecycle, not specialist work.
+
+Select an agent type by profile name with `task(agent_type="worker", task=...)` (default `worker`); `advisor` and `reviewer` are also agent types. A retained agent instance is identified by `agent_id`, not `agent_type`. The `agent-N` syntax (digits after `agent-`) is reserved for instance handles and rejected in `agent_type` before dispatch. To continue an idle instance, use `task(agent_id=..., background=true, task=...)`, omitting `agent_type` to retain its profile. Launch acknowledgments and `check_agents.reuse_guidance` include this reuse guidance.
 
 Route through the `worker`, `advisor`, or `reviewer` agent profile (including user/project TOML profiles). `config.model` accepts a canonical model name or an `@role` from the configured catalog; do not guess model names. The shipped model roles are `orchestrator` for the main assistant and `large`, `medium`, and `small` for subagent work. Worker and reviewer profiles use `@medium` by default; use `@small` for lighter work and escalate to `@large` only for novel algorithmic reasoning, difficult refactoring, broad impact, or a concrete failure that needs more capability. The advisor profile uses `@large` for architecture, design, planning, and destructive-operation analysis, not implementation retries. Use fresh reviewers for independent judgments; never reuse an advisor as a reviewer or give a second-round reviewer earlier conclusions. Keep an advisor across related design refinements.
 
@@ -125,7 +127,7 @@ silently choose another model. An explicit launch `config.thinking` overrides
 the preset for that launch. To get independent reviews, launch separate tasks
 with explicit presets or models. The retired `fan_out: true` flag is rejected.
 
-For background work, `check_agents` before reuse; re-task an idle agent only for a genuine continuation, with the current scope and intervening changes. Model, thinking, and tools can change on re-task, but persona (`instructions` / `system_prompt_id`), role, stack, and independent judgment require a new agent. Running agents are busy. Retrieve results before release; idle retention is best-effort, and evicted agents must be recreated for further work.
+For background work, `check_agents` before reuse; re-task an idle agent only for a genuine continuation, with the current scope and intervening changes. Model, thinking, and tools can change on re-task, but persona (`instructions` / `system_prompt_id`), role, stack, and independent judgment require a new agent. Running agents are busy unless explicitly superseded with `task(agent_id=..., replace_run=True, background=True)`. Busy replacement keeps the conversation, automatically injects supersession framing, joins old cleanup before launching, and forbids config/profile changes. Check `launch_outcome`; stopping/finishing/reserved refusals are not launches. The acknowledgment's `metadata.replaced_run_id` and `metadata.replacement_run_id` identify both runs. Use `cancel_agent(agent_id, run_id)` to request a stop without replacement, then wait for the terminal result; stop acceptance is not completion and neither stop nor retask rolls back side effects. Retrieve results before release; idle retention is best-effort, and evicted agents must be recreated for further work.
 
 **Shell**
 

@@ -4,12 +4,12 @@ import time
 from typing import ClassVar, Literal
 
 from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.timer import Timer
-from textual.widgets import Static
+from textual.widgets import Button, Static
 
-from chartreux.cli.textual_ui.widgets.path_display import PathDisplay
-from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
+from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLine
 
 QuitConfirmKey = Literal["Ctrl+C", "Ctrl+D", "/exit"]
 
@@ -19,17 +19,21 @@ QUIT_CONFIRM_DELAY = 30.0
 class ExitConsequencesScreen(ModalScreen[bool]):
     """Reachable full consequence text, including from a picker or inspection."""
 
+    AUTO_FOCUS = "#exit-cancel"
     BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
-        ("enter", "confirm", "Confirm exit"),
-        ("escape", "cancel", "Keep working"),
+        ("escape", "cancel", "Keep working")
     ]
     DEFAULT_CSS = """
     ExitConsequencesScreen { align: center middle; background: $background 85%; }
-    ExitConsequencesScreen Static {
-        width: 90%; max-width: 76; height: auto;
+    ExitConsequencesScreen #exit-dialog {
+        width: 90%; max-width: 76; height: 90%; max-height: 26;
         padding: 1 2; border: round $warning;
         background: $surface; color: $foreground;
     }
+    ExitConsequencesScreen Static { height: auto; }
+    ExitConsequencesScreen #exit-consequences { height: 1fr; }
+    ExitConsequencesScreen #exit-actions { height: 3; align-horizontal: right; }
+    ExitConsequencesScreen Button { margin-left: 1; }
     """
 
     def __init__(self, consequences: str) -> None:
@@ -37,11 +41,25 @@ class ExitConsequencesScreen(ModalScreen[bool]):
         self._consequences = consequences
 
     def compose(self) -> ComposeResult:
-        yield Static(
-            "Exit consequences\n\n"
-            + self._consequences
-            + "\n\nEnter: confirm exit    Esc: keep working"
-        )
+        with Vertical(id="exit-dialog"):
+            yield Static("Exit consequences")
+            with VerticalScroll(id="exit-consequences"):
+                yield Static(
+                    self._consequences
+                    + "\n\nCancel keeps working without stopping work, abandoning "
+                    "queued input, or answering pending decisions."
+                )
+            yield Static("Tab/Shift+Tab: focus    Enter: activate    Esc: Cancel")
+            with Horizontal(id="exit-actions"):
+                yield Button("Cancel", id="exit-cancel")
+                yield Button("Exit", variant="warning", id="exit-confirm")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "exit-confirm":
+            self.action_confirm()
+        else:
+            self.action_cancel()
 
     def action_confirm(self) -> None:
         self.dismiss(True)
@@ -74,14 +92,10 @@ class QuitManager:
             self._confirm_timer = None
         self._confirm_time = time.monotonic()
         self._confirm_key = key
-        prompt = f"Press {shortcut(key) if key != '/exit' else '/exit'} again to quit"
+        prompt = f"Press {key} again to quit"
         if extra:
             prompt = f"{prompt} ({extra})"
-        try:
-            path_display = self._app.query_one(PathDisplay)
-            path_display.update(shortcut_hint(prompt))
-        except Exception:
-            pass
+        self._app.query_one(SessionStatusLine).set_feedback(prompt)
         self._confirm_timer = self._app.set_timer(
             QUIT_CONFIRM_DELAY, self.cancel_confirmation
         )
@@ -94,8 +108,4 @@ class QuitManager:
         if self._confirm_timer:
             self._confirm_timer.stop()
             self._confirm_timer = None
-        try:
-            path_display = self._app.query_one(PathDisplay)
-            path_display.refresh_display()
-        except Exception:
-            pass
+        self._app.query_one(SessionStatusLine).clear_feedback()

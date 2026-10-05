@@ -14,6 +14,20 @@ Chartreux is a local coding-agent harness with a reusable engine and several del
 
 For practical usage, start with [configuration](../guides/configuration.md), [tools and safety](../guides/tools-safety.md), [subagents](../guides/subagents.md), or the [app-server integration](../integrations/app-server.md).
 
+## Usage accounting
+
+The LLM gateway and utility completion helper finalize content-free per-call
+accounting through an injected sink. Root-owned writers append records to an
+independent local usage ledger, including child-agent and pre-session naming
+calls. Accounting failures degrade coverage without triggering another backend call.
+
+The usage service reads and caches ledger records, aggregates captured costs into
+local calendar windows, and publishes revisions. Host-level `usage/read` and
+`usage/updated` project these snapshots to clients without requiring a session.
+The TUI formats supplied global summaries for status-line spend and keeps a frozen
+snapshot in the read-only Usage browser; rendering does not read the ledger.
+See the [app-server contracts](../integrations/app-server.md#usage-accounting).
+
 ## ADR reading guide
 
 The ADRs record the constraints behind the map above. Read them in order for the broadest picture, or use this guide to jump to a decision.

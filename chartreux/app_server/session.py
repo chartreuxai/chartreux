@@ -54,6 +54,8 @@ from chartreux.app_server.models import (
     UserQuestionResult,
 )
 from chartreux.app_server.protocol import (
+    AgentsCancelParams,
+    AgentsCancelResponse,
     AppServerResponseError,
     CallbackCallParams,
     CallbackCallResponse,
@@ -168,7 +170,7 @@ class AppServerSession:  # noqa: PLR0904
             client_factory=client_factory,
         )
         resource_connection = AppServerResourceConnection(
-            self._connection, self._ensure_attached
+            self._connection, self._ensure_attached, self._ensure_host_connected
         )
         self.resources = AppServerResources(resource_connection, self._state)
         self._event_generation = 0
@@ -310,6 +312,13 @@ class AppServerSession:  # noqa: PLR0904
     @property
     def turn_active(self) -> bool:
         return self._starting_turn or self._active_public_turn_id() is not None
+
+    @property
+    def waiting_only(self) -> bool:
+        return not self._starting_turn and any(
+            turn.status is PublicTurnStatus.IN_PROGRESS and turn.waiting_only
+            for turn in self.state.turns or []
+        )
 
     def exit_summary(self) -> SessionExitSummary:
         session_log = self.resources.runtime.session_log
@@ -603,7 +612,7 @@ class AppServerSession:  # noqa: PLR0904
         )
         return await self.read_turn_queue()
 
-    async def inject_user_context(
+    async def inject_user_context(  # noqa: PLR0913
         self,
         content: str,
         *,
@@ -614,16 +623,23 @@ class AppServerSession:  # noqa: PLR0904
         client_message_id: str | None = None,
         mention_stats: MentionStats | None = None,
         require_active_turn: bool = False,
+        require_waiting_only: bool = False,
+        idempotency_key: str | None = None,
+        expected_turn_id: str | None = None,
     ) -> list[HistoryEntryAdded]:
+        if require_waiting_only and (not expected_turn_id or not idempotency_key):
+            raise ValueError("Conditional steering requires a captured turn and key")
         client = await self._ensure_attached()
         blocks = _content_blocks(content, images, resources)
-        active_turn_id = self._active_public_turn_id()
+        active_turn_id = expected_turn_id or self._active_public_turn_id()
         if active_turn_id is not None:
             validate_wire(
                 TurnSteerResponse,
                 await client.request(
                     "turn/steer",
                     TurnSteerParams(
+                        idempotency_key=idempotency_key,
+                        require_waiting_only=require_waiting_only,
                         session_id=self.session_id,
                         expected_turn_id=active_turn_id,
                         message=blocks,
@@ -654,6 +670,16 @@ class AppServerSession:  # noqa: PLR0904
             ),
         )
         return [HistoryEntryAdded(entry) for entry in response.entries]
+
+    async def cancel_agent(
+        self, agent_id: str, run_id: str | None = None
+    ) -> AgentsCancelResponse:
+        """Request a background run stop without interrupting the root turn."""
+        params = AgentsCancelParams(agent_id=agent_id, run_id=run_id)
+        client = await self._ensure_attached()
+        return validate_wire(
+            AgentsCancelResponse, await client.request("agents/cancel", params)
+        )
 
     async def interrupt(self) -> None:
         active_turn_id = self._active_public_turn_id()
@@ -797,6 +823,12 @@ class AppServerSession:  # noqa: PLR0904
             self._client_request_tasks.clear()
         self._close_event_streams()
 
+    async def _ensure_host_connected(self) -> AppServerClient:
+        client = await self._connection.connect_host()
+        if self._message_task is None:
+            self._message_task = asyncio.create_task(self._pump_messages())
+        return client
+
     async def _ensure_attached(self) -> AppServerClient:
         client = await self._connection.connect()
         if snapshot := self._connection.take_snapshot():
@@ -824,13 +856,19 @@ class AppServerSession:  # noqa: PLR0904
                 self._reconnect_backoff_seconds = min(
                     self._reconnect_backoff_seconds * 2, _RECONNECT_BACKOFF_MAX_SECONDS
                 )
+                was_attached = self._connection.attached
                 if not await self._connection.reconnect(client):
                     self._close_event_streams(error)
                     return
                 if self._closing:
                     self._close_event_streams()
                     return
-                client = await self._attach_with_backoff()
+                client = await self._attach_with_backoff(attach_session=was_attached)
+                if client is not None and not self._closing:
+                    try:
+                        await self.resources.usage.refresh_after_reconnect()
+                    except Exception:
+                        logger.warning("Usage refresh after reconnect failed")
                 if self._closing:
                     self._close_event_streams()
                     return
@@ -840,7 +878,9 @@ class AppServerSession:  # noqa: PLR0904
             if self._message_task is asyncio.current_task():
                 self._message_task = None
 
-    async def _attach_with_backoff(self) -> AppServerClient | None:
+    async def _attach_with_backoff(
+        self, *, attach_session: bool = True
+    ) -> AppServerClient | None:
         while not self._closing:
             client = self._connection.current
             if client is None:
@@ -849,6 +889,8 @@ class AppServerSession:  # noqa: PLR0904
                 )
                 return None
             try:
+                if not attach_session:
+                    return await self._ensure_host_connected()
                 return await self._ensure_attached()
             except asyncio.CancelledError:
                 raise
@@ -985,7 +1027,7 @@ class AppServerSession:  # noqa: PLR0904
             if notification.method == "runtime/updated":
                 await self._resync(client)
                 await self.resources.runtime.refresh()
-            elif notification.method == "mcp_catalog/authUrl":
+            elif notification.method in {"mcp_catalog/authUrl", "usage/updated"}:
                 logger.warning(
                     "Dropping malformed app-server notification method %s",
                     notification.method,

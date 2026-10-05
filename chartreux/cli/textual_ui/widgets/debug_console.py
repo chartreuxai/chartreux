@@ -14,6 +14,7 @@ from textual.binding import Binding, BindingType
 from textual.cache import LRUCache
 from textual.containers import Vertical
 from textual.geometry import Size
+from textual.message import Message
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
 from textual.widget import Widget
@@ -43,7 +44,11 @@ class DebugLogSource(Protocol):
 
 class _LogView(ScrollView, can_focus=True):
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("c", "copy_selected_line", "Copy selected log line", show=False)
+        Binding("c", "copy_selected_line", "Copy selected log line", show=False),
+        Binding("up,k", "select_previous", "Previous log row", show=False),
+        Binding("down,j", "select_next", "Next log row", show=False),
+        Binding("tab", "leave_console(1)", "Next focus group", show=False),
+        Binding("shift+tab", "leave_console(-1)", "Previous focus group", show=False),
     ]
 
     def __init__(
@@ -63,6 +68,34 @@ class _LogView(ScrollView, can_focus=True):
         self._render_line_cache: LRUCache[int, Strip] = LRUCache(1024)
         self._load_page = load_page
         self._has_more = has_more
+
+    def focus(self, scroll_visible: bool = True) -> _LogView:
+        if isinstance(self.parent, DebugConsole):
+            self.parent._suspend_input_focusability()
+        super().focus(scroll_visible=scroll_visible)
+        return self
+
+    def on_focus(self) -> None:
+        # ChatTextArea normally reclaims focus on blur. Suspend that while the
+        # console owns focus, including Screen's direct Tab/pointer focus route.
+        if isinstance(self.parent, DebugConsole):
+            self.parent._suspend_input_focusability()
+
+    def action_leave_console(self, direction: int) -> None:
+        if isinstance(self.parent, DebugConsole):
+            if self.parent.has_class("-fullscreen"):
+                return
+            self.parent._restore_input_focusability()
+        if direction > 0:
+            self.screen.focus_next()
+        else:
+            self.screen.focus_previous()
+
+    def on_blur(self) -> None:
+        if isinstance(self.parent, DebugConsole) and not self.parent.has_class(
+            "-fullscreen"
+        ):
+            self.parent._restore_input_focusability()
 
     def _wrap_markup(self, markup: str) -> int:
         """Return the number of visual lines this markup produces at current width."""
@@ -85,11 +118,20 @@ class _LogView(ScrollView, can_focus=True):
         width = self.size.width
         if width <= 0:
             return
+        anchor = max(0, bisect.bisect_right(self._wrap_prefix, int(self.scroll_y)) - 1)
+        fragment = int(self.scroll_y) - self._wrap_prefix[anchor]
         self._cached_width = width
         self._render_line_cache.clear()
         self._wrap_counts = [self._wrap_markup(m) for m in self._lines]
         self._recompute_prefix()
         self.virtual_size = Size(width, self._total_visual)
+        if anchor < len(self._lines):
+            self.scroll_to(
+                y=self._wrap_prefix[anchor]
+                + min(fragment, self._wrap_counts[anchor] - 1),
+                animate=False,
+                immediate=True,
+            )
 
     def write_line(self, markup: str, scroll_end: bool | None = None) -> None:
         at_bottom = self.is_vertical_scroll_end
@@ -103,7 +145,9 @@ class _LogView(ScrollView, can_focus=True):
         self._total_visual += count
         self.virtual_size = Size(width, self._total_visual)
 
-        if scroll_end or (scroll_end is None and at_bottom):
+        if scroll_end or (
+            scroll_end is None and at_bottom and self._selected_line is None
+        ):
             self.scroll_end(animate=False, immediate=True, x_axis=False)
 
     def prepend_lines(self, markups: list[str]) -> None:
@@ -174,14 +218,37 @@ class _LogView(ScrollView, can_focus=True):
         visual_y = scroll_y + event.y
         logical_idx = bisect.bisect_right(self._wrap_prefix, visual_y) - 1
         if 0 <= logical_idx < len(self._lines):
-            self._selected_line = logical_idx
+            self._select_line(logical_idx)
             self.focus()
-            self._render_line_cache.clear()
-            self.refresh()
-            self.app.query_one("#debug-console-footer", Static).update(
-                "Log row selected · c Copy selected · Ctrl+\\ Close"
-            )
             event.stop()
+
+    def _select_line(self, index: int) -> None:
+        self._selected_line = index
+        self._render_line_cache.clear()
+        self.refresh()
+
+    def _move_selection(self, delta: int) -> None:
+        if not self._lines:
+            return
+        if self._selected_line is None:
+            index = bisect.bisect_right(self._wrap_prefix, int(self.scroll_y)) - 1
+        else:
+            index = self._selected_line + delta
+        index = max(0, min(index, len(self._lines) - 1))
+        self._select_line(index)
+        top = self._wrap_prefix[index]
+        bottom = self._wrap_prefix[index + 1]
+        if top < self.scroll_y or bottom - top >= self.size.height:
+            self.scroll_to(y=top, animate=False, immediate=True)
+        elif bottom > self.scroll_y + self.size.height:
+            self.scroll_to(y=bottom - self.size.height, animate=False, immediate=True)
+        self._try_load_previous()
+
+    def action_select_previous(self) -> None:
+        self._move_selection(-1)
+
+    def action_select_next(self) -> None:
+        self._move_selection(1)
 
     def action_copy_selected_line(self) -> None:
         if self._selected_line is None:
@@ -213,7 +280,39 @@ class _LogView(ScrollView, can_focus=True):
         self._try_load_previous()
 
 
+class _ConsoleFooter(Static):
+    def action_copy(self) -> None:
+        if isinstance(self.parent, DebugConsole):
+            self.parent.action_copy()
+
+    def action_close(self) -> None:
+        if isinstance(self.parent, DebugConsole):
+            self.parent.action_close()
+
+
 class DebugConsole(Vertical):
+    class Closed(Message):
+        pass
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "close", "Close debug console", show=False),
+        Binding("c", "copy", "Copy selected log row", show=False),
+    ]
+
+    def action_copy(self) -> None:
+        if self._log_view is not None:
+            self._log_view.action_copy_selected_line()
+
+    def action_close(self) -> None:
+        self.post_message(self.Closed())
+
+    @property
+    def owns_interaction(self) -> bool:
+        focused = self.app.screen.focused
+        return self.screen is self.app.screen and (
+            focused is self or (focused is not None and self in focused.ancestors)
+        )
+
     def __init__(
         self, log_source: DebugLogSource, page_size: int = DEFAULT_LOG_PAGE_SIZE
     ) -> None:
@@ -244,8 +343,9 @@ class DebugConsole(Vertical):
             id="debug-console-log",
         )
         yield self._log_view
-        footer = Static(
-            "Click row to select · c Copy selected · Ctrl+\\ Close",
+        footer = _ConsoleFooter(
+            "↑/↓ j/k Select row · [@click=copy]c Copy selected[/] · "
+            "[@click=close]Esc / Ctrl+\\ Close[/]",
             id="debug-console-footer",
         )
         footer.styles.height = "auto"
@@ -265,12 +365,18 @@ class DebugConsole(Vertical):
         self.set_class(fullscreen, "-fullscreen")
         self.styles.width = self.app.size.width if fullscreen else DEBUG_DOCK_WIDTH
         if promoted:
-            self._input_focus_target = self.app.query_one("#input", Widget)
-            self._input_can_focus = self._input_focus_target.can_focus
-            self._input_focus_target.can_focus = False
+            self._suspend_input_focusability()
             self.set_timer(0.05, self._focus_fullscreen_log)
-        elif not fullscreen:
+        elif not fullscreen and not self.owns_interaction:
             self._restore_input_focusability()
+
+    def _suspend_input_focusability(self) -> None:
+        if self._input_focus_target is None:
+            inputs = self.app.query("#input")
+            if inputs:
+                self._input_focus_target = inputs.first()
+                self._input_can_focus = self._input_focus_target.can_focus
+                self._input_focus_target.can_focus = False
 
     def on_unmount(self) -> None:
         self._restore_input_focusability()
@@ -282,12 +388,16 @@ class DebugConsole(Vertical):
         self._input_can_focus = None
 
     def _focus_fullscreen_log(self) -> None:
+        if not self.is_mounted or self.screen is not self.app.screen:
+            return
+        if self._log_view is None or not self.has_class("-fullscreen"):
+            return
         if (
-            self.is_mounted
-            and self.has_class("-fullscreen")
-            and self._log_view is not None
+            self.owns_interaction
+            or self.screen.focused is None
+            or self.screen.focused is self._input_focus_target
         ):
-            self.screen.set_focus(self._log_view)
+            self._log_view.focus()
 
     def _show_state(self, text: str | None, *, failed: bool = False) -> None:
         if self._state_row is None:
@@ -386,8 +496,6 @@ class DebugConsole(Vertical):
             return
         if self._log_view.virtual_size.height <= self._log_view.size.height:
             self._schedule_load_page()
-        else:
-            self._log_view.scroll_end(animate=False)
 
     def _format_entry(self, entry: DebugLogEntry) -> str:
         role = LOG_LEVEL_ROLES.get(entry.level, "$text-muted").lstrip("$")

@@ -51,7 +51,8 @@ _RESUME_TAIL_SIZE = 20
 _TRAVERSAL_STEP_COUNT = 8
 _RECONCILE_PASS_CEILING = 3 * 414
 _ENTRY_COUNTS = (300, 400, 500) if _FULL_SCOPE else (400,)
-_SCENARIO_TIMEOUT = 1800 if _FULL_SCOPE else 420
+# Wall-clock guard only: leave headroom above the smoke's ~410s runtime.
+_SCENARIO_TIMEOUT = 1800 if _FULL_SCOPE else 600
 
 
 class _AnchorSample(TypedDict):
@@ -189,13 +190,6 @@ async def _wait_for_resume(
     )
 
 
-def _load_more_label(app: ChartreuxApp) -> str | None:
-    load_more_messages = list(app.query(HistoryLoadMoreMessage))
-    if not load_more_messages:
-        return None
-    return str(load_more_messages[0].query_one(Button).label)
-
-
 async def _wait_for_load_more_state(
     app: ChartreuxApp, expected_start_index: int, *, timeout: float = 120.0
 ) -> None:
@@ -212,6 +206,8 @@ async def _wait_for_load_more_state(
         if (
             app._transcript.admitted_start_index == expected_start_index
             and len(load_more_messages) == 1
+            # The message can enter the DOM before its Button is composed.
+            and len(load_more_messages[0].query(Button)) == 1
         ):
             button = load_more_messages[0].query_one(Button)
             remaining = app._history_backfill_remaining
@@ -224,11 +220,9 @@ async def _wait_for_load_more_state(
                 return
         if asyncio.get_running_loop().time() >= deadline:
             button_state = [
-                (
-                    str(message.query_one(Button).label),
-                    message.query_one(Button).disabled,
-                )
+                (str(button.label), button.disabled)
                 for message in load_more_messages
+                for button in message.query(Button)
             ]
             raise TimeoutError(
                 "transcript Load More did not settle at admitted start index "
@@ -249,7 +243,7 @@ async def _load_all_more(
 ) -> tuple[list[float], float]:
     batch_latency_ms: list[float] = []
     total_started = perf_counter_ns()
-    while _load_more_label(app) is not None:
+    while app.query(HistoryLoadMoreMessage):
         previous_start_index = app._transcript.admitted_start_index
         await _wait_for_load_more_state(app, previous_start_index)
         chat = app.query_one("#chat", ChatScroll)

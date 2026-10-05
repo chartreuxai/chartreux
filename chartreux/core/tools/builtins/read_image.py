@@ -378,7 +378,7 @@ class ReadImage(
             config_permission=self.config.permission,
             sensitive_patterns=self.config.sensitive_patterns,
             workspace=self.workspace,
-            scratchpad_dir=self.scratchpad_dir,
+            scratchpad_roots=self.scratchpad_roots,
         )
 
     def get_result_images(

@@ -83,6 +83,8 @@ from chartreux.app_server.models import (
     PublicSessionState,
 )
 from chartreux.app_server.protocol import (
+    AgentsCancelParams,
+    AgentsCancelResponse,
     AgentTranscriptGetParams,
     AgentTranscriptGetResponse,
     AgentTranscriptState,
@@ -91,9 +93,11 @@ from chartreux.app_server.protocol import (
     CallbackResultError,
     CallbackResultParams,
     CallbackResultResponse,
+    CancelOutcome,
     ContextInjectParams,
     EmptyResponse,
     ProtocolErrorCode,
+    RunStopReason as PublicRunStopReason,
     RuntimeUpdatedParams,
     SessionCompactParams,
     SessionCompactResponse,
@@ -169,7 +173,7 @@ from chartreux.core.session_types import (
     ScheduledLoop as CoreScheduledLoop,
     SessionMetadata,
 )
-from chartreux.core.subagents import UnknownAgentError
+from chartreux.core.subagents import RunStopReason, UnknownAgentError
 from chartreux.observability.logging import logger
 
 DEFAULT_HISTORY_LIMIT = 200
@@ -238,16 +242,43 @@ class CoreRequestHandler:
         self.worktree_token: OwnershipToken | None = None
 
     async def dispatch(self, method: str, raw_params: dict[str, Any]) -> DispatchResult:
+        steer_params: TurnSteerParams | None = None
+        try:
+            if method == "turn/steer":
+                steer_params = validate_wire(TurnSteerParams, raw_params)
+            return await self._dispatch_checked(method, raw_params, steer_params)
+        except RequestFailure as exc:
+            if method == "turn/steer" and (
+                steer_params is None
+                or self._turns.steer_committed(steer_params) is False
+            ):
+                data = dict(exc.data) if isinstance(exc.data, dict) else {}
+                data["steerCommitted"] = False
+                exc.data = data
+            raise
+
+    async def _dispatch_checked(
+        self,
+        method: str,
+        raw_params: dict[str, Any],
+        steer_params: TurnSteerParams | None,
+    ) -> DispatchResult:
         try:
             active = self._execution.active
             if (
                 active is not None
                 and active.kind is SessionExecutionKind.LIFECYCLE
-                and method != "turn/interrupt"
+                and method not in {"turn/interrupt", "agents/cancel"}
+                and not (
+                    steer_params is not None
+                    and self._turns.known_steer_receipt(steer_params)
+                )
             ):
                 raise SessionExecutionConflict(
                     f"Session lifecycle transition is active: {active.id}"
                 )
+            if steer_params is not None:
+                return await self._dispatch_turn(method, raw_params, steer_params)
             return await self._dispatch(method, raw_params)
         except TurnConflictError as exc:
             raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
@@ -303,6 +334,8 @@ class CoreRequestHandler:
             return await self._dispatch_turn(method, raw_params)
         namespace = method.partition("/")[0]
         match namespace:
+            case "agents":
+                result = await self._dispatch_agents(method, raw_params)
             case "agent":
                 result = await self._dispatch_agent(method, raw_params)
             case "session":
@@ -332,6 +365,33 @@ class CoreRequestHandler:
             case _:
                 raise method_not_found(method)
         return result
+
+    async def _dispatch_agents(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult:
+        if method != "agents/cancel":
+            raise method_not_found(method)
+        params = validate_wire(AgentsCancelParams, raw_params)
+        self._require_attached(self._agent_loop.session_id)
+        if self._closed:
+            raise RequestFailure(ProtocolErrorCode.CONFLICT, "Session is closing")
+        result = await self._sessions.cancel_run(
+            params.agent_id,
+            params.run_id,
+            reason=RunStopReason.USER_CANCELLED,
+            requester_session_id=self._agent_loop.session_id,
+        )
+        return DispatchResult(
+            AgentsCancelResponse(
+                outcome=CancelOutcome(result.outcome.value),
+                run_id=result.run_id,
+                stop_reason=(
+                    PublicRunStopReason(result.stop_reason.value)
+                    if result.stop_reason is not None
+                    else None
+                ),
+            )
+        )
 
     async def _dispatch_agent(
         self, method: str, raw_params: dict[str, Any]
@@ -655,7 +715,10 @@ class CoreRequestHandler:
         return DispatchResult(response, after_response=after_response)
 
     async def _dispatch_turn(
-        self, method: str, raw_params: dict[str, Any]
+        self,
+        method: str,
+        raw_params: dict[str, Any],
+        steer_params: TurnSteerParams | None = None,
     ) -> DispatchResult:
         response: ProtocolModel
         after_response: Callable[[], None] | None = None
@@ -699,10 +762,13 @@ class CoreRequestHandler:
                     last_event_id=self._current_event_id(start_params.session_id),
                 )
             case "turn/steer":
-                steer_params = validate_wire(TurnSteerParams, raw_params)
-                self._require_turn_route(
-                    steer_params.session_id, steer_params.expected_turn_id
-                )
+                assert steer_params is not None
+                if not self._turns.known_steer_receipt(steer_params):
+                    if self._closed and steer_params.require_waiting_only:
+                        raise TurnConflictError("Session is closing")
+                    self._require_turn_route(
+                        steer_params.session_id, steer_params.expected_turn_id
+                    )
                 await self._turns.steer(steer_params)
                 response = TurnSteerResponse(
                     last_event_id=self._current_event_id(steer_params.session_id)

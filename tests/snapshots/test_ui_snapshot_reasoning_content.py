@@ -81,10 +81,10 @@ class SnapshotTestAppWithHiddenReasoning(BaseSnapshotTestApp):
                 mock_llm_chunk(content=" This is the ultimate answer."),
             ]
         )
-        super().__init__(config=config)
-        self.agent_loop = build_test_agent_loop(
+        agent_loop = build_test_agent_loop(
             config=config, enable_streaming=True, backend=fake_backend
         )
+        super().__init__(agent_loop=agent_loop)
 
 
 def test_snapshot_shows_reasoning_content(snap_compare: SnapCompare) -> None:

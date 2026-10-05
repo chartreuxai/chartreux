@@ -202,19 +202,23 @@ class AnthropicMapper:
                     )
                 )
 
-        usage_data = data.get("usage", {})
+        usage_data = data.get("usage") or {}
         # Anthropic excludes cached tokens from input_tokens, so fold cache
         # creation and cache read back in to match the OpenTelemetry convention
         # that prompt_tokens includes cached tokens.
         total_input_tokens = (
-            usage_data.get("input_tokens", 0)
-            + usage_data.get("cache_creation_input_tokens", 0)
-            + usage_data.get("cache_read_input_tokens", 0)
+            (usage_data.get("input_tokens") or 0)
+            + (usage_data.get("cache_creation_input_tokens") or 0)
+            + (usage_data.get("cache_read_input_tokens") or 0)
         )
         usage = LLMUsage(
             prompt_tokens=total_input_tokens,
-            completion_tokens=usage_data.get("output_tokens", 0),
-            cached_tokens=usage_data.get("cache_read_input_tokens", 0),
+            completion_tokens=usage_data.get("output_tokens") or 0,
+            cached_tokens=usage_data.get("cache_read_input_tokens") or 0,
+            prompt_tokens_reported=usage_data.get("input_tokens") is not None,
+            completion_tokens_reported=usage_data.get("output_tokens") is not None,
+            cached_tokens_reported=usage_data.get("cache_read_input_tokens")
+            is not None,
         )
 
         return LLMChunk(
@@ -262,6 +266,7 @@ class AnthropicAdapter(APIAdapter):
         # reassembled here and emitted once complete. This state is per-response,
         # which is why the adapter is built per request rather than shared.
         self._open_reasoning_blocks: dict[int, dict[str, Any]] = {}
+        self._output_tokens = 0
 
     @staticmethod
     def _has_thinking_content(messages: list[dict[str, Any]]) -> bool:
@@ -467,20 +472,27 @@ class AnthropicAdapter(APIAdapter):
     def _parse_message_start(self, data: dict[str, Any]) -> LLMChunk:
         self._open_reasoning_blocks.clear()
         message = data.get("message", {})
-        usage_data = message.get("usage", {})
+        usage_data = message.get("usage") or {}
+        self._output_tokens = usage_data.get("output_tokens") or 0
         if not usage_data:
             return LLMChunk(message=LLMMessage(role=Role.assistant, content=None))
         total_input_tokens = (
-            usage_data.get("input_tokens", 0)
-            + usage_data.get("cache_creation_input_tokens", 0)
-            + usage_data.get("cache_read_input_tokens", 0)
+            (usage_data.get("input_tokens") or 0)
+            + (usage_data.get("cache_creation_input_tokens") or 0)
+            + (usage_data.get("cache_read_input_tokens") or 0)
         )
         return LLMChunk(
             message=LLMMessage(role=Role.assistant, content=None),
             usage=LLMUsage(
                 prompt_tokens=total_input_tokens,
-                completion_tokens=0,
-                cached_tokens=usage_data.get("cache_read_input_tokens", 0),
+                completion_tokens=self._output_tokens,
+                cached_tokens=usage_data.get("cache_read_input_tokens") or 0,
+                prompt_tokens_reported=usage_data.get("input_tokens") is not None,
+                # Preserve the observed output count without certifying final usage.
+                completion_tokens_reported=usage_data.get("output_tokens") is not None,
+                is_final=False,
+                cached_tokens_reported=usage_data.get("cache_read_input_tokens")
+                is not None,
             ),
         )
 
@@ -570,14 +582,21 @@ class AnthropicAdapter(APIAdapter):
 
     def _parse_message_delta(self, data: dict[str, Any]) -> LLMChunk:
         delta = data.get("delta", {})
-        usage_data = data.get("usage", {})
+        usage_data = data.get("usage") or {}
+        output_tokens = usage_data.get("output_tokens")
+        # Anthropic sends cumulative output counts; LLMUsage accumulates deltas.
+        # Subtract the previously observed count so final usage replaces it.
         usage = (
-            LLMUsage(
-                prompt_tokens=0, completion_tokens=usage_data.get("output_tokens", 0)
+            LLMUsage.from_reported(
+                completion_tokens=output_tokens - self._output_tokens
+                if output_tokens is not None
+                else None
             )
             if usage_data
             else None
         )
+        if output_tokens is not None:
+            self._output_tokens = output_tokens
         return LLMChunk(
             message=LLMMessage(role=Role.assistant, content=None),
             usage=usage,

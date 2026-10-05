@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 import tomllib
 from typing import Any
 
@@ -22,6 +23,10 @@ class AgentProfile:
 
     @classmethod
     def from_toml(cls, path: Path) -> AgentProfile:
+        if re.fullmatch(r"agent-\d+", path.stem):
+            raise ValueError(
+                f"Profile name '{path.stem}' is reserved for agent instance handles"
+            )
         with path.open("rb") as f:
             data = tomllib.load(f)
         idle_ttl_seconds = data.pop("idle_ttl_seconds", None)

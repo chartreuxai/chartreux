@@ -15,6 +15,7 @@ from chartreux.core.events import (
     UserMessageEvent,
 )
 from chartreux.core.llm_models import FunctionCall, ToolCall
+from chartreux.core.session.title_model import generate_session_title
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
@@ -141,7 +142,7 @@ class TestAgentLoopBackgroundTitle:
     @staticmethod
     def _patch_generator(monkeypatch: pytest.MonkeyPatch, title: str | None) -> None:
         async def fake_generate(
-            messages, *, config, previous_title=None, policy=None
+            messages, *, config, previous_title=None, policy=None, **_accounting
         ) -> str | None:
             return title
 
@@ -296,7 +297,7 @@ class TestAgentLoopBackgroundTitle:
         calls = 0
 
         async def fake_generate(
-            messages, *, config, previous_title=None, policy=None
+            messages, *, config, previous_title=None, policy=None, **_accounting
         ) -> str:
             nonlocal calls
             calls += 1
@@ -325,7 +326,7 @@ class TestAgentLoopBackgroundTitle:
         calls = 0
 
         async def fake_generate(
-            messages, *, config, previous_title=None, policy=None
+            messages, *, config, previous_title=None, policy=None, **_accounting
         ) -> str | None:
             nonlocal calls
             calls += 1
@@ -357,7 +358,7 @@ class TestAgentLoopBackgroundTitle:
         calls = 0
 
         async def fake_generate(
-            messages, *, config, previous_title=None, policy=None
+            messages, *, config, previous_title=None, policy=None, **_accounting
         ) -> str | None:
             nonlocal calls
             outcome = outcomes[calls]
@@ -404,7 +405,7 @@ class TestAgentLoopBackgroundTitle:
         generated = False
 
         async def fake_generate(
-            messages, *, config, previous_title=None, policy=None
+            messages, *, config, previous_title=None, policy=None, **_accounting
         ) -> str:
             nonlocal generated
             generated = True
@@ -439,6 +440,105 @@ class TestAgentLoopBackgroundTitle:
             assert generated is True
         finally:
             await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stale_title_finalizes_into_scheduling_owner_after_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from chartreux.core.agent_loop._loop import RootAccountingOwner
+    from chartreux.core.llm import utility_completion
+    from chartreux.core.llm.backend.generic import notify_request_started
+    from chartreux.core.llm_models import LLMChunk, LLMMessage, LLMUsage, Role
+    from chartreux.core.session_types import SessionMetadata
+    from chartreux.core.usage import AsyncUsageWriter, UsageOutcome, UsageRecord
+
+    loop = _make_agent_loop(tmp_path)
+    old_id = loop.session_id
+    old_records: list[UsageRecord] = []
+    new_records: list[UsageRecord] = []
+    entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def old_sink(record: UsageRecord) -> None:
+        old_records.append(record)
+
+    async def new_sink(record: UsageRecord) -> None:
+        new_records.append(record)
+
+    loop.accounting_owner = RootAccountingOwner(
+        old_id, "old-project", cast(AsyncUsageWriter, old_sink)
+    )
+    backend = FakeBackend()
+
+    async def complete(**_kwargs) -> LLMChunk:
+        notify_request_started()
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as error:
+            cancelled.set()
+            await release.wait()
+            error.usage = LLMUsage.from_reported(completion_tokens=7)  # type: ignore[attr-defined]
+            raise
+        return mock_llm_chunk(content="unreachable")
+
+    monkeypatch.setattr(backend, "complete", complete)
+    monkeypatch.setattr(utility_completion, "create_backend", lambda **_: backend)
+    monkeypatch.setattr(
+        "chartreux.core.session.title_model.generate_session_title",
+        generate_session_title,
+    )
+    loop.messages.append(LLMMessage(role=Role.user, content="title me"))
+    scheduled = loop._maybe_schedule_title_generation(turn_completing=True)
+    assert scheduled is not None
+    task = loop._auto_title_task
+    assert task is not None
+    scheduled.release()
+    await entered.wait()
+    new_owner = RootAccountingOwner(
+        "resumed", "new-project", cast(AsyncUsageWriter, new_sink)
+    )
+    metadata = SessionMetadata(
+        session_id="resumed",
+        start_time="2026-01-01T00:00:00Z",
+        end_time=None,
+        git_commit=None,
+        git_branch=None,
+        environment={},
+        username="test",
+    )
+    try:
+        loop.rebind_to_session(
+            "resumed",
+            tmp_path / "resumed",
+            [],
+            session_metadata=metadata,
+            prepared_scratchpad=None,
+            accounting_owner=new_owner,
+        )
+        await cancelled.wait()
+        assert task in loop._detached_accounting_producers
+        assert not old_records and not new_records
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(old_records) == 1
+        record = old_records[0]
+        assert (record.root_session_id, record.session_id, record.project_key) == (
+            old_id,
+            old_id,
+            "old-project",
+        )
+        assert record.purpose == "title"
+        assert record.outcome == UsageOutcome.INTERRUPTED
+        assert record.output_tokens == 7
+        assert not new_records
+    finally:
+        release.set()
+        # These lightweight sinks stand in for runtime-owned writers; the test
+        # checks producer retention and attribution, not writer shutdown.
+        loop.accounting_owner = None
+        await loop.aclose()
 
 
 class _RecordingCadence:

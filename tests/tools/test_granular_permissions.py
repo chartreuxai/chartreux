@@ -15,11 +15,17 @@ from chartreux.core.tools.builtins.bash import (
     _collect_outside_dirs,
 )
 from chartreux.core.tools.builtins.edit import Edit, EditArgs, EditConfig
-from chartreux.core.tools.builtins.grep import Grep, GrepArgs, GrepToolConfig
+from chartreux.core.tools.builtins.grep import (
+    Grep,
+    GrepArgs,
+    GrepResult,
+    GrepToolConfig,
+)
 from chartreux.core.tools.builtins.read_file import (
     ReadFile,
     ReadFileArgs,
     ReadFileConfig,
+    ReadFileResult,
     ReadFileState,
 )
 from chartreux.core.tools.builtins.web_fetch import (
@@ -36,6 +42,7 @@ from chartreux.core.tools.manager import ToolManager
 from chartreux.core.tools.permissions import PermissionContext
 from chartreux.core.tools.utils import (
     DEFAULT_SENSITIVE_PATTERNS,
+    PathAccess,
     matches_sensitive_pattern,
 )
 from tests.conftest import build_test_vibe_config
@@ -624,13 +631,464 @@ class TestCollectOutsideDirs:
     def test_posix_escaped_space_path_stays_single_token(self, monkeypatch):
         seen_paths: list[str] = []
 
-        def is_within_workdir(path: str, **_kwargs) -> bool:
+        def resolve(_self, path: str, _access) -> PermissionContext:
             seen_paths.append(path)
-            return False
+            return PermissionContext(permission=ToolPermission.NEVER)
 
-        monkeypatch.setattr(bash_module, "is_path_within_workdir", is_within_workdir)
+        monkeypatch.setattr(bash_module.PathAuthority, "resolve", resolve)
 
         dirs = _collect_outside_dirs([r"cat /outside/foo\ bar"])
 
         assert seen_paths == ["/outside/foo bar"]
         assert len(dirs) == 1
+
+
+def _permission(context: PermissionContext | None) -> PermissionContext:
+    assert context is not None
+    return context
+
+
+def _instruction_manager(cwd: Path, files=(), *, parent=None, tools=None, cached=True):
+    config = build_test_vibe_config(tools=tools or {})
+    manager = ToolManager(
+        lambda: config,
+        cwd=cwd,
+        defer_mcp=True,
+        accepted_token_getter=(lambda: "accepted") if cached else None,
+        parent_authority_getter=(lambda: parent) if parent else None,
+    )
+    manager.set_instruction_read_files(frozenset(files))
+    return manager
+
+
+@pytest.mark.asyncio
+async def test_instruction_exact_file_read_capability_main_and_child(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    instructions = tmp_path / "AGENTS.md"
+    instructions.write_text("instruction marker\n")
+    parent = _instruction_manager(workspace, [instructions])
+    child = _instruction_manager(workspace, parent=parent)
+    roots = parent.workspace.authorized_roots
+    for manager in (parent, child):
+        tool = manager.get("read_file")
+        assert isinstance(tool, ReadFile)
+        args = ReadFileArgs(file_path=str(instructions))
+        assert (
+            _permission(tool.resolve_permission(args)).permission
+            == ToolPermission.ALWAYS
+        )
+        results = [item async for item in tool.run(args)]
+        result = results[-1]
+        assert isinstance(result, ReadFileResult)
+        assert "instruction marker" in result.content
+        assert not manager.workspace.allows(instructions)
+        assert instructions not in manager.workspace.authorized_roots
+        assert instructions.parent not in manager.workspace.authorized_roots
+    assert parent.workspace.authorized_roots == roots
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize(
+    "denial", ["none", "configured", "ancestor", "sensitive", "outside", "symlink"]
+)
+def test_shared_path_denial_equivalence(tmp_path, cached, denial):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = (workspace if denial != "outside" else tmp_path) / "instructions.txt"
+    target.write_text("instructions")
+    if denial == "symlink":
+        outside = tmp_path / "outside.txt"
+        outside.write_text("outside")
+        target.unlink()
+        target.symlink_to(outside)
+    if denial == "sensitive":
+        target = workspace / ".env"
+        # Pure lexical permission test: never create or read a sensitive file.
+    rule = {name: {"denylist": [str(target)]} for name in ("read_file", "grep", "bash")}
+    parent = _instruction_manager(
+        workspace, tools=rule if denial == "ancestor" else {}, cached=cached
+    )
+    manager = _instruction_manager(
+        workspace,
+        tools=rule if denial == "configured" else {},
+        parent=parent,
+        cached=cached,
+    )
+    expected = ToolPermission.ALWAYS if denial == "none" else ToolPermission.NEVER
+    for name, args in (
+        ("read_file", {"file_path": str(target)}),
+        ("grep", {"path": str(target), "pattern": "instructions"}),
+        ("bash", {"command": f"cat {target}"}),
+    ):
+        tool = manager.get(name)
+        assert (
+            _permission(
+                tool.resolve_permission(tool.validate_arguments(args))
+            ).permission
+            == expected
+        )
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("cat {path}", ToolPermission.ALWAYS),
+        ("head {path}", ToolPermission.ALWAYS),
+        ("grep instructions {path}", ToolPermission.ALWAYS),
+        ("touch {path}", ToolPermission.NEVER),
+        ("rm {path}", ToolPermission.NEVER),
+        ("tee {path}", ToolPermission.NEVER),
+        ("sort -o {path} input", ToolPermission.NEVER),
+        ("uniq input {path}", ToolPermission.NEVER),
+        ("sed -i s/a/b/ {path}", ToolPermission.NEVER),
+        ("echo replacement > {path}", ToolPermission.NEVER),
+        ("cat {path} > {path}", ToolPermission.NEVER),
+        ("sh -c 'cat {path} > {path}'", ToolPermission.NEVER),
+    ],
+)
+def test_bash_instruction_reads_never_authorize_writes(
+    tmp_path, cached, command, expected
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    instructions = tmp_path / "AGENTS.md"
+    instructions.write_text("instructions")
+    parent = _instruction_manager(workspace, cached=cached)
+    child = _instruction_manager(
+        workspace, [instructions], parent=parent, cached=cached
+    )
+    tool = child.get("bash")
+    args = BashArgs(command=command.format(path=instructions))
+    assert _permission(tool.resolve_permission(args)).permission == expected
+    assert instructions.read_text() == "instructions"
+
+
+@pytest.mark.parametrize("denial", ["configured", "ancestor", "never"])
+def test_bash_instruction_grant_stays_below_denials(tmp_path, denial):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    instructions = tmp_path / "AGENTS.md"
+    instructions.write_text("instructions")
+    rules = {"bash": {"denylist": [str(instructions)]}}
+    parent = _instruction_manager(
+        workspace, tools=rules if denial == "ancestor" else {}
+    )
+    child = _instruction_manager(
+        workspace,
+        [instructions],
+        parent=parent,
+        tools={"bash": {"permission": "never"}}
+        if denial == "never"
+        else rules
+        if denial == "configured"
+        else {},
+    )
+    decision = _permission(
+        child.get("bash").resolve_permission(BashArgs(command=f"cat {instructions}"))
+    )
+    assert decision.permission == ToolPermission.NEVER
+
+
+def test_standalone_bash_instruction_read_uses_local_shared_authority(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    instructions = tmp_path / "AGENTS.md"
+    instructions.write_text("instructions")
+    tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=workspace)
+    tool.instruction_read_files_getter = lambda: frozenset({instructions})
+    assert (
+        _permission(
+            tool.resolve_permission(BashArgs(command=f"cat {instructions}"))
+        ).permission
+        == ToolPermission.ALWAYS
+    )
+    assert (
+        _permission(
+            tool.resolve_permission(BashArgs(command=f"touch {instructions}"))
+        ).permission
+        == ToolPermission.NEVER
+    )
+    assert (
+        _collect_outside_dirs([f"cat {instructions}"], authority=tool.path_authority)
+        == set()
+    )
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit", "read_image"])
+def test_instruction_capability_is_read_only_and_tool_name_scoped(
+    tmp_path, monkeypatch, tool_name
+):
+    from chartreux.core.tools.builtins.read_image import ReadImage
+
+    monkeypatch.setattr(
+        ReadImage, "is_available", classmethod(lambda cls, config=None: True)
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    instructions = tmp_path / "AGENTS.md"
+    instructions.write_text("instructions")
+    manager = _instruction_manager(workspace, [instructions])
+    tool = manager.get(tool_name)
+    args = tool.validate_arguments({
+        "file_path": str(instructions),
+        "content": "replacement",
+        "old_string": "instructions",
+        "new_string": "replacement",
+        "command": f"cat {instructions}",
+    })
+    decision = _permission(tool.resolve_permission(args))
+    assert decision.permission == ToolPermission.NEVER
+    if tool_name in {"write_file", "edit"}:
+        assert decision.reason is not None
+        assert decision.reason.startswith(
+            "Injected instruction files are readable only"
+        )
+        tool.plan_file_write_scope_getter = lambda: workspace / "plan.md"
+        assert "Plan mode" in (_permission(tool.resolve_permission(args)).reason or "")
+        shared = _permission(
+            tool.path_authority.resolve(str(instructions), PathAccess.WRITE)
+        )
+        assert shared.permission == ToolPermission.NEVER and "Plan mode" in (
+            shared.reason or ""
+        )
+
+
+@pytest.mark.parametrize("tool_name", ["read_file", "grep"])
+@pytest.mark.parametrize(
+    "sibling", ["config.toml", "sessions.json", "AGENTS.local.md", "other/AGENTS.md"]
+)
+def test_instruction_manifest_never_grants_siblings(tmp_path, tool_name, sibling):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    instruction = tmp_path / "AGENTS.md"
+    instruction.write_text("instructions")
+    target = tmp_path / sibling
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("not injected")
+    manager = _instruction_manager(workspace, [instruction])
+    tool = manager.get(tool_name)
+    args = tool.validate_arguments({
+        "file_path": str(target),
+        "path": str(target),
+        "pattern": ".",
+    })
+    assert _permission(tool.resolve_permission(args)).permission == ToolPermission.NEVER
+    if tool_name == "grep":
+        assert (
+            _permission(
+                tool.resolve_permission(GrepArgs(path=str(tmp_path), pattern="."))
+            ).permission
+            == ToolPermission.NEVER
+        )
+
+
+@pytest.mark.parametrize("tool_name", ["read_file", "grep"])
+@pytest.mark.parametrize("denial", ["permission", "denylist", "sensitive_patterns"])
+@pytest.mark.parametrize("inherited", [False, True])
+def test_instruction_capability_never_overrides_denials(
+    tmp_path, tool_name, denial, inherited
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    instruction = tmp_path / "AGENTS.md"
+    instruction.write_text("instructions")
+    rule = "never" if denial == "permission" else [str(instruction)]
+    parent = (
+        _instruction_manager(workspace, tools={tool_name: {denial: rule}})
+        if inherited
+        else None
+    )
+    manager = _instruction_manager(
+        workspace,
+        [instruction],
+        parent=parent,
+        tools={} if inherited else {tool_name: {denial: rule}},
+    )
+    tool = manager.get(tool_name)
+    args = tool.validate_arguments({
+        "file_path": str(instruction),
+        "path": str(instruction),
+        "pattern": ".",
+    })
+    assert _permission(tool.resolve_permission(args)).permission == ToolPermission.NEVER
+    if tool_name == "grep":
+        assert isinstance(tool, Grep)
+        _, frozen, _ = tool._snapshot()
+        assert frozen is not None and not frozen(instruction)
+
+
+@pytest.mark.parametrize("tool_name", ["read_file", "grep"])
+def test_instruction_symlink_identity_is_pinned(tmp_path, tool_name):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    original = tmp_path / "original.md"
+    other = tmp_path / "other.md"
+    original.write_text("injected")
+    other.write_text("not injected")
+    link = tmp_path / "AGENTS.md"
+    link.symlink_to(original)
+    manager = _instruction_manager(workspace, [link.resolve()])
+    tool = manager.get(tool_name)
+    args = tool.validate_arguments({
+        "file_path": str(link),
+        "path": str(link),
+        "pattern": ".",
+    })
+    assert (
+        _permission(tool.resolve_permission(args)).permission == ToolPermission.ALWAYS
+    )
+    link.unlink()
+    link.symlink_to(other)
+    assert _permission(tool.resolve_permission(args)).permission == ToolPermission.NEVER
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["rg", "grep"])
+@pytest.mark.parametrize("cached", [False, True])
+async def test_child_differing_instruction_manifest_grep(
+    tmp_path, monkeypatch, backend, cached
+):
+    import shutil
+
+    from chartreux.core.tools.builtins.grep import GrepBackend
+
+    if not shutil.which(backend):
+        pytest.skip(f"{backend} unavailable")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    parent_doc = tmp_path / "parent.md"
+    child_doc = tmp_path / "child.md"
+    parent_doc.write_text("parent marker\n")
+    child_doc.write_text("child marker\n")
+    parent = _instruction_manager(workspace, [parent_doc], cached=cached)
+    child = _instruction_manager(workspace, [child_doc], parent=parent, cached=cached)
+    tool = child.get("grep")
+    assert isinstance(tool, Grep)
+    monkeypatch.setattr(
+        tool,
+        "_detect_backend",
+        lambda: GrepBackend.RIPGREP if backend == "rg" else GrepBackend.GNU_GREP,
+    )
+    for doc in (parent_doc, child_doc):
+        args = GrepArgs(path=str(doc), pattern="marker")
+        assert (
+            _permission(tool.resolve_permission(args)).permission
+            == ToolPermission.ALWAYS
+        )
+        _, frozen, _ = tool._snapshot()
+        if cached:
+            assert frozen is not None and frozen(doc)
+        else:
+            assert frozen is None
+        results = [item async for item in tool.run(args)]
+        result = results[-1]
+        assert isinstance(result, GrepResult)
+        assert result.match_count == 1
+        assert "marker" in result.matches
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [False, True])
+async def test_instruction_grep_rejects_replaced_directory_before_discovery(
+    tmp_path, monkeypatch, cached
+):
+    from chartreux.core.tools.base import ToolError
+    from chartreux.core.tools.builtins import grep as grep_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    doc = tmp_path / "AGENTS.md"
+    doc.write_text("injected")
+    manager = _instruction_manager(workspace, [doc], cached=cached)
+    tool = manager.get("grep")
+    assert isinstance(tool, Grep)
+    doc.unlink()
+    doc.mkdir()
+    (doc / "secret").write_text("not injected")
+    monkeypatch.setattr(
+        grep_module.os,
+        "walk",
+        lambda *a, **k: pytest.fail("directory discovery must not run"),
+    )
+    assert (
+        _permission(
+            tool.resolve_permission(GrepArgs(path=str(doc), pattern="."))
+        ).permission
+        == ToolPermission.NEVER
+    )
+    with pytest.raises(ToolError, match="Search path denied"):
+        _ = [item async for item in tool.run(GrepArgs(path=str(doc), pattern="."))]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("backend", ["rg", "grep"])
+@pytest.mark.parametrize("revoke_owner", ["parent", "child"])
+@pytest.mark.parametrize("boundary", ["collection", "spawn", "publication"])
+async def test_instruction_manifest_revocation_across_grep_async_boundaries(
+    tmp_path, monkeypatch, cached, backend, revoke_owner, boundary
+):
+    import shutil
+
+    from chartreux.core.tools.base import ToolError
+    from chartreux.core.tools.builtins.grep import GrepBackend
+
+    if not shutil.which(backend):
+        pytest.skip(f"{backend} unavailable")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    doc = tmp_path / "AGENTS.md"
+    doc.write_text("injected marker\n")
+    parent = _instruction_manager(
+        workspace, [doc] if revoke_owner == "parent" else [], cached=cached
+    )
+    manager = _instruction_manager(
+        workspace,
+        [doc] if revoke_owner == "child" else [],
+        parent=parent,
+        cached=cached,
+    )
+    owner = parent if revoke_owner == "parent" else manager
+    tool = manager.get("grep")
+    assert isinstance(tool, Grep)
+    monkeypatch.setattr(
+        tool,
+        "_detect_backend",
+        lambda: GrepBackend.RIPGREP if backend == "rg" else GrepBackend.GNU_GREP,
+    )
+    original_stage = tool._stage
+    original_collect = tool._collect_live_paths
+    revoked = False
+
+    async def stage(function, *args, **kwargs):
+        nonlocal revoked
+        result = await original_stage(function, *args, **kwargs)
+        name = function.__name__
+        if not revoked and (
+            boundary == "collection"
+            and name in {"_collect_paths", "_collect_live_paths"}
+            or boundary == "publication"
+            and name in {"_parse_frozen", "_finish_output"}
+            or boundary == "spawn"
+            and name == "_prepare_batch"
+        ):
+            owner.set_instruction_read_files(frozenset())
+            revoked = True
+        return result
+
+    async def collect(*args, **kwargs):
+        nonlocal revoked
+        paths = await original_collect(*args, **kwargs)
+        if boundary == "collection" and not revoked:
+            owner.set_instruction_read_files(frozenset())
+            revoked = True
+        return paths
+
+    monkeypatch.setattr(tool, "_stage", stage)
+    monkeypatch.setattr(tool, "_collect_live_paths", collect)
+    with pytest.raises(ToolError, match="denied|discarded"):
+        _ = [item async for item in tool.run(GrepArgs(path=str(doc), pattern="marker"))]
+    assert revoked

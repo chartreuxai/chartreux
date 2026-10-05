@@ -15,7 +15,11 @@ from pydantic import JsonValue
 import tomli_w
 
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
-from chartreux.core.config.models import ProjectContextConfig, SessionLoggingConfig
+from chartreux.core.config.models import (
+    ProjectContextConfig,
+    SessionLoggingConfig,
+    StatusLineConfig,
+)
 
 
 @dataclass(frozen=True)
@@ -27,7 +31,7 @@ class SettingDescriptor:
     group: str
     choices: tuple[str, ...] = ()
     item_kind: Literal["path", "pattern"] | None = None
-    control: Literal["checklist", "toggle_inventory"] | None = None
+    control: Literal["checklist", "toggle_inventory", "status_line"] | None = None
     inventory: Literal["tools", "skills", "agents"] | None = None
     minimum: int | float | None = None
     exclusive_minimum: bool = False
@@ -59,6 +63,9 @@ def validate_setting_value(
     value: JsonValue,
 ) -> None:
     """Validate a setting value independently of its wire representation."""
+    if path == "status_line.segments":
+        StatusLineConfig.model_validate({"segments": value})
+        return
     if kind == "bool" and type(value) is bool:
         return
     if kind == "str" and isinstance(value, str):
@@ -168,6 +175,51 @@ EDITABLE_SETTINGS: tuple[SettingDescriptor, ...] = (
         "enable_notifications",
         "Notifications",
         "Enable desktop notifications.",
+        "bool",
+        "Interface",
+    ),
+    SettingDescriptor(
+        "status_line.segments",
+        "Status Line Segments",
+        "Ordered segments: directory, pid, model, context, git-branch, spend-today, "
+        "spend-week, spend-month. Directory and context are required; no duplicates. "
+        "Spend segments show recorded USD spend across all projects for the local "
+        "calendar day, Monday-start week, or month (Today/Week/Month). The Usage "
+        "browser's Current project filter never changes this scope. "
+        "+ marks partly unknown cost; "
+        "Unknown means nothing priced; — means unavailable, not zero spend.",
+        "list",
+        "Interface",
+        empty="Directory and context are required; an empty list cannot be saved.",
+    ),
+    SettingDescriptor(
+        "status_line.directory_style",
+        "Status Line Directory Style",
+        "Show the directory name or full path.",
+        "enum",
+        "Interface",
+        choices=("name", "path"),
+    ),
+    SettingDescriptor(
+        "status_line.context_style",
+        "Status Line Context Style",
+        "Show context tokens alone or with the percentage of the compaction threshold.",
+        "enum",
+        "Interface",
+        choices=("tokens", "tokens-percent"),
+    ),
+    SettingDescriptor(
+        "status_line.separator",
+        "Status Line Separator",
+        "Separate status line segments with spaces or pipes.",
+        "enum",
+        "Interface",
+        choices=("space", "pipe"),
+    ),
+    _field(
+        "show_message_timestamps",
+        "Show Message Timestamps",
+        "Show posting times, whole-turn totals, and settled tool durations; capture continues when off.",
         "bool",
         "Interface",
     ),
@@ -407,11 +459,29 @@ EDITABLE_SETTINGS: tuple[SettingDescriptor, ...] = (
     ),
 )
 
+STATUS_LINE_PATHS = tuple(
+    item.path for item in EDITABLE_SETTINGS if item.path.startswith("status_line.")
+)
+STATUS_LINE_SETTING = SettingDescriptor(
+    "status_line",
+    "Status line",
+    "Choose and reorder status line segments, directory and context styles, and the "
+    "separator. Directory and context are required. Spend segments show recorded "
+    "USD spend across all projects for the local calendar day, Monday-start week, "
+    "or month (Today/Week/Month). The Usage browser's Current project filter never "
+    "changes this scope. + marks partly unknown cost; Unknown means nothing priced; "
+    "— means unavailable, not zero spend.",
+    "list",
+    "Interface",
+    control="status_line",
+)
+
 VISIBLE_SETTINGS: tuple[SettingDescriptor, ...] = (
     *(
-        item
+        STATUS_LINE_SETTING if item.path == "status_line.segments" else item
         for item in EDITABLE_SETTINGS
         if not item.path.startswith(("enabled_", "disabled_"))
+        and (item.path not in STATUS_LINE_PATHS or item.path == "status_line.segments")
     ),
     *(
         SettingDescriptor(

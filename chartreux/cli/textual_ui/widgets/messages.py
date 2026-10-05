@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
 
@@ -23,6 +25,7 @@ if TYPE_CHECKING:
 
 from textual import events
 from textual.app import ComposeResult
+from textual.color import Color
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
 from textual.css.query import NoMatches
@@ -38,9 +41,10 @@ from chartreux.cli.textual_ui.widgets.collapsible import (
     DisclosureHeader,
 )
 from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
+from chartreux.cli.textual_ui.widgets.message_header import MessageHeader
 from chartreux.cli.textual_ui.widgets.spinner import SpinnerMixin, SpinnerType
 from chartreux.cli.textual_ui.widgets.tool_widgets import clean_output
-from chartreux.ui.chrome_glyphs import chrome_glyph
+from chartreux.ui.chrome_glyphs import ascii_chrome_enabled, chrome_glyph
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic, NonSelectableStatic
 
@@ -133,11 +137,19 @@ class UserMessage(Static):
         pending: bool = False,
         history_entry_id: str | None = None,
         images: list[ImageAttachment] | None = None,
+        *,
+        posted_at: datetime | None = None,
+        show_message_timestamps: bool = True,
     ) -> None:
         super().__init__()
+        self.header = MessageHeader(
+            self.PROMPT_CHAR, show_message_timestamps=show_message_timestamps
+        )
+        self.posted_at = posted_at
         self.add_class("user-message")
         self._content = content
         self._pending = pending
+        self.header.set_timestamp(None if pending else posted_at)
         self._images = images or []
         self.history_entry_id = history_entry_id
 
@@ -157,11 +169,17 @@ class UserMessage(Static):
         return self._pending
 
     def compose(self) -> ComposeResult:
+        self.set_class(
+            ascii_chrome_enabled()
+            or os.environ.get("NO_COLOR") is not None
+            or bool(self.app.console.no_color),
+            "plain-user-accent",
+        )
         with Vertical(classes="user-message-wrapper"):
+            self.header.set_timestamp(None if self._pending else self.posted_at)
+            yield self.header
             with Horizontal(classes="user-message-container"):
-                yield NonSelectableStatic(
-                    f"{self.PROMPT_CHAR} ", classes="user-message-prompt"
-                )
+                yield NonSelectableStatic(">", classes="user-message-prompt")
                 yield NoMarkupStatic(self._content, classes="user-message-content")
             if self._images:
                 with Vertical(classes="user-message-attachments"):
@@ -171,6 +189,32 @@ class UserMessage(Static):
                 yield ExpandingSeparator(classes="user-message-separator")
             if self._pending:
                 self.add_class("pending")
+
+    def on_mount(self) -> None:
+        self._apply_accent_tint()
+        self.watch(self.app, "theme", self._refresh_accent_tint, init=False)
+
+    def _refresh_accent_tint(self) -> None:
+        # App updates its CSS variables after notifying theme watchers.
+        self.call_after_refresh(self._apply_accent_tint)
+
+    def _apply_accent_tint(self) -> None:
+        wrapper = self.query_one(".user-message-wrapper")
+        if self.has_class("plain-user-accent"):
+            wrapper.styles.background = None
+            return
+        accent = Color.parse(self.app.theme_variables["accent"])
+        # Textual treats ANSI destinations as opaque even with TCSS alpha.
+        # Resolve their theme-provided RGB channels before applying the tint.
+        if accent.ansi is not None:
+            base = Color.parse(
+                "ansi_black" if self.app.current_theme.dark else "ansi_white"
+            )
+            wrapper.styles.background = Color(base.r, base.g, base.b).blend(
+                Color(accent.r, accent.g, accent.b), 0.08
+            )
+        else:
+            wrapper.styles.background = None
 
     @staticmethod
     def _attachment_label(attachment: ImageAttachment) -> str:
@@ -185,6 +229,7 @@ class UserMessage(Static):
             return
 
         self._pending = pending
+        self.header.set_timestamp(None if pending else self.posted_at)
 
         if pending:
             self.add_class("pending")
@@ -192,8 +237,21 @@ class UserMessage(Static):
 
         self.remove_class("pending")
 
+    def reconcile_timestamp(self, posted_at: datetime | None) -> None:
+        """Apply history's authority without stamping optimistic or queued input."""
+        self.posted_at = posted_at
+        self.header.set_timestamp(None if self._pending else posted_at)
+
+    def set_show_message_timestamps(self, show: bool) -> None:
+        self.header.set_timestamp(
+            None if self._pending else self.posted_at, show_message_timestamps=show
+        )
+
     def set_show_separator(self, show: bool) -> None:
         self.set_class(not show, "no-separator")
+
+    def on_resize(self) -> None:
+        self.header._refresh_time()
 
     def set_follows_previous(self, follows: bool) -> None:
         self.set_class(follows, "follows-user")
@@ -338,16 +396,41 @@ class StreamingMessageBase(Static):
 
 
 class AssistantMessage(StreamingMessageBase):
-    def __init__(self, content: str) -> None:
+    def __init__(
+        self,
+        content: str,
+        *,
+        posted_at: datetime | None = None,
+        turn_duration_ms: float | None = None,
+        show_message_timestamps: bool = True,
+    ) -> None:
         super().__init__(content)
+        self.header = MessageHeader(
+            "Assistant",
+            posted_at=posted_at,
+            turn_duration_ms=turn_duration_ms,
+            show_message_timestamps=show_message_timestamps,
+        )
         self.add_class("assistant-message")
+
+    def reconcile_timing(self, duration_ms: float | None) -> None:
+        self.header.set_turn_duration(duration_ms)
+
+    def on_resize(self) -> None:
+        self.header._refresh_time()
+
+    def reconcile_timestamp(self, posted_at: datetime | None) -> None:
+        self.header.set_timestamp(posted_at)
+
+    def set_show_message_timestamps(self, show: bool) -> None:
+        self.header.set_timestamp(self.header.posted_at, show_message_timestamps=show)
 
     def compose(self) -> ComposeResult:
         from textual.widgets import Markdown
 
         markdown = Markdown("")
         self._markdown = markdown
-        yield NonSelectableStatic("Assistant", classes="assistant-message-label")
+        yield self.header
         yield markdown
 
 

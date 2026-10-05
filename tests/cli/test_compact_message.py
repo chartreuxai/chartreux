@@ -6,8 +6,8 @@ import pytest
 
 from chartreux.app_server.models import AgentStatsSnapshot
 from chartreux.cli.textual_ui.widgets.compact import CompactMessage
-from chartreux.cli.textual_ui.widgets.context_progress import ContextProgress
 from chartreux.cli.textual_ui.widgets.messages import UserMessage
+from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLine
 from tests.conftest import build_test_chartreux_app
 
 _SPENT_TOKENS = 120_000
@@ -56,7 +56,7 @@ async def test_compaction_empties_the_context_gauge() -> None:
         )
         runtime_state.context_window = _CONTEXT_WINDOW
         app._refresh_context_progress()
-        assert app.query_one(ContextProgress).tokens.current_tokens == _SPENT_TOKENS
+        assert app.query_one(SessionStatusLine).state.context_tokens == _SPENT_TOKENS
 
         def _shrink_to_summary(**_kwargs: object) -> str:
             # Stands in for the runtime read `AppServerSession.compact` performs,
@@ -76,6 +76,6 @@ async def test_compaction_empties_the_context_gauge() -> None:
 
         # Assert
         assert (
-            app.query_one(ContextProgress).tokens.current_tokens
+            app.query_one(SessionStatusLine).state.context_tokens
             == surviving_summary_tokens
         )

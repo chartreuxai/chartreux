@@ -326,6 +326,37 @@ def _worktree_args(name: str) -> argparse.Namespace:
     return argparse.Namespace(worktree=name, prompt=None, initial_prompt=None)
 
 
+@pytest.mark.parametrize("suggestion", ["model-name", None])
+def test_cli_auto_worktree_retains_context_before_chdir(
+    git_repo: Repo,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suggestion: str | None,
+) -> None:
+    import asyncio
+
+    from chartreux.core._usage_startup import create_startup_accounting_context
+
+    monkeypatch.chdir(tmp_path)
+    context = asyncio.run(create_startup_accounting_context(tmp_path))
+    args = argparse.Namespace(worktree=True, prompt="Fix the bug", initial_prompt=None)
+
+    def suggest(prompt: str | None):
+        assert Path.cwd() == tmp_path
+        assert prompt == "Fix the bug"
+        return suggestion, context
+
+    monkeypatch.setattr(entrypoint, "_suggest_worktree_name", suggest)
+    session, token = entrypoint._enter_worktree(args)
+    try:
+        assert args.startup_accounting is context
+        assert Path.cwd() == session.path
+        assert session.name == (suggestion or "fix-the-bug")
+    finally:
+        monkeypatch.chdir(tmp_path)
+        release_holder(token)
+
+
 def test_cli_acquires_holder_before_chdir_and_releases_on_chdir_failure(
     git_repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

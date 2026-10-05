@@ -29,6 +29,27 @@ validates and restores that identity rather than resolving a role again.
 creates a separate resumable copy. See the [command reference](../reference/commands.md)
 for the complete command surface.
 
+## Usage storage
+
+Recorded usage is stored independently of transcripts at
+`$CHARTREUX_HOME/usage/<root-session-id>/usage.jsonl`. A root session owns its
+subagent calls. The ledger also records compaction, automatic title generation,
+and worktree-naming calls, including naming calls made before a session starts.
+Those records remain even if startup fails.
+
+Disabling session logging or changing its save directory does not disable or
+relocate the ledger. Deleting a saved session does not delete its usage records;
+rewinding a conversation does not undo recorded spend. Sessions from before the
+ledger are not backfilled from transcripts: `/usage` shows **Recorded usage only**.
+There is currently no automatic ledger retention or compaction.
+
+Usage project grouping differs from the directory-scoped session picker. Linked
+Git worktrees share one project identity through their common Git directory;
+separate clones are separate projects even if their remote URL matches. Outside
+Git, grouping uses the canonical root workspace path. Subagents inherit the root's
+project identity. `/usage` defaults to All projects and can filter to Current
+project; status-line spend always covers all projects in the current Chartreux home.
+
 ## Checkpoints and rewind
 
 Use `/rewind`, or press Escape twice with an empty input, to return to an earlier

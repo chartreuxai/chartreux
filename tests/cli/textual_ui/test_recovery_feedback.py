@@ -14,6 +14,8 @@ from chartreux.app_server.models import (
     PublicTurn,
     PublicTurnStatus,
 )
+from chartreux.app_server.protocol import AgentSummaryModel
+from chartreux.cli.textual_ui.widgets.agent_bar import agent_is_active
 from chartreux.cli.textual_ui.widgets.debug_console import DebugConsole
 from chartreux.cli.textual_ui.widgets.log_level_picker import LogLevelPickerApp
 from tests.conftest import build_test_chartreux_app
@@ -119,12 +121,25 @@ async def test_debug_console_loading_empty_failed_and_recovers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_no_output_completion_distinguishes_active_agents() -> None:
+@pytest.mark.parametrize("compacting", [False, True])
+async def test_no_output_completion_distinguishes_active_agents(
+    compacting: bool,
+) -> None:
     app = build_test_chartreux_app()
     async with app.run_test() as pilot:
         # The agent list remains owned by the app rather than by turn completion.
-        with patch("chartreux.cli.textual_ui.app.agent_state", return_value="running"):
-            app._agent_summaries = [object()]  # type: ignore[list-item]
+        agent = AgentSummaryModel(
+            agent_id="agent-1",
+            profile="worker",
+            availability="running",
+            current_run_status="running",
+            compacting=compacting,
+        )
+        assert agent_is_active(agent)
+        with patch(
+            "chartreux.cli.textual_ui.app.agent_is_active", wraps=agent_is_active
+        ) as active:
+            app._agent_summaries = [agent]
             await app._handle_turn_event(
                 TurnCompleted(
                     PublicTurn(
@@ -138,6 +153,7 @@ async def test_no_output_completion_distinguishes_active_agents() -> None:
             notice = app.query_one("#turn-outcome-notice")
             assert "agents are still running" in str(notice.render())
             assert notice.display
+            active.assert_called_with(agent)
         app._agent_summaries = []
         app._show_no_output_outcome()
         assert "ready for another prompt" in str(notice.render())

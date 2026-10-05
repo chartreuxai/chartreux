@@ -87,6 +87,7 @@ from chartreux.app_server.protocol import (
     TurnQueueResumeParams,
     TurnStartParams,
     TurnSteerParams,
+    UsageUpdatedParams,
     format_invalid_params_issues,
     redact_validation_message,
     redact_validation_path,
@@ -131,7 +132,11 @@ _SESSION_BACKEND_HOST_LIFECYCLE_METHODS = frozenset({
     "session/continue",
 })
 
-_SESSION_OPTIONAL_METHODS = frozenset({"config/read", "workspace/trust/decision"})
+_SESSION_OPTIONAL_METHODS = frozenset({
+    "config/read",
+    "workspace/trust/decision",
+    "usage/read",
+})
 
 _SESSION_BACKEND_METHODS = frozenset({
     "callback/result",
@@ -366,6 +371,18 @@ class AppServer:
             self._pending_notifications.clear()
             self._request_error = None
             self._serve_task = asyncio.current_task()
+
+            def usage_updated(params: UsageUpdatedParams) -> None:
+                if (
+                    self._initialization != InitializationState.INITIALIZED
+                    or self._closed
+                ):
+                    return
+                task = asyncio.create_task(self._notify_host(params))
+                self._request_tasks.add(task)
+                task.add_done_callback(self._request_finished)
+
+            unsubscribe_usage = self._host_handler.subscribe_usage(usage_updated)
             try:
                 async for raw_message in transport.messages():
                     message = validate_json_rpc_envelope(raw_message)
@@ -388,6 +405,7 @@ class AppServer:
                     raise self._request_error
                 raise
             finally:
+                unsubscribe_usage()
                 if close_on_disconnect:
                     await self.close()
                 else:
@@ -657,6 +675,13 @@ class AppServer:
     ) -> DispatchResult:
         if method not in SERVER_METHODS:
             raise method_not_found(method)
+        if method == "usage/read":
+            return await self._host_handler.read_usage(
+                raw_params,
+                self._root.session_id
+                if self._root is not None and self._connection_attached
+                else None,
+            )
         if method == "events/read":
             return self._events_read(raw_params)
         if self._mcp_catalog_service is not None and self._mcp_catalog_service.handles(
@@ -668,6 +693,7 @@ class AppServer:
         if method in {
             "config/schema",
             "session/history/get",
+            "workspace/git/branch",
             "workspace/git/checkouts",
             "workspace/git/worktrees/list",
             "workspace/git/worktrees/remove",
@@ -745,9 +771,10 @@ class AppServer:
         host_result = await self._dispatch_backend_host_operation(method, raw_params)
         if host_result is not None:
             return host_result
-        # Interruption validates its operation ID in the backend, including a
-        # reserved Plan successor that has not started its implementation turn.
-        if method != "turn/interrupt":
+        # These run-pinned stops remain available during root lifecycle work;
+        # their routes retain attachment and shutdown checks. Steering delegates
+        # its guard to the backend for receipt replay and pre-commit rejection.
+        if method not in {"turn/interrupt", "agents/cancel", "turn/steer"}:
             root.guard_request()
         backend_result = await self._dispatch_backend_operation(
             root, method, raw_params
@@ -1188,6 +1215,18 @@ class AppServer:
             pending.future.set_exception(exc)
         else:
             pending.future.set_result(result)
+
+    async def _notify_host(self, params: UsageUpdatedParams) -> None:
+        """Global notifications bypass root publication and event sequencing."""
+        method = params.NOTIFICATION_METHOD
+        validate_notification_method(method, params)
+        if (
+            self._closed
+            or self._initialization != InitializationState.INITIALIZED
+            or method in self._client_capabilities.disabled_notifications
+        ):
+            return
+        await self._send_notification(method, params)
 
     async def _notify(self, method: str, params: ProtocolModel) -> None:
         validate_notification_method(method, params)

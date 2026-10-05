@@ -135,7 +135,7 @@ class DeploymentDefinition(_FrozenCatalogModel):
     prices: Prices = Field(default_factory=Prices)
     supports_images: bool = False
     supported_thinking_levels: tuple[str, ...] | None = None
-    auto_compact_threshold: float | None = None
+    auto_compact_threshold: int | None = None
     disabled: bool = False
 
     @field_validator("provider")
@@ -161,12 +161,19 @@ class DeploymentDefinition(_FrozenCatalogModel):
             )
         return value
 
-    @field_validator("auto_compact_threshold")
+    @field_validator("auto_compact_threshold", mode="before")
     @classmethod
-    def auto_compact_threshold_is_positive(cls, value: float | None) -> float | None:
-        if value is not None and (not isfinite(value) or value <= 0):
-            raise ValueError("auto_compact_threshold must be finite and positive")
-        return value
+    def auto_compact_threshold_is_positive_integer(cls, value: Any) -> int | None:
+        if value is None:
+            return None
+        error = "auto_compact_threshold must be a positive whole integer"
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(error)
+        if isinstance(value, float) and (not isfinite(value) or not value.is_integer()):
+            raise ValueError(error)
+        if value <= 0:
+            raise ValueError(error)
+        return int(value)
 
 
 class BaseModelDefinition(_FrozenCatalogModel):

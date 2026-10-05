@@ -16,7 +16,11 @@ from chartreux.app_server._tool_projection import (
 )
 from chartreux.app_server._utils import now_ms
 from chartreux.app_server._worktree_effects import WorktreeEffect
-from chartreux.app_server.config import ConfigView, ModelConfigView
+from chartreux.app_server.config import (
+    ConfigView,
+    ModelConfigView,
+    StatusLineConfigView,
+)
 from chartreux.app_server.models import (
     COMMITTED_MODEL_RECOVERY_ISSUE_FILE,
     AgentStatsSnapshot,
@@ -110,6 +114,13 @@ def project_config_view(
         file_watcher_for_autocomplete=config.file_watcher_for_autocomplete,
         ask_confirmation_on_exit=config.ask_confirmation_on_exit,
         show_thinking_nodes=config.show_thinking_nodes,
+        show_message_timestamps=config.show_message_timestamps,
+        status_line=StatusLineConfigView(
+            segments=list(config.status_line.segments),
+            directory_style=config.status_line.directory_style,
+            context_style=config.status_line.context_style,
+            separator=config.status_line.separator,
+        ),
         ascii_chrome=config.ascii_chrome,
         enable_notifications=config.enable_notifications,
         enable_system_trust_store=config.enable_system_trust_store,
@@ -518,6 +529,7 @@ def _history_user_message(
     return PublicMessageEntry(
         **_history_fields(session_id, history_message_id(message, index), created_at),
         role="user",
+        posted_at=message.posted_at,
         content=project_message_content(
             message.input_text if message.input_text is not None else message.content,
             message.images,
@@ -557,6 +569,12 @@ def _append_assistant_history(
                     created_at,
                 ),
                 role="assistant",
+                posted_at=message.posted_at,
+                turn_duration_ms=(
+                    message.turn_duration * 1000
+                    if message.turn_duration is not None
+                    else None
+                ),
                 content=[TextContentBlock(text=message.content)],
                 source="harness",
             )
@@ -718,20 +736,27 @@ def _persisted_effect_state(
             display=EffectResultDisplay(success=False, message=reason),
         )
     text = TaggedText.from_string(message.content or "")
+    persisted = message.tool_result
+    duration_ms = (
+        persisted.duration * 1000
+        if persisted is not None and persisted.duration is not None
+        else None
+    )
     display_message = text.message or f"{effect.detail.tool_name} completed"
     if text.tag == CANCELLATION_TAG:
         return CancelledEffectState(
             reason=display_message,
             output_text=text.message,
+            duration_ms=duration_ms,
             display=EffectResultDisplay(success=False, message=display_message),
         )
     if text.tag == TOOL_ERROR_TAG:
         return FailedEffectState(
             error=PublicError(message=display_message),
             output_text=text.message,
+            duration_ms=duration_ms,
             display=EffectResultDisplay(success=False, message=display_message),
         )
-    persisted = message.tool_result
     if persisted is not None:
         presentation = persisted.presentation
         display = (
@@ -739,7 +764,6 @@ def _persisted_effect_state(
             if presentation is not None
             else EffectResultDisplay(success=True, message=display_message)
         )
-        duration_ms = (persisted.duration or 0.0) * 1000
         if persisted.cancelled:
             return CancelledEffectState(
                 reason=display.message,

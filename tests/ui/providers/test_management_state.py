@@ -38,7 +38,7 @@ def state() -> ManagementState:
                         "name": "wire-a",
                         "prices": {"input": 1.0, "output": 2.0},
                         "supports_images": True,
-                        "auto_compact_threshold": 0.75,
+                        "auto_compact_threshold": 200_000,
                     },
                     {"provider": "two", "name": "other-a"},
                 ],

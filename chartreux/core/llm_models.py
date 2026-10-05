@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 import copy
+from datetime import UTC, datetime
 from enum import StrEnum, auto
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -129,6 +133,27 @@ class ManualShellContext(BaseModel):
     created_at: int
 
 
+_posting_clock: ContextVar[Callable[[], datetime] | None] = ContextVar(
+    "posting_clock", default=None
+)
+
+
+def posting_time() -> datetime:
+    """Resolve the posting clock only at authoritative acceptance sites."""
+    clock = _posting_clock.get()
+    return clock() if clock is not None else datetime.now(UTC)
+
+
+@contextmanager
+def use_posting_clock(clock: Callable[[], datetime]) -> Iterator[None]:
+    """Inject a task-local posting clock, inherited by newly spawned async tasks."""
+    token = _posting_clock.set(clock)
+    try:
+        yield
+    finally:
+        _posting_clock.reset(token)
+
+
 class LLMMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -144,6 +169,9 @@ class LLMMessage(BaseModel):
     tool_call_id: str | None = None
     tool_result: PersistedToolResult | None = None
     message_id: str | None = None
+    posted_at: datetime | None = None
+    # Whole invocation, unlike AgentStats.last_turn_duration (one LLM call).
+    turn_duration: float | None = None
     user_display_content: UserDisplayContent | None = None
     input_text: str | None = None
     resources: list[UserResource] | None = None
@@ -178,6 +206,8 @@ class LLMMessage(BaseModel):
             "images": getattr(v, "images", None),
             "message_id": getattr(v, "message_id", None)
             or (str(uuid4()) if role != "tool" else None),
+            "posted_at": getattr(v, "posted_at", None),
+            "turn_duration": getattr(v, "turn_duration", None),
             "user_display_content": getattr(v, "user_display_content", None),
             "input_text": getattr(v, "input_text", None),
             "resources": getattr(v, "resources", None),
@@ -246,6 +276,7 @@ class LLMMessage(BaseModel):
             tool_call_id=self.tool_call_id,
             tool_result=self.tool_result or other.tool_result,
             message_id=self.message_id,
+            posted_at=self.posted_at or other.posted_at,
             user_display_content=self.user_display_content
             if self.user_display_content is not None
             else other.user_display_content,
@@ -264,12 +295,54 @@ class LLMUsage(BaseModel):
     completion_tokens: int = 0
     # Prompt tokens served from the provider cache; a subset of prompt_tokens.
     cached_tokens: int = 0
+    # Numeric defaults remain compatible with session stats. Reporting presence is
+    # independent: omitted components are unknown, not reported zero counts.
+    prompt_tokens_reported: bool = False
+    completion_tokens_reported: bool = False
+    cached_tokens_reported: bool = False
+    # Preliminary stream counts do not certify the final billed totals.
+    is_final: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _infer_reporting_presence(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            value = dict(value)
+            for component in ("prompt_tokens", "completion_tokens", "cached_tokens"):
+                value.setdefault(f"{component}_reported", component in value)
+        return value
+
+    @classmethod
+    def from_reported(
+        cls,
+        *,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        cached_tokens: int | None = None,
+    ) -> LLMUsage:
+        """Normalize provider counts without treating absent/null fields as zero."""
+        return cls(
+            prompt_tokens=prompt_tokens or 0,
+            completion_tokens=completion_tokens or 0,
+            cached_tokens=cached_tokens or 0,
+            prompt_tokens_reported=prompt_tokens is not None,
+            completion_tokens_reported=completion_tokens is not None,
+            cached_tokens_reported=cached_tokens is not None,
+        )
 
     def __add__(self, other: LLMUsage) -> LLMUsage:
         return LLMUsage(
             prompt_tokens=self.prompt_tokens + other.prompt_tokens,
             completion_tokens=self.completion_tokens + other.completion_tokens,
             cached_tokens=self.cached_tokens + other.cached_tokens,
+            prompt_tokens_reported=self.prompt_tokens_reported
+            or other.prompt_tokens_reported,
+            completion_tokens_reported=self.completion_tokens_reported
+            or other.completion_tokens_reported,
+            cached_tokens_reported=self.cached_tokens_reported
+            or other.cached_tokens_reported,
+            is_final=(self.is_final and self.completion_tokens_reported)
+            or (other.is_final and other.completion_tokens_reported),
         )
 
 

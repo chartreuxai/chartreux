@@ -15,11 +15,20 @@ from chartreux.core.events import (
     UserMessageEvent,
 )
 from chartreux.core.llm_models import Role
+from chartreux.core.tools.base import ToolPermission
 from chartreux.core.tools.builtins.read_file import ReadFileArgs, ReadFileResult
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.core.agent_loop.test_accepted_source_snapshot import make_orchestrator
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
+
+
+def _read_permission(loop: AgentLoop, path: Path) -> ToolPermission:
+    decision = loop.tool_manager.get("read_file").resolve_permission(
+        ReadFileArgs(file_path=str(path))
+    )
+    assert decision is not None
+    return decision.permission
 
 
 async def _act_and_collect(agent_loop: AgentLoop, prompt: str) -> list[BaseEvent]:
@@ -247,6 +256,191 @@ async def test_outside_root_mention_keeps_read_file_permission_gate(
     assert result.skipped
     assert result.result is None
     assert result.skip_reason == (
-        "File access outside authorized project and session scratch roots; "
-        "only an explicit user scope change can authorize it"
+        "File read is outside authorized workspace and session scratch roots "
+        "and is not an instruction file injected into this agent's context. "
+        "Other paths require an explicit user scope change."
     )
+
+
+@pytest.mark.asyncio
+async def test_injected_user_instruction_mention_and_refresh_manifest(
+    tmp_path, config_dir
+):
+    from chartreux.core.config.harness_files import HarnessFilesManager
+
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+    doc = config_dir / "AGENTS.md"
+    doc.write_text("user instruction marker")
+    loop = build_test_agent_loop(
+        config=build_test_vibe_config(include_project_context=True),
+        cwd=cwd,
+        harness_files=HarnessFilesManager(sources=("user",), cwd=cwd),
+    )
+    try:
+        await loop.wait_until_ready()
+        assert loop.tool_manager.instruction_read_files == frozenset([doc.resolve()])
+        events = await loop.inject_user_context(
+            f"read @{doc}", as_message=True, inject_implicit=True
+        )
+        result = next(event for event in events if isinstance(event, ToolResultEvent))
+        assert not result.skipped
+        assert isinstance(result.result, ReadFileResult)
+        assert "user instruction marker" in result.result.content
+        doc.write_text("  \n")
+        await loop.refresh_system_prompt()
+        assert loop.tool_manager.instruction_read_files == frozenset()
+        assert _read_permission(loop, doc) == ToolPermission.NEVER
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace_tools", [False, True])
+async def test_staged_instruction_manifest_installs_only_on_publish_and_rolls_back(
+    tmp_path, config_dir, replace_tools
+):
+    from chartreux.core.agents.launch import (
+        FrozenPersona,
+        LaunchAuthorityInputs,
+        LaunchCandidate,
+    )
+    from chartreux.core.agents.models import BUILTIN_SUBAGENTS
+    from chartreux.core.config.harness_files import HarnessFilesManager
+    from chartreux.core.subagents import LaunchConfig
+
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+    original = tmp_path / "original.md"
+    replacement = tmp_path / "replacement.md"
+    original.write_text("original instructions")
+    replacement.write_text("replacement instructions")
+    link = config_dir / "AGENTS.md"
+    link.symlink_to(original)
+    loop = build_test_agent_loop(
+        config=build_test_vibe_config(include_project_context=True),
+        cwd=cwd,
+        harness_files=HarnessFilesManager(sources=("user",), cwd=cwd),
+        parent_authority_revision_getter=lambda: 0,
+    )
+    try:
+        await loop.wait_until_ready()
+        old_manager = loop.tool_manager
+        old_prompt = loop.messages[0].content
+        link.unlink()
+        link.symlink_to(replacement)
+        overrides = (
+            LaunchConfig(enabled_tools=["read_file", "grep"])
+            if replace_tools
+            else LaunchConfig()
+        )
+        target = loop.config_orchestrator.copy()
+        assert loop.committed_model is not None
+        candidate = LaunchCandidate(
+            profile=next(iter(BUILTIN_SUBAGENTS.values())),
+            config_inputs={},
+            orchestrator=target,
+            semantic_overrides=overrides,
+            persona=FrozenPersona(loop.config.system_prompt_id, None),
+            effective_model=target.config.get_active_model(),
+            committed_model=loop.committed_model,
+            effective_thinking=target.config.get_active_model().thinking,
+            authority_inputs=LaunchAuthorityInputs(frozenset()),
+        )
+        prepared = await loop.prepare_launch_reconfiguration(
+            candidate,
+            expected_session_generation=loop._session_generation,
+            expected_parent_authority_revision=0,
+        )
+        assert loop.tool_manager is old_manager
+        assert loop.tool_manager.instruction_read_files == frozenset([original])
+        assert loop.messages[0].content == old_prompt
+        assert "replacement instructions" in prepared.consumers.system_prompt
+        assert _read_permission(loop, replacement) == ToolPermission.NEVER
+        publication = loop.publish_launch_reconfiguration(prepared)
+        assert loop.tool_manager.instruction_read_files == frozenset([replacement])
+        assert "replacement instructions" in str(loop.messages[0].content)
+        loop.rollback_launch_reconfiguration(prepared, publication)
+        assert loop.tool_manager is old_manager
+        assert loop.tool_manager.instruction_read_files == frozenset([original])
+        assert loop.messages[0].content == old_prompt
+        assert _read_permission(loop, replacement) == ToolPermission.NEVER
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reload_instruction_manifest_refresh_and_failed_commit_preserves_previous(
+    tmp_path, config_dir, monkeypatch
+):
+    from chartreux.core.config.harness_files import HarnessFilesManager
+
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+    doc = config_dir / "AGENTS.md"
+    doc.write_text("original instructions")
+    loop = build_test_agent_loop(
+        config=build_test_vibe_config(include_project_context=True),
+        cwd=cwd,
+        harness_files=HarnessFilesManager(sources=("user",), cwd=cwd),
+    )
+    try:
+        await loop.wait_until_ready()
+        previous = loop.tool_manager
+        previous_prompt = loop.messages[0].content
+        target = loop.config.model_copy(update={"include_project_context": False})
+        prepared = loop._prepare_reload(target, False)
+        assert loop.tool_manager.instruction_read_files == frozenset([doc.resolve()])
+        with monkeypatch.context() as patch:
+
+            def fail():
+                raise RuntimeError("failed publication")
+
+            patch.setattr(loop, "install_launch_metadata", fail)
+            with pytest.raises(RuntimeError, match="failed publication"):
+                loop._commit_reload(prepared, reset_middleware=False)
+        assert loop.tool_manager is previous
+        assert loop.messages[0].content == previous_prompt
+        assert loop.tool_manager.instruction_read_files == frozenset([doc.resolve()])
+        loop._commit_reload(prepared, reset_middleware=False)
+        assert loop.tool_manager.instruction_read_files == frozenset()
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_trusted_ancestor_read_and_dynamic_subdirectory_excluded(tmp_path):
+    from chartreux.core.config.harness_files import HarnessFilesManager
+    from chartreux.core.trusted_folders import TrustedFoldersManager
+
+    cwd = tmp_path / "workspace"
+    subdir = cwd / "subdir"
+    subdir.mkdir(parents=True)
+    ancestor = tmp_path / "AGENTS.md"
+    ancestor.write_text("ancestor instructions")
+    dynamic = subdir / "AGENTS.md"
+    dynamic.write_text("dynamic instructions")
+    target = subdir / "file.py"
+    target.write_text("source")
+    trust = TrustedFoldersManager()
+    trust.trust_for_session(tmp_path)
+    loop = build_test_agent_loop(
+        config=build_test_vibe_config(include_project_context=True),
+        cwd=cwd,
+        harness_files=HarnessFilesManager(
+            sources=("project",), cwd=cwd, trust_store=trust
+        ),
+    )
+    try:
+        await loop.wait_until_ready()
+        tool = loop.tool_manager.get("read_file")
+        assert _read_permission(loop, ancestor) == ToolPermission.ALWAYS
+        assert loop.tool_manager.instruction_read_files == frozenset([ancestor])
+        result = [item async for item in tool.run(ReadFileArgs(file_path=str(target)))][
+            -1
+        ]
+        assert "dynamic instructions" in (tool.get_result_extra(result) or "")
+        assert str(subdir.resolve()) in tool.state.injected_agents_md
+        assert dynamic not in loop.tool_manager.instruction_read_files
+    finally:
+        await loop.aclose()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import aclosing
+from contextvars import ContextVar
 import functools
 import json
 import types
@@ -63,6 +64,19 @@ if TYPE_CHECKING:
     from chartreux.core.config import ModelConfig, ProviderConfig
 
 
+# Invocation-local rather than backend-instance state: concurrent calls and
+# internal retries must not share or multiply logical request accounting.
+request_start_observer: ContextVar[Callable[[], None] | None] = ContextVar(
+    "request_start_observer", default=None
+)
+
+
+def notify_request_started() -> None:
+    """Signal an actual transport attempt after local request preparation."""
+    if observer := request_start_observer.get():
+        observer()
+
+
 class OpenAIAdapter(APIAdapter):
     endpoint: ClassVar[str] = "/chat/completions"
     THINKING_LEVELS: ClassVar[dict[str, str | None]] = OPENAI_THINKING_LEVELS
@@ -111,6 +125,8 @@ class OpenAIAdapter(APIAdapter):
                         exclude_none=True,
                         exclude={
                             "message_id": True,
+                            "posted_at": True,
+                            "turn_duration": True,
                             "reasoning_message_id": True,
                             "reasoning_payloads": True,
                             "injected": True,
@@ -211,10 +227,10 @@ class OpenAIAdapter(APIAdapter):
 
         usage_data = data.get("usage") or {}
         prompt_details = usage_data.get("prompt_tokens_details") or {}
-        usage = LLMUsage(
-            prompt_tokens=usage_data.get("prompt_tokens", 0),
-            completion_tokens=usage_data.get("completion_tokens", 0),
-            cached_tokens=prompt_details.get("cached_tokens", 0),
+        usage = LLMUsage.from_reported(
+            prompt_tokens=usage_data.get("prompt_tokens"),
+            completion_tokens=usage_data.get("completion_tokens"),
+            cached_tokens=prompt_details.get("cached_tokens"),
         )
         choices = data.get("choices") or []
         finish_reason = choices[0].get("finish_reason") if choices else None
@@ -652,7 +668,9 @@ class GenericBackend:
         self, url: str, data: bytes, headers: dict[str, str]
     ) -> dict[str, Any]:
         client = self._get_client()
-        response = await client.post(url, content=data, headers=headers)
+        request = client.build_request("POST", url, content=data, headers=headers)
+        notify_request_started()
+        response = await client.send(request)
         response.raise_for_status()
 
         return response.json()
@@ -673,9 +691,10 @@ class GenericBackend:
         self, url: str, data: bytes, headers: dict[str, str]
     ) -> AsyncGenerator[dict[str, Any]]:
         client = self._get_client()
-        async with client.stream(
-            method="POST", url=url, content=data, headers=headers
-        ) as response:
+        request = client.build_request("POST", url, content=data, headers=headers)
+        notify_request_started()
+        response = await client.send(request, stream=True)
+        async with aclosing(response):
             if not response.is_success:
                 await response.aread()
             response.raise_for_status()

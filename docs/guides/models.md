@@ -44,6 +44,12 @@ thinking = "high"
 
 Provider definitions may supply extra headers and mark an endpoint as not emitting a finish reason. A model definition has semantic defaults and one or more deployments. A deployment identifies the provider-specific wire name and can declare image support, supported thinking levels, compaction threshold, and prices. Disable a retained provider, model, or deployment with `disabled = true`.
 
+A deployment's `auto_compact_threshold` must be a positive whole integer token
+count; fractional values and `0` are rejected. If omitted, it uses the global
+`auto_compact_threshold` fallback in `config.toml`, where `0` disables automatic
+compaction. The TUI context denominator shows this effective threshold, not the
+model's maximum context window.
+
 Legacy catalog tables in `config.toml` are rejected. Preview migration with `chartreux models migrate`; apply it with `chartreux models migrate --apply`.
 
 ## Smoke-testing a deployment

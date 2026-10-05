@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 
+from chartreux.core.agent_loop.errors import EmptyLLMResponseError
 from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.errors import ContextTooLongError, RateLimitError
 from chartreux.core.events import (
@@ -229,9 +230,12 @@ async def test_act_handles_tool_call_chunk_with_content() -> None:
         function=FunctionCall(name="todo", arguments='{"action": "read"}'),
     )
     backend = FakeBackend([
-        mock_llm_chunk(content="Preparing "),
-        mock_llm_chunk(content="todo request", tool_calls=[todo_tool_call]),
-        mock_llm_chunk(content=" complete"),
+        [
+            mock_llm_chunk(content="Preparing "),
+            mock_llm_chunk(content="todo request", tool_calls=[todo_tool_call]),
+            mock_llm_chunk(content=" complete"),
+        ],
+        [mock_llm_chunk(content="Done reviewing todos.")],
     ])
     agent = build_test_agent_loop(
         config=make_config(
@@ -246,7 +250,7 @@ async def test_act_handles_tool_call_chunk_with_content() -> None:
     event_types = [type(e) for e in events]
     assert Counter(event_types) == Counter({
         UserMessageEvent: 1,
-        AssistantEvent: 3,
+        AssistantEvent: 4,
         ToolCallEvent: 2,
         ToolResultEvent: 1,
     })
@@ -263,6 +267,8 @@ async def test_act_handles_tool_call_chunk_with_content() -> None:
     assert "Preparing " in assistant_contents
     assert "todo request" in assistant_contents
     assert " complete" in assistant_contents
+    assert "Done reviewing todos." in assistant_contents
+    assert agent.messages[-1].content == "Done reviewing todos."
 
     assert any(
         m.role == Role.assistant and m.content == "Preparing todo request complete"
@@ -281,7 +287,10 @@ async def test_chunk_content_yields_before_its_tool_call() -> None:
         index=0,
         function=FunctionCall(name="todo", arguments='{"action": "read"}'),
     )
-    backend = FakeBackend([mock_llm_chunk(content="On it.", tool_calls=[tool_call])])
+    backend = FakeBackend([
+        [mock_llm_chunk(content="On it.", tool_calls=[tool_call])],
+        [mock_llm_chunk(content="Done reviewing todos.")],
+    ])
     agent = build_test_agent_loop(
         config=make_config(
             enabled_tools=["todo"], tools={"todo": {"permission": "always"}}
@@ -297,6 +306,8 @@ async def test_chunk_content_yields_before_its_tool_call() -> None:
     first_tool_call = types.index("ToolCallEvent")
     assert first_assistant < first_tool_call
     assert cast(AssistantEvent, events[first_assistant]).content == "On it."
+    assert isinstance(events[-1], AssistantEvent)
+    assert events[-1].content == "Done reviewing todos."
 
 
 @pytest.mark.asyncio
@@ -351,9 +362,12 @@ async def test_act_merges_streamed_tool_call_arguments() -> None:
         id="tc_merge", index=0, function=FunctionCall(name="todo", arguments='part"}')
     )
     backend = FakeBackend([
-        mock_llm_chunk(content="Planning: "),
-        mock_llm_chunk(content="", tool_calls=[tool_call_part_one]),
-        mock_llm_chunk(content="", tool_calls=[tool_call_part_two]),
+        [
+            mock_llm_chunk(content="Planning: "),
+            mock_llm_chunk(content="", tool_calls=[tool_call_part_one]),
+            mock_llm_chunk(content="", tool_calls=[tool_call_part_two]),
+        ],
+        [mock_llm_chunk(content="Done reviewing todos.")],
     ])
     agent = build_test_agent_loop(
         config=make_config(
@@ -371,6 +385,7 @@ async def test_act_merges_streamed_tool_call_arguments() -> None:
         ToolCallEvent,
         ToolCallEvent,
         ToolResultEvent,
+        AssistantEvent,
     ]
     assert isinstance(events[0], UserMessageEvent)
     assert isinstance(events[2], ToolCallEvent)
@@ -384,6 +399,8 @@ async def test_act_merges_streamed_tool_call_arguments() -> None:
     assert isinstance(events[4], ToolResultEvent)
     assert events[4].error is None
     assert events[4].skipped is False
+    assert isinstance(events[5], AssistantEvent)
+    assert events[5].content == "Done reviewing todos."
     assistant_with_calls = next(
         m for m in agent.messages if m.role == Role.assistant and m.tool_calls
     )
@@ -762,7 +779,7 @@ async def test_interleaved_reasoning_content_preserves_order() -> None:
 
 
 @pytest.mark.asyncio
-async def test_only_reasoning_chunks_yields_reasoning_event() -> None:
+async def test_only_reasoning_chunks_yield_before_empty_response_failure() -> None:
     backend = FakeBackend([
         mock_llm_chunk(content="", reasoning_content="Just thinking..."),
         mock_llm_chunk(content="", reasoning_content=" nothing to say yet."),
@@ -771,8 +788,12 @@ async def test_only_reasoning_chunks_yields_reasoning_event() -> None:
         config=make_config(), backend=backend, enable_streaming=True
     )
 
-    events = [event async for event in agent.act("Silent thinking")]
+    events = []
+    with pytest.raises(EmptyLLMResponseError):
+        async for event in agent.act("Silent thinking"):
+            events.append(event)
 
+    assert len(backend.requests_messages) == 1
     assert _snapshot_events(events) == [
         ("ReasoningEvent", "Just thinking..."),
         ("ReasoningEvent", " nothing to say yet."),

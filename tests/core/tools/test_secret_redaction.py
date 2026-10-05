@@ -19,6 +19,35 @@ FAKE_VALUE = "sk-test-0123456789abcdefghijklmnop"
 FAKE_B64 = "c2stdGVzdC0wMTIzNDU2Nzg5YWJjZGVmZ2hpamtsbW5vcA=="
 
 
+@pytest.mark.parametrize("fallback_fails", [False, True])
+def test_persisted_result_failure_logs_never_include_exception_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fallback_fails: bool,
+) -> None:
+    from chartreux.core.llm_models import PersistedToolResult
+
+    def fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise ValueError(f"Invalid credential: {FAKE_VALUE}")
+
+    result = PersistedToolResult(output={"text": FAKE_VALUE}, duration=0)
+    monkeypatch.setattr(sr, "redact_model", fail)
+    if fallback_fails:
+        monkeypatch.setattr(sr, "redact_json_value", fail)
+    with (
+        sr.bind_policy(
+            sr.ScrubPolicy(redaction_credentials=((FAKE_NAME, FAKE_VALUE),))
+        ),
+        caplog.at_level("DEBUG", logger=sr.logger.name),
+    ):
+        cleaned = sr.redact_persisted_result(result)
+    assert FAKE_VALUE not in str(cleaned.output)
+    assert "reconstruction failed" in caplog.text
+    assert ("fallback failed" in caplog.text) is fallback_fails
+    assert FAKE_VALUE not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
 @pytest.fixture(autouse=True)
 def _clean_module_state() -> Any:
     sr.set_env_passthrough(())
@@ -39,6 +68,280 @@ def fake_credential(monkeypatch: pytest.MonkeyPatch) -> dict[str, str | None]:
     monkeypatch.setattr(sr, "_catalog_env_var_names", lambda: frozenset())
     sr.reset_cache()
     return {FAKE_NAME: stored}
+
+
+def test_shell_feedback_redacts_registered_secret_before_preview() -> None:
+    from chartreux.core.tools.builtins._shell_diagnostics import (
+        Diagnostic,
+        render_diagnostic,
+    )
+
+    secret = "synthetic-diagnostic-[secret]\n" + "x" * 300
+    with sr.bind_policy(sr.ScrubPolicy(redaction_credentials=((FAKE_NAME, secret),))):
+        feedback = render_diagnostic(Diagnostic("denylist", secret, "printf " + secret))
+    assert "synthetic-diagnostic" not in feedback
+    assert "REDACTED" in feedback
+    assert "\n" not in feedback
+
+
+@pytest.mark.parametrize("secret", [1234567890123456, 1234567890.125])
+def test_registered_numeric_json_secrets_are_redacted_without_mutation(
+    secret: int | float,
+) -> None:
+    payload = {"secret": secret, "nested": [secret, 42, 1.5, True, None]}
+    with sr.bind_policy(
+        sr.ScrubPolicy(redaction_credentials=((FAKE_NAME, str(secret)),))
+    ):
+        cleaned = sr.redact_json_value(payload)
+    assert cleaned == {
+        "secret": sr.REDACTED_PLACEHOLDER,
+        "nested": [sr.REDACTED_PLACEHOLDER, 42, 1.5, True, None],
+    }
+    assert payload == {"secret": secret, "nested": [secret, 42, 1.5, True, None]}
+
+
+@pytest.mark.parametrize(
+    "number", [1234567890123456.0, 91234567890123456, 1.234567890123456e20]
+)
+def test_numeric_substring_and_float_forms(number: int | float) -> None:
+    with sr.bind_policy(
+        sr.ScrubPolicy(redaction_credentials=((FAKE_NAME, "1234567890123456"),))
+    ):
+        assert sr.redact_json_value({"nested": [number, True, 42]}) == {
+            "nested": [sr.REDACTED_PLACEHOLDER, True, 42]
+        }
+
+
+def test_presentation_redacts_values_before_repr() -> None:
+    from pydantic import BaseModel
+
+    from chartreux.core.events import ToolCallEvent
+    from chartreux.core.tools.builtins.bash import Bash
+    from chartreux.core.tools.ui import ToolUIDataAdapter
+
+    class Args(BaseModel):
+        text: str
+
+    secret = "synthetic-back\\slash-secret"
+    event = ToolCallEvent(
+        tool_name="fixture",
+        tool_class=Bash,
+        args=Args(text=secret),
+        tool_call_id="fixture",
+    )
+    with sr.bind_policy(sr.ScrubPolicy(redaction_credentials=((FAKE_NAME, secret),))):
+        presentation = ToolUIDataAdapter(None).get_call_presentation(event)
+    assert "synthetic-back" not in presentation.model_dump_json()
+    assert "REDACTED" in presentation.display.summary
+    assert event.args == Args(text=secret)
+
+
+@pytest.mark.parametrize("command", ["printf 'unclosed", "bash -c 'unclosed"])
+def test_unrecoverable_tool_call_source_omits_payload(command: str) -> None:
+    import json
+
+    from chartreux.core.events import ToolCallEvent
+    from chartreux.core.llm_models import FunctionCall, ToolCall
+    from chartreux.core.tools.builtins.bash import Bash, BashArgs
+
+    call = ToolCall(
+        function=FunctionCall(name="bash", arguments=json.dumps({"command": command}))
+    )
+    event = ToolCallEvent(
+        tool_name="bash",
+        tool_class=Bash,
+        args=BashArgs(command=command),
+        tool_call_id="fixture",
+    )
+    with sr.bind_policy(
+        sr.ScrubPolicy(redaction_credentials=((FAKE_NAME, FAKE_VALUE),))
+    ):
+        assert sr.sanitize_recorded_tool_call(call).function.arguments is None
+        assert sr.sanitize_recorded_tool_call(event).args is None
+    assert event.args == BashArgs(command=command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "printf synthetic-se\\\ncret-0123456789",
+        r"printf $'synthetic-se\x63ret-0123456789'",
+        r"printf $'synthetic-se\143ret-0123456789'",
+        r"printf $'synthetic-se\u0063ret-0123456789'",
+    ],
+)
+def test_shell_escape_recovery_sanitizes_recorded_arguments_and_presentation(
+    command: str,
+) -> None:
+    import json
+
+    from chartreux.core.events import ToolCallEvent
+    from chartreux.core.llm_models import FunctionCall, ToolCall
+    from chartreux.core.tools.builtins.bash import Bash, BashArgs
+    from chartreux.utils.tool_presentation import (
+        EffectCallDisplay,
+        ToolCallPresentation,
+        ToolEffectKind,
+    )
+
+    secret = "synthetic-secret-0123456789"
+    presentation = ToolCallPresentation(
+        kind=ToolEffectKind.SHELL,
+        display=EffectCallDisplay(summary=command, status_text="Running"),
+    )
+    call = ToolCall(
+        function=FunctionCall(name="bash", arguments=json.dumps({"command": command})),
+        presentation=presentation,
+    )
+    event = ToolCallEvent(
+        tool_name="bash",
+        tool_class=Bash,
+        args=BashArgs(command=command),
+        tool_call_id="fixture",
+        presentation=presentation,
+    )
+    with sr.bind_policy(sr.ScrubPolicy(redaction_credentials=((FAKE_NAME, secret),))):
+        for original in (call, event):
+            recorded = sr.sanitize_recorded_tool_call(original)
+            serialized = recorded.model_dump_json(exclude={"tool_class"})
+            assert secret not in serialized
+            assert "synthetic-se" not in serialized
+            assert "cret-0123456789" not in serialized
+            assert "REDACTED" in serialized
+    assert event.args == BashArgs(command=command)
+    assert call.presentation == presentation
+    assert json.loads(call.function.arguments or "{}") == {"command": command}
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"printf $'unknown\cX'",
+        r"printf $'invalid\xZZ'",
+        r"printf $'invalid\xff'",
+        r"printf $'nul\0'",
+        "printf $'unclosed",
+    ],
+)
+def test_uncertain_shell_escapes_omit_recorded_values(command: str) -> None:
+    import json
+
+    from chartreux.core.events import ToolCallEvent
+    from chartreux.core.llm_models import FunctionCall, ToolCall
+    from chartreux.core.tools.builtins.bash import Bash, BashArgs
+
+    call = ToolCall(
+        function=FunctionCall(name="bash", arguments=json.dumps({"command": command}))
+    )
+    event = ToolCallEvent(
+        tool_name="bash",
+        tool_class=Bash,
+        args=BashArgs(command=command),
+        tool_call_id="fixture",
+    )
+    with sr.bind_policy(
+        sr.ScrubPolicy(redaction_credentials=((FAKE_NAME, FAKE_VALUE),))
+    ):
+        assert sr.redact_shell_source(command) is None
+        assert sr.sanitize_recorded_tool_call(call).function.arguments is None
+        assert sr.sanitize_recorded_tool_call(event).args is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        '  printf  "hello"  ',
+        r"printf $'hello\n'",
+        "printf syn\\\nthtoken",
+        r"printf hello\ world",
+    ],
+)
+def test_clean_shell_recordings_are_byte_identical(command: str) -> None:
+    import json
+
+    from chartreux.core.llm_models import FunctionCall, ToolCall
+
+    arguments = json.dumps({"command": command}, indent=2)
+    call = ToolCall(function=FunctionCall(name="bash", arguments=arguments))
+    with sr.bind_policy(
+        sr.ScrubPolicy(redaction_credentials=((FAKE_NAME, FAKE_VALUE),))
+    ):
+        assert sr.redact_shell_source(command) == command
+        assert sr.sanitize_recorded_tool_call(call).function.arguments == arguments
+
+
+@pytest.mark.parametrize(
+    "command",
+    ['echo "don\'t"', 'git commit -m "don\'t break"', r"printf $'hello\x22world'"],
+)
+def test_literal_quotes_preserve_recorded_arguments_events_and_presentation(
+    command: str,
+) -> None:
+    import json
+
+    from chartreux.core.events import ToolCallEvent
+    from chartreux.core.llm_models import FunctionCall, ToolCall
+    from chartreux.core.tools.builtins.bash import Bash, BashArgs
+    from chartreux.utils.tool_presentation import (
+        EffectCallDisplay,
+        ToolCallPresentation,
+        ToolEffectKind,
+    )
+
+    expected = command
+    arguments = json.dumps({"command": command}, indent=2)
+    presentation = ToolCallPresentation(
+        kind=ToolEffectKind.SHELL,
+        display=EffectCallDisplay(summary=command, status_text=FAKE_VALUE),
+    )
+    call = ToolCall(
+        function=FunctionCall(name="bash", arguments=arguments),
+        presentation=presentation,
+    )
+    event = ToolCallEvent(
+        tool_name="bash",
+        tool_class=Bash,
+        args=BashArgs(command=command),
+        tool_call_id="fixture",
+        presentation=presentation,
+    )
+    with sr.bind_policy(
+        sr.ScrubPolicy(redaction_credentials=((FAKE_NAME, FAKE_VALUE),))
+    ):
+        assert sr.redact_shell_source(command) == expected
+        recorded_call = sr.sanitize_recorded_tool_call(call)
+        recorded_event = sr.sanitize_recorded_tool_call(event)
+    assert recorded_call.function.arguments is not None
+    assert json.loads(recorded_call.function.arguments) == {"command": expected}
+    assert recorded_call.function.arguments == arguments
+    assert recorded_event.args == BashArgs(command=expected)
+    for recorded in (recorded_call, recorded_event):
+        assert recorded.presentation is not None
+        assert recorded.presentation.display.summary == expected
+        assert recorded.presentation.display.status_text == sr.REDACTED_PLACEHOLDER
+        assert FAKE_VALUE not in recorded.model_dump_json(exclude={"tool_class"})
+    assert call.function.arguments == arguments
+    assert event.args == BashArgs(command=command)
+    assert call.presentation == event.presentation == presentation
+
+
+def test_recorded_tool_call_numeric_substrings() -> None:
+    import json
+
+    from chartreux.core.llm_models import FunctionCall, ToolCall
+
+    payload = {"nested": [1234567890123456.0, 91234567890123456, True, 42]}
+    call = ToolCall(
+        function=FunctionCall(name="fixture", arguments=json.dumps(payload))
+    )
+    with sr.bind_policy(
+        sr.ScrubPolicy(redaction_credentials=((FAKE_NAME, "1234567890123456"),))
+    ):
+        recorded = sr.sanitize_recorded_tool_call(call)
+    assert json.loads(recorded.function.arguments) == {
+        "nested": [sr.REDACTED_PLACEHOLDER, sr.REDACTED_PLACEHOLDER, True, 42]
+    }
+    assert json.loads(call.function.arguments or "{}") == payload
 
 
 def test_redact_replaces_known_secret_value(
@@ -955,9 +1258,11 @@ def test_persisted_result_reconstruction_failure_is_safe(
             raise ValueError("unavailable")
 
     # Construct without validation to simulate a corrupt persisted model.
-    result = BrokenResult.model_construct()
+    result = BrokenResult.model_construct(duration=1.25, cancelled=True)
     cleaned = sr.redact_persisted_result(result)
     assert cleaned.output == {"error": "Tool result unavailable"}
+    assert cleaned.duration == 1.25
+    assert cleaned.cancelled is True
 
 
 def test_redact_persisted_result_fallback_redacts_presentation(
@@ -976,6 +1281,8 @@ def test_redact_persisted_result_fallback_redacts_presentation(
             raise ValueError("revalidation disabled for test")
 
     result = UnvalidatableResult(
+        duration=0.0,
+        cancelled=True,
         output={"stdout": f"leaked {FAKE_VALUE}"},
         presentation=ToolResultPresentation(
             kind=ToolEffectKind.TOOL,
@@ -987,6 +1294,8 @@ def test_redact_persisted_result_fallback_redacts_presentation(
 
     redacted = sr.redact_persisted_result(result)
 
+    assert redacted.duration == 0.0
+    assert redacted.cancelled is True
     assert FAKE_VALUE not in redacted.output["stdout"]
     assert FAKE_VALUE not in redacted.presentation.display.message
     assert sr.REDACTED_PLACEHOLDER in redacted.output["stdout"]

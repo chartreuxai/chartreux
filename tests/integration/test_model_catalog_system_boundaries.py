@@ -156,7 +156,7 @@ async def test_role_bound_child_uses_its_role_instead_of_parent_committed_model(
 
     candidate = registry._resolve_launch_candidate(
         cast(SessionRuntime, SimpleNamespace(agent_loop=parent_loop)),
-        TaskArgs(task="role-bound", agent="worker", background=True),
+        TaskArgs(task="role-bound", agent_type="worker", background=True),
     )
 
     assert candidate.committed_model != committed
@@ -298,8 +298,8 @@ class _BlockingCompletionBackend(FakeBackend):
 class _SiblingCompletionBackend(FakeBackend):
     def __init__(self) -> None:
         super().__init__([
-            mock_llm_chunk(content="sibling completed"),
-            mock_llm_chunk(content="failed sibling recovered"),
+            [mock_llm_chunk(content="sibling completed")],
+            [mock_llm_chunk(content="failed sibling recovered")],
         ])
         self.completed_bases: list[str | None] = []
         self.later_completed = asyncio.Event()
@@ -549,7 +549,7 @@ async def test_reload_while_background_child_runs_keeps_child_snapshot_isolated(
     try:
         launch = await _task_result(
             registry,
-            TaskArgs(task="snapshot", agent="worker", background=True),
+            TaskArgs(task="snapshot", agent_type="worker", background=True),
             InvokeContext(tool_call_id="background", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None

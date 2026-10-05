@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from chartreux.core.agent_loop.errors import EmptyLLMResponseError
 from chartreux.core.config import ChartreuxConfigSchema, ModelConfig, ProviderConfig
 from chartreux.core.errors import RefusalError
 from chartreux.core.llm.backend.generic import GenericBackend
@@ -416,6 +417,50 @@ def _refusal_chunk() -> LLMChunk:
         usage=LLMUsage(prompt_tokens=10, completion_tokens=2),
         stop=StopInfo(reason="refusal"),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_earlier_prose_and_tool_do_not_validate_empty_final_call(
+    vibe_config: ChartreuxConfigSchema, streaming: bool
+):
+    backend = FakeBackend([
+        [mock_llm_chunk(content="Earlier prose")],
+        [
+            mock_llm_chunk(
+                content="Working",
+                tool_calls=[
+                    ToolCall(
+                        id="t",
+                        index=0,
+                        function=FunctionCall(
+                            name="todo", arguments='{"action": "read"}'
+                        ),
+                    )
+                ],
+            )
+        ],
+        [mock_llm_chunk(content=" ")],
+        [mock_llm_chunk(content="")],
+    ])
+    agent = build_test_agent_loop(
+        config=vibe_config, backend=backend, enable_streaming=streaming
+    )
+    if streaming:
+        [_ async for _ in agent._chat_streaming()]
+        [_ async for _ in agent._chat_streaming()]
+        with pytest.raises(EmptyLLMResponseError):
+            [_ async for _ in agent._chat_streaming()]
+    else:
+        await agent._chat()
+        await agent._chat()
+        with pytest.raises(EmptyLLMResponseError):
+            await agent._chat()
+    assert len(backend.requests_messages) == 4
+    assistants = [m for m in agent.messages if m.role is Role.assistant]
+    assert len(assistants) == 2
+    assert assistants[0].content == "Earlier prose"
+    assert assistants[1].tool_calls
 
 
 @pytest.mark.asyncio

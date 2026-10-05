@@ -24,6 +24,7 @@ from tests.conftest import (
     build_test_vibe_config,
     wait_until,
 )
+from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 
 
@@ -179,7 +180,7 @@ async def test_ui_displays_compaction_checkpoint_when_resuming_session(
 
 class _RecordingBackend(FakeBackend):
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(mock_llm_chunk(content="Continued with the selected model."))
         self.models: list[ModelConfig] = []
 
     async def complete(self, *, model: ModelConfig, **kwargs: object):

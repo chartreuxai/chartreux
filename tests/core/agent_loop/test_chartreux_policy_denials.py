@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import shlex
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -154,6 +155,349 @@ async def test_posix_resolver_characterization_without_invocation(
         assert context is not None and context.permission == expected
     finally:
         await agent.aclose()
+
+
+@pytest.mark.parametrize("escaping", ["continuation", "ansi_c"])
+async def test_shell_escaped_secret_absent_from_events_and_persisted_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, escaping: str
+) -> None:
+    from chartreux.core.config.models import SessionLoggingConfig
+    from chartreux.core.tools import secret_redaction as sr
+
+    secret = "synthetic-escaped-credential-0123456789"
+    monkeypatch.setattr(sr, "_read_dotenv_entries", lambda: {"TEST_TOKEN": secret})
+    sr.reset_cache()
+    command = (
+        "printf synthetic-es\\\ncaped-credential-0123456789"
+        if escaping == "continuation"
+        else r"printf $'synthetic-es\x63aped-credential-0123456789'"
+    )
+    agent = build_test_agent_loop(
+        config=build_test_vibe_config(
+            tools={"bash": {"denylist": ["printf"]}},
+            session_logging=SessionLoggingConfig(save_dir=str(tmp_path), enabled=True),
+        ),
+        backend=FakeBackend([
+            [
+                mock_llm_chunk(
+                    tool_calls=[_call("bash", {"command": command}, "denied")]
+                )
+            ],
+            [mock_llm_chunk(content="Denied safely")],
+        ]),
+    )
+    try:
+        events = await _collect(agent)
+        result = next(event for event in events if isinstance(event, ToolResultEvent))
+        assert result.skipped
+        serialized_events = "".join(
+            event.model_dump_json(exclude={"tool_class"}) for event in events
+        )
+        serialized_messages = "".join(
+            message.model_dump_json() for message in agent.messages
+        )
+        session_dir = agent.session_logger.session_dir
+        assert session_dir is not None
+    finally:
+        await agent.aclose()
+        sr.reset_cache()
+    transcript = (session_dir / "messages.jsonl").read_text()
+    for recorded in (serialized_events, serialized_messages, transcript):
+        assert secret not in recorded
+        assert "synthetic-es" not in recorded
+        assert "caped-credential-0123456789" not in recorded
+
+
+@pytest.mark.parametrize(
+    "prefix", ["", "uv run ", "npx --package fixture ", "env CI=1 "]
+)
+async def test_shell_secret_denial_is_safe_in_feedback_events_and_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefix: str
+) -> None:
+    from chartreux.core.config.models import SessionLoggingConfig
+    from chartreux.core.tools import secret_redaction as sr
+
+    secret = "synthetic-shell-feedback'secret-0123456789"
+    monkeypatch.setattr(sr, "_read_dotenv_entries", lambda: {"TEST_TOKEN": secret})
+    sr.reset_cache()
+    command = prefix + f'printf "{secret}[bold]\\n"'
+    agent = build_test_agent_loop(
+        config=build_test_vibe_config(
+            tools={"bash": {"denylist": ["printf"]}},
+            session_logging=SessionLoggingConfig(save_dir=str(tmp_path), enabled=True),
+        ),
+        backend=FakeBackend([
+            [
+                mock_llm_chunk(
+                    tool_calls=[_call("bash", {"command": command}, "denied")]
+                )
+            ],
+            [mock_llm_chunk(content="Denied safely")],
+        ]),
+    )
+    try:
+        events = await _collect(agent)
+        result = next(event for event in events if isinstance(event, ToolResultEvent))
+        assert result.skipped and result.skip_reason
+        assert secret not in result.skip_reason
+        assert "synthetic-shell-feedback" not in result.skip_reason
+        assert "[bold]" not in result.skip_reason
+        assert "REDACTED" in result.skip_reason
+        assert secret not in "".join(
+            event.model_dump_json(exclude={"tool_class"}) for event in events
+        )
+        assert secret not in "".join(
+            message.model_dump_json() for message in agent.messages
+        )
+        session_dir = agent.session_logger.session_dir
+        assert session_dir is not None
+    finally:
+        await agent.aclose()
+        sr.reset_cache()
+    transcript = (session_dir / "messages.jsonl").read_text()
+    assert secret not in transcript
+    assert "REDACTED" in transcript
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("mode", ["denied", "executed", "clean"])
+@pytest.mark.parametrize("source_form", ["plain", "escaped", "nested"])
+async def test_tool_call_recording_redacts_copies_and_preserves_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    streaming: bool,
+    mode: str,
+    source_form: str,
+) -> None:
+    from chartreux.core.config.models import SessionLoggingConfig
+    from chartreux.core.events import ToolCallEvent
+    from chartreux.core.session.session_loader import SessionLoader
+    from chartreux.core.tools import secret_redaction as sr
+    from chartreux.core.tools.builtins.bash import CapturedShellResult
+
+    secret = "synthetic-call-recording-secret-0123456789"
+    if source_form != "plain":
+        secret += "'back\\slash"
+    monkeypatch.setattr(sr, "_read_dotenv_entries", lambda: {"TEST_TOKEN": secret})
+    sr.reset_cache()
+    command = f"printf '{secret if mode != 'clean' else 'ordinary'}\\n'"
+    if source_form != "plain":
+        command = shlex.join(["printf", secret if mode != "clean" else "ordinary"])
+    if source_form == "nested":
+        command = shlex.join(["bash", "-c", command])
+    call = _call("bash", {"command": command}, "recorded")
+    # Preserve unusual JSON whitespace exactly when there is no secret.
+    call.function.arguments = json.dumps({"command": command}, indent=2)
+    agent = build_test_agent_loop(
+        config=build_test_vibe_config(
+            tools={"bash": {"denylist": ["printf"] if mode == "denied" else []}},
+            session_logging=SessionLoggingConfig(save_dir=str(tmp_path), enabled=True),
+        ),
+        enable_streaming=streaming,
+        backend=FakeBackend([
+            [mock_llm_chunk(tool_calls=[call])],
+            [mock_llm_chunk(content="Done safely")],
+        ]),
+    )
+    from collections.abc import AsyncGenerator
+
+    async def result() -> AsyncGenerator[CapturedShellResult, None]:
+        # Exercise call recording independently of shell-result echo rendering.
+        yield CapturedShellResult(command="fixture")
+
+    run = MagicMock(side_effect=lambda *args, **kwargs: result())
+    monkeypatch.setattr(agent.tool_manager.get("bash"), "run", run)
+    try:
+        events = await _collect(agent)
+        calls = [e for e in events if isinstance(e, ToolCallEvent)]
+        assert calls
+        assert secret not in "".join(
+            e.model_dump_json(exclude={"tool_class"}) for e in calls
+        )
+        recorded = next(tc for m in agent.messages for tc in m.tool_calls or [])
+        assert recorded.presentation is not None
+        assert secret not in recorded.presentation.model_dump_json()
+        assert secret not in "".join(m.model_dump_json() for m in agent.messages)
+        if mode != "clean":
+            assert "synthetic-call-recording" not in "".join(
+                e.model_dump_json(exclude={"tool_class"}) for e in calls
+            )
+            assert "synthetic-call-recording" not in "".join(
+                m.model_dump_json() for m in agent.messages
+            )
+        if mode == "denied":
+            run.assert_not_called()
+        else:
+            run.assert_called_once()
+            assert run.call_args is not None
+            assert run.call_args.args[0].command == command
+            assert any(
+                isinstance(e, ToolResultEvent) and e.result is not None for e in events
+            )
+        if mode == "clean":
+            assert recorded.function.arguments == call.function.arguments
+            assert calls[-1].args == BashArgs(command=command)
+            assert recorded.presentation.display.message == command
+        else:
+            assert "REDACTED" in (recorded.function.arguments or "")
+            display = recorded.presentation.display
+            assert "REDACTED" in display.summary
+            assert "REDACTED" in (display.message or "")
+            assert "REDACTED" in (display.settled_message or "")
+        directory = agent.session_logger.session_dir
+        assert directory is not None
+        await agent.aclose()
+        assert secret not in (directory / "messages.jsonl").read_text()
+        messages, _ = SessionLoader.load_session(directory)
+        fresh = build_test_agent_loop(
+            config=agent.config,
+            backend=FakeBackend([[mock_llm_chunk(content="Resumed safely")]]),
+        )
+        try:
+            fresh.messages.reset_preserving_system(messages)
+            fresh._clean_message_history()
+            assert (
+                next(
+                    tc for m in fresh.messages for tc in m.tool_calls or []
+                ).function.arguments
+                == recorded.function.arguments
+            )
+            await _collect(fresh)
+            assert fresh.messages[-1].content == "Resumed safely"
+        finally:
+            await fresh.aclose()
+    finally:
+        await agent.aclose()
+        sr.reset_cache()
+
+
+@pytest.mark.parametrize("timeout", [1234567890123456, 42])
+async def test_numeric_secret_recording_preserves_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout: int
+) -> None:
+    from chartreux.core.config.models import SessionLoggingConfig
+    from chartreux.core.events import ToolCallEvent
+    from chartreux.core.tools import secret_redaction as sr
+    from chartreux.core.tools.builtins.bash import CapturedShellResult
+
+    secret = "1234567890123456"
+    monkeypatch.setattr(sr, "_read_dotenv_entries", lambda: {"TEST_TOKEN": secret})
+    sr.reset_cache()
+    call = ToolCall(
+        id="numeric",
+        index=0,
+        function=FunctionCall(
+            name="bash", arguments=json.dumps({"command": "true", "timeout": timeout})
+        ),
+    )
+    agent = build_test_agent_loop(
+        config=build_test_vibe_config(
+            session_logging=SessionLoggingConfig(save_dir=str(tmp_path), enabled=True)
+        ),
+        backend=FakeBackend([
+            [mock_llm_chunk(tool_calls=[call])],
+            [mock_llm_chunk(content="Done safely")],
+        ]),
+    )
+    from collections.abc import AsyncGenerator
+
+    async def result() -> AsyncGenerator[CapturedShellResult, None]:
+        yield CapturedShellResult(command="true")
+
+    run = MagicMock(side_effect=lambda *args, **kwargs: result())
+    monkeypatch.setattr(agent.tool_manager.get("bash"), "run", run)
+    try:
+        events = await _collect(agent)
+        run.assert_called_once()
+        assert run.call_args is not None
+        assert run.call_args.args[0].timeout == timeout
+        calls = [event for event in events if isinstance(event, ToolCallEvent)]
+        assert calls
+        assert secret not in "".join(
+            event.model_dump_json(exclude={"tool_class"}) for event in events
+        )
+        recorded = next(tc for m in agent.messages for tc in m.tool_calls or [])
+        args = json.loads(recorded.function.arguments or "{}")
+        if str(timeout) == secret:
+            assert args["timeout"] == sr.REDACTED_PLACEHOLDER
+            assert calls[-1].args is None
+        else:
+            assert args["timeout"] == timeout
+            assert isinstance(calls[-1].args, BashArgs)
+            assert calls[-1].args.timeout == timeout
+        directory = agent.session_logger.session_dir
+        assert directory is not None
+        await agent.aclose()
+        assert secret not in (directory / "messages.jsonl").read_text()
+    finally:
+        await agent.aclose()
+        sr.reset_cache()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_presentation_reconstruction_failure_omits_payload_and_executes(
+    monkeypatch: pytest.MonkeyPatch, streaming: bool
+) -> None:
+    from pydantic import field_validator
+
+    from chartreux.core.events import ToolCallEvent
+    from chartreux.core.tools import secret_redaction as sr
+    from chartreux.core.tools.ui import ToolUIDataAdapter
+    from chartreux.utils.tool_presentation import (
+        EffectCallDisplay,
+        ToolCallPresentation,
+        ToolEffectKind,
+    )
+
+    class ConstrainedDisplay(EffectCallDisplay):
+        summary: str = "synthetic-constrained-secret"
+
+        @field_validator("summary")
+        @classmethod
+        def constrain_summary(cls, value: str) -> str:
+            if value != "synthetic-constrained-secret":
+                raise ValueError("Invalid synthetic summary")
+            return value
+
+    secret = "synthetic-constrained-secret"
+    monkeypatch.setattr(sr, "_read_dotenv_entries", lambda: {"TEST_TOKEN": secret})
+    sr.reset_cache()
+    presentation = ToolCallPresentation(
+        kind=ToolEffectKind.TODO, display=ConstrainedDisplay(status_text="Reading")
+    )
+    call = _call("todo", {"action": "read"}, "presentation")
+    call.presentation = presentation
+    agent = build_test_agent_loop(
+        config=build_test_vibe_config(tools={"todo": {"permission": "always"}}),
+        enable_streaming=streaming,
+        backend=FakeBackend([
+            [mock_llm_chunk(tool_calls=[call])],
+            [mock_llm_chunk(content="Done safely")],
+        ]),
+    )
+    monkeypatch.setattr(
+        ToolUIDataAdapter, "get_call_presentation", lambda *args, **kwargs: presentation
+    )
+    try:
+        with sr.bind_policy(agent.scrub_policy):
+            with pytest.raises(ValueError):
+                sr.redact_model(presentation)
+        assert agent._recorded_tool_call(call).presentation is None
+        events = await _collect(agent)
+        calls = [event for event in events if isinstance(event, ToolCallEvent)]
+        assert calls and all(event.presentation is None for event in calls)
+        assert any(
+            isinstance(event, ToolResultEvent) and event.result is not None
+            for event in events
+        )
+        assert agent.stats.tool_calls_succeeded == 1
+        assert secret not in "".join(
+            event.model_dump_json(exclude={"tool_class"}) for event in events
+        )
+        assert secret not in "".join(m.model_dump_json() for m in agent.messages)
+    finally:
+        await agent.aclose()
+        sr.reset_cache()
 
 
 async def test_actual_command_deny_without_running_shell() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from textual.app import App, ComposeResult
@@ -73,6 +74,32 @@ def multi_select_args():
 
 
 class TestQuestionAppState:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "removed_selector", ["#question-app", "#question-content", "#question-body"]
+    )
+    async def test_deferred_body_height_after_removal(
+        self, single_question_args, removed_selector
+    ):
+        class Host(App[None]):
+            def compose(self) -> ComposeResult:
+                yield QuestionApp(single_question_args)
+
+        app = Host()
+        async with app.run_test() as pilot:
+            picker = app.query_one(QuestionApp)
+            await pilot.pause()
+            max_height = picker._body_max_height
+            # Hold the scheduled callback until removal has completed.
+            with patch.object(picker, "call_after_refresh") as schedule:
+                picker._schedule_body_max_height()
+            schedule.assert_called_once()
+            callback = schedule.call_args.args[0]
+            await app.query_one(removed_selector).remove()
+            app.call_after_refresh(callback)
+            await pilot.pause()
+            assert picker._body_max_height == max_height
+
     @pytest.mark.asyncio
     async def test_ascii_chrome_picker_prefixes(self, multi_select_args):
         class Host(App[None]):
@@ -915,6 +942,105 @@ class _HostApp(App[None]):
 
 
 class TestQuestionAppClicks:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("gesture", ["click", "enter"])
+    @pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+    async def test_acceptance_guards_advance_and_submit(
+        self, multi_select_args, gesture, size
+    ):
+        args = multi_select_args.model_copy(deep=True)
+        args.questions.append(args.questions[0].model_copy(deep=True))
+        app = _HostApp(args)
+        async with app.run_test(size=size) as pilot:
+            qapp = app.query_one(QuestionApp)
+
+            async def accept():
+                assert qapp.submit_widget is not None
+                if gesture == "click":
+                    await pilot.click(qapp.submit_widget)
+                else:
+                    qapp.selected_option = qapp._submit_option_idx
+                    await pilot.press("enter")
+
+            with patch.object(
+                qapp, "post_message", wraps=qapp.post_message
+            ) as delivery:
+                with patch.object(qapp, "is_within_grace_period", return_value=True):
+                    qapp.multi_selections[0] = {0}
+                    await accept()
+                    assert qapp.answers == {}
+                    assert qapp.current_question_idx == 0
+                qapp._mount_time = 0.0
+                qapp.multi_selections[0] = set()
+                await accept()
+                assert qapp.current_question_idx == 0
+                assert qapp.answers == {}
+                qapp.multi_selections[0] = {0}
+                await accept()
+                assert qapp.current_question_idx == 1
+                assert qapp.answers[0] == ("Auth", False)
+                assert not any(
+                    isinstance(call.args[0], QuestionApp.Answered)
+                    for call in delivery.call_args_list
+                )
+                qapp.multi_selections[1] = {1}
+                await accept()
+                await accept()
+                answered = [
+                    call.args[0]
+                    for call in delivery.call_args_list
+                    if isinstance(call.args[0], QuestionApp.Answered)
+                ]
+                assert len(answered) == 1
+                assert [a.answer for a in answered[0].answers] == ["Auth", "Caching"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("gesture", ["click", "enter"])
+    @pytest.mark.parametrize("invalid", ["empty", "blank_other"])
+    async def test_revisited_invalid_acceptance_is_rejected(
+        self, multi_select_args, gesture, invalid
+    ):
+        args = multi_select_args.model_copy(deep=True)
+        args.questions.append(args.questions[0].model_copy(deep=True))
+        app = _HostApp(args)
+        async with app.run_test() as pilot:
+            qapp = app.query_one(QuestionApp)
+            qapp._mount_time = 0.0
+            qapp.multi_selections[0] = {0}
+            qapp.selected_option = qapp._submit_option_idx
+            qapp.action_select()
+            assert qapp.current_question_idx == 1
+            qapp.action_prev_question()
+            qapp.multi_selections[0] = (
+                set() if invalid == "empty" else {qapp._other_option_idx}
+            )
+            qapp.other_texts[0] = "   "
+            with patch.object(
+                qapp, "post_message", wraps=qapp.post_message
+            ) as delivery:
+                if gesture == "click":
+                    assert qapp.submit_widget is not None
+                    await pilot.click(qapp.submit_widget)
+                else:
+                    qapp.selected_option = qapp._submit_option_idx
+                    await pilot.press("enter")
+                assert qapp.current_question_idx == 0
+                assert 0 not in qapp.answers
+                assert not any(
+                    isinstance(call.args[0], QuestionApp.Answered)
+                    for call in delivery.call_args_list
+                )
+
+    def test_definite_rejection_allows_resubmission(self, multi_select_args):
+        qapp = QuestionApp(multi_select_args)
+        qapp.multi_selections[0] = {0}
+        qapp.selected_option = qapp._submit_option_idx
+        with patch.object(qapp, "post_message", wraps=qapp.post_message) as delivery:
+            qapp.action_select()
+            qapp.set_submission_status("Failed: Answer rejected")
+            qapp.action_select()
+            assert delivery.call_count == 2
+
     @pytest.mark.asyncio
     async def test_clicking_option_selects_it(self, single_question_args):
         app = _HostApp(single_question_args)

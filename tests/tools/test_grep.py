@@ -858,6 +858,112 @@ async def test_frozen_authority_preserves_two_ancestor_denials(tmp_path):
     assert "allowed.py" in result.matches
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [False, True])
+async def test_retained_grep_scratch_snapshot_detects_replacement_and_revocation(
+    tmp_path, cached
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch = tmp_path / "scratch"
+    replacement = tmp_path / "replacement"
+    for root in (scratch, replacement):
+        root.mkdir()
+        (root / "notes.txt").write_text("hit\n")
+    config = build_test_vibe_config()
+    parent = ToolManager(
+        lambda: config,
+        cwd=workspace,
+        scratchpad_dir=scratch,
+        accepted_token_getter=(lambda: "accepted") if cached else None,
+        defer_mcp=True,
+    )
+    child = ToolManager(
+        lambda: config,
+        cwd=workspace,
+        parent_authority_getter=lambda: parent,
+        accepted_token_getter=(lambda: "accepted") if cached else None,
+        defer_mcp=True,
+    )
+    tool = child.get("grep")
+    assert isinstance(tool, Grep)
+    token = tool._current_token()
+    _, frozen, _ = tool._snapshot()
+    if cached:
+        assert frozen is not None and frozen(scratch / "notes.txt")
+    else:
+        assert frozen is None
+    result = await collect_result(tool.run(GrepArgs(path=str(scratch), pattern="hit")))
+    assert result.match_count == 1
+    parent.set_scratchpad_dir(replacement)
+    with pytest.raises(grep_module._AuthorityChanged):
+        tool._ensure_current(token)
+    decision = tool.resolve_permission(GrepArgs(path=str(scratch), pattern="hit"))
+    assert decision is not None and decision.permission == ToolPermission.NEVER
+    result = await collect_result(
+        tool.run(GrepArgs(path=str(replacement), pattern="hit"))
+    )
+    assert result.match_count == 1
+    token = tool._current_token()
+    parent.set_scratchpad_dir(None)
+    with pytest.raises(grep_module._AuthorityChanged):
+        tool._ensure_current(token)
+    decision = tool.resolve_permission(GrepArgs(path=str(replacement), pattern="hit"))
+    assert decision is not None and decision.permission == ToolPermission.NEVER
+
+
+@pytest.mark.asyncio
+async def test_grep_discards_scratch_candidates_revoked_during_worker_stage(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / "notes.txt").write_text("hit\n")
+    config = build_test_vibe_config()
+    parent = ToolManager(
+        lambda: config,
+        cwd=workspace,
+        scratchpad_dir=scratch,
+        accepted_token_getter=lambda: 1,
+        defer_mcp=True,
+    )
+    child = ToolManager(
+        lambda: config,
+        cwd=workspace,
+        parent_authority_getter=lambda: parent,
+        accepted_token_getter=lambda: 1,
+        defer_mcp=True,
+    )
+    tool = child.get("grep")
+    assert isinstance(tool, Grep)
+    stage = tool._stage
+    revoked = False
+    spawns = []
+
+    async def revoke_after_collection(function, *args, stop):
+        nonlocal revoked
+        value = await stage(function, *args, stop=stop)
+        if function is grep_module._collect_paths and not revoked:
+            assert value == [scratch / "notes.txt"]
+            parent.set_scratchpad_dir(None)
+            revoked = True
+        return value
+
+    async def execute(command):
+        spawns.append(command)
+        return ""
+
+    monkeypatch.setattr(tool, "_stage", revoke_after_collection)
+    monkeypatch.setattr(tool, "_execute_search", execute)
+    monkeypatch.setattr(tool, "_detect_backend", lambda: GrepBackend.GNU_GREP)
+    with pytest.raises(ToolError, match="Search path denied by policy"):
+        await collect_result(tool.run(GrepArgs(path=str(scratch), pattern="hit")))
+    assert revoked
+    assert spawns == []
+
+
 @pytest.mark.skipif(not shutil.which("grep"), reason="GNU grep not available")
 class TestGnuGrepBackend:
     @pytest.mark.asyncio

@@ -40,9 +40,209 @@ from chartreux.core.model_catalog.loader import (
 )
 from chartreux.core.model_catalog.presets import FULLY_CUSTOM, MISTRAL, ProviderPreset
 from chartreux.core.model_catalog.schema import ModelCatalog
-from chartreux.ui.providers.management_state import PendingModel
+from chartreux.ui.providers.management_state import ManagementState, PendingModel
 from chartreux.ui.providers.workbench import ProviderWorkbenchScreen, WorkbenchView
 from tests.snapshots.snapshot_event_loop import install_snapshot_wake
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+async def test_composite_model_groups_are_reversible_and_bounded(size) -> None:  # type: ignore[no-untyped-def]
+    screen, services = setup()
+    async with Host(screen).run_test(size=size) as pilot:
+        await add_preset(pilot, screen, MISTRAL)
+        screen._save_key("test-key")
+        screen._connection_action("continue")
+        await wait_until(pilot, lambda: not screen._busy)
+        models = screen.query_one("#wb-models", SelectionList)
+        actions = screen.query_one("#wb-models-actions", OptionList)
+        models.highlighted = models.option_count - 1
+        models.focus()
+        selected = list(models.selected)
+        await pilot.press("down", "right", "left")
+        assert models.has_focus and models.highlighted == models.option_count - 1
+        await pilot.press("tab")
+        assert actions.has_focus
+        actions.highlighted = actions.option_count - 1
+        await pilot.press("down", "right", "left")
+        assert actions.has_focus and actions.highlighted == actions.option_count - 1
+        await pilot.press("tab")
+        assert screen.query_one("#wb-help").has_focus
+        assert "Tab Models" in str(screen.query_one("#wb-hint").render())
+        assert "Shift+Tab Actions" in str(screen.query_one("#wb-hint").render())
+        await pilot.press("tab")
+        assert models.has_focus and models.highlighted == models.option_count - 1
+        await pilot.press("shift+tab", "shift+tab")
+        assert actions.has_focus and actions.highlighted == actions.option_count - 1
+        await pilot.press("shift+tab")
+        assert models.has_focus
+        models.highlighted = 0
+        await pilot.press("up", "k")
+        assert models.has_focus and models.highlighted == 0
+        await pilot.press("tab")
+        actions.highlighted = 0
+        await pilot.press("up", "k")
+        assert actions.has_focus and actions.highlighted == 0
+        assert list(models.selected) == selected
+        assert len(services.writes) == 1  # connection only
+        await pilot.resize_terminal(120, 36)
+        await pilot.press("tab", "tab")
+        assert models.has_focus and models.highlighted == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+async def test_catalog_groups_bound_arrows_and_repair_filtered_identity(size) -> None:  # type: ignore[no-untyped-def]
+    screen, services = setup()
+    async with Host(screen).run_test(size=size) as pilot:
+        screen._open_catalog()
+        await pilot.pause()
+        models = screen.query_one("#wb-catalog", OptionList)
+        filters = screen.query_one("#wb-catalog-filter", OptionList)
+        models.highlighted = models.option_count - 1
+        await pilot.press("down", "j", "right", "left")
+        assert models.has_focus and models.highlighted == models.option_count - 1
+        await pilot.press("tab")
+        assert screen.query_one("#wb-help").has_focus
+        await pilot.press("tab")
+        assert filters.has_focus
+        filters.highlighted = filters.option_count - 1
+        await pilot.press("down", "j")
+        assert filters.has_focus and filters.highlighted == filters.option_count - 1
+        await pilot.press("shift+tab", "shift+tab")
+        assert models.has_focus and models.highlighted == models.option_count - 1
+        models.highlighted = 0
+        await pilot.press("up", "k")
+        assert models.highlighted == 0
+        await pilot.press("shift+tab")
+        assert filters.has_focus and filters.highlighted == filters.option_count - 1
+        filters.highlighted = 1
+        await pilot.press("up", "k")
+        assert filters.highlighted == 1  # heading is not selectable
+        await press_option(pilot, filters, "filter:one")
+        assert models.highlighted_option and models.highlighted_option.id == "model:a"
+        screen._model_filter = "missing"
+        screen._refresh_catalog()
+        await pilot.press("tab")
+        assert models.has_focus and models.highlighted_option.id == "\x00empty"
+        await pilot.press("down", "enter")
+        assert screen.view is WorkbenchView.CATALOG
+        await pilot.press("tab", "tab")
+        assert filters.has_focus
+        assert "Help" in str(screen.query_one("#wb-help").render())
+        assert "Shift+Tab" in str(screen.query_one("#wb-hint").render())
+        assert not services.writes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+async def test_model_details_pointer_is_separate_and_restores_identity_scroll(
+    size,
+) -> None:  # type: ignore[no-untyped-def]
+    screen, services = setup()
+    services.discovery_result = DiscoveryResult(
+        tuple(DiscoveryItem(f"model-{i:03d}") for i in range(60))
+    )
+    async with Host(screen).run_test(size=size) as pilot:
+        await expand(pilot, screen)
+        screen._select_action("discover")
+        await wait_until(pilot, lambda: not screen._busy)
+        screen._select_action("models")
+        await pilot.pause()
+        models = screen.query_one("#wb-models", SelectionList)
+        await pilot.click(models, offset=(10, 0))
+        await pilot.pause()
+        assert models.get_option_at_index(0).value not in models.selected
+        assert screen.state is not None
+        screen.state.select("model-039")
+        screen._refresh_models()
+        await pilot.pause()
+        models.highlighted = 40
+        models.scroll_to_highlight()
+        await pilot.pause()
+        identity = models.get_option_at_index(40).value
+        before = list(models.selected)
+        scroll = models.scroll_offset.y
+        row = 40 - scroll
+        assert "Details" in models.render_line(row).text
+        await pilot.click(models, offset=(models.size.width - 5, row))
+        await pilot.pause()
+        assert screen._detail == identity
+        assert list(models.selected) == before
+        await pilot.press("escape")
+        await pilot.pause()
+        assert (
+            models.has_focus
+            and models.get_option_at_index(models.highlighted).value == identity
+        )
+        assert models.scroll_offset.y == scroll
+        await pilot.press("enter")
+        assert screen._detail == identity
+        await pilot.press("escape")
+        assert not services.writes
+
+
+@pytest.mark.asyncio
+async def test_models_empty_groups_busy_and_confirmation_remain_usable() -> None:
+    screen, services = setup()
+    services.discovery_result = DiscoveryResult(())
+    async with Host(screen).run_test(size=(80, 24)) as pilot:
+        await add_preset(pilot, screen, MISTRAL)
+        screen._save_key("test-key")
+        screen._connection_action("continue")
+        await wait_until(pilot, lambda: not screen._busy)
+        models = screen.query_one("#wb-models", SelectionList)
+        actions = screen.query_one("#wb-models-actions", OptionList)
+        assert cast(Selection[str], models.highlighted_option).value == "\x00empty"
+        await pilot.press("up", "down", "space", "enter", "right")
+        assert models.has_focus and screen._detail is None
+        assert not models.selected
+        await pilot.press("tab")
+        assert actions.has_focus
+        await pilot.press("shift+tab")
+        actions.disabled = True
+        await pilot.press("tab")
+        assert screen.query_one("#wb-help").has_focus
+        assert "Tab Models" in str(screen.query_one("#wb-hint").render())
+        actions.disabled = False
+        await pilot.press("tab")
+        screen._busy = True
+        await pilot.press("tab", "shift+tab", "enter")
+        assert models.has_focus and screen._detail is None
+        screen._busy = False
+        screen._confirm = "discard"
+        screen._update_help()
+        await pilot.pause()
+        await pilot.press("tab", "shift+tab")
+        assert screen.query_one("#wb-confirm-actions").has_focus
+        await pilot.press("escape")
+        assert screen._confirm is None and models.has_focus
+        assert len(services.writes) == 1
+
+
+@pytest.mark.asyncio
+async def test_models_refresh_repairs_removed_identity_to_nearest_row() -> None:
+    screen, services = setup()
+    async with Host(screen).run_test(size=(120, 36)) as pilot:
+        await expand(pilot, screen)
+        screen._select_action("discover")
+        await pilot.pause()
+        await wait_until(pilot, lambda: not screen._busy)
+        screen._select_action("models")
+        await pilot.pause()
+        models = screen.query_one("#wb-models", SelectionList)
+        models.highlighted = 1
+        identity = cast(Selection[str], models.highlighted_option).value
+        cast(ManagementState, screen.state).discovery = DiscoveryResult((
+            DiscoveryItem("new"),
+        ))
+        screen._refresh_models()
+        await pilot.pause()
+        assert models.has_focus and models.highlighted == 1
+        assert cast(Selection[str], models.highlighted_option).value != identity
+        await pilot.press("tab", "shift+tab")
+        assert models.has_focus and models.highlighted == 1
+        assert not services.writes
 
 
 @pytest.mark.asyncio
@@ -106,7 +306,7 @@ async def test_provider_ascii_footer_and_neutral_confirmation_fit() -> None:
         screen._open_catalog()
         await pilot.pause()
         hint = str(screen.query_one("#wb-hint").render())
-        assert "Tab Switch list" in hint and "Esc Back" in hint
+        assert "Tab Help" in hint and "Shift+Tab Filter" in hint and "Esc Back" in hint
         assert not any(glyph in hint for glyph in "↑↓←→")
         await pilot.press("escape")
         await expand(pilot, screen)
@@ -989,11 +1189,11 @@ async def test_model_actions_are_pinned_outside_checklist() -> None:
         models.highlighted = 0
         models.focus()
         screen._update_help()
-        assert "Space" in str(screen.query_one("#wb-hint").render())
-        assert "Enter" in str(screen.query_one("#wb-hint").render())
-        await pilot.press("right")
+        assert "Space" in str(screen.query_one("#wb-help").render())
+        assert "Enter" in str(screen.query_one("#wb-help").render())
+        await pilot.press("tab")
         assert actions.has_focus
-        await pilot.press("left")
+        await pilot.press("shift+tab")
         assert models.has_focus and models.highlighted == 0
 
 
@@ -1766,7 +1966,9 @@ async def test_provider_draft_detail_save_escape_restores_model_cursor() -> None
         assert restored.highlighted_option is not None
         assert cast(Selection[str], restored.highlighted_option).value == "new"
         await pilot.press("down")
-        assert restored.highlighted != new_index
+        assert restored.highlighted == new_index
+        await pilot.press("up")
+        assert restored.highlighted == new_index - 1
 
 
 @pytest.mark.asyncio
@@ -1798,6 +2000,27 @@ async def test_new_mistral_provider_can_edit_discovered_model_and_continue_to_pr
         assert services.writes
         assert "new" in services.writes[-1].models
         assert screen.view == WorkbenchView.PRESETS
+
+
+@pytest.mark.asyncio
+async def test_catalog_refuses_details_for_unconfigured_discovered_model() -> None:
+    screen, services = setup()
+    async with Host(screen).run_test(size=(80, 24)) as pilot:
+        await expand(pilot, screen)
+        state = screen.state
+        assert state is not None
+        state.discovery = services.discovery_result
+        screen._open_catalog()
+        await pilot.pause()
+        assert screen._stage != "models"
+        screen._open_detail("new")
+        await pilot.pause()
+        assert screen.view is WorkbenchView.CATALOG
+        assert screen._detail is None
+        assert screen._detail_preview_wire is None
+        assert screen._message == "Enable this discovered model before editing details."
+        assert "new" not in state.pending
+        assert not services.writes
 
 
 @pytest.mark.asyncio
@@ -2422,11 +2645,11 @@ async def test_models_forward_action_is_reachable_below_deep_model_list(size) ->
         selected = models.highlighted
         actions = screen.query_one("#wb-models-actions", OptionList)
         assert actions.display and actions.region.bottom <= size[1]
-        await pilot.press("right")
+        await pilot.press("tab")
         assert actions.has_focus and models.highlighted == selected
-        await pilot.press("left")
+        await pilot.press("shift+tab")
         assert models.has_focus and models.highlighted == selected
-        await pilot.press("right", "down", "down", "down", "down")
+        await pilot.press("tab", "down", "down", "down", "down")
         assert (
             actions.highlighted_option
             and actions.highlighted_option.id == "continue-presets"
@@ -2669,8 +2892,9 @@ async def test_two_provider_onboarding_uses_arrows_and_forward_saves() -> None:
     async def model_action(pilot, value: str) -> None:  # type: ignore[no-untyped-def]
         models = screen.query_one("#wb-models", SelectionList)
         models.focus()
-        await pilot.press("right")
+        await pilot.press("tab")
         actions = screen.query_one("#wb-models-actions", OptionList)
+        await pilot.press("home")
         for _ in range(actions.option_count + 1):
             if (
                 actions.highlighted_option

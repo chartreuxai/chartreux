@@ -12,7 +12,10 @@ import pytest
 
 from chartreux.core.agent_loop._loop import AgentLoop, AgentTurnOptions
 from chartreux.core.agent_loop.backend_lifetime import BackendLifetime
-from chartreux.core.agent_loop.errors import AgentLoopLLMResponseError
+from chartreux.core.agent_loop.errors import (
+    AgentLoopLLMResponseError,
+    EmptyLLMResponseError,
+)
 from chartreux.core.agent_loop.llm_gateway import TranscriptAppend, _append_interrupted
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.layers import OverridesLayer
@@ -35,8 +38,9 @@ from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.session_types import CommittedModelIdentity, LaunchMetadataV2
 from chartreux.core.subagents import AgentAvailability, AgentSummary, TaskResult
+from chartreux.core.utils import retry
 from chartreux.core.utils.retry import async_retry
-from tests.conftest import build_test_agent_loop
+from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend, FakeInterruptedStreamingBackend
 
@@ -598,8 +602,7 @@ async def test_streaming_replays_before_semantic_delta_but_not_after_content_rea
     second = FakeBackend([mock_llm_chunk(content="replayed")])
     _failover_backends(replay, first, second)
     assert [chunk.message.content async for chunk in replay._chat_streaming()] == [
-        "",
-        "replayed",
+        "replayed"
     ]
 
     interrupted = _agent(streaming=True)
@@ -968,6 +971,86 @@ async def test_reload_metadata_failure_rolls_back_identity_and_backend() -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("catalog", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_transport_retry_after_empty_attempt_has_no_fresh_deadline(
+    catalog, streaming, monkeypatch
+):
+    clock = [0.0]
+    monkeypatch.setattr("chartreux.core.llm.failures.time.monotonic", lambda: clock[0])
+
+    async def no_sleep(delay):
+        return None
+
+    monkeypatch.setattr(retry.asyncio, "sleep", no_sleep)
+    budgets = []
+
+    class TransportBackend(FakeBackend):
+        def next_response(self):
+            budgets.append(retry._LOGICAL_RETRY_BUDGET.get())
+            if len(budgets) == 1:
+                clock[0] = 0.2
+                return mock_llm_chunk(content="")
+            clock[0] = 0.9
+            raise httpx.ConnectError("transport unavailable")
+
+        @retry.async_retry(tries=3, max_elapsed_time=10)
+        async def _complete(self, **kwargs) -> LLMChunk:
+            return self.next_response()
+
+        async def complete(self, **kwargs) -> LLMChunk:
+            return await self._complete(**kwargs)
+
+        @retry.async_generator_retry(tries=3, max_elapsed_time=10)
+        async def complete_streaming(self, **kwargs):
+            yield self.next_response()
+
+    backend = TransportBackend()
+    if catalog:
+        agent = _agent(streaming=streaming)
+        assert not await agent.config_orchestrator.set_field(
+            "/api_retry_max_elapsed_time", 1.0, target_layer=OverridesLayer.NAME
+        )
+        _failover_backends(
+            agent, backend, FakeBackend(exception_to_raise=ValueError("stop"))
+        )
+    else:
+        agent = build_test_agent_loop(
+            config=build_test_vibe_config(api_retry_max_elapsed_time=1.0),
+            backend=backend,
+            enable_streaming=streaming,
+        )
+        monkeypatch.setattr(agent, "_failover_candidates", lambda *args, **kwargs: ())
+    with pytest.raises((RuntimeError, ValueError)):
+        if streaming:
+            [_ async for _ in agent._chat_streaming()]
+        else:
+            await agent._chat()
+    assert len(budgets) == 2
+    assert budgets[0] is budgets[1]
+    assert budgets[0] is not None
+    assert budgets[0].deadline == 1.0
+    assert retry._LOGICAL_RETRY_BUDGET.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_empty_replay_never_switches_provider(streaming: bool) -> None:
+    agent = _agent(streaming=streaming)
+    first = FakeBackend([[mock_llm_chunk(content=" ")], [mock_llm_chunk(content="")]])
+    second = FakeBackend([mock_llm_chunk(content="must not fail over")])
+    _failover_backends(agent, first, second)
+    with pytest.raises(EmptyLLMResponseError):
+        if streaming:
+            [_ async for _ in agent._chat_streaming()]
+        else:
+            await agent._chat()
+    assert len(first.requests_messages) == 2
+    assert second.requests_messages == []
+    assert agent.completion_metadata_since((0, 0))["switch_notices"] == []
+
+
+@pytest.mark.asyncio
 async def test_chat_and_streaming_share_attempt_transaction() -> None:
     agent = _agent(streaming=True)
     modes: list[bool] = []
@@ -981,8 +1064,11 @@ async def test_chat_and_streaming_share_attempt_transaction() -> None:
     agent._attempt_completion = recording  # type: ignore[method-assign]
     _failover_backends(
         agent,
-        FakeBackend([mock_llm_chunk(content="nonstream")]),
-        FakeBackend([mock_llm_chunk(content="stream")]),
+        FakeBackend([
+            [mock_llm_chunk(content="nonstream")],
+            [mock_llm_chunk(content="stream")],
+        ]),
+        FakeBackend([mock_llm_chunk(content="unused")]),
     )
     await agent._chat()
     _ = [chunk async for chunk in agent._chat_streaming()]
@@ -1047,8 +1133,13 @@ async def test_reasoning_or_tool_call_alone_prevents_stream_replay(
     if semantic == "reasoning":
         message.reasoning_content = "partial thought"
     else:
+        # Interrupt the stream after a well-formed call: malformed JSON arguments
+        # are intentionally omitted by the transcript's redaction boundary.
         message.tool_calls = [
-            ToolCall(id="partial", function=FunctionCall(name="todo", arguments="{"))
+            ToolCall(
+                id="partial",
+                function=FunctionCall(name="todo", arguments='{ "action": "read" }'),
+            )
         ]
     _failover_backends(
         agent,

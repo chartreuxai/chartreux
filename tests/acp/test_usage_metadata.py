@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
+from unittest.mock import PropertyMock, patch
 
 from acp.schema import TextContentBlock, UsageUpdate
 import pytest
@@ -54,3 +55,40 @@ async def test_usage_update_serializes_runtime_statistics_in_acp_metadata(
     assert wire["_meta"] == expected_meta
     assert wire["used"] == stats.context_tokens
     assert wire["size"] > 0
+
+
+@pytest.mark.asyncio
+async def test_unknown_context_window_skips_update_but_preserves_prompt_usage(
+    acp_agent_loop: ChartreuxAcpAgent,
+) -> None:
+    session_id = (
+        await acp_agent_loop.new_session(cwd=str(Path.cwd()), mcp_servers=[])
+    ).session_id
+    session = acp_agent_loop.sessions[session_id]
+    runtime = session.app_server.resources.runtime
+    client: Any = acp_agent_loop.client
+    client._session_updates.clear()
+
+    with patch.object(
+        type(runtime), "context_window", new_callable=PropertyMock, return_value=None
+    ):
+        existing_tasks = session._tasks.copy()
+        acp_agent_loop._send_usage_update(session)
+        # Await only the usage task, not the long-lived notification listener.
+        usage_tasks = session._tasks - existing_tasks
+        assert len(usage_tasks) == 1
+        await asyncio.gather(*usage_tasks)
+        response = await acp_agent_loop.prompt(
+            session_id=session_id, prompt=[TextContentBlock(type="text", text="Hello")]
+        )
+        await asyncio.sleep(0)
+
+    assert not any(
+        isinstance(notification.update, UsageUpdate)
+        for notification in client._session_updates
+    )
+    assert response.usage is not None
+    assert response.usage.input_tokens == runtime.stats.token_usage.input_tokens
+    assert response.usage.output_tokens == runtime.stats.token_usage.output_tokens
+    assert response.usage.total_tokens == runtime.stats.token_usage.total_tokens
+    assert response.usage.total_tokens > 0

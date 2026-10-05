@@ -84,6 +84,40 @@ class SubagentsConfig(BaseModel):
     max_running_subagents: int = Field(default=16, ge=1, strict=True)
 
 
+type StatusLineSegment = Literal[
+    "directory",
+    "pid",
+    "model",
+    "context",
+    "git-branch",
+    "spend-today",
+    "spend-week",
+    "spend-month",
+]
+
+
+class StatusLineConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    segments: list[StatusLineSegment] = Field(
+        default_factory=lambda: ["directory", "pid", "context"]
+    )
+    directory_style: Literal["name", "path"] = "name"
+    context_style: Literal["tokens", "tokens-percent"] = "tokens-percent"
+    separator: Literal["space", "pipe"] = "pipe"
+
+    @field_validator("segments")
+    @classmethod
+    def validate_segments(
+        cls, value: list[StatusLineSegment]
+    ) -> list[StatusLineSegment]:
+        if len(value) != len(set(value)):
+            raise ValueError("Status line segments must be unique")
+        if not {"directory", "context"}.issubset(value):
+            raise ValueError("Status line segments require directory and context")
+        return value
+
+
 class SessionLoggingConfig(BaseSettings):
     save_dir: str = ""
     permission_repair_dir: str = Field(default="", exclude=True, repr=False)

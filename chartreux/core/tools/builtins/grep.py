@@ -28,12 +28,11 @@ from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from chartreux.core.tools.utils import (
     DEFAULT_SENSITIVE_PATTERNS,
+    PathAccess,
     ToolPath,
-    resolve_file_tool_permission,
     resolve_tool_path,
 )
 from chartreux.core.utils import kill_async_subprocess
-from chartreux.core.workspace import Workspace
 from chartreux.utils.io import decode_console_safe, read_safe
 from chartreux.utils.tool_presentation import ToolEffectKind
 
@@ -182,29 +181,6 @@ class GrepResult(BaseModel):
             if match := GrepMatch.from_output_line(line, base):
                 results.append(match)
         return results
-
-
-@dataclass(frozen=True)
-class _FileAuthority:
-    permission: ToolPermission
-    allowlist: tuple[str, ...]
-    denylist: tuple[str, ...]
-    sensitive: tuple[str, ...]
-    workspace: Workspace
-    scratchpad: Path | None
-
-    def allows(self, path: Path) -> bool:
-        decision = resolve_file_tool_permission(
-            str(path),
-            tool_name="grep",
-            allowlist=list(self.allowlist),
-            denylist=list(self.denylist),
-            config_permission=self.permission,
-            sensitive_patterns=list(self.sensitive),
-            workspace=self.workspace,
-            scratchpad_dir=self.scratchpad,
-        )
-        return decision is not None and decision.permission == ToolPermission.ALWAYS
 
 
 @dataclass(frozen=True)
@@ -440,17 +416,7 @@ class Grep(
         }
 
     def resolve_permission(self, args: GrepArgs) -> PermissionContext | None:
-        config = self.config
-        return resolve_file_tool_permission(
-            args.path,
-            tool_name=self.get_name(),
-            allowlist=config.allowlist,
-            denylist=config.denylist,
-            config_permission=config.permission,
-            sensitive_patterns=config.sensitive_patterns,
-            workspace=self.workspace,
-            scratchpad_dir=self.scratchpad_dir,
-        )
+        return self.path_authority.resolve(args.path, PathAccess.READ)
 
     def _detect_backend(self) -> GrepBackend:
         if shutil.which("rg"):
@@ -478,73 +444,36 @@ class Grep(
             self.cwd,
         )
         manager = getattr(self, "_grep_authority_manager", None)
-        states: list[_FileAuthority] = []
         if manager is None:
             if (
                 type(self).resolve_permission is not Grep.resolve_permission
                 or "resolve_permission" in self.__dict__
             ):
                 return None, None, settings
-            states.append(
-                _FileAuthority(
-                    config.permission,
-                    tuple(config.allowlist),
-                    tuple(config.denylist),
-                    tuple(config.sensitive_patterns),
-                    self.workspace,
-                    self.scratchpad_dir,
-                )
-            )
-            frozen_states = tuple(states)
-            return (
-                self._current_token(),
-                lambda path: all(state.allows(path) for state in frozen_states),
-                settings,
-            )
-        token = manager._effective_authority_token()
-        cursor = manager
-        while cursor is not None:
-            if (
-                token is None
-                or cursor._authority_retired
-                or not cursor._name_versionable(self.get_name())
-            ):
-                return None, None, settings
-            try:
-                tool = cursor.get(self.get_name())
-                if type(tool).resolve_permission is not Grep.resolve_permission:
-                    return token, None, settings
-                cfg = cursor.get_tool_config(self.get_name())
-                states.append(
-                    _FileAuthority(
-                        cfg.permission,
-                        tuple(cfg.allowlist),
-                        tuple(cfg.denylist),
-                        tuple(cfg.sensitive_patterns),
-                        cursor.workspace,
-                        cursor._scratchpad_dir,
-                    )
-                )
-                cursor = (
-                    cursor._parent_authority()
-                    if cursor._parent_authority_getter
-                    else None
-                )
-            except Exception:
-                return None, None, settings
-        if manager._effective_authority_token() != token:
-            raise _AuthorityChanged
-        frozen_states = tuple(states)
-        return (
-            token,
-            lambda path: all(state.allows(path) for state in frozen_states),
-            settings,
+            token = self._current_token()
+            authority = self.path_authority
+            if self._current_token() != token:
+                raise _AuthorityChanged
+            return token, authority.allows, settings
+        before = manager._effective_authority_token()
+        token, authority = manager.snapshot_path_authority(
+            self.get_name(), Grep.resolve_permission
         )
+        if manager._effective_authority_token() != before:
+            raise _AuthorityChanged
+        return token, authority.allows if authority is not None else None, settings
 
     def _current_token(self) -> tuple[object, ...] | None:
         manager = getattr(self, "_grep_authority_manager", None)
         if manager is not None:
-            return manager._effective_authority_token()
+            token = manager._effective_authority_token()
+            # Even unversioned/custom policy chains have runtime-owned manifest
+            # publication. Detect revocation instead of merely filtering first-N.
+            return (
+                token
+                if token is not None
+                else ("instruction-files", manager._instruction_read_token())
+            )
         # Unmanaged tools have no publication signal; compare their live inputs
         # at every async boundary rather than trusting a mutable config object.
         config = self.config
@@ -552,7 +481,8 @@ class Grep(
             config.model_dump_json(),
             frozenset(config.model_fields_set),
             self.workspace,
-            self.scratchpad_dir,
+            self.scratchpad_roots,
+            self.instruction_read_files,
         )
 
     def _ensure_current(self, token: tuple[object, ...] | None) -> None:
@@ -617,6 +547,8 @@ class Grep(
                 stop.clear()
                 try:
                     token, frozen, settings = self._snapshot()
+                    if token is None:
+                        token = self._current_token()
                     # Unknown/custom ancestor variants retain their actual live resolver.
                     # This fallback cooperatively yields; it never substitutes grep rules.
                     if frozen is None:

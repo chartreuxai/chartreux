@@ -54,6 +54,7 @@ class LoadingWidget(SpinnerMixin, Static):
         self._action_required_status: str | None = None
         self._status_before_action_required: str | None = None
         self._queued_count: int = 0
+        self._waiting_only = False
         self._interrupting = False
 
     @property
@@ -138,6 +139,12 @@ class LoadingWidget(SpinnerMixin, Static):
         self._queued_count = count
         self._update_hint(max(self._last_elapsed, 0))
 
+    def set_waiting_only(self, waiting_only: bool) -> None:
+        if waiting_only == self._waiting_only:
+            return
+        self._waiting_only = waiting_only
+        self._update_hint(max(self._last_elapsed, 0))
+
     def set_hint_suppressed(self, suppressed: bool) -> None:
         """Hide keyboard shortcuts while another control owns the keys."""
         self._hint_suppressed = suppressed
@@ -157,15 +164,18 @@ class LoadingWidget(SpinnerMixin, Static):
 
     def _format_hint(self, elapsed: int) -> str:
         elapsed_str = _format_elapsed(elapsed)
+        enter_action = (
+            "steers current turn" if self._waiting_only else "queues next turn"
+        )
         if self._queued_count > 0:
             return (
                 f"({elapsed_str} {shortcut('Esc')} to interrupt · "
-                f"{shortcut('Enter')} queues next turn · "
+                f"{shortcut('Enter')} {enter_action} · "
                 f"{shortcut('Ctrl+C')} to cancel last queued message)"
             )
         return (
             f"({elapsed_str} {shortcut('Esc/Ctrl+C')} to interrupt · "
-            f"{shortcut('Enter')} queues next turn)"
+            f"{shortcut('Enter')} {enter_action})"
         )
 
     def compose(self) -> ComposeResult:

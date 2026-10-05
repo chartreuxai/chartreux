@@ -4,6 +4,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 import enum
 import json
+import re
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -42,9 +43,12 @@ class TaskArgs(BaseModel):
         default=None,
         description="Optional short summary of the task for retained-agent status.",
     )
-    agent: str = Field(
+    agent_type: str = Field(
         default="worker",
-        description="The type of specialized subagent to use for this task",
+        description=(
+            "Agent type: profile name for a new agent instance (default worker). "
+            "To continue a retained instance, use agent_id instead, with background: true."
+        ),
     )
     background: bool = Field(
         default=True,
@@ -56,7 +60,14 @@ class TaskArgs(BaseModel):
     )
     agent_id: str | None = Field(
         default=None,
-        description="Existing agent handle to reuse for this task. If None, a new agent is created.",
+        description=(
+            "Retained agent instance handle to continue with background: true. "
+            "If omitted, create a new instance using the agent_type profile name."
+        ),
+    )
+    replace_run: bool = Field(
+        default=False,
+        description="Stop busy background work before reusing agent_id in the same conversation.",
     )
     config: LaunchConfig | None = Field(
         default=None,
@@ -90,10 +101,26 @@ class TaskArgs(BaseModel):
             return {key: item for key, item in value.items() if key != "config"}
         return {**value, "config": config}
 
+    @model_validator(mode="after")
+    def _reject_instance_handle_as_type(self) -> TaskArgs:
+        if re.fullmatch(r"agent-\d+", self.agent_type):
+            raise ValueError(
+                "agent_type takes a profile name; to continue an existing agent "
+                "instance, pass its handle as agent_id (with background: true)"
+            )
+        return self
+
     @field_validator("task_summary")
     @classmethod
     def _normalize_task_summary(cls, value: str | None) -> str | None:
         return normalize_task_summary(value)
+
+
+class LaunchOutcome(enum.StrEnum):
+    LAUNCHED = "launched"
+    ALREADY_STOPPING = "already_stopping"
+    ALREADY_FINISHING = "already_finishing"
+    REJECTED_RESERVATION = "rejected_reservation"
 
 
 class TaskResult(BaseModel):
@@ -102,6 +129,9 @@ class TaskResult(BaseModel):
     response: str = Field(description="The accumulated response from the subagent")
     turns_used: int = Field(description="Number of turns the subagent used")
     completed: bool = Field(description="Whether the task completed normally")
+    launch_outcome: LaunchOutcome | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     status: Literal["launched"] | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -115,10 +145,48 @@ class TaskResult(BaseModel):
         default=None,
         description="Unique run identifier for this invocation. Populated for background launches; None for foreground.",
     )
+    stop_reason: RunStopReason | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     metadata: dict[str, Any] | None = Field(
         default=None,
         description="Additive completion metadata, including provider failover visibility.",
     )
+
+
+class RunStopReason(enum.StrEnum):
+    """Structured run outcome; values match the public app-server contract."""
+
+    USER_CANCELLED = "user_cancelled"
+    ORCHESTRATOR_CANCELLED = "orchestrator_cancelled"
+    RETASKED = "retasked"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    BUDGET_UNVERIFIABLE = "budget_unverifiable"
+    ERROR = "error"
+
+
+class CancelOutcome(enum.StrEnum):
+    STOP_REQUESTED = "stop_requested"
+    ALREADY_STOPPING = "already_stopping"
+    ALREADY_FINISHING = "already_finishing"
+    NOT_RUNNING = "not_running"
+    UNKNOWN_RUN = "unknown_run"
+    FORBIDDEN = "forbidden"
+
+
+class CancelResult(BaseModel):
+    """Stop-request disposition, not a claim that execution has stopped.
+
+    run_id is the resolved target (or the explicit unknown target), and may be
+    None when there is no run identity. stop_reason is the winning requested
+    reason, or the retained terminal reason; refusals need not have a reason.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    outcome: CancelOutcome
+    run_id: str | None = None
+    stop_reason: RunStopReason | None = None
 
 
 class RunStatus(enum.StrEnum):
@@ -160,6 +228,8 @@ class AgentSummary:
     initial_task_summary: str | None = None
     current_task_summary: str | None = None
     idle_seconds: float | None = None
+    run_elapsed_seconds: float | None = None
+    latest_run_id: str | None = None
     ttl_remaining_seconds: float | None = None
     effective_model: str | None = None
     """Configured model alias committed for this retained agent."""
@@ -173,6 +243,15 @@ class AgentSummary:
     """Whether the retained current-run result has expired."""
     last_run_status: RunStatus | None = None
     """Terminal outcome of the most recently finalized run, if any."""
+    context_tokens: int | None = None
+    context_window: int | None = None
+    compacting: bool = False
+    stop_reason: RunStopReason | None = None
+    """Current/latest run's structured stop reason, retained after finalization."""
+
+
+class EmptySubagentResponseError(ValueError):
+    """A completed subagent run produced no substantive response."""
 
 
 class SubagentManagementError(ValueError):
@@ -271,6 +350,17 @@ class SubagentManagementPort(Protocol):
         """
         ...
 
+    async def cancel_run(
+        self,
+        agent_id: str,
+        run_id: str | None = None,
+        *,
+        reason: RunStopReason,
+        requester_session_id: str,
+    ) -> CancelResult:
+        """Request a run-pinned stop without releasing identity or wait leases."""
+        ...
+
     async def release_agent(self, agent_id: str) -> ReleaseAgentOutcome:
         """Close and remove a retained agent or evicted tombstone.
 
@@ -320,11 +410,13 @@ class SubagentRunAccumulator:
         self._response.append(f"\n[Subagent error: {message}]")
 
     def build_result(self, *, turns_used: int, completed: bool = True) -> TaskResult:
-        return TaskResult(
-            response="".join(self._response),
-            turns_used=turns_used,
-            completed=self._completed and completed,
-        )
+        completed = self._completed and completed
+        response = "".join(self._response)
+        if completed and not response.strip():
+            raise EmptySubagentResponseError(
+                "Completed subagent produced an empty response"
+            )
+        return TaskResult(response=response, turns_used=turns_used, completed=completed)
 
 
 def prepare_subagent_prompt(task: str, ctx: InvokeContext) -> str:

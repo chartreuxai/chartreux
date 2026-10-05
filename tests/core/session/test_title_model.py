@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -116,8 +117,13 @@ class TestGenerateSessionTitle:
     @pytest.mark.asyncio
     async def test_returns_none_for_empty_transcript(self) -> None:
         config = build_test_vibe_config()
+        sink = AsyncMock()
 
-        assert await generate_session_title([], config=config) is None
+        assert (
+            await generate_session_title([], config=config, accounting_sink=sink)
+            is None
+        )
+        sink.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_returns_cleaned_title(self, monkeypatch) -> None:
@@ -149,6 +155,9 @@ class TestGenerateSessionTitle:
         )
 
         assert captured["config"] is config
+        assert captured["purpose"] == "title"
+        assert captured["accounting_sink"] is None
+        assert captured["usage_attribution"] is None
         assert captured["retry_budget_seconds"] > 0
         assert captured["max_tokens"] > 0
         assert "do a thing" in captured["user_content"]

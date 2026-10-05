@@ -113,7 +113,8 @@ class ReadFile(
             config_permission=self.config.permission,
             sensitive_patterns=self.config.sensitive_patterns,
             workspace=self.workspace,
-            scratchpad_dir=self.scratchpad_dir,
+            scratchpad_roots=self.scratchpad_roots,
+            instruction_read_files=self.instruction_read_files,
         )
 
     def _find_undiscovered_agents_md(self, file_path: Path) -> list[tuple[Path, str]]:

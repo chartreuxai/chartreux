@@ -24,6 +24,7 @@ from chartreux.app_server.protocol import (
     TurnSteerParams,
 )
 from chartreux.core.agent_loop import CompactionFailedError, ImagesNotSupportedError
+from chartreux.core.agent_loop.errors import EmptyLLMResponseError
 from chartreux.core.errors import (
     ContextTooLongError,
     RateLimitError,
@@ -157,6 +158,8 @@ def public_error(exc: Exception) -> PublicError:  # noqa: PLR0912
             details["reason"] = exc.reason
         case IncompleteStreamError():
             code = TurnErrorCode.INCOMPLETE_STREAM
+        case EmptyLLMResponseError():
+            code = TurnErrorCode.EMPTY_LLM_RESPONSE
         case AllDeploymentsUnavailableError():
             code = TurnErrorCode.ALL_DEPLOYMENTS_UNAVAILABLE
             details["base_model"] = exc.base_model

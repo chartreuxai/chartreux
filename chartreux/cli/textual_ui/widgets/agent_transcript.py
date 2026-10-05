@@ -40,12 +40,20 @@ from chartreux.app_server.protocol import (
     AgentTranscriptToolStatus,
 )
 from chartreux.cli.textual_ui.widgets.inline_notice import InlineNotice
-from chartreux.cli.textual_ui.widgets.messages import StreamingMessageBase
+from chartreux.cli.textual_ui.widgets.messages import (
+    AssistantMessage,
+    StreamingMessageBase,
+    UserMessage,
+)
 from chartreux.cli.textual_ui.widgets.tool_grouping import (
     ToolGroupExpansionState,
     effect_state_is_terminal,
 )
-from chartreux.cli.textual_ui.widgets.tools import ToolGroup
+from chartreux.cli.textual_ui.widgets.tools import (
+    ToolCallMessage,
+    ToolGroup,
+    ToolResultMessage,
+)
 from chartreux.cli.textual_ui.windowing.history import build_history_widgets
 from chartreux.observability.logging import get_effective_log_level, logger
 from chartreux.ui.chrome_glyphs import chrome_glyph
@@ -168,6 +176,7 @@ class AgentTranscriptViewer(Vertical):
         metadata: str = "",
         live: bool = False,
         page_size: int = DEFAULT_TRANSCRIPT_PAGE_SIZE,
+        show_message_timestamps: bool = True,
     ) -> None:
         super().__init__(id="agent-transcript-viewer")
         self._source = source
@@ -183,6 +192,7 @@ class AgentTranscriptViewer(Vertical):
         self._scroll_revision = 0
         self._feedback: tuple[str, str] | None = None
         self._page_size = page_size
+        self.show_message_timestamps = show_message_timestamps
         self._content: Vertical | None = None
         self._status_widget: Static | None = None
         self._content_scroll: VerticalScroll | None = None
@@ -512,6 +522,50 @@ class AgentTranscriptViewer(Vertical):
                 len(response.entries or []),
             )
 
+    def set_show_message_timestamps(self, show: bool) -> None:
+        self.show_message_timestamps = show
+        for widget in self.query(
+            "UserMessage, AssistantMessage, ToolGroup, ToolCallMessage, ToolResultMessage"
+        ):
+            if isinstance(
+                widget,
+                UserMessage
+                | AssistantMessage
+                | ToolGroup
+                | ToolCallMessage
+                | ToolResultMessage,
+            ):
+                widget.set_show_message_timestamps(show)
+
+    def _reconcile_timing_only(
+        self, previous: AgentTranscriptEntry, entry: AgentTranscriptEntry
+    ) -> bool:
+        old = previous.model_dump(exclude={"digest", "updated_at", "turn_duration_ms"})
+        new = entry.model_dump(exclude={"digest", "updated_at", "turn_duration_ms"})
+        for payload in (old, new):
+            if isinstance(payload.get("state"), dict):
+                payload["state"].pop("duration_ms", None)
+        if old != new:
+            return False
+        unit = self._entry_units.get(entry.entry_id)
+        if unit is not None:
+            projected = self._history_entry(entry)
+            unit.entries[entry.entry_id] = projected
+            for widget in unit.entry_widgets.get(entry.entry_id, []):
+                if not widget.is_mounted or widget.parent is None:
+                    continue
+                if isinstance(widget, AssistantMessage):
+                    widget.reconcile_timing(entry.turn_duration_ms)
+                elif isinstance(widget, ToolResultMessage) and isinstance(
+                    projected, PublicEffectEntry
+                ):
+                    widget.update_timing(projected)
+                elif isinstance(widget, ToolCallMessage) and isinstance(
+                    projected, PublicEffectEntry
+                ):
+                    widget.update_entry(projected)
+        return True
+
     def _is_current(self, epoch: int) -> bool:
         return (
             not self._viewer_closed and self.is_mounted and epoch == self._request_epoch
@@ -592,7 +646,7 @@ class AgentTranscriptViewer(Vertical):
                     and entry.display_text
                 ):
                     timeline_entries.append(entry)
-                else:
+                elif not self._reconcile_timing_only(previous, entry):
                     changed.append(entry)
 
         for entry in changed:
@@ -744,12 +798,20 @@ class AgentTranscriptViewer(Vertical):
                     )
                     for name in names
                 )
-                return PublicMessageEntry(role="user", content=content, **common)
+                return PublicMessageEntry(
+                    role="user", content=content, posted_at=entry.posted_at, **common
+                )
             case AgentTranscriptEntryKind.ASSISTANT_TEXT:
                 content: list[ContentBlock] = [
                     TextContentBlock(text=_entry_display_text(entry))
                 ]
-                return PublicMessageEntry(role="assistant", content=content, **common)
+                return PublicMessageEntry(
+                    role="assistant",
+                    content=content,
+                    posted_at=entry.posted_at,
+                    turn_duration_ms=entry.turn_duration_ms,
+                    **common,
+                )
             case AgentTranscriptEntryKind.REASONING:
                 return PublicReasoningEntry(text=_entry_display_text(entry), **common)
             case (
@@ -805,7 +867,7 @@ class AgentTranscriptViewer(Vertical):
                     state = FailedEffectState(
                         error=PublicError(message=interrupted_message),
                         output_text="",
-                        duration_ms=0,
+                        duration_ms=None,
                         display=EffectResultDisplay(
                             success=False,
                             verb="Interrupted",
@@ -861,6 +923,7 @@ class AgentTranscriptViewer(Vertical):
             history_widget_indices=widget_indices,
             tools_collapsed=tools_collapsed,
             expansion_state=self._expansion_state,
+            show_message_timestamps=self.show_message_timestamps,
         )
         return rendered_entries, widgets, history_by_index, widget_indices
 

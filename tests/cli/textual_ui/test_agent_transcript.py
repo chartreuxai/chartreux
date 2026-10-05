@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 import hashlib
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -116,6 +117,72 @@ def _available(
         oldest_cursor=cursor,
         has_more=has_more,
     )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [AgentTranscriptEntryKind.USER_TEXT, AgentTranscriptEntryKind.ASSISTANT_TEXT],
+)
+@pytest.mark.parametrize("show", [True, False])
+@pytest.mark.parametrize("stamped", [True, False])
+@pytest.mark.asyncio
+async def test_child_timestamp_matches_main_history(
+    kind, show: bool, stamped: bool
+) -> None:
+    posted = datetime(2026, 7, 12, 14, 32, tzinfo=UTC) if stamped else None
+    entry = _entry("timestamp", "hello", kind=kind).model_copy(
+        update={"posted_at": posted}
+    )
+    viewer = AgentTranscriptViewer(
+        _FakeSource(), "agent-1", show_message_timestamps=show
+    )
+    projected = viewer._history_entry(entry)
+    assert isinstance(projected, PublicMessageEntry)
+    assert projected.posted_at == posted
+    app = App()
+    async with app.run_test():
+        await app.mount(viewer)
+        _, widgets, _, _ = viewer._build_history_batch([entry])
+        widget = widgets[0]
+        assert isinstance(widget, UserMessage | AssistantMessage)
+        assert widget.header.posted_at == posted
+        assert widget.header.show_message_timestamps == show
+        assert widget.header.timestamp_for_width(
+            80, now=datetime(2026, 7, 12, tzinfo=UTC)
+        ) == (
+            posted.astimezone().strftime("%H:%M") if show and posted is not None else ""
+        )
+        await viewer.dispose()
+
+
+@pytest.mark.asyncio
+async def test_child_timing_patch_keeps_widget_and_propagates_preference() -> None:
+    entry = _entry("timed", "hello", kind=AgentTranscriptEntryKind.ASSISTANT_TEXT)
+    source = _FakeSource()
+    viewer = AgentTranscriptViewer(source, "agent-1")
+    app = App()
+    async with app.run_test() as pilot:
+        await app.mount(viewer)
+        await viewer._apply_response(
+            _available(entry), epoch=viewer._request_epoch, replace=True, before=None
+        )
+        await pilot.pause()
+        message = viewer.query_one(AssistantMessage)
+        updated = entry.model_copy(
+            update={"turn_duration_ms": 7389000, "digest": "new"}
+        )
+        await viewer._apply_response(
+            _available(updated), epoch=viewer._request_epoch, replace=False, before=None
+        )
+        assert viewer.query_one(AssistantMessage) is message
+        assert message.header.turn_duration_ms == 7389000
+        viewer.set_show_message_timestamps(False)
+        assert not message.header.display
+        viewer.set_show_message_timestamps(True)
+        await pilot.pause()
+        assert message.header.display
+        assert message.header.metadata_for_width(80) == "2h03m09s"
+        await viewer.dispose()
 
 
 def test_adapter_preserves_truncation_notice_for_text_and_effect_entries() -> None:

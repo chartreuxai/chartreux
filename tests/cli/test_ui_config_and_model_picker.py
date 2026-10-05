@@ -15,8 +15,8 @@ from chartreux.app_server.protocol import (
     ConfigLayerValueWire,
 )
 from chartreux.cli.textual_ui.app import BottomApp
-from chartreux.cli.textual_ui.widgets.context_progress import ContextProgress
 from chartreux.cli.textual_ui.widgets.model_picker import ModelPickerApp
+from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLine
 from chartreux.cli.textual_ui.widgets.thinking_picker import ThinkingPickerApp
 from chartreux.core.config import ModelConfig
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
@@ -466,8 +466,8 @@ async def test_model_picker_select_default_persists_empty_alias() -> None:
 async def test_model_switch_updates_context_window_status_bar() -> None:
     """Switching models refreshes the bottom-bar context window without a restart.
 
-    The bar's max_tokens is the active model's auto_compact_threshold; a switch
-    to a model with a different threshold must be reflected immediately.
+    The context segment's denominator is the active model's auto_compact_threshold;
+    a switch to a different threshold must be reflected immediately.
     """
     models = [
         ModelConfig(
@@ -487,7 +487,7 @@ async def test_model_switch_updates_context_window_status_bar() -> None:
     app = build_test_chartreux_app(config=config)
     async with app.run_test() as pilot:
         await pilot.pause(0.1)
-        assert app.query_one(ContextProgress).tokens.max_tokens == 200_000
+        assert app.query_one(SessionStatusLine).state.auto_compact_threshold == 200_000
 
         await _open_model_picker(pilot, app)
         # Highlight starts on Default; beta follows the shipped model and alpha.
@@ -495,7 +495,7 @@ async def test_model_switch_updates_context_window_status_bar() -> None:
         await pilot.press("enter")
         await wait_until(pilot, lambda: app.config.active_model.alias == "beta")
 
-        assert app.query_one(ContextProgress).tokens.max_tokens == 800_000
+        assert app.query_one(SessionStatusLine).state.auto_compact_threshold == 800_000
 
 
 # --- /thinking command ---

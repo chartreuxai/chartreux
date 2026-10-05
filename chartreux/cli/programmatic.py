@@ -104,8 +104,10 @@ def run_programmatic(
     output = ProgrammaticOutput(output_format)
 
     async def run() -> str | None:
-        session = await LocalHarness(harness_options).start()
+        harness = LocalHarness(harness_options)
+        session: AppServerSession | None = None
         try:
+            session = await harness.start()
             await session.resources.runtime.wait_until_ready()
             await _warn_if_workspace_untrusted(session)
             output.start(session.history)
@@ -123,7 +125,11 @@ def run_programmatic(
                 )
             return output.finalize(session.history)
         finally:
-            await session.close()
+            try:
+                if session is not None:
+                    await session.close()
+            finally:
+                await harness.close()
 
     return asyncio.run(run())
 

@@ -45,6 +45,7 @@ class SnapshotTestAppWithResumedSession(BaseSnapshotTestApp):
         assistant_msg = LLMMessage(
             role=Role.assistant,
             content="I'm doing well, thank you! Let me read that file for you.",
+            turn_duration=252,
             tool_calls=[
                 ToolCall(
                     id="tool_call_1",
@@ -62,6 +63,7 @@ class SnapshotTestAppWithResumedSession(BaseSnapshotTestApp):
             name="read",
             tool_call_id="tool_call_1",
             tool_result=PersistedToolResult(
+                duration=3.2,
                 output=result.model_dump(mode="json"),
                 presentation=presentation.get_result_presentation(result_event),
             ),

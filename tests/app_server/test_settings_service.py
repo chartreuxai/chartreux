@@ -30,7 +30,8 @@ def snapshot(
         user_revision=revision,
         backing_settings={
             path: SettingDescriptorWire.model_validate(asdict(EDITABLE_BY_PATH[path]))
-            for path in ("enabled_tools", "disabled_tools")
+            for path in EDITABLE_BY_PATH
+            if path.startswith(("enabled_", "disabled_", "status_line."))
         },
         catalog=[
             SettingDescriptorWire.model_validate(asdict(item))
@@ -245,3 +246,50 @@ async def test_inventory_batch_writes_both_backing_leaves_in_one_revision() -> N
         await service.save({"session_logging.enabled": False}, "old")
     ).error == "view_only"
     config.write.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "segments",
+    [
+        [],
+        ["directory"],
+        ["context"],
+        ["directory", "context", "context"],
+        ["directory", "context", "unknown"],
+    ],
+)
+async def test_status_line_save_rejects_invalid_segments_before_write(
+    segments: list[str],
+) -> None:
+    config = AsyncMock()
+    config.read_settings.return_value = snapshot()
+    service = SettingsService(cast(ConfigResource, config))
+    with pytest.raises(ValueError):
+        await service.save({"status_line.segments": list(segments)}, "one")
+    config.write.assert_not_awaited()
+    with pytest.raises(ValueError, match="Unknown settings leaf"):
+        await service.save({"status_line": ["directory", "context"]}, "one")
+    config.write.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_status_line_settings_service_writes_all_keys() -> None:
+    from pydantic import JsonValue
+
+    config = AsyncMock()
+    config.read_settings.return_value = snapshot()
+    config.write.return_value.persistence = "saved"
+    config.write.return_value.application = "applied"
+    values: dict[str, JsonValue] = {
+        "status_line.segments": ["directory", "context", "spend-month"],
+        "status_line.directory_style": "path",
+        "status_line.context_style": "tokens",
+        "status_line.separator": "space",
+        "show_message_timestamps": False,
+    }
+    outcome = await SettingsService(cast(ConfigResource, config)).save(values, "one")
+    assert outcome.persistence == "saved"
+    assert {op.path: op.value for op in config.write.await_args.args[0]} == {
+        "/" + key.replace(".", "/"): value for key, value in values.items()
+    }

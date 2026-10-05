@@ -496,7 +496,9 @@ class SessionBackendImpl:
             event = parse_server_event(notification)
             if event is None:
                 try:
-                    event = self._projection.consume(notification)
+                    event = self._projection.consume(
+                        notification, dedupe_history_additions=False
+                    )
                 except UnknownNotificationError:
                     return False
                 except EventSequenceError:

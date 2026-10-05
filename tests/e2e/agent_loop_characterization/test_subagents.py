@@ -32,7 +32,7 @@ def _worker_subagent_factory(
             call_id=SUBAGENT_TOOL_CALL_ID,
             tool_name="task",
             arguments={
-                "agent": "worker",
+                "agent_type": "worker",
                 "background": False,
                 "task": f"Find the marker {SUBAGENT_MARKER}.",
             },

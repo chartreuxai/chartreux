@@ -28,22 +28,92 @@ completing setup. In standalone Settings, Mistral appears once; `auto` is still
 accepted as a Mistral config alias. Follow each screen's labeled Save and
 forward actions; you do not need to backtrack to advance.
 
-On Provider Settings list and action screens, Up and Down move through visible
-choices, Enter edits or activates the selected control, and Tab is optional.
-Escape backs out one local level. In the Web Search editor, arrows move within
-the current provider choice or text field, Space selects a provider, Enter
-accepts the current draft, and Tab moves focus between controls. Escape offers
-a Keep editing/Discard edits choice when a draft needs one. Read each screen's help because
-some settings save immediately while provider and web-search forms use explicit
-Save actions.
+On Provider Settings browser screens, Tab/Shift+Tab moves between visible focus
+groups; arrows move within the current group and stop at its boundaries. Enter
+edits or activates the selected control. Separate **Details** click targets open
+inspection without activating the row's primary action. Text fields retain their
+normal editing keys. Escape backs out one local level and restores its opener.
+In the Web Search editor, arrows move within the current provider choice or text
+field, Space selects a provider, Enter accepts the current draft, and Tab moves
+focus between controls. Escape offers a Keep editing/Discard edits choice when
+a draft needs one. Read each screen's help because some settings save immediately
+while provider and web-search forms use explicit Save actions.
+
+## Usage browser
+
+Use `/usage` to open a read-only browser of recorded calls and USD cost estimates.
+It defaults to **Day** and **All projects**. Choose **Week** or **Month**, or
+**Current project**, to fetch another snapshot. Calendar windows use the system's
+local timezone, with weeks starting Monday. Current project is unavailable when
+there is **No attached project**; `F1` explains this restriction.
+
+Model rows are grouped by model, provider, and wire name. The final **TOTAL** row
+shows the selected window's authoritative requests, tokens, and known cost.
+Large numbers use downward-truncated K/M/B suffixes; `+` marks a known lower
+bound and `Unknown` means no cost could be priced. Costs are catalog-priced
+estimates, not provider invoices; see [usage storage](sessions-workspaces.md#usage-storage)
+and [cost notation](../reference/configuration.md#status-line).
+
+Press `d` or Enter on a row to open **Details** in a wrapping, scrollable pane
+below the table. Model Details shows the complete deployment identity and exact
+values; TOTAL Details includes the component breakdown. Details contains only
+accounting content, including completeness explanations. The table heading shows
+USD; the window and scope selectors identify the displayed period and scope.
+Details is available even while loading, after an error, or in an empty window.
+There is no resting preview.
+
+Tab/Shift+Tab cycles focus groups: period → scope → table → Details (when open).
+Left/Right moves within selector groups; Up/Down or `j`/`k` moves through table
+rows or scrolls Details. Arrows stop at group boundaries. Enter/Space activates
+selectors; moving focus alone does not fetch a snapshot. In Details, Shift+Tab
+returns to the table without hiding the pane; selecting another row updates its
+content.
+
+Live updates refresh automatically, preserving the selected row and table scroll
+position. While Details is open, the displayed snapshot is frozen; closing the
+pane silently catches up with pending updates. Use `r` or `Ctrl+R` to force a
+refresh, including while Details is open. Use `d` to show or hide Details and
+`F1` for local help. Escape hides Details or help, then closes the browser. The
+final shortcut row also provides clickable Refresh, Details, Help, and Close
+actions, with Back while Details is open. There is no Apply or Cancel action.
+
+A bounded status line appears only for loading, failed reads, or unavailable
+usage. A failed read retains the previous snapshot; `r` retries. An empty ready
+window shows zero totals without a status message. The browser becomes full-screen
+below 84 columns or 28 rows. Opening it while a turn runs does not make a model
+call, interrupt work, or change queued input.
 
 ## Input and queueing
 
-A prompt submitted while a turn is running joins the queued follow-up input. Queued prompts are combined into the next follow-up turn rather than executed as separate FIFO turns.
+A prompt submitted while a turn is running normally joins the queued follow-up
+input. Queued prompts are combined into the next follow-up turn rather than
+executed as separate FIFO turns.
+
+When the main agent is **only waiting on subagents**, submitting a message instead
+steers the current turn immediately. Chartreux cancels the outstanding waits,
+not the subagents, keeps the same turn, and sends the message to the model without
+waiting for those runs to finish. The server checks that the turn is still
+waiting-only; if it has moved on, confirmed rejection falls back to queueing.
+Delivery receipts prevent duplicate injection on retries. If recovery cannot
+prove whether a message was delivered, the UI reports an uncertain outcome
+rather than silently queueing or resending a possible duplicate.
 
 With an empty input, use `Ctrl+C` to remove the newest queued prompt. With nonempty input, `Ctrl+C` clears the input instead. `Escape` interrupts the active turn and pauses the remaining queue; press Enter on an empty input to resume it. To steer the active turn immediately, press `Ctrl+Enter` or `Super+Enter` with an empty input; this sends queued prompts into that turn unless queue selection is active.
 
 When queued prompts exist, press Up from input history to enter queue selection. Up and Down move between prompts; Enter opens the selected prompt for editing; Backspace or Delete removes it; and Escape leaves selection. While editing, Enter saves the change and Escape discards it.
+
+## Exit confirmation
+
+When an exit confirmation appears, **Cancel** has default focus. Enter therefore
+keeps Chartreux open until you explicitly select **Exit** with Tab or the arrow
+keys, or click it. Escape cancels the confirmation without interrupting work.
+
+## Debug console
+
+Open the console with `/debug` or `Ctrl+\`. While it has focus, use Up/Down or
+`j`/`k` to select a logical log row and `c` to copy it. The footer also has
+clickable **Copy selected** and **Close** actions. Escape closes the focused
+console; it does not also interrupt the turn.
 
 ## Copying and selection
 

@@ -59,50 +59,6 @@ TextArea > .text-area--cursor {
     color: $error;
 }
 
-#agent-bar {
-    width: 100%;
-    height: 1;
-    max-height: 10;
-    color: $text-muted;
-}
-
-#agent-bar-title, #agent-bar-detail, #agent-bar-footer {
-    width: 100%;
-    height: 1;
-    text-overflow: ellipsis;
-}
-
-#agent-bar.-expanded #agent-bar-title {
-    text-style: bold;
-    color: $foreground;
-}
-
-#agent-bar-rows, #agent-bar-full-details {
-    width: 100%;
-    height: 1fr;
-    overflow-y: auto;
-}
-
-#agent-bar-full-content {
-    width: 100%;
-    height: auto;
-    text-wrap: wrap;
-}
-
-#agent-bar-content {
-    width: 100%;
-    height: auto;
-}
-
-#agent-bar:focus {
-    color: $foreground;
-}
-
-#agent-bar.-expanded {
-    height: auto;
-    max-height: 10;
-}
-
 #bottom-app-container,
 #input-container {
     height: auto;
@@ -151,28 +107,6 @@ TextArea > .text-area--cursor {
     padding: 0;
     align: left middle;
     layout: horizontal;
-}
-
-#bottom-bar PathDisplay {
-    height: 1;
-    text-overflow: ellipsis;
-    overflow-x: hidden;
-}
-
-#spacer {
-    width: 1fr;
-    height: auto;
-    background: transparent;
-}
-
-#process-title {
-    width: auto;
-    height: auto;
-    background: transparent;
-    padding: 0;
-    margin: 0 0 0 1;
-    color: $text-muted;
-
 }
 
 #messages {
@@ -420,6 +354,18 @@ Markdown {
 .user-message-wrapper {
     width: 100%;
     height: auto;
+    padding-left: 2;
+    background: $accent 8%;
+}
+
+.user-message.plain-user-accent {
+    .user-message-wrapper {
+        background: transparent;
+    }
+    .user-message-prompt {
+        color: $foreground;
+        text-style: none;
+    }
 }
 
 .user-message-container {
@@ -435,7 +381,7 @@ Markdown {
 .user-message-attachments {
     width: 100%;
     height: auto;
-    padding: 0 2 0 2;
+    padding: 0 2 0 0;
     color: $text-muted;
 
 }
@@ -456,10 +402,10 @@ Markdown {
 }
 
 .user-message-prompt {
-    width: auto;
-    height: auto;
-    color: $foreground;
-    text-style: bold;
+    width: 2;
+    height: 1;
+    color: $accent;
+    text-style: none;
 }
 
 .user-message-content {
@@ -925,6 +871,25 @@ StatusMessage {
     text-opacity: 100%;
 }
 
+/* Timing rows reserve trailing metadata before eliding target/detail text. */
+.tool-call-header.has-timing .status-indicator-text,
+.collapsible-toggle.header.has-timing .status-indicator-text {
+    width: 1fr;
+    min-width: 0;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+.collapsible-toggle.header.has-timing.expanded .status-indicator-text {
+    text-wrap: wrap;
+    text-overflow: fold;
+}
+
+.tool-group.timing-enabled > .tool-group-body > .tool-group-content {
+    border-left: none;
+    padding-left: 0;
+}
+
 /* Focus styling wins over folded/resting color rules. */
 .collapsible-toggle:focus .status-indicator-text,
 .collapsible-toggle:focus .collapsible-header-verb,
@@ -1236,7 +1201,32 @@ StatusMessage {
     text-style: bold;
 }
 
+#mcp-actions {
+    height: 1;
+    width: 100%;
+}
+
+#mcp-actions Button {
+    height: 1;
+    min-width: 0;
+    margin-right: 2;
+    border: none;
+}
+
+#mcp-app {
+    height: 50vh;
+}
+
+#mcp-content {
+    height: 1fr;
+}
+
+#mcp-options {
+    height: 1fr;
+}
+
 #mcp-search-row {
+    height: auto;
     width: 100%;
     background: transparent;
     padding-left: 1;
@@ -1486,16 +1476,6 @@ ExpandingBorder {
     width: auto;
     height: 100%;
     content-align: left bottom;
-}
-
-PathDisplay,
-ContextProgress {
-    width: auto;
-    height: auto;
-    background: transparent;
-    padding: 0;
-    margin: 0;
-    color: $text-muted;
 }
 
 NarratorStatus {
@@ -1839,6 +1819,26 @@ NarratorStatus {
     color: $text-muted;
     margin-bottom: 1;
 
+}
+
+#loglevelpicker-scopes {
+    height: 1;
+    width: 100%;
+}
+
+#loglevelpicker-scopes Button, #loglevelpicker-apply {
+    width: auto;
+    min-width: 0;
+    height: 1;
+    background: $surface;
+    border: none;
+    color: $foreground;
+    padding: 0 1;
+    margin-right: 1;
+}
+
+#loglevelpicker-scopes Button:focus, #loglevelpicker-apply:focus {
+    text-style: bold reverse;
 }
 
 #loglevelpicker-options {

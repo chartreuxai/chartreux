@@ -12,6 +12,7 @@ from textual.widget import Widget
 from chartreux.app_server.models import (
     PublicEffectEntry,
     PublicHistoryEntry,
+    PublicMessageEntry,
     PublicReasoningEntry,
 )
 from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
@@ -20,6 +21,11 @@ from chartreux.cli.textual_ui.widgets.tool_grouping import (
     ToolGroupExpansionState,
     ToolGroupKey,
     entry_keeps_tool_group,
+)
+from chartreux.cli.textual_ui.widgets.tools import (
+    ToolCallMessage,
+    ToolGroup,
+    ToolResultMessage,
 )
 from chartreux.cli.textual_ui.windowing.history import (
     _build_history_widgets_raw,
@@ -446,6 +452,60 @@ class TranscriptWindow:
             if self.entry_expansion_state
             else True
         )
+
+    def update_entry(self, entry: PublicHistoryEntry) -> None:
+        """Refresh retained data even when its placement is currently evicted."""
+        unit_id = self._entry_to_unit.get(entry.id)
+        if unit_id is None:
+            return
+        unit = self.units[unit_id]
+        offset = unit.member_entry_ids.index(entry.id)
+        if unit.entry_snapshots[offset] != entry:
+            unit.entries[offset] = entry
+            unit.entry_snapshots[offset] = entry.model_copy(deep=True)
+            self._invalidate(unit)
+
+    def admit_reused_root(
+        self, entry: PublicMessageEntry, root: Widget, *, index: int
+    ) -> bool:
+        """Extend the last placement when a retry continues its assistant root."""
+        if not self.unit_ids or index != self.admitted_end_index:
+            return False
+        unit = self.units[self.unit_ids[-1]]
+        if unit.group_key is not None or root not in unit.mounted_roots:
+            return False
+        self._check_batch([entry.id], index)
+        self._record_index(entry.id, index)
+        unit.member_entry_ids.append(entry.id)
+        unit.entries.append(entry)
+        unit.entry_snapshots.append(entry.model_copy(deep=True))
+        self._entry_to_unit[entry.id] = unit.id
+        self._invalidate(unit)
+        return True
+
+    def mounted_entry_widgets(self, entry_id: str) -> list[Widget]:
+        """Resolve retained DOM via unit membership, never revive evicted/removed rows."""
+        unit_id = self._entry_to_unit.get(entry_id)
+        if unit_id is None:
+            return []
+        unit = self.units[unit_id]
+        if unit.placeholders:
+            return []
+        roots = [
+            root
+            for root in unit.mounted_roots
+            if root.is_mounted and root.parent is not None
+        ]
+        if unit.group_key is None:
+            return roots
+        return [
+            child
+            for root in roots
+            if isinstance(root, ToolGroup)
+            for child in root.content_container.children
+            if (isinstance(child, ToolCallMessage) and child.tool_call_id == entry_id)
+            or (isinstance(child, ToolResultMessage) and child._entry.id == entry_id)
+        ]
 
     def register_mounted(self, unit_id: str, roots: Sequence[Widget]) -> None:
         """Register mounted roots; rejects units still owning placeholders.
@@ -1051,8 +1111,29 @@ class TranscriptWindow:
         self, unit_id: str, history_widget_indices: WeakKeyDictionary[Widget, int]
     ) -> list[Widget]:
         unit = self.units[unit_id]
+        entries = unit.entries
+        if (
+            unit.group_key is None
+            and len(entries) > 1
+            and all(
+                isinstance(entry, PublicMessageEntry) and entry.role == "assistant"
+                for entry in entries
+            )
+        ):
+            messages = [
+                entry for entry in entries if isinstance(entry, PublicMessageEntry)
+            ]
+            entries = [
+                messages[-1].model_copy(
+                    update={
+                        "content": [
+                            part for entry in messages for part in entry.content
+                        ]
+                    }
+                )
+            ]
         return _build_history_widgets_raw(
-            unit.entries,
+            entries,
             start_index=unit.start_index,
             history_widget_indices=history_widget_indices,
             tools_collapsed=self.tools_collapsed,

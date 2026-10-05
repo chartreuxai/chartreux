@@ -107,9 +107,11 @@ class WriteFile(
             config_permission=self.config.permission,
             sensitive_patterns=self.config.sensitive_patterns,
             workspace=self.workspace,
-            scratchpad_dir=self.scratchpad_dir,
+            scratchpad_dir=self.owned_scratchpad_dir,
+            scratchpad_roots=self.scratchpad_roots,
             plan_file_write_scope=self.plan_file_write_scope_getter(),
             inherited_plan_write_scopes=self.inherited_plan_write_scopes,
+            instruction_read_files=self.instruction_read_files,
         )
 
     @final

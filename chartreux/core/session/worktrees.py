@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from chartreux.core.config import ModelConfig
 from chartreux.core.git.worktree import (
     ManagedWorktree,
     PreparedWorktree,
@@ -33,6 +34,7 @@ from chartreux.core.git.worktree.record import (
     OwnershipToken,
     release_holder,
 )
+from chartreux.core.usage import AccountingSink, UsageAttribution
 from chartreux.observability.logging import logger
 
 
@@ -146,7 +148,14 @@ class SessionWorktrees:
         )
 
     async def resolve_for_start(
-        self, request: WorktreeRequest, base_cwd: Path
+        self,
+        request: WorktreeRequest,
+        base_cwd: Path,
+        *,
+        accounting_sink: AccountingSink | None = None,
+        usage_attribution: UsageAttribution | None = None,
+        usage_attribution_factory: Callable[[ModelConfig], UsageAttribution]
+        | None = None,
     ) -> ResolvedWorktree:
         """Resolve off the event loop, cleaning up if the start is cancelled.
 
@@ -155,7 +164,13 @@ class SessionWorktrees:
         shield lets the creation finish so there is something to clean up, and
         the caller then cleans it up before re-raising.
         """
-        suggested_name = await self._suggest_name(request, base_cwd)
+        suggested_name = await self._suggest_name(
+            request,
+            base_cwd,
+            accounting_sink=accounting_sink,
+            usage_attribution=usage_attribution,
+            usage_attribution_factory=usage_attribution_factory,
+        )
         resolve = asyncio.create_task(
             asyncio.to_thread(self.resolve, request, base_cwd, suggested_name)
         )
@@ -178,7 +193,15 @@ class SessionWorktrees:
             raise
 
     @staticmethod
-    async def _suggest_name(request: WorktreeRequest, base_cwd: Path) -> str | None:
+    async def _suggest_name(
+        request: WorktreeRequest,
+        base_cwd: Path,
+        *,
+        accounting_sink: AccountingSink | None = None,
+        usage_attribution: UsageAttribution | None = None,
+        usage_attribution_factory: Callable[[ModelConfig], UsageAttribution]
+        | None = None,
+    ) -> str | None:
         """Ask the model for a name, before the resolve that runs in a thread.
 
         Only the prompt arm pays for the call: every other one was given a name
@@ -187,7 +210,13 @@ class SessionWorktrees:
         """
         if not isinstance(request, CreateWorktreeForPrompt):
             return None
-        return await suggest_worktree_name(request.prompt, cwd=base_cwd)
+        return await suggest_worktree_name(
+            request.prompt,
+            cwd=base_cwd,
+            accounting_sink=accounting_sink,
+            usage_attribution=usage_attribution,
+            usage_attribution_factory=usage_attribution_factory,
+        )
 
     @staticmethod
     async def cleanup(

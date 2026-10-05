@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+import asyncio
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from http import HTTPStatus
@@ -8,6 +9,7 @@ from http import HTTPStatus
 import httpx
 import pytest
 
+from chartreux.core.llm.failures import RequestRetryBudget
 from chartreux.core.utils import retry as retry_module
 from chartreux.core.utils.retry import (
     RetryCategory,
@@ -18,6 +20,7 @@ from chartreux.core.utils.retry import (
     _parse_retry_after,
     async_generator_retry,
     async_retry,
+    bind_retry_budget,
 )
 
 
@@ -440,6 +443,259 @@ class TestBudgetBoundedRetry:
                 await operation()
 
         assert attempts == 1
+
+
+def _retry_operation(
+    call: Callable[[], Awaitable[str]],
+    *,
+    generator: bool,
+    budget: RequestRetryBudget | None = None,
+    on_retry: Callable[[RetryReason], Awaitable[None]] | None = None,
+) -> Callable[[], Awaitable[str]]:
+    if not generator:
+        return async_retry(
+            tries=2,
+            delay_seconds=0.5,
+            max_elapsed_time=60.0,
+            budget=budget,
+            on_retry=on_retry,
+        )(call)
+
+    @async_generator_retry(
+        tries=2,
+        delay_seconds=0.5,
+        max_elapsed_time=60.0,
+        budget=budget,
+        on_retry=on_retry,
+    )
+    async def stream() -> AsyncGenerator[str]:
+        yield await call()
+
+    async def consume() -> str:
+        return "".join([item async for item in stream()])
+
+    return consume
+
+
+class TestLogicalRetryBudget:
+    @pytest.fixture
+    def fake_clock(self, monkeypatch: pytest.MonkeyPatch) -> list[float]:
+        now = [0.0]
+        monkeypatch.setattr(retry_module.time, "monotonic", lambda: now[0])
+
+        async def sleep(seconds: float) -> None:
+            now[0] += seconds
+
+        monkeypatch.setattr(retry_module.asyncio, "sleep", sleep)
+        return now
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("generator", [False, True])
+    async def test_successive_calls_share_deadline(
+        self, fake_clock: list[float], generator: bool
+    ) -> None:
+        attempts = 0
+        reasons: list[RetryReason] = []
+
+        async def observe(reason: RetryReason) -> None:
+            reasons.append(reason)
+
+        async def call() -> str:
+            nonlocal attempts
+            attempts += 1
+            fake_clock[0] += 0.2
+            if attempts != 2:
+                raise _make_http_status_error(503)
+            return "ok"
+
+        operation = _retry_operation(call, generator=generator, on_retry=observe)
+        budget = RequestRetryBudget(1.0)
+        with bind_retry_budget(budget):
+            assert await operation() == "ok"
+        with bind_retry_budget(budget), pytest.raises(httpx.HTTPStatusError):
+            await operation()
+        assert attempts == 3
+        assert reasons == [RetryReason(RetryCategory.SERVER_ERROR, "HTTP 503")]
+        assert budget.deadline == 1.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("generator", [False, True])
+    @pytest.mark.parametrize("explicit_seconds", [0.0, 10.0])
+    async def test_explicit_budget_takes_precedence(
+        self, fake_clock: list[float], generator: bool, explicit_seconds: float
+    ) -> None:
+        attempts = 0
+
+        async def call() -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise _make_http_status_error(503)
+            return "ok"
+
+        operation = _retry_operation(
+            call, generator=generator, budget=RequestRetryBudget(explicit_seconds)
+        )
+        with bind_retry_budget(
+            RequestRetryBudget(10.0 if explicit_seconds == 0 else 0.0)
+        ):
+            if explicit_seconds == 0:
+                with pytest.raises(httpx.HTTPStatusError):
+                    await operation()
+                assert attempts == 1
+            else:
+                assert await operation() == "ok"
+                assert attempts == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("generator", [False, True])
+    async def test_nested_scope_resets_after_error(
+        self, fake_clock: list[float], generator: bool
+    ) -> None:
+        attempts = 0
+
+        async def call() -> str:
+            nonlocal attempts
+            attempts += 1
+            raise _make_http_status_error(503)
+
+        operation = _retry_operation(call, generator=generator)
+        with bind_retry_budget(RequestRetryBudget(10.0)):
+            with (
+                pytest.raises(httpx.HTTPStatusError),
+                bind_retry_budget(RequestRetryBudget(0.0)),
+            ):
+                await operation()
+            assert attempts == 1
+            with pytest.raises(httpx.HTTPStatusError):
+                await operation()
+            assert attempts == 3
+        with pytest.raises(httpx.HTTPStatusError):
+            await operation()
+        assert attempts == 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("generator", [False, True])
+    async def test_default_eligibility_unchanged_under_binding(
+        self, fake_clock: list[float], generator: bool
+    ) -> None:
+        attempts = 0
+
+        async def call() -> str:
+            nonlocal attempts
+            attempts += 1
+            raise ValueError("not HTTP")
+
+        operation = _retry_operation(call, generator=generator)
+        with bind_retry_budget(RequestRetryBudget(10.0)), pytest.raises(ValueError):
+            await operation()
+        assert attempts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("generator", [False, True])
+async def test_budget_binding_is_task_local(generator: bool) -> None:
+    entered = [asyncio.Event(), asyncio.Event()]
+    attempts = [0, 0]
+
+    async def worker(index: int, seconds: float) -> None:
+        async def call() -> str:
+            attempts[index] += 1
+            entered[index].set()
+            await entered[1 - index].wait()
+            if attempts[index] == 1:
+                raise _make_http_status_error(503)
+            return "ok"
+
+        operation = _retry_operation(call, generator=generator)
+        with bind_retry_budget(RequestRetryBudget(seconds)):
+            if seconds == 0:
+                with pytest.raises(httpx.HTTPStatusError):
+                    await operation()
+            else:
+                assert await operation() == "ok"
+
+    await asyncio.gather(worker(0, 0.0), worker(1, 10.0))
+    assert attempts == [1, 2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("generator", [False, True])
+async def test_cancel_during_bound_retry_sleep(
+    monkeypatch: pytest.MonkeyPatch, generator: bool
+) -> None:
+    sleeping = asyncio.Event()
+    attempts = 0
+    reasons: list[RetryReason] = []
+
+    async def sleep(_seconds: float) -> None:
+        sleeping.set()
+        await asyncio.Event().wait()
+
+    async def observe(reason: RetryReason) -> None:
+        reasons.append(reason)
+
+    async def call() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise _make_http_status_error(503)
+
+    operation = _retry_operation(call, generator=generator, on_retry=observe)
+    monkeypatch.setattr(retry_module.asyncio, "sleep", sleep)
+
+    async def worker() -> None:
+        try:
+            with bind_retry_budget(RequestRetryBudget(10.0)):
+                await operation()
+        finally:
+            assert retry_module._LOGICAL_RETRY_BUDGET.get() is None
+
+    task = asyncio.create_task(worker())
+    await sleeping.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert attempts == 1
+    assert len(reasons) == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_budget_scope_excludes_outward_yield_and_includes_close() -> None:
+    budget = RequestRetryBudget(10.0)
+    seen: list[RequestRetryBudget | None] = []
+
+    @async_generator_retry()
+    async def backend() -> AsyncGenerator[str]:
+        try:
+            seen.append(retry_module._LOGICAL_RETRY_BUDGET.get())
+            yield "first"
+            seen.append(retry_module._LOGICAL_RETRY_BUDGET.get())
+            yield "second"
+        finally:
+            seen.append(retry_module._LOGICAL_RETRY_BUDGET.get())
+
+    async def gateway() -> AsyncGenerator[str]:
+        stream = backend()
+        try:
+            while True:
+                with bind_retry_budget(budget):
+                    try:
+                        item = await anext(stream)
+                    except StopAsyncIteration:
+                        return
+                yield item
+        finally:
+            with bind_retry_budget(budget):
+                await stream.aclose()
+
+    stream = gateway()
+    assert await anext(stream) == "first"
+    assert retry_module._LOGICAL_RETRY_BUDGET.get() is None
+    assert await anext(stream) == "second"
+    assert retry_module._LOGICAL_RETRY_BUDGET.get() is None
+    await stream.aclose()
+    assert seen == [budget, budget, budget]
+    assert retry_module._LOGICAL_RETRY_BUDGET.get() is None
 
 
 class TestParseRetryAfter:

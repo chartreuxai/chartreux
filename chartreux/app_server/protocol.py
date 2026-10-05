@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime
 from enum import StrEnum, auto
 from functools import cache
 from types import MappingProxyType
 from typing import Annotated, Any, ClassVar, Literal, Protocol, Self, get_origin
 
 from pydantic import (
+    AwareDatetime,
     Field,
     JsonValue,
     StrictInt,
@@ -59,6 +61,7 @@ from chartreux.app_server.models import (
     PublicSessionState,
     PublicTurn,
     PublicTurnQueue,
+    RunStopReason as RunStopReason,
     ScheduledLoop,
     SessionContentBlock,
     SessionEmbeddedResourceContentBlock as SessionEmbeddedResourceContentBlock,
@@ -71,6 +74,11 @@ from chartreux.app_server.models import (
     TurnContextInputEntry as TurnContextInputEntry,
     TurnInputEntry,
     TurnUserInputEntry,
+    UsageComponentBreakdown,
+    UsageCoverageWarning,
+    UsageModelSummary,
+    UsageWindow,
+    UsageWindowSummaries,
     UserDisplayContent,
     WorkspaceTrustDecision,
     WorkspaceTrustDetails,
@@ -85,7 +93,10 @@ from chartreux.app_server.review import (
     ReviewScope,
     ReviewTarget,
 )
-from chartreux.core.config.settings_catalog import validate_setting_value
+from chartreux.core.config.settings_catalog import (
+    STATUS_LINE_PATHS as STATUS_LINE_PATHS,
+    validate_setting_value,
+)
 from chartreux.utils.mcp import MCPAddTransport
 from chartreux.utils.tool_presentation import (
     ToolCallPresentation,
@@ -94,6 +105,7 @@ from chartreux.utils.tool_presentation import (
 
 SERVER_METHODS: tuple[str, ...] = (
     "agent/transcript/get",
+    "agents/cancel",
     "callback/result",
     "config/fields/read",
     "config/settings/read",
@@ -168,6 +180,8 @@ SERVER_METHODS: tuple[str, ...] = (
     "turn/interrupt",
     "turn/start",
     "turn/steer",
+    "usage/read",
+    "workspace/git/branch",
     "workspace/git/checkouts",
     "workspace/git/worktrees/list",
     "workspace/git/worktrees/remove",
@@ -538,7 +552,8 @@ class AgentTranscriptEntry(ProtocolModel):
     """One chronological, widget-ready projection entry.
 
     ``created_at`` and ``updated_at`` are synthetic transcript-order ordinals,
-    not wall-clock timestamps: stored LLM messages do not record entry times.
+    not wall-clock timestamps. ``posted_at`` is the nullable canonical posting
+    time; old messages remain unstamped.
     ``generation_status`` is synthesized as completed because LLM messages have
     no lifecycle marker. ``title`` is a synthesized role/tool label. ``digest``
     is the content-revision hash used by paging; tool-call digests include their
@@ -552,6 +567,12 @@ class AgentTranscriptEntry(ProtocolModel):
     digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     created_at: int = Field(ge=0)
     updated_at: int = Field(ge=0)
+    posted_at: datetime | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    turn_duration_ms: float | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     generation_status: PublicEntryGenerationStatus
     title: str = Field(max_length=MAX_AGENT_TRANSCRIPT_ID_LENGTH)
     tool_name: str | None = Field(
@@ -622,6 +643,28 @@ class AgentTranscriptEntry(ProtocolModel):
         if self.truncated != (self.truncation is not None):
             raise ValueError("truncated and truncation must agree")
         return self
+
+
+class CancelOutcome(StrEnum):
+    STOP_REQUESTED = "stop_requested"
+    ALREADY_STOPPING = "already_stopping"
+    ALREADY_FINISHING = "already_finishing"
+    NOT_RUNNING = "not_running"
+    UNKNOWN_RUN = "unknown_run"
+    FORBIDDEN = "forbidden"
+
+
+class AgentsCancelParams(ProtocolModel):
+    agent_id: str = Field(min_length=1)
+    run_id: str | None = Field(default=None, min_length=1)
+
+
+class AgentsCancelResponse(ProtocolModel):
+    """Stop-request disposition, not confirmation of terminal cancellation."""
+
+    outcome: CancelOutcome
+    run_id: str | None = None
+    stop_reason: RunStopReason | None = None
 
 
 class AgentTranscriptGetParams(ProtocolModel):
@@ -953,7 +996,7 @@ class RuntimeSnapshot(ProtocolModel):
     skills: list[SkillSummary]
     tools: list[ToolSummary]
     stats: AgentStatsSnapshot
-    context_window: int
+    context_window: int | None
     issues: list[ConfigIssue]
     hooks_count: int
     mcp: MCPState
@@ -1076,7 +1119,7 @@ class SettingDescriptorWire(ProtocolModel):
     group: str
     choices: tuple[str, ...] = ()
     item_kind: Literal["path", "pattern"] | None = None
-    control: Literal["checklist", "toggle_inventory"] | None = None
+    control: Literal["checklist", "toggle_inventory", "status_line"] | None = None
     inventory: Literal["tools", "skills", "agents"] | None = None
     minimum: int | float | None = None
     exclusive_minimum: bool = False
@@ -1196,7 +1239,28 @@ class StatsReadParams(ProtocolModel):
 
 class StatsReadResponse(ProtocolModel):
     stats: AgentStatsSnapshot
-    context_window: int
+    context_window: int | None
+
+
+class UsageReadParams(ProtocolModel):
+    """Host-level ledger read; no session attachment is required."""
+
+    window: UsageWindow = "day"
+    project_key: str | None = None
+
+
+class UsageReadResponse(ProtocolModel):
+    """All windows and selected-window detail share one as_of and revision."""
+
+    as_of: AwareDatetime
+    revision: int = Field(ge=0, strict=True)
+    summaries: UsageWindowSummaries
+    window: UsageWindow = "day"
+    models: list[UsageModelSummary] = Field(default_factory=list)
+    components: UsageComponentBreakdown = Field(default_factory=UsageComponentBreakdown)
+    # Attached root identity, not the request filter; absent before attachment.
+    project_key: str | None = None
+    warnings: list[UsageCoverageWarning] = Field(default_factory=list)
 
 
 class DiagnosticsListParams(ProtocolModel):
@@ -1332,6 +1396,18 @@ class WorkspacePromptPrepareParams(ProtocolModel):
 
 class WorkspacePromptPrepareResponse(ProtocolModel):
     prompt: PreparedPrompt
+
+
+class WorkspaceBranchReadParams(ProtocolModel):
+    session_id: str
+    cwd: str = Field(min_length=1)
+
+
+class WorkspaceBranchReadResponse(ProtocolModel):
+    session_id: str
+    cwd: str
+    branch: str | None = None
+    status: Literal["branch", "detached", "not_repository", "unknown"]
 
 
 class WorkspaceTrustStatusParams(ProtocolModel):
@@ -1605,6 +1681,7 @@ class TurnStartResponse(EventWatermarkResponse):
 
 
 class TurnSteerParams(ProtocolModel):
+    require_waiting_only: bool = False
     idempotency_key: str | None = None
     session_id: str
     expected_turn_id: str
@@ -1771,6 +1848,12 @@ class TurnStartedParams(EventNotificationParams):
     turn: PublicTurn
 
 
+class TurnUpdatedParams(EventNotificationParams):
+    NOTIFICATION_METHOD: ClassVar[str] = "turn/updated"
+
+    turn: PublicTurn
+
+
 class TurnCompletedParams(EventNotificationParams):
     NOTIFICATION_METHOD: ClassVar[str] = "turn/completed"
 
@@ -1785,9 +1868,16 @@ class AgentSummaryModel(ProtocolModel):
     current_run_status: str | None = None
     turns_used: int | None = None
     last_run_status: str | None = None
+    # Structured current/latest run outcome, retained through finalization/eviction.
+    stop_reason: RunStopReason | None = None
+    context_tokens: int | None = None
+    context_window: int | None = None
+    compacting: bool = False
     initial_task_summary: str | None = None
     current_task_summary: str | None = None
     idle_seconds: float | None = None
+    run_elapsed_seconds: float | None = None
+    latest_run_id: str | None = None
     ttl_remaining_seconds: float | None = None
     effective_model: str | None = None
     base_model: str | None = None
@@ -1815,7 +1905,22 @@ class StatsUpdatedParams(EventNotificationParams):
     NOTIFICATION_METHOD: ClassVar[str] = "session/statsUpdated"
 
     stats: AgentStatsSnapshot
-    context_window: int
+    context_window: int | None
+
+
+class UsageUpdatedParams(ProtocolModel):
+    """Coalesced global snapshot, independent of session event sequencing.
+
+    Servers coalesce updates; clients deduplicate snapshots by revision.
+    Summaries are always global, never filtered by the last usage/read.
+    """
+
+    NOTIFICATION_METHOD: ClassVar[str] = "usage/updated"
+
+    as_of: AwareDatetime
+    revision: int = Field(ge=0, strict=True)
+    summaries: UsageWindowSummaries
+    degraded: bool = False
 
 
 class Notification(ProtocolModel):

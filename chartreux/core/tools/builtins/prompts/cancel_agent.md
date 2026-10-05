@@ -1,0 +1,5 @@
+Request a stop for a background agent's run without releasing its identity or conversation. Supply `agent_id` and optionally a pinned `run_id`; omitting `run_id` selects the active run atomically. Only the owning parent orchestrator may stop its background agents. Foreground tasks are not supported.
+
+The result is a request disposition, not terminal cancellation: `stop_requested`, `already_stopping`, `already_finishing`, `not_running`, `unknown_run`, or `forbidden`, with the resolved `run_id` and winning `stop_reason`. A repeated request does not override the first accepted reason. Use `wait_for_agent` or `get_agent_result` to retrieve the terminal result after cleanup; cancelled work returns partial accumulated output with `completed: false` and `stop_reason: "orchestrator_cancelled"` when this request wins.
+
+Stopping does not roll back file, shell, or remote side effects. Conversation and results remain available subject to retention policy; zero-retention agents may be evicted at finalization. `release_agent` instead destroys retained identity and results. To supersede busy work in the same conversation, use `task(agent_id=..., replace_run=True)`.

@@ -14,7 +14,6 @@ from chartreux.core.config.harness_files import (
     HarnessFilesManager,
     get_harness_files_manager,
 )
-from chartreux.core.paths import CHARTREUX_HOME
 from chartreux.core.prompts import UtilityPrompt
 from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils import get_platform_display_name
@@ -28,6 +27,19 @@ if TYPE_CHECKING:
     from chartreux.core.tools.manager import ToolManager
 
 _git_status_cache: dict[Path, str] = {}
+
+
+class SystemPrompt(str):
+    """Prompt text with provenance from the very same loaded documents."""
+
+    instruction_read_files: frozenset[Path]
+
+    def __new__(
+        cls, text: str, instruction_read_files: frozenset[Path]
+    ) -> SystemPrompt:
+        prompt = super().__new__(cls, text)
+        prompt.instruction_read_files = instruction_read_files
+        return prompt
 
 
 class ProjectContextProvider:
@@ -316,7 +328,7 @@ def _get_tool_aware_os_system_prompt(tool_manager: ToolManager | None) -> str:
     return _get_os_system_prompt()
 
 
-def get_universal_system_prompt(
+def get_universal_system_prompt(  # noqa: PLR0914 - prompt sections and their provenance
     config: ChartreuxConfigSchema,
     skill_manager: SkillManager,
     agent_manager: AgentManager,
@@ -328,9 +340,10 @@ def get_universal_system_prompt(
     tool_manager: ToolManager | None = None,
     role_instructions: str | None = None,
     is_subagent: bool = False,
-) -> str:
+) -> SystemPrompt:
     cwd = (cwd or Path.cwd()).resolve()
     harness_files = harness_files or get_harness_files_manager()
+    instruction_read_files: set[Path] = set()
     sections = [_interpolate_prompt(config.system_prompt)]
 
     if role_instructions is not None:
@@ -385,24 +398,28 @@ def get_universal_system_prompt(
                 + dirs_lines
             )
 
-        user_doc = harness_files.load_user_doc()
-        project_docs = harness_files.load_project_docs()
-
+        documents = harness_files.load_instruction_documents()
+        instruction_read_files.update(doc.canonical_path for doc in documents)
         doc_sections: list[str] = []
-        if user_doc.strip():
-            doc_sections.append(
-                f"## User instructions\n\nContents of {CHARTREUX_HOME.path}/AGENTS.md (user-level instructions):\n\n{user_doc.strip()}"
-            )
-        if project_docs:
-            doc_sections.append("## Project instructions (checked into the codebase)")
-        for doc_dir, doc_content in project_docs:
-            doc_sections.append(
-                f"Contents of {doc_dir}/AGENTS.md:\n\n{doc_content.strip()}"
-            )
+        project_heading_added = False
+        for document in documents:
+            if document.source == "user":
+                doc_sections.append(
+                    f"## User instructions\n\nContents of {document.path} (user-level instructions):\n\n{document.content}"
+                )
+            else:
+                if not project_heading_added:
+                    doc_sections.append(
+                        "## Project instructions (checked into the codebase)"
+                    )
+                    project_heading_added = True
+                doc_sections.append(
+                    f"Contents of {document.path}:\n\n{document.content}"
+                )
         if doc_sections:
             template = UtilityPrompt.AGENTS_DOC.read()
             sections.append(
                 Template(template).safe_substitute(sections="\n\n".join(doc_sections))
             )
 
-    return "\n\n".join(sections)
+    return SystemPrompt("\n\n".join(sections), frozenset(instruction_read_files))

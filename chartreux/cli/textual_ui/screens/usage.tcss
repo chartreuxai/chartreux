@@ -1,0 +1,40 @@
+#usage-screen { align: center middle; }
+#usage-content {
+    width: 92; height: 100%; padding: 0 1;
+    background: $surface; border: solid $foreground-muted;
+    border-title-color: $foreground; border-title-style: bold;
+}
+#usage-content.fullscreen { background: $background; border: none; }
+#usage-title { display: none; height: 1; text-style: bold; }
+#usage-content.fullscreen #usage-title { display: block; }
+#usage-selectors { height: 1; }
+#usage-windows, #usage-scopes { width: auto; height: 1; }
+#usage-content.compact #usage-selectors { layout: vertical; height: 2; }
+#usage-content Button {
+    height: 1; min-width: 0; width: auto; margin: 0 1 0 0;
+    padding: 0; border: none; background: transparent; color: $foreground;
+}
+#usage-content Button:hover { background: transparent; }
+#usage-content Button:focus { background: $foreground; color: $surface; text-style: bold; }
+#usage-content.fullscreen Button:focus { color: $background; }
+#usage-status, #usage-heading, #usage-hint { height: 1; text-wrap: nowrap; }
+#usage-heading, #usage-hint { color: $text-muted; }
+#usage-status { color: $warning; text-overflow: ellipsis; }
+#usage-models {
+    height: 1fr; border: none; padding: 0; text-wrap: nowrap;
+}
+#usage-models > .option-list--option-highlighted {
+    color: $foreground; background: transparent; text-style: none;
+}
+#usage-models:focus > .option-list--option-highlighted {
+    color: $surface; background: $foreground; text-style: bold;
+}
+#usage-content.fullscreen #usage-models:focus > .option-list--option-highlighted { color: $background; }
+#usage-models > .option-list--option-hover { background: transparent; }
+#usage-details { display: none; height: 1fr; color: $text-muted; overflow-y: auto; }
+#usage-hint { dock: bottom; }
+#usage-detail-text { height: auto; text-wrap: wrap; }
+#usage-models:ansi:focus > .option-list--option-highlighted,
+#usage-content Button:ansi:focus {
+    color: $ansi-background; background: $ansi-foreground;
+}

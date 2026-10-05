@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_EMPTY_USAGE = LLMUsage(prompt_tokens=0, completion_tokens=0)
+_EMPTY_USAGE = LLMUsage()
 
 _ERROR_HTTP_STATUS = {
     "authentication_error": HTTPStatus.UNAUTHORIZED,
@@ -58,6 +58,7 @@ class OpenAIResponsesStreamError(StreamHTTPError):
     def __init__(self, error_type: str, message: str) -> None:
         self.error_type = error_type
         self.message = message
+        self.usage: LLMUsage | None = None
         super().__init__(
             f"OpenAI Responses stream error ({error_type}): {message}",
             _ERROR_HTTP_STATUS.get(error_type),
@@ -210,10 +211,10 @@ class _OpenAIResponsesStreamParser:
     def _usage_from_response(usage_data: _ResponsesUsageData | None) -> LLMUsage:
         usage = usage_data or {}
         input_details = usage.get("input_tokens_details") or {}
-        return LLMUsage(
-            prompt_tokens=usage.get("input_tokens", 0),
-            completion_tokens=usage.get("output_tokens", 0),
-            cached_tokens=input_details.get("cached_tokens", 0),
+        return LLMUsage.from_reported(
+            prompt_tokens=usage.get("input_tokens"),
+            completion_tokens=usage.get("output_tokens"),
+            cached_tokens=input_details.get("cached_tokens"),
         )
 
     @staticmethod
@@ -464,6 +465,9 @@ class _OpenAIResponsesStreamParser:
         event = _RESPONSES_ERROR_EVENT_ADAPTER.validate_python(data)
         self.reset()
         response = event.get("response") or {}
+        usage = self._usage_from_response(response.get("usage")).model_copy(
+            update={"is_final": False}
+        )
         error_data = response.get("error") or event.get("error")
         if error_data is None:
             error_data = {"code": event.get("code"), "message": event.get("message")}
@@ -472,7 +476,7 @@ class _OpenAIResponsesStreamParser:
         error_message = error.get("message") or "Unknown streaming error"
         if error_type in {"authentication_error", "invalid_api_key"}:
             if self._model_call is not None:
-                raise BackendError(
+                backend_error = BackendError(
                     provider=self._model_call.provider,
                     endpoint=self._model_call.endpoint,
                     status=HTTPStatus.UNAUTHORIZED,
@@ -485,8 +489,12 @@ class _OpenAIResponsesStreamParser:
                     model=self._model_call.model,
                     payload_summary=self._model_call.payload_summary(),
                     api_key_origin=self._model_call.api_key_origin,
-                ) from None
-        raise OpenAIResponsesStreamError(error_type, error_message)
+                )
+                backend_error.usage = usage  # type: ignore[attr-defined]
+                raise backend_error from None
+        stream_error = OpenAIResponsesStreamError(error_type, error_message)
+        stream_error.usage = usage
+        raise stream_error
 
     def _on_unknown_event(self, data: _ResponsesStreamEventEnvelope) -> LLMChunk:
         if event_type := data.get("type"):

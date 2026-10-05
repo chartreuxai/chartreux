@@ -17,8 +17,8 @@ async def _wait_for_event_worker(app, pilot) -> Worker[None]:
 
 
 @pytest.mark.asyncio
-async def test_stop_event_listener_cancels_worker_while_dom_is_intact() -> None:
-    """The event listener is cancelled before the DOM is torn down.
+async def test_stop_event_listener_stops_worker_while_dom_is_intact() -> None:
+    """The event listener is stopped before the DOM is torn down.
 
     A queued turn (e.g. a skill) streams effects through
     ``_listen_app_server_events``, which mounts widgets. Textual only cancels
@@ -35,7 +35,8 @@ async def test_stop_event_listener_cancels_worker_while_dom_is_intact() -> None:
 
         await app._stop_app_server_event_listener()
 
-        assert worker.state is WorkerState.CANCELLED
+        # begin_close() may end the event stream before worker cancellation.
+        assert worker.state in {WorkerState.CANCELLED, WorkerState.SUCCESS}
         assert app._app_server_events_worker is None
         # The worker is stopped without the DOM having been torn down.
         assert messages_area.is_attached
@@ -55,7 +56,10 @@ async def test_stop_event_listener_waits_for_in_flight_handler() -> None:
             app._app_server_event_handler_lock.release()
 
         await stop_task
-        assert worker.state is WorkerState.CANCELLED
+        # begin_close() may end the event stream before worker cancellation.
+        assert worker.state in {WorkerState.CANCELLED, WorkerState.SUCCESS}
+        assert app._app_server_events_worker is None
+        assert app.query_one("#messages").is_attached
 
 
 @pytest.mark.asyncio

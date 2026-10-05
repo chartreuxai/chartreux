@@ -24,7 +24,7 @@ class GatedSequenceBackend(FakeBackend):
     """Return one response per gate, keeping every selected child run observable."""
 
     def __init__(self) -> None:
-        super().__init__([mock_llm_chunk(content="done")])
+        super().__init__()
         self.started: list[asyncio.Event] = []
         self.releases: list[asyncio.Event] = []
         self.started_at: list[float | None] = []
@@ -36,6 +36,7 @@ class GatedSequenceBackend(FakeBackend):
         self.started.append(started)
         self.releases.append(release)
         self.started_at.append(None)
+        self._streams.append([mock_llm_chunk(content="done")])
         return started, release
 
     async def complete(
@@ -118,7 +119,12 @@ async def create_subagent_harness(model_names: Sequence[str]) -> SubagentHarness
     config = build_test_vibe_config(
         enabled_tools=["task"], tools={"task": {"permission": "always"}}
     ).attach_catalog_snapshot(snapshot)
-    parent = build_test_agent_loop(config=config, backend=FakeBackend())
+    parent = build_test_agent_loop(
+        config=config,
+        backend=FakeBackend([
+            [mock_llm_chunk(content="parent done")] for _ in model_names
+        ]),
+    )
 
     # Origin: tests/app_server/test_subagents.py:301-330 for the parent,
     # SessionRuntimeRegistry, and AgentRuntimeFactory lifecycle; fan-out registry

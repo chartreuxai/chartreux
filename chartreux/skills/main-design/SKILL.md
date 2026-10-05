@@ -21,7 +21,7 @@ Own the what and why before implementation. The orchestrator gathers context and
 3. **Dispatch the advisor for design analysis.** Send a self-contained task to the `advisor` profile:
 
 ```text
-task(task="Design analysis for: <problem>. Context: <relevant code, interfaces, constraints>. Requirements: <what the design must address, preserved behavior, non-goals>. Return a recommended approach with rationale, alternatives rejected, risks, and assumptions.", agent="advisor", config={model="@large"})
+task(task="Design analysis for: <problem>. Context: <relevant code, interfaces, constraints>. Requirements: <what the design must address, preserved behavior, non-goals>. Return a recommended approach with rationale, alternatives rejected, risks, and assumptions.", agent_type="advisor", config={model="@large"})
 ```
 
 For large or cross-cutting changes, dispatch the `advisor` profile (or `worker`) with `sub-architecture-mapper` first to map the affected subsystems, then use that output to frame the design question.

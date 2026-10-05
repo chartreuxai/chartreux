@@ -213,6 +213,7 @@ def _run_programmatic_mode(args: argparse.Namespace, stdin_prompt: str | None) -
                     trust_workspace=bool(args.trust or args.worktree),
                 ),
                 session=session_intent,
+                startup_accounting=getattr(args, "startup_accounting", None),
             ),
             prompt=programmatic_prompt or "",
             output_format=output_format,
@@ -272,11 +273,13 @@ def _run_interactive_mode(args: argparse.Namespace, stdin_prompt: str | None) ->
                 trust_workspace=trust_workspace,
             ),
             session=_session_intent(args, allow_picker=True),
+            startup_accounting=getattr(args, "startup_accounting", None),
         )
     )
     try:
         summary = run_textual_ui(
             start_app_server=harness.connect,
+            close_app_server=harness.close,
             history_file=HISTORY_FILE.path,
             startup=StartupOptions(
                 initial_prompt=args.initial_prompt or stdin_prompt,

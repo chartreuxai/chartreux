@@ -22,10 +22,13 @@ from chartreux.app_server.models import (
     ShellEffectOutput,
     SkillEffectDetail,
     SkillEffectInput,
+    SubagentEffectDetail,
+    SubagentEffectInput,
     WebSearchEffectOutput,
     validate_history_entry,
 )
 from chartreux.core.events import ToolCallEvent, ToolResultEvent
+from chartreux.core.subagents import TaskArgs
 from chartreux.core.tools.builtins.bash import Bash, BashArgs, CapturedShellResult
 from chartreux.core.tools.builtins.edit import Edit, EditResult
 from chartreux.core.tools.builtins.grep import Grep, GrepResult
@@ -77,6 +80,33 @@ def test_generic_tool_projection_preserves_json_input() -> None:
 
     assert detail.kind is ToolEffectKind.TOOL
     assert detail.input == {"command": "forecast Paris", "timeout": 30}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        TaskArgs(task="Inspect", agent_type="reviewer"),
+        {"task": "Inspect", "agent_type": "reviewer"},
+        {"task": "Inspect", "agent": "reviewer"},
+    ],
+)
+def test_task_projection_retains_public_agent_field(value) -> None:
+    detail = project_effect_detail(
+        "task", value, _presentation(ToolEffectKind.SUBAGENT)
+    )
+    assert isinstance(detail, SubagentEffectDetail)
+    assert detail.input == SubagentEffectInput(task="Inspect", agent="reviewer")
+    assert detail.input is not None
+    assert detail.input.model_dump() == {"task": "Inspect", "agent": "reviewer"}
+
+
+def test_default_task_model_projects_worker_profile() -> None:
+    detail = project_effect_detail(
+        "task", TaskArgs(task="Inspect"), _presentation(ToolEffectKind.SUBAGENT)
+    )
+    assert isinstance(detail, SubagentEffectDetail)
+    assert detail.input is not None
+    assert detail.input.agent == "worker"
 
 
 def test_stored_effect_args_missing_required_field_degrade_to_generic() -> None:

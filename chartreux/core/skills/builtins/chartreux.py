@@ -683,10 +683,12 @@ scope checks remain enforced.
 - **advisor**: Independent, read-only advisor bound to the `@large` capacity preset with the `advisor` role prompt. Its tools are limited to `read_file`, `grep`, `web_search`, and `web_fetch`, and its TTL is `0`.
 - **reviewer**: Independent, read-only reviewer bound to the `@medium` capacity preset with the `reviewer` role prompt.
 
-Use `task` to launch a subagent. Profiles are presets: the orchestrator can choose a configured canonical model or role, predefined system prompt, inline instructions, tools, and thinking for an individual launch, but never beyond the parent authority ceiling. Per-call configuration is not written to `config.toml`; committed child launch state is retained in child-session metadata and revalidated fail-closed on resume. For a bounded design, feature, or review loop,
+Use `task(agent_type="worker", task=...)` to create an agent instance. The agent type is a profile name (default `worker`); `agent_id` identifies a retained agent instance instead. The `agent-N` syntax (digits after `agent-`) is reserved for instance handles and rejected in `agent_type` before dispatch. Profiles are presets: the orchestrator can choose a configured canonical model or role, predefined system prompt, inline instructions, tools, and thinking for an individual launch, but never beyond the parent authority ceiling. Per-call configuration is not written to `config.toml`; committed child launch state is retained in child-session metadata and revalidated fail-closed on resume. For a bounded design, feature, or review loop,
 keep the engagement cast — advisors, planner, implementors, and reviewers —
 resident while exchanging findings, requirements, and plan updates between them.
-Background launches return stable `agent_id` and per-invocation `run_id` handles.
+Background launches return stable `agent_id` and per-invocation `run_id` handles,
+and include guidance to continue the instance with `task(agent_id=..., background=true, task=...)`.
+`check_agents.reuse_guidance` also describes this reuse; omit `agent_type` to retain the profile.
 `task_summary` is an optional concise action plus subsystem or feature (up to 240
 characters); it identifies retained work in `check_agents`. `check_agents` includes
 an agent's effective model, thinking, initial and current task summaries, idle
@@ -750,6 +752,12 @@ subagents. Custom subagents are TOML files in `~/.chartreux/agents/NAME.toml`.
   are passed to the model for the continuation. Relevant error messages also
   hint at this command.
 - `/status` - Display agent statistics
+- `/usage` - Browse recorded usage and USD cost estimates. Read-only Day/Week/Month
+  snapshots default to All projects; Current project filters the browser only.
+  Available while a turn runs without interrupting work. Use `r` to Refresh,
+  `d` for below-table Details, `F1` for help, and Escape to go back or close.
+  The TOTAL row summarizes the window; clickable shortcuts offer the same actions.
+  Recorded usage only: pre-ledger sessions are excluded; estimates are not provider invoices.
 - `/copy` - Copy the last agent message to the clipboard
 - `/paste-image` - Paste an image from the OS clipboard into the prompt.
   **macOS only** — the command is not registered on Linux.

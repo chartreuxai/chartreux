@@ -50,6 +50,7 @@ from chartreux.app_server.models import (
     WebSearchEffectOutput,
 )
 from chartreux.core.events import ToolResultEvent
+from chartreux.core.subagents import TaskArgs
 from chartreux.core.utils import TaggedText
 from chartreux.utils.tool_presentation import ToolCallPresentation, ToolEffectKind
 
@@ -107,6 +108,12 @@ def project_effect_detail(
             tool_name=tool_name, input=_dump_value(value), display=presentation.display
         )
     try:
+        if tool_name == "task" and projection.input_model is SubagentEffectInput:
+            # Keep the public effect's `agent` field stable across the Task rename.
+            if isinstance(value, dict) and "agent_type" in value:
+                value = {**value, "agent": value["agent_type"]}
+            elif isinstance(value, TaskArgs):
+                value = {**value.model_dump(mode="json"), "agent": value.agent_type}
         projected_input = _project_model(projection.input_model, value)
     except ValidationError:
         # Stored tool arguments can predate a schema change (e.g. a field that
@@ -127,7 +134,7 @@ def project_effect_state(
     event: ToolResultEvent, *, output_text: str = ""
 ) -> EffectState:
     display = _result_display(event)
-    duration_ms = (event.duration or 0.0) * 1000
+    duration_ms = event.duration * 1000 if event.duration is not None else None
     if event.cancelled:
         return CancelledEffectState(
             reason=event.error or "Cancelled",

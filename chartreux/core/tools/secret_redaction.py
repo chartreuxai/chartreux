@@ -31,8 +31,10 @@ from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+import json
 import os
 import re
+import shlex
 import threading
 import time
 from typing import Any
@@ -703,6 +705,16 @@ def _redact_json(value: Any, depth: int = 0) -> Any:
         return REDACTED_PLACEHOLDER
     if isinstance(value, str):
         return redact(value)
+    if type(value) in {int, float}:
+        # Match substrings just as string payloads do. Fixed-point formatting
+        # also recovers digits hidden by a float's scientific notation.
+        representations = [str(value)]
+        if isinstance(value, float):
+            from decimal import Decimal
+
+            representations.append(format(Decimal(str(value)), "f"))
+        if any(redact(text) != text for text in representations):
+            return REDACTED_PLACEHOLDER
     if isinstance(value, dict):
         changed = False
         items: dict[Any, Any] = {}
@@ -760,6 +772,200 @@ def redact_model(model: Any) -> Any:
     })
 
 
+_MAX_SOURCE_DEPTH = 8
+
+
+def _normalize_shell_escapes(value: str) -> str:
+    """Recover shell reconstructions strictly; unsupported escapes fail closed.
+
+    This is a recording-only projection, never source for execution. Applying it
+    conservatively even inside other quotes is safe: a false positive may omit a
+    preview, but must not preserve a reconstructable credential.
+    """
+    value = value.replace("\\\n", "")
+    pieces: list[str] = []
+    index = 0
+    escapes = {
+        "a": b"\a",
+        "b": b"\b",
+        "e": b"\x1b",
+        "E": b"\x1b",
+        "f": b"\f",
+        "n": b"\n",
+        "r": b"\r",
+        "t": b"\t",
+        "v": b"\v",
+        "\\": b"\\",
+        "'": b"'",
+        '"': b'"',
+        "?": b"?",
+    }
+    while index < len(value):
+        if not value.startswith("$'", index):
+            pieces.append(value[index])
+            index += 1
+            continue
+        index += 2
+        decoded = bytearray()
+        while index < len(value) and value[index] != "'":
+            character = value[index]
+            index += 1
+            if character != "\\":
+                decoded.extend(character.encode("utf-8"))
+                continue
+            if index >= len(value):
+                raise ValueError("Incomplete ANSI-C escape")
+            character = value[index]
+            index += 1
+            if character in escapes:
+                decoded.extend(escapes[character])
+                continue
+            if character in "01234567":
+                index -= 1
+                pattern = r"[0-7]{1,3}"
+                base = 8
+            elif character in "xuU":
+                pattern = {
+                    "x": r"[0-9a-fA-F]{1,2}",
+                    "u": r"[0-9a-fA-F]{4}",
+                    "U": r"[0-9a-fA-F]{8}",
+                }[character]
+                base = 16
+            else:
+                raise ValueError("Unmodeled ANSI-C escape")
+            match = re.match(pattern, value[index:])
+            if match is None:
+                raise ValueError("Invalid ANSI-C escape")
+            index += len(match.group())
+            number = int(match.group(), base)
+            if character in "uU":
+                decoded.extend(chr(number).encode("utf-8"))
+            else:
+                decoded.append(number)
+        if index >= len(value):
+            raise ValueError("Unclosed ANSI-C quote")
+        index += 1
+        text = decoded.decode("utf-8", errors="strict")
+        if "\x00" in text:
+            raise ValueError("NUL in ANSI-C quote")
+        pieces.append(shlex.quote(text))
+    return "".join(pieces)
+
+
+def redact_shell_source(value: str, depth: int = 0) -> str | None:
+    """Match raw and reconstructed source; omit on uncertain recovery."""
+    redacted = redact(value)
+    try:
+        normalized = _normalize_shell_escapes(value)
+        normalized_redacted = redact(normalized)
+        tokens = shlex.split(normalized_redacted)
+    except (ValueError, UnicodeError, OverflowError):
+        return None
+    if tokens == [normalized_redacted] or not tokens:
+        return normalized_redacted if normalized_redacted != normalized else redacted
+    if depth >= _MAX_SOURCE_DEPTH:
+        return None
+    sanitized: list[str] = []
+    for index, token in enumerate(tokens):
+        try:
+            shlex.split(token)
+        except ValueError:
+            # A possible shell -c operand is source, not literal argument data.
+            # Keep malformed nested source fail-closed after the parent split.
+            if index and tokens[index - 1].startswith("-") and "c" in tokens[index - 1]:
+                recovered = None
+            else:
+                # The parent split resolved quoting; unmatched quotes inside
+                # literal argument data do not make the source uncertain.
+                recovered = redact(token)
+        else:
+            recovered = redact_shell_source(token, depth + 1)
+        if recovered is None:
+            return None
+        sanitized.append(recovered)
+    if sanitized != tokens or normalized_redacted != normalized:
+        return shlex.join(sanitized)
+    return redacted
+
+
+def sanitize_recorded_tool_call(call: Any) -> Any:
+    """One copy-only boundary for transcript calls, events and UI inputs.
+
+    Never return an original payload on reconstruction failure. Execution must
+    retain its separate, unsanitized arguments.
+    """
+    from pydantic import BaseModel
+
+    def arguments(payload: Any, tool_name: str) -> Any:
+        cleaned = redact_json_value(payload)
+        if tool_name == "bash" and known_secret_values():
+            if isinstance(cleaned, dict) and isinstance(cleaned.get("command"), str):
+                command = redact_shell_source(cleaned["command"])
+                if command is None:
+                    raise ValueError("Unrecoverable shell source")
+                if command != cleaned["command"]:
+                    cleaned = {**cleaned, "command": command}
+        return cleaned
+
+    def source_payload(value: Any) -> Any:
+        if isinstance(value, str):
+            recovered = redact_shell_source(value)
+            if recovered is None:
+                raise ValueError("Unrecoverable recorded source")
+            return recovered
+        if isinstance(value, dict):
+            return {
+                source_payload(key): source_payload(item) for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [source_payload(item) for item in value]
+        return value
+
+    def safe_model(model: Any, *, shell_source: bool = False) -> Any:
+        try:
+            cleaned = redact_model(model)
+            if (
+                shell_source
+                and known_secret_values()
+                and isinstance(cleaned, BaseModel)
+            ):
+                payload = source_payload(cleaned.model_dump())
+                return type(cleaned).model_validate(payload)
+            return cleaned
+        except Exception:
+            return None
+
+    tool_name = call.function.name if hasattr(call, "function") else call.tool_name
+    updates: dict[str, Any] = {
+        "presentation": safe_model(call.presentation, shell_source=tool_name == "bash")
+    }
+    if hasattr(call, "function"):
+        original = call.function.arguments
+        try:
+            payload = json.loads(original or "{}")
+            cleaned = arguments(payload, call.function.name)
+            serialized = json.dumps(cleaned) if cleaned != payload else original
+        except Exception:
+            # Partial/malformed JSON cannot be safely reconstructed.
+            serialized = None
+        updates["function"] = call.function.model_copy(update={"arguments": serialized})
+    else:
+        try:
+            original = call.args
+            payload = (
+                original.model_dump() if isinstance(original, BaseModel) else original
+            )
+            cleaned = arguments(payload, call.tool_name)
+            updates["args"] = (
+                type(original).model_validate(cleaned)
+                if isinstance(original, BaseModel) and cleaned != payload
+                else safe_model(original)
+            )
+        except Exception:
+            updates["args"] = None
+    return call.model_copy(update=updates)
+
+
 def redact_persisted_result(result: Any) -> Any:
     """Redact secret values from a ``PersistedToolResult``-shaped object.
 
@@ -775,7 +981,8 @@ def redact_persisted_result(result: Any) -> Any:
         # Model field names are schema, not payload dictionary keys.
         return redact_model(result)
     except Exception:
-        logger.debug("redact_persisted_result reconstruction failed", exc_info=True)
+        # Reconstruction errors can contain credentials; log only the failed stage.
+        logger.debug("redact_persisted_result reconstruction failed")
         from chartreux.core.llm_models import PersistedToolResult
 
         try:
@@ -788,8 +995,12 @@ def redact_persisted_result(result: Any) -> Any:
                 else None,
             )
         except Exception:
-            logger.debug("redact_persisted_result fallback failed", exc_info=True)
-            return PersistedToolResult(output={"error": "Tool result unavailable"})
+            logger.debug("redact_persisted_result fallback failed")
+            return PersistedToolResult(
+                output={"error": "Tool result unavailable"},
+                duration=result.duration,
+                cancelled=result.cancelled,
+            )
 
 
 def set_env_passthrough(names: Iterable[str]) -> None:

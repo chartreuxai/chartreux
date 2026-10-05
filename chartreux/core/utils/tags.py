@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum, auto
 import re
 
-from chartreux.core.events import BaseEvent, ToolResultEvent
+from chartreux.core.events import BaseEvent, ToolCancellationOrigin, ToolResultEvent
 from chartreux.utils import VIBE_WARNING_TAG
 
 CANCELLATION_TAG = "user_cancellation"
@@ -77,4 +77,7 @@ def get_user_cancellation_message(
 def is_user_cancellation_event(event: BaseEvent) -> bool:
     if not isinstance(event, ToolResultEvent):
         return False
-    return event.cancelled
+    return (
+        event.cancelled
+        and event.cancellation_origin is not ToolCancellationOrigin.STEERING
+    )

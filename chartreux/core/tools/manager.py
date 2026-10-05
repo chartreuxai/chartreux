@@ -19,6 +19,7 @@ from chartreux.core.llm_models import AvailableFunction
 from chartreux.core.paths import DEFAULT_TOOL_DIR
 from chartreux.core.tools.base import BaseTool, BaseToolConfig, ToolPermission
 from chartreux.core.tools.remote import MCPTool
+from chartreux.core.tools.utils import PathAuthority
 from chartreux.core.utils import name_matches, run_sync
 from chartreux.core.workspace import Workspace
 from chartreux.observability.logging import logger
@@ -121,6 +122,7 @@ class ToolManager:
         # Managers without an accepted-revision signal retain live, uncached getters.
         self._accepted_token_getter = accepted_token_getter
         self._authority_generation = 0
+        self._instruction_read_files: frozenset[Path] = frozenset()
         self._registry_generation = 0
         self._authority_cache: dict[
             str, tuple[tuple[object, ...], type[BaseToolConfig], str]
@@ -474,6 +476,79 @@ class ToolManager:
             else (parent is not None and parent._available_tool(tool_name) is not None)
         )
 
+    def path_authority(self, tool_name: str) -> PathAuthority:
+        """Capture local policy with live chain-walked runtime capabilities."""
+        if self._authority_retired:
+            raise NoSuchToolError("Tool manager authority retired")
+        config = self.get_tool_config(tool_name)
+        tool_class = self._available_tool(tool_name)
+        if tool_class is None:
+            raise NoSuchToolError(f"Unknown or disabled tool: {tool_name}")
+        return PathAuthority(
+            tool_name,
+            config.permission,
+            tuple(config.allowlist),
+            tuple(config.denylist),
+            tool_class.path_sensitive_patterns(config),
+            self.workspace,
+            self._scratchpad_dir,
+            self.scratchpad_roots,
+            self.instruction_read_files,
+            plan_file_write_scope=(
+                self._plan_file_write_scope_getter()
+                if tool_name in {"write_file", "edit"}
+                and self._plan_file_write_scope_getter is not None
+                else None
+            ),
+            inherited_plan_write_scopes=(
+                self._inherited_plan_write_scopes
+                if tool_name in {"write_file", "edit"}
+                else ()
+            ),
+        )
+
+    def snapshot_path_authority(
+        self, tool_name: str, resolver: Callable[..., Any]
+    ) -> tuple[tuple[object, ...] | None, PathAuthority | None]:
+        """Conjoin builtin path policies only when the entire chain is versioned.
+
+        Unavailable or custom policies require live invocation resolution, never
+        an approximation that could turn missing authority into permission.
+        """
+        from dataclasses import replace
+
+        token = self._effective_authority_token()
+        if token is None:
+            return None, None
+        states: list[PathAuthority] = []
+        try:
+            roots = self.scratchpad_roots
+            files = self.instruction_read_files
+            cursor: ToolManager | None = self
+            while cursor is not None:
+                if cursor._authority_retired or not cursor._name_versionable(tool_name):
+                    return None, None
+                tool = cursor.get(tool_name)
+                if type(tool).resolve_permission is not resolver:
+                    return token, None
+                states.append(
+                    replace(
+                        cursor.path_authority(tool_name),
+                        scratchpad_roots=roots,
+                        instruction_read_files=files,
+                    )
+                )
+                cursor = (
+                    cursor._parent_authority()
+                    if cursor._parent_authority_getter is not None
+                    else None
+                )
+        except Exception:
+            return None, None
+        if self._effective_authority_token() != token:
+            return None, None
+        return token, replace(states[0], parents=tuple(states[1:]))
+
     def _parent_permission(self, tool_name: str, args: Any) -> Any:
         """Return a parent invocation denial, including tool-specific guards."""
         from chartreux.core.tools.permissions import PermissionContext
@@ -488,7 +563,16 @@ class ToolManager:
             )
         try:
             parent_tool = parent.get(tool_name)
-            parent_context = parent_tool.resolve_permission(args)
+            from chartreux.core.tools.utils import (
+                instruction_read_ceiling,
+                scratchpad_ceiling,
+            )
+
+            with (
+                instruction_read_ceiling(self.instruction_read_files),
+                scratchpad_ceiling(self.scratchpad_roots),
+            ):
+                parent_context = parent_tool.resolve_permission(args)
             if parent.get_tool_config(tool_name).permission == ToolPermission.NEVER:
                 return PermissionContext(
                     permission=ToolPermission.NEVER,
@@ -991,6 +1075,20 @@ class ToolManager:
             self._workspace_cache = (token, workspace)
         return workspace
 
+    def _tool_authority_is_current(
+        self, tool_name: str, tool_class: type[BaseTool]
+    ) -> bool:
+        try:
+            if tool_name in {"read_file", "read_image", "write_file", "edit"}:
+                # Validate the chain before availability recursively visits parents.
+                _ = self.scratchpad_roots
+            return (
+                not self._authority_retired
+                and self._available_tool(tool_name) is tool_class
+            )
+        except Exception:
+            return False
+
     def get(self, tool_name: str) -> BaseTool:
         """Get a tool instance, creating it lazily on first call.
 
@@ -999,6 +1097,8 @@ class ToolManager:
         """
         if self._authority_retired:
             raise NoSuchToolError("Tool manager authority retired")
+        if tool_name in {"read_file", "read_image", "write_file", "edit"}:
+            _ = self.scratchpad_roots
         tool_class = self._available_tool(tool_name)
         if tool_class is None:
             raise NoSuchToolError(f"Unknown or disabled tool: {tool_name}")
@@ -1013,6 +1113,10 @@ class ToolManager:
         )
         instance.workspace = self.workspace
         instance._workspace_getter = lambda: self.workspace
+        instance.instruction_read_files_getter = lambda: self.instruction_read_files
+        instance.scratchpad_roots_getter = lambda: self.scratchpad_roots
+        instance.path_authority_getter = lambda: self.path_authority(tool_name)
+        instance.owned_scratchpad_getter = lambda: self._scratchpad_dir
         runtime_config_setter = getattr(instance, "_set_runtime_config_getter", None)
         if runtime_config_setter is not None:
             runtime_config_setter(self._config_getter)
@@ -1020,10 +1124,7 @@ class ToolManager:
             instance.plan_file_write_scope_getter = self._plan_file_write_scope_getter
         instance.inherited_plan_write_scopes = self._inherited_plan_write_scopes
         instance._bind_authority(
-            lambda: (
-                not self._authority_retired
-                and self._available_tool(tool_name) is tool_class
-            ),
+            lambda: self._tool_authority_is_current(tool_name, tool_class),
             lambda args: self._parent_permission(tool_name, args),
         )
         if tool_name == "grep":
@@ -1037,6 +1138,74 @@ class ToolManager:
         if self._mcp_registry is None:
             return {}
         return self._mcp_registry.pop_failed()
+
+    @property
+    def instruction_read_files(self) -> frozenset[Path]:
+        """Per-agent prompt files plus live inherited read capabilities.
+
+        These exact-file grants never enter Workspace.authorized_roots. Ancestor
+        denials are checked separately against the requesting agent's manifest.
+        """
+        files: set[Path] = set()
+        seen: set[int] = set()
+        cursor: ToolManager | None = self
+        while cursor is not None:
+            if cursor._authority_retired or id(cursor) in seen:
+                raise NoSuchToolError("Instruction read authority unavailable")
+            seen.add(id(cursor))
+            files.update(cursor._instruction_read_files)
+            if cursor._parent_authority_getter is None:
+                break
+            cursor = cursor._parent_authority()
+            if cursor is None:
+                raise NoSuchToolError("Parent instruction read authority unavailable")
+        return frozenset(files)
+
+    def _instruction_read_token(self) -> tuple[tuple[int, int], ...]:
+        """Version runtime manifest publications even in uncached policy chains."""
+        tokens: list[tuple[int, int]] = []
+        seen: set[int] = set()
+        cursor: ToolManager | None = self
+        while cursor is not None:
+            if cursor._authority_retired or id(cursor) in seen:
+                raise NoSuchToolError("Instruction read authority unavailable")
+            seen.add(id(cursor))
+            tokens.append((id(cursor), cursor._authority_generation))
+            if cursor._parent_authority_getter is None:
+                break
+            cursor = cursor._parent_authority()
+            if cursor is None:
+                raise NoSuchToolError("Parent instruction read authority unavailable")
+        return tuple(tokens)
+
+    def set_instruction_read_files(self, files: frozenset[Path]) -> None:
+        """Publish canonical loader identities without re-resolving or persisting."""
+        if files != self._instruction_read_files:
+            self._instruction_read_files = frozenset(files)
+            self._authority_generation += 1
+
+    @property
+    def scratchpad_roots(self) -> frozenset[Path]:
+        """Live inherited scratch access; never transfers directory ownership.
+
+        Identities are absolute and checked for symlink replacement at invocation.
+        Each ancestor still applies its own denial and Plan ceilings.
+        """
+        roots: set[Path] = set()
+        seen: set[int] = set()
+        cursor: ToolManager | None = self
+        while cursor is not None:
+            if cursor._authority_retired or id(cursor) in seen:
+                raise NoSuchToolError("Scratchpad authority unavailable")
+            seen.add(id(cursor))
+            if cursor._scratchpad_dir is not None:
+                roots.add(cursor._scratchpad_dir.absolute())
+            if cursor._parent_authority_getter is None:
+                break
+            cursor = cursor._parent_authority()
+            if cursor is None:
+                raise NoSuchToolError("Parent scratchpad authority unavailable")
+        return frozenset(roots)
 
     def set_scratchpad_dir(self, scratchpad_dir: Path | None) -> None:
         """Replace session scratch authority for both cached and future tools."""

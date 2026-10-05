@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+from weakref import WeakValueDictionary
 
 from textual.widget import Widget
 
@@ -78,7 +80,7 @@ class _RetryPresentation:
 
 
 class EventHandler:
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         mount_callback: Callable,
         get_tools_collapsed: Callable[[], bool],
@@ -87,12 +89,24 @@ class EventHandler:
         on_session_title_changed: Callable[[str], None] | None = None,
         entry_expansion_state: EntryExpansionState | None = None,
         group_expansion_state: ToolGroupExpansionState | None = None,
+        get_show_message_timestamps: Callable[[], bool] | None = None,
+        on_user_message: Callable[[PublicMessageEntry], None] | None = None,
+        mounted_entry_widgets: Callable[[str], list[Widget]] | None = None,
+        *,
+        update_retained_entry: Callable[[PublicHistoryEntry], None] | None = None,
     ) -> None:
+        self.update_retained_entry = update_retained_entry or (lambda _entry: None)
+        self.assistant_entry_widgets: WeakValueDictionary[str, AssistantMessage] = (
+            WeakValueDictionary()
+        )
         self.mount_callback = mount_callback
+        self.mounted_entry_widgets = mounted_entry_widgets or (lambda _entry_id: [])
         self.entry_expansion_state = entry_expansion_state
         self.group_expansion_state = group_expansion_state
         self.get_tools_collapsed = get_tools_collapsed
         self.get_show_thinking = get_show_thinking or (lambda: True)
+        self.get_show_message_timestamps = get_show_message_timestamps or (lambda: True)
+        self.on_user_message = on_user_message or (lambda _entry: None)
         self.on_context_cleared = on_context_cleared
         self.on_session_title_changed = on_session_title_changed
         self.tool_calls: dict[str, ToolCallMessage] = {}
@@ -169,10 +183,14 @@ class EventHandler:
 
         match entry:
             case PublicMessageEntry(role="assistant"):
-                await self._handle_assistant_delta(entry.text, loading_widget)
+                await self._handle_assistant_delta(
+                    entry.text, loading_widget, entry.posted_at
+                )
+                self._reconcile_stream_timing(entry)
                 if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
                     await self.finalize_streaming()
             case PublicMessageEntry(role="user"):
+                self.on_user_message(entry)
                 self.cancel_retry_presentation()
                 await self.finalize_streaming()
             case PublicMessageEntry(role="system"):
@@ -207,14 +225,60 @@ class EventHandler:
                 )
         return None
 
-    async def _handle_entry_updated(
+    def _reconcile_stream_timing(self, entry: PublicMessageEntry) -> None:
+        if self.current_streaming_message is not None:
+            self.assistant_entry_widgets[entry.id] = self.current_streaming_message
+            self.current_streaming_message.reconcile_timing(entry.turn_duration_ms)
+
+    def _reconcile_mounted_timing(self, entry: PublicHistoryEntry) -> None:
+        widgets = self.mounted_entry_widgets(entry.id)
+        self.update_retained_entry(entry)
+        # Retry continuations can share a root with the preceding public entry.
+        assistant = self.assistant_entry_widgets.get(entry.id)
+        if (
+            assistant is not None
+            and assistant.is_mounted
+            and assistant.parent is not None
+        ):
+            if assistant not in widgets:
+                widgets.append(assistant)
+        for widget in widgets:
+            if isinstance(widget, AssistantMessage) and isinstance(
+                entry, PublicMessageEntry
+            ):
+                widget.reconcile_timing(entry.turn_duration_ms)
+            elif isinstance(widget, ToolResultMessage) and isinstance(
+                entry, PublicEffectEntry
+            ):
+                widget.update_timing(entry)
+            elif isinstance(widget, ToolCallMessage) and isinstance(
+                entry, PublicEffectEntry
+            ):
+                widget.update_entry(entry)
+
+    async def _handle_entry_updated(  # noqa: PLR0912
         self, update: HistoryEntryUpdated, loading_widget: LoadingWidget | None
     ) -> None:
         entry = update.entry
+        if update.patch and all(
+            operation.op in {"add", "replace"}
+            and operation.path in {"/turnDurationMs", "/state/durationMs"}
+            for operation in update.patch
+        ):
+            self._reconcile_mounted_timing(entry)
+            return
         match entry:
             case PublicMessageEntry(role="assistant"):
                 if delta := _appended_text(update.patch, "/content/0/text"):
-                    await self._handle_assistant_delta(delta, loading_widget)
+                    await self._handle_assistant_delta(
+                        delta, loading_widget, entry.posted_at
+                    )
+                    self._reconcile_stream_timing(entry)
+                elif (
+                    self.current_streaming_message is not None
+                    and self.current_streaming_message.header.posted_at is None
+                ):
+                    self.current_streaming_message.reconcile_timestamp(entry.posted_at)
                 if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
                     await self.finalize_streaming()
             case PublicReasoningEntry():
@@ -248,7 +312,9 @@ class EventHandler:
             existing.update_entry(entry)
             tool_call = existing
         else:
-            tool_call = ToolCallMessage(entry)
+            tool_call = ToolCallMessage(
+                entry, show_message_timestamps=self.get_show_message_timestamps()
+            )
             self.tool_calls[entry.id] = tool_call
             self._tool_call_anchors[entry.id] = tool_call
             if not entry_keeps_tool_group(entry):
@@ -274,7 +340,10 @@ class EventHandler:
         call_widget = self.tool_calls.get(entry.id)
         anchor = self._tool_call_anchors.get(entry.id) or call_widget
         result = ToolResultMessage(
-            entry, call_widget, expansion_state=self.entry_expansion_state
+            entry,
+            call_widget,
+            expansion_state=self.entry_expansion_state,
+            show_message_timestamps=self.get_show_message_timestamps(),
         )
         await self.mount_callback(result, after=anchor)
         position = self._tool_group_call_positions.pop(entry.id, None)
@@ -311,7 +380,10 @@ class EventHandler:
             loading_widget.set_status(DEFAULT_LOADING_STATUS)
 
     async def _handle_assistant_delta(
-        self, content: str, loading_widget: LoadingWidget | None
+        self,
+        content: str,
+        loading_widget: LoadingWidget | None,
+        posted_at: datetime | None = None,
     ) -> None:
         if self.current_streaming_reasoning is not None:
             self.current_streaming_reasoning.stop_spinning()
@@ -326,11 +398,17 @@ class EventHandler:
                 self._turn_assistant_message = message
                 await message.append_content(content)
                 return
-            message = AssistantMessage(content)
+            message = AssistantMessage(
+                content,
+                posted_at=posted_at,
+                show_message_timestamps=self.get_show_message_timestamps(),
+            )
             self.current_streaming_message = message
             self._turn_assistant_message = message
             await self.mount_callback(message)
             return
+        if self.current_streaming_message.header.posted_at is None:
+            self.current_streaming_message.reconcile_timestamp(posted_at)
         await self.current_streaming_message.append_content(content)
 
     async def _resolve_retry_presentation(
@@ -484,7 +562,9 @@ class EventHandler:
                 self.current_tool_group = group
                 return group
             group = ToolGroup(
-                key=ToolGroupKey(entry_id), expansion_state=self.group_expansion_state
+                key=ToolGroupKey(entry_id),
+                expansion_state=self.group_expansion_state,
+                show_message_timestamps=self.get_show_message_timestamps(),
             )
             self.current_tool_group = group
             self._current_tool_group_next_position = 0

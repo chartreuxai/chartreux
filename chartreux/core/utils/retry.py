@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Awaitable, Callable
-from contextlib import aclosing
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
+from contextlib import aclosing, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum, auto
 import functools
@@ -18,6 +19,24 @@ from chartreux.core.llm.failures import RequestRetryBudget, classify_failure
 logger = logging.getLogger("vibe")
 
 _DEFAULT_MAX_DELAY_SECONDS = 60.0
+_LOGICAL_RETRY_BUDGET: ContextVar[RequestRetryBudget | None] = ContextVar(
+    "logical_retry_budget", default=None
+)
+
+
+@contextmanager
+def bind_retry_budget(budget: RequestRetryBudget) -> Iterator[None]:
+    """Bind a logical deadline for backend operations in the current task.
+
+    Scope this around await, anext, or aclose only, never an outward yield:
+    async generators execute in their consumer's context.
+    """
+    token = _LOGICAL_RETRY_BUDGET.set(budget)
+    try:
+        yield
+    finally:
+        _LOGICAL_RETRY_BUDGET.reset(token)
+
 
 _RETRYABLE_REQUEST_ERRORS: tuple[type[httpx.RequestError], ...] = (
     httpx.TimeoutException,
@@ -185,7 +204,9 @@ def async_retry[T, **P](
         @functools.wraps(func)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
             last_exc = None
-            active_budget = budget
+            active_budget = (
+                budget if budget is not None else _LOGICAL_RETRY_BUDGET.get()
+            )
             start = time.monotonic() if max_elapsed_time is not None else 0.0
             attempts = count() if tries is None else range(tries)
             for attempt in attempts:
@@ -281,7 +302,9 @@ def async_generator_retry[T, **P](
         @functools.wraps(func)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> AsyncGenerator[T]:
             last_exc = None
-            active_budget = budget
+            active_budget = (
+                budget if budget is not None else _LOGICAL_RETRY_BUDGET.get()
+            )
             start = time.monotonic() if max_elapsed_time is not None else 0.0
             attempts = count() if tries is None else range(tries)
             for attempt in attempts:

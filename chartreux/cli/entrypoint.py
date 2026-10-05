@@ -23,6 +23,7 @@ from chartreux import __version__
 # (pydantic, textual, rich) at import time.
 
 if TYPE_CHECKING:
+    from chartreux.core._usage_startup import StartupAccountingContext
     from chartreux.core.git.worktree import PreparedWorktree, WorktreeCleanupState
     from chartreux.core.git.worktree.record import OwnershipToken
 
@@ -195,8 +196,9 @@ def _enter_worktree(
         with WorktreeRepository.open(Path.cwd()) as repository:
             if args.worktree is True:
                 prompt = args.prompt or args.initial_prompt
+                suggested_name, args.startup_accounting = _suggest_worktree_name(prompt)
                 session = repository.prepare_auto(
-                    prompt=prompt, suggested_name=_suggest_worktree_name(prompt)
+                    prompt=prompt, suggested_name=suggested_name
                 )
             else:
                 session = repository.prepare(args.worktree)
@@ -355,11 +357,13 @@ def _cleanup_worktree_on_exit(  # noqa: PLR0911
         rprint(f"[dim]Kept branch: {worktree.branch}[/]", file=sys.stderr)
 
 
-def _suggest_worktree_name(prompt: str | None) -> str | None:
+def _suggest_worktree_name(
+    prompt: str | None,
+) -> tuple[str | None, StartupAccountingContext | None]:
     # Bare `vibe --worktree` has nothing to name from, so skip the dotenv read
     # and the event loop rather than spinning both up to be told None.
     if not prompt:
-        return None
+        return None, None
 
     import asyncio
 
@@ -375,7 +379,32 @@ def _suggest_worktree_name(prompt: str | None) -> str | None:
     # init with these same sources returns without replacing the singleton.
     load_dotenv_values()
     init_harness_files_manager("user", "project")
-    return asyncio.run(suggest_worktree_name(prompt, cwd=Path.cwd()))
+    original_workspace = Path.cwd()
+
+    async def suggest() -> tuple[str | None, StartupAccountingContext]:
+        from chartreux.core._usage_startup import create_startup_accounting_context
+        from chartreux.core.usage import AsyncUsageWriter
+
+        context = await create_startup_accounting_context(original_workspace)
+        writer = AsyncUsageWriter(writer=context.writer)
+        unsubscribe = writer.subscribe(context.on_early_settlement)
+        try:
+            # Await the producer directly: it must finish finalization before
+            # this loop closes. Only the durable context crosses into run_cli.
+            suggestion = await suggest_worktree_name(
+                prompt,
+                cwd=original_workspace,
+                accounting_sink=writer,
+                usage_attribution_factory=context.attribution,
+            )
+            return suggestion, context
+        finally:
+            try:
+                await writer.aclose()
+            finally:
+                unsubscribe()
+
+    return asyncio.run(suggest())
 
 
 def _set_process_title() -> None:

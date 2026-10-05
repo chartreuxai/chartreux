@@ -38,6 +38,125 @@ method list, including typed parameter and result models. It covers:
   trust and Git worktree operations; and
 - MCP catalog read/add/remove/toggle/refresh/login/logout operations.
 
+## Usage accounting
+
+`usage/read` is a host-level method available after initialization, before session
+attachment and during active turns. It does not create a session or require an
+idle turn. Parameters are `window` (`day`, `week`, or `month`, default `day`) and
+nullable `projectKey` (default `null`, meaning all projects). Reads reconcile local
+ledger changes. Wire field names use camelCase.
+
+```json
+{"jsonrpc":"2.0","id":12,"method":"usage/read","params":{"window":"day","projectKey":null}}
+```
+
+The result contains:
+
+| Field | Contract |
+| --- | --- |
+| `asOf`, `revision` | One aware timestamp and non-negative revision shared by all summaries and detail. |
+| `summaries` | `day`, `week`, and `month` totals, all subject to the request's project filter. |
+| `window`, `models`, `components` | Selected window, rows grouped by `(model, provider, wireName)`, and `uncachedInput`/`cachedInput`/`output` breakdown. |
+| `projectKey` | Attached root's resolved project identity, not the request filter; `null` before attachment. Use it for a later Current project read. |
+| `warnings` | Coverage warnings with `code` and nullable `rootSessionId`/`recordId`, never paths or exception text. Codes: `write-failed`, `unreadable`, `malformed-record`, `torn-tail`, `unsupported-schema`. |
+
+Each window summary has `state` (`loading`, `ready`, or `unavailable`), `requests`,
+`inputTokens`, `outputTokens`, `cachedInputTokens`, `hasUnknownTokens`,
+`knownCostUsd`, `hasKnownCost`, and `hasUnknownCost`. It also has aware
+`startLocal`/`endLocal` and `startUtc`/`endUtc` boundaries, `timezone`, and
+`currency` (`USD`). Windows are half-open `[start, end)`, using the system-local
+calendar day, Monday-start week, and calendar month. Calls count at completion.
+
+Model rows carry the same totals plus `model`, `provider`, and `wireName`.
+Components carry `tokens`, `hasUnknownTokens`, `knownCostUsd`, `hasKnownCost`,
+and `hasUnknownCost`. Cached input is a subset of summary/model input counts;
+component `uncachedInput` excludes it. Known amounts and token counts are lower
+bounds when their unknown flags are set. A ready empty window is zero; unpriced
+calls are not known zero. Costs use captured catalog rates, not provider invoices.
+
+For example, this is the `summaries.day` portion of a ready response with one
+partially priced call (the full result also includes week/month and detail):
+
+```json
+{
+  "state": "ready", "requests": 1,
+  "inputTokens": 1000, "outputTokens": 200, "cachedInputTokens": 0,
+  "hasUnknownTokens": false,
+  "knownCostUsd": 0.01, "hasKnownCost": true, "hasUnknownCost": true,
+  "startLocal": "2026-10-01T00:00:00+00:00",
+  "endLocal": "2026-10-02T00:00:00+00:00",
+  "startUtc": "2026-10-01T00:00:00Z",
+  "endUtc": "2026-10-02T00:00:00Z",
+  "timezone": "UTC", "currency": "USD"
+}
+```
+
+`usage/updated` is a coalesced host-level notification containing only `asOf`,
+`revision`, and `summaries`. Its day/week/month summaries are always global,
+regardless of the last read's filter. It is independent of session event sequencing
+and has no `sessionId` or event ID. Initialized unattached clients can receive it
+unless notifications are disabled. Updates follow local appends, reconciliation,
+and calendar rollover; they are not a per-call event stream. Clients deduplicate
+by revision and read afresh after reconnecting. To discover external-process
+appends, issue `usage/read` on open/refresh; the TUI also polls about every 60
+seconds while spend segments are enabled.
+
+For example, a notification envelope uses the same three summary objects as a
+read response. In this Python example, `response` is a `UsageReadResponse`:
+
+```python
+notification = {
+    "jsonrpc": "2.0",
+    "method": "usage/updated",
+    "params": {
+        "asOf": response.as_of.isoformat(),
+        "revision": response.revision,
+        "summaries": response.summaries.model_dump(mode="json", by_alias=True),
+    },
+}
+```
+
+Build this example from an unfiltered response, not a Current project read.
+`stats/read` and `session/statsUpdated` remain session statistics; the ledger
+contracts do not change their conversation-scoped accounting.
+
+## Steering during subagent waits
+
+`PublicTurn.waiting_only` identifies an active turn whose remaining work is only
+subagent waits. Clients can submit `turn/steer` with `requireWaitingOnly: true`,
+the `expectedTurnId`, and a nonempty `idempotencyKey`. The server rechecks the
+live turn and admission fences rather than trusting the client's snapshot.
+Accepted steering cancels the waits, not child runs, and keeps the current turn
+so the model receives the input immediately.
+
+Retry the same payload with the same key to recover its delivery receipt without
+injecting it twice; reusing a key with a different payload is rejected. Receipts
+are bounded and runtime-local, not durable recovery records. A transport failure
+or expired receipt is not proof of nondelivery: clients must preserve uncertainty
+instead of automatically queueing a possible duplicate.
+
+## Background run cancellation
+
+`agents/cancel` accepts `{"agentId": "…", "runId": "…"}`. `runId` may be
+omitted to snapshot the active run; interactive confirmations should pin it to
+avoid stopping a newer run. `AppServerSession.cancel_agent(agent_id, run_id)`
+returns a typed public response with `outcome`, nullable `runId`, and nullable
+`stopReason`.
+
+The outcomes are `stop_requested`, `already_stopping`, `already_finishing`,
+`not_running`, `unknown_run`, and `forbidden`. Acceptance requests a stop; it
+does not confirm terminal cancellation. Observe `agents/update` for settlement.
+The winning stop reason is first-writer-wins, so a racing orchestrator stop may
+retain its reason rather than `user_cancelled`.
+
+This user-authorized operation stops only the selected background run, not the
+root turn or siblings. It remains available during root lifecycle work while
+attachment and shutdown fences still apply. Retained agent identity, transcript,
+and partial results are preserved subject to retention and release policy.
+User-cancelled completion is injected into the parent: an idle parent learns at
+its next turn and is never auto-started. Root interruption remains the separate
+`turn/interrupt` operation.
+
 ## Settings projection and writes
 
 `config/settings/read` returns the curated settings view and the current user

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, assert_never, cast
 from uuid import uuid4
 
-from chartreux.app_server._patch import apply_json_patch
+from chartreux.app_server._patch import apply_json_patch, is_timing_only_patch
 from chartreux.app_server._projection import project_message_content
 from chartreux.app_server._root_session import rebind_history
 from chartreux.app_server._tool_projection import (
@@ -17,6 +18,7 @@ from chartreux.app_server.models import (
     CallbackDetail,
     CallbackOutput,
     CancelledEffectState,
+    CompletedEffectState,
     EffectCallDisplay,
     EffectDetail,
     EffectResultDisplay,
@@ -71,6 +73,8 @@ from chartreux.core.hooks.models import (
     HookRunStartEvent,
     HookStartEvent,
 )
+from chartreux.core.llm_models import LLMMessage
+from chartreux.core.timing import CompletedTurnTiming
 from chartreux.user_content import UserResource, UserResourceLink
 
 
@@ -388,10 +392,35 @@ class EventProjector:
                 )
         return updates
 
-    def finalize(self, *, cancelled: bool = False) -> list[ProjectedUpdate]:
+    def finalize(
+        self,
+        *,
+        cancelled: bool = False,
+        timing: CompletedTurnTiming | None = None,
+        messages: Sequence[LLMMessage] = (),
+        replay_timing: bool = False,
+    ) -> list[ProjectedUpdate]:
         updates: list[ProjectedUpdate] = []
         for entry in list(self._entries.values()):
             if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
+                if replay_timing:
+                    operations = [
+                        JsonPatchOperation(
+                            op="replace", path="/generationStatus", value="completed"
+                        )
+                    ]
+                    if isinstance(entry, PublicEffectEntry | PublicCallbackEntry):
+                        operations.insert(
+                            0,
+                            JsonPatchOperation(
+                                op="replace",
+                                path="/state",
+                                value=entry.state.model_dump(
+                                    mode="json", by_alias=True
+                                ),
+                            ),
+                        )
+                    updates.append(self._patch(entry.id, operations))
                 continue
             operations: list[JsonPatchOperation] = []
             if isinstance(entry, PublicEffectEntry):
@@ -434,6 +463,52 @@ class EventProjector:
                 )
             )
             updates.append(self._patch(entry.id, operations))
+        # Timing settles after iterator close and tool join, including events the
+        # cancelled queue consumer never drained. Reconcile even completed entries.
+        if timing is not None:
+            entry_id = self._assistant_entries.get(timing.message_id)
+            entry = self._entries.get(entry_id) if entry_id is not None else None
+            if isinstance(entry, PublicMessageEntry):
+                duration_ms = timing.duration * 1000
+                if replay_timing or entry.turn_duration_ms != duration_ms:
+                    updates.append(
+                        self._patch(
+                            entry.id,
+                            [
+                                JsonPatchOperation(
+                                    op="replace",
+                                    path="/turnDurationMs",
+                                    value=duration_ms,
+                                )
+                            ],
+                        )
+                    )
+        for message in messages:
+            persisted = message.tool_result
+            entry_id = self._effect_entries.get(message.tool_call_id or "")
+            entry = self._entries.get(entry_id) if entry_id is not None else None
+            if persisted is None or persisted.duration is None:
+                continue
+            if (
+                isinstance(entry, PublicEffectEntry)
+                and isinstance(
+                    entry.state,
+                    CompletedEffectState | FailedEffectState | CancelledEffectState,
+                )
+                and (replay_timing or entry.state.duration_ms is None)
+            ):
+                updates.append(
+                    self._patch(
+                        entry.id,
+                        [
+                            JsonPatchOperation(
+                                op="replace",
+                                path="/state/durationMs",
+                                value=persisted.duration * 1000,
+                            )
+                        ],
+                    )
+                )
         return updates
 
     def _entry_fields(
@@ -469,13 +544,18 @@ class EventProjector:
         self, entry_id: str, operations: list[JsonPatchOperation]
     ) -> ProjectedUpdate:
         entry = self._entries[entry_id]
-        if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
+        timing_only = is_timing_only_patch(entry, operations)
+        if (
+            entry.generation_status is PublicEntryGenerationStatus.COMPLETED
+            and not timing_only
+        ):
             raise ValueError(f"Completed public history entry is frozen: {entry_id}")
         timestamp = now_ms()
-        operations = [
-            *operations,
-            JsonPatchOperation(op="replace", path="/updatedAt", value=timestamp),
-        ]
+        if not timing_only:
+            operations = [
+                *operations,
+                JsonPatchOperation(op="replace", path="/updatedAt", value=timestamp),
+            ]
         raw = entry.model_dump(mode="json", by_alias=True)
         patched = apply_json_patch(raw, operations)
         updated = validate_history_entry(patched)
@@ -527,6 +607,7 @@ class EventProjector:
                         event.message_id, PublicEntryGenerationStatus.COMPLETED
                     ),
                     role="user",
+                    posted_at=event.posted_at,
                     content=project_message_content(
                         event.content, event.images, event.resources
                     ),
@@ -567,6 +648,7 @@ class EventProjector:
             PublicMessageEntry(
                 **self._entry_fields(entry_id, PublicEntryGenerationStatus.IN_PROGRESS),
                 role="assistant",
+                posted_at=event.posted_at,
                 content=[TextContentBlock(text=event.content)],
             )
         )

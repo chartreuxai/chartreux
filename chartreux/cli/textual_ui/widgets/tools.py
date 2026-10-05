@@ -272,8 +272,10 @@ class ToolGroup(Vertical):
         *,
         key: ToolGroupKey | None = None,
         expansion_state: ToolGroupExpansionState | None = None,
+        show_message_timestamps: bool = True,
     ) -> None:
         super().__init__(classes="tool-group")
+        self.show_message_timestamps = show_message_timestamps
         self._key = key
         self._expansion_state = expansion_state
         self._header = ToolGroupHeader()
@@ -288,13 +290,17 @@ class ToolGroup(Vertical):
 
     def compose(self) -> ComposeResult:
         yield self._header
-        self._content.display = not self._is_collapsed
-        self._border.display = not self._is_collapsed
+        self._header.display = not self.show_message_timestamps
+        self._content.display = self.show_message_timestamps or not self._is_collapsed
+        self._border.display = (
+            not self.show_message_timestamps and not self._is_collapsed
+        )
         with Horizontal(classes="tool-group-body"):
             yield self._border
             yield self._content
 
     def on_mount(self) -> None:
+        self._apply_folding_mode()
         self._header.set_collapsed(self._is_collapsed)
         self._header._update_text()
 
@@ -351,17 +357,65 @@ class ToolGroup(Vertical):
     def resume(self) -> None:
         self._header.resume()
 
+    def set_show_message_timestamps(self, show: bool) -> None:
+        changed = self.show_message_timestamps != show
+        self.show_message_timestamps = show
+        if changed:
+            self._apply_folding_mode()
+        for widget in self._content.query(ToolCallMessage):
+            widget.set_show_message_timestamps(show)
+        for widget in self._content.query(ToolResultMessage):
+            widget.set_show_message_timestamps(show)
+
+    def _apply_folding_mode(self) -> None:
+        timing = self.show_message_timestamps
+        self._content.display = timing or not self._is_collapsed
+        if self.is_mounted:
+            focused = self.screen.focused
+            if timing and focused is self._header:
+                target = next(
+                    (
+                        row
+                        for row in self._content.query(DisclosureHeader)
+                        if row.can_focus
+                        and all(
+                            node.display
+                            for node in row.ancestors_with_self
+                            if isinstance(node, Widget)
+                        )
+                    ),
+                    None,
+                )
+                if target is not None:
+                    self.screen.set_focus(target)
+            elif (
+                not timing
+                and self._is_collapsed
+                and focused is not None
+                and self._content in focused.ancestors_with_self
+            ):
+                self._header.display = True
+                self.screen.set_focus(self._header)
+        self._header.display = not timing
+        self._border.display = not timing and not self._is_collapsed
+        self.set_class(timing, "timing-enabled")
+        for section in self._content.query(CollapsibleSection):
+            section.set_group_folded(timing and self._is_collapsed)
+        for result in self._content.query(ToolResultMessage):
+            if not result._is_collapsible:
+                result.display = not (timing and self._is_collapsed)
+
     def set_collapsed(self, collapsed: bool) -> None:
         if (
             collapsed
+            and not self.show_message_timestamps
             and self._content.is_mounted
             and self.screen.focused is not None
             and self._content in self.screen.focused.ancestors_with_self
         ):
             self._header.focus()
         self._is_collapsed = collapsed
-        self._content.display = not collapsed
-        self._border.display = not collapsed
+        self._apply_folding_mode()
         self._header.set_collapsed(collapsed)
         if self._key is not None and self._expansion_state is not None:
             self._expansion_state.set_collapsed(self._key, collapsed)
@@ -379,7 +433,10 @@ class ToolGroup(Vertical):
 class ToolCallMessage(StatusMessage):
     SETTLED_GLYPH = ""
 
-    def __init__(self, entry: PublicEffectEntry) -> None:
+    def __init__(
+        self, entry: PublicEffectEntry, *, show_message_timestamps: bool = True
+    ) -> None:
+        self.show_message_timestamps = show_message_timestamps
         self._entry = entry
         self._tool_name = entry.detail.tool_name
         self._stream_expanded = False
@@ -433,6 +490,7 @@ class ToolCallMessage(StatusMessage):
                 )
                 self._suffix_widget.display = False
                 yield self._suffix_widget
+                yield self._header_row.duration_slot
             self._stream_widget = NoMarkupStatic("", classes="tool-stream-message")
             self._stream_widget.display = False
             yield self._stream_widget
@@ -507,6 +565,7 @@ class ToolCallMessage(StatusMessage):
     def update_entry(self, entry: PublicEffectEntry) -> None:
         previous_header = self._header_parts()
         self._entry = entry
+        self._refresh_timing()
         self._tool_name = entry.detail.tool_name
         verb, message, suffix = self._header_parts()
         if (verb, message, suffix) != previous_header:
@@ -595,8 +654,20 @@ class ToolCallMessage(StatusMessage):
             # sits right after it; otherwise the title takes 1fr and wraps.
             self._header_row.set_class(bool(suffix), "has-suffix")
 
+    def set_show_message_timestamps(self, show: bool) -> None:
+        self.show_message_timestamps = show
+        self._refresh_timing()
+
+    def _refresh_timing(self) -> None:
+        if isinstance(self._header_row, DisclosureHeader):
+            self._header_row.set_duration(
+                getattr(self._entry.state, "duration_ms", None),
+                show=self.show_message_timestamps,
+            )
+
     def update_display(self) -> None:
         super().update_display()
+        self._refresh_timing()
         verb, _, suffix = self._header_parts()
         if self._header_row is not None:
             self._header_row.set_class(self._is_spinning, "running")
@@ -625,7 +696,9 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
         call_widget: ToolCallMessage | None = None,
         *,
         expansion_state: EntryExpansionState | None = None,
+        show_message_timestamps: bool = True,
     ) -> None:
+        self.show_message_timestamps = show_message_timestamps
         self._entry = entry
         self._expansion_state = expansion_state
         if expansion_state is not None and (
@@ -666,8 +739,25 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
             self._content_container = Vertical(classes="tool-result-content")
             yield self._content_container
 
+    def update_timing(self, entry: PublicEffectEntry) -> None:
+        self._entry = entry
+        if self._call_widget is not None:
+            self._call_widget.update_entry(entry)
+        self.set_show_message_timestamps(self.show_message_timestamps)
+
+    def set_show_message_timestamps(self, show: bool) -> None:
+        self.show_message_timestamps = show
+        for section in self.query(HeaderCollapsibleSection):
+            if isinstance(section._toggle_row, DisclosureHeader):
+                section._toggle_row.set_duration(
+                    getattr(self._state, "duration_ms", None), show=show
+                )
+        if self._call_widget is not None:
+            self._call_widget.set_show_message_timestamps(show)
+
     async def on_mount(self) -> None:
         if self._call_widget:
+            self._call_widget.update_entry(self._entry)
             if isinstance(self._state, FailedEffectState):
                 # Start muted; the verdict (recoverable vs terminal) lands later.
                 self._call_widget.show_muted()
@@ -704,6 +794,7 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
             self.parent.parent, ToolGroup
         ):
             self.parent.parent.header._update_text()
+            self.parent.parent._apply_folding_mode()
 
     def recompute_gap(self) -> None:
         self.set_class(self._needs_standalone_gap(), "has-gap")
@@ -806,6 +897,25 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
             collapsed = True
         await container.mount(section)
         section.set_collapsed(collapsed)
+        if isinstance(section, HeaderCollapsibleSection) and isinstance(
+            section._toggle_row, DisclosureHeader
+        ):
+            section._toggle_row.set_duration(
+                getattr(self._state, "duration_ms", None),
+                show=self.show_message_timestamps,
+            )
+        group = next(
+            (
+                ancestor
+                for ancestor in self.ancestors
+                if isinstance(ancestor, ToolGroup)
+            ),
+            None,
+        )
+        if group is not None:
+            section.set_group_folded(
+                group.show_message_timestamps and group.is_collapsed
+            )
 
     async def _render_result_collapsible(self) -> None:
         # Bodies are built lazily (factory closures): a collapsed result keeps

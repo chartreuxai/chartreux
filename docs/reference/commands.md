@@ -86,10 +86,11 @@ can add commands.
 | `/log` | Show the current interaction-log path. |
 | `/log-level` | Change the session log level or persist it. |
 | `/debug` | Toggle the debug console. |
-| `/agents` | Toggle the expanded retained-background-agent list above the input. |
+| `/agents` | Toggle the docked agent browser above the input, including Main and retained subagents. |
 | `/compact [instructions]` | Summarize the conversation context. |
 | `/exit`, `exit`, `quit`, `:q`, `:quit` | Exit immediately while idle. During consequential active work, opens the exit confirmation dialog. |
 | `/status` | Display agent statistics. |
+| `/usage` | Browse recorded usage and USD cost estimates by calendar window and project; available while a turn runs. |
 | `/proxy-setup` | Configure proxy and certificate settings. See [networking](../integrations/networking.md). |
 | `/providers` | Open Provider Settings to add or manage model providers. |
 | `/resume`, `/continue` | Browse, resume, or delete saved sessions. |
@@ -117,7 +118,7 @@ can add commands.
 | `Ctrl+Y` or `Ctrl+Shift+C` | Copy the current selection. |
 | `Shift+Up` / `Shift+Down` | Scroll chat. |
 | `Ctrl+\\` | Toggle the debug console. |
-| `Ctrl+Shift+A` | Toggle the expanded background-agent list above the input. |
+| `Ctrl+Shift+A` | Toggle the docked agent browser; use `D` for details or `F1` for local help inside it. |
 | `Alt+Left` / `Alt+Right` | Move by word in input. |
 | `Ctrl+V` | Paste a clipboard image where that platform feature is available. |
 

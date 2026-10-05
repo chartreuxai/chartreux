@@ -455,26 +455,33 @@ def test_network_clients_are_denied_by_default(command):
         "ruby -e 'puts 1'",
     ],
 )
-def test_interpreter_inline_code_is_denied_by_default(command):
+def test_interpreter_inline_code_is_allowed_by_default(command):
     bash_tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
 
     permission = bash_tool.resolve_permission(BashArgs(command=command))
 
     assert isinstance(permission, PermissionContext)
-    assert permission.permission is ToolPermission.NEVER
-    assert "matches denylist pattern" in (permission.reason or "")
+    assert permission.permission is ToolPermission.ALWAYS
 
 
-def test_python3_dash_c_variant_is_denied_by_default():
-    bash_tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
+@pytest.mark.parametrize(
+    "command",
+    [
+        'python3 -c "print(1)"',
+        'python3 -B -c "print(1)"',
+        "python3 -u -c'print(1)'",
+        'python3 -W ignore -c "print(1)"',
+    ],
+)
+def test_configured_python_inline_denial_matches_python3_variants(command):
+    config = BashToolConfig(denylist=["python -c"])
+    bash_tool = Bash(config_getter=lambda: config, state=BaseToolState())
 
-    permission = bash_tool.resolve_permission(
-        BashArgs(command='python3 -c "import os"')
-    )
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
 
     assert isinstance(permission, PermissionContext)
     assert permission.permission is ToolPermission.NEVER
-    assert "matches denylist pattern 'python3 -c'" in (permission.reason or "")
+    assert "matches denylist pattern 'python -c'" in (permission.reason or "")
 
 
 @pytest.mark.asyncio
@@ -644,7 +651,7 @@ def test_posix_accident_guard_sensitive_paths_precede_hard_guards(
     result = tool.resolve_permission(BashArgs(command=command))
     assert result is not None
     assert result.permission is ToolPermission.NEVER
-    assert result.reason == "Sensitive file access denied (bash)"
+    assert result.reason == r"Sensitive file access denied \u0028bash\u0029"
 
 
 _FILE_CONTENT_READER_COMMANDS = [
@@ -672,7 +679,7 @@ def test_posix_file_content_readers_deny_sensitive_paths(tmp_path, command):
     )
     assert result is not None
     assert result.permission is ToolPermission.NEVER
-    assert result.reason == "Sensitive file access denied (bash)"
+    assert result.reason == r"Sensitive file access denied \u0028bash\u0029"
 
 
 @pytest.mark.parametrize("command", _FILE_CONTENT_READER_COMMANDS)
@@ -1107,7 +1114,7 @@ def test_sensitive_option_operand_is_denied(tmp_path, monkeypatch):
     )
     result = tool.resolve_permission(BashArgs(command="grep --file=secret.txt input"))
     assert result is not None and result.permission is ToolPermission.NEVER
-    assert result.reason == "Sensitive file access denied (bash)"
+    assert result.reason == r"Sensitive file access denied \u0028bash\u0029"
 
 
 @pytest.mark.parametrize(
@@ -1199,6 +1206,7 @@ def test_unmodeled_env_wrappers_are_denied(command):
     assert result is not None and result.permission is ToolPermission.NEVER
     assert result.reason and (
         "unsupported env wrapper form" in result.reason
+        or "missing executor execution target" in result.reason
         or "assignment-only statements" in result.reason
     )
 
@@ -1562,7 +1570,7 @@ def test_lookup_mutations_at_every_executable_position_are_denied(
 def test_startup_environment_mutation_is_denied(command: str, tmp_path: Path) -> None:
     result = _w11_permission(command, tmp_path)
     assert result.permission is ToolPermission.NEVER
-    assert "BASH_ENV" in (result.reason or "")
+    assert r"BASH\u005fENV" in (result.reason or "")
 
 
 @pytest.mark.parametrize(
@@ -1610,17 +1618,27 @@ def test_wrapped_network_executable_is_denied(wrapper: str, tmp_path: Path):
     "command",
     [
         "python3 -B -c 'print(1)'",
-        "python3 -u -cprint(1)",
+        "python3 -u -c'print(1)'",
         "node --eval '1'",
         "node -pe '1'",
         "perl -we '1'",
         "ruby -we '1'",
     ],
 )
-def test_interpreter_switch_after_flags_is_denied(command: str, tmp_path: Path):
-    result = _w11_permission(command, tmp_path)
-    assert result.permission is ToolPermission.NEVER
-    assert "matches denylist pattern" in (result.reason or "")
+@pytest.mark.parametrize("configured_denial", [False, True])
+def test_interpreter_switch_after_flags_policy(
+    command: str, tmp_path: Path, configured_denial: bool
+):
+    config = BashToolConfig()
+    if configured_denial:
+        config.denylist = ["python -c", "node -e", "perl -e", "ruby -e"]
+    tool = Bash(config_getter=lambda: config, state=BaseToolState(), cwd=tmp_path)
+    result = tool.resolve_permission(BashArgs(command=command))
+    assert result is not None
+    expected = ToolPermission.NEVER if configured_denial else ToolPermission.ALWAYS
+    assert result.permission is expected
+    if configured_denial:
+        assert "matches denylist pattern" in (result.reason or "")
 
 
 @pytest.mark.parametrize(
@@ -1634,12 +1652,20 @@ def test_interpreter_switch_after_flags_is_denied(command: str, tmp_path: Path):
         "ruby -I lib -e 'puts 1'",
     ],
 )
-def test_interpreter_value_options_before_inline_code_are_denied(
-    command: str, tmp_path: Path
+@pytest.mark.parametrize("configured_denial", [False, True])
+def test_interpreter_value_options_before_inline_code_policy(
+    command: str, tmp_path: Path, configured_denial: bool
 ) -> None:
-    result = _w11_permission(command, tmp_path)
-    assert result.permission is ToolPermission.NEVER
-    assert "matches denylist pattern" in (result.reason or "")
+    config = BashToolConfig()
+    if configured_denial:
+        config.denylist = ["python -c", "node -e", "perl -e", "ruby -e"]
+    tool = Bash(config_getter=lambda: config, state=BaseToolState(), cwd=tmp_path)
+    result = tool.resolve_permission(BashArgs(command=command))
+    assert result is not None
+    expected = ToolPermission.NEVER if configured_denial else ToolPermission.ALWAYS
+    assert result.permission is expected
+    if configured_denial:
+        assert "matches denylist pattern" in (result.reason or "")
 
 
 def test_unknown_interpreter_option_before_inline_code_is_denied(
@@ -2034,6 +2060,235 @@ def test_git_paging_readers_inspect_non_pager_vectors(
     result = _w11_permission("git --no-pager " + command, tmp_path)
     assert result.permission is ToolPermission.NEVER
     assert "core.fsmonitor" in (result.reason or "")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'uv run python -c "print(1 * 2)"',
+        'uv --quiet run --no-sync python -c "print(1 * 2)"',
+        "uv run python -c \"print('[abc] ../outside/*.py')\"",
+        'npx --package fixture python -c "print(1 * 2)"',
+        'pipx run --spec fixture python -c "print(1 * 2)"',
+        'env CI=1 uv run python -c "print(1 * 2)"',
+        "bash -c 'uv run python -c \"print(1 * 2)\"'",
+        "npx --package rm echo 'rm -r'",
+        "pipx run --spec rm echo 'rm -r'",
+        "go run main.go rm -r",
+        "cargo run --bin fixture -- rm -r",
+        "cargo run -- rm -r",
+        "python -m ordinary_package harmless",
+        "python -m uv run echo harmless",
+    ],
+)
+def test_executor_inline_payloads_and_non_executable_operands_allowed(
+    tmp_path: Path, command: str
+) -> None:
+    assert _w11_permission(command, tmp_path).permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uv run rm -r build",
+        "python -m uv run rm -r build",
+        "python3 -I -m uv run rm -r build",
+        "uv run python -m uv run rm -r build",
+        "python -m pipx run rm -r build",
+        "npx rm -r build",
+        "npx --package fixture rm -r build",
+        "pipx run --spec fixture rm -r build",
+        "env CI=1 uv run rm -r build",
+        "env CI=1 npx rm -r build",
+        "env CI=1 pipx run rm -r build",
+        "bash -c 'uv run rm -r build'",
+        "bash -c 'npx rm -r build'",
+        "bash -c 'pipx run rm -r build'",
+        "bash +O extglob -c 'uv run rm -r build'",
+        "env CI=1 bash +o errexit -c 'uv run rm -r build'",
+    ],
+)
+def test_executor_inner_commands_reenter_hard_policy(
+    tmp_path: Path, command: str
+) -> None:
+    result = _w11_permission(command, tmp_path)
+    assert result.permission is ToolPermission.NEVER
+    assert result.reason == (
+        "Command denied: recursive rm option '-r' in 'rm -r build'. "
+        "This is a hard guard regardless of target. "
+        "Use non-recursive rm -- 'file', then rmdir -- 'dir'."
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "uv run",
+        "npx",
+        "pipx run --spec fixture",
+        "python -m uv run",
+        "uv run python -m uv run",
+    ],
+)
+@pytest.mark.parametrize(
+    "inner",
+    [
+        "echo forbidden",
+        "python -uc 'print(1 * 2)'",
+        "rm file",
+        "curl https://example.com",
+    ],
+)
+def test_executor_inner_user_denials(tmp_path: Path, prefix: str, inner: str) -> None:
+    config = BashToolConfig(denylist=["echo forbidden", "python -c", "rm", "curl"])
+    tool = Bash(config_getter=lambda: config, state=BaseToolState(), cwd=tmp_path)
+    result = tool.resolve_permission(BashArgs(command=f"{prefix} {inner}"))
+    assert result is not None and result.permission is ToolPermission.NEVER
+    assert "matches denylist pattern" in (result.reason or "")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uv run python escape.py",
+        "uv run python ../outside.py",
+        "python -m pip install ../outside",
+        "uv run python -m pip install ../outside",
+        "go run escape.go",
+        "env CI=1 go run escape.go",
+        "bash -c 'go run escape.go'",
+        "cargo run --manifest-path escape.toml -- harmless",
+        "env CI=1 cargo run --manifest-path escape.toml -- harmless",
+        "bash -c 'cargo run --manifest-path escape.toml -- harmless'",
+    ],
+)
+def test_executor_script_and_native_targets_obey_authority(
+    tmp_path: Path, command: str
+) -> None:
+    for name in ("escape.py", "escape.go", "escape.toml"):
+        (tmp_path / name).symlink_to(tmp_path.parent / "outside")
+    assert _w11_permission(command, tmp_path).permission is ToolPermission.NEVER
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uv run --unknown child python -c code",
+        "uv run --directory",
+        "uv run --directory -- python",
+        "uv run --dir child python",
+        "uv run --script fixture.py",
+        "uv run fixture.py",
+        "npx --package",
+        "npx --unknown fixture",
+        "pipx run --spec",
+        "pipx run --spec -- app",
+        "go run -exec python main.go",
+        "go run -C child main.go",
+        "cargo run fixture arg",
+        "uv run npx --package",
+        "python -m uv.unknown run echo harmless",
+        "python -m ../uv run echo harmless",
+    ],
+)
+def test_executor_unknown_missing_and_ambiguous_forms_deny(
+    tmp_path: Path, command: str
+) -> None:
+    assert _w11_permission(command, tmp_path).permission is ToolPermission.NEVER
+
+
+def test_executor_argv_is_not_reparsed_as_shell(tmp_path: Path, monkeypatch) -> None:
+    calls: list[str] = []
+    original = bash_module._analyze_guardrail_source
+
+    def record(source: str, *, nested_source: bool = False):
+        calls.append(source)
+        return original(source, nested_source=nested_source)
+
+    monkeypatch.setattr(bash_module, "_analyze_guardrail_source", record)
+    command = "uv run echo 'x; rm -r build' 'a b' 'print(1 * 2)'"
+    assert _w11_permission(command, tmp_path).permission is ToolPermission.ALWAYS
+    assert calls == [command]
+    expanded = bash_module._expand_guardrail_commands([command])
+    assert shlex.split(expanded[-1]) == [
+        "echo",
+        "x; rm -r build",
+        "a b",
+        "print(1 * 2)",
+    ]
+
+
+def test_executor_child_cwd_is_scoped_and_paths_and_redirects_use_it(
+    tmp_path: Path,
+) -> None:
+    child = tmp_path / "child"
+    child.mkdir()
+    (child / "escape.py").symlink_to(tmp_path.parent / "outside")
+    (child / "output").symlink_to(tmp_path.parent / "outside")
+    (child / "child").symlink_to(tmp_path.parent / "outside")
+    _write_repository_config(child, "[core]\n pager = ./pager\n")
+    for command in (
+        "uv run --directory child python escape.py",
+        "uv run --directory child git status",
+        'uv run --directory child bash -c "echo hi > output"',
+        "uv run --directory ../outside python -c code",
+        "go -C child run escape.py",
+        "go -C child run -modfile escape.py main.go",
+        "uv run --directory child --project escape.py python -c code",
+        "uv run --directory child --with ./escape.py python -c code",
+        "uv run --directory child --project child python -c code",
+    ):
+        assert _w11_permission(command, tmp_path).permission is ToolPermission.NEVER
+    for command in (
+        "uv run --directory child python -c code; git status",
+        'uv run --directory child bash -c "cd nested"; git status',
+        "uv --directory child run python -c code; cat escape.py",
+    ):
+        assert _w11_permission(command, tmp_path).permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize(
+    "prefix", ["uv run", "env CI=1", "npx --package fixture", "pipx run --spec fixture"]
+)
+def test_executor_implicit_child_cwd_cannot_leak_to_parent(
+    tmp_path: Path, prefix: str
+) -> None:
+    child = tmp_path / "child"
+    child.mkdir()
+    _write_repository_config(child, "[core]\n pager = ./pager\n")
+    result = _w11_permission(f"{prefix} command cd child; git status", tmp_path)
+    assert result.permission is ToolPermission.ALWAYS
+    assert (
+        _w11_permission("command cd child; git status", tmp_path).permission
+        is ToolPermission.NEVER
+    )
+
+
+def test_executor_cwd_unknown_and_recursive_budgets_deny(tmp_path: Path) -> None:
+    for command in (
+        "cd; uv run python script.py",
+        "cd; uv run --directory child python -c code",
+        "uv run " * 9 + "echo hi",
+        "; ".join(["uv run echo hi"] * 129),
+        "uv run python -c " + shlex.quote("x" * (33 * 1024)),
+    ):
+        assert _w11_permission(command, tmp_path).permission is ToolPermission.NEVER
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("uv pip install fixture", ToolPermission.ALWAYS),
+        ("uv sync --project child", ToolPermission.ALWAYS),
+        ("uv pip install ../outside", ToolPermission.NEVER),
+        ("uv pip install --target ../outside fixture", ToolPermission.NEVER),
+        ("uv pip install fixture[extra]", ToolPermission.NEVER),
+    ],
+)
+def test_non_run_uv_package_policy_stays_pinned(
+    tmp_path: Path, command: str, expected: ToolPermission
+) -> None:
+    assert _w11_permission(command, tmp_path).permission is expected
 
 
 @pytest.mark.asyncio

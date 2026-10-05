@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import asyncio
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, field, replace
 import functools
@@ -43,10 +44,15 @@ if TYPE_CHECKING:
     from chartreux.core.config import ChartreuxConfigSchema
     from chartreux.core.hooks.models import HookConfigResult
     from chartreux.core.skills.manager import SkillManager
-    from chartreux.core.subagents import SubagentManagementPort, SubagentRunnerPort
+    from chartreux.core.subagents import (
+        SubagentManagementPort,
+        SubagentRunnerPort,
+        TaskResult,
+    )
     from chartreux.core.tools.io_port import ToolIOPort
     from chartreux.core.tools.mcp.pool import MCPConnectionPool
     from chartreux.core.tools.models import PermissionContext
+    from chartreux.core.tools.utils import PathAuthority
 
 ARGS_COUNT = 4
 
@@ -78,6 +84,7 @@ class InvokeContext:
     mcp_pool: MCPConnectionPool | None = field(default=None)
     tool_io: ToolIOPort | None = field(default=None)
     is_subagent: bool = field(default=False)
+    register_wait_task: Callable[[asyncio.Task[TaskResult] | None], None] | None = None
 
 
 class ToolError(Exception):
@@ -173,10 +180,74 @@ class BaseTool[
         self.workspace = Workspace.for_session(self.cwd)
         self._workspace_getter: Callable[[], Workspace] | None = None
         self.scratchpad_dir = scratchpad_dir
+        self.scratchpad_roots_getter: Callable[[], frozenset[Path]] | None = None
+        self.owned_scratchpad_getter: Callable[[], Path | None] | None = None
         # Installed by the runtime independently of tool config and session grants.
         # A live getter avoids stale scope after profile switches or plan resets.
+        self.instruction_read_files_getter: Callable[[], frozenset[Path]] = frozenset
         self.plan_file_write_scope_getter: Callable[[], Path | None] = lambda: None
+        self.path_authority_getter: Callable[[], PathAuthority] | None = None
         self.inherited_plan_write_scopes: tuple[tuple[Path, Path | None], ...] = ()
+
+    @classmethod
+    def path_sensitive_patterns(cls, config: BaseToolConfig) -> tuple[str, ...]:
+        """File sensitivity; tools may have separate command-prefix policy."""
+        return tuple(config.sensitive_patterns)
+
+    @property
+    def path_authority(self) -> PathAuthority:
+        """Live local path authority; parent invocation guards remain independent."""
+        from chartreux.core.tools.utils import PathAuthority
+
+        self._check_authority()
+        if self.path_authority_getter is not None:
+            authority = self.path_authority_getter()
+        else:
+            config = self.config
+            authority = PathAuthority(
+                self.get_name(),
+                config.permission,
+                tuple(config.allowlist),
+                tuple(config.denylist),
+                self.path_sensitive_patterns(config),
+                self.workspace,
+                self.owned_scratchpad_dir,
+                self.scratchpad_roots,
+                self.instruction_read_files,
+            )
+        if self.get_name() in {"write_file", "edit"}:
+            authority = replace(
+                authority,
+                plan_file_write_scope=self.plan_file_write_scope_getter(),
+                inherited_plan_write_scopes=self.inherited_plan_write_scopes,
+            )
+        return authority
+
+    @property
+    def owned_scratchpad_dir(self) -> Path | None:
+        self._check_authority()
+        return (
+            self.owned_scratchpad_getter()
+            if self.owned_scratchpad_getter is not None
+            else self.scratchpad_dir
+        )
+
+    @property
+    def scratchpad_roots(self) -> frozenset[Path]:
+        """Live access capabilities, distinct from the runtime's owned directory."""
+        self._check_authority()
+        if self.scratchpad_roots_getter is not None:
+            return self.scratchpad_roots_getter()
+        return (
+            frozenset({self.scratchpad_dir.absolute()})
+            if self.scratchpad_dir is not None
+            else frozenset()
+        )
+
+    @property
+    def instruction_read_files(self) -> frozenset[Path]:
+        self._check_authority()
+        return self.instruction_read_files_getter()
 
     @property
     def config(self) -> ToolConfig:

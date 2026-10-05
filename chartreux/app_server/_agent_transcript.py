@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -572,6 +573,7 @@ def _project_user_entry(
         AgentTranscriptEntryKind.USER_TEXT,
         text,
         timestamp=timestamp,
+        posted_at=_posted_at(message),
         payload=_EntryPayload(
             title="User message", attachment_names=names, attachment_count=count
         ),
@@ -651,6 +653,12 @@ def _project_assistant_text_entry(
         AgentTranscriptEntryKind.ASSISTANT_TEXT,
         text,
         timestamp=timestamp,
+        posted_at=_posted_at(message),
+        turn_duration_ms=(
+            message["turn_duration"] * 1000
+            if isinstance(message.get("turn_duration"), int | float)
+            else None
+        ),
         payload=_EntryPayload(title="Assistant response"),
     )
 
@@ -819,7 +827,7 @@ def _project_present_result(
     duration_ms = (
         max(0.0, duration_value * 1000)
         if isinstance(duration_value, int | float)
-        else 0.0
+        else None
     )
     cancelled = persisted.get("cancelled") is True or tagged.tag == CANCELLATION_TAG
     failed = tagged.tag == TOOL_ERROR_TAG
@@ -855,7 +863,7 @@ def _effect_state(
     presentation: ToolResultPresentation,
     output: JsonValue | None,
     output_text: str,
-    duration_ms: float,
+    duration_ms: float | None,
     cancelled: bool,
     failed: bool,
 ) -> tuple[EffectState, AgentTranscriptToolStatus]:
@@ -1032,6 +1040,18 @@ def _attachment_placeholders(message: dict[str, Any]) -> tuple[list[str], int]:
     return names, len(images)
 
 
+def _posted_at(message: dict[str, Any]) -> datetime | None:
+    value = message.get("posted_at")
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            pass
+    return None
+
+
 def _entry(
     entry_id: str,
     kind: AgentTranscriptEntryKind,
@@ -1039,6 +1059,8 @@ def _entry(
     *,
     timestamp: int,
     payload: _EntryPayload,
+    posted_at: datetime | None = None,
+    turn_duration_ms: float | None = None,
 ) -> AgentTranscriptEntry:
     bounded_text, truncated = _truncate_utf8(display_text, _DISPLAY_TEXT_LIMIT)
     entry = AgentTranscriptEntry(
@@ -1048,6 +1070,8 @@ def _entry(
         digest="0" * 64,
         created_at=timestamp,
         updated_at=timestamp,
+        posted_at=posted_at,
+        turn_duration_ms=turn_duration_ms,
         generation_status=PublicEntryGenerationStatus.COMPLETED,
         title=_bounded_text(payload.title, MAX_AGENT_TRANSCRIPT_ID_LENGTH),
         tool_name=payload.tool_name,

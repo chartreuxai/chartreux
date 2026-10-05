@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from pydantic import ValidationError
@@ -20,11 +21,20 @@ from chartreux.app_server.models import (
     PublicTurn,
     PublicTurnQueue,
     PublicTurnStatus,
+    UsageComponentBreakdown,
+    UsageComponentSummary,
+    UsageCoverageWarning,
+    UsageModelSummary,
+    UsageTotals,
+    UsageWindowSummaries,
+    UsageWindowSummary,
 )
 from chartreux.app_server.protocol import (
     SERVER_METHODS,
     AgentConfig,
     AgentEvictionModel,
+    AgentsCancelParams,
+    AgentsCancelResponse,
     AgentSummaryModel,
     AgentsUpdateParams,
     AgentTranscriptEntry,
@@ -36,6 +46,7 @@ from chartreux.app_server.protocol import (
     CallbackResult,
     CallbackResultError,
     CallbackResultResponse,
+    CancelOutcome,
     EventWatermarkResponse,
     InitializeParams,
     MCPReadParams,
@@ -68,8 +79,265 @@ from chartreux.app_server.protocol import (
     TurnStartResponse,
     TurnSteerResponse,
     TurnUserInputEntry,
+    UsageReadParams,
+    UsageReadResponse,
+    UsageUpdatedParams,
+    server_notification_registry,
+    validate_notification_method,
 )
 from chartreux.user_content import UserDisplayContent
+
+
+def _usage_summaries() -> UsageWindowSummaries:
+    def summary(end: str) -> UsageWindowSummary:
+        return UsageWindowSummary(
+            start_local=datetime.fromisoformat("2026-06-01T00:00:00+02:00"),
+            end_local=datetime.fromisoformat(end + "T00:00:00+02:00"),
+            start_utc=datetime.fromisoformat("2026-05-31T22:00:00+00:00"),
+            end_utc=datetime.fromisoformat(end + "T00:00:00+02:00").astimezone(UTC),
+            timezone="Europe/Paris",
+            requests=2,
+            input_tokens=100,
+            cached_input_tokens=20,
+            output_tokens=10,
+            known_cost_usd=0.25,
+            has_known_cost=True,
+            has_unknown_cost=True,
+            has_unknown_tokens=True,
+        )
+
+    return UsageWindowSummaries(
+        day=summary("2026-06-02"),
+        week=summary("2026-06-08"),
+        month=summary("2026-07-01"),
+    )
+
+
+def test_usage_read_defaults_and_host_level_params() -> None:
+    assert "usage/read" in SERVER_METHODS
+    params = validate_wire(UsageReadParams, {})
+    assert params.window == "day"
+    assert params.project_key is None
+    assert "session_id" not in UsageReadParams.model_fields
+    assert params.model_dump(mode="json", exclude_none=True) == {"window": "day"}
+    params = UsageReadParams(window="month", project_key="git:/repo/.git")
+    wire = {"window": "month", "projectKey": "git:/repo/.git"}
+    assert params.model_dump(mode="json", exclude_none=True) == wire
+    assert validate_wire(UsageReadParams, wire) == params
+    assert validate_wire(UsageReadParams, {"projectKey": None}).project_key is None
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        {"window": "year"},
+        {"window": None},
+        {"project_key": "private"},
+        {"projectKey": 1},
+        {"sessionId": "session"},
+        {"extra": True},
+    ],
+)
+def test_usage_read_rejects_invalid_wire_params(wire: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(UsageReadParams, wire)
+
+
+def test_usage_read_response_wire_round_trip() -> None:
+    response = UsageReadResponse(
+        as_of=datetime.fromisoformat("2026-06-01T12:00:00+00:00"),
+        revision=7,
+        summaries=_usage_summaries(),
+        window="week",
+        project_key="git:/repo/.git",
+        models=[
+            UsageModelSummary(
+                model="alias",
+                provider="provider",
+                wire_name="deployment",
+                requests=2,
+                input_tokens=100,
+                cached_input_tokens=20,
+                output_tokens=10,
+                known_cost_usd=0.25,
+                has_known_cost=True,
+                has_unknown_cost=True,
+                has_unknown_tokens=True,
+            )
+        ],
+        components=UsageComponentBreakdown(
+            uncached_input=UsageComponentSummary(
+                tokens=80, known_cost_usd=0.1, has_known_cost=True
+            ),
+            cached_input=UsageComponentSummary(
+                tokens=20, known_cost_usd=0.05, has_known_cost=True
+            ),
+            output=UsageComponentSummary(
+                tokens=10,
+                known_cost_usd=0.1,
+                has_known_cost=True,
+                has_unknown_cost=True,
+                has_unknown_tokens=True,
+            ),
+        ),
+        warnings=[UsageCoverageWarning(code="malformed-record", record_id="record")],
+    )
+    wire = response.model_dump(mode="json", exclude_none=True)
+    assert wire["asOf"] == "2026-06-01T12:00:00Z"
+    assert wire["projectKey"] == "git:/repo/.git"
+    assert wire["summaries"]["day"]["startLocal"] == "2026-06-01T00:00:00+02:00"
+    assert wire["summaries"]["day"]["startUtc"] == "2026-05-31T22:00:00Z"
+    assert wire["summaries"]["day"]["currency"] == "USD"
+    assert wire["models"][0]["wireName"] == "deployment"
+    assert wire["models"][0]["cachedInputTokens"] == 20
+    assert wire["components"]["uncachedInput"]["tokens"] == 80
+    assert wire["warnings"] == [{"code": "malformed-record", "recordId": "record"}]
+    assert validate_wire(UsageReadResponse, wire) == response
+    assert UsageReadResponse.model_validate_json(response.model_dump_json()) == response
+
+
+def test_usage_read_response_pre_session_defaults() -> None:
+    response = UsageReadResponse(
+        as_of=datetime.fromisoformat("2026-06-01T12:00:00+00:00"),
+        revision=0,
+        summaries=_usage_summaries(),
+    )
+    wire = response.model_dump(mode="json", exclude_none=True)
+    assert "projectKey" not in wire
+    assert response.window == "day"
+    assert response.models == []
+    assert response.warnings == []
+    assert response.components.uncached_input.tokens == 0
+    assert validate_wire(UsageReadResponse, wire) == response
+
+
+def test_usage_updated_global_notification_registration_and_round_trip() -> None:
+    summaries = _usage_summaries()
+    summaries.day.degraded = True
+    params = UsageUpdatedParams(
+        as_of=datetime.fromisoformat("2026-06-01T12:00:00+00:00"),
+        revision=8,
+        summaries=summaries,
+        degraded=True,
+    )
+    assert server_notification_registry()["usage/updated"] is UsageUpdatedParams
+    validate_notification_method("usage/updated", params)
+    wire = params.model_dump(mode="json", exclude_none=True)
+    assert set(wire) == {"asOf", "revision", "summaries", "degraded"}
+    assert wire["degraded"] is True
+    assert wire["summaries"]["day"]["degraded"] is True
+    assert wire["summaries"]["week"]["degraded"] is False
+    assert set(wire["summaries"]) == {"day", "week", "month"}
+    assert validate_wire(UsageUpdatedParams, wire) == params
+    with pytest.raises(ValueError, match="does not match"):
+        validate_notification_method("session/statsUpdated", params)
+    with pytest.raises(ValidationError):
+        validate_wire(UsageUpdatedParams, wire | {"sessionId": "session"})
+
+
+@pytest.mark.parametrize("model", [UsageTotals, UsageComponentSummary])
+@pytest.mark.parametrize("cost", [-1, float("inf"), float("nan")])
+def test_usage_rejects_invalid_costs(model: type[Any], cost: float) -> None:
+    with pytest.raises(ValidationError):
+        model(known_cost_usd=cost)
+
+
+@pytest.mark.parametrize("revision", [-1, True, 1.5])
+@pytest.mark.parametrize("model", [UsageReadResponse, UsageUpdatedParams])
+def test_usage_rejects_invalid_revisions(model: type[Any], revision: Any) -> None:
+    with pytest.raises(ValidationError):
+        model(
+            as_of="2026-06-01T12:00:00Z",
+            revision=revision,
+            summaries=_usage_summaries(),
+        )
+
+
+@pytest.mark.parametrize("model", [UsageReadResponse, UsageUpdatedParams])
+def test_usage_rejects_naive_as_of_and_private_wire_spelling(model: type[Any]) -> None:
+    wire: dict[str, Any] = {
+        "asOf": "2026-06-01T12:00:00Z",
+        "revision": 0,
+        "summaries": _usage_summaries().model_dump(mode="json"),
+    }
+    with pytest.raises(ValidationError):
+        validate_wire(model, wire | {"asOf": "2026-06-01T12:00:00"})
+    with pytest.raises(ValidationError):
+        validate_wire(model, wire | {"as_of": wire["asOf"]})
+    wire["summaries"]["day"]["input_tokens"] = 100
+    with pytest.raises(ValidationError):
+        validate_wire(model, wire)
+
+
+@pytest.mark.parametrize(
+    "field", ["requests", "inputTokens", "cachedInputTokens", "outputTokens"]
+)
+@pytest.mark.parametrize("value", [-1, True, 1.5])
+def test_usage_rejects_invalid_totals(field: str, value: Any) -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(UsageTotals, {field: value})
+
+
+@pytest.mark.parametrize("state", ["loading", "ready", "unavailable"])
+def test_usage_snapshot_states_and_completeness(state: str) -> None:
+    totals = UsageTotals.model_validate({"state": state})
+    assert totals.requests == 0
+    assert totals.has_known_cost is False
+    free = UsageTotals(requests=1, has_known_cost=True)
+    unknown = UsageTotals(requests=1, has_unknown_cost=True, has_unknown_tokens=True)
+    assert free.known_cost_usd == unknown.known_cost_usd == 0
+    assert free.has_known_cost is not unknown.has_known_cost
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "malformed-record",
+        "unreadable",
+        "write-failed",
+        "torn-tail",
+        "unsupported-schema",
+    ],
+)
+def test_usage_coverage_warning_wire_contract(code: str) -> None:
+    warning = UsageCoverageWarning.model_validate({"code": code})
+    assert warning.model_dump(mode="json", exclude_none=True) == {"code": code}
+
+
+@pytest.mark.parametrize("outcome", list(CancelOutcome))
+def test_agents_cancel_public_wire_contract(outcome: CancelOutcome) -> None:
+    assert "agents/cancel" in SERVER_METHODS
+    assert validate_wire(AgentsCancelParams, {"agentId": "agent"}).run_id is None
+    params = validate_wire(AgentsCancelParams, {"agentId": "agent", "runId": "run"})
+    assert params.model_dump(mode="json") == {"agentId": "agent", "runId": "run"}
+    wire = {"outcome": outcome.value, "runId": "run", "stopReason": "user_cancelled"}
+    response = validate_wire(AgentsCancelResponse, wire)
+    assert response.outcome is outcome
+    assert response.model_dump(mode="json") == wire
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        {},
+        {"agent_id": "a"},
+        {"agentId": ""},
+        {"agentId": 1},
+        {"agentId": "a", "run_id": "r"},
+        {"agentId": "a", "runId": ""},
+        {"agentId": "a", "extra": True},
+    ],
+)
+def test_agents_cancel_rejects_invalid_wire_params(wire: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(AgentsCancelParams, wire)
+
+
+def test_agents_cancel_rejects_private_response_spelling() -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(AgentsCancelResponse, {"outcome": "not_running", "run_id": "r"})
+    with pytest.raises(ValidationError):
+        validate_wire(AgentsCancelResponse, {"outcome": "cancelled"})
 
 
 def _turn_queue() -> PublicTurnQueue:
@@ -719,9 +987,15 @@ def test_agents_update_carries_retention_metadata() -> None:
         "currentRunStatus": None,
         "turnsUsed": None,
         "lastRunStatus": None,
+        "stopReason": None,
+        "contextTokens": None,
+        "contextWindow": None,
+        "compacting": False,
         "initialTaskSummary": "Initial task",
         "currentTaskSummary": None,
         "idleSeconds": 3.5,
+        "runElapsedSeconds": None,
+        "latestRunId": None,
         "ttlRemainingSeconds": 42.0,
         "effectiveModel": "strong",
         "baseModel": "base",
@@ -730,3 +1004,110 @@ def test_agents_update_carries_retention_metadata() -> None:
         "resultExpired": True,
     }
     assert update.model_dump(mode="json")["evictions"][0]["reason"] == "ttl"
+
+
+def test_agent_context_contract_accepts_older_wire_payloads() -> None:
+    old = {"agentId": "child", "profile": "worker", "availability": "idle"}
+    summary = validate_wire(AgentSummaryModel, old)
+    assert summary.context_tokens is None and summary.context_window is None
+    assert summary.compacting is False and summary.stop_reason is None
+    assert summary.run_elapsed_seconds is None and summary.latest_run_id is None
+    current = old | {
+        "runElapsedSeconds": 252.0,
+        "latestRunId": "run-1",
+        "contextTokens": 135000,
+        "contextWindow": 400000,
+        "compacting": True,
+    }
+    dump = validate_wire(AgentSummaryModel, current).model_dump(mode="json")
+    assert {key: dump[key] for key in current} == current
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "user_cancelled",
+        "orchestrator_cancelled",
+        "retasked",
+        "budget_exceeded",
+        "budget_unverifiable",
+        "error",
+    ],
+)
+def test_run_stop_reason_contract(reason: str) -> None:
+    from chartreux.app_server.models import PublicTurnStopReason, RunStopReason
+    from chartreux.core.subagents import (
+        AgentAvailability,
+        AgentSummary,
+        RunStatus,
+        RunStopReason as CoreRunStopReason,
+    )
+
+    assert {item.value for item in RunStopReason} == {
+        item.value for item in CoreRunStopReason
+    }
+    assert PublicTurnStopReason(reason).value == reason
+    core = AgentSummary(
+        "child",
+        "worker",
+        AgentAvailability.IDLE,
+        "run",
+        RunStatus.COMPLETED,
+        stop_reason=CoreRunStopReason(reason),
+    )
+    wire = AgentSummaryModel(
+        agent_id=core.agent_id,
+        profile=core.profile,
+        availability=core.availability.value,
+        stop_reason=RunStopReason(core.stop_reason),
+    )
+    assert (
+        validate_wire(AgentSummaryModel, wire.model_dump(mode="json")).stop_reason
+        == reason
+    )
+    with pytest.raises(ValidationError):
+        validate_wire(
+            AgentSummaryModel,
+            {
+                "agentId": "child",
+                "profile": "worker",
+                "availability": "idle",
+                "stopReason": "guess",
+            },
+        )
+
+
+def test_posting_times_are_optional_and_independent_of_lifecycle_ordinals() -> None:
+    from chartreux.app_server.models import PublicMessageEntry
+
+    message = {
+        "id": "m",
+        "sessionId": "s",
+        "createdAt": 10,
+        "updatedAt": 11,
+        "generationStatus": "completed",
+        "role": "user",
+        "content": [],
+    }
+    transcript = {
+        "entryId": "m",
+        "kind": "user_text",
+        "displayText": "hello",
+        "digest": "a" * 64,
+        "createdAt": 0,
+        "updatedAt": 1,
+        "generationStatus": "completed",
+        "title": "User",
+    }
+    for model, old in (
+        (PublicMessageEntry, message),
+        (AgentTranscriptEntry, transcript),
+    ):
+        assert validate_wire(model, old).posted_at is None
+        stamped = validate_wire(model, old | {"postedAt": "2026-06-01T12:34:56Z"})
+        dump = stamped.model_dump(mode="json")
+        assert dump["postedAt"] == "2026-06-01T12:34:56Z"
+        assert (
+            dump["createdAt"] == old["createdAt"]
+            and dump["updatedAt"] == old["updatedAt"]
+        )

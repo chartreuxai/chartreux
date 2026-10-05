@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
+from pydantic import ValidationError
 import pytest
 
 from chartreux.app_server._model import validate_wire
@@ -65,6 +66,8 @@ from chartreux.app_server.models import (
     UserQuestionResult,
 )
 from chartreux.app_server.protocol import (
+    AgentsCancelParams,
+    AgentsCancelResponse,
     AppServerResponseError,
     CallbackCallResponse,
     CallbackResultError,
@@ -463,6 +466,7 @@ async def test_stale_runtime_update_after_resume_does_not_close_connection() -> 
     session = await create_test_app_server_session(agent_loop)
     runtime = session.resources.runtime
     current_context_window = runtime.context_window
+    assert current_context_window is not None
     stale_update = RuntimeUpdatedParams(
         session_id=f"stale-{session.session_id}",
         runtime=RuntimeSnapshot(
@@ -3102,6 +3106,30 @@ async def test_legacy_interrupt_rejects_the_open_callback_in_core(monkeypatch) -
     assert reject_request.call_count == 1
     assert reject_request.call_args.args[0] == callback_id
     assert isinstance(reject_request.call_args.args[1], RuntimeError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_id", [None, "captured-run"])
+async def test_cancel_agent_forwards_target_and_validates_response(
+    run_id: str | None,
+) -> None:
+    session = object.__new__(AppServerSession)
+    client = AsyncMock()
+    client.request.return_value = {
+        "outcome": "not_running",
+        "runId": run_id,
+        "stopReason": None,
+    }
+    session._ensure_attached = AsyncMock(return_value=client)
+    response = await session.cancel_agent("agent", run_id)
+    assert isinstance(response, AgentsCancelResponse)
+    assert response.run_id == run_id
+    client.request.assert_awaited_once_with(
+        "agents/cancel", AgentsCancelParams(agent_id="agent", run_id=run_id)
+    )
+    client.request.return_value = {"outcome": "not_running", "run_id": "private"}
+    with pytest.raises(ValidationError):
+        await session.cancel_agent("agent", run_id)
 
 
 @pytest.mark.asyncio

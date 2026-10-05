@@ -21,6 +21,25 @@ from tests.conftest import ConfigBuilder, OrchestratorLoader
 
 
 class TestAgentProfile:
+    @pytest.mark.parametrize("name", ["agent-0", "agent-1", "agent-123"])
+    def test_instance_handle_names_are_reserved(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        path = tmp_path / f"{name}.toml"
+        path.write_text('agent_type = "subagent"\n', encoding="utf-8")
+        with pytest.raises(ValueError, match="reserved for agent instance handles"):
+            AgentProfile.from_toml(path)
+
+    @pytest.mark.parametrize("name", ["agent-helper", "agent-1-extra"])
+    def test_non_handle_profile_names_keep_internal_enum(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        path = tmp_path / f"{name}.toml"
+        path.write_text('agent_type = "subagent"\n', encoding="utf-8")
+        profile = AgentProfile.from_toml(path)
+        assert profile.name == name
+        assert profile.agent_type is AgentType.SUBAGENT
+
     @pytest.mark.parametrize(
         (
             "profile",

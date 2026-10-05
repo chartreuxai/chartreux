@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import threading
@@ -46,7 +47,12 @@ from chartreux.app_server.protocol import (
     TransportKind,
 )
 from chartreux.app_server.transport import JsonRpcTransport, memory_transport_pair
+from chartreux.core._usage_startup import (
+    StartupAccountingContext,
+    create_startup_accounting_context,
+)
 from chartreux.core.agent_loop import AgentLoop, AgentRuntimePolicy
+from chartreux.core.agent_loop._loop import RootAccountingOwner
 from chartreux.core.agents.launch import FrozenPersona, LaunchCandidate, resolve_launch
 from chartreux.core.agents.manager import AgentManager
 from chartreux.core.config import (
@@ -85,6 +91,8 @@ from chartreux.core.subagents import (
     LaunchConfig,
     UnsupportedChildForkError,
 )
+from chartreux.core.usage import AsyncUsageWriter, UsageReader, UsageService
+from chartreux.core.usage_project import resolve_project_key_async
 from chartreux.observability.logging import logger, set_config_log_level
 from chartreux.utils.cache_store import FileSystemCacheStore
 
@@ -149,6 +157,9 @@ class LocalHarnessOptions:
     )
     session: LocalSessionIntent = field(default_factory=NewSessionIntent)
     client_tool_handler: ClientToolHandler | None = None
+    startup_accounting: StartupAccountingContext | None = field(
+        default=None, repr=False
+    )
 
 
 class RuntimeSessionNotFoundError(RuntimeError):
@@ -197,10 +208,27 @@ class RootOpenRequest:
     session_id: str | None = None
     continue_latest: bool = False
     client_capabilities: ClientCapabilities = field(default_factory=ClientCapabilities)
+    startup_accounting: StartupAccountingContext | None = None
+    # Controllers claim before naming; direct callers claim in open_root.
+    startup_accounting_claimed: bool = False
 
     def __post_init__(self) -> None:
+        if self.startup_accounting is not None and (
+            self.session_id is not None or self.continue_latest
+        ):
+            raise ValueError("Startup accounting requires a new root session")
         if self.session_id is not None and self.continue_latest:
             raise ValueError("Cannot resume a session and continue the latest")
+
+    def claim_startup_accounting(self) -> None:
+        context = self.startup_accounting
+        if context is None:
+            return
+        if self.startup_accounting_claimed:
+            if context.state != "claimed":
+                raise RuntimeError("Startup accounting context was not claimed")
+        else:
+            context.claim()
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,9 +248,11 @@ class _AgentLoopBlueprint:
     frozen_system_prompt_id: str | None = None
     frozen_instructions: str | None = None
     committed_model: CommittedModelIdentity | None = None
+    accounting_owner: RootAccountingOwner | None = None
+    process: HarnessProcess | None = None
 
     def build(self) -> AgentLoop:
-        return AgentLoop(
+        agent_loop = AgentLoop(
             config_orchestrator=self.config_orchestrator,
             max_turns=self.policy.max_turns,
             max_price=self.policy.max_price,
@@ -254,7 +284,11 @@ class _AgentLoopBlueprint:
             session_id=self.session_id,
             session_dir=self.session_dir,
             session_lease=self.session_lease,
+            accounting_owner=self.accounting_owner,
         )
+        if self.process is not None:
+            self.process._track_accounting_loop(agent_loop)
+        return agent_loop
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +307,7 @@ class _RootRuntimeBlueprint:
     hook_config_result: HookConfigResult
     cache_store: FileSystemCacheStore
     mcp_registry: MCPRegistry | None = None
+    process: HarnessProcess | None = None
 
     @property
     def cwd(self) -> Path:
@@ -290,6 +325,7 @@ class _RootRuntimeBlueprint:
         session_dir: Path | None = None,
         session_lease: SessionLease | None = None,
         committed_model: CommittedModelIdentity | None = None,
+        accounting_owner: RootAccountingOwner | None = None,
     ) -> AgentLoop:
         policy = AgentRuntimePolicy(
             max_turns=self.options.max_turns,
@@ -324,6 +360,8 @@ class _RootRuntimeBlueprint:
             session_dir=session_dir,
             session_lease=session_lease,
             committed_model=committed_model,
+            accounting_owner=accounting_owner,
+            process=self.process,
             mcp_registry=self.mcp_registry,
         ).build()
 
@@ -333,11 +371,29 @@ class HarnessServer:
     _server: AppServer
     _transport: JsonRpcTransport
     _reconnectable: bool = False
+    _startup_accounting: StartupAccountingContext | None = None
+    _owned_process: HarnessProcess | None = None
+
+    async def close(self) -> None:
+        await self._server.close()
+        if self._owned_process is not None:
+            await self._owned_process.close()
 
     async def serve(self) -> None:
-        await self._server.serve_connection(
-            self._transport, close_on_disconnect=not self._reconnectable
-        )
+        try:
+            await self._server.serve_connection(
+                self._transport, close_on_disconnect=not self._reconnectable
+            )
+        finally:
+            # Detaching an in-process connection does not shut down its backend.
+            # An unused initial slot must nevertheless never survive reconnect.
+            if (
+                self._startup_accounting is not None
+                and self._startup_accounting.state == "available"
+            ):
+                self._startup_accounting.abandon()
+            if not self._reconnectable and self._owned_process is not None:
+                await self._owned_process.close()
 
     def connect_client(self) -> AppServerClient:
         if not self._reconnectable:
@@ -352,6 +408,41 @@ class HarnessServer:
 
 
 class AgentRuntimeFactory:
+    def __init__(self, process: HarnessProcess | None = None) -> None:
+        self._process = process
+
+    async def retire_root_accounting(self, source: AgentLoop) -> None:
+        """Release all accounting bindings retained by a finalized root runtime."""
+        if self._process is None:
+            return
+        root_ids = {
+            root_id
+            for root_id, loops in self._process._accounting_loop_roots.items()
+            if source in loops
+        }
+        owner = getattr(source, "accounting_owner", None)
+        if owner is not None:
+            root_ids.add(owner.root_session_id)
+        for root_id in root_ids:
+            await self._process.retire_root_usage_writer(root_id)
+
+    async def retire_child_accounting(self, source: AgentLoop) -> None:
+        """Untrack a settled child without retiring its shared root writer."""
+        if self._process is not None:
+            self._process.untrack_accounting_loop(source)
+
+    async def prepare_rebind_accounting_owner(
+        self, source: AgentLoop, session_id: str
+    ) -> RootAccountingOwner | None:
+        owner = source.accounting_owner
+        if owner is None or source._is_subagent or owner.root_session_id == session_id:
+            return owner
+        if self._process is None:
+            raise RuntimeError("Accounting rebind requires a harness process")
+        # Retain the old process-owned writer: draining now cannot settle producers
+        # that still hold invocation-local resources (including cancelled titles).
+        return await self._process.create_accounting_owner(session_id, source.cwd)
+
     def resolve_latest(self, source: AgentLoop, cwd: Path) -> str:
         _require_session_logging(source.config)
         return _find_session_to_continue(source.config, cwd=cwd)
@@ -388,10 +479,12 @@ class AgentRuntimeFactory:
             # keeps a scratchpad failure from leaving the old session's runtime
             # consumers configured for the target session.
             prepared_scratchpad = source.prepare_scratchpad_for_session(session_id)
+            accounting_owner = await self.prepare_rebind_accounting_owner(
+                source, session_id
+            )
             await source.config_orchestrator.reload()
             session_metadata = SessionMetadata.model_validate(metadata)
             resume_identity = _resume_identity(source.config, session_metadata)
-            active_model = config_active_model(metadata)
             target_model_applied = True
             await _restore_session_thinking(
                 source.config_orchestrator,
@@ -405,7 +498,7 @@ class AgentRuntimeFactory:
             elif _is_legacy_root_metadata(session_metadata):
                 await _restore_session_active_model(
                     source.config_orchestrator,
-                    active_model,
+                    config_active_model(metadata),
                     clear_existing=previous_session_pinned,
                 )
             else:
@@ -446,6 +539,7 @@ class AgentRuntimeFactory:
                 parent_session_id=_parent_session_id(metadata),
                 stats=stats,
                 prepared_scratchpad=prepared_scratchpad,
+                accounting_owner=accounting_owner,
             )
             source.replace_session_lease(lease)
         except BaseException:
@@ -513,12 +607,18 @@ class AgentRuntimeFactory:
             await _restore_session_active_model(
                 blueprint.config_orchestrator, config_active_model(metadata)
             )
+        accounting_owner = (
+            await self._process.create_accounting_owner(session_id, blueprint.cwd)
+            if self._process is not None
+            else None
+        )
         replacement = blueprint.build(
             parent_session_id=_parent_session_id(metadata),
             session_id=session_id,
             session_dir=session_path,
             session_lease=session_lease,
             committed_model=resume_identity,
+            accounting_owner=accounting_owner,
         )
         # Set messages and stats immediately so the UI can render the stored
         # transcript while the runtime (git, MCP) warms up in the background.
@@ -592,6 +692,7 @@ class AgentRuntimeFactory:
                 session_lease=lease,
                 policy=policy,
                 launch_candidate=candidate,
+                accounting_owner=parent.accounting_owner,
             )
             metadata = child.session_logger.session_metadata
             if metadata is not None:
@@ -694,6 +795,14 @@ class AgentRuntimeFactory:
         )
         forked: AgentLoop | None = None
         try:
+            owner = source.accounting_owner
+            if owner is not None:
+                if self._process is None:
+                    raise RuntimeError("Accounting fork requires a harness process")
+                # A fork's parent link is lineage, not shared ledger ownership.
+                owner = self._process.accounting_owner_for_project(
+                    session_id, owner.project_key
+                )
             forked = self._create_like(
                 source,
                 is_subagent=source._is_subagent,
@@ -703,6 +812,7 @@ class AgentRuntimeFactory:
                 parent_session_id=source.session_id,
                 session_id=session_id,
                 session_lease=lease,
+                accounting_owner=owner,
             )
             await forked.wait_until_ready()
             forked.messages.extend(_messages_for_fork(source, message_id))
@@ -717,8 +827,8 @@ class AgentRuntimeFactory:
             raise
         return forked
 
-    @staticmethod
     def _create_like(
+        self,
         source: AgentLoop,
         *,
         config_orchestrator: ConfigOrchestrator[ChartreuxConfigSchema] | None = None,
@@ -729,6 +839,7 @@ class AgentRuntimeFactory:
         session_lease: SessionLease | None = None,
         policy: AgentRuntimePolicy | None = None,
         launch_candidate: LaunchCandidate | None = None,
+        accounting_owner: RootAccountingOwner | None = None,
     ) -> AgentLoop:
         if policy is None:
             policy = (
@@ -748,6 +859,8 @@ class AgentRuntimeFactory:
             session_id=session_id,
             session_dir=session_dir,
             session_lease=session_lease,
+            accounting_owner=accounting_owner,
+            process=self._process,
             launch_profile=(
                 launch_candidate.profile.name if launch_candidate else None
             ),
@@ -779,7 +892,25 @@ class HarnessProcess:
         from chartreux.app_server._mcp_auth import MCPAuthenticationService
         from chartreux.app_server.mcp_catalog import MCPCatalogService
 
-        self.runtime_factory = AgentRuntimeFactory()
+        self.runtime_factory = AgentRuntimeFactory(self)
+        self.usage_service = UsageService(UsageReader())
+        # Processes may be constructed synchronously. Do not create a scan
+        # coroutine until a loop exists; the first writer or async read starts it.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            self.usage_service.start()
+        self._root_usage_writers: dict[str, AsyncUsageWriter] = {}
+        self._root_accounting_owners: dict[str, RootAccountingOwner] = {}
+        self._root_usage_drains: dict[str, asyncio.Task[None]] = {}
+        self._startup_contexts: dict[str, StartupAccountingContext] = {}
+        self._startup_producers: dict[str, set[asyncio.Task[object]]] = {}
+        # Keep rebound/closed loops reachable until their stale producers settle.
+        self._accounting_loops: set[AgentLoop] = set()
+        self._accounting_loop_roots: dict[str, set[AgentLoop]] = {}
+        self._close_task: asyncio.Task[None] | None = None
         self.cache_store = FileSystemCacheStore()
         self.harness_files = harness_files or HarnessFilesManager(
             sources=("user", "project")
@@ -789,15 +920,221 @@ class HarnessProcess:
         self._staged_roots: dict[str, AgentLoop] = {}
         self._staged_roots_lock = asyncio.Lock()
         self._closed = False
-        self.host_handler = HostRequestHandler(self.harness_files)
+        self.host_handler = HostRequestHandler(
+            self.harness_files,
+            usage_service=self.usage_service,
+            usage_project_key=self.usage_project_key,
+        )
         self.mcp_authentication = MCPAuthenticationService()
         self.mcp_catalog = MCPCatalogService(
             self.mcp_authentication,
             sessionless_catalog_factory=self.build_sessionless_mcp_catalog,
         )
 
+    def usage_project_key(self, root_session_id: str) -> str | None:
+        # Live loops may have rebound since the owner was first registered.
+        for agent_loop in self._accounting_loops:
+            if agent_loop.session_id == root_session_id:
+                owner = agent_loop.accounting_owner
+                if owner is not None:
+                    return owner.project_key
+        owner = self._root_accounting_owners.get(root_session_id)
+        return owner.project_key if owner is not None else None
+
+    def _track_accounting_loop(self, agent_loop: AgentLoop) -> None:
+        # Accounting is optional; do not retain runtimes without its interface.
+        if not hasattr(agent_loop, "accounting_owner"):
+            return
+        self._accounting_loops.add(agent_loop)
+        owner = agent_loop.accounting_owner
+        if owner is not None:
+            self._accounting_loop_roots.setdefault(owner.root_session_id, set()).add(
+                agent_loop
+            )
+
+    def untrack_accounting_loop(self, agent_loop: AgentLoop) -> None:
+        """Release a settled loop from live and historical accounting bindings."""
+        self._accounting_loops.discard(agent_loop)
+        for root_id, loops in tuple(self._accounting_loop_roots.items()):
+            loops.discard(agent_loop)
+            if not loops:
+                del self._accounting_loop_roots[root_id]
+
+    def root_usage_writer(self, root_session_id: str) -> AsyncUsageWriter:
+        """Lazily allocate one event-loop-owned writer per root, not per child."""
+        if self._closed:
+            raise RuntimeError("The app-server harness process is closed")
+        writer = self._root_usage_writers.get(root_session_id)
+        if writer is None:
+            self.usage_service.start()
+            writer = AsyncUsageWriter()
+            self.usage_service.attach_writer(writer)
+            self._root_usage_writers[root_session_id] = writer
+        return writer
+
+    async def allocate_startup_accounting(
+        self, original_workspace: Path
+    ) -> tuple[StartupAccountingContext, RootAccountingOwner]:
+        reservation = asyncio.create_task(
+            create_startup_accounting_context(original_workspace)
+        )
+        try:
+            context = await asyncio.shield(reservation)
+        except asyncio.CancelledError:
+            # Reservation runs in a thread: join it before abandoning its identity.
+            while not reservation.done():
+                with suppress(asyncio.CancelledError):
+                    await asyncio.shield(reservation)
+            reservation.result().abandon()
+            raise
+        try:
+            return context, self.startup_accounting_owner(context)
+        except BaseException:
+            await self.abandon_startup_accounting(context)
+            raise
+
+    async def abandon_startup_accounting(
+        self, context: StartupAccountingContext
+    ) -> None:
+        context.abandon()
+        await self.retire_root_usage_writer(context.identity.root_session_id)
+
+    def startup_accounting_owner(
+        self, context: StartupAccountingContext
+    ) -> RootAccountingOwner:
+        """Bind a loop-local owner without changing the reserved durable identity."""
+        if self._closed:
+            raise RuntimeError("The app-server harness process is closed")
+        root_id = context.identity.root_session_id
+        existing = self._startup_contexts.get(root_id)
+        if existing is not None and existing is not context:
+            raise RuntimeError("Startup accounting identity is already owned")
+        if existing is None:
+            if context.state not in {"available", "claimed"}:
+                raise RuntimeError("Startup accounting context is single-use")
+            if root_id in self._root_usage_writers:
+                raise RuntimeError("Startup accounting identity is already owned")
+            writer = AsyncUsageWriter(writer=context.writer)
+            self.usage_service.start()
+            self.usage_service.attach_writer(writer)
+            self._root_usage_writers[root_id] = writer
+            self._startup_contexts[root_id] = context
+        return self.accounting_owner_for_project(root_id, context.identity.project_key)
+
+    def track_startup_producer[T](
+        self, context: StartupAccountingContext, task: asyncio.Task[T]
+    ) -> None:
+        """Retain pre-AgentLoop naming work through cancellation finalization."""
+        self.startup_accounting_owner(context)
+        producers = self._startup_producers.setdefault(
+            context.identity.root_session_id, set()
+        )
+        producers.add(task)
+        task.add_done_callback(producers.discard)
+
+    async def _settle_startup_producers(self, root_session_id: str) -> None:
+        producers = self._startup_producers.get(root_session_id, set())
+        # Cancel each producer only once; retries must not interrupt finalization.
+        for task in tuple(producers):
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        if producers:
+            _, pending = await asyncio.wait(
+                tuple(producers), timeout=_USAGE_SETTLEMENT_TIMEOUT
+            )
+            if pending:
+                raise TimeoutError("Startup producers did not settle during shutdown")
+        self._startup_producers.pop(root_session_id, None)
+
+    async def retire_root_usage_writer(self, root_session_id: str) -> None:
+        """Stop producers, settle late finalizers, then retire this root's writer."""
+        await self._settle_startup_producers(root_session_id)
+        writer = self._root_usage_writers.get(root_session_id)
+        if writer is not None:
+            for agent_loop in tuple(self._accounting_loops):
+                owner = agent_loop.accounting_owner
+                if owner is not None and owner.writer is writer:
+                    await close_agent_loop(agent_loop)
+            # Rebind/reset may have moved the live binding, but a detached title
+            # still holds the old sink. Its task must finish before the drain.
+            await _settle_detached_accounting_producers(
+                self._accounting_loop_roots.get(root_session_id, ())
+            )
+            drain = self._root_usage_drains.get(root_session_id)
+            if drain is None:
+                drain = asyncio.create_task(writer.drain())
+                self._root_usage_drains[root_session_id] = drain
+            # A timed-out drain must stay alive and owned: cancelling it cannot
+            # interrupt the filesystem thread safely. Retry joins the same task.
+            _, pending = await asyncio.wait({drain}, timeout=_USAGE_SETTLEMENT_TIMEOUT)
+            if pending:
+                raise TimeoutError("Usage writer did not drain during shutdown")
+            self._root_usage_drains.pop(root_session_id, None)
+            drain.result()
+            await writer.aclose()
+            self.usage_service.detach_writer(writer)
+            if self._root_usage_writers.get(root_session_id) is writer:
+                del self._root_usage_writers[root_session_id]
+                self._root_accounting_owners.pop(root_session_id, None)
+                self._accounting_loop_roots.pop(root_session_id, None)
+                # A rebound loop may still belong to another live root. Retain
+                # only those loops, or loops still needed for late finalizers.
+                retained = {
+                    loop
+                    for loops in self._accounting_loop_roots.values()
+                    for loop in loops
+                }
+                for agent_loop in tuple(self._accounting_loops - retained):
+                    owner = agent_loop.accounting_owner
+                    if (
+                        owner is not None
+                        and owner.writer in self._root_usage_writers.values()
+                    ) or any(
+                        not task.done()
+                        for task in agent_loop._detached_accounting_producers
+                    ):
+                        continue
+                    self._accounting_loops.discard(agent_loop)
+                context = self._startup_contexts.pop(root_session_id, None)
+                if context is not None:
+                    context.abandon()
+
+    async def create_accounting_owner(
+        self, root_session_id: str, root_workspace: Path
+    ) -> RootAccountingOwner:
+        for agent_loop in tuple(self._accounting_loops):
+            self._track_accounting_loop(agent_loop)
+        owner = self._root_accounting_owners.get(root_session_id)
+        if owner is not None:
+            return owner
+        project_key = await resolve_project_key_async(root_workspace)
+        return self.accounting_owner_for_project(root_session_id, project_key)
+
+    def accounting_owner_for_project(
+        self, root_session_id: str, project_key: str
+    ) -> RootAccountingOwner:
+        """Prepare a root binding while preserving an already-resolved project key."""
+        # Snapshot old bindings before reset/rebind commits a replacement. This
+        # remembers intermediate owners too, without coupling retirement to the
+        # synchronous identity commit or waiting on unrelated sibling roots.
+        for agent_loop in tuple(self._accounting_loops):
+            self._track_accounting_loop(agent_loop)
+        owner = self._root_accounting_owners.get(root_session_id)
+        if owner is None:
+            owner = RootAccountingOwner(
+                root_session_id=root_session_id,
+                project_key=project_key,
+                writer=self.root_usage_writer(root_session_id),
+                owner_factory=self.accounting_owner_for_project,
+            )
+            self._root_accounting_owners[root_session_id] = owner
+        return owner
+
     def create_session_backend_host(
-        self, services: SessionBackendServices
+        self,
+        services: SessionBackendServices,
+        *,
+        startup_accounting: StartupAccountingContext | None = None,
     ) -> SessionBackendHost:
         from chartreux.app_server._session_runtime_impl import (
             create_session_backend_host_impl,
@@ -810,6 +1147,11 @@ class HarnessProcess:
             stage_root=self.stage_root,
             services=services,
             mcp_catalog_service=self.mcp_catalog,
+            allocate_startup_accounting=self.allocate_startup_accounting,
+            abandon_startup_accounting=self.abandon_startup_accounting,
+            track_startup_producer=self.track_startup_producer,
+            startup_accounting=startup_accounting,
+            startup_accounting_owner=self.startup_accounting_owner,
         )
 
     async def stage_root(self, root: AgentLoop) -> None:
@@ -828,22 +1170,64 @@ class HarnessProcess:
             raise RuntimeError("The app-server harness process is closed")
 
     async def close(self) -> None:
+        if self._close_task is None or (
+            self._close_task.done() and self._close_task.exception() is not None
+        ):
+            self._close_task = asyncio.create_task(self._close_owned())
+        cancelled = False
+        while not self._close_task.done():
+            try:
+                await asyncio.shield(self._close_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        self._close_task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close_owned(self) -> None:
         async with self._staged_roots_lock:
-            if self._closed:
-                return
             self._closed = True
             staged = list(self._staged_roots.values())
             self._staged_roots.clear()
+        # UsageService currently combines publication stop and drain in aclose.
+        # Stop its publication here, but defer cache/scan teardown until after
+        # producer settlement and writer retirement. aclose repeats this safely.
+        service = self.usage_service
+        service._closed = True
+        if service._debounce is not None:
+            service._debounce.cancel()
+            service._debounce = None
+        for unsubscribe in service._writers.values():
+            unsubscribe()
+        service._callbacks.clear()
         errors: list[BaseException] = []
-        for root in staged:
+        for root in set(staged) | self._accounting_loops:
             try:
                 await close_agent_loop(root)
             except BaseException as exc:
                 errors.append(exc)
+        # Failed producer cleanup must not reject its eventual finalization by
+        # closing the sink. Keep ownership for a later close retry.
+        if not errors:
+            for root_id in tuple(self._root_usage_writers):
+                try:
+                    await self.retire_root_usage_writer(root_id)
+                except BaseException as exc:
+                    errors.append(exc)
+        if not errors:
+            # Do not re-enter an unbounded service drain after a writer timeout.
+            # Its stopped publication and retained cache are safe to retry later.
+            try:
+                await service.aclose()
+            except BaseException as exc:
+                errors.append(exc)
+        if not errors:
+            self._accounting_loops.clear()
+            self._accounting_loop_roots.clear()
         if len(errors) == 1:
             raise errors[0]
         if errors:
-            raise BaseExceptionGroup("Failed to close staged session runtimes", errors)
+            raise BaseExceptionGroup("Failed to close session runtimes", errors)
 
     async def build_session_runtime(self, options: SessionOptions) -> RuntimeSnapshot:
         session_config = await self._build_session_config(options)
@@ -897,9 +1281,14 @@ class HarnessProcess:
             hook_config_result=hook_config_result,
             cache_store=self.cache_store,
             mcp_registry=await self._build_mcp_registry_impl(config_orchestrator),
+            process=self,
         )
 
     async def open_root(self, request: RootOpenRequest) -> AgentLoop:
+        context = request.startup_accounting
+        # Validation makes this exclusively a new-session attempt. Claim before
+        # any awaited preparation, so concurrent construction cannot consume it.
+        request.claim_startup_accounting()
         try:
             if request.session_id is not None:
                 staged = await self._claim_staged_root(request.session_id)
@@ -928,12 +1317,30 @@ class HarnessProcess:
                     if lease is not None:
                         await asyncio.to_thread(lease.release)
                     raise
-            session_id = generate_session_id()
+            session_id = (
+                context.identity.root_session_id
+                if context is not None
+                else generate_session_id()
+            )
             lease = await asyncio.to_thread(
                 _acquire_session_lease, blueprint.config, session_id
             )
             try:
-                return blueprint.build(session_id=session_id, session_lease=lease)
+                owner = (
+                    self.startup_accounting_owner(context)
+                    if context is not None
+                    else await self.create_accounting_owner(session_id, blueprint.cwd)
+                )
+                root = blueprint.build(
+                    session_id=session_id, session_lease=lease, accounting_owner=owner
+                )
+                if context is not None:
+                    # Replay content-free outcomes, not just bytes: a cold scan
+                    # cannot recover warnings from failed early appends.
+                    for record, result in context.early_settlements:
+                        self.usage_service._on_settlement(record, result)
+                    context.commit_adoption()
+                return root
             except BaseException:
                 if lease is not None:
                     await asyncio.to_thread(lease.release)
@@ -942,6 +1349,9 @@ class HarnessProcess:
             raise RuntimeAuthenticationError(exc.provider_name) from exc
         except (ValidationError, ValueError) as exc:
             raise RuntimeConfigurationError(str(exc)) from exc
+        finally:
+            if context is not None and context.state != "adopted":
+                context.abandon()
 
     async def _build_mcp_registry_impl(
         self, orchestrator: ConfigOrchestrator[ChartreuxConfigSchema]
@@ -997,21 +1407,31 @@ async def create_harness_server(
     *,
     transport_kind: TransportKind,
     process: HarnessProcess | None = None,
+    startup_accounting: StartupAccountingContext | None = None,
 ) -> HarnessServer:
     """Build a server over ``transport``."""
     from chartreux.app_server.server import AppServer
 
+    owns_process = process is None
     process = process or HarnessProcess()
+
+    def create_backend_host(services: SessionBackendServices) -> SessionBackendHost:
+        return process.create_session_backend_host(
+            services, startup_accounting=startup_accounting
+        )
+
     return HarnessServer(
         _server=AppServer(
             transport,
             transport_kind=transport_kind,
             host_handler=process.host_handler,
-            session_backend_host_factory=process.create_session_backend_host,
+            session_backend_host_factory=create_backend_host,
             mcp_catalog_service=process.mcp_catalog,
         ),
         _transport=transport,
         _reconnectable=transport_kind == "in_process",
+        _startup_accounting=startup_accounting,
+        _owned_process=process if owns_process else None,
     )
 
 
@@ -1340,5 +1760,32 @@ def _messages_for_fork(source: AgentLoop, message_id: str | None) -> list[LLMMes
     return [message.model_copy(deep=True) for message in messages[:end]]
 
 
+_USAGE_SETTLEMENT_TIMEOUT = 5.0
+
+
+async def _settle_detached_accounting_producers(
+    agent_loops: Iterable[AgentLoop],
+) -> None:
+    producers = {
+        task
+        for agent_loop in agent_loops
+        for task in agent_loop._detached_accounting_producers
+        if not task.done()
+    }
+    if producers:
+        # Do not cancel a stale producer again: it may already be finalizing a
+        # cancelled request. On timeout its loop retains it and its writer stays
+        # open, so a later retirement can retry without losing the paid call.
+        _, pending = await asyncio.wait(producers, timeout=_USAGE_SETTLEMENT_TIMEOUT)
+        if pending:
+            raise TimeoutError("Accounting producers did not settle during shutdown")
+
+
 async def close_agent_loop(agent_loop: AgentLoop) -> None:
+    title_task = agent_loop._auto_title_task
+    if title_task is not None and not title_task.done():
+        agent_loop._detached_accounting_producers.add(title_task)
+        title_task.add_done_callback(agent_loop._detached_accounting_producers.discard)
+        agent_loop._cancel_auto_title_task()
     await agent_loop.aclose()
+    await _settle_detached_accounting_producers((agent_loop,))

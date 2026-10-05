@@ -75,6 +75,7 @@ from chartreux.app_server.protocol import (
     TurnStartResponse,
     TurnSteerParams,
     TurnSteerResponse,
+    TurnUpdatedParams,
 )
 from chartreux.core.agent_loop import AgentLoop, AgentTurnOptions
 from chartreux.core.events import (
@@ -82,6 +83,7 @@ from chartreux.core.events import (
     BackgroundWorkEvent,
     BaseEvent,
     CompactEndEvent,
+    ToolWaitStateChangedEvent,
     UserInputRequestEvent,
     UserMessageEvent,
 )
@@ -132,6 +134,19 @@ class CallbackClosedError(RuntimeError):
 
 class CallbackRejectedError(RuntimeError):
     pass
+
+
+_STEER_RECEIPT_CAPACITY = 128
+
+
+@dataclass(slots=True)
+class SteerReceipt:
+    params: TurnSteerParams
+    task: asyncio.Task[TurnSteerResponse] | None = None
+    event: UserMessageEvent | None = None
+    events: list[BaseEvent] = field(default_factory=list)
+    pending_updates: list[ProjectedUpdate] = field(default_factory=list)
+    recovery_error: BaseException | None = None
 
 
 @dataclass(slots=True)
@@ -191,6 +206,13 @@ class TurnStartAction:
             self._controller._pending_start = None
         self._controller._abort_unstarted_turn(self._turn, self._session_execution)
 
+    def cancel(self) -> None:
+        """Settle an accepted but unstarted operation; rollback still uses abort."""
+        if self._resolved:
+            return
+        self.abort()
+        self._controller._settle_unstarted_cancellation(self._turn)
+
 
 class TurnController:  # noqa: PLR0904
     def __init__(
@@ -224,6 +246,7 @@ class TurnController:  # noqa: PLR0904
         self._published_completions: set[str] = set()
         self._active_task: asyncio.Task[None] | None = None
         self._pending_start: TurnStartAction | None = None
+        self._unstarted_turn_id: str | None = None
         self._projector: EventProjector | None = None
         self._harness_effects: dict[str, EventProjector] = {}
         self._history: list[PublicHistoryEntry] = []
@@ -231,6 +254,12 @@ class TurnController:  # noqa: PLR0904
         self._scheduled_loop_id: str | None = None
         self._turn_queue = TurnQueue()
         self._queue_lock = asyncio.Lock()
+        self._steer_lock = asyncio.Lock()
+        self._steer_receipts: dict[str, SteerReceipt] = {}
+        self._steer_replay_floor = 0
+        self._steer_evidence_lost = False
+        self._steer_tasks: set[asyncio.Task[TurnSteerResponse]] = set()
+        self._closing = False
         self._queue_tasks: set[asyncio.Task[None]] = set()
         self._handoff_pending = False
 
@@ -367,6 +396,7 @@ class TurnController:  # noqa: PLR0904
                 queued_contexts=queued_contexts,
             )
             try:
+                self._unstarted_turn_id = turn.id
                 self._active_task = asyncio.create_task(run)
             except BaseException:
                 run.close()
@@ -451,6 +481,109 @@ class TurnController:  # noqa: PLR0904
         if completed is None:
             raise RuntimeError(f"Turn did not complete: {turn_id}")
         return completed
+
+    def operation_pending_turn_id(self, initial_turn_id: str) -> str | None:
+        """Return the executing/promised turn, or None past execution terminal.
+
+        Completion is recorded before publication and controller teardown. A
+        linked successor remains cancellable even before it has an active turn.
+        This synchronous query is safe inside the registry's admission lock.
+        """
+        turn_id = initial_turn_id
+        visited: set[str] = set()
+        while turn_id not in visited:
+            visited.add(turn_id)
+            completed = next(
+                (turn for turn in self._completed_turns if turn.id == turn_id), None
+            )
+            if completed is None:
+                return turn_id
+            if completed.next_turn_id is None:
+                return None
+            turn_id = completed.next_turn_id
+        raise RuntimeError(f"Cyclic turn continuation: {turn_id}")
+
+    def operation_terminal_turn(self, initial_turn_id: str) -> PublicTurn | None:
+        """Return the immutable execution outcome, even while teardown is pending."""
+        turn_id = initial_turn_id
+        visited: set[str] = set()
+        while turn_id not in visited:
+            visited.add(turn_id)
+            completed = next(
+                (turn for turn in self._completed_turns if turn.id == turn_id), None
+            )
+            if completed is None:
+                return None
+            if completed.next_turn_id is None:
+                return completed
+            turn_id = completed.next_turn_id
+        raise RuntimeError(f"Cyclic turn continuation: {turn_id}")
+
+    def interrupt_operation(self, initial_turn_id: str) -> bool:
+        """Interrupt only this operation, including a promised continuation."""
+        pending_id = self.operation_pending_turn_id(initial_turn_id)
+        if pending_id is None:
+            return False
+        active = self._active_turn
+        if active is not None and active.id == pending_id:
+            self.interrupt(
+                TurnInterruptParams(
+                    session_id=active.session_id, expected_turn_id=active.id
+                )
+            )
+            return True
+        predecessor = next(
+            (turn for turn in self._completed_turns if turn.next_turn_id == pending_id),
+            None,
+        )
+        execution = self._execution.active
+        if predecessor is None or active is not None:
+            return False
+        if execution is not None and execution.id != pending_id:
+            return False
+        if self._active_task is not None and not self._active_task.done():
+            # The handoff driver owns recovery of the promised successor. It
+            # must join its publication/cleanup before wait_for_operation settles.
+            self._active_task.cancel()
+        else:
+            self._settle_unstarted_cancellation(
+                PublicTurn(
+                    id=pending_id,
+                    session_id=predecessor.session_id,
+                    status=PublicTurnStatus.IN_PROGRESS,
+                    started_at=now_ms(),
+                )
+            )
+        return True
+
+    def _settle_unstarted_cancellation(
+        self, turn: PublicTurn, cancelled_task: asyncio.Task[None] | None = None
+    ) -> None:
+        completed = turn.model_copy(
+            update={"status": PublicTurnStatus.INTERRUPTED, "completed_at": now_ms()}
+        )
+        self._completed_turns.append(completed)
+
+        async def settle() -> None:
+            try:
+                if cancelled_task is not None:
+                    await asyncio.gather(cancelled_task, return_exceptions=True)
+                await self._publish_turn_completed(completed)
+                await self._emit_status("idle")
+            finally:
+                execution = self._execution.active
+                if execution is not None and execution.id == turn.id:
+                    self._execution.finish(execution)
+                self._session_execution = None
+                self._scheduled_loop_id = None
+                self._unstarted_turn_id = None
+                try:
+                    await self._after_turn_terminal(PublicTurnStatus.INTERRUPTED)
+                finally:
+                    if self._active_task is asyncio.current_task():
+                        self._active_task = None
+
+        self._active_task = asyncio.create_task(settle())
 
     async def wait_for_operation(self, initial_turn_id: str) -> PublicTurn:
         """Wait for linked turns and their controller teardown, not queued work.
@@ -555,24 +688,189 @@ class TurnController:  # noqa: PLR0904
         self._harness_effects.pop(entry_id, None)
         await self._emit_projected(events)
 
+    async def _drain_steer_updates(self, receipt: SteerReceipt) -> None:
+        while receipt.pending_updates:
+            # Keep the projection until notification succeeds. Replays never
+            # project again, but can heal a failed or ambiguous notification.
+            await self._emit_projected(receipt.pending_updates[0])
+            receipt.pending_updates.pop(0)
+
+    def _prune_steer_receipts(self) -> None:
+        # Keep 64 settled, retired deliveries, plus recoverable active/pending
+        # work up to a total of 128 receipts. Never evict an in-flight operation.
+        active_id = self._active_turn.id if self._active_turn is not None else None
+        retired = [
+            key
+            for key, receipt in self._steer_receipts.items()
+            if receipt.params.expected_turn_id != active_id
+            and receipt.task is not None
+            and receipt.task.done()
+            and not receipt.pending_updates
+        ]
+        for key in retired[:-64]:
+            receipt = self._steer_receipts.pop(key)
+            for index, turn in enumerate(self._completed_turns):
+                if turn.id == receipt.params.expected_turn_id:
+                    self._steer_replay_floor = max(self._steer_replay_floor, index + 1)
+                    break
+        for key, receipt in list(self._steer_receipts.items()):
+            if len(self._steer_receipts) < _STEER_RECEIPT_CAPACITY:
+                break
+            if (
+                receipt.params.expected_turn_id != active_id
+                and receipt.task is not None
+                and receipt.task.done()
+            ):
+                self._steer_receipts.pop(key)
+                # Pending projections may already have reached a client. Losing
+                # their content must not become evidence of non-commitment.
+                self._steer_evidence_lost = True
+
+    def known_steer_receipt(self, params: TurnSteerParams) -> bool:
+        self._prune_steer_receipts()
+        receipt = self._steer_receipts.get(params.idempotency_key or "")
+        return receipt is not None and receipt.params == params
+
+    def steer_committed(self, params: TurnSteerParams) -> bool | None:
+        receipt = self._steer_receipts.get(params.idempotency_key or "")
+        if receipt is not None and receipt.params.session_id != params.session_id:
+            # Compaction changes the client's session identity, not the original
+            # delivery's commitment. A mismatched replay is not proof of rejection.
+            return None
+        if receipt is None and (
+            self._steer_evidence_lost
+            or any(
+                turn.id == params.expected_turn_id
+                for turn in self._completed_turns[: self._steer_replay_floor]
+            )
+        ):
+            # An expired replay window is not proof of rejection. Do not tell
+            # an ambiguous client to enqueue context that may already be seen.
+            return None
+        return (
+            receipt is not None
+            and receipt.params == params
+            and receipt.event is not None
+        )
+
+    def _validate_steer(self, params: TurnSteerParams) -> None:
+        turn = self._require_active_turn(params.expected_turn_id)
+        if not params.require_waiting_only:
+            return
+        execution = self._execution.active
+        if params.session_id != turn.session_id:
+            raise TurnConflictError("Steering session does not match the active turn")
+        if (
+            execution is None
+            or execution.kind is not SessionExecutionKind.TURN
+            or execution.id != turn.id
+        ):
+            raise TurnConflictError("Active turn does not own session execution")
+        if (
+            self._closing
+            or self._handoff_pending
+            or (self._active_task is not None and self._active_task.cancelling())
+            or any(not record.core_resolved for record in self._callbacks.values())
+        ):
+            raise TurnConflictError("Active turn cannot accept steering")
+        if params.require_waiting_only and not self._agent_loop.is_waiting_only(
+            turn.id
+        ):
+            raise TurnConflictError("Active turn is not waiting-only")
+
     async def steer(self, params: TurnSteerParams) -> TurnSteerResponse:
-        self._require_active_turn(params.expected_turn_id)
-        decoded = decode_input(
-            params, session_dir=self._agent_loop.session_logger.session_dir
-        )
-        events = await self._agent_loop.inject_user_context(
-            decoded.prompt,
-            as_message=True,
-            inject_implicit=params.inject_invoked_skill,
-            images=decoded.images or None,
-            input_text=decoded.input_text if decoded.resources else None,
-            resources=decoded.resources or None,
-            client_message_id=params.client_user_message_id,
-        )
-        await self._project_events(events, user_message_source="turn_steer")
-        return TurnSteerResponse()
+        async with self._steer_lock:
+            self._prune_steer_receipts()
+            receipt = self._steer_receipts.get(params.idempotency_key or "")
+            if receipt is not None:
+                if receipt.params != params:
+                    raise TurnConflictError(
+                        "Steering idempotency key has a different payload"
+                    )
+                if (
+                    receipt.task is not None
+                    and receipt.task.done()
+                    and receipt.event is not None
+                ):
+                    await self._drain_steer_updates(receipt)
+                    return TurnSteerResponse()
+            else:
+                if params.require_waiting_only and not params.idempotency_key:
+                    raise TurnConflictError(
+                        "Conditional steering requires an idempotency key"
+                    )
+                self._validate_steer(params)
+                if (
+                    params.idempotency_key
+                    and len(self._steer_receipts) >= _STEER_RECEIPT_CAPACITY
+                ):
+                    raise TurnConflictError("Steering receipt capacity reached")
+                receipt = SteerReceipt(params=params.model_copy(deep=True))
+                receipt.task = asyncio.create_task(self._run_steer(receipt))
+                self._steer_tasks.add(receipt.task)
+                receipt.task.add_done_callback(self._steer_tasks.discard)
+                receipt.task.add_done_callback(lambda _: self._prune_steer_receipts())
+                # Observe failures even if the transport waiter disconnects.
+                receipt.task.add_done_callback(
+                    lambda task: task.exception() if not task.cancelled() else None
+                )
+                if params.idempotency_key:
+                    self._steer_receipts[params.idempotency_key] = receipt
+            assert receipt.task is not None
+        return await asyncio.shield(receipt.task)
+
+    async def _run_steer(self, receipt: SteerReceipt) -> TurnSteerResponse:
+        params = receipt.params
+        projector = self._projector
+
+        def on_injected_event(event: BaseEvent) -> None:
+            # Retain completed expansion work before persistence can fail.
+            receipt.events.append(event)
+            if projector is not None:
+                receipt.pending_updates.extend(
+                    projector.project(event, user_message_source="turn_steer")
+                )
+
+        def on_commit(event: UserMessageEvent) -> None:
+            receipt.event = event
+            # Mutate the original turn projection once, before any async recovery
+            # or notification failure can retire it or cause a retry.
+            on_injected_event(event)
+
+        try:
+            decoded = decode_input(
+                params, session_dir=self._agent_loop.session_logger.session_dir
+            )
+            await self._agent_loop.inject_user_context(
+                decoded.prompt,
+                as_message=True,
+                inject_implicit=params.inject_invoked_skill,
+                images=decoded.images or None,
+                input_text=decoded.input_text if decoded.resources else None,
+                resources=decoded.resources or None,
+                client_message_id=params.client_user_message_id,
+                before_commit=lambda: self._validate_steer(params),
+                on_commit=on_commit,
+                on_injected_event=on_injected_event,
+                on_context_ready=lambda: (
+                    self._agent_loop.cancel_outstanding_waits_for_steering(
+                        params.expected_turn_id
+                    )
+                ),
+            )
+            await self._drain_steer_updates(receipt)
+            return TurnSteerResponse()
+        except BaseException as exc:
+            receipt.recovery_error = exc
+            if receipt.event is not None:
+                raise RuntimeError(
+                    "Steering committed; accepted-operation recovery failed"
+                ) from exc
+            raise
 
     def interrupt(self, params: TurnInterruptParams) -> TurnInterruptResponse:
+        if self.operation_terminal_turn(params.expected_turn_id) is not None:
+            raise StaleTurnError(params.expected_turn_id)
         execution = self._execution.active
         if not (
             self._handoff_pending
@@ -591,8 +889,13 @@ class TurnController:  # noqa: PLR0904
             self._require_active_turn(params.expected_turn_id)
         if self._active_task is not None:
             self._active_task.cancel()
+            turn = self._active_turn
+            if turn is not None and turn.id == self._unstarted_turn_id:
+                self._active_turn = None
+                self._projector = None
+                self._settle_unstarted_cancellation(turn, self._active_task)
         elif self._pending_start is not None:
-            self._pending_start.abort()
+            self._pending_start.cancel()
         return TurnInterruptResponse()
 
     async def inject(
@@ -675,7 +978,12 @@ class TurnController:  # noqa: PLR0904
             return "accepted"
 
     async def close(self) -> None:
+        self._closing = True
         errors: list[BaseException] = []
+        if self._steer_tasks:
+            errors.extend(
+                await cancel_tasks(self._steer_tasks.copy(), label="steering")
+            )
         if self._pending_start is not None:
             self._pending_start.abort()
         tasks = [*self._queue_tasks]
@@ -709,6 +1017,12 @@ class TurnController:  # noqa: PLR0904
         self._harness_effects.clear()
         self._history.clear()
         self._callbacks.clear()
+        self._steer_receipts.clear()
+        self._steer_replay_floor = 0
+        # Reset discards receipt and turn identities (including expired replay
+        # evidence). Unknown retries can no longer prove non-commitment.
+        self._steer_evidence_lost = True
+        self._closing = False
         self._turn_queue.reset()
         if not queue_changed:
             return None
@@ -727,6 +1041,7 @@ class TurnController:  # noqa: PLR0904
         queued_contexts: tuple[DecodedInput, ...],
     ) -> None:
         """Drive both public phases in one operation task, ahead of queued work."""
+        self._unstarted_turn_id = None
         successor: PublicTurn | None = None
         status = PublicTurnStatus.FAILED
         try:
@@ -748,6 +1063,22 @@ class TurnController:  # noqa: PLR0904
                 if isinstance(exc, asyncio.CancelledError)
                 else PublicTurnStatus.FAILED
             )
+            # A continuation can be promised before it has an active PublicTurn.
+            # Recover that identity when cancellation hits the handoff gap.
+            predecessor = next(
+                (item for item in self._completed_turns if item.id == turn.id), None
+            )
+            if (
+                successor is None
+                and predecessor is not None
+                and predecessor.next_turn_id
+            ):
+                successor = PublicTurn(
+                    id=predecessor.next_turn_id,
+                    session_id=predecessor.session_id,
+                    status=PublicTurnStatus.IN_PROGRESS,
+                    started_at=now_ms(),
+                )
             # Recovery is joined even if another interrupt arrives while publishing
             # the predecessor or its promised terminal successor.
             recovery = asyncio.create_task(
@@ -840,8 +1171,20 @@ class TurnController:  # noqa: PLR0904
         projector = self._projector
         if projector is not None:
             with suppress(Exception):
-                projector.finalize(cancelled=status is PublicTurnStatus.INTERRUPTED)
+                updates = projector.finalize(
+                    cancelled=status is PublicTurnStatus.INTERRUPTED,
+                    timing=self._agent_loop.completed_turn_timing,
+                    messages=self._agent_loop.messages,
+                    replay_timing=True,
+                )
+                for update in updates:
+                    with suppress(Exception):
+                        await self._emit_projected(update)
+            replacements = {entry.id: entry for entry in projector.history}
             existing_ids = {entry.id for entry in self._history}
+            self._history = [
+                replacements.get(entry.id, entry) for entry in self._history
+            ]
             self._history.extend(
                 entry for entry in projector.history if entry.id not in existing_ids
             )
@@ -897,6 +1240,7 @@ class TurnController:  # noqa: PLR0904
                     subagent_runner=self._subagent_runner,
                     tool_io=self._tool_io,
                     turn_options=AgentTurnOptions(
+                        turn_id=turn.id,
                         retry_sink=self._emit_retrying,
                         injected=params.injected,
                         user_initiated_retry=(
@@ -906,6 +1250,9 @@ class TurnController:  # noqa: PLR0904
                 )
             ) as events:
                 async for event in events:
+                    if isinstance(event, ToolWaitStateChangedEvent):
+                        await self._update_waiting_only(event.turn_id)
+                        continue
                     await self._clear_retrying()
                     if self._event_sink is not None:
                         await self._event_sink(event)
@@ -920,7 +1267,12 @@ class TurnController:  # noqa: PLR0904
                         isinstance(event, AssistantEvent)
                         and event.stopped_by_middleware
                     ):
-                        stop_reason = PublicTurnStopReason.LIMIT
+                        stop_reason = (
+                            PublicTurnStopReason.BUDGET_UNVERIFIABLE
+                            if event.middleware_metadata.get("code")
+                            == "budget-unverifiable"
+                            else PublicTurnStopReason.LIMIT
+                        )
                     await self._project_events([event])
                     context_tokens = self._agent_loop.stats.context_tokens
                     if context_tokens != last_context_tokens:
@@ -937,6 +1289,34 @@ class TurnController:  # noqa: PLR0904
             status = PublicTurnStatus.FAILED
             error = public_error(exc)
         return status, error, stop_reason
+
+    async def _update_waiting_only(self, turn_id: str) -> None:
+        turn = self._active_turn
+        if turn is None or turn.id != turn_id:
+            return
+        try:
+            self._validate_steer(
+                TurnSteerParams(
+                    session_id=turn.session_id,
+                    expected_turn_id=turn_id,
+                    message=[],
+                    require_waiting_only=True,
+                )
+            )
+            waiting_only = True
+        except (TurnConflictError, StaleTurnError):
+            waiting_only = False
+        if turn.waiting_only != waiting_only:
+            turn.waiting_only = waiting_only
+            await self._notify(
+                "turn/updated",
+                TurnUpdatedParams(
+                    event_id=0,
+                    session_id=turn.session_id,
+                    turn=turn.model_copy(deep=True),
+                    emitted_at=now_ms(),
+                ),
+            )
 
     async def _announce_turn_started(self, turn: PublicTurn) -> int:
         await self._notify(
@@ -976,7 +1356,9 @@ class TurnController:  # noqa: PLR0904
         projector = self._projector
         if projector is not None:
             for update in projector.finalize(
-                cancelled=status is PublicTurnStatus.INTERRUPTED
+                cancelled=status is PublicTurnStatus.INTERRUPTED,
+                timing=self._agent_loop.completed_turn_timing,
+                messages=self._agent_loop.messages,
             ):
                 await self._emit_projected(update)
             self._history.extend(projector.history)
@@ -988,6 +1370,7 @@ class TurnController:  # noqa: PLR0904
                 "error": error,
                 "stop_reason": stop_reason,
                 "next_turn_id": next_turn_id,
+                "waiting_only": False,
             }
         )
         self._completed_turns.append(completed)
@@ -1003,6 +1386,7 @@ class TurnController:  # noqa: PLR0904
         self._session_execution = None
         await self._emit_status("idle")
         self._execution.finish(session_execution)
+        self._prune_steer_receipts()
         await self._publish_turn_completed(completed)
 
     def _after_queue_response(self, *, promote: bool) -> Callable[[], None]:
@@ -1339,7 +1723,7 @@ class TurnController:  # noqa: PLR0904
                 self._agent_loop.config.get_active_model().auto_compact_threshold
             )
         except ValueError:
-            context_window = 0
+            context_window = None
         await self._notify(
             "session/statsUpdated",
             StatsUpdatedParams(

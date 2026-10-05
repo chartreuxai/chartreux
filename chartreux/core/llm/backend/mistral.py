@@ -132,6 +132,38 @@ def _cached_tokens(usage: object | None) -> int:
         return 0
 
 
+def _parse_usage(usage: object | None) -> LLMUsage:
+    # UsageInfo supplies zero defaults even for omitted fields. Consult the SDK's
+    # field set, not those defaults, while keeping the legacy numeric values.
+    fields_set = getattr(usage, "model_fields_set", None)
+
+    def reported(name: str) -> bool:
+        return getattr(usage, name, None) is not None and (
+            fields_set is None or name in fields_set
+        )
+
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached_value = (
+        details.get("cached_tokens")
+        if isinstance(details, dict)
+        else getattr(details, "cached_tokens", None)
+    )
+    try:
+        cached_reported = cached_value is not None
+        if cached_value is not None:
+            int(cached_value)
+    except (TypeError, ValueError):
+        cached_reported = False
+    return LLMUsage(
+        prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+        completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+        cached_tokens=_cached_tokens(usage),
+        prompt_tokens_reported=reported("prompt_tokens"),
+        completion_tokens_reported=reported("completion_tokens"),
+        cached_tokens_reported=cached_reported,
+    )
+
+
 class ParsedContent(NamedTuple):
     content: Content
     reasoning_content: Content | None
@@ -412,6 +444,11 @@ class MistralBackend:
             request.stream = httpx.ByteStream(content)
             request._content = content
             request.headers["content-length"] = str(len(content))
+        # The SDK has validated/serialized the payload and built its headers.
+        # Import lazily to retain backend-factory startup behavior.
+        from chartreux.core.llm.backend.generic import notify_request_started
+
+        notify_request_started()
 
     async def _on_response(self, response: httpx.Response) -> None:
         """Release the connection behind a retryable response, then report it.
@@ -583,11 +620,7 @@ class MistralBackend:
                     if message and message.tool_calls
                     else None,
                 ),
-                usage=LLMUsage(
-                    prompt_tokens=response.usage.prompt_tokens or 0,
-                    completion_tokens=response.usage.completion_tokens or 0,
-                    cached_tokens=_cached_tokens(response.usage),
-                ),
+                usage=_parse_usage(response.usage),
                 stop=(
                     StopInfo(reason=str(choice.finish_reason))
                     if choice.finish_reason is not None
@@ -701,15 +734,7 @@ class MistralBackend:
                             if delta and delta.tool_calls
                             else None,
                         ),
-                        usage=LLMUsage(
-                            prompt_tokens=chunk.data.usage.prompt_tokens or 0
-                            if chunk.data.usage
-                            else 0,
-                            completion_tokens=chunk.data.usage.completion_tokens or 0
-                            if chunk.data.usage
-                            else 0,
-                            cached_tokens=_cached_tokens(chunk.data.usage),
-                        ),
+                        usage=_parse_usage(chunk.data.usage),
                         correlation_id=correlation_id,
                         stop=(
                             StopInfo(reason=str(choice.finish_reason))

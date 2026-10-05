@@ -4,20 +4,24 @@ import asyncio
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import uuid4
+from weakref import WeakSet
 
 from textual.widget import Widget
 
 from chartreux.app_server.models import (
     ImageAttachment,
     PreparedPrompt,
+    PublicMessageEntry,
     PublicQueuedTurn,
     PublicTurnQueue,
     SessionImageContentBlock,
     SessionTextContentBlock,
     TurnUserInputEntry,
 )
+from chartreux.app_server.protocol import AppServerResponseError
 from chartreux.cli.textual_ui.widgets.messages import QueueHeaderMessage, UserMessage
 from chartreux.observability.logging import logger
 from chartreux.utils.image_uri import image_attachment_from_session_block
@@ -65,6 +69,8 @@ class QueuePorts:
     steer_turn: Callable[..., Awaitable[None]]
     turn_has_started: Callable[[str], bool]
     set_loading_queue_count: Callable[[int], None]
+    get_show_message_timestamps: Callable[[], bool] = lambda: True
+    history_message: Callable[[str], PublicMessageEntry | None] = lambda _id: None
 
 
 @dataclass(slots=True)
@@ -96,7 +102,16 @@ class _MergedTurn:
     item_id: str | None = None
 
 
-class QueueController:
+@dataclass(slots=True)
+class _SteeringDelivery:
+    block: _MergedTurn
+    expected_turn_id: str
+    idempotency_key: str
+    require_waiting_only: bool = True
+    ambiguous: bool = False
+
+
+class QueueController:  # noqa: PLR0904
     """Merge busy-time prompts into one app-server turn.
 
     The app server keeps a FIFO queue and promotes one item at a time, which the
@@ -120,6 +135,39 @@ class QueueController:
         # interleave with an in-flight enqueue or replace.
         self._lock = asyncio.Lock()
         self._pending_enqueues = 0
+        self._message_widgets: dict[str, WeakSet[UserMessage]] = {}
+        self._posted_at: dict[str, datetime | None] = {}
+        # Ambiguous deliveries remain immutable and non-promotable, but are
+        # exposed to queue selection so the user can discard a stuck delivery.
+        self._unresolved_steering: list[_SteeringDelivery] = []
+
+    def reconcile_history_entry(self, entry: PublicMessageEntry) -> None:
+        """Consume canonical history, before or after a queue promotion event.
+
+        The owner wires this to EventHandler.on_user_message and supplies
+        history_message for promotion-time lookup. Weak references also reach already-promoted
+        widgets without retaining evicted transcript pages.
+        """
+        if entry.role != "user":
+            return
+        self._posted_at[entry.id] = entry.posted_at
+        for widget in self._message_widgets.get(entry.id, ()):
+            if widget.history_entry_id == entry.id:
+                widget.reconcile_timestamp(entry.posted_at)
+                widget.set_show_message_timestamps(
+                    self._ports.get_show_message_timestamps()
+                )
+
+    def _track_message(self, widget: UserMessage) -> None:
+        entry_id = widget.history_entry_id
+        widget.set_show_message_timestamps(self._ports.get_show_message_timestamps())
+        if entry_id is None:
+            return
+        self._message_widgets.setdefault(entry_id, WeakSet()).add(widget)
+        if (entry := self._ports.history_message(entry_id)) is not None:
+            self.reconcile_history_entry(entry)
+        elif entry_id in self._posted_at:
+            widget.reconcile_timestamp(self._posted_at[entry_id])
 
     @property
     def header(self) -> QueueHeaderMessage | None:
@@ -135,13 +183,21 @@ class QueueController:
 
     @property
     def has_removable(self) -> bool:
-        return any(block.entries for block in self._blocks())
+        return any(block.entries for block in self._manageable_blocks())
+
+    @property
+    def has_unresolved_steering(self) -> bool:
+        return bool(self._unresolved_steering)
 
     def __bool__(self) -> bool:
-        return bool(self._blocks()) or bool(self._optimistic)
+        return (
+            bool(self._blocks())
+            or bool(self._optimistic)
+            or self.has_unresolved_steering
+        )
 
     def __len__(self) -> int:
-        return sum(len(block.entries) for block in self._blocks()) + len(
+        return sum(len(block.entries) for block in self._manageable_blocks()) + len(
             self._optimistic
         )
 
@@ -234,6 +290,8 @@ class QueueController:
             self._merged = None
             self._restored.clear()
             self._optimistic.clear()
+            self._message_widgets.clear()
+            self._posted_at.clear()
 
             removed: set[int] = set()
             for widget in widgets:
@@ -251,7 +309,7 @@ class QueueController:
 
     async def pop_last(self) -> bool:
         async with self._lock:
-            blocks = self._blocks()
+            blocks = self._manageable_blocks()
             if not blocks:
                 return False
             merged = blocks[-1]
@@ -261,18 +319,95 @@ class QueueController:
                 return False
             return await self._drop_entry_locked(merged, len(merged.entries) - 1)
 
-    async def steer_pending(self) -> bool:
-        """Send the queued prompts into the active turn as steering.
+    async def steer_prepared(
+        self,
+        content: str,
+        *,
+        prepared_prompt: PreparedPrompt,
+        expected_turn_id: str,
+        skill_name: str | None = None,
+    ) -> bool:
+        """Admit only this new prepared prompt, without touching the backlog."""
+        async with self._lock:
+            entry_id = str(uuid4())
+            prompt = _QueuedPrompt(
+                content, skill_name, prepared_prompt.model_copy(deep=True), entry_id
+            )
+            widget = self._build_widget(prompt, history_entry_id=entry_id)
+            self._track_message(widget)
+            delivery = _SteeringDelivery(
+                _MergedTurn([_MergedEntry(prompt, widget)], entry_id),
+                expected_turn_id,
+                f"steer:{entry_id}:{uuid4()}",
+            )
+            self._unresolved_steering.append(delivery)
+            await self._ports.mount_and_scroll(widget)
+            return await self._deliver_prepared_locked(delivery)
 
-        Removes the merged queue item first so it cannot also promote as its own
-        turn, then steers its combined text/images into the running turn. If the
-        steer fails (e.g. the turn ended between the guard and the steer), the
-        block is re-enqueued so it still promotes as the next turn. If that
-        recovery also fails, its pending widgets retain the unresolved prompt
-        for the caller to report rather than discarding user content. On success
-        the queued widgets un-pend so they read as sent messages. Returns True
-        sent, False when there was nothing steerable (empty queue, or the merged
-        block already started).
+    async def retry_unresolved_steering(self) -> bool:
+        async with self._lock:
+            sent = False
+            for delivery in list(self._unresolved_steering):
+                sent = await self._deliver_prepared_locked(delivery) or sent
+            return sent
+
+    async def _deliver_prepared_locked(self, delivery: _SteeringDelivery) -> bool:
+        block = delivery.block
+        try:
+            await self._ports.steer_turn(
+                self._server_text(block.entries),
+                self._server_images(block.entries) or None,
+                block.message_entry_id,
+                require_waiting_only=delivery.require_waiting_only,
+                expected_turn_id=delivery.expected_turn_id,
+                idempotency_key=delivery.idempotency_key,
+            )
+        except asyncio.CancelledError:
+            delivery.ambiguous = True
+            self._push_loading_queue_count()
+            raise
+        except Exception as error:
+            if (
+                isinstance(error, AppServerResponseError)
+                and isinstance(error.error.data, dict)
+                and error.error.data.get("steerCommitted") is False
+            ):
+                # Definitive rejection only. Keep this as a separate trailing
+                # block so older prompts are neither replaced nor reordered.
+                delivery.ambiguous = False
+                self._unresolved_steering.remove(delivery)
+                if delivery.require_waiting_only or self._merged is not None:
+                    self._restored.append(block)
+                else:
+                    self._merged = block
+                await self._ensure_header()
+                await self._reenqueue_after_failed_steer(block)
+                if block.item_id is not None and self._ports.turn_has_started(
+                    block.item_id
+                ):
+                    await self._turn_started_locked(block.item_id)
+                self._push_loading_queue_count()
+                raise
+            delivery.ambiguous = True
+            self._push_loading_queue_count()
+            raise RuntimeError(
+                "Steering delivery could not be confirmed; your prompt was kept "
+                "unresolved. Retry uses the same delivery receipt; queue remove "
+                "discards the entire unresolved delivery without undoing accepted context."
+            ) from error
+        self._unresolved_steering.remove(delivery)
+        for entry in block.entries:
+            self._track_message(entry.widget)
+            await entry.widget.set_pending(False)
+        await self._remove_header_if_empty()
+        self._push_loading_queue_count()
+        return True
+
+    async def steer_pending(self, *, expected_turn_id: str) -> bool:
+        """Remove the backlog before explicit steering, retaining a retry receipt.
+
+        Only definitive pre-commit rejection re-enqueues the block. Ambiguous
+        outcomes stay outside the promotable/editable queue until receipt replay.
         """
         async with self._lock:
             merged = self._merged
@@ -290,32 +425,16 @@ class QueueController:
                 if self._ports.turn_has_started(merged.item_id):
                     await self._turn_started_locked(merged.item_id)
                 return False
-            entries = merged.entries
-            try:
-                await self._ports.steer_turn(
-                    self._server_text(entries),
-                    self._server_images(entries) or None,
-                    merged.message_entry_id,
-                )
-            except Exception:
-                # The item is removed but the steer failed (e.g. the turn just
-                # ended). Put the block back so it still promotes as the next
-                # turn. If that recovery fails too, retain the pending widgets
-                # and their content: the caller can report the failed recovery
-                # instead of silently discarding an unresolved user prompt.
-                try:
-                    await self._reenqueue_after_failed_steer(merged)
-                except Exception:
-                    merged.item_id = None
-                    self._push_loading_queue_count()
-                    raise
-                raise
-            for entry in entries:
-                await entry.widget.set_pending(False)
+            merged.item_id = None
             self._merged = None
-            await self._remove_header()
-            self._push_loading_queue_count()
-            return True
+            delivery = _SteeringDelivery(
+                merged,
+                expected_turn_id,
+                f"steer:{merged.message_entry_id}:{uuid4()}",
+                require_waiting_only=False,
+            )
+            self._unresolved_steering.append(delivery)
+            return await self._deliver_prepared_locked(delivery)
 
     async def _reenqueue_after_failed_steer(self, merged: _MergedTurn) -> None:
         # Use a fresh idempotency key: the original one (derived from
@@ -351,6 +470,12 @@ class QueueController:
                 return False
             return await self._drop_entry_locked(merged, entry_index)
 
+    def is_unresolved_prompt(self, index: int) -> bool:
+        located = self._entry_at(index)
+        return located is not None and any(
+            delivery.block is located[0] for delivery in self._unresolved_steering
+        )
+
     async def update_prompt(
         self,
         queue_index: int,
@@ -363,6 +488,9 @@ class QueueController:
             if located is None:
                 return False
             merged, entry_index = located
+            if any(delivery.block is merged for delivery in self._unresolved_steering):
+                # Editing would change the payload tied to the replay receipt.
+                return False
             if merged.item_id is not None and self._ports.turn_has_started(
                 merged.item_id
             ):
@@ -393,13 +521,16 @@ class QueueController:
     def _blocks(self) -> list[_MergedTurn]:
         return [*([self._merged] if self._merged is not None else []), *self._restored]
 
+    def _manageable_blocks(self) -> list[_MergedTurn]:
+        return [*self._blocks(), *(d.block for d in self._unresolved_steering)]
+
     def _entries(self) -> list[_MergedEntry]:
-        return [entry for block in self._blocks() for entry in block.entries]
+        return [entry for block in self._manageable_blocks() for entry in block.entries]
 
     def _entry_at(self, index: int) -> tuple[_MergedTurn, int] | None:
         if index < 0:
             return None
-        for block in self._blocks():
+        for block in self._manageable_blocks():
             if index < len(block.entries):
                 return block, index
             index -= len(block.entries)
@@ -415,6 +546,7 @@ class QueueController:
             history_entry_id=prompt.message_entry_id,
             images=images or None,
         )
+        self._track_message(widget)
         await self._ports.mount_and_scroll(widget)
         pending = _Pending(prompt, widget)
         try:
@@ -530,6 +662,18 @@ class QueueController:
         self._push_loading_queue_count()
 
     async def _drop_entry_locked(self, merged: _MergedTurn, index: int) -> bool:
+        delivery = next(
+            (d for d in self._unresolved_steering if d.block is merged), None
+        )
+        if delivery is not None:
+            # Discard the entire immutable delivery, not a changed retry payload.
+            # This cannot retract context that the server may already have seen.
+            self._unresolved_steering.remove(delivery)
+            for entry in merged.entries:
+                await entry.widget.remove()
+            await self._remove_header_if_empty()
+            self._push_loading_queue_count()
+            return True
         entry = merged.entries[index]
         if len(merged.entries) == 1:
             return await self._remove_merged_locked(merged)
@@ -596,6 +740,7 @@ class QueueController:
             return
         pending = self._optimistic.pop(queue_item_id, None)
         if pending is not None:
+            self._track_message(pending.widget)
             await pending.widget.set_pending(False)
             await self._reset_header_position()
             self._push_loading_queue_count()
@@ -606,6 +751,7 @@ class QueueController:
         if merged is None:
             return
         for entry in merged.entries:
+            self._track_message(entry.widget)
             await entry.widget.set_pending(False)
         if merged is self._merged:
             self._merged = None
@@ -698,6 +844,7 @@ class QueueController:
             widget.set_follows_previous(index > 0)
             widget.set_show_separator(index == last)
             widget.history_entry_id = rewind_id if index == 0 else None
+            self._track_message(widget)
 
     @staticmethod
     def _server_text_of(prompt: _QueuedPrompt) -> str:

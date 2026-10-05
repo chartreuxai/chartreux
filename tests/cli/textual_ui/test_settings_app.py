@@ -16,6 +16,7 @@ from chartreux.app_server.protocol import (
     SettingsReadResponse,
 )
 from chartreux.cli.textual_ui.screens.settings import (
+    ADD_PATTERN,
     ConfirmationText,
     SettingsChecklist,
     SettingsOptionList,
@@ -25,6 +26,12 @@ from chartreux.cli.textual_ui.screens.settings import (
     parse_setting_value,
     toggle_inventory_name,
 )
+from chartreux.cli.textual_ui.screens.status_line_settings import (
+    StatusLineOptionList,
+    StatusLineSettingsResult,
+    StatusLineSettingsScreen,
+)
+from chartreux.core.config.models import StatusLineConfig
 from chartreux.core.config.settings_catalog import (
     DEFERRED_SETTINGS,
     EDITABLE_BY_PATH,
@@ -64,7 +71,11 @@ class FakeService:
             fields=[
                 SettingLeafWire(
                     path=item.path,
-                    effective_value=False
+                    effective_value=StatusLineConfig().model_dump(mode="json")[
+                        item.path.split(".")[1]
+                    ]
+                    if item.path.startswith("status_line.")
+                    else False
                     if item.kind == "bool"
                     else 2
                     if item.kind in {"int", "float"}
@@ -107,6 +118,10 @@ class FakeService:
                     update={
                         "effective_value": value
                         if value is not None
+                        else StatusLineConfig().model_dump(mode="json")[
+                            field.path.split(".")[1]
+                        ]
+                        if field.path.startswith("status_line.")
                         else ([] if isinstance(field.effective_value, list) else False),
                         "saved_explicit": value is not None,
                         "saved_value": value,
@@ -114,7 +129,9 @@ class FakeService:
                     }
                 )
             fields.append(field)
-        self.snapshot = self.snapshot.model_copy(update={"fields": fields})
+        self.snapshot = self.snapshot.model_copy(
+            update={"fields": fields, "user_revision": f"revision-{len(self.saved)}"}
+        )
         self.snapshot.inventory_states = _inventory_item_states(
             self.snapshot.inventories,
             {field.path: field.effective_value for field in fields},
@@ -840,6 +857,11 @@ async def test_settings_log_level_link_returns_after_escape(
         await pilot.press(*"log_level", "enter")
         await pilot.pause(0.2)
         assert app._current_bottom_app == BottomApp.LogLevelPicker
+        assert app.focused is not None
+        assert app.focused.id == "loglevelpicker-session"
+        await pilot.press("tab", "tab", "tab")
+        assert app.focused is not None
+        assert app.focused.id == "loglevelpicker-apply"
         await pilot.press("escape")
         await pilot.pause(0.2)
         assert app._current_bottom_app == BottomApp.Input
@@ -1357,6 +1379,53 @@ async def test_inventory_last_allowed_item_restores_default() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+async def test_inventory_add_pattern_space_does_not_activate(
+    size: tuple[int, int],
+) -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=size) as pilot:
+        await pilot.pause()
+        await pilot.press(*"inventory_skills", "enter", "space", "down", "down")
+        await pilot.pause()
+        screen = cast(SettingsScreen, pilot.app.screen)
+        checklist = screen.query_one(SettingsChecklist)
+        assert (
+            checklist.get_option_at_index(checklist.highlighted or 0).value
+            == ADD_PATTERN
+        )
+        assert screen._inventory_draft == {"enabled": [], "disabled": ["review"]}
+        assert screen._inventory_draft is not None
+        draft = {key: list(values) for key, values in screen._inventory_draft.items()}
+        snapshot = service.snapshot.model_dump()
+        expanded = screen._expanded
+        selected = list(checklist.selected)
+        highlighted = checklist.highlighted
+
+        await pilot.press("space")
+        await pilot.pause()
+
+        assert pilot.app.screen is screen
+        assert screen._expanded == expanded
+        assert screen._editing is None
+        assert checklist.display and checklist.has_focus
+        assert not screen.query_one("#settings-editor").display
+        assert checklist.highlighted == highlighted
+        assert checklist.selected == selected
+        assert screen._inventory_draft == draft
+        assert service.snapshot.model_dump() == snapshot
+        assert not service.saved and not service.revisions
+
+        await pilot.press("enter")
+        await pilot.pause()
+        assert screen.query_one("#settings-input", Input).has_focus
+        assert screen.query_one("#settings-editor").display
+        assert screen._inventory_draft == draft
+        assert service.snapshot.model_dump() == snapshot
+        assert not service.saved and not service.revisions
+
+
+@pytest.mark.asyncio
 async def test_inventory_pattern_add_delete_and_reset() -> None:
     service = FakeService()
     async with Harness(service).run_test(size=(80, 24)) as pilot:
@@ -1561,3 +1630,607 @@ async def test_invalid_numeric_input_stays_open_without_write() -> None:
         await pilot.press("escape")
         await pilot.pause()
         assert not screen.query_one("#settings-editor").display
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["not_saved", "exception"])
+async def test_failed_list_save_retains_editable_draft_and_retry(failure: str) -> None:
+    class FailingService(FakeService):
+        async def save(
+            self, changed_leaves: dict[str, object], expected_revision: str | None
+        ) -> SettingsSaveOutcome:
+            if failure == "exception" and self.outcome is not None:
+                raise ValueError("invalid list")
+            return await super().save(changed_leaves, expected_revision)
+
+    service = FailingService()
+    service.outcome = SettingsSaveOutcome(
+        "not_saved", "unchanged", error="invalid list"
+    )
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        await pilot.press(*"agent_paths", "enter")
+        screen = cast(SettingsScreen, pilot.app.screen)
+        item = next(item for item in screen.catalog if item.path == "agent_paths")
+        draft = ["my-agent", "other-agent"]
+        screen._list_draft = draft.copy()
+        screen._refresh_options()
+        screen._save_list(item)
+        await pilot.pause()
+        assert screen._expanded == item.path
+        assert screen._list_draft == draft
+        options = screen.query_one(SettingsOptionList)
+        assert options.editing and options.has_focus
+        assert "invalid list" in str(
+            screen.query_one("#settings-help", NoMarkupStatic).content
+        )
+        assert not screen.fields[item.path].saved_explicit
+        service.outcome = None
+        screen._list_draft = ["my-agent"]
+        screen._save_list(item)
+        await pilot.pause()
+        assert service.saved[-1] == {item.path: ["my-agent"]}
+        assert screen._expanded is None and screen._list_draft is None
+
+
+@pytest.mark.asyncio
+async def test_status_line_backing_leaves_are_not_generic_list_rows() -> None:
+    async with Harness(FakeService()).run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        screen = cast(SettingsScreen, pilot.app.screen)
+        assert all(not item.path.startswith("status_line.") for item in screen.catalog)
+        composite = next(item for item in screen.catalog if item.path == "status_line")
+        assert composite.control == "status_line"
+        assert screen._row(composite, selected=False).plain.startswith("  ")
+        assert screen._row(composite, selected=True).plain.startswith("▸ ")
+        assert screen.fields["status_line.segments"].effective_value == [
+            "directory",
+            "pid",
+            "context",
+        ]
+
+
+class StatusLineHarness(App[None]):
+    def __init__(self, service: FakeService) -> None:
+        super().__init__()
+        self.service = service
+        self.result: StatusLineSettingsResult | None = None
+
+    def on_mount(self) -> None:
+        self.push_screen(
+            StatusLineSettingsScreen(
+                cast(SettingsService, self.service), self.service.snapshot
+            ),
+            self._receive,
+        )
+
+    def _receive(self, result: StatusLineSettingsResult | None) -> None:
+        self.result = result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "theme", ["textual-dark", "textual-light", "ansi-dark", "ansi-light"]
+)
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+@pytest.mark.parametrize("plain_chrome", [False, True])
+async def test_status_line_focused_rows_remain_readable(
+    theme: str,
+    size: tuple[int, int],
+    plain_chrome: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from rich.color import ColorType
+
+    if plain_chrome:
+        monkeypatch.setenv("NO_COLOR", "1")
+    else:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+    app = StatusLineHarness(FakeService())
+    app.theme = theme
+    monkeypatch.setattr(
+        app, "config", SimpleNamespace(ascii_chrome=plain_chrome), raising=False
+    )
+
+    def assert_readable(options: OptionList, row: int, label: str) -> None:
+        strip = options.render_line(row)
+        assert label in strip.text
+        assert strip.cell_length == options.scrollable_content_region.width
+        padding_style = list(strip)[-1].style
+        assert padding_style is not None
+        styles = [segment.style for segment in strip if segment.text.strip()]
+        assert styles
+        for style in styles:
+            assert style is not None and style.bold and not style.reverse
+            assert style.color is not None and style.bgcolor is not None
+            assert style.color.type != ColorType.DEFAULT
+            assert style.bgcolor.type != ColorType.DEFAULT
+            assert style.color != style.bgcolor
+            # Text and padding share the same block cursor, with no inline colors.
+            assert style.color == padding_style.color
+            assert style.bgcolor == padding_style.bgcolor
+
+    async with app.run_test(size=size) as pilot:
+        await pilot.pause()
+        screen = cast(StatusLineSettingsScreen, app.screen)
+        options = screen.query_one(StatusLineOptionList)
+        assert options.has_focus
+        assert_readable(options, 0, "Directory")
+        assert options.render_line(0).text.startswith("> " if plain_chrome else "▸ ")
+        options.highlighted = 3  # An off row must not retain its muted inline color.
+        await pilot.pause()
+        assert_readable(options, 3, "Model")
+        await pilot.press("d")
+        await pilot.pause()
+        assert not options.has_focus
+        assert not any(
+            segment.style and segment.style.bold for segment in options.render_line(3)
+        )
+        await pilot.press("escape", "space", "escape")
+        await pilot.pause()
+        actions = screen.query_one(
+            "#status-line-settings-confirmation-actions", OptionList
+        )
+        assert_readable(actions, 0, "[Cancel]")
+        await pilot.press("down")
+        await pilot.pause()
+        assert_readable(actions, 1, "[Discard edits]")
+
+
+@pytest.mark.asyncio
+async def test_status_line_two_apply_events_before_worker_start_save_once() -> None:
+    service = FakeService()
+    app = StatusLineHarness(service)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = cast(StatusLineSettingsScreen, app.screen)
+        screen.draft.directory_style = "path"
+        options = screen.query_one(StatusLineOptionList)
+        apply = options.get_option("apply")
+        # Two Enter selections dispatched without yielding to the save worker.
+        for _ in range(2):
+            screen.on_option_list_option_selected(
+                OptionList.OptionSelected(options, apply, 9)
+            )
+        assert screen._busy
+        await pilot.pause()
+        assert service.saved == [{"status_line.directory_style": "path"}]
+
+
+@pytest.mark.asyncio
+async def test_status_line_cycles_reorders_and_saves_only_changed_leaves() -> None:
+    service = FakeService()
+    app = StatusLineHarness(service)
+    async with app.run_test(size=(80, 24)) as pilot:
+        screen = cast(StatusLineSettingsScreen, app.screen)
+        options = screen.query_one(StatusLineOptionList)
+        preview = screen.query_one("#status-line-settings-preview", NoMarkupStatic)
+        await pilot.pause()
+        assert "pid 4242" in str(preview.content)
+        assert screen._example.home_directory is not None
+        await pilot.press("enter", "down", "space", "right_square_bracket")
+        assert screen.draft.directory_style == "path"
+        assert screen.draft.segments == ["directory", "context"]
+        assert screen._selected() == "pid"
+        assert not service.saved
+        options.highlighted = 8
+        await pilot.press("space", "alt+up")
+        assert screen.draft.separator == "space" and screen._selected() == "separator"
+        options.highlighted = 9
+        await pilot.press("space")
+        assert not service.saved
+        await pilot.press("enter")
+        await pilot.pause()
+        assert service.saved == [
+            {
+                "status_line.segments": ["directory", "context"],
+                "status_line.directory_style": "path",
+                "status_line.separator": "space",
+            }
+        ]
+        assert service.revisions == ["revision"]
+        assert app.result and not app.result.needs_refresh
+
+
+@pytest.mark.asyncio
+async def test_status_line_off_only_reorder_resize_hover_and_mouse() -> None:
+    service = FakeService()
+    async with StatusLineHarness(service).run_test(size=(100, 32)) as pilot:
+        screen = cast(StatusLineSettingsScreen, pilot.app.screen)
+        options = screen.query_one(StatusLineOptionList)
+        options.highlighted = 3  # Model is off, after enabled segments.
+        await pilot.press("right_square_bracket")
+        assert screen._selected() == "model" and not screen.dirty
+        await pilot.resize_terminal(50, 20)
+        await pilot.pause()
+        await pilot.hover("#status-line-settings-options", offset=(2, 1))
+        assert screen._selected() == "model" and options.has_focus
+        screen.action_apply()
+        await pilot.pause()
+        assert not service.saved
+        await pilot.click("#status-line-settings-options", offset=(2, 0))
+        assert screen._selected() == "directory" and not screen.dirty
+        await pilot.click("#status-line-settings-options", offset=(2, 0), times=2)
+        await pilot.pause()
+        assert screen.draft.directory_style == "path"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["not_saved", "conflict", "exception"])
+async def test_status_line_failure_retains_draft_focus_and_conflict_blocks_retry(
+    failure: str,
+) -> None:
+    class FailingService(FakeService):
+        async def save(
+            self, changed_leaves: dict[str, object], expected_revision: str | None
+        ) -> SettingsSaveOutcome:
+            if failure == "exception":
+                raise ValueError("invalid draft")
+            return await super().save(changed_leaves, expected_revision)
+
+    service = FailingService()
+    service.outcome = SettingsSaveOutcome(
+        "not_saved",
+        "unchanged",
+        error="conflict" if failure == "conflict" else "invalid draft",
+    )
+    async with StatusLineHarness(service).run_test() as pilot:
+        screen = cast(StatusLineSettingsScreen, pilot.app.screen)
+        await pilot.press("enter")
+        screen.action_apply()
+        await pilot.pause()
+        assert pilot.app.screen is screen and screen.dirty
+        assert screen.query_one(StatusLineOptionList).has_focus
+        assert "Failed:" in screen._feedback
+        if failure == "conflict":
+            screen.action_apply()
+            await pilot.pause()
+            assert len(service.saved) == 1
+            assert screen._needs_refresh
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind", ["saved", "shadowed", "durability", "application", "unknown"]
+)
+async def test_status_line_saved_outcome_payload(kind: str) -> None:
+    service = FakeService()
+    after = service.snapshot.model_copy(update={"user_revision": "after"})
+    service.outcome = SettingsSaveOutcome(
+        "durability_uncertain" if kind == "durability" else "saved",
+        "failed" if kind == "application" else "applied",
+        None if kind == "unknown" else after,
+        ("status_line.directory_style",) if kind == "shadowed" else (),
+        "snapshot_unknown" if kind == "unknown" else None,
+    )
+    app = StatusLineHarness(service)
+    async with app.run_test() as pilot:
+        screen = cast(StatusLineSettingsScreen, app.screen)
+        await pilot.press("space")
+        screen.action_apply()
+        await pilot.pause()
+        assert app.result
+        assert app.result.snapshot is (None if kind == "unknown" else after)
+        assert app.result.revision == (None if kind == "unknown" else "after")
+        assert app.result.needs_refresh is (kind == "unknown")
+        assert ("Warning:" in app.result.feedback) is (kind != "saved")
+
+
+@pytest.mark.asyncio
+async def test_status_line_escape_precedence_and_cancel_default() -> None:
+    async with StatusLineHarness(FakeService()).run_test() as pilot:
+        screen = cast(StatusLineSettingsScreen, pilot.app.screen)
+        await pilot.press("enter", "d", "f1")
+        screen._busy = True
+        await pilot.press("escape")
+        assert screen._help_open and screen._details_open
+        screen._busy = False
+        await pilot.press("escape")
+        assert not screen._help_open and screen._details_open
+        await pilot.press("escape")
+        assert not screen._details_open
+        await pilot.press("escape")
+        actions = screen.query_one(
+            "#status-line-settings-confirmation-actions", OptionList
+        )
+        assert screen._confirmation == "discard"
+        assert actions.highlighted_option and actions.highlighted_option.id == "cancel"
+        assert "[Cancel]" in str(actions.highlighted_option.prompt)
+        assert actions.virtual_size.height == 2 and actions.region.height == 2
+        await pilot.press("enter")
+        assert not screen._confirmation and screen.dirty
+        await pilot.press("escape", "escape")
+        assert not screen._confirmation and screen.dirty
+        await pilot.press("escape", "down", "enter")
+        await pilot.pause()
+        assert pilot.app.screen is not screen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("saved", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+async def test_status_line_reset_saved_explicit_only_preserves_draft_on_failure(
+    saved: bool, failed: bool
+) -> None:
+    service = FakeService()
+    for field in service.snapshot.fields:
+        if field.path == "status_line.separator":
+            field.saved_explicit = saved
+            field.saved_value = "space" if saved else None
+    if failed:
+        service.outcome = SettingsSaveOutcome(
+            "not_saved", "unchanged", error="reset failed"
+        )
+    async with StatusLineHarness(service).run_test() as pilot:
+        screen = cast(StatusLineSettingsScreen, pilot.app.screen)
+        await pilot.press("space", "ctrl+r")
+        if not saved:
+            assert not screen._confirmation and "no user override" in screen._feedback
+            assert not service.saved
+        else:
+            assert screen._confirmation == "reset"
+            await pilot.press("down", "enter")
+            await pilot.pause()
+            assert service.saved == [{"status_line.separator": None}]
+            if failed:
+                assert screen.dirty and screen.query_one(StatusLineOptionList).has_focus
+                assert pilot.app.screen is screen
+            else:
+                assert pilot.app.screen is not screen
+
+
+@pytest.mark.asyncio
+async def test_status_line_view_only_and_pending_indication() -> None:
+    service = FakeService()
+    service.snapshot.user_revision = None
+    app = StatusLineHarness(service)
+    app._pending_callbacks = [object()]  # type: ignore[attr-defined]
+    async with app.run_test() as pilot:
+        screen = cast(StatusLineSettingsScreen, app.screen)
+        assert screen.query_one("#status-line-settings-pending-action").display
+        before = screen.draft.model_copy(deep=True)
+        await pilot.press("enter", "space", "right_square_bracket", "ctrl+r")
+        screen.action_apply()
+        assert screen.draft == before and not service.saved
+        assert "view only" in screen._feedback
+
+
+@pytest.mark.asyncio
+async def test_status_line_nested_save_restores_opener_and_revision() -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(100, 32)) as pilot:
+        parent = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"status", "enter")
+        child = cast(StatusLineSettingsScreen, pilot.app.screen)
+        assert parent.is_mounted and parent in pilot.app.screen_stack
+        await pilot.press("space")
+        child.action_apply()
+        await pilot.pause()
+        assert pilot.app.screen is parent
+        options = parent.query_one(SettingsOptionList)
+        assert options._query == "status" and options.has_focus
+        assert (
+            options.highlighted_option
+            and options.highlighted_option.id == "status_line"
+        )
+        assert parent.snapshot.user_revision == "revision-1"
+        assert parent.fields["status_line.directory_style"].effective_value == "path"
+        assert "Saved:" in str(
+            parent.query_one("#settings-help", NoMarkupStatic).content
+        )
+        await pilot.press("enter")
+        child = cast(StatusLineSettingsScreen, pilot.app.screen)
+        assert child.opening.directory_style == "path"
+        await pilot.press("escape")
+        await pilot.pause()
+        item = next(item for item in parent.catalog if item.path == "show_greeting")
+        await parent._write(item, True)
+        assert service.revisions == ["revision", "revision-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dismissal", ["escape", "back"])
+async def test_status_line_warning_survives_unchanged_child_return(
+    dismissal: str,
+) -> None:
+    service = FakeService()
+    service.outcome = SettingsSaveOutcome(
+        "saved", "failed", service.snapshot, error="application failed"
+    )
+    async with Harness(service).run_test(size=(100, 32)) as pilot:
+        parent = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"status", "enter", "space")
+        child = cast(StatusLineSettingsScreen, pilot.app.screen)
+        child.action_apply()
+        await pilot.pause()
+        assert pilot.app.screen is parent
+        warning = parent._unresolved["status_line"]
+        assert "application failed" in warning
+        assert warning in str(
+            parent.query_one("#settings-help", NoMarkupStatic).content
+        )
+
+        await pilot.press("enter")
+        child = cast(StatusLineSettingsScreen, pilot.app.screen)
+        assert not child.dirty and not child._feedback
+        if dismissal == "back":
+            options = child.query_one(StatusLineOptionList)
+            options.highlighted = options.get_option_index("back")
+            await pilot.press("enter")
+        else:
+            await pilot.press("escape")
+        await pilot.pause()
+        assert pilot.app.screen is parent
+        assert len(service.saved) == 1
+        assert parent._unresolved["status_line"] == warning
+        assert parent._error == warning
+        assert warning in str(
+            parent.query_one("#settings-help", NoMarkupStatic).content
+        )
+
+        # A subsequent successful save, unlike inspection, resolves the warning.
+        service.outcome = None
+        await pilot.press("enter", "space")
+        child = cast(StatusLineSettingsScreen, pilot.app.screen)
+        child.action_apply()
+        await pilot.pause()
+        assert pilot.app.screen is parent
+        assert "status_line" not in parent._unresolved
+        assert "Saved:" in str(
+            parent.query_one("#settings-help", NoMarkupStatic).content
+        )
+
+
+@pytest.mark.asyncio
+async def test_status_line_parent_unknown_snapshot_blocks_writes_and_grouped_reset() -> (
+    None
+):
+    service = FakeService()
+    async with Harness(service).run_test() as pilot:
+        parent = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"status_line")
+        help_text = str(parent.query_one("#settings-help", NoMarkupStatic).content)
+        assert "Saved user overrides: 0/4" in help_text and "Not Set" not in help_text
+        parent.fields["status_line.separator"].saved_explicit = True
+        await pilot.press("ctrl+r", "down", "enter")
+        await pilot.pause()
+        assert service.saved == [{"status_line.separator": None}]
+        service.outcome = SettingsSaveOutcome(
+            "saved", "applied", error="snapshot_unknown"
+        )
+        await pilot.press("enter", "space")
+        child = cast(StatusLineSettingsScreen, pilot.app.screen)
+        child.action_apply()
+        await pilot.pause()
+        assert pilot.app.screen is parent and parent._needs_refresh
+        assert parent.snapshot.user_revision is None
+        assert "current state unknown" in str(
+            parent.query_one("#settings-help", NoMarkupStatic).content
+        )
+        item = next(item for item in parent.catalog if item.path == "show_greeting")
+        await parent._write(item, True)
+        assert len(service.saved) == 2
+
+
+@pytest.mark.asyncio
+async def test_status_line_real_app_escape_and_pending_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from unittest.mock import Mock
+
+    from tests.snapshots.base_snapshot_test_app import BaseSnapshotTestApp
+
+    service = FakeService()
+    app = BaseSnapshotTestApp()
+    interrupt = Mock(return_value=False)
+    monkeypatch.setattr(app, "_try_interrupt", interrupt)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        parent = SettingsScreen(cast(SettingsService, service), service.snapshot)
+        await app.push_screen(parent)
+        await pilot.press(*"status_line", "enter")
+        child = cast(StatusLineSettingsScreen, app.screen)
+        assert app.check_action("interrupt", ()) is False
+        app._pending_local_question = asyncio.get_running_loop().create_future()
+        app._indicate_pending_action()
+        assert child.query_one("#status-line-settings-pending-action").display
+        assert app._secondary_surface_active()
+        await pilot.press("escape")
+        await pilot.pause()
+        interrupt.assert_not_called()
+        assert app.screen is parent and parent.is_mounted
+        app._pending_local_question = None
+        app._indicate_pending_action()
+        assert not parent.query_one("#settings-pending-action").display
+
+
+@pytest.mark.asyncio
+async def test_status_line_unfiltered_opener_scroll_and_read_only_round_trip() -> None:
+    service = FakeService()
+    service.snapshot.user_revision = None
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        parent = cast(SettingsScreen, pilot.app.screen)
+        options = parent.query_one(SettingsOptionList)
+        options.highlighted = next(
+            i
+            for i in range(options.option_count)
+            if options.get_option_at_index(i).id == "status_line"
+        )
+        await pilot.pause()
+        options.scroll_to(y=5, animate=False, force=True, immediate=True)
+        scroll_y = options.scroll_y
+        await pilot.press("enter")
+        child = cast(StatusLineSettingsScreen, pilot.app.screen)
+        assert child.snapshot.view_only
+        await pilot.press("enter", "escape")
+        await pilot.pause()
+        assert pilot.app.screen is parent and options.has_focus
+        assert options._query == "" and options.scroll_y == scroll_y
+        assert (
+            options.highlighted_option
+            and options.highlighted_option.id == "status_line"
+        )
+        assert not service.saved
+
+
+@pytest.mark.asyncio
+async def test_status_line_all_cycles_required_states_and_preview_focus_stability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    service = FakeService()
+    async with StatusLineHarness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(StatusLineSettingsScreen, pilot.app.screen)
+        await pilot.pause()
+        update = Mock(wraps=screen._update_preview)
+        monkeypatch.setattr(screen, "_update_preview", update)
+        await pilot.press("j", "k")
+        await pilot.hover("#status-line-settings-options", offset=(2, 2))
+        assert update.call_count == 0
+        options = screen.query_one(StatusLineOptionList)
+        for index in range(8):
+            options.highlighted = index
+            name = screen._selected()
+            before = screen.draft.model_copy(deep=True)
+            await pilot.press("enter", "space")
+            assert screen.draft == before
+            assert {"directory", "context"}.issubset(screen.draft.segments)
+            if name == "context":
+                await pilot.press("space")
+                assert screen.draft.context_style == "tokens"
+        options.highlighted = 2
+        screen.action_move_up()
+        assert screen.draft.segments == ["directory", "context", "pid"]
+        screen.action_apply()
+        await pilot.pause()
+        assert service.saved == [
+            {
+                "status_line.segments": ["directory", "context", "pid"],
+                "status_line.context_style": "tokens",
+            }
+        ]
+
+
+@pytest.mark.asyncio
+async def test_status_line_details_scroll_and_narrow_footer_exit_visible() -> None:
+    async with StatusLineHarness(FakeService()).run_test(size=(50, 20)) as pilot:
+        screen = cast(StatusLineSettingsScreen, pilot.app.screen)
+        await pilot.pause()
+        hint = screen.query_one("#status-line-settings-hint", NoMarkupStatic)
+        assert (
+            "Esc" in str(hint.content)
+            and len(str(hint.content)) <= hint.content_size.width
+        )
+        await pilot.press("d")
+        details = screen.query_one("#status-line-settings-details")
+        assert details.has_focus
+        await pilot.press("pagedown")
+        await pilot.pause()
+        assert details.scroll_y > 0
+        await pilot.press("escape")
+        assert screen.query_one(StatusLineOptionList).has_focus
+        assert screen._selected() == "directory"

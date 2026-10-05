@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 
 import pytest
 
+from chartreux.app_server.client import AppServerResponseError
 from chartreux.app_server.models import (
     ImageAttachment,
     InlineImageSource,
@@ -13,7 +14,12 @@ from chartreux.app_server.models import (
     PublicQueuedTurn,
     PublicTurnQueue,
 )
-from chartreux.app_server.protocol import SessionTextContentBlock, TurnUserInputEntry
+from chartreux.app_server.protocol import (
+    ProtocolError,
+    ProtocolErrorCode,
+    SessionTextContentBlock,
+    TurnUserInputEntry,
+)
 from chartreux.cli.commands import Command
 from chartreux.cli.textual_ui.message_queue import (
     QueueController,
@@ -428,7 +434,9 @@ def _merging_controller(
     calls: dict[str, list] = {"enqueue": [], "replace": [], "remove": [], "steer": []}
     queue = PublicTurnQueue()
 
-    async def default_steer_turn(content, images=None, message_entry_id=None) -> None:
+    async def default_steer_turn(
+        content, images=None, message_entry_id=None, **kwargs
+    ) -> None:
         calls["steer"].append((content, images, message_entry_id))
 
     async def enqueue_turn(content: str, **kwargs) -> PublicQueuedTurn:
@@ -856,7 +864,7 @@ async def test_steer_pending_steers_merged_prompts_and_unpends() -> None:
     await controller.enqueue_prompt("second")
     widgets = controller.widgets
 
-    assert await controller.steer_pending()
+    assert await controller.steer_pending(expected_turn_id="parent")
 
     # The merged item is removed from the queue so it cannot also promote as its
     # own turn, and its combined text is steered into the active turn.
@@ -890,7 +898,7 @@ async def test_steer_pending_combines_images() -> None:
     await controller.enqueue_prompt("a", prepared_prompt=first)
     await controller.enqueue_prompt("b", prepared_prompt=second)
 
-    assert await controller.steer_pending()
+    assert await controller.steer_pending(expected_turn_id="parent")
 
     ((content, images, _entry),) = calls["steer"]
     assert content == "a\n\nb"
@@ -901,7 +909,7 @@ async def test_steer_pending_combines_images() -> None:
 async def test_steer_pending_returns_false_when_nothing_queued() -> None:
     controller, calls = _merging_controller()
 
-    assert not await controller.steer_pending()
+    assert not await controller.steer_pending(expected_turn_id="parent")
 
     assert calls["steer"] == []
     assert calls["remove"] == []
@@ -920,7 +928,7 @@ async def test_steer_pending_finalizes_block_that_already_started() -> None:
     # The block promoted before the steer arrived: finalize it as a normal turn
     # start instead of steering (and instead of losing it).
     started["value"] = True
-    assert not await controller.steer_pending()
+    assert not await controller.steer_pending(expected_turn_id="parent")
 
     assert calls["steer"] == []
     assert calls["remove"] == []
@@ -931,15 +939,21 @@ async def test_steer_pending_finalizes_block_that_already_started() -> None:
 @pytest.mark.asyncio
 async def test_steer_pending_reenqueues_when_steer_fails() -> None:
     async def failing_steer(*_args, **_kwargs) -> None:
-        raise RuntimeError("steer boom")
+        raise AppServerResponseError(
+            ProtocolError(
+                code=ProtocolErrorCode.STALE_TURN,
+                message="steer boom",
+                data={"steerCommitted": False},
+            )
+        )
 
     controller, calls = _merging_controller(steer_turn=failing_steer)
 
     await controller.enqueue_prompt("first")
     await controller.enqueue_prompt("second")
 
-    with pytest.raises(RuntimeError, match="steer boom"):
-        await controller.steer_pending()
+    with pytest.raises(AppServerResponseError, match="steer boom"):
+        await controller.steer_pending(expected_turn_id="parent")
 
     # Remove-first: the item is removed then re-enqueued (fresh idempotency
     # key), so the prompts survive and stay queued to promote as the next turn.
@@ -971,7 +985,13 @@ async def test_steer_pending_preserves_block_when_reenqueue_also_fails(
         )
 
     async def failing_steer(*_args, **_kwargs) -> None:
-        raise RuntimeError("steer boom")
+        raise AppServerResponseError(
+            ProtocolError(
+                code=ProtocolErrorCode.STALE_TURN,
+                message="steer boom",
+                data={"steerCommitted": False},
+            )
+        )
 
     controller = _queue_controller(enqueue_turn=enqueue_turn, steer_turn=failing_steer)
     await controller.enqueue_prompt("only")
@@ -980,7 +1000,7 @@ async def test_steer_pending_preserves_block_when_reenqueue_also_fails(
     # instead of silently discarding the user's content. The caller reports the
     # recovery failure and a later reconnect/snapshot can reconcile the queue.
     with pytest.raises(RuntimeError, match="enqueue boom"):
-        await controller.steer_pending()
+        await controller.steer_pending(expected_turn_id="parent")
 
     assert controller.has_removable
     assert [widget.get_content() for widget in controller.widgets] == ["only"]
@@ -995,3 +1015,212 @@ async def test_steer_pending_preserves_block_when_reenqueue_also_fails(
     assert controller._merged is not None
     assert controller._merged.item_id == "item-3"
     assert enqueue_calls["contents"] == ["only", "only", "edited\n\nnext"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_explicit_steer_ambiguity_retains_identical_receipt_without_reenqueue(
+    monkeypatch: pytest.MonkeyPatch, cancelled: bool
+) -> None:
+    requests = []
+
+    async def steer(*args, **kwargs):
+        requests.append((args, kwargs))
+        if len(requests) == 1:
+            if cancelled:
+                raise asyncio.CancelledError
+            raise OSError("response lost after commit")
+
+    controller, calls = _merging_controller(steer_turn=steer)
+    await controller.enqueue_prompt("first")
+    await controller.enqueue_prompt("second")
+    widgets = controller.widgets
+    with pytest.raises(asyncio.CancelledError if cancelled else RuntimeError):
+        await controller.steer_pending(expected_turn_id="parent")
+    assert controller.has_unresolved_steering
+    assert controller.has_removable
+    assert controller.widgets == widgets
+    assert calls["remove"] == ["item-1"]
+    assert len(calls["enqueue"]) == 1
+    assert requests[0][1]["require_waiting_only"] is False
+    assert requests[0][1]["expected_turn_id"] == "parent"
+    assert requests[0][1]["idempotency_key"].startswith("steer:")
+    assert [w.pending for w in widgets] == [True, True]
+    assert not await controller.update_prompt(0, "changed")
+    assert await controller.retry_unresolved_steering()
+    assert requests[0] == requests[1]
+    assert [w.pending for w in widgets] == [False, False]
+    assert not controller.has_server_work
+    assert len(calls["enqueue"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["stale", "completion", "transport", "recovery"])
+async def test_conditional_selected_delivery_preserves_preparation_and_backlog(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from chartreux.app_server.client import AppServerResponseError
+    from chartreux.app_server.protocol import ProtocolError, ProtocolErrorCode
+
+    requests = []
+    enqueues = []
+    mounted = []
+
+    async def enqueue(content, **kwargs):
+        enqueues.append((content, kwargs))
+        if failure == "recovery" and len(enqueues) > 1:
+            raise OSError("requeue failed")
+        return _server_turn(
+            f"item-{len(enqueues)}", content, kwargs.get("message_entry_id")
+        )
+
+    async def steer(*args, **kwargs):
+        requests.append((args, kwargs))
+        if len(requests) == 1:
+            if failure == "transport":
+                raise OSError("lost response")
+            raise AppServerResponseError(
+                ProtocolError(
+                    code=ProtocolErrorCode.STALE_TURN
+                    if failure == "stale"
+                    else ProtocolErrorCode.CONFLICT,
+                    message="No matching active turn",
+                    data={"steerCommitted": False},
+                )
+            )
+
+    async def mount(widget, **kwargs):
+        mounted.append(widget)
+
+    monkeypatch.setattr(UserMessage, "set_pending", _noop_async)
+    controller = _queue_controller(
+        enqueue_turn=enqueue, steer_turn=steer, mount_and_scroll=mount
+    )
+    await controller.enqueue_prompt("older")
+    old_block = controller._merged
+    old_widget = controller.widgets[0]
+    prepared = PreparedPrompt(
+        display_text="/skill attachment",
+        prompt_text="/skill expanded attachment",
+        mentions=MentionStats(),
+        images=[_image("attachment.png")],
+    )
+    with pytest.raises((AppServerResponseError, OSError, RuntimeError)):
+        await controller.steer_prepared(
+            "/skill attachment",
+            prepared_prompt=prepared,
+            skill_name="skill",
+            expected_turn_id="parent",
+        )
+    assert controller._merged is old_block
+    assert controller.widgets[0] is old_widget
+    args, kwargs = requests[0]
+    assert args[0] == prepared.prompt_text
+    assert args[1] == prepared.images
+    assert kwargs["require_waiting_only"] is True
+    assert kwargs["expected_turn_id"] == "parent"
+    selected = next(
+        widget
+        for widget in mounted
+        if isinstance(widget, UserMessage) and widget is not old_widget
+    )
+    assert args[2] == selected.history_entry_id
+    posted_at = selected.posted_at
+    if failure == "transport":
+        assert len(enqueues) == 1
+        assert controller.has_unresolved_steering
+        assert controller.widgets == [old_widget, selected]
+        assert await controller.retry_unresolved_steering()
+        assert requests[0] == requests[1]
+        assert selected.posted_at == posted_at
+        assert not controller.has_unresolved_steering
+    else:
+        assert not controller.has_unresolved_steering
+        assert [w.get_content() for w in controller.widgets] == [
+            "older",
+            "/skill attachment",
+        ]
+        block = controller._restored[-1]
+        assert block.entries[0].prompt.skill_name == "skill"
+        assert block.entries[0].prompt.prepared_prompt == prepared
+        assert selected.posted_at == posted_at
+        assert enqueues[-1][1]["message_entry_id"] == args[2]
+        assert enqueues[-1][1]["idempotency_key"] != kwargs["idempotency_key"]
+        if failure == "recovery":
+            assert block.item_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("committed", [False, None])
+async def test_ambiguous_then_definitive_rejection_restores_prompt(
+    explicit: bool, committed: bool | None
+) -> None:
+    requests = []
+
+    async def steer(*args, **kwargs):
+        requests.append((args, kwargs))
+        if len(requests) == 1:
+            raise OSError("request never arrived")
+        raise AppServerResponseError(
+            ProtocolError(
+                code=ProtocolErrorCode.STALE_TURN,
+                message="Turn retired",
+                data={"steerCommitted": False} if committed is False else None,
+            )
+        )
+
+    controller = _queue_controller(steer_turn=steer)
+    if explicit:
+        await controller.enqueue_prompt("kept")
+    with pytest.raises(RuntimeError, match="unresolved"):
+        if explicit:
+            await controller.steer_pending(expected_turn_id="retired")
+        else:
+            await controller.steer_prepared(
+                "kept",
+                prepared_prompt=PreparedPrompt(display_text="kept", prompt_text="kept"),
+                expected_turn_id="retired",
+            )
+    await controller.enqueue_prompt("newer")
+    expected_error = AppServerResponseError if committed is False else RuntimeError
+    expected_message = "Turn retired" if committed is False else "unresolved"
+    with pytest.raises(expected_error, match=expected_message):
+        await controller.retry_unresolved_steering()
+    assert requests[0] == requests[1]
+    if committed is None:
+        # A session-changing recovery cannot prove rejection. F3 must keep the
+        # accepted-but-ambiguous delivery instead of enqueuing duplicate context.
+        assert controller.has_unresolved_steering
+        assert controller.queue_item_texts() == [(0, "newer"), (1, "kept")]
+        assert not controller._restored
+        return
+    assert not controller.has_unresolved_steering
+    assert controller.queue_item_texts() == [(0, "newer"), (1, "kept")]
+    assert controller._restored[0].item_id is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last", [False, True])
+async def test_unresolved_delivery_can_be_selected_and_discarded(
+    monkeypatch: pytest.MonkeyPatch, last: bool
+) -> None:
+    async def steer(*args, **kwargs):
+        raise OSError("disconnected")
+
+    monkeypatch.setattr(UserMessage, "remove", _noop_async)
+    controller = _queue_controller(steer_turn=steer)
+    with pytest.raises(RuntimeError, match="unresolved"):
+        await controller.steer_prepared(
+            "stuck",
+            prepared_prompt=PreparedPrompt(display_text="stuck", prompt_text="stuck"),
+            expected_turn_id="parent",
+        )
+    assert controller.has_removable
+    assert len(controller) == 1
+    assert controller.queue_item_texts() == [(0, "stuck")]
+    assert not await controller.update_prompt(0, "changed")
+    assert await (controller.pop_last() if last else controller.pop_at(0))
+    assert not controller.has_unresolved_steering
+    assert not controller
+    assert not await controller.retry_unresolved_steering()

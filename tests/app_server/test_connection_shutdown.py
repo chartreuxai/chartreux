@@ -34,6 +34,7 @@ class _EofClient:
 class _Connection:
     def __init__(self, client: _EofClient) -> None:
         self.current = client
+        self.attached = True
         self.reconnect_calls = 0
 
     async def reconnect(self, failed_client: _EofClient) -> bool:
@@ -134,7 +135,8 @@ async def test_close_during_attach_closes_streams_without_receiving_on_new_clien
     release_attach = asyncio.Event()
     attached_client = _BlockingIncomingClient()
 
-    async def attach():
+    async def attach(*, attach_session: bool = True):
+        assert attach_session
         attach_started.set()
         await release_attach.wait()
         return cast(AppServerClient, attached_client)

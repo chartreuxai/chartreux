@@ -7,7 +7,9 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import pytest
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.widgets import Input, OptionList
+from textual.widget import Widget
+from textual.widgets import Button, Input, OptionList
+from textual.widgets.option_list import Option
 from textual.worker import Worker
 
 from chartreux.app_server.models import (
@@ -63,6 +65,15 @@ def _plain_content(widget: NoMarkupStatic) -> str:
 
 
 class MCPAppHarness(App[None]):
+    CSS = """
+    #mcp-content { height: auto; }
+    #mcp-search-row { height: 3; }
+    #mcp-options { height: auto; max-height: 30vh; }
+    #mcp-actions { height: 1; }
+    #mcp-actions Button { height: 1; border: none; }
+    #mcp-help { height: auto; }
+    """
+
     def __init__(self, state: MCPState) -> None:
         super().__init__()
         self._state = state
@@ -132,11 +143,15 @@ async def test_overview_starts_on_first_source_and_search_uses_tab() -> None:
         assert option_list.highlighted_option is not None
         assert option_list.highlighted_option.id == "server:gmail"
 
-        await pilot.press("up")
+        await pilot.press("up", "k")
         assert app.screen.focused is option_list
         assert option_list.highlighted_option is not None
-        assert option_list.highlighted_option.id == "server:slack"
+        assert option_list.highlighted_option.id == "server:gmail"
 
+        await pilot.press("tab")
+        assert app.screen.focused is app.query_one("#mcp-disable", Button)
+        await pilot.press("tab")
+        assert app.screen.focused is app.query_one("#mcp-enable", Button)
         await pilot.press("tab")
         assert app.screen.focused is search
         await pilot.press("tab")
@@ -147,10 +162,10 @@ async def test_overview_starts_on_first_source_and_search_uses_tab() -> None:
         await pilot.press("tab")
         assert app.screen.focused is option_list
 
-        await pilot.press("down")
+        await pilot.press("down", "j", "down")
         assert app.screen.focused is option_list
         assert option_list.highlighted_option is not None
-        assert option_list.highlighted_option.id == "server:gmail"
+        assert option_list.highlighted_option.id == "server:slack"
 
 
 @pytest.mark.asyncio
@@ -761,3 +776,198 @@ async def test_starting_a_refresh_does_not_repost_a_detail_auth_request() -> Non
 
         release.set()
         await pilot.pause()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+async def test_detail_bounded_navigation_and_focus_cycle(size: tuple[int, int]) -> None:
+    app = MCPAppHarness(
+        _state(
+            _source(
+                "server", tools=[MCPToolSummary(name="a"), MCPToolSummary(name="b")]
+            )
+        )
+    )
+    async with app.run_test(size=size) as pilot:
+        picker = app.query_one(MCPApp)
+        options = picker.query_one(MCPOptionList)
+        await pilot.press("enter", "up", "k")
+        assert cast(Option, options.highlighted_option).id == "tool:a"
+        await pilot.press("down", "j", "down")
+        assert cast(Option, options.highlighted_option).id == "tool:b"
+        for key, expected in [
+            ("tab", "mcp-disable"),
+            ("tab", "mcp-enable"),
+            ("tab", "mcp-options"),
+            ("shift+tab", "mcp-enable"),
+            ("shift+tab", "mcp-disable"),
+            ("shift+tab", "mcp-options"),
+        ]:
+            await pilot.press(key)
+            assert cast(Widget, app.screen.focused).id == expected
+            assert cast(Option, options.highlighted_option).id == "tool:b"
+        await pilot.resize_terminal(
+            120 if size[0] == 80 else 80, 36 if size[1] == 24 else 24
+        )
+        assert cast(Option, options.highlighted_option).id == "tool:b"
+        assert all(tool.enabled for tool in picker._state.sources[0].tools)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("detail", [False, True])
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+async def test_pointer_toggle_matches_keyboard(
+    detail: bool, size: tuple[int, int]
+) -> None:
+    app = MCPAppHarness(_state(_source("server", tools=[MCPToolSummary(name="tool")])))
+    async with app.run_test(size=size) as pilot:
+        picker = app.query_one(MCPApp)
+        if detail:
+            await pilot.press("enter")
+        with patch.object(picker, "post_message", wraps=picker.post_message) as posted:
+            await pilot.press("d", "e")
+            await pilot.click("#mcp-disable")
+            assert cast(Widget, app.screen.focused).id == "mcp-disable"
+            await pilot.click("#mcp-enable")
+            messages = [
+                call.args[0]
+                for call in posted.call_args_list
+                if isinstance(call.args[0], MCPApp.MCPToggled)
+            ]
+        assert [(m.name, m.tool_name, m.disabled) for m in messages] == [
+            ("server", "tool" if detail else None, disabled)
+            for disabled in [True, False, True, False]
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("detail", [False, True])
+async def test_informational_rows_do_not_toggle_via_buttons(detail: bool) -> None:
+    app = MCPAppHarness(_state(_source("empty")) if detail else _state())
+    async with app.run_test() as pilot:
+        picker = app.query_one(MCPApp)
+        if detail:
+            await pilot.press("enter")
+        with patch.object(picker, "post_message", wraps=picker.post_message) as posted:
+            await pilot.press("d", "e")
+            await pilot.click("#mcp-disable")
+            await pilot.click("#mcp-enable")
+            assert not any(
+                isinstance(call.args[0], MCPApp.MCPToggled)
+                for call in posted.call_args_list
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+async def test_back_restores_identity_filter_focus_and_scroll(
+    size: tuple[int, int],
+) -> None:
+    app = MCPAppHarness(
+        _state(*[
+            _source(f"server-{i:02}", tools=[MCPToolSummary(name="tool")])
+            for i in range(30)
+        ])
+    )
+    async with app.run_test(size=size) as pilot:
+        picker = app.query_one(MCPApp)
+        options = picker.query_one(MCPOptionList)
+        help_widget = picker.query_one("#mcp-help", NoMarkupStatic)
+        assert _plain_content(help_widget).endswith("Esc Close")
+        await pilot.press("shift+tab")
+        picker.query_one(Input).value = "server"
+        await pilot.press("tab")
+        assert _plain_content(help_widget).endswith("Esc Clear filter")
+        options.highlighted = options.get_option_index("server:server-20")
+        await pilot.pause()
+        options.scroll_to(y=17, animate=False, immediate=True, force=True)
+        scroll_y = options.scroll_offset.y
+        assert scroll_y > 0
+        await pilot.press("enter")
+        assert _plain_content(help_widget).endswith("Esc Back")
+        await pilot.press("tab", "escape")
+        assert picker._query == picker.query_one(Input).value == "server"
+        assert cast(Option, options.highlighted_option).id == "server:server-20"
+        assert app.screen.focused is options
+        assert options.scroll_offset.y == scroll_y
+        await pilot.press("escape")
+        assert _plain_content(help_widget).endswith("Esc Close")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("detail", [False, True])
+async def test_refresh_removal_repairs_to_nearest_surviving_identity(
+    detail: bool,
+) -> None:
+    app = MCPAppHarness(
+        _state(*[
+            _source(
+                name, tools=[MCPToolSummary(name=tool) for tool in ["a", "b", "c", "d"]]
+            )
+            for name in ["a", "b", "c", "d"]
+        ])
+    )
+    async with app.run_test() as pilot:
+        picker = app.query_one(MCPApp)
+        options = picker.query_one(MCPOptionList)
+        options.highlighted = options.get_option_index("server:c")
+        if detail:
+            await pilot.press("enter")
+            options.highlighted = options.get_option_index("tool:c")
+            picker._state.sources[2].tools = [
+                MCPToolSummary(name=tool) for tool in ["a", "b", "d"]
+            ]
+        else:
+            picker._state.sources = [
+                source for source in picker._state.sources if source.name != "c"
+            ]
+        picker.refresh_index()
+        await pilot.pause()
+        assert cast(Option, options.highlighted_option).id == (
+            "tool:d" if detail else "server:d"
+        )
+        if detail:
+            picker._state.sources = [
+                source for source in picker._state.sources if source.name != "c"
+            ]
+            picker.refresh_index()
+            await pilot.pause()
+            assert picker._viewing_name is None
+            assert cast(Option, options.highlighted_option).id == "server:d"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+async def test_host_layout_exposes_toggle_controls(
+    size: tuple[int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_snapshot_wake()
+    app = build_test_chartreux_app()
+    state = _state(*[
+        _source(f"server-{i:02}", tools=[MCPToolSummary(name="tool")])
+        for i in range(30)
+    ])
+    async with app.run_test(size=size) as pilot:
+        mcp = app.app_server.resources.mcp
+        mcp._state.mcp = state
+        monkeypatch.setattr(mcp, "read", AsyncMock(return_value=state))
+        monkeypatch.setattr(mcp, "toggle", AsyncMock())
+        await app._show_mcp()
+        await wait_until(pilot, lambda: bool(app.query(MCPApp)))
+        app.query_one(MCPApp)._state_getter = lambda: state
+        await pilot.pause()
+        assert await pilot.click("#mcp-disable")
+        await pilot.pause()
+        cast(AsyncMock, mcp.toggle).assert_awaited_once()
+        assert await pilot.click("#mcp-enable")
+        await pilot.pause()
+        app.query_one(MCPOptionList).focus()
+        await pilot.press("enter")
+        assert app.query_one(MCPApp)._viewing_name == "server-00"
+        assert await pilot.click("#mcp-disable")
+        assert await pilot.click("#mcp-enable")
+        await pilot.resize_terminal(
+            120 if size[0] == 80 else 80, 36 if size[1] == 24 else 24
+        )
+        assert await pilot.click("#mcp-disable")
+        assert await pilot.click("#mcp-enable")

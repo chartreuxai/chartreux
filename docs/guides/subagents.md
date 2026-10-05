@@ -6,19 +6,26 @@ continue working while subagents run.
 
 ## Launching work
 
-The `task` tool uses a named agent profile when `agent` is supplied. Chartreux
-ships three built-in role profiles: `worker`, `advisor`, and `reviewer`. A task
-without an `agent` name uses the default `worker` profile. There is no built-in
+The `task` tool selects an agent type by profile name through `agent_type` and
+creates a new agent instance when `agent_id` is omitted. Chartreux ships three
+built-in agent types: `worker`, `advisor`, and `reviewer`. A new task without an
+`agent_type` name uses the default `worker` profile. There is no built-in
 `explore` profile; `explore` remains a system-prompt ID.
+
+An agent instance's retained identity is its `agent_id`. Handles of the form
+`agent-N` (digits after `agent-`) are reserved for instances and cannot be profile
+names; supplying one as `agent_type` is rejected before dispatch. Unknown profile
+names report `Unknown agent_type profile`, while unknown retained handles report
+`Unknown agent_id instance handle`. The old Task field `agent` is not accepted.
 
 For the built-in role profiles, dispatch the task directly. Their role prompts
 already contain the noninteractive subagent contract and role guidance; do not
 add a role-specific skill-loading instruction:
 
 ```text
-task(task="Implement the bounded change in the issue", agent="worker")
-task(task="Recommend an approach and identify risks", agent="advisor")
-task(task="Review the authentication changes", agent="reviewer")
+task(task="Implement the bounded change in the issue", agent_type="worker")
+task(task="Recommend an approach and identify risks", agent_type="advisor")
+task(task="Review the authentication changes", agent_type="reviewer")
 ```
 
 Task-type skills remain explicit. For example, a search assignment can ask the
@@ -26,7 +33,7 @@ worker to load `sub-finder`; the role profile and the task skill serve different
 purposes:
 
 ```text
-task(task="Load the sub-finder skill and locate all callers of the parser.", agent="worker")
+task(task="Load the sub-finder skill and locate all callers of the parser.", agent_type="worker")
 ```
 
 A task launches in the background by default (`background: true`). The call
@@ -91,12 +98,38 @@ a changed persona requires launching a new subagent. A subagent cannot gain
 tool authority beyond its parent. Retasking is available only for background
 subagents.
 
+Subagents can reread exact instruction files injected into their context,
+including `AGENTS.md`, using `read_file` or exact-file `grep` even outside the
+workspace roots. This does not grant directory searches or write access, and
+tool denials and sensitive-file protections still apply. See
+[Privacy](../project/privacy.md#instruction-file-access) for the data boundary.
+
+Subagents inherit access to the session scratchpad through their parent-authority
+chain rather than receiving a new workspace grant. File tools and shell checks
+resolve that access against the ancestor scratchpad roots. Broken authority
+chains, symlink escapes, and retargeted roots fail closed; tool denials and
+sensitive-file protections still apply.
+
 ## Lifecycle and results
 
-A background subagent is first **running**. When its run reaches a terminal
-outcome it becomes **idle** and remains available for inspection or reuse.
+A background subagent starts **running**, may be **compacting**, then passes
+through **finishing** while cleanup and result publication settle. It becomes
+**idle** and remains available for inspection or reuse, subject to retention
+policy. The browser shows the last run's outcome, including **Cancelled**, even
+when the retained agent is idle. **Stopping** is a local TUI presentation state
+for a pending stop, not a registry availability state or a terminal outcome.
 The parent receives a completion notification that points it to
 `get_agent_result`.
+
+A would-be successful run without final prose is reported as **Failed**, with
+`completed: false` and stop reason `error`, not as an empty successful result.
+Empty model responses get at most one bounded replay; terminal failures use
+`EmptyLLMResponseError` or `IncompleteLLMResponseError`. Published streaming
+output is never replayed automatically.
+
+If the parent is only waiting on subagents, submitting a new message in the TUI
+cancels its waits, not the child runs, and steers the same parent turn immediately.
+See [Input and queueing](terminal.md#input-and-queueing).
 
 - `check_agents` lists retained subagents, including status and effective model
   and thinking information.
@@ -104,7 +137,10 @@ The parent receives a completion notification that points it to
   waiting; it returns no result while the run is active.
 - `wait_for_agent(agent_id, run_id, timeout=...)` waits for completion. A
   timeout only stops the wait; it does not cancel the subagent.
-- Pass an idle `agent_id` to `task` to give that subagent another assignment.
+- Pass an idle agent instance's `agent_id` to
+  `task(agent_id=..., background=true, task=...)` to give it another assignment;
+  omit `agent_type` to retain its profile. Both launch acknowledgments and
+  `check_agents.reuse_guidance` include this reuse guidance.
 - `release_agent(agent_id)` closes and removes a retained subagent when it is no
   longer useful.
 
@@ -114,13 +150,64 @@ tombstone and stored results, so `get_agent_result` remains usable after
 eviction. Result expiry is separate: each root generation retains at most 32
 unreferenced stored results. Release subagents when you are done.
 
+### Cancelling and replacing background work
+
+The orchestrator can stop one run with `cancel_agent(agent_id, run_id=None)`.
+Omitting `run_id` targets the current run; supplying it pins the request to that
+run and cannot stop a newer assignment. This tool manages only the
+orchestrator's own background agents. Foreground work uses the normal parent
+interruption controls.
+
+A response of `stop_requested` means the stop was accepted, not that cleanup is
+finished. `already_stopping` means a stop is already pending;
+`already_finishing` preserves work that has finished executing. `not_running`,
+`unknown_run`, and `forbidden` report an inactive, unknown, or unauthorized
+target. Use `wait_for_agent` to wait for the terminal result. Cancellation does
+not interrupt the parent or sibling agents and does not release the agent.
+
+Cancelled results carry `completed: false`, accumulator partial output, and a
+`stop_reason`: `user_cancelled`, `orchestrator_cancelled`, or `retasked` for these
+operations. The first accepted stop reason wins. A genuine completion or error
+is not rewritten by a late stop. Stopping does not undo file, shell, or remote
+side effects, generate a summary, or salvage additional output.
+
+The retained conversation, transcript, partial result, and existing waits remain
+available subject to retention policy. Zero-retention agents evict at
+finalization; other agents may evict on TTL or idle-cap limits. Eviction keeps
+stored results until separate result expiry. Saved transcript inspection depends
+on session logging and disk availability. Explicit `release_agent` removes the
+agent and purges its stored results and wait leases.
+
+To replace a busy assignment in the same retained conversation:
+
+```text
+task(agent_id="<agent-id>", task="Investigate the revised requirement", replace_run=True)
+```
+
+`replace_run=True` requires an `agent_id` and background mode. It stops the old
+run with reason `retasked`, waits for its cleanup, and launches the replacement
+without overlapping execution. The replacement prompt states that it supersedes
+the interrupted task; the acknowledgment metadata includes both run IDs.
+Busy replacement cannot change the profile or launch configuration. An idle
+target uses ordinary reuse, which still permits runtime configuration overrides.
+Ordinary reuse of a busy agent without `replace_run=True` is rejected. Already
+stopping or finishing targets are not replaced; if replacement admission fails,
+the old run remains stopped and the error is reported.
+
+A user stop notifies the parent as an injected message **without starting a
+parent turn**. An idle parent learns of the cancellation on its next turn. The
+notification attributes the cancellation to the user; orchestrator cancellation
+and retask are attributed separately.
+
 ## Active-work admission cap
 
 By default, at most 16 subagent runs can be active under a root session. The cap
 counts foreground and background work, including retasking idle agents and
-pending child creation; idle retained agents do not count. A launch or retask
-at capacity is rejected immediately rather than queued. Wait for active work
-to finish before trying again.
+pending child creation; idle retained agents do not count. A new launch or idle
+reuse at capacity is rejected immediately rather than queued. A busy replacement
+with `replace_run=True` proceeds at capacity: it reserves the old run's existing
+slot through cleanup and transfers it to the replacement, adding no concurrency.
+Unrelated launches cannot take that reserved slot.
 
 Set the cap in `config.toml`:
 
@@ -150,19 +237,49 @@ the [configuration reference](../reference/configuration.md) for role presets.
 
 ## TUI monitoring
 
-The TUI shows a one-line background-agent statusline above the input. It includes
-an activity spinner while agents are running and aggregate counts by state (for
-example, `3 agents: 2 running · 1 idle`). Click the statusline, type `/agents`, or
-press `Ctrl+Shift+A` to expand it into an in-place list.
+The TUI shows a one-line agent summary above the input with aggregate counts by
+state. Click it, type `/agents`, or press `Ctrl+Shift+A` to open the docked
+agent browser.
 
-The expanded list is keyboard- and mouse-navigable. It keeps a pinned **Main
-agent** entry at the top, followed by one row per retained agent. Rows show the
-agent ID, profile, status, model, turns used for the current run, run ID, and
-idle/TTL information. Released agents are removed; evicted tombstones remain
-browsable with their stored-result metadata. The list is capped to roughly ten
-rows and scrolls internally when more agents are available. Use `Up`/`Down` to
-move the selection and `Enter` to open it. `/agents` and `Ctrl+Shift+A` toggle the
-list; collapsing it restores focus to the chat input.
+The browser keeps **Main agent** pinned at the top, followed by retained agents
+in stable order. Its ten-row sheet scrolls internally. Rows show identity,
+profile, and a static state marker: **Running**, **Compacting**, **Stopping**, **Finishing**
+(with the run outcome), **Idle**, **Failed**, **Cancelled**, **Budget stopped**,
+or **Evicted**. Compacting is a presentation substate of active work, not a
+separate lifecycle state. Released agents disappear; evicted tombstones remain
+browsable with their stored-result metadata.
+
+Use `Up`/`Down` to select a row, then `Enter` or a single click to open its output.
+Two detail rows show the selection's state, running or last-run duration, idle
+duration where applicable, context usage, model, and turns. Running and idle
+elapsed times are anchored to receipt of the server snapshot; evicted values
+remain frozen at the last recorded measurement. Context usage uses the effective
+compaction threshold as its denominator, not the model's maximum context window.
+
+Press `D` for scrollable full metadata, including task, provider, model, thinking,
+run ID, stop reason, and retention information. Details also works on **Main
+agent**. `F1` opens local help; `Escape` returns from help, then details, then
+closes the browser and restores input focus. The footer lists available actions.
+`/agents` and `Ctrl+Shift+A` toggle the browser.
+
+On a highlighted **Running** or **Compacting** child with a current run ID,
+press `C` to open inline **[Stop run] [Cancel]** controls. The confirmation names
+the agent and captured run and explains retention-qualified preservation.
+**Cancel** has default focus; use `Tab`, arrow keys, or a click to choose an
+action, then `Enter` to activate it. `PageUp`/`PageDown` scroll the scope text.
+`Escape` dismisses the confirmation first, without closing the browser or
+interrupting the parent. Dismissal and submission return focus to the browser
+list; closing inspection restores the conversation's focus and reading position.
+
+Choosing **Stop run** sends only that pinned run and shows **Stopping** until
+an authoritative update settles it; repeat stops are disabled while pending.
+Accepted or already-pending stops do not immediately claim **Cancelled**.
+Inactive or unknown targets clear the pending display; finishing targets reconcile
+to their actual state. Forbidden requests and transport failures surface an error
+toast while leaving retained output inspectable. Updates that terminate, remove,
+or replace the captured run invalidate the confirmation or pending display; late
+responses cannot mark a replacement run as Stopping. There is no `T` retask key:
+ask the orchestrator in prose to use `task(..., replace_run=True)`.
 
 Selecting an agent replaces the conversation area with a bordered pane titled
 `Subagent: <id> · <profile>`. Running or finalizing agents show a live,
@@ -171,8 +288,9 @@ entry structure as the saved transcript, so it converges when the run finishes.
 Older pages do not jump during refresh: use `PageUp` to paginate and `r` for a
 manual refresh. The pane identifies saved transcripts when the agent is no
 longer running. Press `Escape`, or select **Main agent**, to return to the
-conversation. A new main-agent turn closes the pane automatically; releasing an
-agent closes its pane, while an evicted agent remains available from disk.
+conversation. Main-agent activity does not close inspection; releasing an
+agent closes its pane, while an evicted agent remains inspectable when its saved
+transcript is available.
 
 Completion notifications still arrive in the parent session; use the result
 tools to consume the machine-readable outcome.
@@ -199,6 +317,11 @@ disabled_tools = ["edit", "write_file"]
 [tools.bash]
 permission = "always"
 ```
+
+The TOML `agent_type = "subagent"` field classifies the profile internally; it is
+not the Task `agent_type` argument, which takes the profile name (`reviewer` in
+this example). Profile names matching `agent-N` are reserved and rejected during
+discovery.
 
 Profile fields are validated during discovery; an invalid profile is not made
 available. Use `role` to bind a profile to a role; `active_model` is rejected in

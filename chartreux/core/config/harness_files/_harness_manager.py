@@ -28,6 +28,14 @@ FileSource = Literal["user", "project"]
 
 
 @dataclass(frozen=True)
+class InstructionDocument:
+    source: FileSource
+    path: Path
+    canonical_path: Path
+    content: str
+
+
+@dataclass(frozen=True)
 class HarnessFilesManager:
     sources: tuple[FileSource, ...] = ("user",)
     cwd: Path | None = field(default=None)
@@ -222,6 +230,55 @@ class HarnessFilesManager:
             return []
         d = GLOBAL_PROMPTS_DIR.path
         return [d] if d.is_dir() else []
+
+    @staticmethod
+    def _read_instruction_document(
+        path: Path, source: FileSource
+    ) -> InstructionDocument | None:
+        try:
+            canonical = path.resolve()
+            content = read_safe(canonical).text.strip()
+            if content:
+                return InstructionDocument(source, path, canonical, content)
+        except (FileNotFoundError, OSError):
+            pass
+        return None
+
+    def load_instruction_documents(self) -> list[InstructionDocument]:
+        """Load prompt documents and pin their exact canonical file identities.
+
+        Lazy, workspace-internal subdirectory discovery by read_file is separate
+        and never contributes to this manifest. No local-file variant is loaded.
+        """
+        documents: list[InstructionDocument] = []
+        if "user" in self.sources:
+            user = self._read_instruction_document(
+                CHARTREUX_HOME.path / AGENTS_MD_FILENAME, "user"
+            )
+            if user is not None:
+                documents.append(user)
+        seen: set[Path] = set()
+        for root in self.project_roots:
+            stop = self.trust_store.find_trust_root(root) or root
+            if not root.is_relative_to(stop):
+                continue
+            collected: list[InstructionDocument] = []
+            current = root
+            while True:
+                document = self._read_instruction_document(
+                    current / AGENTS_MD_FILENAME, "project"
+                )
+                if document is not None:
+                    collected.append(document)
+                if current in {stop, current.parent}:
+                    break
+                current = current.parent
+            for document in reversed(collected):
+                identity = document.path.parent.resolve()
+                if identity not in seen:
+                    seen.add(identity)
+                    documents.append(document)
+        return documents
 
     def load_user_doc(self) -> str:
         if "user" not in self.sources:

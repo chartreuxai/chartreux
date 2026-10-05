@@ -18,6 +18,8 @@ from chartreux.core.events import (
 )
 from chartreux.core.llm.exceptions import BackendError, PayloadSummary
 from chartreux.core.llm_models import FunctionCall, LLMChunk, LLMMessage, Role, ToolCall
+from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.prompts import UtilityPrompt
 from tests.conftest import (
     build_test_agent_loop,
@@ -144,6 +146,104 @@ class _ScriptedBackend(FakeBackend):
         )
         for chunk in stream:
             yield chunk
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["strict", "fallback", "retry", "cancelled"])
+async def test_failed_compaction_preserves_measured_usage_and_history(
+    failure: str,
+) -> None:
+    raises_at = {}
+    if failure == "retry":
+        raises_at[0] = _ctx_too_long_error()
+    elif failure == "cancelled":
+        raises_at[1] = asyncio.CancelledError()
+    backend = _ScriptedBackend(
+        [
+            [
+                mock_llm_chunk(
+                    content="no summary", prompt_tokens=40, completion_tokens=20
+                )
+            ]
+        ],
+        raises_at=raises_at,
+    )
+    agent = build_test_agent_loop(
+        config=build_test_vibe_config(
+            models=make_test_models(auto_compact_threshold=999),
+            raise_on_compaction_failure=failure == "strict",
+        ),
+        backend=backend,
+    )
+    agent.messages.extend([
+        LLMMessage(role=Role.user, content="old ask"),
+        LLMMessage(role=Role.assistant, content="old work"),
+        LLMMessage(role=Role.user, content="latest ask"),
+    ])
+    agent.stats.context_tokens = 5432
+    history = list(agent.messages)
+    expected_error = (
+        asyncio.CancelledError if failure == "cancelled" else CompactionFailedError
+    )
+    with pytest.raises(expected_error):
+        await agent.compact()
+
+    assert list(agent.messages) == history
+    assert agent.stats.context_tokens == 5432
+    assert agent.stats.session_total_llm_tokens >= 60
+    assert agent.stats.known_cost_total > 0
+
+
+@pytest.mark.asyncio
+async def test_successful_compaction_is_unknown_until_conversation_call() -> None:
+    backend = FakeBackend([
+        [mock_llm_chunk(content="<summary>done</summary>")],
+        [mock_llm_chunk(content="sideband", prompt_tokens=200)],
+        [
+            mock_llm_chunk(
+                content="conversation", prompt_tokens=80, completion_tokens=20
+            )
+        ],
+    ])
+    agent = build_test_agent_loop(
+        config=build_test_vibe_config(
+            models=make_test_models(auto_compact_threshold=999)
+        ),
+        backend=backend,
+    )
+    agent.messages.append(LLMMessage(role=Role.user, content="Hello"))
+    agent.stats.context_tokens = 5432
+    await agent.compact()
+    assert agent.stats.context_tokens == -1
+    await agent._complete(
+        model=agent.config.get_active_model(),
+        messages=agent.messages,
+        tools=None,
+        tool_choice=None,
+        call_type="secondary_call",
+        account_conversation=False,
+    )
+    assert agent.stats.context_tokens == -1
+    await agent._chat()
+    assert agent.stats.context_tokens == 100
+    assert agent.stats.session_total_llm_tokens == 320
+
+
+@pytest.mark.asyncio
+async def test_global_zero_threshold_disables_auto_compaction() -> None:
+    config = build_test_vibe_config(auto_compact_threshold=0)
+    raw = config.catalog_snapshot.catalog.model_dump()
+    raw["models"]["glm-5-3"]["deployments"][0]["auto_compact_threshold"] = None
+    # Catalog overlays without a deployment override use the global fallback.
+    config.attach_catalog_snapshot(
+        CatalogSnapshot(ModelCatalog.model_validate(raw), "test")
+    )
+    agent = build_test_agent_loop(
+        config=config, backend=FakeBackend(mock_llm_chunk(content="done"))
+    )
+    agent.stats.context_tokens = 999999
+    events = [event async for event in agent.act("Hello")]
+    assert not any(isinstance(event, CompactStartEvent) for event in events)
 
 
 @pytest.mark.asyncio
@@ -390,8 +490,8 @@ async def test_compact_raises_on_tool_call_when_flag_enabled() -> None:
 
 @pytest.mark.asyncio
 async def test_compact_raises_on_empty_summary_when_flag_enabled() -> None:
-    """With the flag on, a compaction with empty content raises."""
-    backend = FakeBackend([[mock_llm_chunk(content="   ")]])
+    """With the flag on, an empty extracted summary raises without replay."""
+    backend = FakeBackend([[mock_llm_chunk(content="<summary> </summary>")]])
     cfg = build_test_vibe_config(
         models=make_test_models(auto_compact_threshold=999),
         raise_on_compaction_failure=True,
@@ -403,13 +503,14 @@ async def test_compact_raises_on_empty_summary_when_flag_enabled() -> None:
     with pytest.raises(CompactionFailedError) as exc_info:
         await agent.compact()
     assert exc_info.value.reason == "empty_summary"
+    assert len(backend.requests_messages) == 1
 
 
 @pytest.mark.asyncio
 async def test_compact_falls_back_when_flag_disabled() -> None:
-    """With the flag off (default), empty primary content uses the fallback."""
+    """With the flag off (default), an empty extracted summary uses the fallback."""
     backend = FakeBackend([
-        [mock_llm_chunk(content="")],
+        [mock_llm_chunk(content="<summary> </summary>")],
         [mock_llm_chunk(content="<summary>recovered</summary>")],
     ])
     cfg = build_test_vibe_config(models=make_test_models(auto_compact_threshold=999))
@@ -419,6 +520,43 @@ async def test_compact_falls_back_when_flag_disabled() -> None:
 
     summary = await agent.compact()
     assert summary == "recovered"
+    assert len(backend.requests_messages) == 2
+    assert backend.requests_messages[0] != backend.requests_messages[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["strict", "recovered", "exhausted"])
+async def test_compact_raw_empty_response_replays_before_fallback(outcome: str) -> None:
+    streams = [[mock_llm_chunk(content="")], [mock_llm_chunk(content="")]]
+    if outcome == "recovered":
+        streams.append([mock_llm_chunk(content="<summary>recovered</summary>")])
+    backend = FakeBackend(streams)
+    cfg = build_test_vibe_config(
+        models=make_test_models(auto_compact_threshold=999),
+        raise_on_compaction_failure=outcome == "strict",
+    )
+    agent = build_test_agent_loop(config=cfg, backend=backend)
+    agent.messages.append(LLMMessage(role=Role.user, content="Hello"))
+    agent.stats.context_tokens = 100
+    history = list(agent.messages)
+
+    if outcome == "recovered":
+        assert await agent.compact() == "recovered"
+        assert agent.messages[-1].context_boundary == "compaction"
+    else:
+        with pytest.raises(CompactionFailedError) as exc_info:
+            await agent.compact()
+        assert exc_info.value.reason == "empty_summary"
+        assert list(agent.messages) == history
+        assert agent.stats.context_tokens == 100
+
+    expected_calls = {"strict": 2, "recovered": 3, "exhausted": 4}
+    assert len(backend.requests_messages) == expected_calls[outcome]
+    assert backend.requests_messages[0] == backend.requests_messages[1]
+    if outcome != "strict":
+        assert backend.requests_messages[1] != backend.requests_messages[2]
+    if outcome == "exhausted":
+        assert backend.requests_messages[2] == backend.requests_messages[3]
 
 
 @pytest.mark.asyncio
@@ -549,13 +687,15 @@ async def test_compact_catalog_selector_retains_shipped_thinking_without_mutatio
 async def test_compact_glm_5_3_fallback_retains_encodable_thinking() -> None:
     config = build_test_vibe_config(compaction_model="glm-5-3")
     backend = _ScriptedBackend([
-        [mock_llm_chunk(content="")],
+        [mock_llm_chunk(content="<summary> </summary>")],
         [mock_llm_chunk(content="<summary>recovered</summary>")],
     ])
     agent = build_test_agent_loop(config=config, backend=backend)
     agent.messages.append(LLMMessage(role=Role.user, content="Hello"))
 
     assert await agent.compact() == "recovered"
+    assert len(backend.requested_models) == 2
+    assert backend.requests_messages[0] != backend.requests_messages[1]
     assert backend.requested_models[1].thinking == "high"
 
 
@@ -572,6 +712,8 @@ async def test_compact_fallback_failure_raises() -> None:
         await agent.compact()
 
     assert exc_info.value.reason == "tool_call"
+    assert len(backend.requests_messages) == 3
+    assert backend.requests_messages[1] == backend.requests_messages[2]
 
 
 @pytest.mark.asyncio

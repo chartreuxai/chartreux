@@ -39,6 +39,7 @@ from chartreux.core.config.models import (
     ProjectContextConfig,
     ProviderConfig,
     SessionLoggingConfig,
+    StatusLineConfig,
     SubagentsConfig,
     ThinkingLevel,
     normalize_authorized_roots,
@@ -384,6 +385,10 @@ class ChartreuxConfigSchema(ConfigSchema):
     displayed_workdir: Annotated[str, WithReplaceMerge()] = ""
     context_warnings: Annotated[bool, WithReplaceMerge()] = False
     show_thinking_nodes: Annotated[bool, WithReplaceMerge()] = False
+    show_message_timestamps: Annotated[bool, WithReplaceMerge()] = True
+    status_line: Annotated[StatusLineConfig, WithDeepMerge()] = Field(
+        default_factory=StatusLineConfig
+    )
     ascii_chrome: Annotated[bool, WithReplaceMerge()] = False
     raise_on_compaction_failure: Annotated[bool, WithReplaceMerge()] = False
     system_prompt_id: Annotated[str, WithReplaceMerge()] = SystemPrompt.CLI

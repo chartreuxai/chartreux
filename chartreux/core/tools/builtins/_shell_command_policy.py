@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import stat
+from typing import Literal
 from urllib.parse import unquote, urlsplit
+
+from chartreux.core.tools.builtins._shell_diagnostics import Diagnostic
 
 # Length of a single-character short option ("-i") and the minimum length of
 # an unambiguous combined short-option cluster ("-ic").
@@ -19,6 +22,23 @@ _MAX_LESS_RESUMED_OPTIONS = 256
 class ShellCommandPolicy:
     requires_approval: bool = False
     denial_reason: str | None = None
+    diagnostic: Diagnostic | None = None
+
+    def denial_diagnostic(self, command_part: str) -> Diagnostic:
+        if self.diagnostic is not None:
+            return Diagnostic(
+                self.diagnostic.code,
+                self.diagnostic.offending_token,
+                command_part,
+                self.diagnostic.detail,
+            )
+        return Diagnostic(
+            "policy",
+            command_part=command_part,
+            detail=self.denial_reason
+            or "unsafe or unmodeled command options are not permitted",
+        )
+
     inspect_positional_paths: bool = False
     # Test-only classification contract: runtime scopes all sed operands alike,
     # including in-place writes; no reader exemption depends on this flag.
@@ -217,6 +237,642 @@ def _has_short_in_cluster(parsed: _ParsedOptions, names: frozenset[str]) -> bool
         and not token.startswith("--")
         and any(short in names for short in token[1:])
         for token in parsed.options
+    )
+
+
+# Only modeled options may advance the scan: an unknown option might consume
+# the next word, hiding an execution target behind it.
+_INLINE_SWITCHES = {
+    "python": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
+    "python3": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
+    "pypy": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
+    "pypy3": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
+    "node": (
+        "e",
+        frozenset("ip"),
+        frozenset("r"),
+        {
+            "--require": True,
+            "--input-type": True,
+            "--no-warnings": False,
+            "--trace-warnings": False,
+            "--no-deprecation": False,
+            "--experimental-repl-await": False,
+        },
+    ),
+    "perl": ("e", frozenset("wlnpT"), frozenset("IMmF"), {}),
+    "ruby": (
+        "e",
+        frozenset("wdv"),
+        frozenset("IrCEFKTW"),
+        {"--disable": True, "--enable": True},
+    ),
+}
+
+
+_MAX_EXECUTOR_DEPTH = 8
+
+BoundaryKind = Literal[
+    "none",
+    "shell_source",
+    "argv_after_keyword",
+    "argv_positional",
+    "module_target",
+    "inline_code_switch",
+]
+ArgumentRange = tuple[int, int]
+
+
+@dataclass(frozen=True)
+class ExecutorGrammar:
+    """Declarative, bounded argv grammar; not a shell parser or package resolver."""
+
+    options: _OptionTable = _OptionTable()
+    flags: frozenset[str] = frozenset()
+    boundary_kind: BoundaryKind = "none"
+    keyword: str | None = None
+    prefix_operands: int = 0
+    cwd_options: tuple[str, ...] = ()
+    inline_options: tuple[str, ...] = ()
+    module_options: tuple[str, ...] = ()
+    native_target: Literal["go", "cargo"] | None = None
+    assignments: bool = False
+    single_dash_long: bool = False
+    plus_value_options: frozenset[str] = frozenset()
+    admitted_applets: frozenset[str] | None = None
+    require_leading_assignment: bool = False
+    package_executable: bool = False
+    child_execution: bool = True
+    reject_execution: str | None = None
+    # Legacy adapters intentionally retain their historical recognition rules.
+    legacy_inline: (
+        tuple[str, frozenset[str], frozenset[str], dict[str, bool]] | None
+    ) = None
+
+
+@dataclass(frozen=True)
+class ExecutorBoundary:
+    """Token ranges are half-open indexes into the original argv, including argv[0].
+
+    consumed_ranges belong to the executor, never the inner command. Payload
+    ranges may overlap consumed ranges (including an attached switch/payload).
+    Native targets and program arguments are NOT executable argv: callers must
+    not recursively dispatch them. cwd_overrides apply only to child execution.
+    Unknown registered syntax raises ValueError, never returns a guessed boundary.
+    """
+
+    boundary_kind: BoundaryKind
+    inner_command_range: ArgumentRange | None = None
+    consumed_ranges: tuple[ArgumentRange, ...] = ()
+    inline_payload_ranges: tuple[ArgumentRange, ...] = ()
+    module_targets: tuple[str, ...] = ()
+    cwd_overrides: tuple[str, ...] = ()
+    native_targets: tuple[str, ...] = ()
+    program_argument_range: ArgumentRange | None = None
+    inline_payloads: tuple[str, ...] = ()
+    child_execution: bool = False
+    module_command: tuple[str, ...] = ()
+
+
+EXECUTOR_REGISTRY: dict[str, ExecutorGrammar] = {
+    "uv": ExecutorGrammar(
+        options=_OptionTable(
+            long_values=frozenset({
+                "--directory",
+                "--project",
+                "--python",
+                "--with",
+                "--with-editable",
+                "--with-requirements",
+                "--package",
+                "--extra",
+                "--group",
+                "--index",
+                "--index-url",
+                "--default-index",
+                "--cache-dir",
+                "--config-file",
+                "--exclude",
+                "--no-group",
+                "--env-file",
+            }),
+            short_values=frozenset("p"),
+            boolean_long=frozenset({
+                "--no-sync",
+                "--locked",
+                "--frozen",
+                "--isolated",
+                "--no-project",
+                "--no-dev",
+                "--all-extras",
+                "--all-groups",
+                "--no-cache",
+                "--offline",
+                "--quiet",
+                "--verbose",
+                "--no-config",
+                "--active",
+            }),
+        ),
+        flags=frozenset("qv"),
+        boundary_kind="argv_after_keyword",
+        keyword="run",
+        cwd_options=("--directory",),
+    ),
+    "npx": ExecutorGrammar(
+        options=_OptionTable(
+            long_values=frozenset({
+                "--package",
+                "--cache",
+                "--registry",
+                "--userconfig",
+            }),
+            short_values=frozenset("p"),
+            boolean_long=frozenset({"--yes", "--no", "--no-install", "--quiet"}),
+        ),
+        flags=frozenset("ynq"),
+        boundary_kind="argv_positional",
+        package_executable=True,
+    ),
+    "pipx": ExecutorGrammar(
+        options=_OptionTable(
+            long_values=frozenset({"--spec", "--python", "--pip-args", "--index-url"}),
+            boolean_long=frozenset({
+                "--verbose",
+                "--quiet",
+                "--no-cache",
+                "--system-site-packages",
+                "--pypackages",
+                "--editable",
+            }),
+        ),
+        flags=frozenset("vq"),
+        boundary_kind="argv_after_keyword",
+        keyword="run",
+    ),
+    # go run compiles .go files (possibly several) or ONE package target; later
+    # operands are program arguments. Neither is an executable argv boundary.
+    "go": ExecutorGrammar(
+        # Canonical -- names let the shared scanner model Go's single-dash
+        # whole-name flags without treating -tags as a short-option cluster.
+        options=_OptionTable(
+            long_values=frozenset({
+                "--C",
+                "--asmflags",
+                "--buildmode",
+                "--compiler",
+                "--gccgoflags",
+                "--gcflags",
+                "--ldflags",
+                "--mod",
+                "--modfile",
+                "--overlay",
+                "--p",
+                "--pkgdir",
+                "--tags",
+            }),
+            boolean_long=frozenset({
+                "--a",
+                "--n",
+                "--race",
+                "--msan",
+                "--asan",
+                "--trimpath",
+                "--v",
+                "--work",
+                "--x",
+                "--buildvcs",
+            }),
+        ),
+        boundary_kind="none",
+        keyword="run",
+        native_target="go",
+        single_dash_long=True,
+        cwd_options=("--C",),
+    ),
+    # cargo run selects a manifest/package/bin/example, or the manifest's default
+    # binary. Only operands AFTER -- are program arguments, never executable argv.
+    "cargo": ExecutorGrammar(
+        options=_OptionTable(
+            long_values=frozenset({
+                "--manifest-path",
+                "--package",
+                "--bin",
+                "--example",
+                "--features",
+                "--target",
+                "--target-dir",
+                "--profile",
+                "--jobs",
+                "--config",
+            }),
+            short_values=frozenset("pjF"),
+            boolean_long=frozenset({
+                "--release",
+                "--quiet",
+                "--verbose",
+                "--locked",
+                "--frozen",
+                "--offline",
+                "--all-features",
+                "--no-default-features",
+            }),
+        ),
+        flags=frozenset("qvr"),
+        keyword="run",
+        native_target="cargo",
+    ),
+    "script": ExecutorGrammar(
+        options=_OptionTable(short_values=frozenset("c")),
+        boundary_kind="shell_source",
+        inline_options=("-c",),
+        reject_execution="unsupported script -c shell wrapper",
+    ),
+    "env": ExecutorGrammar(
+        options=_OptionTable(
+            long_values=frozenset({"--unset", "--chdir"}),
+            short_values=frozenset("uC"),
+            boolean_long=frozenset({"--ignore-environment"}),
+        ),
+        flags=frozenset("i"),
+        boundary_kind="argv_positional",
+        assignments=True,
+        require_leading_assignment=True,
+        cwd_options=("--chdir", "-C"),
+    ),
+    "eval": ExecutorGrammar(boundary_kind="shell_source"),
+    "command": ExecutorGrammar(
+        flags=frozenset("pVv"), boundary_kind="argv_positional", child_execution=False
+    ),
+    "builtin": ExecutorGrammar(boundary_kind="argv_positional", child_execution=False),
+    "exec": ExecutorGrammar(
+        options=_OptionTable(short_values=frozenset("a")),
+        flags=frozenset("cl"),
+        boundary_kind="argv_positional",
+        child_execution=False,
+    ),
+    "busybox": ExecutorGrammar(
+        boundary_kind="argv_positional",
+        admitted_applets=frozenset({"sh", "ash", "bash", "dash", "hush"}),
+    ),
+}
+
+for _name, (_values, _flags, _operands) in {
+    "timeout": (
+        ("--signal", "--kill-after", "-s", "-k"),
+        ("--foreground", "--preserve-status", "--verbose", "-v"),
+        1,
+    ),
+    "nice": (("--adjustment", "-n"), (), 0),
+    "stdbuf": (("-i", "-o", "-e"), (), 0),
+    "flock": (
+        ("--wait", "--conflict-exit-code", "-w", "-E"),
+        (
+            "--shared",
+            "--exclusive",
+            "--unlock",
+            "--nonblock",
+            "--close",
+            "--no-fork",
+            "-s",
+            "-x",
+            "-u",
+            "-n",
+            "-o",
+            "-F",
+        ),
+        1,
+    ),
+    "setsid": ((), ("--ctty", "--fork", "--wait", "-c", "-f", "-w"), 0),
+    "nohup": ((), (), 0),
+    "ionice": (
+        ("--class", "--classdata", "-c", "-n", "-p", "-P", "-u"),
+        ("--ignore", "-t"),
+        0,
+    ),
+    "taskset": ((), ("--all-tasks", "--cpu-list", "-a", "-c"), 1),
+    "time": (
+        ("--format", "--output", "-f", "-o"),
+        ("--append", "--portability", "--verbose", "--quiet", "-a", "-p", "-v", "-q"),
+        0,
+    ),
+}.items():
+    EXECUTOR_REGISTRY[_name] = ExecutorGrammar(
+        options=_OptionTable(
+            long_values=frozenset(value for value in _values if value.startswith("--")),
+            short_values=frozenset(
+                value[1] for value in _values if not value.startswith("--")
+            ),
+            boolean_long=frozenset(flag for flag in _flags if flag.startswith("--")),
+        ),
+        flags=frozenset(flag[1] for flag in _flags if not flag.startswith("--")),
+        boundary_kind="argv_positional",
+        prefix_operands=_operands,
+    )
+
+for _name in ("ash", "bash", "sh", "dash", "hush", "zsh", "ksh"):
+    EXECUTOR_REGISTRY[_name] = ExecutorGrammar(
+        options=_OptionTable(
+            long_values=frozenset({"--rcfile", "--init-file"}),
+            short_values=frozenset("cOo"),
+            boolean_long=frozenset({
+                "--noprofile",
+                "--norc",
+                "--posix",
+                "--login",
+                "--interactive",
+                "--noediting",
+            }),
+        ),
+        flags=frozenset("ilrsuvxenfC"),
+        boundary_kind="shell_source",
+        inline_options=("-c",),
+        plus_value_options=frozenset("oO"),
+    )
+
+for _name, _legacy in _INLINE_SWITCHES.items():
+    _switch, _flags, _values, _long = _legacy
+    _python = _name in {"python", "python3", "pypy", "pypy3"}
+    EXECUTOR_REGISTRY[_name] = ExecutorGrammar(
+        options=_OptionTable(
+            long_values=frozenset(key for key, value in _long.items() if value)
+            | (frozenset({"--check-hash-based-pycs"}) if _python else frozenset())
+            | (frozenset({"--eval", "--print"}) if _name == "node" else frozenset()),
+            short_values=_values
+            | frozenset(_switch)
+            | (frozenset("m") if _python else frozenset())
+            | (frozenset("p") if _name == "node" else frozenset()),
+            boolean_long=frozenset(key for key, value in _long.items() if not value),
+        ),
+        flags=_flags,
+        boundary_kind="inline_code_switch",
+        inline_options=(f"-{_switch}",)
+        + (("--eval", "-p", "--print") if _name == "node" else ()),
+        module_options=("-m",) if _python else (),
+        legacy_inline=_legacy,
+    )
+
+
+def _executor_option(
+    tokens: list[str], index: int, grammar: ExecutorGrammar
+) -> tuple[int, _ParsedOptions]:
+    """Validate BEFORE _scan_options: its permissive unknown-option handling is
+    deliberately unsuitable for determining executable boundaries. No long-option
+    abbreviation is assumed across executors. Missing/empty values also fail closed.
+    """
+    token = tokens[index]
+    if token.startswith("+"):
+        if token[1:] not in grammar.plus_value_options:
+            raise ValueError(f"unknown or ambiguous executor option: {token}")
+        token = "-" + token[1:]
+    if grammar.single_dash_long:
+        if token.startswith("--"):
+            raise ValueError(f"unknown executor option: {token}")
+        token = "-" + token
+    table = grammar.options
+    count = 1
+    if token.startswith("--"):
+        option, separator, value = token.partition("=")
+        if option in table.long_values:
+            if separator:
+                if not value:
+                    raise ValueError("empty executor option value")
+            else:
+                count = 2
+        elif option not in table.boolean_long or separator:
+            raise ValueError(f"unknown or ambiguous executor option: {token}")
+    else:
+        for offset, short in enumerate(token[1:]):
+            if short in table.short_values:
+                count = 2 if offset == len(token) - 2 else 1
+                break
+            if short not in grammar.flags:
+                raise ValueError(f"unknown or ambiguous executor option: {token}")
+    if count > 1 and (
+        index + 1 >= len(tokens)
+        or not tokens[index + 1]
+        or tokens[index + 1].startswith("-")
+    ):
+        raise ValueError(f"missing or ambiguous executor option value: {token}")
+    return count, _scan_options([token, *tokens[index + 1 : index + count]], table)
+
+
+def _module_executor_command(value: str, arguments: list[str]) -> tuple[str, ...]:
+    known_modules = EXECUTOR_REGISTRY.keys() | {"pip", "pip3"}
+    if re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", value) is None:
+        raise ValueError("ambiguous interpreter module target")
+    if value in known_modules:
+        return (value, *arguments)
+    if value.split(".")[0] in known_modules:
+        raise ValueError("unrecognized executor module target")
+    return ()
+
+
+def executor_boundary(  # noqa: PLR0911, PLR0912, PLR0914, PLR0915
+    tokens: list[str], *, admission: bool = False
+) -> ExecutorBoundary | None:
+    """Return a registry-owned boundary; admission retains legacy restrictions.
+
+    npx's first positional is its package-derived executable (unless --package
+    supplies the package); pipx run's first positional is the app, NOT --spec's
+    package operand. uv run executes its first positional as argv. go/cargo never
+    expose compiled targets or program arguments as commands. Unsupported syntax
+    is intentionally rejected rather than inferred from the next positional.
+    """
+    if (
+        not tokens
+        or (grammar := EXECUTOR_REGISTRY.get(_command_name(tokens[0]))) is None
+    ):
+        return None
+    name = _command_name(tokens[0])
+    if admission and grammar.reject_execution:
+        raise ValueError(grammar.reject_execution)
+    if (
+        admission
+        and grammar.require_leading_assignment
+        and (
+            not tokens[2:]
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[1], re.DOTALL) is None
+        )
+    ):
+        raise ValueError("unsupported env wrapper form")
+    if (
+        admission
+        and grammar.admitted_applets is not None
+        and (not tokens[1:] or tokens[1] not in grammar.admitted_applets)
+    ):
+        raise ValueError("unsupported busybox applet")
+    index = 1
+    keyword_seen = grammar.keyword is None
+    cwd: list[str] = []
+    targets: list[str] = []
+    process_selection = False
+    kind = grammar.boundary_kind
+    if name == "eval":
+        return ExecutorBoundary(
+            kind,
+            consumed_ranges=((0, len(tokens)),),
+            inline_payload_ranges=((1, len(tokens)),),
+            inline_payloads=(" ".join(tokens[1:]),),
+        )
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            if admission and kind == "shell_source" and "-c" in tokens[index + 1 :]:
+                raise ValueError("unsupported shell -- -c option form")
+            index += 1
+            break
+        if grammar.assignments and token == "-":
+            index += 1  # env's legacy ignore-environment selector.
+            continue
+        if (
+            not (
+                token.startswith("-")
+                or (grammar.plus_value_options and token.startswith("+"))
+            )
+            or token == "-"
+        ):
+            if not keyword_seen:
+                if token != grammar.keyword:
+                    return ExecutorBoundary("none")
+                keyword_seen = True
+                index += 1
+                continue
+            if grammar.assignments and re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*=.*", token, re.DOTALL
+            ):
+                index += 1
+                continue
+            break
+        if name == "nice" and re.fullmatch(r"-\d+", token):
+            index += 1
+            continue
+        count, parsed = _executor_option(tokens, index, grammar)
+        if name == "ionice" and parsed.values_for("-p", "-P", "-u"):
+            process_selection = True
+        cwd.extend(parsed.values_for(*grammar.cwd_options))
+        if len(cwd) > 1:
+            raise ValueError("ambiguous repeated executor directory override")
+        if (
+            grammar.single_dash_long
+            and keyword_seen
+            and parsed.values_for(*grammar.cwd_options)
+        ):
+            raise ValueError("go -C must precede run")
+        if grammar.native_target == "cargo":
+            targets.extend(
+                parsed.values_for(
+                    "--manifest-path", "--package", "-p", "--bin", "--example"
+                )
+            )
+        selected = next(
+            (
+                (option, value)
+                for option, value in parsed.values
+                if option in grammar.inline_options + grammar.module_options
+            ),
+            None,
+        )
+        if selected is not None:
+            if kind == "shell_source" and count == 1:
+                raise ValueError("shell -c requires a separate source operand")
+            if (
+                name in {"perl", "ruby"}
+                and index + count < len(tokens)
+                and tokens[index + count].startswith("-")
+                and tokens[index + count] != "--"
+            ):
+                # These interpreters may resume option parsing (including more
+                # code switches) after a snippet. Do not label that code argv.
+                raise ValueError("unsupported options after inline code")
+            option, value = selected
+            payload = (index + count - 1, index + count)
+            end = index + count
+            selected_kind: BoundaryKind = (
+                "module_target" if option in grammar.module_options else kind
+            )
+            return ExecutorBoundary(
+                selected_kind,
+                None,
+                ((0, end),),
+                () if selected_kind == "module_target" else (payload,),
+                (value,) if selected_kind == "module_target" else (),
+                tuple(cwd),
+                program_argument_range=(end, len(tokens)),
+                inline_payloads=() if selected_kind == "module_target" else (value,),
+                module_command=(
+                    _module_executor_command(value, tokens[end:])
+                    if selected_kind == "module_target"
+                    else ()
+                ),
+            )
+        index += count
+    if not keyword_seen:
+        raise ValueError("missing executor subcommand")
+    if grammar.native_target == "cargo":
+        if index < len(tokens) and tokens[index - 1] != "--":
+            raise ValueError("cargo run program arguments require --")
+        return ExecutorBoundary(
+            "none",
+            consumed_ranges=((0, index),),
+            cwd_overrides=tuple(cwd),
+            native_targets=tuple(targets),
+            program_argument_range=(index, len(tokens)),
+        )
+    if grammar.native_target == "go":
+        if index >= len(tokens):
+            raise ValueError("missing go run target")
+        end = index + 1
+        if tokens[index].endswith(".go"):
+            while end < len(tokens) and tokens[end].endswith(".go"):
+                end += 1
+        return ExecutorBoundary(
+            "none",
+            consumed_ranges=((0, end),),
+            cwd_overrides=tuple(cwd),
+            native_targets=tuple(tokens[index:end]),
+            program_argument_range=(end, len(tokens)),
+        )
+    if grammar.assignments:
+        # GNU env still consumes assignments after its option terminator.
+        while index < len(tokens) and re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index], re.DOTALL
+        ):
+            index += 1
+    index += grammar.prefix_operands
+    if kind in {"inline_code_switch", "shell_source"}:
+        # Script operands remain native interpreter targets, not executable argv.
+        return ExecutorBoundary(
+            "none",
+            consumed_ranges=((0, min(index + 1, len(tokens))),),
+            cwd_overrides=tuple(cwd),
+            native_targets=tuple(tokens[index : index + 1]),
+            program_argument_range=(min(index + 1, len(tokens)), len(tokens)),
+        )
+    if index >= len(tokens):
+        if process_selection:
+            return ExecutorBoundary("none", consumed_ranges=((0, len(tokens)),))
+        raise ValueError("missing executor execution target")
+    if tokens[index].startswith("-") and (index == 0 or tokens[index - 1] != "--"):
+        raise ValueError("ambiguous executor execution target")
+    if name == "uv" and tokens[index].endswith((".py", ".pyw")):
+        raise ValueError(
+            "unsupported uv implicit script execution; use an explicit interpreter"
+        )
+    # command -v/-V describes a command rather than executing it.
+    if name == "command" and any(
+        flag in token[1:]
+        for token in tokens[1:index]
+        if token.startswith("-") and token != "--"
+        for flag in "vV"
+    ):
+        return ExecutorBoundary("none", consumed_ranges=((0, len(tokens)),))
+    return ExecutorBoundary(
+        kind,
+        (index, len(tokens)),
+        ((0, index),),
+        cwd_overrides=tuple(cwd),
+        child_execution=grammar.child_execution,
     )
 
 
@@ -939,7 +1595,10 @@ def _rm_policy(args: list[str]) -> ShellCommandPolicy:
             and not token.startswith("--")
             and any(flag in token[1:] for flag in "rR")
         ):
-            return ShellCommandPolicy(requires_approval=True)
+            return ShellCommandPolicy(
+                requires_approval=True,
+                diagnostic=Diagnostic("recursive_rm", offending_token=token),
+            )
     return ShellCommandPolicy()
 
 
@@ -1865,36 +2524,6 @@ _COMMAND_POLICIES = {
 }
 
 
-# Only modeled options may advance the scan: an unknown option might consume
-# the next word, hiding an inline-code selector behind it.
-_INLINE_SWITCHES = {
-    "python": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
-    "python3": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
-    "pypy": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
-    "pypy3": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
-    "node": (
-        "e",
-        frozenset("ip"),
-        frozenset("r"),
-        {
-            "--require": True,
-            "--input-type": True,
-            "--no-warnings": False,
-            "--trace-warnings": False,
-            "--no-deprecation": False,
-            "--experimental-repl-await": False,
-        },
-    ),
-    "perl": ("e", frozenset("wlnpT"), frozenset("IMmF"), {}),
-    "ruby": (
-        "e",
-        frozenset("wdv"),
-        frozenset("IrCEFKTW"),
-        {"--disable": True, "--enable": True},
-    ),
-}
-
-
 def _short_interpreter_option(
     token: str, switch: str, flags: frozenset[str], values: frozenset[str]
 ) -> int:
@@ -1916,9 +2545,11 @@ def inline_interpreter_switch(tokens: list[str]) -> str | None:
     Unclassified options before an apparent inline selector fail closed rather
     than guessing whether they consume the following word.
     """
-    if not tokens or (name := _command_name(tokens[0])) not in _INLINE_SWITCHES:
+    name = _command_name(tokens[0]) if tokens else ""
+    grammar = EXECUTOR_REGISTRY.get(name)
+    if grammar is None or grammar.legacy_inline is None:
         return None
-    switch, flags, values, long_options = _INLINE_SWITCHES[name]
+    switch, flags, values, long_options = grammar.legacy_inline
     index = 1
     while index < len(tokens):
         token = tokens[index]
@@ -1961,7 +2592,9 @@ def _package_module_tokens(tokens: list[str]) -> list[str]:
     name = _command_name(tokens[0]) if tokens else ""
     if name not in {"python", "python3", "pypy", "pypy3"}:
         return tokens
-    _, flags, values, _ = _INLINE_SWITCHES[name]
+    grammar = EXECUTOR_REGISTRY[name]
+    assert grammar.legacy_inline is not None
+    _, flags, values, _ = grammar.legacy_inline
     index = 1
     while index < len(tokens):
         token = tokens[index]
@@ -1989,14 +2622,175 @@ def _package_module_tokens(tokens: list[str]) -> list[str]:
     return tokens
 
 
+def executor_owned_tokens(tokens: list[str]) -> list[str]:
+    """Project executor-owned argv; child argv and inline source are opaque here."""
+    boundary = executor_boundary(tokens)
+    if boundary is None:
+        return tokens
+    if boundary.module_command and boundary.program_argument_range:
+        return tokens[: boundary.program_argument_range[0]]
+    end = (
+        boundary.inner_command_range[0] if boundary.inner_command_range else len(tokens)
+    )
+    if (
+        boundary.inner_command_range
+        and EXECUTOR_REGISTRY[_command_name(tokens[0])].package_executable
+    ):
+        end += 1  # npx's executable selector is also a package requirement.
+    if (
+        boundary.program_argument_range
+        and boundary.native_targets
+        and not EXECUTOR_REGISTRY[_command_name(tokens[0])].native_target
+    ):
+        end = boundary.program_argument_range[0]
+    excluded = {
+        index
+        for start, stop in boundary.inline_payload_ranges
+        for index in range(start, stop)
+    }
+    grammar = EXECUTOR_REGISTRY[_command_name(tokens[0])]
+    if grammar.keyword and boundary.consumed_ranges:
+        index = 1
+        while index < end and tokens[index].startswith("-"):
+            count, _ = _executor_option(tokens, index, grammar)
+            index += count
+        if index < end and tokens[index] == grammar.keyword:
+            excluded.add(index)
+    return [token for index, token in enumerate(tokens[:end]) if index not in excluded]
+
+
+def package_argument_indexes(tokens: list[str], *, depth: int = 0) -> set[int]:
+    """Original argv indexes needing quote-aware package-glob checks."""
+    if depth > _MAX_EXECUTOR_DEPTH:
+        raise ValueError("shell nesting depth limit exceeded")
+    boundary = executor_boundary(tokens)
+    if boundary and boundary.module_command and boundary.program_argument_range:
+        start, _ = boundary.program_argument_range
+        return {
+            start + index - 1
+            for index in package_argument_indexes(
+                list(boundary.module_command), depth=depth + 1
+            )
+        }
+    owned = executor_owned_tokens(tokens)
+    end = (
+        boundary.inner_command_range[0]
+        if boundary and boundary.inner_command_range
+        else len(tokens)
+    )
+    if (
+        boundary
+        and boundary.inner_command_range
+        and EXECUTOR_REGISTRY[_command_name(tokens[0])].package_executable
+    ):
+        end += 1
+    indexes = set(range(1, end)) if is_package_command(owned) else set()
+    if boundary:
+        for start, stop in boundary.inline_payload_ranges:
+            indexes.difference_update(range(start, stop))
+        if boundary.inner_command_range:
+            start, stop = boundary.inner_command_range
+            indexes.update(
+                start + index
+                for index in package_argument_indexes(
+                    tokens[start:stop], depth=depth + 1
+                )
+            )
+    return indexes
+
+
 def is_package_command(tokens: list[str]) -> bool:
     """Identify commands whose requirement syntax needs quote-aware analysis."""
     tokens = _package_module_tokens(tokens)
     return bool(tokens) and _command_name(tokens[0]) in _PACKAGE_PATH_COMMANDS
 
 
+def _executor_package_policy(
+    tokens: list[str], boundary: ExecutorBoundary
+) -> ShellCommandPolicy:
+    """Inspect package/executor operands with the SAME grammar as expansion.
+
+    Native program argv remains conservatively path-inspected, but never becomes
+    executable argv or resumes parsing the compiler's options.
+    """
+    grammar = EXECUTOR_REGISTRY[_command_name(tokens[0])]
+    end = (
+        boundary.inner_command_range[0]
+        if boundary.inner_command_range
+        else boundary.program_argument_range[0]
+        if boundary.program_argument_range
+        else len(tokens)
+    )
+    index = 1
+    paths: list[str] = []
+    operands: list[str] = []
+    path_options = _PACKAGE_PATH_OPTIONS | frozenset({
+        "--manifest-path",
+        "--config",
+        "--modfile",
+        "--overlay",
+        "--pkgdir",
+        "--with-requirements",
+        "--C",
+    })
+    if grammar.native_target == "cargo":
+        path_options -= {"--target"}  # Rust target triple, not a directory.
+    requirement_options = {"--with", "--with-editable", "--package", "--spec"}
+    if grammar.package_executable:
+        requirement_options.add("-p")
+    try:
+        while index < end:
+            token = tokens[index]
+            if token == "--":
+                operands.extend(tokens[index + 1 : end])
+                break
+            if token.startswith("-"):
+                count, parsed = _executor_option(tokens, index, grammar)
+                paths.extend(
+                    _package_local_path(value)
+                    for value in parsed.values_for(*path_options)
+                )
+                operands.extend(parsed.values_for(*requirement_options))
+                index += count
+            else:
+                if token != grammar.keyword:
+                    operands.append(token)
+                index += 1
+        if grammar.package_executable and boundary.inner_command_range:
+            operands.append(tokens[boundary.inner_command_range[0]])
+        if grammar.native_target and boundary.program_argument_range:
+            start, stop = boundary.program_argument_range
+            operands.extend(tokens[start:stop])
+        positionals = tuple(
+            path
+            for value in operands
+            if (path := _package_requirement_path(value)) is not None
+        )
+    except ValueError:
+        return ShellCommandPolicy(
+            requires_approval=True, denial_reason="unmodeled local package URL"
+        )
+    return ShellCommandPolicy(
+        inspect_positional_paths=True,
+        option_path_values=tuple(paths),
+        positional_values=positionals,
+    )
+
+
 def analyze_shell_command_policy(tokens: list[str]) -> ShellCommandPolicy:
-    tokens = _package_module_tokens(tokens)
+    boundary = executor_boundary(tokens)
+    if boundary and boundary.module_command:
+        # Expanded module argv is inspected as its own command, with its own
+        # executor boundary. The interpreter does not own that child's source.
+        return ShellCommandPolicy()
+    if (
+        boundary
+        and boundary.consumed_ranges
+        and (grammar := EXECUTOR_REGISTRY.get(_command_name(tokens[0])))
+        and (grammar.keyword or grammar.package_executable)
+    ):
+        return _executor_package_policy(tokens, boundary)
+    tokens = _package_module_tokens(executor_owned_tokens(tokens))
     if not tokens:
         return ShellCommandPolicy()
     name = _command_name(tokens[0])
@@ -2010,12 +2804,40 @@ def analyze_shell_command_policy(tokens: list[str]) -> ShellCommandPolicy:
 
 
 def path_candidates(
-    tokens: list[str], *, inspect_positional_paths: bool
+    tokens: list[str],
+    *,
+    inspect_positional_paths: bool,
+    inspect_executable: bool = False,
 ) -> tuple[str, ...]:
     if not tokens:
         return ()
+    executable_paths = (
+        [tokens[0]] if "/" in tokens[0] or tokens[0].startswith("~") else []
+    )
+    boundary = executor_boundary(tokens)
+    if boundary is not None and (
+        boundary.inner_command_range is not None
+        or boundary.module_command
+        or boundary.inline_payload_ranges
+        or boundary.native_targets
+    ):
+        owned = executor_owned_tokens(tokens)
+        policy = analyze_shell_command_policy(tokens)
+        # Compiled targets and interpreter scripts are files/packages, never
+        # commands. Only the executor's own operands are inspected at this layer.
+        # Registered outer wrappers retain their legacy executable treatment;
+        # an executable selected inside another executor is always inspected.
+        candidates = [
+            *(executable_paths if inspect_executable else []),
+            *policy.option_path_values,
+        ]
+        candidates.extend(policy.positional_values or ())
+        candidates.extend(boundary.cwd_overrides)
+        if boundary.native_targets and not is_package_command(owned):
+            candidates.extend(boundary.native_targets)
+        return tuple(dict.fromkeys(candidates))
     policy = analyze_shell_command_policy(tokens)
-    candidates = list(policy.option_path_values)
+    candidates = [*executable_paths, *policy.option_path_values]
     if not (inspect_positional_paths or policy.inspect_positional_paths):
         return tuple(candidates)
     command = _command_name(tokens[0])

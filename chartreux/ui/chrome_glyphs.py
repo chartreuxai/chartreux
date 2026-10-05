@@ -5,9 +5,10 @@ from __future__ import annotations
 from textual._context import active_app
 
 _GLYPHS: dict[str, tuple[str, str]] = {
+    "metadata_separator": ("·", "."),
     "information": ("i", "i"),
     "running": ("…", "..."),
-    "success": ("✓", "+"),
+    "success": ("✓", "v"),
     "warning": ("!", "!"),
     "error": ("✗", "x"),
     "muted": ("□", " "),

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 import pytest_asyncio
-from textual import events
+from textual.widget import Widget
 from textual.widgets import Button, OptionList, Static
+from textual.widgets.option_list import Option
 
 from chartreux.cli.textual_ui.widgets.log_level_picker import (
     LogLevelPickerApp,
@@ -73,17 +75,46 @@ async def test_bare_opens_picker_panel() -> None:
     assert handled is True
 
 
-def test_badge_focus_uses_tab_not_horizontal_arrows(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    picker = LogLevelPickerApp(get_log_level_chain())
-    monkeypatch.setattr(picker, "_redraw", lambda: None)
-    picker.on_key(events.Key("tab", None))
-    assert picker._focused_badge == "config"
-    picker.on_key(events.Key("left", None))
-    assert picker._focused_badge == "config"
-    picker.on_key(events.Key("shift+tab", None))
-    assert picker._focused_badge == "session"
+@pytest.mark.asyncio
+async def test_badge_focus_cycle_is_symmetric_and_navigation_is_inert() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        await app._handle_command("/log-level")
+        await pilot.pause()
+        picker = app.query_one(LogLevelPickerApp)
+        original = (picker._session_level, picker._config_level)
+        config = app.app_server.resources.config.current.log_level
+        targets = [
+            "loglevelpicker-session",
+            "loglevelpicker-config",
+            "loglevelpicker-options",
+            "loglevelpicker-apply",
+        ]
+        assert cast(Widget, app.focused).id == targets[0]
+        for target in [*targets[1:], targets[0]]:
+            await pilot.press("tab")
+            assert cast(Widget, app.focused).id == target
+        for target in [*reversed(targets[1:]), targets[0]]:
+            await pilot.press("shift+tab")
+            assert cast(Widget, app.focused).id == target
+        assert (picker._session_level, picker._config_level) == original
+        assert get_session_override() is None
+        assert app.app_server.resources.config.current.log_level == config
+        await pilot.press("enter", "home", "up", "k")
+        options = picker.query_one(OptionList)
+        assert options.highlighted == 0
+        await pilot.press("down", "down")
+        session_row = cast(Option, options.highlighted_option).id
+        await pilot.press("shift+tab", "shift+tab")
+        assert picker._highlighted_level == session_row
+        await pilot.press("tab", "enter", "end", "down", "j")
+        assert options.highlighted == options.option_count - 1
+        config_row = cast(Option, options.highlighted_option).id
+        await pilot.press("shift+tab", "shift+tab", "enter")
+        assert cast(Option, options.highlighted_option).id == session_row
+        await pilot.press("shift+tab", "enter")
+        assert cast(Option, options.highlighted_option).id == config_row
+        assert (picker._session_level, picker._config_level) == original
 
 
 def test_highlighted_log_badges_distinguish_set_and_unset() -> None:
@@ -151,7 +182,7 @@ async def test_discard_confirmation_fits_and_restores_log_level_picker(
         highlighted = options.highlighted_option
         assert highlighted is not None
 
-        await pilot.press("tab", "space", "escape")
+        await pilot.press("tab", "enter", "space", "escape")
         await pilot.pause()
 
         cancel = picker.query_one("#loglevelpicker-keep", Button)
@@ -181,6 +212,89 @@ async def test_discard_confirmation_fits_and_restores_log_level_picker(
         assert picker._config_level == picker._highlighted_level
         assert not picker.query_one("#loglevelpicker-discard").display
         assert "Navigate" in str(help_widget.content)
+
+
+@pytest.mark.parametrize("scope_key", ["enter", "space"])
+@pytest.mark.parametrize("apply_key", ["enter", "space", "ctrl+s", "click"])
+@pytest.mark.asyncio
+async def test_activation_edits_only_focused_scope_until_explicit_apply(
+    apply_key: str, scope_key: str
+) -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        await app._handle_command("/log-level")
+        await pilot.pause()
+        picker = app.query_one(LogLevelPickerApp)
+        original_config = picker._config_level
+        await pilot.press(scope_key)
+        assert picker.query_one(OptionList).has_focus
+        await pilot.press("home", "enter")
+        assert picker._session_level == "DEBUG"
+        assert picker._config_level == original_config
+        assert get_session_override() is None
+        assert app.query(LogLevelPickerApp)
+        await pilot.press("shift+tab", scope_key)
+        assert picker.query_one(OptionList).has_focus
+        await pilot.press("end", "enter")
+        assert picker._session_level == "DEBUG"
+        assert picker._config_level == "CRITICAL"
+        assert app.app_server.resources.config.current.log_level == original_config
+        await pilot.press("enter")
+        assert picker._config_level is None
+        await pilot.press("enter", "tab")
+        assert app.query(LogLevelPickerApp)
+        assert get_session_override() is None
+        if apply_key == "click":
+            await pilot.click("#loglevelpicker-apply")
+        else:
+            await pilot.press(apply_key)
+        assert await _wait_until(pilot, lambda: not app.query(LogLevelPickerApp))
+        assert get_session_override() == "DEBUG"
+        assert app.app_server.resources.config.current.log_level == "CRITICAL"
+
+
+@pytest.mark.asyncio
+async def test_pointer_badges_edit_the_clicked_scope_without_saving() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        await app._handle_command("/log-level")
+        await pilot.pause()
+        picker = app.query_one(LogLevelPickerApp)
+        options = picker.query_one(OptionList)
+        original_config = picker._config_level
+        # DEBUG is not the effective row, so its badges begin at columns 14 and 25.
+        await pilot.click(options, offset=(16, 0))
+        assert picker._session_level == "DEBUG"
+        assert picker._config_level == original_config
+        # The Active label now shifts the badges seven columns to the right.
+        await pilot.click(options, offset=(34, 0))
+        assert picker._focused_badge == "config"
+        assert picker._config_level == "DEBUG"
+        assert get_session_override() is None
+        assert app.app_server.resources.config.current.log_level == original_config
+        await pilot.press("escape", "escape")
+        assert options.has_focus
+        assert picker._focused_badge == "config"
+        assert picker._highlighted_level == "DEBUG"
+        await pilot.click("#loglevelpicker-session")
+        assert options.has_focus
+        assert picker._focused_badge == "session"
+        assert picker._session_level == "DEBUG"
+
+
+@pytest.mark.asyncio
+async def test_discard_cancel_restores_apply_target() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        await app._handle_command("/log-level")
+        await pilot.pause()
+        picker = app.query_one(LogLevelPickerApp)
+        await pilot.press("enter", "home", "space", "tab", "escape")
+        assert cast(Widget, app.focused).id == "loglevelpicker-keep"
+        await pilot.press("enter")
+        assert cast(Widget, app.focused).id == "loglevelpicker-apply"
+        assert picker._session_level == "DEBUG"
+        assert get_session_override() is None
 
 
 @pytest.mark.asyncio

@@ -65,7 +65,17 @@ def test_tools_inventory_intersects_filters_without_changing_other_categories(
 
 
 def test_curated_registry_is_complete_and_validated() -> None:
-    assert len(EDITABLE_SETTINGS) == len(EDITABLE_BY_PATH) == 41
+    assert len(EDITABLE_SETTINGS) == len(EDITABLE_BY_PATH) == 46
+    assert len(VISIBLE_SETTINGS) == 40
+    visible = {item.path: item for item in VISIBLE_SETTINGS}
+    assert visible["status_line"].control == "status_line"
+    assert "status_line" not in EDITABLE_BY_PATH
+    assert "show_message_timestamps" in visible
+    assert all(
+        path not in visible
+        for path in EDITABLE_BY_PATH
+        if path.startswith("status_line.")
+    )
     assert "ascii_chrome" in EDITABLE_BY_PATH
     assert all(
         item.label and item.description and item.empty for item in EDITABLE_SETTINGS
@@ -234,6 +244,11 @@ async def test_snapshot_pairs_force_loaded_revision_with_sparse_leaf_values(
         ]
         fields = {item.path: item for item in response.fields}
         catalog = {item.path: item for item in response.catalog}
+        assert catalog["status_line"].control == "status_line"
+        for path in ("segments", "directory_style", "context_style", "separator"):
+            leaf = f"status_line.{path}"
+            assert leaf in fields and leaf in response.backing_settings
+            assert leaf not in catalog
         assert catalog["system_prompt_id"].choices == tuple(
             sorted((
                 "cli",
@@ -364,6 +379,92 @@ async def test_snapshot_pairs_force_loaded_revision_with_sparse_leaf_values(
             field for field in list_read.fields if field.path == "enabled_tools"
         ).saved_value == ["tool-*", "re:^custom_"]
         assert "bash" in list_read.inventories["tools"]
+        from chartreux.app_server.protocol import ConfigReadParams, ConfigReadResponse
+
+        new_values = {
+            "status_line.segments": [
+                "context",
+                "directory",
+                "spend-today",
+                "spend-week",
+                "spend-month",
+            ],
+            "status_line.directory_style": "path",
+            "status_line.context_style": "tokens",
+            "status_line.separator": "space",
+            "show_message_timestamps": False,
+        }
+        defaults = {field.path: field for field in list_read.fields}
+        assert defaults["status_line.segments"].effective_value == [
+            "directory",
+            "pid",
+            "context",
+        ]
+        assert defaults["show_message_timestamps"].effective_value is True
+        chrome_save = await client.request(
+            "config/write",
+            ConfigWriteParams(
+                session_id=loop.session_id,
+                target="user",
+                expected_revision=list_read.user_revision,
+                ops=[
+                    ConfigWriteOpWire(
+                        op="set",
+                        path="/" + path.replace(".", "/"),
+                        value=value,
+                        target_layer="renamed-user",
+                    )
+                    for path, value in new_values.items()
+                ],
+            ),
+        )
+        assert chrome_save["persistence"] == "saved"
+        chrome_read = SettingsReadResponse.model_validate(
+            await client.request(
+                "config/settings/read", SettingsReadParams(session_id=loop.session_id)
+            )
+        )
+        leaves = {field.path: field for field in chrome_read.fields}
+        for path, value in new_values.items():
+            assert leaves[path].saved_value == value
+            assert leaves[path].effective_value == value
+        projected = ConfigReadResponse.model_validate(
+            await client.request(
+                "config/read", ConfigReadParams(session_id=loop.session_id)
+            )
+        ).config
+        assert projected.show_message_timestamps is False
+        assert projected.status_line.model_dump(mode="json") == {
+            "segments": new_values["status_line.segments"],
+            "directoryStyle": "path",
+            "contextStyle": "tokens",
+            "separator": "space",
+        }
+        original_text = source.read_text()
+        for invalid in (
+            ["directory"],
+            ["context"],
+            ["directory", "context", "context"],
+            ["directory", "context", "unknown"],
+        ):
+            rejected = await client.request(
+                "config/write",
+                ConfigWriteParams(
+                    session_id=loop.session_id,
+                    target="user",
+                    expected_revision=chrome_read.user_revision,
+                    ops=[
+                        ConfigWriteOpWire(
+                            op="set",
+                            path="/status_line/segments",
+                            value=list(invalid),
+                            target_layer="renamed-user",
+                        )
+                    ],
+                ),
+            )
+            assert rejected["persistence"] == "not_saved"
+            assert source.read_text() == original_text
     finally:
         await a.close()
         await b.close()

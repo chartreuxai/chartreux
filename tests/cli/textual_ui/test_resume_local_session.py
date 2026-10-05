@@ -19,10 +19,10 @@ from chartreux.app_server.protocol import (
 from chartreux.app_server.session import AppServerSession
 from chartreux.cli.textual_ui.app import ChartreuxApp
 from chartreux.cli.textual_ui.widgets.chat_input import ChatInputContainer
-from chartreux.cli.textual_ui.widgets.context_progress import ContextProgress
 from chartreux.cli.textual_ui.widgets.loading import LoadingWidget
 from chartreux.cli.textual_ui.widgets.messages import ErrorMessage, UserCommandMessage
 from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
+from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLine
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from tests.cli.textual_ui.test_history_grouping import _message
 from tests.conftest import build_test_chartreux_app
@@ -38,9 +38,12 @@ def chartreux_app() -> ChartreuxApp:
 
 def _app_with_fake_runtime(runtime: MagicMock) -> ChartreuxApp:
     app = build_test_chartreux_app()
-    app_server = object.__new__(AppServerSession)
+    app_server = MagicMock(spec=AppServerSession)
+    app_server.session_id = "resume-readiness-test"
     app_server.resources = MagicMock()
     app_server.resources.runtime = runtime
+    app_server.resources.usage.current = None
+    app_server.resources.usage.read = AsyncMock()
     app._app_server = app_server
     return app
 
@@ -171,9 +174,10 @@ async def test_resume_local_session_updates_context_progress(
 
         await chartreux_app._resume_local_session("abcd1234")
 
-        widget = chartreux_app.query_one(ContextProgress)
-        assert widget.tokens.current_tokens == _RESUMED_TOKENS
-        assert widget.tokens.max_tokens == _RESUMED_CONTEXT_WINDOW
+        widget = chartreux_app.query_one(SessionStatusLine)
+        assert widget.state.context_tokens == _RESUMED_TOKENS
+        assert widget.state.auto_compact_threshold == _RESUMED_CONTEXT_WINDOW
+        assert "50k/200k (25%)" in widget.render().plain
 
 
 @pytest.mark.asyncio
@@ -223,8 +227,9 @@ async def test_resume_local_session_shows_zero_when_no_llm_activity(
 
         await chartreux_app._resume_local_session("abcd1234")
 
-        widget = chartreux_app.query_one(ContextProgress)
-        assert widget.tokens.current_tokens == 0
+        widget = chartreux_app.query_one(SessionStatusLine)
+        assert widget.state.context_tokens == 0
+        assert "0/" in widget.render().plain
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,7 @@ from pydantic import Field, JsonValue
 
 from chartreux.core.agents.models import AgentType
 from chartreux.core.events import ToolCallEvent, ToolResultEvent, ToolStreamEvent
-from chartreux.core.subagents import TaskArgs, TaskResult
+from chartreux.core.subagents import LaunchOutcome, TaskArgs, TaskResult
 from chartreux.core.tools.base import (
     BaseTool,
     BaseToolConfig,
@@ -76,7 +76,7 @@ class Task(
         args = event.args
         if isinstance(args, TaskArgs):
             background = " (background)" if args.background else ""
-            message = f"{args.agent} agent{background}: {args.task}"
+            message = f"{args.agent_type} agent{background}: {args.task}"
             return ToolCallDisplay(
                 summary=f"Running {message}",
                 verb="Running",
@@ -96,6 +96,15 @@ class Task(
     def get_result_display(cls, event: ToolResultEvent) -> ToolResultDisplay:
         result = event.result
         if isinstance(result, TaskResult):
+            if (
+                result.launch_outcome is not None
+                and result.launch_outcome is not LaunchOutcome.LAUNCHED
+            ):
+                return ToolResultDisplay(
+                    success=False,
+                    verb="Not launched",
+                    message=f"agent {result.agent_id}: {result.launch_outcome.value}",
+                )
             names = _result_display_names(result)
             switches = _switch_notice_lines(result.metadata)
             detail = "; ".join([*names, *switches])
@@ -146,10 +155,10 @@ class Task(
         return "Running subagent"
 
     def resolve_permission(self, args: TaskArgs) -> PermissionContext | None:
-        if args.agent_id is not None and "agent" not in args.model_fields_set:
+        if args.agent_id is not None and "agent_type" not in args.model_fields_set:
             # The retained profile is resolved by the runner before resources.
             return None
-        agent_name = args.agent
+        agent_name = args.agent_type
 
         for pattern in self.config.denylist:
             if fnmatch.fnmatch(agent_name, pattern):
@@ -175,9 +184,11 @@ class Task(
                 "Agent depth limit of 1 reached. Complete the task in the current "
                 "subagent."
             )
+        if args.replace_run and (args.agent_id is None or not args.background):
+            raise ToolError("replace_run requires agent_id and background mode")
         if args.agent_id is not None and not args.background:
             raise ToolError("agent_id can only be used with background mode")
-        if args.agent_id is not None and "agent" not in args.model_fields_set:
+        if args.agent_id is not None and "agent_type" not in args.model_fields_set:
             if ctx.subagent_runner is None:
                 raise ToolError("Task tool requires a subagent runner in context")
             async for event in ctx.subagent_runner.run(args, ctx):
@@ -185,13 +196,13 @@ class Task(
             return
 
         try:
-            agent_profile = agent_manager.get_agent(args.agent)
+            agent_profile = agent_manager.get_agent(args.agent_type)
         except ValueError as e:
-            raise ToolError(f"Unknown agent: {args.agent}") from e
+            raise ToolError(f"Unknown agent_type profile: {args.agent_type}") from e
 
         if agent_profile.agent_type != AgentType.SUBAGENT:
             raise ToolError(
-                f"Agent '{args.agent}' is a {agent_profile.agent_type.value} agent. "
+                f"Agent '{args.agent_type}' is a {agent_profile.agent_type.value} agent. "
                 f"Only subagents can be used with the task tool. "
                 f"This is a security constraint to prevent recursive spawning."
             )

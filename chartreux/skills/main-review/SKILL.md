@@ -34,7 +34,7 @@ If a listed reviewer fails or is unavailable, report the failure as a blocker in
 Each task string must be self-contained:
 
 ```text
-task(task="Review: <target>. Intent: <intent>. Tier: <tier>. Return a complete review report with findings, evidence, and verification status.", agent="reviewer", config={model="@small"})
+task(task="Review: <target>. Intent: <intent>. Tier: <tier>. Return a complete review report with findings, evidence, and verification status.", agent_type="reviewer", config={model="@small"})
 ```
 
 For Deep and Plans, dispatch one `reviewer` task with

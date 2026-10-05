@@ -34,6 +34,7 @@
 
     .terminal-r1 { fill: #c5c8c6 }
 .terminal-r2 { fill: #c5c8c6;font-weight: bold }
+.terminal-r3 { fill: #608ab1;text-decoration: underline; }
     </style>
 
     <defs>
@@ -144,7 +145,7 @@
 </text><text class="terminal-r1" x="976" y="508" textLength="12.2" clip-path="url(#terminal-line-20)">
 </text><text class="terminal-r1" x="976" y="532.4" textLength="12.2" clip-path="url(#terminal-line-21)">
 </text><text class="terminal-r1" x="976" y="556.8" textLength="12.2" clip-path="url(#terminal-line-22)">
-</text><text class="terminal-r1" x="12.2" y="581.2" textLength="634.4" clip-path="url(#terminal-line-23)">Click&#160;row&#160;to&#160;select&#160;·&#160;c&#160;Copy&#160;selected&#160;·&#160;Ctrl+\&#160;Close</text>
+</text><text class="terminal-r1" x="12.2" y="581.2" textLength="256.2" clip-path="url(#terminal-line-23)">↑/↓&#160;j/k&#160;Select&#160;row&#160;·&#160;</text><text class="terminal-r3" x="268.4" y="581.2" textLength="183" clip-path="url(#terminal-line-23)">c&#160;Copy&#160;selected</text><text class="terminal-r1" x="451.4" y="581.2" textLength="36.6" clip-path="url(#terminal-line-23)">&#160;·&#160;</text><text class="terminal-r3" x="488" y="581.2" textLength="219.6" clip-path="url(#terminal-line-23)">Esc&#160;/&#160;Ctrl+\&#160;Close</text>
     </g>
     </g>
 </svg>

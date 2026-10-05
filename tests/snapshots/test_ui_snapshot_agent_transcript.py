@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from textual.app import App, ComposeResult
 from textual.pilot import Pilot
 
@@ -79,6 +81,7 @@ def _tool_entry(
             tool_name=name, input={"file_path": "src/example.py"}, display=display
         ),
         state=CompletedEffectState(
+            duration_ms=3200,
             output={"content": "Example file contents"},
             output_text="Example file contents",
             display=EffectResultDisplay(
@@ -89,7 +92,7 @@ def _tool_entry(
 
 
 class _SnapshotSource:
-    def __init__(self) -> None:
+    def __init__(self, *, stamped: bool = False) -> None:
         self.response = AgentTranscriptGetResponse(
             state=AgentTranscriptState.AVAILABLE,
             entries=[
@@ -106,6 +109,7 @@ class _SnapshotSource:
                     "I will inspect the image and read `src/example.py`.",
                     AgentTranscriptEntryKind.ASSISTANT_TEXT,
                     1,
+                    turn_duration_ms=372000,
                 ),
                 _text_entry(
                     "reasoning",
@@ -120,6 +124,15 @@ class _SnapshotSource:
             has_more=False,
         )
 
+        if stamped:
+            for entry in self.response.entries or []:
+                if entry.kind in {
+                    AgentTranscriptEntryKind.USER_TEXT,
+                    AgentTranscriptEntryKind.ASSISTANT_TEXT,
+                    AgentTranscriptEntryKind.REASONING,
+                }:
+                    entry.posted_at = datetime(2026, 6, 15, 12, 34, tzinfo=UTC)
+
     async def read_agent_transcript(
         self, agent_id: str, *, before: str | None = None, limit: int = 50
     ) -> AgentTranscriptGetResponse:
@@ -129,11 +142,13 @@ class _SnapshotSource:
 class AgentTranscriptViewerSnapshotApp(App[None]):
     CSS_PATH = "../../chartreux/cli/textual_ui/app.tcss"
 
+    STAMPED = False
+
     def __init__(self) -> None:
         super().__init__()
         self._tools_collapsed = False
         self.viewer = AgentTranscriptViewer(
-            _SnapshotSource(), "agent-snapshot", profile="reviewer"
+            _SnapshotSource(stamped=self.STAMPED), "agent-snapshot", profile="reviewer"
         )
 
     def compose(self) -> ComposeResult:
@@ -141,6 +156,39 @@ class AgentTranscriptViewerSnapshotApp(App[None]):
 
     async def on_load(self) -> None:
         install_snapshot_wake()
+
+
+class StampedAgentTranscriptSnapshotApp(AgentTranscriptViewerSnapshotApp):
+    STAMPED = True
+
+
+def test_snapshot_stamped_agent_transcript(snap_compare: SnapCompare) -> None:
+    async def run_before(pilot: Pilot) -> None:
+        await pilot.pause(0.1)
+        viewer = pilot.app.query_one(AgentTranscriptViewer)
+        if not viewer._known_entries:
+            viewer.action_refresh()
+        for _ in range(20):
+            await pilot.pause(0.1)
+            if (
+                len(viewer.query(UserMessage)) == 1
+                and len(viewer.query(AssistantMessage)) == 1
+                and len(viewer.query(ReasoningMessage)) == 1
+                and len(viewer.query(ToolResultMessage)) == 1
+            ):
+                assert all(
+                    entry.posted_at is not None
+                    for entry in viewer._known_entries.values()
+                    if entry.kind == AgentTranscriptEntryKind.USER_TEXT
+                )
+                return
+        raise AssertionError("stamped transcript did not populate")
+
+    assert snap_compare(
+        "test_ui_snapshot_agent_transcript.py:StampedAgentTranscriptSnapshotApp",
+        terminal_size=(100, 30),
+        run_before=run_before,
+    )
 
 
 def test_snapshot_agent_transcript_viewer_renders_all_entry_kinds(

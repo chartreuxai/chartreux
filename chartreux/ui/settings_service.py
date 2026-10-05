@@ -110,7 +110,7 @@ class SettingsService:
             descriptor.path: descriptor
             for descriptor in before.catalog
             if descriptor.kind not in {"link", "deferred"}
-            and descriptor.control != "toggle_inventory"
+            and descriptor.control not in {"toggle_inventory", "status_line"}
         }
         web_search_paths = (
             {field.path for field in before.web_search.fields}
@@ -123,7 +123,11 @@ class SettingsService:
                 backing = before.backing_settings.get(path)
                 if path in web_search_paths:
                     pass  # The app server validates the complete merged search config.
-                elif backing is None or not path.startswith(("enabled_", "disabled_")):
+                elif backing is None or not path.startswith((
+                    "enabled_",
+                    "disabled_",
+                    "status_line.",
+                )):
                     raise ValueError(f"Unknown settings leaf: {path}")
                 elif value is not None:
                     backing.validate_value(value)

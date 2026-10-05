@@ -14,9 +14,13 @@ from chartreux.core.subagents import (
     AgentProfileMismatchError,
     AgentResultExpiredError,
     AgentSummary,
+    CancelOutcome,
+    CancelResult,
+    EmptySubagentResponseError,
     LaunchConfigError,
     MissingAgentProfileError,
     RunStatus,
+    RunStopReason,
     SubagentManagementError,
     SubagentRunAccumulator,
     TaskArgs,
@@ -25,6 +29,90 @@ from chartreux.core.subagents import (
     normalize_task_summary,
 )
 from chartreux.core.tools.builtins.bash import Bash, CapturedShellResult
+
+
+@pytest.mark.parametrize("outcome", list(CancelOutcome))
+def test_cancel_result_contract_roundtrips(outcome: CancelOutcome) -> None:
+    result = CancelResult(
+        outcome=outcome, run_id="run", stop_reason=RunStopReason.USER_CANCELLED
+    )
+    assert CancelResult.model_validate_json(result.model_dump_json()) == result
+    assert result.model_dump(mode="json") == {
+        "outcome": outcome.value,
+        "run_id": "run",
+        "stop_reason": "user_cancelled",
+    }
+    assert CancelResult(outcome=outcome).run_id is None
+    task = TaskResult(response="partial", turns_used=1, completed=False)
+    assert "stop_reason" not in task.model_dump()
+    task.stop_reason = result.stop_reason
+    assert json.loads(task.model_dump_json())["stop_reason"] == "user_cancelled"
+
+
+def test_task_profile_name_schema_has_no_agent_alias() -> None:
+    properties = TaskArgs.model_json_schema()["properties"]
+    assert "agent" not in properties
+    assert properties["agent_type"]["type"] == "string"
+    assert "agent_id" in properties["agent_type"]["description"]
+    assert "agent_type" in properties["agent_id"]["description"]
+    with pytest.raises(ValidationError) as error:
+        TaskArgs.model_validate({"task": "work", "agent": "worker"})
+    assert error.value.errors()[0]["loc"] == ("agent",)
+    assert error.value.errors()[0]["type"] == "extra_forbidden"
+
+
+@pytest.mark.parametrize("handle", ["agent-0", "agent-1", "agent-123"])
+def test_task_profile_rejects_instance_handles(handle: str) -> None:
+    with pytest.raises(
+        ValidationError, match="agent_type takes a profile name"
+    ) as error:
+        TaskArgs(task="work", agent_type=handle)
+    assert "agent_id (with background: true)" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "profile", ["worker", "custom-worker", "agent-helper", "agent-1-extra"]
+)
+def test_task_profile_accepts_non_handle_names(profile: str) -> None:
+    assert TaskArgs(task="work", agent_type=profile).agent_type == profile
+
+
+def test_replace_run_default_and_schema() -> None:
+    args = TaskArgs(task="work")
+    assert args.replace_run is False
+    field = TaskArgs.model_json_schema()["properties"]["replace_run"]
+    assert field["type"] == "boolean" and field["default"] is False
+    assert (
+        "launch_outcome"
+        not in TaskResult(response="done", turns_used=1, completed=True).model_dump()
+    )
+
+
+def test_summary_keeps_last_recorded_context_and_terminal_outcome() -> None:
+    summary = AgentSummary(
+        agent_id="agent",
+        profile="worker",
+        availability=AgentAvailability.EVICTED,
+        current_run_id="run",
+        current_run_status=RunStatus.COMPLETED,
+        context_tokens=123,
+        context_window=456,
+        stop_reason=RunStopReason.BUDGET_UNVERIFIABLE,
+    )
+    assert (summary.context_tokens, summary.context_window, summary.compacting) == (
+        123,
+        456,
+        False,
+    )
+    assert summary.stop_reason is RunStopReason.BUDGET_UNVERIFIABLE
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(
+        AssistantEvent(content="Budget exceeded", stopped_by_middleware=True),
+        tool_call_id="task",
+    )
+    assert not accumulator.build_result(turns_used=1).completed
+    # TaskResult's completion flag and prose do not encode a structured reason.
+    assert "stop_reason" not in accumulator.build_result(turns_used=1).model_dump()
 
 
 def test_subagent_run_accumulates_response_and_tool_progress() -> None:
@@ -79,7 +167,7 @@ def test_task_args_supports_background_launch_and_agent_reuse() -> None:
 def test_task_args_defaults_to_background() -> None:
     args = TaskArgs.model_validate({
         "task": "inspect the repository",
-        "agent": "worker",
+        "agent_type": "worker",
     })
 
     assert args.background is True
@@ -129,7 +217,7 @@ def test_task_args_launch_config_preserves_supplied_fields() -> None:
         "enabled_tools": [],
         "tools": {"bash": {"permission": "always"}},
     }
-    assert "agent" not in args.model_fields_set
+    assert "agent_type" not in args.model_fields_set
     assert "config" in args.model_fields_set
 
 
@@ -279,9 +367,49 @@ def test_background_subagent_handle_types() -> None:
     assert AgentAvailability.EVICTED.value == "evicted"
 
 
-def test_subagent_accumulator_result_has_no_handles() -> None:
-    result = SubagentRunAccumulator().build_result(turns_used=0)
+def test_subagent_accumulator_rejects_empty_successful_result() -> None:
+    with pytest.raises(EmptySubagentResponseError, match="empty response"):
+        SubagentRunAccumulator().build_result(turns_used=0)
 
+
+@pytest.mark.parametrize("response", ["", " \t\n"])
+@pytest.mark.parametrize("completed", [False, True])
+def test_subagent_accumulator_gates_only_prospective_completion(
+    response: str, completed: bool
+) -> None:
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(AssistantEvent(content=response), tool_call_id="task")
+
+    if completed:
+        with pytest.raises(EmptySubagentResponseError, match="empty response"):
+            accumulator.build_result(turns_used=1, completed=completed)
+    else:
+        assert accumulator.build_result(
+            turns_used=1, completed=completed
+        ) == TaskResult(response=response, turns_used=1, completed=False)
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_subagent_accumulator_allows_empty_middleware_stopped_result(
+    completed: bool,
+) -> None:
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(
+        AssistantEvent(content="", stopped_by_middleware=True), tool_call_id="task"
+    )
+
+    assert accumulator.build_result(turns_used=1, completed=completed) == TaskResult(
+        response="", turns_used=1, completed=False
+    )
+
+
+def test_subagent_accumulator_nonempty_result_has_no_handles() -> None:
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(AssistantEvent(content="  done\n"), tool_call_id="task")
+    result = accumulator.build_result(turns_used=1)
+
+    assert result.response == "  done\n"
+    assert result.completed
     assert result.agent_id is None
     assert result.run_id is None
 

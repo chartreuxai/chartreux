@@ -4,7 +4,7 @@ Chartreux exposes file, search, shell, delegation, web, image, and session-manag
 
 ## Built-in tools
 
-The built-ins are `ask_user_question`, `bash`, `check_agents`, `edit`, `get_agent_result`, `grep`, `read_file`, `read_image`, `release_agent`, `skill`, `task`, `todo`, `wait_for_agent`, `web_fetch`, `web_search`, and `write_file`. MCP servers can add tools; their names use `<server>_<tool>`.
+The built-ins are `ask_user_question`, `bash`, `cancel_agent`, `check_agents`, `edit`, `get_agent_result`, `grep`, `read_file`, `read_image`, `release_agent`, `skill`, `task`, `todo`, `wait_for_agent`, `web_fetch`, `web_search`, and `write_file`. MCP servers can add tools; their names use `<server>_<tool>`.
 
 `web_search` supports `auto`, `mistral`, `exa`, `brave`, and `duckduckgo`. The runtime default remains `auto`, which selects Mistral only; it does not fall back to another provider. Configure the provider, optional credential environment-variable name, base URL, timeout, result limit, and Mistral search model in `[tools.web_search]`. An unset or blank `base_url` uses the selected provider's default endpoint; the blank value saved by the editor is not treated as a URL override. For a keyed provider, Chartreux selects exactly one credential-variable name: `api_key_env_var` when configured, otherwise the provider default (`EXA_API_KEY` or `BRAVE_SEARCH_API_KEY`); `auto` and `mistral` otherwise use the configured Mistral provider's credential variable or `MISTRAL_API_KEY`. If that selected variable is unavailable, web search reports the missing key. DuckDuckGo needs no key.
 
@@ -45,6 +45,14 @@ max_results = 5
 
 `read_image` is available only when the active model deployment supports images. It is subject to the ordinary file and sensitive-path policy. See [Models](models.md) for deployment capabilities.
 
+## Background stop and replacement
+
+`cancel_agent(agent_id, run_id=None)` requests a stop for the owning parent's background run. Pin `run_id` to avoid stopping newer work; omission selects the active run atomically. Its dispositions are `stop_requested`, `already_stopping`, `already_finishing`, `not_running`, `unknown_run`, and `forbidden`. Acceptance is not terminal cancellation: use `wait_for_agent` or `get_agent_result` after cleanup. Partial accumulated output and the winning stop reason are preserved subject to retention; zero-retention may evict the agent at finalization. Foreground runs are unsupported.
+
+`task(agent_id=..., replace_run=True)` stops busy work and launches its replacement in the same conversation only after old cleanup and result publication join. It holds the existing capacity allocation, works at capacity, and injects a deterministic supersession frame. Busy replacement forbids config/profile changes; idle reuse keeps reconfiguration. Check `launch_outcome`: `already_stopping`, `already_finishing`, and `rejected_reservation` mean no launch. Successful replacement reports `metadata.replaced_run_id` and `metadata.replacement_run_id`. Caller cancellation or authority revocation prevents replacement admission; admission failure never resumes the old run.
+
+Neither operation rolls back file, shell, or remote side effects. `release_agent` is destructive: it discards identity and results. Stop and replacement use ordinary tool filtering and permissions, with Task's effective permissions checked before any busy run is stopped.
+
 ## Filtering and permissions
 
 Use `enabled_tools` to narrow the available set and `disabled_tools` to remove from that result. Patterns can be exact names, globs, or case-insensitive full-match regular expressions prefixed with `re:`.
@@ -74,8 +82,36 @@ Trust can apply to the current folder, the repository root when offered, or the 
 
 `bash` runs a finite command in a fresh POSIX shell. Standard input is closed, a timeout is enforced, and stdout and stderr are returned separately. Shell state, process handles, continued stdin, polling, and cursor-based output do not persist between calls. Configure its `permission`, `max_output_bytes`, `default_timeout`, `denylist`, `denylist_standalone`, and `sensitive_patterns` under `[tools.bash]`; runtime path and sensitive-file protections still apply.
 
+## Shell authority and diagnostics
+
+Shell authority is bounded, not sandboxed. Chartreux inspects modeled command
+arguments, redirects, working directories, and known executor boundaries;
+unmodeled syntax and analysis-budget overflow are denied. These checks do not
+contain arbitrary program effects, package scripts, network access, or inline
+interpreter code to the workspace.
+
+Inline interpreter code (for example, `python -c`, `node -e`, and their modeled
+`uv run` forms) is allowed by default. Its source is not treated as a file operand
+or a shell-expanded glob. Users can deny these forms through `[tools.bash]`
+`denylist` entries such as `"python -c"` or `"node -e"`; modeled inner commands
+also receive those checks. Bare interactive interpreter commands remain denied
+by the default standalone denylist. Inline-code recognition is not code inspection.
+
+Recursive `rm` is a hard guard regardless of target. Its denial names the original
+option or cluster, such as `-r`, `-rf`, or `--recursive`, and recommends
+`rm -- 'file'`, then `rmdir -- 'dir'`. Rejected path-glob diagnostics identify the
+candidate token and command segment and explain that they cannot be safely
+inspected. Feedback previews are bounded, registered secrets are redacted before
+escaping or truncation, and control characters and markup delimiters are escaped.
+These messages explain existing denials; they do not grant authority.
+
 ## Interactive questions
 
 `ask_user_question` works only in an interactive UI. Each question requires two or more options; two to four is recommended, not a maximum. An `Other` free-text choice is added unless `hide_other` is true, and questions may permit multiple selections. Programmatic runs deny interactive callbacks rather than displaying them.
+
+For multi-select questions, Space toggles membership. Enter on an ordinary
+unchecked option adds it before accepting the answer. Clicking the acceptance
+row follows the same validation and acceptance rules as Enter; navigation alone
+does not submit an answer.
 
 For reusable instructions that guide tool use, see [Instructions and skills](instructions-skills.md). For non-interactive workflows, see [Automation](automation.md).

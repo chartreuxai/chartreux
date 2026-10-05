@@ -38,7 +38,7 @@ class _ToolGroupApp(App[None]):
 async def test_group_header_category_and_collapsed_body_persist() -> None:
     state = ToolGroupExpansionState()
     key = ToolGroupKey("first")
-    group = ToolGroup(key=key, expansion_state=state)
+    group = ToolGroup(key=key, expansion_state=state, show_message_timestamps=False)
     group.add_call_kind(ToolEffectKind.FILE_READ)
     group.add_content_child(Static("tool call"))
     app = _ToolGroupApp(group)

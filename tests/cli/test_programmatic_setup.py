@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from pathlib import Path
 
 from git import Repo
 import pytest
 
-from chartreux.app_server.local import LocalHarnessOptions
+from chartreux.app_server.local import (
+    ContinueSessionIntent,
+    LocalHarnessOptions,
+    NewSessionIntent,
+    ResumeSessionIntent,
+)
 from chartreux.cli import (
     cli as cli_mod,
     entrypoint as entrypoint_mod,
     programmatic as programmatic_mod,
 )
+from chartreux.core._usage_startup import create_startup_accounting_context
 from chartreux.core.config import (
     ChartreuxConfigSchema,
     MissingAPIKeyError,
@@ -570,6 +577,38 @@ def test_session_trust_does_not_write_to_disk(
 
     assert trusted_folders_manager.is_trusted(project) is True
     assert not trust_file.exists()
+
+
+@pytest.mark.parametrize("intent", ["new", "resume", "continue"])
+def test_programmatic_launch_forwards_startup_accounting_without_overloading_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, intent: str
+) -> None:
+    context = asyncio.run(create_startup_accounting_context(tmp_path))
+    args = _make_args(
+        startup_accounting=context,
+        resume="saved-session" if intent == "resume" else None,
+        continue_session=intent == "continue",
+    )
+    calls: list[LocalHarnessOptions] = []
+
+    def run(*, harness_options: LocalHarnessOptions, **_kwargs: object) -> str:
+        calls.append(harness_options)
+        return "done"
+
+    monkeypatch.setattr(programmatic_mod, "run_programmatic", run)
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod._run_programmatic_mode(args, None)
+    assert exc_info.value.code == 0
+    assert calls[0].startup_accounting is context
+    assert (
+        calls[0].session
+        == {
+            "new": NewSessionIntent(),
+            "resume": ResumeSessionIntent("saved-session"),
+            "continue": ContinueSessionIntent(),
+        }[intent]
+    )
+    assert context.state == "available"
 
 
 def test_run_cli_passes_max_tokens_to_run_programmatic(

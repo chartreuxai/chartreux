@@ -376,7 +376,9 @@ async def test_live_and_restored_tool_groups_have_matching_structure() -> None:
 
 @pytest.mark.asyncio
 async def test_restored_group_supports_local_expansion_and_ctrl_o() -> None:
-    app = build_test_chartreux_app(config=build_test_vibe_config())
+    app = build_test_chartreux_app(
+        config=build_test_vibe_config(show_message_timestamps=False)
+    )
     projection = CoreEventProjection()
     projection.project(_call_event("a"))
     projection.project(_result_event("a"))
@@ -387,6 +389,7 @@ async def test_restored_group_supports_local_expansion_and_ctrl_o() -> None:
         tools_collapsed=True,
         expansion_state=app._tool_group_expansion_state,
         entry_expansion_state=app._entry_expansion_state,
+        show_message_timestamps=False,
     )[0]
 
     assert isinstance(restored_group, ToolGroup)

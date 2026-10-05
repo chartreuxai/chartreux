@@ -50,6 +50,16 @@ MCP OAuth remains supported. Use `/mcp login <name>` to authenticate or retry au
 
 For command options, use `chartreux mcp add --help` and see the [command reference](../reference/commands.md).
 
+## Terminal browser
+
+Open `/mcp` to browse servers and their tools. Tab/Shift+Tab moves between
+visible controls; Up/Down or `j`/`k` moves within the focused list without
+wrapping or leaving it. Enter opens a server's tools or connects it where
+advertised. Use `d`/`e` or the visible **Disable**/**Enable** buttons to change
+the selected server or tool; moving the selection alone changes nothing.
+Escape clears a nonempty filter first, returns from server details, or closes
+the browser at its root. Closing restores focus to the opener.
+
 ## Checking readiness
 
 `chartreux doctor` validates MCP configuration locally without connecting or

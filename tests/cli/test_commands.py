@@ -225,6 +225,24 @@ class TestCommandRegistry:
 
         assert registry.commands[command_name].side_channel is False
 
+    @pytest.mark.parametrize("invocation", ["/usage", "  /USAGE  "])
+    def test_usage_command_registration(self, invocation: str) -> None:
+        registry = CommandRegistry()
+        result = registry.parse_command(invocation)
+        assert result is not None
+        name, command, args = result
+        assert name == "usage"
+        assert command.handler == "_show_usage"
+        assert command.description == "Browse recorded usage and costs"
+        assert command.side_channel is True
+        assert command.exits is False
+        assert args == ""
+        assert "`/usage`: Browse recorded usage and costs" in registry.get_help_text()
+        assert registry.parse_command("usage") is None
+        assert (
+            CommandRegistry(excluded_commands=["usage"]).parse_command("/usage") is None
+        )
+
     def test_settings_command_registration(self) -> None:
         registry = CommandRegistry()
         assert registry.get_command_name("/settings") == "settings"

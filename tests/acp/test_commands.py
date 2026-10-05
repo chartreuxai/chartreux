@@ -20,6 +20,7 @@ from chartreux.app_server.protocol import (
 )
 from chartreux.utils.paths import get_chartreux_home
 from chartreux.utils.retry_prompt import build_retry_prompt
+from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_client import FakeClient
 
@@ -186,6 +187,7 @@ async def test_retry_command_continues_the_last_response_as_an_injected_turn(
         prompt=[TextContentBlock(type="text", text="Hello")],
     )
 
+    backend._streams.append([mock_llm_chunk(content="Continued response.")])
     response = await acp_agent_loop.prompt(
         session_id=created.session_id,
         prompt=[TextContentBlock(type="text", text="/retry stay brief")],
@@ -208,6 +210,7 @@ async def test_retry_instructions_never_attach_workspace_files(
         prompt=[TextContentBlock(type="text", text="Hello")],
     )
 
+    backend._streams.append([mock_llm_chunk(content="Continued response.")])
     response = await acp_agent_loop.prompt(
         session_id=created.session_id,
         prompt=[TextContentBlock(type="text", text="/retry compare @shot.png closely")],
@@ -246,6 +249,7 @@ async def test_command_arguments_survive_any_whitespace_separator(
         prompt=[TextContentBlock(type="text", text="Hello")],
     )
 
+    backend._streams.append([mock_llm_chunk(content="Continued response.")])
     await acp_agent_loop.prompt(
         session_id=created.session_id,
         prompt=[TextContentBlock(type="text", text="/retry\tstay brief")],

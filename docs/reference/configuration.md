@@ -18,7 +18,7 @@ Unless noted, list defaults are `[]`, map defaults are `{}`, and booleans shown 
 | --- | --- | --- |
 | `compaction_model` | `""` | Model expression; empty uses the current main model. The resolved model must share the main provider. |
 | `allowed_models` | `[]` | Model-expression patterns. A non-empty list restricts selection. |
-| `auto_compact_threshold` | `200000` | Positive fallback token threshold; a catalog deployment may set its own. |
+| `auto_compact_threshold` | `200000` | Integer fallback token threshold; `0` turns automatic compaction off when the deployment has no threshold of its own. A catalog deployment may override this fallback. |
 
 ### Tools and integrations
 
@@ -45,7 +45,7 @@ Every `[tools.<name>]` table except `tools.bash` accepts `permission` (`always` 
 | `tools.todo` | `max_todos = 100`; permission `always`. |
 | `tools.read_image` | Permission `always`; no additional documented fields. |
 | `tools.edit` | Permission `always`; no additional documented fields. |
-| `tools.wait_for_agent`, `tools.ask_user_question`, `tools.get_agent_result`, `tools.skill`, `tools.check_agents`, `tools.release_agent` | Permission `always`; no additional documented fields. |
+| `tools.wait_for_agent`, `tools.ask_user_question`, `tools.get_agent_result`, `tools.skill`, `tools.check_agents`, `tools.cancel_agent`, `tools.release_agent` | Permission `always`; no additional documented fields. |
 
 The built-in read/edit/write/image/grep configurations include sensitive patterns for `.env`-style files. Do not remove those protections casually.
 
@@ -63,7 +63,7 @@ The built-in read/edit/write/image/grep configurations include sensitive pattern
 | `[subagents].max_idle_agents` | `16` | Integer, at least 0. |
 | `[subagents].max_running_subagents` | `16` | Strict positive integer, at least 1. Active-work admission cap set in `config.toml` or via `CHARTREUX_SUBAGENTS__MAX_RUNNING_SUBAGENTS`; excluded from the settings-UI catalog. |
 
-The active-work cap counts foreground and background runs, including reuse and pending child creation, but not idle retained agents. The root session's effective configuration controls admission; child configuration does not. Accepted configuration changes affect later admissions without stopping existing work. Completion, cancellation, release, or failed creation frees capacity.
+The active-work cap counts foreground and background runs, including reuse and pending child creation, but not idle retained agents. The root session's effective configuration controls admission; child configuration does not. Accepted configuration changes affect later admissions without stopping existing work. Completion, cancellation, release, or failed creation frees capacity. Busy `task(..., replace_run=True)` transfers the existing allocation rather than allocating another; the handoff holds capacity until replacement admission or unwind. `replace_run` is a call argument (default `false`), not configuration. Busy replacement requires `agent_id` and background mode and rejects launch `config` or profile changes before stopping; idle reuse still accepts its usual overrides. Configure `cancel_agent` through `[tools.cancel_agent]` and ordinary tool filters; it has no extra settings.
 
 ### Interface, prompts, and project context
 
@@ -78,6 +78,7 @@ The active-work cap counts foreground and background runs, including reuse and p
 | `displayed_workdir` | `""` | UI label for the working directory. |
 | `context_warnings` | `false` | Boolean. |
 | `show_thinking_nodes` | `false` | Boolean. |
+| `show_message_timestamps` | `true` | Boolean. Show known message posting times, whole-turn totals, and settled tool durations (also in child transcripts). Capture and persistence continue when off; unstamped history stays unstamped. |
 | `ascii_chrome` | `false` | Boolean. Use ASCII equivalents for application chrome glyphs. |
 | `raise_on_compaction_failure` | `false` | Boolean. |
 | `system_prompt_id` | `"cli"` | Prompt ID. Built-ins are `cli`, `explore`, `tests`, `minimal`, `worker`, `advisor`, and `reviewer`; custom IDs resolve from prompt directories. |
@@ -88,6 +89,37 @@ The active-work cap counts foreground and background runs, including reuse and p
 | `include_prompt_detail` | `true` | Boolean. |
 | `[project_context].default_commit_count` | `5` | Integer. |
 | `[project_context].timeout_seconds` | `2.0` | Number of seconds. |
+
+### Status line
+
+The `[status_line]` table controls the bottom session status row. Unknown fields and invalid values are rejected.
+
+| Key | Default | Accepted value |
+| --- | --- | --- |
+| `segments` | `["directory", "pid", "context"]` | Ordered, unique list of `directory`, `pid`, `model`, `context`, `git-branch`, `spend-today`, `spend-week`, or `spend-month`. Both `directory` and `context` are required. |
+| `directory_style` | `"name"` | `name` or `path`. |
+| `context_style` | `"tokens-percent"` | `tokens` or `tokens-percent`. |
+| `separator` | `"pipe"` | `space` or `pipe`. |
+
+Context renders without a label, for example `135k/400k (34%)`; the denominator is the effective automatic-compaction threshold, not the model's maximum context window. The `tokens` variant omits the percentage. Git branch lookup is asynchronous and cached. Configure this row in Settings > Status line; see the [configuration guide](../guides/configuration.md#status-line-and-message-timing) for editor controls.
+
+Spend segments show recorded USD cost estimates across all projects:
+`spend-today` renders `Today $12.34`, `spend-week` renders `Week $12.34`,
+and `spend-month` renders `Month $12.34`. Windows use the system-local
+calendar day, Monday-start week, and calendar month. Calls are attributed at
+completion time; stored timestamps are UTC. The `/usage` project filter does
+not change this global scope.
+
+- `—` means loading or unavailable (`-` in ASCII chrome), not zero spend.
+- `$12.34+` is the known lower bound when some cost is unknown.
+- `Unknown` means recorded calls have no priced usage.
+- `$0.00` means a valid empty window or known zero-cost usage.
+
+These are recorded usage only, priced from catalog rates captured at call time,
+not provider invoices. Historical calls are not repriced after catalog changes.
+See the [Usage browser](../guides/terminal.md#usage-browser) for model and token
+details. Under width pressure, the row drops `pid` first, then optional segments
+from the end, preserving directory and context.
 
 ### Sessions, logging, networking, and authority
 
@@ -152,7 +184,7 @@ Set the orchestrator or other role's `thinking` in `models.toml`; use
 | `[[models."base".deployments]]` | Deployment definition. `provider` and `name` are required. |
 | `supports_images` | `false`. |
 | `supported_thinking_levels` | Unset, or a list of known thinking levels. |
-| `auto_compact_threshold` | Unset positive number. |
+| `auto_compact_threshold` | Unset, or a positive whole integer token threshold. Fractional values and `0` are rejected; unset uses the global fallback, which allows `0` to disable automatic compaction. |
 | `[models."base".deployments.prices]` | `input`, `output`, and `cached_input`: non-negative price per million tokens. Omit an unknown price; zero means explicitly free. |
 | `[roles."name"]` | Default preset: `model` is one canonical base-model name; `thinking` is one of `off`, `low`, `medium`, `high`, or `max`; `description` is optional. Old `models` lists are rejected. |
 

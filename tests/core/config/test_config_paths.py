@@ -591,3 +591,30 @@ class TestLoadUserDoc:
         (config_dir / "AGENTS.md").write_text("   \n  ", encoding="utf-8")
         mgr = HarnessFilesManager(sources=("user",))
         assert mgr.load_user_doc() == ""
+
+
+@pytest.mark.parametrize("sources", [("user",), ()])
+def test_instruction_documents_pin_loaded_canonical_identity(
+    config_dir, tmp_path, sources
+):
+    original = tmp_path / "original.md"
+    other = tmp_path / "other.md"
+    original.write_text(" loaded content \n")
+    other.write_text("other content")
+    link = config_dir / "AGENTS.md"
+    link.symlink_to(original)
+    mgr = HarnessFilesManager(sources=sources)
+    documents = mgr.load_instruction_documents()
+    if not sources:
+        assert documents == []
+        return
+    assert len(documents) == 1
+    document = documents[0]
+    assert document.path == link
+    assert document.canonical_path == original.resolve()
+    assert document.content == "loaded content"
+    assert document.source == "user"
+    link.unlink()
+    link.symlink_to(other)
+    assert document.canonical_path == original.resolve()
+    assert mgr.load_instruction_documents()[0].canonical_path == other.resolve()

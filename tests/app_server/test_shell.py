@@ -325,7 +325,7 @@ async def test_exited_leader_cleanup_terminates_descendant_and_readers(
                 try:
                     if status.read_text().split(")", 1)[1].split()[0] == "Z":
                         break
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
                     break
                 await asyncio.sleep(0.005)
         assert all(reader.done() for reader in readers)

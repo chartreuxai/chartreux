@@ -24,6 +24,7 @@ from chartreux.core.config.orchestrator import (
 )
 from chartreux.core.model_catalog.resolver import ModelResolutionError
 from tests.conftest import FakeBackend, build_test_agent_loop, build_test_vibe_config
+from tests.mock.utils import mock_llm_chunk
 from tests.stubs.app_server import (
     attach_test_app_server_session,
     create_test_app_server_session,
@@ -222,7 +223,11 @@ async def test_picker_model_then_thinking_save_reopen_and_switch(
             enabled=True, save_dir=str(tmp_path / "sessions")
         ),
     )
-    loop = build_test_agent_loop(config=config, backend=FakeBackend(), cwd=tmp_path)
+    loop = build_test_agent_loop(
+        config=config,
+        backend=FakeBackend(mock_llm_chunk(content="Picker state saved.")),
+        cwd=tmp_path,
+    )
     session = await create_test_app_server_session(loop)
     saved_id = loop.session_id
     try:
@@ -365,7 +370,11 @@ async def test_thinking_choice_survives_session_resume_without_changing_preset(
         ],
         session_logging=logging,
     )
-    saved = build_test_agent_loop(config=config, backend=FakeBackend(), cwd=tmp_path)
+    saved = build_test_agent_loop(
+        config=config,
+        backend=FakeBackend(mock_llm_chunk(content="Thinking choice remembered.")),
+        cwd=tmp_path,
+    )
     default_preset = saved.config.catalog_snapshot.catalog.roles["orchestrator"]
     await saved.persist_empty_session()
     session_id = saved.session_id

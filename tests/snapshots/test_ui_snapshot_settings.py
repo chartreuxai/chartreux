@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import cast
 
+from pydantic import JsonValue
 from textual.pilot import Pilot
 
 from chartreux.app_server.protocol import (
@@ -20,6 +21,17 @@ class SettingsSnapshotApp(BaseSnapshotTestApp):
     async def on_mount(self) -> None:
         await super().on_mount()
         service = FakeService()
+        # The generic fake uses empty values; seed valid chrome defaults instead.
+        defaults: dict[str, JsonValue] = {
+            "status_line.segments": ["directory", "pid", "context"],
+            "status_line.directory_style": "name",
+            "status_line.context_style": "tokens-percent",
+            "status_line.separator": "pipe",
+            "show_message_timestamps": True,
+        }
+        for field in service.snapshot.fields:
+            if field.path in defaults:
+                field.effective_value = defaults[field.path]
         self.push_screen(
             SettingsScreen(cast(SettingsService, service), service.snapshot)
         )
@@ -203,4 +215,54 @@ def test_settings_provenance(snap_compare: SnapCompare) -> None:
         "test_ui_snapshot_settings.py:SettingsSnapshotApp",
         terminal_size=(80, 24),
         run_before=before,
+    )
+
+
+def test_status_line_editor_default(snap_compare: SnapCompare) -> None:
+    assert snap_compare(
+        "test_ui_snapshot_settings.py:SettingsSnapshotApp",
+        terminal_size=(80, 24),
+        press=[*"status_line", "enter"],
+    )
+
+
+def test_status_line_editor_edited_reordered(snap_compare: SnapCompare) -> None:
+    assert snap_compare(
+        "test_ui_snapshot_settings.py:SettingsSnapshotApp",
+        terminal_size=(80, 24),
+        press=[
+            *"status_line",
+            "enter",
+            "space",
+            "down",
+            "space",
+            "right_square_bracket",
+            "j",
+            "space",
+            "alt+up",
+        ],
+    )
+
+
+def test_status_line_editor_discard_confirmation(snap_compare: SnapCompare) -> None:
+    assert snap_compare(
+        "test_ui_snapshot_settings.py:SettingsSnapshotApp",
+        terminal_size=(80, 24),
+        press=[*"status_line", "enter", "space", "escape"],
+    )
+
+
+def test_status_line_editor_large(snap_compare: SnapCompare) -> None:
+    assert snap_compare(
+        "test_ui_snapshot_settings.py:SettingsSnapshotApp",
+        terminal_size=(120, 36),
+        press=[*"status_line", "enter"],
+    )
+
+
+def test_status_line_editor_narrow(snap_compare: SnapCompare) -> None:
+    assert snap_compare(
+        "test_ui_snapshot_settings.py:SettingsSnapshotApp",
+        terminal_size=(50, 20),
+        press=[*"status_line", "enter"],
     )

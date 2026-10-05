@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -90,9 +91,29 @@ class WaitForAgent(
         if not ctx or not ctx.subagent_manager:
             raise ToolError("wait_for_agent requires a subagent manager in context")
         try:
-            result = await ctx.subagent_manager.wait_for_agent(
+            wait = ctx.subagent_manager.wait_for_agent(
                 args.agent_id, args.run_id, timeout=args.timeout
             )
+            if ctx.register_wait_task is None:
+                result = await wait
+            else:
+                task = asyncio.create_task(wait)
+                ctx.register_wait_task(task)
+                try:
+                    result = await asyncio.shield(task)
+                finally:
+                    if not task.done() and not task.cancelling():
+                        task.cancel()
+                    joined = asyncio.gather(task, return_exceptions=True)
+                    interrupted = False
+                    while not joined.done():
+                        try:
+                            await asyncio.shield(joined)
+                        except asyncio.CancelledError:
+                            interrupted = True
+                    ctx.register_wait_task(None)
+                    if interrupted:
+                        raise asyncio.CancelledError
         except AgentEvictedError as exc:
             raise ToolError(
                 "Agent was evicted and cannot be waited on; use get_agent_result "

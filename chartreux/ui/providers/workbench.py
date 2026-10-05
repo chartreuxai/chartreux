@@ -58,7 +58,7 @@ from chartreux.core.model_catalog.schema import (
     ProviderDefinition,
     valid_provider_name,
 )
-from chartreux.ui.chrome_glyphs import ascii_chrome_enabled, chrome_glyph
+from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.providers.management_state import (
     ConnectionDraft,
     CredentialStatusResolver,
@@ -76,6 +76,10 @@ CURSOR_GUTTER = 2
 
 class DetailHelp(NoMarkupStatic):
     """Scrollable selected-item text reachable by Tab when a summary truncates."""
+
+    def on_focus(self, event: events.Focus) -> None:
+        if isinstance(self.screen, ProviderWorkbenchScreen):
+            self.screen.call_after_refresh(self.screen._update_help)
 
     can_focus = True
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -122,6 +126,19 @@ class NavigationFrame:
     provider_id: str | None = None
 
 
+def _bounded_cursor(widget: OptionList, direction: int) -> None:
+    """Move to the next enabled row without wrapping or leaving the group."""
+    anchor = widget.highlighted
+    if anchor is None:
+        anchor = -1 if direction > 0 else widget.option_count
+    for index in range(
+        anchor + direction, widget.option_count if direction > 0 else -1, direction
+    ):
+        if not widget.get_option_at_index(index).disabled:
+            widget.highlighted = index
+            return
+
+
 class WorkbenchList(NavigableOptionList):
     """Two-cell cursor gutter, independent of each row's value."""
 
@@ -147,16 +164,20 @@ class WorkbenchList(NavigableOptionList):
             return
         await super()._on_click(event)
 
+    def action_cursor_down(self) -> None:
+        if self.id in {"wb-models-actions", "wb-catalog-filter", "wb-catalog"}:
+            _bounded_cursor(self, 1)
+        else:
+            super().action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        if self.id in {"wb-models-actions", "wb-catalog-filter", "wb-catalog"}:
+            _bounded_cursor(self, -1)
+        else:
+            super().action_cursor_up()
+
     def on_key(self, event: events.Key) -> None:
         screen = self.screen
-        if self.id == "wb-models-actions" and isinstance(
-            screen, ProviderWorkbenchScreen
-        ):
-            if event.key == "left" or (event.key == "up" and self.highlighted == 0):
-                screen.query_one("#wb-models", ModelChecklist).focus()
-                event.stop()
-                event.prevent_default()
-                return
         if (
             event.key == "space"
             and self.id == "wb-detail-fields"
@@ -241,6 +262,10 @@ class BrowserList(WorkbenchList):
 class ModelChecklist(Checklist):
     """Space toggles a deployment; Enter opens its metadata editor."""
 
+    def on_focus(self, event: events.Focus) -> None:
+        if isinstance(self.screen, ProviderWorkbenchScreen):
+            self.screen.call_after_refresh(self.screen._update_help)
+
     def render_line(self, y: int) -> Strip:
         line = super().render_line(y)
         index = self.scroll_offset.y + y
@@ -255,19 +280,62 @@ class ModelChecklist(Checklist):
             segments[1:CHECKBOX_SEGMENTS] = [Segment("   ", style)]
         if self.has_focus and index == self.highlighted:
             segments[0] = Segment(f"{chrome_glyph('cursor')} ", style)
-        return Strip(segments)
+        line = Strip(segments)
+        if self.id == "wb-models" and not value.startswith("\x00"):
+            details = " [Details]"
+            details_style = style + Style(meta={"model_details": index})
+            line = Strip([
+                *line.crop_extend(
+                    0,
+                    max(0, self.scrollable_content_region.width - len(details)),
+                    style,
+                ),
+                Segment(details, details_style),
+            ])
+        return line
+
+    async def _on_click(self, event: events.Click) -> None:
+        if self.id != "wb-models":
+            return
+        event.stop()
+        event.prevent_default()
+        if (
+            not isinstance(self.screen, ProviderWorkbenchScreen)
+            or self.screen._busy
+            or event.chain > 1
+        ):
+            return
+        details_index = event.style.meta.get("model_details")
+        index = (
+            details_index
+            if details_index is not None
+            else event.style.meta.get("option")
+        )
+        if index is None:
+            return
+        option = self.get_option_at_index(index)
+        if option.disabled or option.value.startswith("\x00"):
+            return
+        self.highlighted = index
+        self.focus()
+        if details_index is not None:
+            self.action_detail()
+        else:
+            self.toggle(option.value)
+
+    def action_cursor_down(self) -> None:
+        if self.id == "wb-models":
+            _bounded_cursor(self, 1)
+        else:
+            super().action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        if self.id == "wb-models":
+            _bounded_cursor(self, -1)
+        else:
+            super().action_cursor_up()
 
     def on_key(self, event: events.Key) -> None:
-        if self.id == "wb-models" and isinstance(self.screen, ProviderWorkbenchScreen):
-            if event.key == "right" or (
-                event.key == "down" and self.highlighted == self.option_count - 1
-            ):
-                actions = self.screen.query_one("#wb-models-actions", WorkbenchList)
-                if actions.display:
-                    actions.focus()
-                    event.stop()
-                    event.prevent_default()
-                    return
         if event.key == "space" and self.highlighted is not None and self.option_count:
             value = self.get_option_at_index(self.highlighted).value
             if isinstance(value, str) and value.startswith("\x00"):
@@ -417,6 +485,10 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "back", "Back", priority=True, show=False),
         Binding("f1", "help", "Help", show=False),
+        Binding("tab", "cycle_group(1)", "Next group", priority=True, show=False),
+        Binding(
+            "shift+tab", "cycle_group(-1)", "Previous group", priority=True, show=False
+        ),
     ]
     MIN_WIDTH = 48
     MIN_HEIGHT = 24
@@ -670,6 +742,42 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if self.initial_view == "presets":
             self._open_presets()
 
+    def _focus_groups(self) -> list[str]:
+        groups = {
+            WorkbenchView.MODELS: ["wb-models", "wb-models-actions", "wb-help"],
+            WorkbenchView.CATALOG: ["wb-catalog-filter", "wb-catalog", "wb-help"],
+        }.get(self._view, [])
+        return [
+            group
+            for group in groups
+            if self.query_one(f"#{group}").can_focus
+            and self.query_one(f"#{group}").display
+            and not self.query_one(f"#{group}").disabled
+        ]
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "cycle_group":
+            return self._view in {WorkbenchView.MODELS, WorkbenchView.CATALOG}
+        return super().check_action(action, parameters)
+
+    def action_cycle_group(self, direction: int) -> None:
+        if self._confirm:
+            self.query_one("#wb-confirm-actions").focus()
+            return
+        if self._busy:
+            return
+        groups = self._focus_groups()
+        if not groups:
+            return
+        current = self.focused.id if self.focused else None
+        index = (
+            groups.index(current) if current in groups else (-1 if direction > 0 else 0)
+        )
+        self.query_one(f"#{groups[(index + direction) % len(groups)]}").focus(
+            scroll_visible=False
+        )
+        self._update_help()
+
     def _frame(self) -> NavigationFrame:
         focused = self.focused
         selected: str | None = None
@@ -767,16 +875,14 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             widget_id = f"wb-{widget_id}"
         widget = self.query_one(f"#{widget_id}")
         if selected_id is not None and isinstance(widget, OptionList):
-            ids = [str(option.id) for option in widget.options]
+            ids = [
+                str(cast(Selection[str], option).value)
+                if isinstance(widget, SelectionList)
+                else str(option.id)
+                for option in widget.options
+            ]
             if selected_id in ids:
                 widget.highlighted = ids.index(selected_id)
-        elif selected_id is not None and isinstance(widget, SelectionList):
-            values = [
-                str(cast(Selection[str], widget.get_option_at_index(index)).value)
-                for index in range(widget.option_count)
-            ]
-            if selected_id in values:
-                widget.highlighted = values.index(selected_id)
         if getattr(widget, "can_focus", False) or hasattr(widget, "focus"):
             self.set_focus(widget)
         if frame_scroll := getattr(self, "_restore_scroll", None):
@@ -853,6 +959,14 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             # retain their widgets; restore their recorded control directly.
             self._activate_view(
                 frame.view, focus_id=frame.focus_id, selected_id=frame.selected_id
+            )
+        if (
+            frame.view in {WorkbenchView.MODELS, WorkbenchView.CATALOG}
+            and frame.focus_id
+        ):
+            widget = self.query_one(f"#{frame.focus_id}")
+            self.call_after_refresh(
+                widget.scroll_to, y=frame.scroll, animate=False, force=True
             )
         self._restore_scroll = 0
 
@@ -1098,8 +1212,12 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._models_view = True
         self._model_filter = provider
         self._detail_cursor = focus
-        self._refresh_catalog()
-        self._activate_view(WorkbenchView.CATALOG, focus_id="wb-catalog")
+        self._refresh_catalog(preserve_filter_cursor=False)
+        self._activate_view(
+            WorkbenchView.CATALOG,
+            focus_id="wb-catalog",
+            selected_id=f"model:{focus}" if focus else None,
+        )
 
     def _catalog_model_summary(
         self, name: str, definition: BaseModelDefinition | None
@@ -1153,7 +1271,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             f"{runnable_count} runnable · {role_summary}"
         )
 
-    def _refresh_catalog(self, *, preserve_filter_cursor: bool = False) -> None:  # noqa: PLR0914
+    def _refresh_catalog(self, *, preserve_filter_cursor: bool = True) -> None:  # noqa: PLR0914
         filters = self.query_one("#wb-catalog-filter", NavigableOptionList)
         current_filter = f"filter:{self._model_filter or ''}"
         state = self.state
@@ -1164,6 +1282,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             and filters.highlighted_option.id is not None
             else None
         )
+        previous_filter_index = filters.highlighted or 1
         filters.clear_options()
         filters.add_option(
             Option("PROVIDER FILTER", id="\x00provider-filter", disabled=True)
@@ -1178,11 +1297,11 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         for provider in sorted(provider_ids):
             filters.add_option(Option(f"{provider}", id=f"filter:{provider}"))
         filter_ids = [str(option.id) for option in filters.options]
-        filter_target = (
-            previous_filter if previous_filter in filter_ids else current_filter
-        )
+        filter_target = previous_filter or current_filter
         filters.highlighted = (
-            filter_ids.index(filter_target) if filter_target in filter_ids else 0
+            filter_ids.index(filter_target)
+            if filter_target in filter_ids
+            else min(previous_filter_index, len(filter_ids) - 1)
         )
         catalog = self.query_one("#wb-catalog", NavigableOptionList)
         previous = (
@@ -1190,6 +1309,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             if catalog.highlighted_option and catalog.highlighted_option.id is not None
             else None
         )
+        previous_index = catalog.highlighted or 0
         catalog.clear_options()
         if state is not None and state.dirty:
             catalog.add_option(
@@ -1236,9 +1356,13 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if not shown:
             catalog.add_option(Option("No models configured", id="\x00empty"))
         ids = [str(option.id) for option in catalog.options]
-        target = f"model:{self._detail_cursor}" if self._detail_cursor else previous
+        target = previous or (
+            f"model:{self._detail_cursor}" if self._detail_cursor else None
+        )
         catalog.highlighted = (
-            ids.index(target) if target in ids else (0 if ids else None)
+            ids.index(target)
+            if target in ids
+            else (min(previous_index, len(ids) - 1) if ids else None)
         )
         self._update_help()
 
@@ -1697,6 +1821,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             if models.highlighted is not None and models.option_count
             else None
         )
+        previous_index = models.highlighted or 0
         self._model_sync = True
         models.clear_options()
         rows = state.model_rows()
@@ -1735,7 +1860,11 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if not rows:
             models.add_option(Selection("No models configured", "\x00empty", False))
         ids = [str(cast(Selection[str], option).value) for option in models.options]
-        models.highlighted = ids.index(previous) if previous in ids else 0
+        models.highlighted = (
+            ids.index(previous)
+            if previous in ids
+            else min(previous_index, len(ids) - 1)
+        )
         self._model_sync = False
         self._update_help()
 
@@ -4512,7 +4641,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     descriptions.get(
                         str(action.id) if action else "", "Choose a model action."
                     )
-                    + " Left returns to the selected model."
+                    + " Tab/Shift+Tab cycles models, actions, and help."
                 )
                 model_value = ""
             else:
@@ -4528,7 +4657,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     description = synthetic[name]
                 else:
                     description = (
-                        f"{state.provider_id}/{row[1]} ({row[0]}). Click row or Space toggles inclusion; Enter opens details."
+                        f"{state.provider_id}/{row[1]} ({row[0]}). Click row or Space toggles inclusion; click [Details] or Enter opens details."
                         if row
                         else "No models configured."
                     )
@@ -4679,25 +4808,17 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             if model_option is not None
             else ""
         )
-        left_key = "Left" if ascii_chrome_enabled() else "←"
-        right_key = "Right" if ascii_chrome_enabled() else "→"
         model_bindings = (
-            [
-                ("↑↓", "Actions"),
-                (left_key, "Models"),
-                ("Enter", "Select"),
-                ("Esc", "Back"),
-            ]
+            [("↑↓", "Move"), ("Enter", "Select"), ("Esc", "Back")]
             if self.query_one("#wb-models-actions").has_focus
             else [
                 ("↑↓", "Move"),
-                (right_key, "Actions"),
                 ("Space", "Toggle"),
-                ("Enter", "Edit"),
+                ("Enter", "Details"),
                 ("Esc", "Back"),
             ]
             if model_value != "\x00empty"
-            else [(right_key, "Actions"), ("Esc", "Back")]
+            else [("Esc", "Back")]
         )
         picker_option = (
             self.query_one("#wb-picker", NavigableOptionList).highlighted_option
@@ -4726,6 +4847,37 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 ("Esc", "Back"),
             ]
         )
+        groups = self._focus_groups()
+        traversal: list[tuple[str, str]] = []
+        if primary in {"models", "catalog"} and groups:
+            labels = {
+                "wb-models": "Models",
+                "wb-models-actions": "Actions",
+                "wb-catalog-filter": "Filter",
+                "wb-catalog": "Models",
+                "wb-help": "Help",
+            }
+            current = self.focused.id if self.focused else None
+            index = groups.index(current) if current in groups else 0
+            traversal = [
+                ("Tab", labels[groups[(index + 1) % len(groups)]]),
+                ("Shift+Tab", labels[groups[(index - 1) % len(groups)]]),
+            ]
+            target_bindings = (
+                model_bindings if primary == "models" else catalog_bindings
+            )
+            target_bindings[:] = traversal + [
+                item for item in target_bindings if item[0] not in {"Tab", "Shift+Tab"}
+            ]
+            if current == "wb-help":
+                target_bindings[:] = traversal + [("↑↓", "Scroll"), ("Esc", "Back")]
+            help_text.append(
+                " Tab moves forward and Shift+Tab moves backward through "
+                + ", ".join(labels[group] for group in groups)
+                + "; each group remembers its position."
+            )
+            self.query_one("#wb-help", NoMarkupStatic).update(help_text)
+
         detail_bindings = [
             ("↑↓", "Move"),
             ("Space", "Toggle images"),
@@ -4774,8 +4926,13 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             escape_binding = next(
                 (item for item in bindings if item[0] == "Esc"), ("Esc", "Back")
             )
-            if primary == "catalog":
-                shown = [("Tab", "Switch list"), escape_binding, ("F1", "Help")]
+            if (
+                primary in {"catalog", "models"}
+                and groups
+                and not self._confirm
+                and not self._busy
+            ):
+                shown = traversal + [escape_binding]
             else:
                 shown = [
                     next(

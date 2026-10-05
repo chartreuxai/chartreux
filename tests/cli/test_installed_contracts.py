@@ -218,8 +218,36 @@ def _assert_sdist_executable_modes(
         )
 
 
+def _require_wheelhouse() -> None:
+    if not os.environ.get("UV_FIND_LINKS"):
+        pytest.skip(
+            "installed contracts require UV_FIND_LINKS pointing to a pre-provisioned "
+            "local wheelhouse; builds and installs run offline with no index"
+        )
+
+
+@pytest.mark.parametrize("wheelhouse", [None, ""])
+def test_wheelhouse_guard_has_environment_free_skip_message(
+    monkeypatch: pytest.MonkeyPatch, wheelhouse: str | None
+) -> None:
+    monkeypatch.setenv("MISTRAL_API_KEY", "synthetic-guard-secret")
+    if wheelhouse is None:
+        monkeypatch.delenv("UV_FIND_LINKS", raising=False)
+    else:
+        monkeypatch.setenv("UV_FIND_LINKS", wheelhouse)
+
+    with pytest.raises(pytest.skip.Exception) as exc_info:
+        _require_wheelhouse()
+
+    assert str(exc_info.value) == (
+        "installed contracts require UV_FIND_LINKS pointing to a pre-provisioned "
+        "local wheelhouse; builds and installs run offline with no index"
+    )
+
+
 @pytest.fixture(scope="module")
 def installed_bundle(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
+    _require_wheelhouse()
     root = tmp_path_factory.mktemp("installed-contracts")
     dist = root / "dist"
     dist.mkdir()
@@ -245,10 +273,6 @@ def installed_bundle(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Pa
         shutil.copy2(_PROJECT_ROOT / relative, destination)
     uv = shutil.which("uv")
     assert uv is not None, "installed contracts require uv on PATH"
-    assert os.environ.get("UV_FIND_LINKS"), (
-        "installed contracts require UV_FIND_LINKS pointing to a pre-provisioned "
-        "local wheelhouse; builds and installs run offline with no index"
-    )
     # Registry identity is part of lock freshness. The runner's Linux-only local
     # index is suitable for builds, not for checking the universal PyPI lock.
     check_env = dict(os.environ)

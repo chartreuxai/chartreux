@@ -26,6 +26,7 @@ from chartreux.app_server.events import (
 from chartreux.app_server.models import (
     COMMITTED_MODEL_RECOVERY_ISSUE_FILE,
     PublicMessageEntry,
+    PublicTurnStatus,
 )
 from chartreux.app_server.protocol import (
     AppServerResponseError,
@@ -42,11 +43,13 @@ from chartreux.core.session.session_loader import SessionLoader
 from chartreux.core.session_types import LaunchMetadataV2, ScheduledLoop
 from chartreux.utils.cache_store import FileSystemCacheStore
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
+from tests.mock.utils import mock_llm_chunk
 from tests.stubs.app_server import (
     attach_test_app_server_session,
     create_test_app_server_session,
     start_test_app_server,
 )
+from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
 
 _MODEL_A = ModelConfig(name="model-a", provider="mistral", alias="model-a")
@@ -81,11 +84,14 @@ async def _consume(events):
     return [event async for event in events]
 
 
-async def _recovery_context(tmp_path: Path, *, target_in_catalog: bool):
+async def _recovery_context(
+    tmp_path: Path, *, target_in_catalog: bool, backend: FakeBackend | None = None
+):
     target_session_id = await _persist_target_session(tmp_path)
     # The resuming process pins no model and its catalog lacks model-b.
     source = build_test_agent_loop(
-        config=_resuming_config(tmp_path, with_target=target_in_catalog)
+        config=_resuming_config(tmp_path, with_target=target_in_catalog),
+        backend=backend,
     )
     session = await create_test_app_server_session(source)
     return session, source, target_session_id
@@ -157,7 +163,9 @@ async def test_recovery_gate_opens_after_explicit_model_selection(
     tmp_path: Path,
 ) -> None:
     session, source, target_session_id = await _recovery_context(
-        tmp_path, target_in_catalog=False
+        tmp_path,
+        target_in_catalog=False,
+        backend=FakeBackend(mock_llm_chunk(content="Hello after model selection.")),
     )
     try:
         await session.resume(target_session_id)
@@ -166,6 +174,10 @@ async def test_recovery_gate_opens_after_explicit_model_selection(
 
         # The explicit selection unblocks the turn; no silent default is used.
         await _consume(session.act("hello", client_message_id="u1"))
+        completed = session.state.latest_turn
+        assert completed is not None
+        assert completed.status is PublicTurnStatus.COMPLETED
+        assert completed.error is None
         assert source.committed_model is not None
         assert source.committed_model.base_model == "model-a"
         assert committed_model_recovery_issue(source) is None
@@ -267,7 +279,9 @@ async def test_unrelated_config_write_keeps_the_choice_pending(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_enqueue_is_gated_while_model_choice_is_pending(tmp_path: Path) -> None:
     session, source, target_session_id = await _recovery_context(
-        tmp_path, target_in_catalog=False
+        tmp_path,
+        target_in_catalog=False,
+        backend=FakeBackend(mock_llm_chunk(content="Hello after queued model choice.")),
     )
     try:
         await session.resume(target_session_id)
@@ -288,6 +302,8 @@ async def test_enqueue_is_gated_while_model_choice_is_pending(tmp_path: Path) ->
         async with asyncio.timeout(5):
             async for event in session.events():
                 if isinstance(event, TurnCompleted):
+                    assert event.turn.status is PublicTurnStatus.COMPLETED
+                    assert event.turn.error is None
                     break
         assert source.committed_model is not None
     finally:
@@ -318,7 +334,12 @@ async def _persist_target_session_with_due_loop(tmp_path: Path) -> str:
 @pytest.mark.asyncio
 async def test_due_scheduled_loop_backs_off_until_model_choice(tmp_path: Path) -> None:
     target_session_id = await _persist_target_session_with_due_loop(tmp_path)
-    source = build_test_agent_loop(config=_resuming_config(tmp_path, with_target=False))
+    source = build_test_agent_loop(
+        config=_resuming_config(tmp_path, with_target=False),
+        backend=FakeBackend(
+            mock_llm_chunk(content="Hello after scheduled model choice.")
+        ),
+    )
     session = await create_test_app_server_session(source)
     try:
         await session.resume(target_session_id)
@@ -348,6 +369,8 @@ async def test_due_scheduled_loop_backs_off_until_model_choice(tmp_path: Path) -
             async for event in session.events():
                 fired.append(event)
                 if isinstance(event, TurnCompleted):
+                    assert event.turn.status is PublicTurnStatus.COMPLETED
+                    assert event.turn.error is None
                     break
         assert any(isinstance(event, TurnStarted) for event in fired)
         assert any(

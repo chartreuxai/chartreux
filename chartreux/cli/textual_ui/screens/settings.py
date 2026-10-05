@@ -21,7 +21,15 @@ from textual.widget import Widget
 from textual.widgets import Input, OptionList, SelectionList
 from textual.widgets.option_list import Option, OptionDoesNotExist
 
-from chartreux.app_server.protocol import SettingDescriptorWire, SettingsReadResponse
+from chartreux.app_server.protocol import (
+    STATUS_LINE_PATHS,
+    SettingDescriptorWire,
+    SettingsReadResponse,
+)
+from chartreux.cli.textual_ui.screens.status_line_settings import (
+    StatusLineSettingsResult,
+    StatusLineSettingsScreen,
+)
 from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.settings_service import SettingsService
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
@@ -215,8 +223,6 @@ class SettingsChecklist(Checklist):
         if event.key == "space" and self.highlighted is not None:
             value = self.get_option_at_index(self.highlighted).value
             if value == ADD_PATTERN or value.startswith("\x00pattern:"):
-                if value == ADD_PATTERN:
-                    self.action_commit()
                 event.stop()
                 event.prevent_default()
 
@@ -334,6 +340,7 @@ class SettingsScreen(ModalScreen[str | None]):
         self._confirmation: tuple[str, SettingDescriptorWire, Any] | None = None
         self._pending_navigation: SettingDescriptorWire | None = None
         self._help_open = False
+        self._child_returning = False
         self._help_return_focus: Widget | None = None
         self.return_state: tuple[str, str | None, int, str | None] | None = None
 
@@ -393,6 +400,12 @@ class SettingsScreen(ModalScreen[str | None]):
         options.scroll_to(y=scroll_y, animate=False, force=True, immediate=True)
         target = self.query_one(f"#{focused_id}") if focused_id else options
         target.focus()
+
+    def _restore_child_state(self) -> None:
+        self._restore_return_state()
+        self.return_state = None
+        self._child_returning = False
+        self._update_help()
 
     def on_resize(self, event: events.Resize) -> None:
         self._resize_surface()
@@ -491,7 +504,18 @@ class SettingsScreen(ModalScreen[str | None]):
             actions.insert(1, ("Space", "Save toggle"))
         if item is not None and not self.snapshot.view_only:
             field = self.fields.get(item.path)
-            if item.control == "toggle_inventory" or (field and field.saved_explicit):
+            if (
+                item.control == "toggle_inventory"
+                or (
+                    item.control == "status_line"
+                    and any(
+                        self.fields[path].saved_explicit
+                        for path in STATUS_LINE_PATHS
+                        if path in self.fields
+                    )
+                )
+                or (field and field.saved_explicit)
+            ):
                 actions.insert(-1, ("Ctrl+R", "Remove override"))
         return actions
 
@@ -545,7 +569,11 @@ class SettingsScreen(ModalScreen[str | None]):
         )
         self._refresh_options(preserve=False)
 
-    def _display_value(self, item: SettingDescriptorWire) -> str:
+    def _display_value(self, item: SettingDescriptorWire) -> str:  # noqa: PLR0911
+        if item.control == "status_line":
+            field = self.fields.get("status_line.segments")
+            segments = field.effective_value if field else []
+            return f"{len(segments) if isinstance(segments, list) else 0} segments"
         if item.control == "toggle_inventory":
             category = item.inventory or "tools"
             names = self.snapshot.inventories.get(category, [])
@@ -589,7 +617,8 @@ class SettingsScreen(ModalScreen[str | None]):
             if item.kind == "bool"
             else "",
             item.label
-            if item.control == "toggle_inventory" or item.kind == "link"
+            if item.control in {"toggle_inventory", "status_line"}
+            or item.kind == "link"
             else item.path,
             "    ",
             ("" if item.kind == "bool" else self._display_value(item), "$text-muted"),
@@ -839,6 +868,20 @@ class SettingsScreen(ModalScreen[str | None]):
                 )
             )
             return
+        if item.control == "status_line":
+            count = sum(
+                self.fields[path].saved_explicit
+                for path in STATUS_LINE_PATHS
+                if path in self.fields
+            )
+            self.query_one("#settings-help", NoMarkupStatic).update(
+                self._help_with_feedback(
+                    item.description
+                    + "\nOpen to edit a draft; Apply changes saves to user settings."
+                    + f"\nSaved user overrides: {count}/4 · Ctrl+R restores inheritance."
+                )
+            )
+            return
         if item.control == "toggle_inventory":
             draft = self._inventory_draft
             detail = ""
@@ -924,6 +967,8 @@ class SettingsScreen(ModalScreen[str | None]):
         if (
             self._error.startswith(f"{chrome_glyph('success')} Saved:")
             and not self._busy
+            and not self._child_returning
+            and (event.option.id != "status_line" or self._error_path != "status_line")
         ):
             self._error = ""
         self._mark_cursor()
@@ -987,7 +1032,58 @@ class SettingsScreen(ModalScreen[str | None]):
         return False
 
     def _open_setting(self, item: SettingDescriptorWire) -> None:
-        if item.kind == "link":
+        if item.control == "status_line":
+            options = self.query_one(SettingsOptionList)
+            state = (
+                options._query,
+                str(options.highlighted_option.id)
+                if options.highlighted_option
+                else None,
+                int(options.scroll_y),
+                self.focused.id if self.focused is not None else None,
+            )
+
+            def returned(result: StatusLineSettingsResult | None) -> None:
+                if result is not None:
+                    if result.snapshot is not None:
+                        self.snapshot = result.snapshot.model_copy(
+                            update={"user_revision": result.revision}
+                        )
+                        self.catalog = self.snapshot.catalog
+                        self.fields = {
+                            field.path: field for field in self.snapshot.fields
+                        }
+                    else:
+                        self.snapshot = self.snapshot.model_copy(
+                            update={"user_revision": None}
+                        )
+                    self._needs_refresh = self._needs_refresh or result.needs_refresh
+                    # Inspection-only returns do not reconcile a prior save warning.
+                    if result.feedback.startswith((
+                        f"{chrome_glyph('success')} Saved:",
+                        "! Warning:",
+                        "Failed:",
+                    )):
+                        self._error_path = item.path
+                        self._error = result.feedback
+                        self._unresolved.pop(item.path, None)
+                        if (
+                            result.feedback.startswith("! Warning:")
+                            or result.needs_refresh
+                        ):
+                            self._unresolved[item.path] = result.feedback
+                self.return_state = state
+                self._child_returning = True
+                self._refresh_options()
+                self.call_after_refresh(self._restore_child_state)
+
+            self.app.push_screen(
+                StatusLineSettingsScreen(
+                    self.service, self.snapshot, needs_refresh=self._needs_refresh
+                ),
+                returned,
+            )
+        elif item.kind == "link":
             options = self.query_one(SettingsOptionList)
             self.return_state = (
                 options._query,
@@ -1059,9 +1155,10 @@ class SettingsScreen(ModalScreen[str | None]):
         values = list(self._list_draft or [])
         saved = self.fields.get(item.path)
         original = saved.effective_value if saved is not None else []
-        self._collapse()
         if values != original:
             self.run_worker(self._write(item, values), group="settings-write")
+        else:
+            self._collapse()
 
     def _inventory_values(self, category: str) -> tuple[list[str], list[str]]:
         def values(path: str) -> list[str]:
@@ -1421,6 +1518,8 @@ class SettingsScreen(ModalScreen[str | None]):
                 if target.path in ids:
                     options.highlighted = ids.index(target.path)
                 self._open_setting(target)
+        elif kind == "status-reset":
+            self.run_worker(self._write_changes(item, value), group="settings-write")
         elif kind == "reset":
             category = item.inventory or "tools"
             self._collapse()
@@ -1502,10 +1601,33 @@ class SettingsScreen(ModalScreen[str | None]):
             "Delete item",
         )
 
-    def action_remove_override(self) -> None:
+    def action_remove_override(self) -> None:  # noqa: PLR0911
         if self._busy or self._confirmation is not None:
             return
         item = self._current_item()
+        if item is not None and item.control == "status_line":
+            self._error_path = item.path
+            if self.snapshot.view_only:
+                self._error = f"{chrome_glyph('error')} User configuration is unavailable (view only)."
+                self._update_help()
+                return
+            changes = {
+                path: None
+                for path in STATUS_LINE_PATHS
+                if path in self.fields and self.fields[path].saved_explicit
+            }
+            if not changes:
+                self._error = "Info: Status line has no user override."
+                self._update_help()
+                return
+            self._open_confirmation(
+                "status-reset",
+                item,
+                changes,
+                "Remove saved status line overrides? Restores inheritance, not necessarily defaults. Cancel preserves saved values.",
+                "Remove overrides",
+            )
+            return
         if item is not None and item.control == "toggle_inventory":
             if self.snapshot.view_only:
                 return
@@ -1579,6 +1701,10 @@ class SettingsScreen(ModalScreen[str | None]):
                 self._unresolved[item.path] = self._error
                 self._update_help()
                 return
+            # Keep the list editor and draft until persistence succeeds. Validation,
+            # conflicts and transport failures must leave the draft editable.
+            if self._expanded == item.path and self._list_draft is not None:
+                self._collapse()
             if outcome.snapshot is None:
                 self._needs_refresh = True
                 self._error = "! Warning: Settings saved; current state unknown. Reopen Settings before editing."

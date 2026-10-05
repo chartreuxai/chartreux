@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from abc import ABC
+from datetime import datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
@@ -26,6 +28,7 @@ class BaseEvent(BaseModel, ABC):
 class UserMessageEvent(BaseEvent):
     content: str
     message_id: str
+    posted_at: datetime | None = None
     images: list[ImageAttachment] = Field(default_factory=list)
     user_display_content: UserDisplayContent | None = None
     resources: list[UserResource] = Field(default_factory=list)
@@ -34,20 +37,25 @@ class UserMessageEvent(BaseEvent):
 class AssistantEvent(BaseEvent):
     content: str
     stopped_by_middleware: bool = False
+    middleware_metadata: dict[str, Any] = Field(default_factory=dict)
     message_id: str | None = None
+    posted_at: datetime | None = None
 
     def __add__(self, other: AssistantEvent) -> AssistantEvent:
         return AssistantEvent(
             content=self.content + other.content,
             stopped_by_middleware=self.stopped_by_middleware
             or other.stopped_by_middleware,
+            middleware_metadata=self.middleware_metadata or other.middleware_metadata,
             message_id=self.message_id or other.message_id,
+            posted_at=self.posted_at or other.posted_at,
         )
 
 
 class ReasoningEvent(BaseEvent):
     content: str
     message_id: str | None = None
+    posted_at: datetime | None = None
 
 
 class ToolCallEvent(BaseEvent):
@@ -59,6 +67,15 @@ class ToolCallEvent(BaseEvent):
     presentation: ToolCallPresentation | None = None
 
 
+class ToolCancellationOrigin(StrEnum):
+    STEERING = "steering"
+
+
+class ToolWaitStateChangedEvent(BaseEvent):
+    turn_id: str
+    waiting_only: bool
+
+
 class ToolResultEvent(BaseEvent):
     tool_name: str
     tool_class: type[BaseTool] | None
@@ -68,6 +85,7 @@ class ToolResultEvent(BaseEvent):
     skipped: bool = False
     skip_reason: str | None = None
     cancelled: bool = False
+    cancellation_origin: ToolCancellationOrigin | None = None
     duration: float | None = None
     tool_call_id: str
     presentation: ToolResultPresentation | None = None

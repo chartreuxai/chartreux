@@ -35,9 +35,10 @@
     .terminal-r1 { fill: #c5c8c6 }
 .terminal-r2 { fill: #b87333 }
 .terminal-r3 { fill: #b87333;font-weight: bold }
-.terminal-r4 { fill: #c5c8c6;font-weight: bold }
+.terminal-r4 { fill: #98a84b }
 .terminal-r5 { fill: #98a84b;font-weight: bold }
 .terminal-r6 { fill: #608ab1 }
+.terminal-r7 { fill: #c5c8c6;font-weight: bold }
     </style>
 
     <defs>
@@ -159,7 +160,7 @@
             </g>
 
     <g transform="translate(9, 41)" clip-path="url(#terminal-clip-terminal)">
-
+    <rect fill="#000a00" x="0" y="684.7" width="24.4" height="24.65" shape-rendering="crispEdges"/><rect fill="#000a00" x="24.4" y="684.7" width="12.2" height="24.65" shape-rendering="crispEdges"/><rect fill="#000a00" x="36.6" y="684.7" width="12.2" height="24.65" shape-rendering="crispEdges"/><rect fill="#000a00" x="48.8" y="684.7" width="48.8" height="24.65" shape-rendering="crispEdges"/><rect fill="#000a00" x="97.6" y="684.7" width="1366.4" height="24.65" shape-rendering="crispEdges"/>
     <g class="terminal-matrix">
     <text class="terminal-r1" x="1464" y="20" textLength="12.2" clip-path="url(#terminal-line-0)">
 </text><text class="terminal-r1" x="1464" y="44.4" textLength="12.2" clip-path="url(#terminal-line-1)">
@@ -189,14 +190,14 @@
 </text><text class="terminal-r1" x="0" y="630" textLength="183" clip-path="url(#terminal-line-25)">F1&#160;Help&#160;·&#160;/help</text><text class="terminal-r1" x="1464" y="630" textLength="12.2" clip-path="url(#terminal-line-25)">
 </text><text class="terminal-r1" x="1464" y="654.4" textLength="12.2" clip-path="url(#terminal-line-26)">
 </text><text class="terminal-r1" x="1464" y="678.8" textLength="12.2" clip-path="url(#terminal-line-27)">
-</text><text class="terminal-r4" x="0" y="703.2" textLength="48.8" clip-path="url(#terminal-line-28)">You&#160;</text><text class="terminal-r1" x="48.8" y="703.2" textLength="48.8" clip-path="url(#terminal-line-28)">/mcp</text><text class="terminal-r1" x="1464" y="703.2" textLength="12.2" clip-path="url(#terminal-line-28)">
+</text><text class="terminal-r4" x="24.4" y="703.2" textLength="12.2" clip-path="url(#terminal-line-28)">&gt;</text><text class="terminal-r1" x="48.8" y="703.2" textLength="48.8" clip-path="url(#terminal-line-28)">/mcp</text><text class="terminal-r1" x="1464" y="703.2" textLength="12.2" clip-path="url(#terminal-line-28)">
 </text><text class="terminal-r1" x="24.4" y="727.6" textLength="12.2" clip-path="url(#terminal-line-29)">⎣</text><text class="terminal-r1" x="48.8" y="727.6" textLength="378.2" clip-path="url(#terminal-line-29)">No&#160;MCP&#160;servers&#160;configured.&#160;Run&#160;</text><text class="terminal-r5" x="427" y="727.6" textLength="170.8" clip-path="url(#terminal-line-29)">/mcp&#160;add&#160;&lt;url&gt;</text><text class="terminal-r1" x="597.8" y="727.6" textLength="146.4" clip-path="url(#terminal-line-29)">&#160;to&#160;add&#160;one.</text><text class="terminal-r1" x="1464" y="727.6" textLength="12.2" clip-path="url(#terminal-line-29)">
 </text><text class="terminal-r1" x="1464" y="752" textLength="12.2" clip-path="url(#terminal-line-30)">
 </text><text class="terminal-r1" x="1464" y="776.4" textLength="12.2" clip-path="url(#terminal-line-31)">
 </text><text class="terminal-r6" x="0" y="800.8" textLength="1464" clip-path="url(#terminal-line-32)">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1464" y="800.8" textLength="12.2" clip-path="url(#terminal-line-32)">
-</text><text class="terminal-r4" x="0" y="825.2" textLength="12.2" clip-path="url(#terminal-line-33)">&gt;</text><text class="terminal-r1" x="1464" y="825.2" textLength="12.2" clip-path="url(#terminal-line-33)">
+</text><text class="terminal-r7" x="0" y="825.2" textLength="12.2" clip-path="url(#terminal-line-33)">&gt;</text><text class="terminal-r1" x="1464" y="825.2" textLength="12.2" clip-path="url(#terminal-line-33)">
 </text><text class="terminal-r6" x="0" y="849.6" textLength="1464" clip-path="url(#terminal-line-34)">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1464" y="849.6" textLength="12.2" clip-path="url(#terminal-line-34)">
-</text><text class="terminal-r1" x="0" y="874" textLength="158.6" clip-path="url(#terminal-line-35)">/test/workdir</text><text class="terminal-r1" x="170.8" y="874" textLength="134.2" clip-path="url(#terminal-line-35)">[PID&#160;00000]</text>
+</text><text class="terminal-r1" x="0" y="874" textLength="353.8" clip-path="url(#terminal-line-35)">workdir&#160;|&#160;pid&#160;0&#160;|&#160;0/400k&#160;(0%)</text>
     </g>
     </g>
 </svg>

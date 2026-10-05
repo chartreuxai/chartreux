@@ -8,7 +8,11 @@ import re
 from tree_sitter import Language, Node, Parser
 import tree_sitter_bash as tsbash
 
-from chartreux.core.tools.builtins._shell_command_policy import is_package_command
+from chartreux.core.tools.builtins._shell_command_policy import (
+    executor_boundary,
+    package_argument_indexes,
+)
+from chartreux.core.tools.builtins._shell_diagnostics import Diagnostic
 
 _SUPPORTED_COMMAND_PARTS = {
     "command_name",
@@ -323,26 +327,19 @@ def _executable_parts(node: Node) -> list[str]:
     parts = [
         token for child in node.children if (token := _literal_token(child)) is not None
     ]
-    # Unwrap each executable position, including repeated command/builtin
-    # prefixes. Arguments of the final executable are never reinterpreted.
-    while parts and (command := parts[0].rsplit("/", 1)[-1]) in {
-        "command",
-        "builtin",
-        "exec",
-    }:
-        index = 1
-        while index < len(parts):
-            if parts[index] == "--":
-                index += 1
-                break
-            if command == "exec" and parts[index] == "-a":
-                index += 2
-                continue
-            if parts[index].startswith("-"):
-                index += 1
-                continue
+    # Follow registry-owned argv positions only, with the same depth bound as
+    # Bash. env stays visible so its original assignment spelling is checked.
+    for _ in range(8):
+        if parts and parts[0].rsplit("/", 1)[-1] == "env":
             break
-        parts = parts[index:]
+        try:
+            boundary = executor_boundary(parts)
+        except ValueError:
+            break  # Bash reports the grammar failure after extracting argv.
+        if boundary is None or boundary.inner_command_range is None:
+            break
+        start, end = boundary.inner_command_range
+        parts = parts[start:end]
     return parts
 
 
@@ -408,11 +405,18 @@ def _command_allowance_reasons(node: Node) -> Iterator[str]:
         parts = parts[1:]
         while parts and re.match(r"[A-Za-z_][A-Za-z0-9_]*=", parts[0]):
             parts = parts[1:]
-    if is_package_command(parts) and any(
-        child.type in _SUPPORTED_COMMAND_PARTS
+    argv_nodes = [child for child in node.children if _literal_token(child) is not None]
+    try:
+        indexes = package_argument_indexes([
+            _literal_token(child) or "" for child in argv_nodes
+        ])
+    except ValueError:
+        indexes = set()  # The recursive pipeline denies invalid executor syntax.
+    if any(
+        index in indexes
         and child.text is not None
         and _has_active_bracket_glob(child.text)
-        for child in node.children
+        for index, child in enumerate(argv_nodes)
     ):
         yield "unquoted package bracket syntax may expand as a shell glob"
 
@@ -434,52 +438,81 @@ _COMMAND_LOOKUP_MUTATORS = frozenset({
 })
 
 
-def _lookup_mutation_reason(node: Node, nested_source: bool) -> str | None:
-    parts = _executable_parts(node)
+def argv_permission_reasons(
+    parts: list[str], *, nested_source: bool = False
+) -> tuple[str, ...]:
+    """Inspect an actual executable argv without interpreting its arguments as shell."""
     if not parts:
-        return None
+        return ()
     name = parts[0].rsplit("/", 1)[-1]
-    if name in {"export", "declare", "typeset", "readonly"}:
-        assignments = parts[1:] + [
-            child.text.decode("utf-8")
-            for child in node.children
-            if child.type == "concatenation" and child.text is not None
-        ]
-        for arg in assignments:
-            variable, separator, _ = arg.partition("=")
-            if separator and (
-                variable in DANGEROUS_ENV_NAMES
-                or variable.startswith(_DANGEROUS_ENV_PREFIXES)
+    reasons: list[str] = []
+    if name == "env":
+        try:
+            boundary = executor_boundary(parts)
+        except ValueError:
+            return ()  # The pipeline reports this invalid grammar on entry.
+        end = (
+            boundary.inner_command_range[0]
+            if boundary and boundary.inner_command_range
+            else len(parts)
+        )
+        for assignment in parts[1:end]:
+            key, separator, value = assignment.partition("=")
+            if not separator:
+                continue
+            if re.fullmatch(r"[A-Z_][A-Z0-9_]*", key) is None:
+                reasons.append("an environment assignment with a non-uppercase name")
+            elif key in DANGEROUS_ENV_NAMES or key.startswith(_DANGEROUS_ENV_PREFIXES):
+                reasons.append(f"dangerous environment assignment ({key})")
+            elif key == "PYTHONPATH" and any(
+                not entry or entry.startswith(("/", "~")) or ".." in entry.split("/")
+                for entry in value.split(":")
             ):
-                return f"dangerous environment assignment ({variable})"
-    # A top-level hash -p or alias definition affects later command resolution;
-    # nested shells can also change lookup via the remaining builtins.
-    mutates_lookup = (
-        (nested_source and name in _COMMAND_LOOKUP_MUTATORS)
-        or (
-            name == "hash"
-            and any(option == "-p" or option.startswith("-p") for option in parts[1:])
-        )
-        or (name == "alias" and any("=" in value for value in parts[1:]))
-        or (
-            name == "alias"
-            and any(
-                child.type == "concatenation"
-                and child.text is not None
-                and b"=" in child.text
-                for child in node.children
-            )
-        )
+                reasons.append("dangerous environment assignment (PYTHONPATH)")
+    if name in {"export", "declare", "typeset", "readonly"}:
+        for assignment in parts[1:]:
+            key, separator, _ = assignment.partition("=")
+            if separator and (
+                key in DANGEROUS_ENV_NAMES or key.startswith(_DANGEROUS_ENV_PREFIXES)
+            ):
+                reasons.append(f"dangerous environment assignment ({key})")
+    mutates_lookup = nested_source and name in _COMMAND_LOOKUP_MUTATORS
+    mutates_lookup |= name == "hash" and any(
+        value.startswith("-p") for value in parts[1:]
     )
+    mutates_lookup |= name == "alias" and any("=" in value for value in parts[1:])
     if mutates_lookup:
-        return f"unsupported command lookup modification ({name})"
-    return None
+        reasons.append(f"unsupported command lookup modification ({name})")
+    return tuple(reasons)
+
+
+def _lookup_mutation_reason(node: Node, nested_source: bool) -> str | None:
+    return next(
+        iter(
+            argv_permission_reasons(
+                _executable_parts(node), nested_source=nested_source
+            )
+        ),
+        None,
+    )
 
 
 @dataclass(frozen=True)
 class ShellPermissionAnalysis:
     command_parts: tuple[str, ...]
     approval_reasons: tuple[str, ...]
+    diagnostics: tuple[Diagnostic, ...] = ()
+
+    @property
+    def approval_diagnostic(self) -> Diagnostic:
+        return Diagnostic(
+            "analysis",
+            related=self.diagnostics
+            or tuple(
+                Diagnostic("analysis", detail=reason)
+                for reason in self.approval_reasons
+            ),
+        )
 
     @property
     def requires_approval(self) -> bool:
@@ -496,7 +529,7 @@ def _get_parser() -> Parser:
     return Parser(Language(tsbash.language()))
 
 
-def _analyze_shell_command(
+def _analyze_shell_command(  # noqa: PLR0915
     command: str, *, nested_source: bool = False
 ) -> ShellPermissionAnalysis:
     """Extract commands and fail closed on syntax the policy cannot model."""
@@ -506,6 +539,7 @@ def _analyze_shell_command(
     tree = _get_parser().parse(command.encode("utf-8"))
     commands: list[str] = []
     approval_reasons: set[str] = set()
+    diagnostics: dict[str, Diagnostic] = {}
 
     if tree.root_node.has_error:
         approval_reasons.add("a syntax error")
@@ -531,6 +565,7 @@ def _analyze_shell_command(
         )
 
     def find_commands(node: Node) -> None:  # noqa: PLR0912
+        previous_reasons = approval_reasons.copy()
         if node.type == "variable_assignment":
             if reason := _assignment_reason(node):
                 approval_reasons.add(reason)
@@ -576,12 +611,30 @@ def _analyze_shell_command(
             if parts:
                 commands.append(" ".join(parts))
 
+        for reason in approval_reasons - previous_reasons:
+            original = (node.text or b"").decode("utf-8")
+            parent = node
+            while parent.parent is not None and parent.type != "command":
+                parent = parent.parent
+            diagnostics[reason] = Diagnostic(
+                "analysis",
+                offending_token=original,
+                command_part=(parent.text or b"").decode("utf-8"),
+                detail=reason,
+            )
         for child in node.children:
             find_commands(child)
 
     find_commands(tree.root_node)
     return ShellPermissionAnalysis(
-        command_parts=tuple(commands), approval_reasons=tuple(sorted(approval_reasons))
+        command_parts=tuple(commands),
+        approval_reasons=tuple(sorted(approval_reasons)),
+        diagnostics=tuple(
+            diagnostics.get(
+                reason, Diagnostic("analysis", command_part=command, detail=reason)
+            )
+            for reason in sorted(approval_reasons)
+        ),
     )
 
 

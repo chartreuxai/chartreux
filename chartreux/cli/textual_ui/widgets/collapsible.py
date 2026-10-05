@@ -5,6 +5,7 @@ import inspect
 import re
 from typing import TYPE_CHECKING, ClassVar, cast
 
+from rich.cells import cell_len
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
     from chartreux.cli.textual_ui.app import ChatScroll
 
 from chartreux.ui.chrome_glyphs import chrome_glyph
+from chartreux.ui.duration_display import format_duration
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic, NonSelectableStatic
 
 # Control chars (incl. ESC) that must never reach the terminal via a header.
@@ -99,8 +101,67 @@ class DisclosureHeader(Horizontal):
         activate: Callable[[], None | Awaitable[None]],
         classes: str,
     ) -> None:
-        super().__init__(*children, classes=classes)
+        self.duration_slot = NonSelectableStatic("", classes="tool-duration")
+        self.duration_slot.display = False
+        # Eager headers compose their supplied children in order. Call headers
+        # supply children through compose(), including this slot last.
+        super().__init__(
+            *children, *([self.duration_slot] if children else []), classes=classes
+        )
         self._activate = activate
+        self._duration_ms: float | None = None
+        self._show_timing = True
+
+    DEFAULT_CSS = """
+    DisclosureHeader .tool-duration {
+        width: auto;
+        height: 1;
+        margin-left: 1;
+        color: $text-muted;
+        text-wrap: nowrap;
+    }
+    DisclosureHeader.has-timing .status-indicator-text {
+        width: 1fr;
+        min-width: 0;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+    """
+
+    def set_duration(self, duration_ms: float | None, *, show: bool = True) -> None:
+        self._duration_ms = duration_ms
+        self._show_timing = show
+        self._refresh_duration()
+
+    def _refresh_duration(self) -> None:
+        text = format_duration(self._duration_ms) if self._show_timing else ""
+        fixed_width = sum(
+            cell_len(str(child.render()))
+            + child.styles.margin.left
+            + child.styles.margin.right
+            for child in self.children
+            if isinstance(child, NoMarkupStatic)
+            and child is not self.duration_slot
+            and not child.has_class("status-indicator-text")
+            and not child.has_class("status-indicator-suffix")
+        )
+        available = self.content_size.width
+        visible = bool(text) and available >= fixed_width + cell_len(text) + 2
+        self.duration_slot.update(text)
+        self.duration_slot.display = visible
+        self.set_class(bool(text), "has-timing")
+        for suffix in self.query(".status-indicator-suffix"):
+            suffix.display = bool(str(suffix.render())) and (
+                not text
+                or available
+                >= fixed_width + cell_len(text) + cell_len(str(suffix.render())) + 4
+            )
+
+    def on_mount(self) -> None:
+        self._refresh_duration()
+
+    def on_resize(self) -> None:
+        self._refresh_duration()
 
     async def action_activate(self) -> None:
         result = self._activate()
@@ -146,6 +207,8 @@ class CollapsibleSection(ClickWithoutDragMixin, Vertical):
             self._body = body
             body.display = False
         self._is_collapsed = True
+        self._group_folded = False
+        self._group_fold_requested = False
         self.on_collapse_changed: Callable[[bool], None] | None = None
         self._triangle = NonSelectableStatic(
             chrome_glyph("disclosure_closed"), classes="collapsible-triangle"
@@ -183,9 +246,30 @@ class CollapsibleSection(ClickWithoutDragMixin, Vertical):
         else:
             self._body.display = False
 
+    def set_group_folded(self, folded: bool) -> None:
+        """Mask raw bodies without overwriting the individual expansion preference."""
+        if folded == self._group_fold_requested:
+            return
+        self._group_fold_requested = folded
+        self._group_folded = folded
+        collapsed = folded or self._is_collapsed
+        if collapsed:
+            self._hide_body()
+        else:
+            self._show_body()
+        self._triangle.update(
+            chrome_glyph("disclosure_closed" if collapsed else "disclosure_open")
+            if self._collapsible
+            else " "
+        )
+        self._on_toggled(collapsed)
+
     def toggle(self) -> None:
         if not self._collapsible:
             return
+        if self._group_folded:
+            self._group_folded = False
+            self._is_collapsed = True
         if self._is_collapsed:
             chat = next(
                 (ancestor for ancestor in self.ancestors if ancestor.id == "chat"), None

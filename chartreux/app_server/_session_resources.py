@@ -75,6 +75,8 @@ from chartreux.app_server.protocol import (
     SessionShellCommandResponse,
     SessionTitleUpdateParams,
     SessionTitleUpdateResponse,
+    WorkspaceBranchReadParams,
+    WorkspaceBranchReadResponse,
     WorkspacePromptPrepareParams,
     WorkspacePromptPrepareResponse,
     WorkspaceTrustDecisionParams,
@@ -545,6 +547,52 @@ class WorkspaceResource:
     ) -> None:
         self._connection = connection
         self._state = state
+        self._branch_identity: tuple[str, str] | None = None
+        self._branch_cache: WorkspaceBranchReadResponse | None = None
+        self._branch_generation = 0
+
+    def _workspace_identity(self) -> tuple[str, str]:
+        return self._state.session_id, self._state.state.session.cwd or ""
+
+    async def read_branch(
+        self, *, refresh: bool = False
+    ) -> WorkspaceBranchReadResponse | None:
+        """Read cached branch facts; None means an in-flight result was discarded.
+
+        Refresh after turns or external checkout changes. Cache entries (including
+        unknown results) belong only to the current session and working directory.
+        A newer read/refresh supersedes older in-flight probes.
+        """
+        identity = self._workspace_identity()
+        if identity != self._branch_identity:
+            self._branch_identity = identity
+            self._branch_cache = None
+            self._branch_generation += 1
+        if not refresh and self._branch_cache is not None:
+            return self._branch_cache.model_copy()
+        self._branch_generation += 1
+        generation = self._branch_generation
+        if not identity[1]:
+            self._branch_cache = WorkspaceBranchReadResponse(
+                session_id=identity[0], cwd="", status="unknown"
+            )
+            return self._branch_cache.model_copy()
+        client = await self._connection.connect()
+        response = validate_wire(
+            WorkspaceBranchReadResponse,
+            await client.request(
+                "workspace/git/branch",
+                WorkspaceBranchReadParams(session_id=identity[0], cwd=identity[1]),
+            ),
+        )
+        if (
+            self._workspace_identity() != identity
+            or self._branch_generation != generation
+            or (response.session_id, response.cwd) != identity
+        ):
+            return None
+        self._branch_cache = response
+        return response.model_copy()
 
     async def prepare_prompt(
         self, message: str, *, title_content: list[ContentBlock] | None = None

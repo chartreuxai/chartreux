@@ -173,7 +173,7 @@ async def test_public_root_tree(
                 # Exercise the real subagent entry point, not just its guard helper.
                 with pytest.raises(RuntimeError):
                     async for _ in registry.run(
-                        TaskArgs(task="must not run", agent="plan"),
+                        TaskArgs(task="must not run", agent_type="plan"),
                         InvokeContext(
                             tool_call_id="racing-child",
                             session_id=runtimes[-1].agent_loop.session_id,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from collections import deque
 from collections.abc import Iterator
+from importlib.util import resolve_name
 from pathlib import Path
 
 import pytest
@@ -219,6 +220,82 @@ def test_core_does_not_import_app_server_or_textual() -> None:
     assert not violations, "\n".join(sorted(violations))
 
 
+def _reverse_boundary_imports(source_path: Path) -> set[str]:
+    names = {name for _, name in _imports(source_path)}
+    module = _module_name(source_path)
+    package = module if source_path.name == "__init__.py" else module.rpartition(".")[0]
+    tree = ast.parse(read_safe(source_path).text, filename=source_path)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        base = node.module or ""
+        if node.level:
+            base = resolve_name("." * node.level + base, package)
+        names.add(base)
+        names.update(f"{base}.{alias.name}" for alias in node.names)
+    # Importing a submodule also executes its package initializers.
+    names.update(
+        parent
+        for name in list(names)
+        for parent in (
+            ".".join(name.split(".")[:index])
+            for index in range(1, len(name.split(".")))
+        )
+    )
+    return names
+
+
+def test_core_and_app_server_have_no_transitive_cli_or_textual_dependency() -> None:
+    modules = _production_modules()
+    imports = {
+        module: _reverse_boundary_imports(path) for module, path in modules.items()
+    }
+    starts = {
+        module
+        for module, path in modules.items()
+        if path.is_relative_to(CORE_ROOT)
+        or path.is_relative_to(CHARTREUX_ROOT / "app_server")
+    }
+    pending = deque((module, [module]) for module in starts)
+    visited = set(starts)
+    violations: list[str] = []
+    forbidden = ("textual", "chartreux.cli")
+    while pending:
+        module, chain = pending.popleft()
+        for imported in imports[module]:
+            if any(
+                imported == prefix or imported.startswith(prefix + ".")
+                for prefix in forbidden
+            ):
+                violations.append(" -> ".join([*chain, imported]))
+                continue
+            resolved = imported
+            while resolved and resolved not in modules:
+                resolved = resolved.rpartition(".")[0]
+            if not resolved or resolved in visited:
+                continue
+            visited.add(resolved)
+            pending.append((resolved, [*chain, resolved]))
+    assert not violations, "\n".join(sorted(violations))
+
+
+@pytest.mark.parametrize("forbidden", ["textual.widgets", "chartreux.cli.textual_ui"])
+def test_reverse_boundary_rejects_transitive_ui_import(
+    monkeypatch: pytest.MonkeyPatch, forbidden: str
+) -> None:
+    original_imports = _imports
+    utils = CHARTREUX_ROOT / "utils" / "io.py"
+
+    def injected_imports(source_path: Path) -> Iterator[tuple[int, str]]:
+        yield from original_imports(source_path)
+        if source_path == utils:
+            yield 1, forbidden
+
+    monkeypatch.setattr(__name__ + "._imports", injected_imports)
+    with pytest.raises(AssertionError, match=forbidden):
+        test_core_and_app_server_have_no_transitive_cli_or_textual_dependency()
+
+
 def test_only_app_server_runtime_constructs_agent_loop() -> None:
     allowed = CHARTREUX_ROOT / "app_server" / "_runtime.py"
     violations = [
@@ -238,3 +315,46 @@ def test_only_app_server_runtime_constructs_agent_loop() -> None:
 
 def test_protocol_has_no_generic_command_escape_hatch() -> None:
     assert not [method for method in SERVER_METHODS if method.endswith("/command")]
+
+
+def test_agent_stop_clients_do_not_access_registry() -> None:
+    forbidden = {
+        "SubagentRegistry",
+        "_registry",
+        "_subagent_registry",
+        "_registry_lock",
+        "cancel_run",
+    }
+    violations = [
+        f"{path.relative_to(CHARTREUX_ROOT)}:{node.lineno}"
+        for path in [*_production_files(), *PUBLIC_APP_SERVER_PATHS]
+        for node in ast.walk(ast.parse(read_safe(path).text, filename=path))
+        if (isinstance(node, ast.Name) and node.id in forbidden)
+        or (isinstance(node, ast.Attribute) and node.attr in forbidden)
+    ]
+    assert not violations, "\n".join(violations)
+
+
+@pytest.mark.parametrize(
+    "relative_path,symbols",
+    [
+        ("cli/textual_ui/app.py", {"CancelOutcome"}),
+        (
+            "cli/textual_ui/widgets/agent_bar.py",
+            {"AgentsCancelResponse", "CancelOutcome"},
+        ),
+        ("app_server/session.py", {"AgentsCancelParams", "AgentsCancelResponse"}),
+    ],
+)
+def test_agent_stop_uses_public_protocol_models(
+    relative_path: str, symbols: set[str]
+) -> None:
+    tree = ast.parse(read_safe(CHARTREUX_ROOT / relative_path).text)
+    imported = {
+        alias.asname or alias.name: (node.module, alias.name)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    for symbol in symbols:
+        assert imported[symbol] == ("chartreux.app_server.protocol", symbol)

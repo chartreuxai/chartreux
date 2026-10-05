@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import BaseModel, JsonValue
 
+from chartreux.core.tools.secret_redaction import sanitize_recorded_tool_call
 from chartreux.core.tools.utils import file_display_harness
 from chartreux.utils.tool_presentation import (
     EffectCallDisplay,
@@ -117,6 +118,8 @@ class ToolUIDataAdapter:
         return self.ui_data_class.effect_kind
 
     def get_call_display(self, event: ToolCallEvent) -> ToolCallDisplay:
+        # Redact original values before any tool formatter or repr escapes them.
+        event = sanitize_recorded_tool_call(event)
         if self.ui_data_class:
             with file_display_harness(self.harness_files):
                 display = self.ui_data_class.get_call_display(event)

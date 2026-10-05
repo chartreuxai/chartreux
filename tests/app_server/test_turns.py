@@ -32,6 +32,44 @@ from tests.stubs.fake_backend import FakeBackend
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["prepared_cancel", "scheduled_cancel", "rollback"])
+async def test_unstarted_turn_cancel_settles_but_rollback_does_not(mode: str) -> None:
+    from unittest.mock import AsyncMock
+
+    from chartreux.app_server._sessions import SessionRuntimeRegistry
+    from chartreux.app_server.models import PublicTurnStatus
+    from chartreux.app_server.protocol import TurnStartParams
+
+    loop = build_test_agent_loop()
+    registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
+    runtime = registry._build_child_runtime(loop)
+    try:
+        response, action = runtime.turns.start(
+            TurnStartParams(session_id=loop.session_id, message=[])
+        )
+        if mode == "rollback":
+            action.abort()
+            assert runtime.turns.completed_turns == []
+            with pytest.raises(RuntimeError, match="Turn did not complete"):
+                await runtime.turns.wait_for_operation(response.turn.id)
+        else:
+            if mode == "scheduled_cancel":
+                action()
+            waiter = asyncio.create_task(
+                runtime.turns.wait_for_operation(response.turn.id)
+            )
+            assert runtime.turns.interrupt_operation(response.turn.id)
+            action()  # A cancelled prepared action cannot resurrect execution.
+            terminal = await asyncio.wait_for(waiter, 2)
+            assert terminal.status is PublicTurnStatus.INTERRUPTED
+            assert runtime.turns.operation_pending_turn_id(response.turn.id) is None
+        assert runtime.execution.active is None
+        assert runtime.turns.active_turn is None
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_background_title_keeps_runtime_non_quiescent_until_delivery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -15,7 +15,6 @@ from tree_sitter import Language, Node, Parser
 import tree_sitter_bash as tsbash
 
 from chartreux.core.events import ToolResultEvent, ToolStreamEvent
-from chartreux.core.scratchpad import is_scratchpad_path
 from chartreux.core.tools.base import (
     BaseTool,
     BaseToolConfig,
@@ -27,26 +26,32 @@ from chartreux.core.tools.base import (
 from chartreux.core.tools.builtins._shell_command_policy import (
     ShellCommandPolicy,
     analyze_shell_command_policy,
+    executor_boundary,
     git_metadata_paths,
     git_repository_config_risk,
     inline_interpreter_switch,
     matches_command_prefix,
     path_candidates,
 )
+from chartreux.core.tools.builtins._shell_diagnostics import (
+    Diagnostic,
+    render_diagnostic,
+)
 from chartreux.core.tools.builtins._shell_permission_analysis import (
     DANGEROUS_ENV_NAMES,
     ShellPermissionAnalysis,
     _has_active_bracket_glob,
     analyze_shell_command,
+    argv_permission_reasons,
 )
 from chartreux.core.tools.io_port import ShellCommandRequest
 from chartreux.core.tools.permissions import PermissionContext
 from chartreux.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from chartreux.core.tools.utils import (
     DEFAULT_SENSITIVE_PATTERNS,
+    PathAccess,
+    PathAuthority,
     ambient_workspace,
-    is_path_within_workdir,
-    matches_sensitive_pattern,
     resolve_tool_path,
 )
 from chartreux.core.utils import kill_async_subprocess
@@ -56,13 +61,18 @@ from chartreux.utils.io import decode_console_safe
 from chartreux.utils.tool_presentation import ToolEffectKind
 
 
+def _denied(diagnostic: Diagnostic) -> PermissionContext:
+    return PermissionContext(
+        permission=ToolPermission.NEVER, reason=render_diagnostic(diagnostic)
+    )
+
+
 @lru_cache(maxsize=1)
 def _get_parser() -> Parser:
     return Parser(Language(tsbash.language()))
 
 
 _SHELLS = frozenset({"ash", "bash", "sh", "dash", "hush", "zsh"})
-_BUSYBOX_SHELL_APPLETS = frozenset({"sh", "ash", "bash", "dash", "hush"})
 _MAX_SHELL_DEPTH = 8
 _MAX_EXPANDED_COMMANDS = 256
 _MAX_ANALYZED_BYTES = 64 * 1024
@@ -76,183 +86,9 @@ class _UnsafeShellSyntax(ValueError):
 class _GuardrailPart:
     text: str
     scope: tuple[int, ...] = ()
-
-
-def _shell_source(tokens: list[str]) -> str | None:
-    """Locate a literal -c operand using a deliberately narrow shell argv grammar."""
-    if not tokens or Path(tokens[0]).name not in _SHELLS:
-        return None
-    index = 1
-    while index < len(tokens):
-        token = tokens[index]
-        if token == "--":
-            if any(candidate == "-c" for candidate in tokens[index + 1 :]):
-                raise _UnsafeShellSyntax("unsupported shell -- -c option form")
-            index += 1
-            break
-        if token == "-c":
-            if index + 1 >= len(tokens):
-                raise _UnsafeShellSyntax("shell -c has no literal source")
-            return tokens[index + 1]
-        if (
-            token.startswith("-")
-            and not token.startswith("--")
-            and len(token) > len("-c")
-        ):
-            flags = token[1:]
-            if "c" in flags:
-                if flags[-1] != "c" or index + 1 >= len(tokens):
-                    raise _UnsafeShellSyntax("unsupported shell -c option form")
-                return tokens[index + 1]
-            if set(flags) <= set("ilrsuvxenfC"):
-                index += 1
-                continue
-        if token in {
-            "-i",
-            "-l",
-            "-r",
-            "-s",
-            "-u",
-            "-v",
-            "-x",
-            "-e",
-            "-n",
-            "-f",
-            "-C",
-            "--noprofile",
-            "--norc",
-            "--posix",
-            "--login",
-            "--interactive",
-            "--noediting",
-        }:
-            index += 1
-            continue
-        if token in {"-O", "+O", "-o", "+o", "--rcfile", "--init-file"}:
-            index += 2
-            continue
-        if token.startswith("-"):
-            raise _UnsafeShellSyntax("unsupported shell option before -c")
-        break
-    return None
-
-
-def _original_argv_suffix(command: str, count: int) -> str:
-    """Retain shell quoting/escapes when exposing a wrapped executable."""
-    tree = _get_parser().parse(command.encode("utf-8"))
-
-    def command_nodes(node: Node) -> Iterator[Node]:
-        if node.type == "command":
-            yield node
-        else:
-            for child in node.children:
-                yield from command_nodes(child)
-
-    commands = list(command_nodes(tree.root_node))
-    if len(commands) != 1:
-        raise _UnsafeShellSyntax("cannot preserve wrapped executable syntax")
-    nodes = [
-        child
-        for child in commands[0].children
-        if child.type
-        in {"command_name", "number", "word", "string", "raw_string", "concatenation"}
-    ]
-    if count <= 0 or count > len(nodes):
-        raise _UnsafeShellSyntax("cannot preserve wrapped executable syntax")
-    return command.encode("utf-8")[
-        nodes[-count].start_byte : nodes[-1].end_byte
-    ].decode("utf-8")
-
-
-def _wrapper_executable(tokens: list[str], name: str, command: str) -> list[str]:
-    """Locate the executable using only modeled wrapper argv forms."""
-    values = {
-        "timeout": {"-s", "--signal", "-k", "--kill-after"},
-        "stdbuf": {"-i", "-o", "-e"},
-        "nice": {"-n", "--adjustment"},
-        "ionice": {"-c", "--class", "-n", "--classdata"},
-        "taskset": {"-c", "--cpu-list"},
-        "time": {"-f", "--format", "-o", "--output"},
-        "flock": {"-w", "--wait", "-E", "--conflict-exit-code"},
-    }.get(name, set())
-    flags = {
-        "nohup": set(),
-        "setsid": {"-c", "-f", "-w", "--ctty", "--fork", "--wait"},
-        "nice": set(),
-        "ionice": {"-t", "--ignore", "-p", "-P", "-u"},
-        "taskset": {"-a", "--all-tasks", "-p", "--pid"},
-        "time": {
-            "-a",
-            "--append",
-            "-p",
-            "--portability",
-            "-v",
-            "--verbose",
-            "-q",
-            "--quiet",
-        },
-        "flock": {
-            "-s",
-            "--shared",
-            "-x",
-            "--exclusive",
-            "-u",
-            "--unlock",
-            "-n",
-            "--nonblock",
-            "-o",
-            "--close",
-            "-F",
-            "--no-fork",
-        },
-    }.get(name, set())
-    index = 1
-    while index < len(tokens):
-        token = tokens[index]
-        if token == "--":
-            index += 1
-            break
-        if token in values:
-            if index + 1 >= len(tokens):
-                raise _UnsafeShellSyntax(f"missing {name} wrapper option value")
-            index += 2
-            continue
-        if token in flags or (name == "nice" and re.fullmatch(r"-\d+", token)):
-            index += 1
-            continue
-        if name == "stdbuf" and re.fullmatch(r"-[ioe].+", token):
-            index += 1
-            continue
-        if name in {"nice", "ionice", "taskset", "time", "flock"} and any(
-            token.startswith(option) and len(token) > len(option)
-            for option in values
-            if len(option) == len("-n") and option.startswith("-")
-        ):
-            index += 1
-            continue
-        if any(
-            token.startswith(option + "=")
-            for option in values
-            if option.startswith("--")
-        ):
-            index += 1
-            continue
-        if token.startswith("-"):
-            raise _UnsafeShellSyntax(f"unsupported {name} wrapper option")
-        break
-    if name == "timeout":
-        index += 1  # duration
-    if (
-        name == "taskset"
-        and index < len(tokens)
-        and re.fullmatch(r"(?:0[xX])?[0-9a-fA-F,]+", tokens[index])
-    ):
-        index += 1  # CPU affinity mask
-    if name == "flock":
-        index += 1  # lock file or descriptor
-    if index >= len(tokens):
-        raise _UnsafeShellSyntax(f"missing {name} wrapped executable")
-    return [_original_argv_suffix(command, len(tokens) - index)]
+    access: PathAccess | None = None
+    cwd_overrides: tuple[str, ...] = ()
+    inspect_executable: bool = False
 
 
 def _has_unrecognized_nested_shell(tokens: list[str]) -> bool:
@@ -270,123 +106,108 @@ def _has_unrecognized_nested_shell(tokens: list[str]) -> bool:
     )
 
 
-def _env_assignment_source(tokens: list[str]) -> str:
-    index = 1
-    assignments: list[str] = []
-    while index < len(tokens) and re.fullmatch(
-        r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index], re.DOTALL
-    ):
-        key, _, value = tokens[index].partition("=")
-        assignments.append(f"{key}={shlex.quote(value)}")
-        index += 1
-    if index == 1 or index >= len(tokens) or tokens[index].startswith("-"):
-        raise _UnsafeShellSyntax("unsupported env wrapper form")
-    return " ".join([*assignments, shlex.join(tokens[index:])])
-
-
-def _wrapped_guardrail_commands(command: str) -> tuple[list[str], str | None]:  # noqa: PLR0911
-    """Return actual executable positions, and literal nested shell source."""
-    try:
-        tokens = shlex.split(command)
-    except ValueError as exc:
-        raise _UnsafeShellSyntax("malformed shell quoting") from exc
-    if not tokens:
-        return [], None
-    name = Path(tokens[0]).name
-    if name == "env":
-        _env_assignment_source(tokens)  # Validate the supported wrapper form.
-        return [], _original_argv_suffix(command, len(tokens) - 1)
-    if name == "eval":
-        source = " ".join(tokens[1:])
-        return list(analyze_shell_command(source).command_parts) if source else [], None
-    if name in {"command", "builtin", "exec"}:
-        index = 1
-        while index < len(tokens):
-            token = tokens[index]
-            if token == "--":
-                index += 1
-                break
-            if name == "exec" and token == "-a":
-                index += 2
-                continue
-            if token.startswith("-"):
-                index += 1
-                continue
-            break
-        return (
-            [_original_argv_suffix(command, len(tokens) - index)]
-            if index < len(tokens)
-            else []
-        ), None
-    if name == "script" and "-c" in tokens[1:]:
-        raise _UnsafeShellSyntax("unsupported script -c shell wrapper")
-    if name == "busybox":
-        if not tokens[1:] or tokens[1] not in _BUSYBOX_SHELL_APPLETS:
-            raise _UnsafeShellSyntax("unsupported busybox applet")
-        # The first operand selects the applet; parse its shell argv and source
-        # exactly as a direct shell invocation, subject to the same limits.
-        return [shlex.join(tokens[1:])], None
-    if name in {
-        "nohup",
-        "setsid",
-        "stdbuf",
-        "timeout",
-        "nice",
-        "ionice",
-        "taskset",
-        "time",
-        "flock",
-    }:
-        return _wrapper_executable(tokens, name, command), None
-    if name not in _SHELLS and _has_unrecognized_nested_shell(tokens):
-        raise _UnsafeShellSyntax(f"unsupported wrapper before shell -c ({name})")
-    return [], _shell_source(tokens)
-
-
-def _expand_guardrail_parts(
+def _expand_guardrail_parts(  # noqa: PLR0915
     command_parts: list[str],
-) -> tuple[list[_GuardrailPart], list[str], list[str]]:
+) -> tuple[list[_GuardrailPart], list[str], list[Diagnostic]]:
     """Expand in occurrence order, preserving child-shell cwd isolation."""
     expanded: list[_GuardrailPart] = []
     redirects: list[str] = []
-    errors: list[str] = []
+    errors: list[Diagnostic] = []
     byte_count = 0
     next_scope = 0
 
-    def visit(part: str, scope: tuple[int, ...], depth: int) -> None:
+    def visit(
+        part: str,
+        scope: tuple[int, ...],
+        depth: int,
+        cwd_overrides: tuple[str, ...] = (),
+        *,
+        inspect_executable: bool = False,
+    ) -> None:
         nonlocal byte_count, next_scope
         byte_count += len(part.encode("utf-8"))
         if byte_count > _MAX_ANALYZED_BYTES or len(expanded) >= _MAX_EXPANDED_COMMANDS:
             raise _UnsafeShellSyntax(
                 "shell analysis budget exceeded (bytes or commands)"
             )
-        expanded.append(_GuardrailPart(part, scope))
-        wrapped, source = _wrapped_guardrail_commands(part)
-        if source is not None:
-            if depth >= _MAX_SHELL_DEPTH:
-                raise _UnsafeShellSyntax("shell nesting depth limit exceeded")
-            # Quoted source is parsed afresh: shlex cannot model substitutions.
-            analysis = _analyze_guardrail_source(source, nested_source=True)
-            if analysis.approval_reasons:
-                errors.extend(analysis.approval_reasons)
-            redirects.extend(_extract_redirect_paths(source))
-            next_scope += 1
-            child_scope = (*scope, next_scope)
-            for child in analysis.command_parts:
-                visit(child, child_scope, depth + 1)
-        for child in wrapped:
-            if depth >= _MAX_SHELL_DEPTH:
-                raise _UnsafeShellSyntax("shell nesting depth limit exceeded")
-            # Wrapper expansion introduces an executable position absent from
-            # the original AST; inspect its lookup/startup mutations as well.
-            errors.extend(
-                reason
-                for reason in analyze_shell_command(child).approval_reasons
-                if "command lookup modification" in reason
-                or "dangerous environment assignment" in reason
-                or "unquoted package bracket syntax" in reason
+        expanded.append(
+            _GuardrailPart(
+                part,
+                scope,
+                cwd_overrides=cwd_overrides,
+                inspect_executable=inspect_executable,
             )
-            visit(child, scope, depth + 1)
+        )
+        try:
+            tokens = shlex.split(part)
+        except ValueError as exc:
+            raise _UnsafeShellSyntax("malformed shell quoting") from exc
+        try:
+            inline_interpreter_switch(tokens)  # Preserve legacy option diagnostics.
+            boundary = executor_boundary(tokens, admission=True)
+        except ValueError as exc:
+            raise _UnsafeShellSyntax(str(exc)) from exc
+        if boundary is None:
+            if _has_unrecognized_nested_shell(tokens):
+                name = Path(tokens[0]).name
+                raise _UnsafeShellSyntax(
+                    f"unsupported wrapper before shell -c ({name})"
+                )
+            return
+        if boundary.boundary_kind == "shell_source":
+            if depth >= _MAX_SHELL_DEPTH:
+                raise _UnsafeShellSyntax("shell nesting depth limit exceeded")
+            for source in boundary.inline_payloads:
+                analysis = _analyze_guardrail_source(source, nested_source=True)
+                errors.extend(analysis.approval_diagnostic.related)
+                redirects.extend(_extract_redirect_paths(source))
+                next_scope += 1
+                child_scope = (*scope, next_scope)
+                for child in analysis.command_parts:
+                    visit(child, child_scope, depth + 1)
+                for path in _extract_redirect_paths(source):
+                    if path not in _REDIRECTION_DEVICES:
+                        byte_count += len(path.encode("utf-8"))
+                        if (
+                            byte_count > _MAX_ANALYZED_BYTES
+                            or len(expanded) >= _MAX_EXPANDED_COMMANDS
+                        ):
+                            raise _UnsafeShellSyntax(
+                                "shell analysis budget exceeded (bytes or commands)"
+                            )
+                        expanded.append(
+                            _GuardrailPart(
+                                f"cat {shlex.quote(path)}",
+                                child_scope,
+                                PathAccess.WRITE,
+                            )
+                        )
+        if boundary.inner_command_range is not None or boundary.module_command:
+            if depth >= _MAX_SHELL_DEPTH:
+                raise _UnsafeShellSyntax("shell nesting depth limit exceeded")
+            start, end = boundary.inner_command_range or (0, 0)
+            child_tokens = list(boundary.module_command) or tokens[start:end]
+            errors.extend(
+                Diagnostic(
+                    "analysis", command_part=shlex.join(child_tokens), detail=reason
+                )
+                for reason in argv_permission_reasons(
+                    child_tokens, nested_source=bool(scope)
+                )
+            )
+            child_scope = scope
+            if boundary.child_execution or boundary.cwd_overrides:
+                next_scope += 1
+                child_scope = (*scope, next_scope)
+            # shlex.join is only a lossless argv serialization for the policy
+            # helpers. This argv is NEVER parsed as shell source or an AST.
+            visit(
+                shlex.join(child_tokens),
+                child_scope,
+                depth + 1,
+                boundary.cwd_overrides,
+                inspect_executable=True,
+            )
 
     for part in command_parts:
         visit(part, (), 0)
@@ -447,6 +268,11 @@ def _scoped_guardrail_cwds(
             parent = scope[:-1]
             scope_cwds[scope] = set(scope_cwds[parent])
             scope_unknown[scope] = scope_unknown[parent]
+            for directory in entry.cwd_overrides:
+                scope_cwds[scope] = {
+                    resolve_tool_path(directory, parent_cwd)
+                    for parent_cwd in scope_cwds[scope]
+                }
         possible_cwds = scope_cwds[scope]
         tokens = _split_command_tokens(entry.text)
         scope_unknown[scope] |= _update_guardrail_cwds(tokens, possible_cwds)
@@ -517,16 +343,6 @@ def _get_default_denylist() -> list[str]:
         "nc",
         "ncat",
         "socat",
-        # Inline interpreter code. Enumerated per executable because prefix
-        # matching normalizes only the executable token, so a "python -c"
-        # pattern does not match "python3 -c".
-        "python -c",
-        "python3 -c",
-        "pypy -c",
-        "pypy3 -c",
-        "node -e",
-        "perl -e",
-        "ruby -e",
     ]
 
 
@@ -617,11 +433,69 @@ def _split_command_tokens(command: str) -> list[str]:
         return command.split()
 
 
+# Only commands whose modeled operands cannot be output files receive exact
+# instruction-read capabilities. E.g. sort -o, uniq's second operand, sed and
+# archivers are deliberately not classified as readers.
+_INSTRUCTION_READ_COMMANDS = frozenset({
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "grep",
+    "nl",
+    "tac",
+    "stat",
+    "file",
+    "ls",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "shasum",
+    "sum",
+    "strings",
+    "zcat",
+})
+
+
+def _operand_access(command: str) -> PathAccess:
+    if command in _INSTRUCTION_READ_COMMANDS:
+        return PathAccess.READ
+    if command in {"mkdir", "tee", "touch"}:
+        return PathAccess.WRITE
+    # Mixed-source/destination commands and opaque effects are mutators: an
+    # input-looking operand must not smuggle in an exact-file read capability.
+    return PathAccess.MUTATE
+
+
+def _operand_guardrail_cwds(
+    token: str, tokens: list[str], possible_cwds: set[Path]
+) -> set[Path]:
+    """Directory selectors are parent-relative; executor operands are child-relative."""
+    boundary = executor_boundary(tokens)
+    if boundary is None or not boundary.cwd_overrides:
+        return possible_cwds
+    if token in boundary.cwd_overrides:
+        policy = analyze_shell_command_policy(tokens)
+        occurrences = (*policy.option_path_values, *(policy.positional_values or ()))
+        if occurrences.count(token) <= len(boundary.cwd_overrides):
+            return possible_cwds
+        # Path candidates are strings, so identical selector/operand spellings
+        # must be checked in both coordinate systems, not guessed by identity.
+        child_cwds = possible_cwds
+        for directory in boundary.cwd_overrides:
+            child_cwds = {resolve_tool_path(directory, cwd) for cwd in child_cwds}
+        return possible_cwds | child_cwds
+    for directory in boundary.cwd_overrides:
+        possible_cwds = {resolve_tool_path(directory, cwd) for cwd in possible_cwds}
+    return possible_cwds
+
+
 def _collect_outside_dirs(
     command_parts: list[str],
     *,
     workspace: Workspace | None = None,
     scratchpad_dir: Path | None = None,
+    authority: PathAuthority | None = None,
 ) -> set[str]:
     """Collect parent directories referenced outside the workdir.
 
@@ -634,15 +508,28 @@ def _collect_outside_dirs(
 
     Only invoked under POSIX-shell semantics, where "/" is a valid path separator.
     """
-    workspace = workspace or ambient_workspace()
+    workspace = (
+        authority.workspace
+        if authority is not None
+        else workspace or ambient_workspace()
+    )
     resolved_cwd = workspace.cwd
-
-    def is_within_workdir(path: str) -> bool:
-        return is_path_within_workdir(path, workspace=workspace)
+    # The legacy helper reports boundaries only unless a full authority is
+    # supplied. Keep its return contract without a parallel path evaluator.
+    authority = authority or PathAuthority(
+        "bash", ToolPermission.ALWAYS, (), (), (), workspace, scratchpad_dir
+    )
 
     dirs: set[str] = set()
-    for part in command_parts:
-        tokens = _split_command_tokens(part)
+    try:
+        expanded, _, errors = _expand_guardrail_parts(command_parts)
+    except _UnsafeShellSyntax:
+        return {str(resolved_cwd)}
+    if errors:
+        return {str(resolved_cwd)}
+    for entry, tokens, possible_cwds, unknown in _scoped_guardrail_cwds(
+        expanded, resolved_cwd
+    ):
         command = Path(tokens[0]).name if tokens else None
         if not command:
             continue
@@ -652,19 +539,15 @@ def _collect_outside_dirs(
             # Bare filenames can be symlinks outside the accepted workspace too.
             if token == "<redirect>":
                 continue
-            path_token = token
-            if is_within_workdir(path_token):
+            if unknown and not Path(token).is_absolute():
+                dirs.add(str(resolved_cwd))
                 continue
-            resolved = resolve_tool_path(path_token, resolved_cwd)
-            if (
-                scratchpad_dir is not None
-                and scratchpad_dir.resolve() == scratchpad_dir.absolute()
-                and is_scratchpad_path(str(resolved), scratchpad_dir=scratchpad_dir)
-                and (workspace.ceiling is None or workspace.ceiling.allows(resolved))
-            ):
-                continue
-            parent = str(resolved) if resolved.is_dir() else str(resolved.parent)
-            dirs.add(parent)
+            for cwd in _operand_guardrail_cwds(token, tokens, possible_cwds):
+                resolved = resolve_tool_path(token, cwd)
+                if authority.allows(resolved, entry.access or _operand_access(command)):
+                    continue
+                parent = str(resolved) if resolved.is_dir() else str(resolved.parent)
+                dirs.add(parent)
     return dirs
 
 
@@ -834,6 +717,11 @@ class Bash(
     effect_kind = ToolEffectKind.SHELL
 
     @classmethod
+    def path_sensitive_patterns(cls, config: BaseToolConfig) -> tuple[str, ...]:
+        # sensitive_patterns in Bash config is command-prefix policy, not globs.
+        return tuple(DEFAULT_SENSITIVE_PATTERNS)
+
+    @classmethod
     def format_call_display(cls, args: BashArgs) -> ToolCallDisplay:
         return ToolCallDisplay(
             summary=f"bash: {args.command}",
@@ -890,6 +778,7 @@ class Bash(
                 for pattern in self.config.denylist
                 if matches_command_prefix(tokens, _split_command_tokens(pattern))
                 or pattern == interpreter
+                or (interpreter == "python3 -c" and pattern == "python -c")
                 or (shell_interactive and pattern == f"{name} -i")
             ),
             None,
@@ -957,6 +846,8 @@ class Bash(
     ) -> PermissionContext | None:
         expanded = expanded_parts or _expand_guardrail_parts(command_parts)[0]
         for entry in expanded:
+            if entry.access is not None:
+                continue  # Synthetic redirect operands are not executable commands.
             part = entry.text
             tokens = _split_command_tokens(part)
             if (
@@ -967,83 +858,65 @@ class Bash(
                     for name in tokens[1:]
                 )
             ):
-                return PermissionContext(
-                    permission=ToolPermission.NEVER,
-                    reason="Command denied: unsetting a protected shell environment variable",
-                )
+                return _denied(Diagnostic("protected_env"))
             try:
                 matched = self._find_denylist_match(part)
             except ValueError as exc:
-                return PermissionContext(
-                    permission=ToolPermission.NEVER, reason=f"Command denied: {exc}"
+                return _denied(
+                    Diagnostic("command", detail=str(exc), command_part=part)
                 )
             if matched:
-                return PermissionContext(
-                    permission=ToolPermission.NEVER,
-                    reason=f"Command denied: '{part}' matches denylist pattern '{matched}'. Do not attempt to run this command.",
-                )
+                return _denied(Diagnostic("denylist", matched, part))
             if self._is_standalone_denylisted(part):
-                return PermissionContext(
-                    permission=ToolPermission.NEVER,
-                    reason=f"Command denied: '{part}' is not allowed as a standalone command. Do not attempt to run this command.",
-                )
+                return _denied(Diagnostic("standalone", command_part=part))
         for entry, tokens, possible_cwds, cwd_unknown in _scoped_guardrail_cwds(
             expanded, self.cwd
         ):
+            if entry.access is not None:
+                continue
             part = entry.text
             if self._is_sensitive(part):
-                return PermissionContext(
-                    permission=ToolPermission.NEVER,
-                    reason="Command denied by a sensitive command rule",
-                )
+                return _denied(Diagnostic("sensitive_command"))
             policy = analyze_shell_command_policy(tokens)
             if policy.requires_approval:
-                reason = (
-                    "Command denied: find execution predicates are not permitted"
+                diagnostic = (
+                    Diagnostic(
+                        "command", detail="find execution predicates are not permitted"
+                    )
                     if tokens and Path(tokens[0]).name == "find"
-                    else f"Command denied: {policy.denial_reason or 'unsafe or unmodeled command options are not permitted'}: '{part}'"
+                    else policy.denial_diagnostic(part)
                 )
-                return PermissionContext(permission=ToolPermission.NEVER, reason=reason)
+                return _denied(diagnostic)
             if not policy.inspect_git_repository:
                 continue
             if cwd_unknown:
-                return PermissionContext(
-                    permission=ToolPermission.NEVER,
-                    reason=(
-                        "Command denied: the working directory at this git command "
-                        "is not statically known, so its repository git config "
-                        "cannot be inspected"
-                    ),
-                )
+                return _denied(Diagnostic("git_cwd_unknown"))
             if risk := self._repository_config_risk(tokens, policy, possible_cwds):
-                return PermissionContext(
-                    permission=ToolPermission.NEVER, reason=f"Command denied: {risk}"
-                )
+                return _denied(Diagnostic("command", detail=risk, command_part=part))
         return None
 
     def _resolve_preconditions(self) -> PermissionContext | None:
         if self.config.permission == ToolPermission.NEVER:
-            return PermissionContext(
-                permission=ToolPermission.NEVER, reason="Tool denied: bash"
-            )
+            return _denied(Diagnostic("tool_denied"))
         if not self.workspace.allows(self.cwd):
-            return PermissionContext(
-                permission=ToolPermission.NEVER,
-                reason="Shell cwd is outside the authorized workspace",
-            )
+            return _denied(Diagnostic("cwd_outside"))
         return None
 
     def _resolve_path_permission(
         self, path_parts: list[_GuardrailPart]
     ) -> PermissionContext | None:
-        for _entry, tokens, possible_cwds, cwd_unknown in _scoped_guardrail_cwds(
+        authority = self.path_authority
+        for entry, tokens, possible_cwds, cwd_unknown in _scoped_guardrail_cwds(
             path_parts, self.cwd
         ):
             if not tokens:
                 continue
             command = Path(tokens[0]).name
+            access = entry.access or _operand_access(command)
             for token in path_candidates(
-                tokens, inspect_positional_paths=command in _PATH_COMMANDS
+                tokens,
+                inspect_positional_paths=command in _PATH_COMMANDS,
+                inspect_executable=entry.inspect_executable,
             ):
                 if token == "<redirect>":
                     continue
@@ -1079,62 +952,42 @@ class Bash(
                             character in parent for character in _SHELL_GLOB_CHARACTERS
                         ) and all(
                             self.workspace.allows(resolve_tool_path(parent, cwd))
-                            and not matches_sensitive_pattern(
-                                str(resolve_tool_path(token, cwd)),
-                                DEFAULT_SENSITIVE_PATTERNS,
-                            )
+                            and authority.allows(resolve_tool_path(parent, cwd), access)
+                            and authority.allows(resolve_tool_path(token, cwd), access)
                             and all(
                                 self.workspace.allows(Path(match).resolve())
-                                and not matches_sensitive_pattern(
-                                    str(Path(match).resolve()),
-                                    DEFAULT_SENSITIVE_PATTERNS,
-                                )
+                                and authority.allows(Path(match).resolve(), access)
                                 for match in glob.glob(str(cwd / token))
                             )
                             for cwd in possible_cwds
                         ):
                             continue
-                    return PermissionContext(
-                        permission=ToolPermission.NEVER,
-                        reason="Shell path glob cannot be safely inspected",
-                    )
+                    return _denied(Diagnostic("path_glob", token, entry.text))
                 if (
                     cwd_unknown
                     and not Path(token).is_absolute()
                     and not token.startswith("~")
                 ):
-                    return PermissionContext(
-                        permission=ToolPermission.NEVER,
-                        reason="Shell file operand has a working directory that is not statically known",
-                    )
-                for cwd in possible_cwds:
+                    return _denied(Diagnostic("operand_cwd_unknown", token, entry.text))
+                for cwd in _operand_guardrail_cwds(token, tokens, possible_cwds):
                     resolved = resolve_tool_path(token, cwd)
-                    if matches_sensitive_pattern(
-                        str(resolved), DEFAULT_SENSITIVE_PATTERNS
-                    ):
-                        return PermissionContext(
-                            permission=ToolPermission.NEVER,
-                            reason="Sensitive file access denied (bash)",
-                        )
-                    if is_path_within_workdir(str(resolved), workspace=self.workspace):
-                        continue
+                    decision = authority.resolve(str(resolved), access)
                     if (
-                        self.scratchpad_dir is not None
-                        and self.scratchpad_dir.resolve()
-                        == self.scratchpad_dir.absolute()
-                        and is_scratchpad_path(
-                            str(resolved), scratchpad_dir=self.scratchpad_dir
-                        )
-                        and (
-                            self.workspace.ceiling is None
-                            or self.workspace.ceiling.allows(resolved)
-                        )
+                        decision is not None
+                        and decision.permission == ToolPermission.NEVER
                     ):
-                        continue
-                    return PermissionContext(
-                        permission=ToolPermission.NEVER,
-                        reason="Shell path is outside the authorized workspace; only an explicit user scope change can authorize it",
-                    )
+                        # Keep the shell's established outside-scope diagnostic.
+                        if (
+                            decision.reason
+                            and decision.reason.startswith("File ")
+                            and "outside" in decision.reason
+                        ):
+                            return _denied(
+                                Diagnostic("path_outside", token, entry.text)
+                            )
+                        return _denied(
+                            Diagnostic("text", token, entry.text, decision.reason)
+                        )
         return None
 
     def _redirect_metadata_permission(
@@ -1152,10 +1005,7 @@ class Bash(
             for cwd in possible_cwds:
                 directories = git_metadata_paths(tokens, cwd=cwd)
                 if directories is None:
-                    return PermissionContext(
-                        permission=ToolPermission.NEVER,
-                        reason="Command denied: protected Git metadata cannot be located",
-                    )
+                    return _denied(Diagnostic("metadata_unlocated"))
                 metadata.update(directories)
         for path in redirect_paths:
             if ".git" in Path(path).parts or any(
@@ -1163,10 +1013,7 @@ class Bash(
                 or any(resolved.is_relative_to(directory) for directory in metadata)
                 for cwd in redirect_cwds
             ):
-                return PermissionContext(
-                    permission=ToolPermission.NEVER,
-                    reason="Command denied: redirection to protected Git metadata",
-                )
+                return _denied(Diagnostic("metadata_redirect", path))
         return None
 
     def resolve_permission(self, args: BashArgs) -> PermissionContext | None:  # noqa: PLR0911
@@ -1178,10 +1025,7 @@ class Bash(
             len(args.command.encode("utf-8", errors="surrogatepass"))
             > _MAX_ANALYZED_BYTES
         ):
-            return PermissionContext(
-                permission=ToolPermission.NEVER,
-                reason="Command denied: shell analysis budget exceeded (bytes)",
-            )
+            return _denied(Diagnostic("byte_budget"))
         analysis = _analyze_guardrail_source(args.command)
         command_parts = list(analysis.command_parts)
         try:
@@ -1189,15 +1033,12 @@ class Bash(
                 command_parts
             )
         except _UnsafeShellSyntax as exc:
-            return PermissionContext(
-                permission=ToolPermission.NEVER, reason=f"Command denied: {exc}"
+            return _denied(
+                Diagnostic("command", detail=str(exc), command_part=args.command)
             )
         expanded_command_parts = [entry.text for entry in expanded]
         if "shell analysis failed" in analysis.approval_reasons:
-            guardrail_permission = PermissionContext(
-                permission=ToolPermission.NEVER,
-                reason=f"Command denied: {analysis.approval_label}",
-            )
+            guardrail_permission = _denied(analysis.approval_diagnostic)
         else:
             guardrail_permission = self._resolve_guardrail_permission(
                 command_parts, expanded
@@ -1205,20 +1046,14 @@ class Bash(
         if guardrail_permission is not None:
             return guardrail_permission
         if inner_errors:
-            return PermissionContext(
-                permission=ToolPermission.NEVER,
-                reason=f"Command denied: nested shell syntax cannot be safely inspected: {', '.join(sorted(set(inner_errors)))}",
-            )
+            return _denied(Diagnostic("nested_analysis", related=tuple(inner_errors)))
 
         if any(
             _split_command_tokens(part)
             and _split_command_tokens(part)[0] in {"eval", "exec"}
             for part in expanded_command_parts
         ):
-            return PermissionContext(
-                permission=ToolPermission.NEVER,
-                reason="Command denied: eval and exec cannot be safely inspected",
-            )
+            return _denied(Diagnostic("eval_exec"))
 
         redirect_paths = _extract_redirect_paths(args.command) + inner_redirects
         # Redirection destinations are file operands, not a blanket veto on
@@ -1228,8 +1063,8 @@ class Bash(
         ):
             return metadata_permission
         path_parts = expanded + [
-            _GuardrailPart(f"cat {shlex.quote(path)}")
-            for path in redirect_paths
+            _GuardrailPart(f"cat {shlex.quote(path)}", access=PathAccess.WRITE)
+            for path in _extract_redirect_paths(args.command)
             if path not in _REDIRECTION_DEVICES
         ]
         path_permission = self._resolve_path_permission(path_parts)
@@ -1237,10 +1072,7 @@ class Bash(
             return path_permission
 
         if analysis.requires_approval:
-            return PermissionContext(
-                permission=ToolPermission.NEVER,
-                reason=f"Command denied: {analysis.approval_label}",
-            )
+            return _denied(analysis.approval_diagnostic)
         return PermissionContext(permission=ToolPermission.ALWAYS)
 
     @final

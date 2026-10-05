@@ -42,3 +42,32 @@ async def test_render_line_no_keyerror_on_width_mismatch():
         ):
             result = log_view.render_line(2)
             assert isinstance(result, Strip)
+
+
+@pytest.mark.asyncio
+async def test_selection_and_reading_anchor_survive_prepend_poll_and_resize() -> None:
+    app = _LogViewTestApp()
+    async with app.run_test(size=(80, 24)) as pilot:
+        view = app._log_view
+        for index in range(60):
+            view.write_line(f"{index}: " + "x" * 180, scroll_end=False)
+        await pilot.pause()
+        view.scroll_to(y=view._wrap_prefix[20], animate=False, immediate=True)
+        view.focus()
+        await pilot.press("down")
+        assert view._selected_line == 20
+        selected = view._lines[20]
+        view.prepend_lines(["older " * 40, "older " * 40])
+        assert view._selected_line == 22
+        assert view._lines[22] == selected
+        assert view.scroll_y == view._wrap_prefix[22]
+        view.write_line("new arrival " * 20)
+        assert view.scroll_y == view._wrap_prefix[22]
+        await pilot.resize_terminal(120, 36)
+        await pilot.pause()
+        assert view._selected_line == 22
+        assert view._lines[22] == selected
+        assert view.scroll_y == view._wrap_prefix[22]
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause()
+        assert view.scroll_y == view._wrap_prefix[22]

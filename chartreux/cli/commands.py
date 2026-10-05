@@ -133,6 +133,12 @@ class CommandRegistry:
                 handler="_show_status",
                 side_channel=True,
             ),
+            "usage": Command(
+                aliases=frozenset(["/usage"]),
+                description="Browse recorded usage and costs",
+                handler="_show_usage",
+                side_channel=True,
+            ),
             "settings": Command(
                 aliases=frozenset(["/settings"]),
                 description="Browse and edit curated user settings",

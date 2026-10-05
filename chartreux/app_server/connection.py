@@ -50,21 +50,34 @@ class AppServerConnection:
     def current(self) -> AppServerClient | None:
         return self._client
 
+    @property
+    def attached(self) -> bool:
+        return self._attached_session_id is not None
+
+    async def connect_host(self) -> AppServerClient:
+        """Initialize the transport without opening or resuming a session."""
+        async with self._lock:
+            return await self._initialize()
+
+    async def _initialize(self) -> AppServerClient:
+        client = self._client
+        if client is None:
+            raise RuntimeError("App-server connection is closed")
+        if not self._initialized:
+            try:
+                await client.start()
+                await client.initialize(self._client_info, self._capabilities)
+                await client.notify("initialized")
+            except Exception:
+                await client.close()
+                self._client = None
+                raise
+            self._initialized = True
+        return client
+
     async def connect(self) -> AppServerClient:
         async with self._lock:
-            client = self._client
-            if client is None:
-                raise RuntimeError("App-server connection is closed")
-            if not self._initialized:
-                try:
-                    await client.start()
-                    await client.initialize(self._client_info, self._capabilities)
-                    await client.notify("initialized")
-                except Exception:
-                    await client.close()
-                    self._client = None
-                    raise
-                self._initialized = True
+            client = await self._initialize()
             if self._attached_session_id != self._state.session_id:
                 previous = self._state.projection.state
                 session_id = self._state.session_id
@@ -137,9 +150,14 @@ class AppServerResourceConnection:
         self,
         connection: AppServerConnection,
         connect_session: Callable[[], Awaitable[AppServerClient]],
+        connect_host: Callable[[], Awaitable[AppServerClient]] | None = None,
     ) -> None:
         self._connection = connection
         self._connect_session = connect_session
+        self._connect_host = connect_host or connection.connect_host
+
+    async def connect_host(self) -> AppServerClient:
+        return await self._connect_host()
 
     async def connect(self) -> AppServerClient:
         return await self._connect_session()

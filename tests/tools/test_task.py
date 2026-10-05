@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, cast
 
+from pydantic import ValidationError
 import pytest
 
 from chartreux.app_server._sessions import SessionRuntimeRegistry
@@ -15,6 +16,7 @@ from chartreux.core.llm.format import (
     ParsedMessage,
     ParsedToolCall,
 )
+from chartreux.core.subagents import LaunchOutcome
 from chartreux.core.tools.base import (
     BaseToolState,
     InvokeContext,
@@ -86,17 +88,17 @@ class TestTaskArgs:
 
     def test_default_subagent_is_worker(self) -> None:
         args = TaskArgs(task="do something")
-        assert args.agent == "worker"
+        assert args.agent_type == "worker"
 
     def test_custom_values(self) -> None:
         args = TaskArgs(
             task="do something",
             task_summary="Implement task tool validation",
-            agent="worker",
+            agent_type="worker",
         )
         assert args.task == "do something"
         assert args.task_summary == "Implement task tool validation"
-        assert args.agent == "worker"
+        assert args.agent_type == "worker"
 
 
 class TestTaskToolValidation:
@@ -124,16 +126,16 @@ class TestTaskToolValidation:
     async def test_rejects_nonexistent_agent(
         self, task_tool: Task, ctx: InvokeContext
     ) -> None:
-        args = TaskArgs(task="do something", agent="nonexistent")
+        args = TaskArgs(task="do something", agent_type="nonexistent")
 
         with pytest.raises(ToolError) as exc_info:
             await collect_result(task_tool.run(args, ctx))
 
-        assert "Unknown agent" in str(exc_info.value)
+        assert "Unknown agent_type profile: nonexistent" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_requires_agent_manager_in_context(self, task_tool: Task) -> None:
-        args = TaskArgs(task="do something", agent="worker")
+        args = TaskArgs(task="do something", agent_type="worker")
         ctx = InvokeContext(tool_call_id="test-call-id")  # No agent_manager
 
         with pytest.raises(ToolError) as exc_info:
@@ -148,20 +150,20 @@ class TestTaskToolValidation:
 
 class TestTaskToolResolvePermission:
     def test_worker_allowed_by_default(self, task_tool: Task) -> None:
-        args = TaskArgs(task="do something", agent="worker")
+        args = TaskArgs(task="do something", agent_type="worker")
         result = task_tool.resolve_permission(args)
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ALWAYS
 
     def test_unknown_agent_returns_none(self, task_tool: Task) -> None:
-        args = TaskArgs(task="do something", agent="custom_agent")
+        args = TaskArgs(task="do something", agent_type="custom_agent")
         result = task_tool.resolve_permission(args)
         assert result is None
 
     def test_denylist_takes_precedence(self) -> None:
         config = TaskToolConfig(allowlist=["worker"], denylist=["worker"])
         tool = Task(config_getter=lambda: config, state=BaseToolState())
-        args = TaskArgs(task="do something", agent="worker")
+        args = TaskArgs(task="do something", agent_type="worker")
         result = tool.resolve_permission(args)
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.NEVER
@@ -169,7 +171,7 @@ class TestTaskToolResolvePermission:
     def test_glob_pattern_in_allowlist(self) -> None:
         config = TaskToolConfig(allowlist=["work*"])
         tool = Task(config_getter=lambda: config, state=BaseToolState())
-        args = TaskArgs(task="do something", agent="worker")
+        args = TaskArgs(task="do something", agent_type="worker")
         result = tool.resolve_permission(args)
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ALWAYS
@@ -177,7 +179,7 @@ class TestTaskToolResolvePermission:
     def test_glob_pattern_in_denylist(self) -> None:
         config = TaskToolConfig(denylist=["danger*"])
         tool = Task(config_getter=lambda: config, state=BaseToolState())
-        args = TaskArgs(task="do something", agent="dangerous_agent")
+        args = TaskArgs(task="do something", agent_type="dangerous_agent")
         result = tool.resolve_permission(args)
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.NEVER
@@ -185,7 +187,7 @@ class TestTaskToolResolvePermission:
     def test_empty_lists_returns_none(self) -> None:
         config = TaskToolConfig(allowlist=[], denylist=[])
         tool = Task(config_getter=lambda: config, state=BaseToolState())
-        args = TaskArgs(task="do something", agent="worker")
+        args = TaskArgs(task="do something", agent_type="worker")
         result = tool.resolve_permission(args)
         assert result is None
 
@@ -194,7 +196,56 @@ class TestTaskToolResolvePermission:
         assert "worker" in config.allowlist
 
 
+@pytest.mark.parametrize("outcome", list(LaunchOutcome))
+def test_launch_outcome_controls_display(outcome: LaunchOutcome) -> None:
+    result = TaskResult(
+        response=outcome.value,
+        turns_used=0,
+        completed=outcome is LaunchOutcome.LAUNCHED,
+        launch_outcome=outcome,
+        agent_id="agent-1",
+        run_id="run-1",
+    )
+    event = ToolResultEvent(
+        tool_name="task", tool_class=Task, result=result, tool_call_id="call"
+    )
+    display = Task.get_result_display(event)
+    assert (display.verb == "Launched") == (outcome is LaunchOutcome.LAUNCHED)
+    assert display.success == (outcome is LaunchOutcome.LAUNCHED)
+    assert (
+        TaskResult.model_validate_json(result.model_dump_json()).launch_outcome
+        is outcome
+    )
+
+
 class TestTaskToolExecution:
+    @pytest.mark.asyncio
+    async def test_instance_handle_as_type_fails_before_dispatch(
+        self, task_tool: Task, ctx: InvokeContext
+    ) -> None:
+        runner = ctx.subagent_runner
+        assert isinstance(runner, FakeSubagentRunner)
+        with pytest.raises(ValidationError, match="agent_type takes a profile name"):
+            await collect_result(
+                task_tool.run(TaskArgs(task="work", agent_type="agent-1"), ctx)
+            )
+        assert runner.calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "values", [{}, {"agent_id": "agent-1", "background": False}]
+    )
+    async def test_replace_guards_before_delegation(
+        self, task_tool: Task, ctx: InvokeContext, values
+    ) -> None:
+        runner = ctx.subagent_runner
+        assert isinstance(runner, FakeSubagentRunner)
+        with pytest.raises(ToolError, match="replace_run requires"):
+            await collect_result(
+                task_tool.run(TaskArgs(task="work", replace_run=True, **values), ctx)
+            )
+        assert not runner.calls
+
     @pytest.fixture
     def ctx(
         self,
@@ -229,7 +280,7 @@ class TestTaskToolExecution:
     async def test_happy_path_returns_subagent_response(
         self, task_tool: Task, ctx: InvokeContext
     ) -> None:
-        args = TaskArgs(task="explore the codebase", agent="worker")
+        args = TaskArgs(task="explore the codebase", agent_type="worker")
         events = [event async for event in task_tool.run(args, ctx)]
 
         assert isinstance(events[0], ToolStreamEvent)
@@ -247,7 +298,7 @@ class TestTaskToolExecution:
 
         with pytest.raises(ToolError, match="subagent runner"):
             await collect_result(
-                task_tool.run(TaskArgs(task="do something", agent="worker"), ctx)
+                task_tool.run(TaskArgs(task="do something", agent_type="worker"), ctx)
             )
 
 
@@ -346,7 +397,7 @@ class TestTaskToolFormatterHandoff:
             "config": {},
         })
 
-        assert "agent" not in call.args_dict
+        assert "agent_type" not in call.args_dict
         events = [
             event async for event in task_tool.invoke(formatter_ctx, **call.args_dict)
         ]
@@ -354,8 +405,8 @@ class TestTaskToolFormatterHandoff:
         assert len(events) == 2
         runner = cast(FakeSubagentRunner, formatter_ctx.subagent_runner)
         args, _ = runner.calls[-1]
-        assert args.agent == "worker"
-        assert "agent" not in args.model_fields_set
+        assert args.agent_type == "worker"
+        assert "agent_type" not in args.model_fields_set
         assert args.config is not None
         assert args.config.model_fields_set == set()
 
@@ -365,11 +416,11 @@ class TestTaskToolFormatterHandoff:
     ) -> None:
         call = _resolve_task_call({
             "task": "do something",
-            "agent": "worker",
+            "agent_type": "worker",
             "agent_id": "retained-agent",
         })
 
-        assert call.args_dict["agent"] == "worker"
+        assert call.args_dict["agent_type"] == "worker"
         events = [
             event async for event in task_tool.invoke(formatter_ctx, **call.args_dict)
         ]
@@ -377,8 +428,8 @@ class TestTaskToolFormatterHandoff:
         assert len(events) == 2
         runner = cast(FakeSubagentRunner, formatter_ctx.subagent_runner)
         args, _ = runner.calls[-1]
-        assert args.agent == "worker"
-        assert "agent" in args.model_fields_set
+        assert args.agent_type == "worker"
+        assert "agent_type" in args.model_fields_set
 
     def test_explicit_null_config_is_accepted_as_omitted(self) -> None:
         null_config = _resolve_task_call({"task": "do something", "config": None})
@@ -433,7 +484,7 @@ class TestTaskToolFormatterHandoff:
 async def test_nested_task_is_rejected_by_tool_and_direct_runner(
     task_tool: Task, background: bool
 ) -> None:
-    args = TaskArgs(task="nested", agent="worker", background=background)
+    args = TaskArgs(task="nested", agent_type="worker", background=background)
     nested_context = InvokeContext(
         tool_call_id="nested",
         is_subagent=True,

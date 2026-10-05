@@ -9,13 +9,17 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from textual.widgets import Button
 
 from chartreux.app_server.events import AgentsUpdate, TurnStarted
 from chartreux.app_server.models import PublicTurn, PublicTurnStatus
 from chartreux.app_server.protocol import (
+    AgentsCancelResponse,
     AgentSummaryModel,
+    AgentTranscriptEntryKind,
     AgentTranscriptGetResponse,
     AgentTranscriptState,
+    CancelOutcome,
 )
 from chartreux.cli.textual_ui.widgets.agent_bar import AgentBar
 from chartreux.cli.textual_ui.widgets.agent_transcript import AgentTranscriptViewer
@@ -25,6 +29,8 @@ from chartreux.observability.logging import (
     logger,
     set_log_level,
 )
+from tests.cli.textual_ui.test_agent_transcript import _available, _entry
+from tests.cli.textual_ui.test_history_grouping import _message
 from tests.conftest import build_test_chartreux_app
 
 
@@ -218,6 +224,132 @@ async def test_transcript_inspection_exposes_unclipped_agent_metadata() -> None:
         assert "Thinking: high" in str(metadata.render())
         assert "Run ID: run-unique-identifier" in str(metadata.render())
         assert metadata.region.width <= 40
+
+
+@pytest.mark.asyncio
+async def test_compacting_transcript_keeps_polling_across_running_transition() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        read = AsyncMock(
+            return_value=AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+            )
+        )
+        app.app_server.resources.sessions.read_agent_transcript = read
+        running = _agent("one", "running")
+        compacting = running.model_copy(update={"compacting": True})
+        await app._handle_turn_event(AgentsUpdate([running]))
+        await app._handle_turn_event(AgentsUpdate([compacting]))
+        await pilot.press("ctrl+shift+a", "down", "enter")
+        await pilot.pause()
+        viewer = app.query_one(AgentTranscriptViewer)
+        assert viewer._live_timer is not None
+        before = read.await_count
+        await pilot.pause(1.2)
+        assert read.await_count > before
+        timer = viewer._live_timer
+        await app._handle_turn_event(AgentsUpdate([running]))
+        assert viewer._live_timer is timer
+        await app._handle_turn_event(AgentsUpdate([compacting]))
+        before = read.await_count
+        await pilot.pause(1.2)
+        assert read.await_count > before
+        assert viewer._live_timer is timer
+        await app._handle_turn_event(AgentsUpdate([running]))
+        assert app.query_one(AgentTranscriptViewer) is viewer
+        assert viewer._live_timer is timer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mouse", [False, True])
+@pytest.mark.parametrize("stop", [False, True])
+async def test_agent_browser_restores_non_composer_opener(
+    mouse: bool, stop: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        app.app_server.resources.sessions.read_agent_transcript = AsyncMock(
+            return_value=AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+            )
+        )
+        await app._handle_turn_event(AgentsUpdate([_agent("one")]))
+        await app._initial_history_loaded.wait()
+        history = app.app_server._state.projection.state.history
+        assert history is not None
+        history.extend(_message(i) for i in range(45))
+        await app._resume_history_from_messages()
+        await app._mount_history_batch(
+            history[15:25], app._messages_area, start_index=15, before=0
+        )
+        await pilot.pause()
+        opener = Button("Conversation action")
+        await app._messages_area.mount(opener)
+        assert app._chat_input_container is not None
+        assert app._chat_input_container.input_widget is not None
+        composer = app._chat_input_container.input_widget
+        composer.load_text("draft retained")
+        composer.set_app_focus(False)
+        opener.focus()
+        await pilot.pause()
+        assert app.screen.focused is opener
+        unit = app._transcript.units["message-18"]
+        app._chat_widget.scroll_to(
+            y=app._chat_widget.scroll_y
+            + unit.mounted_roots[0].region.y
+            - app._chat_widget.region.y,
+            animate=False,
+            force=True,
+            immediate=True,
+        )
+        await pilot.pause()
+        anchor = app._transcript.capture_anchor(app._messages_area, following=False)
+        assert anchor is not None and anchor.entry_id == "message-18"
+        if mouse:
+            await pilot.click("#agent-bar")
+        else:
+            await pilot.press("ctrl+shift+a")
+        if stop:
+            running = _agent("one", "running").model_copy(
+                update={"current_run_id": "r1"}
+            )
+            await app._handle_turn_event(AgentsUpdate([running]))
+            monkeypatch.setattr(
+                app.app_server,
+                "cancel_agent",
+                AsyncMock(
+                    return_value=AgentsCancelResponse(
+                        outcome=CancelOutcome.STOP_REQUESTED, run_id="r1"
+                    )
+                ),
+            )
+            await pilot.press("down", "c", "escape")
+            assert app.screen.focused is app._agent_bar
+            await pilot.press("c", "left", "enter")
+            assert app.screen.focused is app._agent_bar
+            stopped = _agent("one").model_copy(
+                update={
+                    "latest_run_id": "r1",
+                    "last_run_status": "cancelled",
+                    "stop_reason": "user_cancelled",
+                }
+            )
+            await app._handle_turn_event(AgentsUpdate([stopped]))
+            await pilot.pause()
+            assert app.screen.focused is app._agent_bar
+            await pilot.press("d", "escape", "f1", "escape", "enter")
+        else:
+            await pilot.press("d", "escape", "f1", "escape", "down", "enter")
+        await pilot.pause()
+        assert app.query(AgentTranscriptViewer)
+        await pilot.press("escape", "escape")
+        await pilot.pause()
+        assert app.screen.focused is opener
+        assert composer.text == "draft retained"
+        restored = app._transcript.capture_anchor(app._messages_area, following=False)
+        assert restored is not None
+        assert restored.entry_id == anchor.entry_id
+        assert restored.row_offset == anchor.row_offset
 
 
 @pytest.mark.asyncio
@@ -621,3 +753,92 @@ async def test_shutdown_during_teardown_is_safe(
         assert app._agent_transition_task is not None
         await asyncio.wait_for(app._agent_transition_task, 3)
         assert not viewer.is_attached
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("saved", [False, True])
+async def test_stopped_agent_output_details_eviction_and_release(
+    saved: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        read = AsyncMock(
+            return_value=(
+                _available(
+                    _entry(
+                        "partial",
+                        "Retained partial output",
+                        kind=AgentTranscriptEntryKind.ASSISTANT_TEXT,
+                    )
+                )
+                if saved
+                else AgentTranscriptGetResponse(
+                    state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+                )
+            )
+        )
+        app.app_server.resources.sessions.read_agent_transcript = read
+        monkeypatch.setattr(
+            app.app_server,
+            "cancel_agent",
+            AsyncMock(
+                return_value=AgentsCancelResponse(
+                    outcome=CancelOutcome.STOP_REQUESTED, run_id="r1"
+                )
+            ),
+        )
+        running = _agent("one", "running").model_copy(update={"current_run_id": "r1"})
+        await app._handle_turn_event(AgentsUpdate([running]))
+        await pilot.press("ctrl+shift+a", "down", "c", "left", "enter")
+        stopped = _agent("one").model_copy(
+            update={
+                "latest_run_id": "r1",
+                "last_run_status": "cancelled",
+                "stop_reason": "user_cancelled",
+            }
+        )
+        await app._handle_turn_event(AgentsUpdate([stopped]))
+        bar = app._agent_bar
+        assert bar is not None and not bar.stop_is_pending("one", "r1")
+        await pilot.press("d")
+        details = str(bar.query_one("#agent-bar-full-content").render())
+        assert "user_cancelled" in details and "r1" in details
+        await pilot.press("escape", "enter")
+        await pilot.pause()
+        viewer = app.query_one(AgentTranscriptViewer)
+        assert viewer._live_timer is None
+        assert "user_cancelled" in str(
+            viewer.query_one(".agent-transcript-metadata").render()
+        )
+        if saved:
+            from chartreux.cli.textual_ui.widgets.messages import AssistantMessage
+
+            assert (
+                viewer.query_one(AssistantMessage).get_content()
+                == "Retained partial output"
+            )
+        else:
+            assert viewer._status_widget is not None
+            assert "No saved transcript" in str(viewer._status_widget.render())
+        # Eviction leaves a browsable tombstone; result expiry is independent.
+        evicted = stopped.model_copy(update={"availability": "evicted"})
+        await app._handle_turn_event(AgentsUpdate([evicted]))
+        await pilot.pause()
+        assert app.query_one(AgentTranscriptViewer) is viewer
+        assert not bar.agents[0].result_expired
+        assert "Result expired: False" in str(
+            viewer.query_one(".agent-transcript-metadata").render()
+        )
+        expired = evicted.model_copy(update={"result_expired": True})
+        await app._handle_turn_event(AgentsUpdate([expired]))
+        assert app.query_one(AgentTranscriptViewer) is viewer
+        assert bar.agents[0].result_expired
+        assert "Result expired: True" in str(
+            viewer.query_one(".agent-transcript-metadata").render()
+        )
+        # Explicit release removes the summary and closes inspection.
+        await app._handle_turn_event(AgentsUpdate([]))
+        await pilot.pause()
+        assert not app.query(AgentTranscriptViewer)
+        assert app.query_one("#chat").display

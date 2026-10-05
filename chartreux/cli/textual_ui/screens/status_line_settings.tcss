@@ -1,0 +1,65 @@
+#status-line-settings-screen { align: center middle; }
+#status-line-settings-content {
+    width: 92;
+    height: 100%;
+    background: $surface;
+    border: solid $foreground-muted;
+    border-title-color: $foreground;
+    border-title-style: bold;
+    padding: 0 1;
+}
+#status-line-settings-content.fullscreen {
+    width: 100%;
+    height: 100%;
+    background: $background;
+    border: none;
+}
+#status-line-settings-title { display: none; height: 1; text-style: bold; }
+#status-line-settings-content.fullscreen #status-line-settings-title { display: block; }
+#status-line-settings-pending-action { height: 1; color: $warning; text-overflow: ellipsis; }
+#status-line-settings-heading { height: 1; color: $text-muted; }
+#status-line-settings-options {
+    height: 1fr;
+    width: 100%;
+    border: none;
+    padding: 0;
+    text-wrap: nowrap;
+}
+/* Use a block cursor, not reverse video over Textual's inverted cursor colors. */
+#status-line-settings-options > .option-list--option-highlighted,
+#status-line-settings-confirmation-actions > .option-list--option-highlighted {
+    color: $foreground;
+    background: transparent;
+    text-style: none;
+}
+#status-line-settings-options:focus > .option-list--option-highlighted,
+#status-line-settings-confirmation-actions:focus > .option-list--option-highlighted {
+    color: $surface;
+    background: $foreground;
+    text-style: bold;
+}
+#status-line-settings-content.fullscreen #status-line-settings-options:focus > .option-list--option-highlighted,
+#status-line-settings-content.fullscreen #status-line-settings-confirmation-actions:focus > .option-list--option-highlighted {
+    color: $background;
+}
+#status-line-settings-options:ansi:focus > .option-list--option-highlighted,
+#status-line-settings-confirmation-actions:ansi:focus > .option-list--option-highlighted,
+#status-line-settings-content.fullscreen #status-line-settings-options:ansi:focus > .option-list--option-highlighted,
+#status-line-settings-content.fullscreen #status-line-settings-confirmation-actions:ansi:focus > .option-list--option-highlighted {
+    color: $ansi-background;
+    background: $ansi-foreground;
+}
+#status-line-settings-options > .option-list--option-hover { background: transparent; }
+#status-line-settings-details {
+    height: 3;
+    overflow-y: auto;
+    color: $text-muted;
+}
+#status-line-settings-details.expanded { height: 10; }
+#status-line-settings-feedback { height: 1; color: $warning; text-overflow: ellipsis; }
+#status-line-settings-preview-label { height: 1; color: $text-muted; }
+#status-line-settings-preview { height: 1; text-wrap: nowrap; }
+#status-line-settings-hint { height: 1; color: $text-muted; text-overflow: ellipsis; }
+#status-line-settings-confirmation { height: 1fr; }
+#status-line-settings-confirmation-text { height: auto; }
+#status-line-settings-confirmation-actions { height: 2; border: none; padding: 0; }

@@ -400,7 +400,7 @@ class RuntimeResource:
         return self._state.stats
 
     @property
-    def context_window(self) -> int:
+    def context_window(self) -> int | None:
         return self._state.context_window
 
     @property

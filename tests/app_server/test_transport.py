@@ -29,7 +29,9 @@ from chartreux.app_server.transport import (
 )
 from chartreux.utils.terminal import TerminalEmulator
 from tests.conftest import build_test_agent_loop
+from tests.mock.utils import mock_llm_chunk
 from tests.stubs.app_server import build_test_app_server, create_legacy_app_server
+from tests.stubs.fake_backend import FakeBackend
 
 
 class BlockingWriter:
@@ -321,7 +323,9 @@ async def test_app_server_session_round_trips_a_turn_over_stdio() -> None:
     client_writer = client_socket.makefile("wb")
     server_reader = server_socket.makefile("rb")
     server_writer = server_socket.makefile("wb")
-    agent_loop = build_test_agent_loop()
+    agent_loop = build_test_agent_loop(
+        backend=FakeBackend(mock_llm_chunk(content="Hello over stdio."))
+    )
     client_transport = StdioJsonRpcTransport(client_reader, client_writer)
     server_transport = StdioJsonRpcTransport(server_reader, server_writer)
     server = build_test_app_server(agent_loop, server_transport)
@@ -340,7 +344,8 @@ async def test_app_server_session_round_trips_a_turn_over_stdio() -> None:
             and isinstance(event.entry, PublicMessageEntry)
         ]
         assert [(message.role, message.text) for message in messages] == [
-            ("user", "hello")
+            ("user", "hello"),
+            ("assistant", "Hello over stdio."),
         ]
     finally:
         await session.close()

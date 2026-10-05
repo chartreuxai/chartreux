@@ -104,7 +104,7 @@ class ResolvedModel:
                 list[ThinkingLevel] | None, self.deployment.supported_thinking_levels
             ),
             supports_images=self.deployment.supports_images,
-            auto_compact_threshold=int(
+            auto_compact_threshold=(
                 self.deployment.auto_compact_threshold
                 if self.deployment.auto_compact_threshold is not None
                 else auto_compact_threshold

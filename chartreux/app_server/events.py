@@ -5,7 +5,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from chartreux.app_server._model import validate_wire
-from chartreux.app_server._patch import apply_json_patch, make_json_patch
+from chartreux.app_server._patch import (
+    apply_json_patch,
+    is_completed_effect_replay,
+    is_timing_only_patch,
+    make_json_patch,
+)
 from chartreux.app_server.models import (
     JsonPatchOperation,
     PublicCallbackEntry,
@@ -38,6 +43,7 @@ from chartreux.app_server.protocol import (
     TurnQueueUpdatedParams,
     TurnRetryingParams,
     TurnStartedParams,
+    TurnUpdatedParams,
 )
 
 
@@ -77,6 +83,11 @@ class SessionUpdated:
 
 @dataclass(frozen=True, slots=True)
 class TurnStarted:
+    turn: PublicTurn
+
+
+@dataclass(frozen=True, slots=True)
+class TurnUpdated:
     turn: PublicTurn
 
 
@@ -134,6 +145,7 @@ type AppServerEvent = (
     | SessionContextCleared
     | SessionUpdated
     | TurnStarted
+    | TurnUpdated
     | TurnCompleted
     | AgentsUpdate
     | TurnQueueUpdated
@@ -245,6 +257,7 @@ type _KnownEventParams = (
     | AgentsUpdateParams
     | TurnQueueUpdatedParams
     | TurnStartedParams
+    | TurnUpdatedParams
 )
 
 
@@ -264,6 +277,7 @@ _PROJECTION_EVENT_PARAMS: dict[str, type[_KnownEventParams]] = {
     "history/entryAdded": HistoryEntryAddedParams,
     "history/entryUpdated": HistoryEntryUpdatedParams,
     "turn/started": TurnStartedParams,
+    "turn/updated": TurnUpdatedParams,
     "turn/completed": TurnCompletedParams,
     "agents/update": AgentsUpdateParams,
     "turn_queue_updated": TurnQueueUpdatedParams,
@@ -419,7 +433,9 @@ class ClientProjection:
             )
         self._replace_turn(turn)
 
-    def consume(self, notification: Notification) -> AppServerEvent | None:
+    def consume(
+        self, notification: Notification, *, dedupe_history_additions: bool = True
+    ) -> AppServerEvent | None:
         params = _parse_event_params(notification)
         if isinstance(params, SessionCompactedParams | SessionContextClearedParams):
             self._validate_handoff(params)
@@ -433,6 +449,15 @@ class ClientProjection:
         if event_id is None:
             return None
         event = self._apply_event(params)
+        if (
+            event is None
+            and not dedupe_history_additions
+            and isinstance(params, HistoryEntryAddedParams)
+        ):
+            # Backend streams must forward every newly numbered addition even
+            # when their own projection already knows it. The consumer dedupes
+            # the addition while advancing its sequence watermark.
+            event = HistoryEntryAdded(self._entries[params.entry.id])
         self._last_event_id = event_id
         return event
 
@@ -445,13 +470,19 @@ class ClientProjection:
             case SessionUpdatedParams():
                 event = self._update_session(params)
             case HistoryEntryAddedParams():
-                self._add_entry(params.entry)
-                event = HistoryEntryAdded(params.entry)
+                event = (
+                    HistoryEntryAdded(params.entry)
+                    if self._add_entry(params.entry)
+                    else None
+                )
             case HistoryEntryUpdatedParams():
                 event = self._update_entry(params)
             case TurnStartedParams():
                 self._replace_turn(params.turn)
                 event = TurnStarted(params.turn)
+            case TurnUpdatedParams():
+                self._replace_turn(params.turn)
+                event = TurnUpdated(params.turn)
             case TurnCompletedParams():
                 self._replace_turn(params.turn)
                 event = TurnCompleted(params.turn)
@@ -554,9 +585,12 @@ class ClientProjection:
             )
         )
 
-    def _add_entry(self, entry: PublicHistoryEntry) -> None:
+    def _add_entry(self, entry: PublicHistoryEntry) -> bool:
         if entry.id in self._entries:
-            raise ValueError(f"Duplicate public history entry: {entry.id}")
+            # A pending notification can be retried with a new event ID after
+            # delivery or snapshot recovery. Keep the already-known entry,
+            # which may have advanced beyond the original addition.
+            return False
         self._entries[entry.id] = entry
         if self.state.history is None:
             self.state.history = []
@@ -570,6 +604,7 @@ class ClientProjection:
             )
         ):
             self.state.active_callbacks.append(entry)
+        return True
 
     def _update_entry(
         self, params: HistoryEntryUpdatedParams
@@ -577,7 +612,14 @@ class ClientProjection:
         previous = self._entries.get(params.entry_id)
         if previous is None:
             return None
-        if previous.generation_status is PublicEntryGenerationStatus.COMPLETED:
+        if is_completed_effect_replay(previous, params.patch):
+            # Ambiguous delivery and snapshot recovery can already contain this
+            # completion. Drain the retry without changing the frozen entry.
+            return None
+        if (
+            previous.generation_status is PublicEntryGenerationStatus.COMPLETED
+            and not is_timing_only_patch(previous, params.patch)
+        ):
             raise ValueError(
                 f"Completed public history entry is frozen: {params.entry_id}"
             )

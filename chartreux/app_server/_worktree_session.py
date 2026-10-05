@@ -14,12 +14,14 @@ contract does not import core.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 from chartreux.app_server._dispatch import RequestFailure
 from chartreux.app_server.protocol import ProtocolErrorCode, SessionOptions
+from chartreux.core.config import ModelConfig
 from chartreux.core.git.worktree import PreparedWorktree, acquire_for_attachment
 from chartreux.core.git.worktree.record import (
     AcquireResult,
@@ -35,6 +37,7 @@ from chartreux.core.session.worktrees import (
     UseExistingWorktree,
     WorktreeRequest,
 )
+from chartreux.core.usage import AccountingSink, UsageAttribution
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +87,15 @@ class SessionWorktrees:
         )
         return _rewritten(options, resolved)
 
-    async def resolve_for_start(self, options: SessionOptions) -> WorktreeResolution:
+    async def resolve_for_start(
+        self,
+        options: SessionOptions,
+        *,
+        accounting_sink: AccountingSink | None = None,
+        usage_attribution: UsageAttribution | None = None,
+        usage_attribution_factory: Callable[[ModelConfig], UsageAttribution]
+        | None = None,
+    ) -> WorktreeResolution:
         """Resolve off the event loop, cleaning up if the start is cancelled."""
         request = _requested(options)
         if request is None:
@@ -110,7 +121,13 @@ class SessionWorktrees:
                     "Worktree is currently unavailable",
                 )
             return WorktreeResolution(options=options, pending_token=acquired.token)
-        resolved = await self._lifecycle.resolve_for_start(request, _base_cwd(options))
+        resolved = await self._lifecycle.resolve_for_start(
+            request,
+            _base_cwd(options),
+            accounting_sink=accounting_sink,
+            usage_attribution=usage_attribution,
+            usage_attribution_factory=usage_attribution_factory,
+        )
         return _rewritten(options, resolved)
 
     async def cleanup(self, resolution: WorktreeResolution) -> None:

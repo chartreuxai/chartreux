@@ -113,13 +113,13 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
         _send_and_wait_for_text(
             child, "\x1b[B\r", "Models for Local e2e provider", timeout=25
         )
-        _send_and_wait_for_text(child, "\x1b[C", "▸ Retry discovery")
+        _send_and_wait_for_text(child, "\t", "▸ Retry discovery")
         _send_and_wait_for_text(child, "\x1b[B", "▸ Edit connection")
         _send_and_wait_for_text(child, "\x1b[B", "▸ Add model manually")
         _send_and_wait_for_text(child, "\r", "Model ID *")
         child.send("onboarding-mock-model\r")
         wait_for_rendered_text(child, captured, "onboarding-mock-model", timeout=10)
-        _send_and_wait_for_text(child, "\x1b[C", "▸ Add model manually")
+        _send_and_wait_for_text(child, "\t", "▸ Add model manually")
         _send_and_wait_for_text(child, "\x1b[B", "▸ Save and add another provider")
         _send_and_wait_for_text(child, "\x1b[B", "▸ Save and continue to presets")
         _send_and_wait_for_text(child, "\r", "Choose default presets", timeout=25)

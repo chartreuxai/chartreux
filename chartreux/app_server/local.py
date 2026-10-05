@@ -46,6 +46,10 @@ class LocalHarness:
         self._started = True
         return await self._host.connect(self._options)
 
+    async def close(self) -> None:
+        """Settle runtimes and release the automatically owned process."""
+        await self._host.close()
+
 
 class LocalHarnessHost:
     def __init__(self) -> None:
@@ -63,7 +67,10 @@ class LocalHarnessHost:
         process = self._process_for()
         client_transport, server_transport = memory_transport_pair()
         harness = await create_harness_server(
-            server_transport, transport_kind="in_process", process=process
+            server_transport,
+            transport_kind="in_process",
+            process=process,
+            startup_accounting=options.startup_accounting,
         )
         client = AppServerClient(client_transport, run_peer=harness.serve)
         resume_session_id: str | None = None

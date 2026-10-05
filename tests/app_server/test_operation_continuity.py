@@ -19,6 +19,7 @@ from chartreux.app_server.protocol import (
 from chartreux.app_server.session import AppServerSession, AppServerTurnError
 from chartreux.core.subagents import TaskArgs
 from chartreux.core.tools.base import InvokeContext
+from chartreux.core.types import AssistantEvent
 from tests.conftest import build_test_agent_loop
 from tests.stubs.app_server import create_test_app_server_session
 
@@ -30,6 +31,72 @@ def _turn(turn_id: str, session_id: str = "session") -> PublicTurn:
         status=PublicTurnStatus.IN_PROGRESS,
         started_at=1,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("driver", [False, True])
+async def test_continuation_gap_interrupt_settles_and_joins(driver: bool) -> None:
+    from chartreux.app_server._execution import SessionExecutionKind
+    from chartreux.app_server._turns import StaleTurnError
+    from chartreux.app_server.protocol import TurnInterruptParams
+
+    registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
+    loop = build_test_agent_loop()
+    runtime = registry._build_child_runtime(loop)
+    controller = runtime.turns
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_finalize = controller._finalize_turn
+
+    async def linked_finalize(
+        turn, status, error, stop_reason, session_execution, *, next_turn_id=None
+    ):
+        await original_finalize(
+            turn,
+            status,
+            error,
+            stop_reason,
+            session_execution,
+            next_turn_id="successor",
+        )
+        entered.set()
+        await release.wait()
+
+    try:
+        if driver:
+            controller._finalize_turn = linked_finalize
+            response, action = controller.start(
+                TurnStartParams(session_id=loop.session_id, message=[])
+            )
+            action()
+            await asyncio.wait_for(entered.wait(), 2)
+            initial_id = response.turn.id
+        else:
+            plan = _turn("plan", loop.session_id)
+            plan.status = PublicTurnStatus.COMPLETED
+            plan.next_turn_id = "successor"
+            controller._completed_turns.append(plan)
+            runtime.execution.begin(SessionExecutionKind.LIFECYCLE, "successor")
+            initial_id = plan.id
+        assert controller.operation_pending_turn_id(initial_id) == "successor"
+        waiter = asyncio.create_task(controller.wait_for_operation(initial_id))
+        assert controller.interrupt_operation(initial_id)
+        terminal = await asyncio.wait_for(waiter, 2)
+        assert (
+            terminal.id == "successor"
+            and terminal.status is PublicTurnStatus.INTERRUPTED
+        )
+        assert controller.operation_pending_turn_id(initial_id) is None
+        assert runtime.execution.active is None and controller._active_task is None
+        assert not controller.interrupt_operation(initial_id)
+        with pytest.raises(StaleTurnError):
+            controller.interrupt(
+                TurnInterruptParams(
+                    session_id=loop.session_id, expected_turn_id=initial_id
+                )
+            )
+    finally:
+        release.set()
+        await runtime.close()
 
 
 def test_next_turn_wire_default_and_roundtrip() -> None:
@@ -244,6 +311,10 @@ async def test_child_waits_for_operation_and_interrupts_successor(cancel: bool) 
         assert turn_id == plan.id
         waiting.set()
         await release.wait()
+        if not cancel:
+            await runtime.turns._event_sink(
+                AssistantEvent(content="Implementation done.")
+            )
         successor.status = PublicTurnStatus.COMPLETED
         return successor
 
@@ -259,7 +330,7 @@ async def test_child_waits_for_operation_and_interrupts_successor(cancel: bool) 
             item
             async for item in SessionRuntimeRegistry.run(
                 registry,
-                TaskArgs(task="implement", agent="worker", background=False),
+                TaskArgs(task="implement", agent_type="worker", background=False),
                 context,
             )
         ]
@@ -332,6 +403,9 @@ async def test_completed_operation_does_not_wait_for_unrelated_turn() -> None:
             await asyncio.wait_for(controller.wait_for_operation(plan.id), 1)
             is successor
         )
+        assert controller.operation_pending_turn_id(plan.id) is None
+        assert controller.operation_terminal_turn(plan.id) is successor
+        assert not controller.interrupt_operation(plan.id)
         assert not controller._active_task.done()
     finally:
         release.set()

@@ -516,6 +516,11 @@ async def test_public_serialized_session_only_policy(
         )
         token = loop.config_orchestrator.accepted_token
         new_id = loop.session_id if same_session else "rebound-policy-session"
+        accounting_owner = (
+            await registry._runtime_factory.prepare_rebind_accounting_owner(
+                loop, new_id
+            )
+        )
         loop.rebind_to_session(
             new_id,
             tmp_path / new_id,
@@ -530,6 +535,7 @@ async def test_public_serialized_session_only_policy(
                 username="fixture",
                 config={},
             ),
+            accounting_owner=accounting_owner,
         )
         assert loop.config_orchestrator.accepted_token is token
         rebound = state(root)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -83,3 +85,31 @@ def test_merge_falls_back_to_other_user_display_content() -> None:
     )
 
     assert merged.user_display_content == other_display_content
+
+
+def test_merge_preserves_first_posting_time_even_with_reasoning_first() -> None:
+    first_time = datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
+    first = LLMMessage(
+        role=Role.assistant, reasoning_content="thinking", posted_at=first_time
+    )
+    later = LLMMessage(
+        role=Role.assistant,
+        content="answer",
+        posted_at=first_time + timedelta(minutes=1),
+    )
+    assert (first + later).posted_at == first_time
+    assert (_msg("") + first).posted_at == first_time
+    assert (_msg("") + _msg("old")).posted_at is None
+
+
+def test_normalization_and_copies_preserve_posting_time() -> None:
+    posted_at = datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
+    message = LLMMessage.model_validate(
+        SimpleNamespace(role="assistant", content="answer", posted_at=posted_at)
+    )
+    assert message.posted_at == posted_at
+    assert message.model_copy().posted_at == posted_at
+    assert message.model_copy(deep=True).posted_at == posted_at
+    assert LLMMessage.model_validate(message.model_dump()).posted_at == posted_at
+    assert LLMMessage(role=Role.user, content="queued").posted_at is None
+    assert LLMMessage.model_validate(SimpleNamespace(content="old")).posted_at is None

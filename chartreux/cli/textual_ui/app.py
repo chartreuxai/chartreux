@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Mapping
 from contextlib import aclosing, suppress
 from dataclasses import dataclass, replace
 from enum import StrEnum, auto
@@ -21,13 +21,19 @@ from weakref import WeakKeyDictionary
 import webbrowser
 
 from rich import print as rprint
-from rich.cells import cell_len
 from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, VerticalGroup, VerticalScroll
 from textual.dom import NoScreen
 from textual.driver import Driver
-from textual.events import AppBlur, AppFocus, MouseScrollDown, MouseScrollUp, MouseUp
+from textual.events import (
+    AppBlur,
+    AppFocus,
+    DescendantFocus,
+    MouseScrollDown,
+    MouseScrollUp,
+    MouseUp,
+)
 from textual.screen import Screen
 from textual.timer import Timer
 from textual.widget import Widget
@@ -44,10 +50,15 @@ from chartreux.app_server.events import (
     HistoryEntryUpdated,
     ServerError,
     ServerWarning,
+    SessionCompacted,
+    SessionContextCleared,
+    SessionSnapshot,
+    SessionUpdated,
     StatsUpdated,
     TurnCompleted,
     TurnQueueUpdated,
     TurnStarted,
+    TurnUpdated,
 )
 from chartreux.app_server.models import (
     COMMITTED_MODEL_RECOVERY_ISSUE_FILE,
@@ -57,6 +68,7 @@ from chartreux.app_server.models import (
     PublicCallbackEntry,
     PublicCheckpointEntry,
     PublicEffectEntry,
+    PublicEntryGenerationStatus,
     PublicError,
     PublicHistoryEntry,
     PublicMessageEntry,
@@ -67,6 +79,8 @@ from chartreux.app_server.models import (
     PublicTurnStatus,
     TokenUsage,
     TurnErrorCode,
+    UsageWindow,
+    UsageWindowSummaries,
     UserInputCallbackOutput,
     UserQuestionRequest,
     UserQuestionResult,
@@ -76,12 +90,14 @@ from chartreux.app_server.protocol import (
     AgentEvictionModel,
     AgentSummaryModel,
     AppServerResponseError,
+    CancelOutcome,
     ConfigReadResponse,
     ConfigWriteOpWire,
     ProtocolError,
     ProtocolErrorCode,
+    UsageReadResponse,
+    UsageUpdatedParams,
 )
-from chartreux.cli._process_title import process_id_label
 from chartreux.cli.commands import Command, CommandContext, CommandRegistry
 from chartreux.cli.process_start import PROCESS_START_WALLCLOCK
 from chartreux.cli.textual_ui.external_editor import ExternalEditor
@@ -108,7 +124,7 @@ from chartreux.cli.textual_ui.quit_manager import (
     QuitManager,
 )
 from chartreux.cli.textual_ui.scheduled_loop_runner import ScheduledLoopCommands
-from chartreux.cli.textual_ui.widgets.agent_bar import AgentBar, agent_state
+from chartreux.cli.textual_ui.widgets.agent_bar import AgentBar, agent_is_active
 from chartreux.cli.textual_ui.widgets.agent_transcript import AgentTranscriptViewer
 from chartreux.cli.textual_ui.widgets.banner.banner import Banner
 from chartreux.cli.textual_ui.widgets.branch_created_message import BranchCreatedMessage
@@ -127,10 +143,6 @@ from chartreux.cli.textual_ui.widgets.chat_input.input_kinds import (
 from chartreux.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
 from chartreux.cli.textual_ui.widgets.collapsible import CollapsibleSection
 from chartreux.cli.textual_ui.widgets.compact import CompactMessage
-from chartreux.cli.textual_ui.widgets.context_progress import (
-    ContextProgress,
-    TokenState,
-)
 from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
 from chartreux.cli.textual_ui.widgets.inline_notice import InlineNotice
 from chartreux.cli.textual_ui.widgets.links import normalize_url
@@ -157,9 +169,12 @@ from chartreux.cli.textual_ui.widgets.messages import (
     WarningMessage,
     WhatsNewMessage,
 )
-from chartreux.cli.textual_ui.widgets.path_display import PathDisplay
 from chartreux.cli.textual_ui.widgets.reload_message import ReloadConfigMessage
 from chartreux.cli.textual_ui.widgets.rewind_fork_message import RewindForkMessage
+from chartreux.cli.textual_ui.widgets.session_status_line import (
+    SessionStatusLine,
+    SessionStatusState,
+)
 from chartreux.cli.textual_ui.widgets.tool_grouping import (
     ToolGroupExpansionState,
     entry_keeps_tool_group,
@@ -180,6 +195,7 @@ from chartreux.cli.textual_ui.windowing import (
     should_resume_history,
     sync_backfill_state,
 )
+from chartreux.cli.textual_ui.windowing.history import build_history_widgets
 from chartreux.cli.textual_ui.windowing.transcript import (
     TranscriptAnchor,
     TranscriptWindow,
@@ -204,6 +220,29 @@ from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.utils.paths import get_chartreux_home, is_dangerous_directory
 from chartreux.utils.retry_prompt import build_retry_prompt
 from chartreux.utils.session_id import shorten_session_id
+
+
+class _SessionTranscriptWindow(TranscriptWindow):
+    """Apply current interface preferences even to rematerialized history units."""
+
+    def __init__(self, get_show_timestamps: Callable[[], bool], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._get_show_timestamps = get_show_timestamps
+
+    def build_unit(
+        self, unit_id: str, history_widget_indices: WeakKeyDictionary[Widget, int]
+    ) -> list[Widget]:
+        unit = self.units[unit_id]
+        return build_history_widgets(
+            unit.entries,
+            start_index=unit.start_index,
+            history_widget_indices=history_widget_indices,
+            tools_collapsed=self.tools_collapsed,
+            expansion_state=self.expansion_state,
+            entry_expansion_state=self.entry_expansion_state,
+            show_message_timestamps=self._get_show_timestamps(),
+        )
+
 
 # Expected turn outcomes with bespoke user messages; not worth reporting to Sentry.
 _BENIGN_TURN_ERROR_CODES = {
@@ -656,6 +695,7 @@ _REJECT_HINT_PAUSED = "clear the queue first or remove this input."
 # Greeting interval in seconds (default: 24 hours)
 _GREETING_INTERVAL_SECONDS = 24 * 60 * 60
 _UNTRUSTED_CONFIG_WARNING_SECTION = "untrusted_config_warning"
+_USAGE_POLL_INTERVAL_SECONDS = 60
 
 
 class _AgentTranscriptSource:
@@ -801,6 +841,14 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._provider_management_worker: Worker[None] | None = None
         self._web_search_worker: Worker[None] | None = None
         self._shutdown_started = False
+        # Global spend outlives the attached session and its presentation resets.
+        self._usage_summaries: UsageWindowSummaries | None = None
+        self._usage_binding: tuple[AppServerSession, str] | None = None
+        self._usage_unsubscribe: Callable[[], None] | None = None
+        self._usage_initial_task: asyncio.Task[None] | None = None
+        self._usage_poll_task: asyncio.Task[None] | None = None
+        self._usage_worker: Worker[None] | None = None
+        self._usage_tasks: set[asyncio.Task[None]] = set()
         self._resume_adopted = False
         self._app_server_event_handler_lock = asyncio.Lock()
         self._init_controllers()
@@ -827,7 +875,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._entry_expansion_state = EntryExpansionState()
         self._preview_entry_expansion_state = EntryExpansionState()
         self._windowing = SessionWindowing(load_more_batch_size=LOAD_MORE_BATCH_SIZE)
-        self._transcript = TranscriptWindow(
+        self._transcript = _SessionTranscriptWindow(
+            lambda: self.config.show_message_timestamps,
             expansion_state=self._tool_group_expansion_state,
             entry_expansion_state=self._entry_expansion_state,
         )
@@ -857,7 +906,14 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._cached_messages_area: Widget | None = None
         self._cached_chat: ChatScroll | None = None
         self._cached_loading_area: Widget | None = None
-        self._context_progress: ContextProgress | None = None
+        self._status_line: SessionStatusLine | None = None
+        self._branch_identity: tuple[str, str] | None = None
+        self._branch_generation = 0
+        self._root_compacting = False
+        self._root_context_unknown = False
+        self._agent_browser_opener: Widget | None = None
+        self._last_conversation_focus: Widget | None = None
+        self._agent_browser_anchor: TranscriptAnchor | None = None
         self._agent_bar: AgentBar | None = None
         self._agent_summaries: list[AgentSummaryModel] = []
         self._agent_evictions: dict[str, AgentEvictionModel] = {}
@@ -882,6 +938,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     def _mark_session_ready(self) -> None:
         self._session_ready.set()
+        self._sync_usage_subscription()
         self._sync_terminal_title()
 
     def _on_session_title_changed(self, title: str) -> None:
@@ -979,6 +1036,15 @@ class ChartreuxApp(App):  # noqa: PLR0904
             steer_turn=self._steer_queue_prompts,
             turn_has_started=self._queued_turn_has_started,
             set_loading_queue_count=self._set_loading_queue_count,
+            get_show_message_timestamps=lambda: self.config.show_message_timestamps,
+            history_message=lambda entry_id: next(
+                (
+                    entry
+                    for entry in self.app_server.history
+                    if isinstance(entry, PublicMessageEntry) and entry.id == entry_id
+                ),
+                None,
+            ),
         )
 
     def _init_controllers(self) -> None:
@@ -1055,6 +1121,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
         content: str,
         images: list[ImageAttachment] | None = None,
         client_message_id: str | None = None,
+        *,
+        require_waiting_only: bool = False,
+        expected_turn_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> None:
         # Fail closed when the turn already ended: inject_user_context would
         # otherwise write idle session context and steer_pending would drop the
@@ -1066,6 +1136,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
             images=images,
             client_message_id=client_message_id,
             require_active_turn=True,
+            require_waiting_only=require_waiting_only,
+            expected_turn_id=expected_turn_id,
+            idempotency_key=idempotency_key,
         )
 
     def _queued_turn_has_started(self, queue_item_id: str) -> bool:
@@ -1191,21 +1264,16 @@ class ChartreuxApp(App):  # noqa: PLR0904
             yield pending
 
         with Horizontal(id="bottom-bar"):
-            self._path_display = PathDisplay(
-                self.app_server.cwd if has_session else str(Path.cwd())
+            config = self.config if has_session else (init.config if init else None)
+            self._status_line = SessionStatusLine(
+                SessionStatusState(
+                    cwd=self.app_server.cwd if has_session else Path.cwd(),
+                    pid=os.getpid(),
+                ),
+                config.status_line if config is not None else None,
+                id="session-status-line",
             )
-            yield self._path_display
-            self._process_title = NoMarkupStatic(process_id_label(), id="process-title")
-            yield self._process_title
-            yield NoMarkupStatic(id="spacer")
-            self._context_progress = ContextProgress()
-            if has_session:
-                stats = self.app_server.resources.runtime.stats
-                self._context_progress.tokens = TokenState(
-                    max_tokens=self.app_server.resources.runtime.context_window,
-                    current_tokens=stats.context_tokens,
-                )
-            yield self._context_progress
+            yield self._status_line
 
     @property
     def _messages_area(self) -> Widget:
@@ -1281,7 +1349,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._refresh_command_registry()
         self._refresh_banner()
         self._refresh_context_progress()
-        self.call_after_refresh(self._layout_status_line)
         # Ready now unless a resume/continue/picker flow is pending — those mark
         # ready at their own return-to-input points to avoid dispatching against
         # a half-rebound session.
@@ -1333,12 +1400,32 @@ class ChartreuxApp(App):  # noqa: PLR0904
         set_config_log_level(config.log_level)
         self._refresh_banner()
         self._refresh_context_progress()
+        for widget in [
+            *self.query(UserMessage),
+            *self.query(AssistantMessage),
+            *self.query(ToolGroup),
+            *self.query(ToolCallMessage),
+            *self.query(ToolResultMessage),
+        ]:
+            widget.set_show_message_timestamps(config.show_message_timestamps)
+        if self._agent_transcript_viewer is not None:
+            self._agent_transcript_viewer.set_show_message_timestamps(
+                config.show_message_timestamps
+            )
+
+    def _mounted_timing_widgets(self, entry_id: str) -> list[Widget]:
+        self._admit_live_history()
+        return self._transcript.mounted_entry_widgets(entry_id)
 
     async def _complete_mount(self) -> None:
         self.event_handler = EventHandler(
             mount_callback=self._mount_and_scroll,
             get_tools_collapsed=lambda: self._tools_collapsed,
             get_show_thinking=lambda: self.config.show_thinking_nodes,
+            get_show_message_timestamps=lambda: self.config.show_message_timestamps,
+            on_user_message=self._queue.reconcile_history_entry,
+            mounted_entry_widgets=self._mounted_timing_widgets,
+            update_retained_entry=self._transcript.update_entry,
             on_context_cleared=self._on_context_cleared,
             on_session_title_changed=self._on_session_title_changed,
             entry_expansion_state=self._entry_expansion_state,
@@ -1374,13 +1461,17 @@ class ChartreuxApp(App):  # noqa: PLR0904
         gc.freeze()
 
     def _update_context_progress(self, event: StatsUpdated) -> None:
-        if self._context_progress is None:
-            return
-        self._context_progress.tokens = TokenState(
-            max_tokens=event.params.context_window,
-            current_tokens=event.params.stats.context_tokens,
-        )
-        self._layout_status_line()
+        self._root_context_unknown = False
+        self._refresh_context_progress()
+        if self._status_line is not None:
+            self._status_line.set_state(
+                replace(
+                    self._status_line.state,
+                    context_tokens=event.params.stats.context_tokens,
+                    auto_compact_threshold=event.params.context_window,
+                )
+            )
+            self._refresh_main_agent_details()
 
     def _start_post_ready_startup(self) -> None:
         self.run_worker(self._complete_post_ready_startup(), exclusive=False)
@@ -1651,7 +1742,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if self._is_busy():
             if not await self._try_side_channel_command(value, input_widget):
                 if not await self._handle_queue_submit(
-                    value, reject_hint=_REJECT_HINT_BUSY
+                    value, reject_hint=_REJECT_HINT_BUSY, allow_waiting_only=True
                 ):
                     self._restore_input_if_empty(input_widget, value)
             return
@@ -1670,6 +1761,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
             # Promoted despite the body's guard (race): copy on write.
             await self._enqueue_edited_copy(event.value)
             return
+        if self._queue.is_unresolved_prompt(current_index):
+            await self._report_unresolved_queue_edit()
+            return
         widget = self._queue_selected_widget
         prepared = await self._prepare_prompt_or_abort(event.value)
         if prepared is None:
@@ -1687,7 +1781,19 @@ class ChartreuxApp(App):  # noqa: PLR0904
             current_index, event.value, prepared_prompt=prepared
         )
         if not updated:
-            await self._enqueue_edited_copy(event.value)
+            if self._queue.is_unresolved_prompt(current_index):
+                await self._report_unresolved_queue_edit()
+            else:
+                await self._enqueue_edited_copy(event.value)
+
+    async def _report_unresolved_queue_edit(self) -> None:
+        await self._mount_and_scroll(
+            ErrorMessage(
+                "Steering delivery is unresolved; the original prompt was retained. "
+                "Retry the delivery or remove it from the queue instead of editing it.",
+                collapsed=self._tools_collapsed,
+            )
+        )
 
     async def _enqueue_edited_copy(self, value: str) -> None:
         """Queue an edited prompt again if the original started meanwhile."""
@@ -1824,7 +1930,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         await self._queue.resume()
         return True
 
-    async def _handle_queue_submit(self, value: str, *, reject_hint: str) -> bool:
+    async def _handle_queue_submit(
+        self, value: str, *, reject_hint: str, allow_waiting_only: bool = False
+    ) -> bool:
         if self._bash_task is not None and not self._bash_task.done():
             rejection = f"Input cannot be queued while a shell command is running — {reject_hint}"
         else:
@@ -1836,7 +1944,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     rejection = f"Slash commands cannot be queued — {reject_hint}"
                 case Skill(command=command, name=name):
                     return await self._enqueue_prompt_with_resources(
-                        command, skill_name=name
+                        command, skill_name=name, allow_waiting_only=allow_waiting_only
                     )
                 case Bash():
                     rejection = f"Shell commands cannot be queued — {reject_hint}"
@@ -1844,7 +1952,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     await self._empty_bash_error()
                     return False
                 case Prompt(text=text):
-                    return await self._enqueue_prompt_with_resources(text)
+                    return await self._enqueue_prompt_with_resources(
+                        text, allow_waiting_only=allow_waiting_only
+                    )
         if rejection is not None:
             self._warn_not_queueable(rejection)
             return False
@@ -1856,11 +1966,35 @@ class ChartreuxApp(App):  # noqa: PLR0904
         *,
         skill_name: str | None = None,
         optimistic_start: bool = False,
+        allow_waiting_only: bool = False,
     ) -> bool:
+        # Capture before preparation: never retarget a successor after an await.
+        waiting_turn = (
+            next(
+                (
+                    turn.id
+                    for turn in self.app_server.state.turns or []
+                    if turn.waiting_only
+                ),
+                None,
+            )
+            if allow_waiting_only and self.app_server.waiting_only
+            else None
+        )
         with self._queue.reserve_enqueue():
             prepared = await self._prepare_prompt_or_abort(content)
             if prepared is None:
                 return False
+            if waiting_turn is not None:
+                await self._steer_queued_now(
+                    content=content,
+                    prepared_prompt=prepared,
+                    skill_name=skill_name,
+                    expected_turn_id=waiting_turn,
+                )
+                # Delivery owns the content even on rejection/ambiguity; do not
+                # restore raw input and create a second submission.
+                return True
             try:
                 await self._queue.enqueue_prompt(
                     content,
@@ -1887,8 +2021,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
     def _is_queue_edit_active(self) -> bool:
         if not self._queue:
             return False
-        return self._agent_job_active() or (
-            self._bash_task is not None and not self._bash_task.done()
+        return (
+            self._queue.has_unresolved_steering
+            or self._agent_job_active()
+            or (self._bash_task is not None and not self._bash_task.done())
         )
 
     async def on_question_app_answered(self, message: QuestionApp.Answered) -> None:
@@ -1948,7 +2084,14 @@ class ChartreuxApp(App):  # noqa: PLR0904
         # block and inject it into a turn that Escape is already cancelling.
         await self._submit_or_defer("")
 
-    async def _steer_queued_now(self) -> bool:
+    async def _steer_queued_now(  # noqa: PLR0911
+        self,
+        *,
+        content: str | None = None,
+        prepared_prompt: PreparedPrompt | None = None,
+        skill_name: str | None = None,
+        expected_turn_id: str | None = None,
+    ) -> bool:
         """Send queued messages into the running turn as steering.
 
         Returns True when a steer was sent. No-op (returns False) unless a turn
@@ -1957,14 +2100,49 @@ class ChartreuxApp(App):  # noqa: PLR0904
         """
         from chartreux.app_server import AppServerConnectionClosed
 
+        if prepared_prompt is not None:
+            assert content is not None and expected_turn_id is not None
+            try:
+                return await self._queue.steer_prepared(
+                    content,
+                    prepared_prompt=prepared_prompt,
+                    skill_name=skill_name,
+                    expected_turn_id=expected_turn_id,
+                )
+            except Exception as error:
+                await self._mount_and_scroll(
+                    ErrorMessage(
+                        f"Steering admission failed; your prompt was kept. {error}",
+                        collapsed=self._tools_collapsed,
+                    )
+                )
+                return False
         if self._input_in_queue_mode():
             # Empty Enter while selecting/editing a queued item is an edit
             # action, not a steer (Ctrl+Enter already skips queue mode).
             return False
+        if self._queue.has_unresolved_steering:
+            try:
+                return await self._queue.retry_unresolved_steering()
+            except Exception as error:
+                await self._mount_and_scroll(
+                    ErrorMessage(str(error), collapsed=self._tools_collapsed)
+                )
+                return False
         if not self._queue.has_removable or not self.app_server.turn_active:
             return False
+        turn_id = next(
+            (
+                turn.id
+                for turn in self.app_server.state.turns or []
+                if turn.status is PublicTurnStatus.IN_PROGRESS
+            ),
+            None,
+        )
+        if turn_id is None:
+            return False
         try:
-            return await self._queue.steer_pending()
+            return await self._queue.steer_pending(expected_turn_id=turn_id)
         except AppServerConnectionClosed:
             # A failed steer may have removed the server item before reconnect
             # could re-enqueue it. QueueController retains the prompt in that
@@ -1986,6 +2164,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 and error.error.message == "No active turn"
             ):
                 return False
+            await self._mount_and_scroll(
+                ErrorMessage(str(error), collapsed=self._tools_collapsed)
+            )
+            return False
+        except Exception as error:
             await self._mount_and_scroll(
                 ErrorMessage(str(error), collapsed=self._tools_collapsed)
             )
@@ -2057,6 +2240,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         except Exception:
             return
         loading = LoadingWidget(status=status, show_hint=show_hint)
+        loading.set_waiting_only(
+            self._app_server is not None and self._app_server.waiting_only
+        )
         loading.set_hint_suppressed(self._current_bottom_app == BottomApp.Question)
         self._loading_widget = loading
         await loading_area.mount(loading)
@@ -2622,13 +2808,34 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     )
 
     def _admit_live_history(self) -> None:
-        if self.event_handler and self.event_handler.current_tool_group is not None:
-            return
+        open_group = (
+            self.event_handler.current_tool_group if self.event_handler else None
+        )
         history = self.app_server.history
         start = self._transcript.admitted_end_index
+        while start < len(history) and self.event_handler is not None:
+            entry = history[start]
+            if not isinstance(entry, PublicMessageEntry) or entry.role != "assistant":
+                break
+            root = self.event_handler.assistant_entry_widgets.get(entry.id)
+            if root is None or not self._transcript.admit_reused_root(
+                entry, root, index=start
+            ):
+                break
+            start += 1
+            self._request_transcript_reconcile()
         if start >= len(history):
             return
         batch = history[start:]
+        if open_group is not None:
+            # Admit completed roots preceding the still-growing group, but leave
+            # the group's membership open until its finalization.
+            end = len(batch)
+            while end and entry_keeps_tool_group(batch[end - 1]):
+                end -= 1
+            batch = batch[:end]
+            if not batch:
+                return
         if self._transcript.unit_ids and all(
             entry_keeps_tool_group(entry) for entry in batch
         ):
@@ -2660,6 +2867,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             child
             for child in self._messages_area.children
             if child not in mounted
+            and child is not open_group
             and type(child)
             in {
                 UserMessage,
@@ -2817,11 +3025,18 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 )
 
                 async def restore_after_reflow() -> None:
-                    ready: asyncio.Future[None] = (
-                        asyncio.get_running_loop().create_future()
-                    )
-                    self.call_after_refresh(lambda: ready.set_result(None))
-                    await ready
+                    # App resize precedes the screen's resize message. Wait for
+                    # the chat viewport to adopt the new width before restoring
+                    # a wrapped-message anchor against its reflowed geometry.
+                    for _ in range(100):
+                        if (
+                            not self.is_running
+                            or not self._chat_widget.display
+                            or self._chat_widget.region.width == self.size.width
+                        ):
+                            break
+                        await asyncio.sleep(0.01)
+                    # Restore against the available geometry if reflow never settles.
                     self._messages_area.refresh(layout=True)
                     await self._transcript._layout_pass(self._messages_area)
                     await self._transcript.restore_anchor(self._messages_area, anchor)
@@ -2832,28 +3047,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     lambda _: self.call_after_refresh(self._remember_transcript_anchor)
                 )
         self._request_transcript_reconcile()
-        self._layout_status_line()
-
-    def _layout_status_line(self) -> None:
-        """Reserve context capacity before spending width on optional identities."""
-        path = getattr(self, "_path_display", None)
-        process = getattr(self, "_process_title", None)
-        context = self._context_progress
-        if path is None or process is None or context is None:
-            return
-        width = self.size.width
-        usage = str(context.render())
-        reserve = cell_len(usage) + (1 if usage else 0)
-        path.compact(False)
-        process.display = True
-        if (
-            cell_len(str(path.render())) + cell_len(str(process.render())) + 1 + reserve
-            > width
-        ):
-            process.display = False
-        if cell_len(str(path.render())) + reserve > width:
-            path.compact(True)
-        path.styles.max_width = max(0, width - reserve)
 
     def _is_tool_enabled_in_main_agent(self, tool: str) -> bool:
         return self.app_server.resources.runtime.has_tool(tool)
@@ -2913,7 +3106,13 @@ class ChartreuxApp(App):  # noqa: PLR0904
             or self._agent_selection_target is not None
             or self._current_bottom_app not in {BottomApp.Input, BottomApp.Question}
             or any(
-                screen.id in {"settings-screen", "websearch-screen"}
+                screen.id
+                in {
+                    "settings-screen",
+                    "usage-screen",
+                    "status-line-settings-screen",
+                    "websearch-screen",
+                }
                 or screen.__class__.__name__ == "ProviderWorkbenchScreen"
                 for screen in self.screen_stack
             )
@@ -2923,6 +3122,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         pending = bool(self._pending_callbacks or self._pending_local_question)
         for indication in (
             "#settings-pending-action",
+            "#status-line-settings-pending-action",
             "#wb-pending-action",
             "#agent-transcript-pending-action",
         ):
@@ -3068,9 +3268,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             await self._handle_turn_event(event)
 
     def _show_no_output_outcome(self) -> None:
-        agents_running = any(
-            agent_state(agent) == "running" for agent in self._agent_summaries
-        )
+        agents_running = any(agent_is_active(agent) for agent in self._agent_summaries)
         self._turn_outcome_notice.show(
             "Info: Main turn completed without a final response; "
             + (
@@ -3097,8 +3295,52 @@ class ChartreuxApp(App):  # noqa: PLR0904
             ):
                 self._show_no_output_outcome()
 
+    def _refresh_status_for_event(self, event: AppServerEvent) -> None:
+        if isinstance(event, SessionCompacted):
+            self._root_context_unknown = True
+        elif isinstance(event, SessionContextCleared):
+            self._root_context_unknown = False
+        if isinstance(event, (SessionSnapshot, SessionUpdated)):
+            self._refresh_context_progress()
+        if isinstance(event, (TurnCompleted, SessionCompacted, SessionContextCleared)):
+            self._root_compacting = False
+            self._refresh_context_progress()
+        if isinstance(event, TurnStarted):
+            self._refresh_context_progress()
+        if isinstance(event, TurnCompleted):
+            self._schedule_branch_refresh()
+        if isinstance(event, SessionCompacted) and self._status_line is not None:
+            self._status_line.set_state(
+                replace(self._status_line.state, context_tokens=None, compacting=False)
+            )
+            self._refresh_main_agent_details()
+        if isinstance(event, (HistoryEntryAdded, HistoryEntryUpdated)):
+            checkpoint = _public_entry(event)
+            if (
+                isinstance(checkpoint, PublicCheckpointEntry)
+                and checkpoint.kind == "compaction"
+            ):
+                if (
+                    checkpoint.generation_status
+                    is PublicEntryGenerationStatus.COMPLETED
+                ):
+                    # Completion is published before the post-compaction stats.
+                    self._root_context_unknown = True
+                self._root_compacting = (
+                    checkpoint.generation_status
+                    is PublicEntryGenerationStatus.IN_PROGRESS
+                )
+                self._refresh_context_progress()
+
     async def _handle_turn_event(self, event: AppServerEvent) -> None:
+        received_at = time.monotonic()
         self._track_turn_outcome(event)
+        self._refresh_status_for_event(event)
+        if (
+            isinstance(event, (TurnStarted, TurnUpdated, TurnCompleted))
+            and self._loading_widget is not None
+        ):
+            self._loading_widget.set_waiting_only(event.turn.waiting_only)
         if isinstance(event, AgentsUpdate):
             viewer = self._agent_transcript_viewer
             selected_id = self._agent_selection_target or (
@@ -3128,7 +3370,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
             }
             if self._agent_bar is not None:
                 self._agent_bar.update_agents(
-                    event.agents, tuple(self._agent_evictions.values())
+                    event.agents,
+                    tuple(self._agent_evictions.values()),
+                    received_at=received_at,
                 )
             viewer = self._agent_transcript_viewer
             if viewer is not None:
@@ -3140,9 +3384,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     ),
                     None,
                 )
-                viewer.set_live(
-                    selected is not None and agent_state(selected) == "running"
-                )
+                viewer.set_live(selected is not None and agent_is_active(selected))
                 if selected is not None and self._agent_bar is not None:
                     viewer.set_metadata(self._agent_bar.full_metadata(selected))
             return
@@ -3907,6 +4149,31 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return
         await self._switch_to_theme_picker_app()
 
+    async def _show_usage(self, **kwargs: Any) -> None:
+        if self._shutdown_started or (
+            self._usage_worker is not None and not self._usage_worker.is_finished
+        ):
+            return
+        from chartreux.cli.textual_ui.screens.usage import UsageScreen
+
+        if any(isinstance(screen, UsageScreen) for screen in self.screen_stack):
+            return
+        self._usage_worker = self.run_worker(
+            self._wait_for_usage(), exclusive=False, name="usage"
+        )
+
+    async def _wait_for_usage(self) -> None:
+        from chartreux.cli.textual_ui.screens.usage import UsageScreen
+
+        try:
+            read_provider, subscribe = self._usage_screen_providers()
+            # Push before reading: the browser owns loading and read-error states.
+            await self.push_screen_wait(UsageScreen(read_provider, subscribe))
+        finally:
+            self._usage_worker = None
+            if not self._shutdown_started:
+                await self._present_pending_callback()
+
     async def _show_settings(self, **kwargs: Any) -> None:
         if (
             self._settings_worker is not None and not self._settings_worker.is_finished
@@ -4392,6 +4659,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         await self._request_agent_transcript_close(restore_focus=False)
         self._resume_adopted = False
         self._resume_ui_ready.clear()
+        self._stop_usage_subscription()
         try:
             await self.app_server.resume(
                 session_id, on_adopt=lambda: setattr(self, "_resume_adopted", True)
@@ -4423,6 +4691,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             raise
         finally:
             self._resume_ui_ready.set()
+            self._sync_usage_subscription()
 
     async def _show_adopted_resume_recovery(self, exc: BaseException) -> None:
         self._active_callback = None
@@ -4926,7 +5195,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         main = self._agent_job_active() or (
             self._bash_task is not None and not self._bash_task.done()
         )
-        agents = any(agent_state(agent) == "running" for agent in self._agent_summaries)
+        agents = any(agent_is_active(agent) for agent in self._agent_summaries)
         decisions = bool(
             self._active_callback
             or self._pending_callbacks
@@ -5676,13 +5945,25 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if action != "interrupt":
             return True
         if (
-            self.screen.id in {"settings-screen", "websearch-screen"}
+            self.screen.id
+            in {
+                "settings-screen",
+                "usage-screen",
+                "websearch-screen",
+                "status-line-settings-screen",
+            }
             or self.screen.__class__.__name__ == "ProviderWorkbenchScreen"
         ):
             return False
-        if self._agent_transcript_viewer is not None:
-            # Route priority Escape to the mounted overlay rather than the
-            # parent interrupt action.
+        if (
+            isinstance(self.screen, ExitConsequencesScreen)
+            or self._agent_transcript_viewer is not None
+            or (
+                self._debug_console is not None and self._debug_console.owns_interaction
+            )
+        ):
+            # Route priority Escape to the active overlay rather than the
+            # parent interrupt action (even while queue selection is active).
             return True
         containers = self.query(ChatInputContainer)
         if not containers:
@@ -5698,6 +5979,12 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return
         if viewer := self._agent_transcript_viewer:
             viewer.action_close()
+            return
+        # Only the focused console owns Escape; a visible dock is not an overlay.
+        # Keep modal/transcript owners above it and agent browsing below it.
+        if self._debug_console is not None and self._debug_console.owns_interaction:
+            self._last_escape_time = None
+            self._debug_console.action_close()
             return
         if self._agent_bar is not None and self._agent_bar.expanded:
             self._agent_bar.action_collapse()
@@ -5825,13 +6112,191 @@ class ChartreuxApp(App):  # noqa: PLR0904
             await node.set_collapsed(self._tools_collapsed)
         self._request_transcript_reconcile()
 
+    def _usage_screen_providers(
+        self,
+    ) -> tuple[
+        Callable[[UsageWindow, str | None], Awaitable[UsageReadResponse]],
+        Callable[[Callable[[UsageUpdatedParams], None]], Callable[[], None]],
+    ]:
+        """Resource-backed constructor arguments for UsageScreen, without opening it."""
+        usage = self.app_server.resources.usage
+        return usage.read, usage.subscribe
+
+    def _track_usage_task(
+        self, coroutine: Coroutine[Any, Any, None]
+    ) -> asyncio.Task[None]:
+        task = asyncio.create_task(coroutine)
+        self._usage_tasks.add(task)
+        task.add_done_callback(self._usage_tasks.discard)
+        return task
+
+    def _stop_usage_subscription(self) -> None:
+        self._usage_binding = None
+        if self._usage_unsubscribe is not None:
+            self._usage_unsubscribe()
+            self._usage_unsubscribe = None
+        for task in (self._usage_initial_task, self._usage_poll_task):
+            if task is not None:
+                task.cancel()
+        self._usage_initial_task = None
+        self._usage_poll_task = None
+
+    def _sync_usage_subscription(self) -> None:
+        if (
+            self._shutdown_started
+            or self._app_server is None
+            or not self._session_ready.is_set()
+            or not self._resume_ui_ready.is_set()
+        ):
+            return
+        session = self.app_server
+        binding = (session, session.session_id)
+        if binding != self._usage_binding:
+            self._stop_usage_subscription()
+            self._usage_binding = binding
+            usage = session.resources.usage
+
+            def updated(snapshot: UsageUpdatedParams) -> None:
+                if (
+                    self._usage_binding == binding
+                    and self._app_server is session
+                    and session.session_id == binding[1]
+                    and not self._shutdown_started
+                ):
+                    self._on_usage_updated(snapshot)
+
+            self._usage_unsubscribe = usage.subscribe(updated)
+            if usage.current is not None:
+                updated(usage.current)
+            # No usage RPC is awaited on the mount/readiness path.
+            self._usage_initial_task = self._track_usage_task(self._read_usage(session))
+        enabled = any(
+            segment in {"spend-today", "spend-week", "spend-month"}
+            for segment in self.config.status_line.segments
+        )
+        if enabled and self._usage_poll_task is None:
+            self._usage_poll_task = self._track_usage_task(self._poll_usage(session))
+        elif not enabled and self._usage_poll_task is not None:
+            self._usage_poll_task.cancel()
+            self._usage_poll_task = None
+
+    async def _read_usage(self, session: AppServerSession) -> None:
+        try:
+            # The resource publishes reconciled global summaries to subscribers.
+            await session.resources.usage.read()
+        except Exception as exc:
+            logger.debug("Usage refresh failed", exc_info=exc)
+
+    async def _poll_usage(self, session: AppServerSession) -> None:
+        while True:
+            await asyncio.sleep(_USAGE_POLL_INTERVAL_SECONDS)
+            await self._read_usage(session)
+
+    def _on_usage_updated(self, snapshot: UsageUpdatedParams) -> None:
+        self._usage_summaries = snapshot.summaries
+        if self._status_line is not None:
+            self._status_line.set_state(
+                replace(
+                    self._status_line.state,
+                    usage_day=snapshot.summaries.day,
+                    usage_week=snapshot.summaries.week,
+                    usage_month=snapshot.summaries.month,
+                )
+            )
+
     def _refresh_context_progress(self) -> None:
-        if self._context_progress is None:
+        self._sync_usage_subscription()
+        if self._status_line is None or self._app_server is None:
             return
         runtime = self.app_server.resources.runtime
-        self._context_progress.tokens = TokenState(
-            max_tokens=runtime.context_window,
-            current_tokens=runtime.stats.context_tokens,
+        identity = (self.app_server.session_id, self.app_server.cwd)
+        if identity != self._branch_identity:
+            self._root_context_unknown = False
+            self._root_compacting = any(
+                isinstance(entry, PublicCheckpointEntry)
+                and entry.kind == "compaction"
+                and entry.generation_status is PublicEntryGenerationStatus.IN_PROGRESS
+                for entry in self.app_server.history
+            )
+        self._status_line.set_config(self.config.status_line)
+        self._status_line.set_state(
+            replace(
+                self._status_line.state,
+                cwd=self.app_server.cwd,
+                model_identity=self.config.active_model.display_name,
+                context_tokens=(
+                    None if self._root_context_unknown else runtime.stats.context_tokens
+                ),
+                auto_compact_threshold=runtime.context_window,
+                compacting=self._root_compacting,
+                ascii_chrome=self.config.ascii_chrome,
+                usage_day=self._usage_summaries.day if self._usage_summaries else None,
+                usage_week=self._usage_summaries.week
+                if self._usage_summaries
+                else None,
+                usage_month=self._usage_summaries.month
+                if self._usage_summaries
+                else None,
+            )
+        )
+        self._refresh_main_agent_details()
+        identity = (self.app_server.session_id, self.app_server.cwd)
+        if identity != self._branch_identity:
+            self._branch_identity = identity
+            self._status_line.set_state(
+                replace(self._status_line.state, branch=None, branch_status="unknown")
+            )
+            self._schedule_branch_refresh()
+
+    def _refresh_main_agent_details(self) -> None:
+        if self._agent_bar is None or self._status_line is None:
+            return
+        state = self._status_line.state
+        self._agent_bar.update_main_details(
+            {
+                "Session": self.app_server.session_id,
+                "Directory": self.app_server.cwd,
+                "Model": state.model_identity or "—",
+                "State": "Running" if self._agent_job_active() else "Idle",
+            },
+            context_tokens=state.context_tokens,
+            auto_compact_threshold=state.auto_compact_threshold,
+            compacting=state.compacting,
+        )
+
+    def _schedule_branch_refresh(self) -> None:
+        if self._app_server is None:
+            return
+        self._branch_generation += 1
+        generation = self._branch_generation
+        session = self.app_server
+        identity = (session.session_id, session.cwd)
+        self.run_worker(
+            self._refresh_branch(session, identity, generation), exclusive=False
+        )
+
+    async def _refresh_branch(
+        self, session: AppServerSession, identity: tuple[str, str], generation: int
+    ) -> None:
+        try:
+            branch = await session.resources.workspace.read_branch(refresh=True)
+        except Exception as exc:
+            logger.debug("Branch refresh failed", exc_info=exc)
+            return
+        if (
+            branch is None
+            or generation != self._branch_generation
+            or self._app_server is not session
+            or identity != (session.session_id, session.cwd)
+            or self._status_line is None
+        ):
+            return
+        self._status_line.set_state(
+            replace(
+                self._status_line.state,
+                branch=branch.branch,
+                branch_status=branch.status,
+            )
         )
 
     async def _should_show_greeting(self) -> bool:
@@ -5876,6 +6341,32 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 hooks_count=self.app_server.resources.runtime.hooks_count,
             )
 
+    def on_descendant_focus(self, event: DescendantFocus) -> None:
+        if self._agent_transcript_viewer is not None:
+            return
+        if event.widget is self._agent_bar:
+            if self._agent_browser_opener is None:
+                self._capture_agent_browser_origin(self._last_conversation_focus)
+        elif self._agent_bar is None or not self._agent_bar.expanded:
+            self._last_conversation_focus = event.widget
+
+    def _capture_agent_browser_origin(self, opener: Widget | None) -> None:
+        self._agent_browser_opener = opener
+        self._agent_browser_anchor = self._transcript.capture_anchor(
+            self._messages_area, following=self._transcript_following
+        )
+
+    async def on_agent_bar_closed(self, message: AgentBar.Closed) -> None:
+        message.stop()
+        anchor = self._agent_browser_anchor
+        self._agent_browser_anchor = None
+        if anchor is not None:
+            await self._transcript.restore_anchor(self._messages_area, anchor)
+        opener = self._agent_browser_opener
+        self._agent_browser_opener = None
+        if opener is not None and opener.is_mounted:
+            self.call_after_refresh(lambda: opener.focus(scroll_visible=False))
+
     async def action_toggle_agent_browser(self, **kwargs: Any) -> None:
         if self._agent_bar is None:
             return
@@ -5889,11 +6380,44 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 UserCommandMessage("Finish or cancel this question first.")
             )
             return
-        self._agent_bar.toggle()
-        if self._agent_bar.expanded:
-            self._agent_bar.focus()
-        elif self._chat_input_container is not None:
-            self._chat_input_container.focus_input()
+        if not self._agent_bar.expanded:
+            self._capture_agent_browser_origin(self.screen.focused)
+            self._refresh_main_agent_details()
+            self._agent_bar.open_browser()
+        else:
+            self._agent_bar.close_browser()
+            await self.on_agent_bar_closed(AgentBar.Closed())
+
+    def on_agent_bar_stop_requested(self, message: AgentBar.StopRequested) -> None:
+        message.stop()
+        # Do not block agents/update processing while the RPC is outstanding.
+        self.run_worker(
+            self._cancel_agent_run(message.agent_id, message.run_id), exclusive=False
+        )
+
+    async def _cancel_agent_run(self, agent_id: str, run_id: str) -> None:
+        bar = self._agent_bar
+        if bar is None or not bar.stop_is_pending(agent_id, run_id):
+            return
+        try:
+            response = await self.app_server.cancel_agent(agent_id, run_id)
+        except Exception as exc:
+            bar.settle_stop(agent_id, run_id, None)
+            self.notify(
+                f"Failed to stop {agent_id}, run {run_id}: {exc}. "
+                "Retained output remains inspectable; retry or close the browser.",
+                severity="error",
+                markup=False,
+            )
+            return
+        bar.settle_stop(agent_id, run_id, response)
+        if response.outcome is CancelOutcome.FORBIDDEN:
+            self.notify(
+                f"Stop forbidden for {agent_id}, run {run_id}. "
+                "Retained output remains inspectable; close the browser.",
+                severity="error",
+                markup=False,
+            )
 
     def on_agent_bar_selection_requested(
         self, message: AgentBar.SelectionRequested
@@ -5980,7 +6504,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
                         if self._agent_bar is not None
                         else ""
                     ),
-                    live=agent_state(agent) == "running",
+                    live=agent_is_active(agent),
+                    show_message_timestamps=self.config.show_message_timestamps,
                 )
                 self._agent_transcript_viewer = viewer
                 self._chat_widget.display = False
@@ -6082,15 +6607,19 @@ class ChartreuxApp(App):  # noqa: PLR0904
             if self._cached_chat is not None:
                 self._cached_chat.display = True
             self._restore_conversation_chrome()
+            if self._agent_browser_anchor is not None:
+                await self._transcript.restore_anchor(
+                    self._messages_area, self._agent_browser_anchor
+                )
         if not restore_focus:
             self._agent_transcript_focus_target = None
             return
         target = self._agent_transcript_focus_target
         self._agent_transcript_focus_target = None
-        if target is not None and target.is_mounted:
-            self.call_after_refresh(target.focus)
-        elif self._agent_bar is not None and self._agent_bar.expanded:
+        if self._agent_bar is not None and self._agent_bar.expanded:
             self.call_after_refresh(self._agent_bar.focus)
+        elif target is not None and target.is_mounted:
+            self.call_after_refresh(lambda: target.focus(scroll_visible=False))
         elif self._chat_input_container is not None:
             if input_widget := self._chat_input_container.input_widget:
                 input_widget.set_app_focus(True)
@@ -6118,16 +6647,32 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if self._agent_bar is not None:
             self._agent_bar.display = bool(self._agent_bar.agents)
 
+    async def on_debug_console_closed(self, _message: DebugConsole.Closed) -> None:
+        await self._close_debug_console()
+
+    async def _close_debug_console(self) -> None:
+        console = self._debug_console
+        if console is None:
+            return
+        self._debug_console = None
+        await console.remove()
+        target = self._debug_console_focus_target
+        self._debug_console_focus_target = None
+        if (
+            target is not None
+            and target.is_mounted
+            and target.display
+            and target.can_focus
+        ):
+            self.call_after_refresh(target.focus)
+        else:
+            self.call_after_refresh(self._focus_current_bottom_app)
+
     async def action_toggle_debug_console(self, **kwargs: Any) -> None:
         if self._app_server is None:
             return
         if self._debug_console is not None:
-            await self._debug_console.remove()
-            self._debug_console = None
-            target = self._debug_console_focus_target
-            self._debug_console_focus_target = None
-            if target is not None and target.is_mounted and target.display:
-                self.call_after_refresh(target.focus)
+            await self._close_debug_console()
         else:
             from chartreux.cli.textual_ui.widgets.debug_console import DebugConsole
 
@@ -6137,8 +6682,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
             await self.mount(self._debug_console)
             if self._debug_console.has_class("-fullscreen"):
-                log_view = self._debug_console.query_one("#debug-console-log")
-                self.call_after_refresh(lambda: self.screen.set_focus(log_view))
+                self.call_after_refresh(self._debug_console._focus_fullscreen_log)
 
     def _get_chat_input(self) -> ChatInputContainer | None:
         input_widgets = self.query(ChatInputContainer)
@@ -6184,6 +6728,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     async def _begin_shutdown(self) -> None:
         self._shutdown_started = True
+        self._stop_usage_subscription()
+        if self._usage_tasks:
+            await asyncio.gather(*self._usage_tasks, return_exceptions=True)
         await self._request_agent_transcript_close(restore_focus=False)
         if self._app_server is not None:
             # Signal shutdown before waiting for or cancelling UI work, so a
@@ -6500,10 +7047,12 @@ def run_textual_ui(
     start_app_server: AppServerBootstrap,
     history_file: Path,
     startup: StartupOptions | None = None,
+    *,
+    close_app_server: Callable[[], Awaitable[None]] | None = None,
 ) -> SessionExitSummary | None:
     resolve_auto_theme()
 
-    async def run() -> SessionExitSummary | None:
+    async def run_owned() -> SessionExitSummary | None:
         from chartreux.app_server.host import AppServerHost
 
         app_server = await start_app_server()
@@ -6558,5 +7107,12 @@ def run_textual_ui(
                 startup=effective_startup,
             )
         return await _run_app_with_cleanup(app)
+
+    async def run() -> SessionExitSummary | None:
+        try:
+            return await run_owned()
+        finally:
+            if close_app_server is not None:
+                await close_app_server()
 
     return asyncio.run(run())

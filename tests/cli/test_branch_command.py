@@ -13,6 +13,8 @@ from tests.conftest import (
     build_test_chartreux_app,
     build_test_vibe_config,
 )
+from tests.mock.utils import mock_llm_chunk
+from tests.stubs.fake_backend import FakeBackend
 
 
 def _enabled_session_config(save_dir: Path) -> SessionLoggingConfig:
@@ -82,7 +84,11 @@ async def test_branch_surfaces_errors_without_switching_sessions(
 @pytest.mark.asyncio
 async def test_branch_writes_resumable_detached_session(tmp_path: Path) -> None:
     config = build_test_vibe_config(session_logging=_enabled_session_config(tmp_path))
-    app = build_test_chartreux_app(agent_loop=build_test_agent_loop(config=config))
+    app = build_test_chartreux_app(
+        agent_loop=build_test_agent_loop(
+            config=config, backend=FakeBackend(mock_llm_chunk(content="Hello."))
+        )
+    )
 
     async with app.run_test() as pilot:
         events = [event async for event in app.app_server.act("hello")]

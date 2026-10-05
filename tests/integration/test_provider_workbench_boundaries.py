@@ -134,7 +134,7 @@ async def test_workbench_ascii_chrome_cursor_and_feedback(config_dir: Path) -> N
         )
         screen._message = "Key saved."
         screen._feedback_kind = "success"
-        assert screen._feedback().plain.startswith("+ Saved:")
+        assert screen._feedback().plain.startswith("v Saved:")
         screen._message = "Failed to save key"
         screen._feedback_kind = "error"
         assert screen._feedback().plain.startswith("x Failed:")

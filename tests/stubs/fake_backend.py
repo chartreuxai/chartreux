@@ -12,8 +12,10 @@ from tests.mock.utils import mock_llm_chunk
 class FakeBackend:
     """Minimal async backend stub to drive Agent.act without network.
 
-    Provide a finite sequence of LLMResult objects to be returned by
-    `complete`. When exhausted, returns an empty assistant message.
+    Provide a finite sequence of chunks or streams for completion calls.
+    Exhaustion returns an empty assistant response, which the gateway rejects;
+    it is not a valid successful terminator. Tests wanting successful completion
+    must supply explicit terminal assistant content.
     """
 
     def __init__(
@@ -131,6 +133,7 @@ class FakeBackend:
                 chunk_agg += chunk
             return chunk_agg
 
+        # Exhaustion stays empty so the gateway rejects missing terminal content.
         return mock_llm_chunk(content="")
 
     async def complete_streaming(
@@ -160,6 +163,7 @@ class FakeBackend:
         if self._streams:
             stream = list(self._streams.pop(0))
         else:
+            # An exhausted stream is empty, not a successful terminal response.
             stream = [mock_llm_chunk(content="")]
         for chunk in stream:
             yield chunk

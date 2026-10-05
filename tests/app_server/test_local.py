@@ -31,6 +31,7 @@ import chartreux.app_server._sessions as _sessions
 from chartreux.app_server._turns import TurnController
 from chartreux.app_server._worktree_session import SessionWorktrees
 from chartreux.app_server.client import AppServerClient
+from chartreux.app_server.local import LocalHarness, LocalHarnessHost
 from chartreux.app_server.models import PublicHistoryEntry
 from chartreux.app_server.protocol import (
     AppServerResponseError,
@@ -67,6 +68,11 @@ from chartreux.app_server.protocol import (
 )
 from chartreux.app_server.session import AppServerSession
 from chartreux.app_server.transport import memory_transport_pair
+from chartreux.cli import programmatic
+from chartreux.core._usage_startup import (
+    StartupAccountingContext,
+    create_startup_accounting_context,
+)
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.config import (
     ChartreuxConfigSchema,
@@ -90,6 +96,7 @@ from chartreux.core.git.worktree import (
 import chartreux.core.git.worktree.record as worktree_record
 import chartreux.core.git.worktree.repository as worktree_module
 from chartreux.core.hooks.config import HookConfigResult
+from chartreux.core.llm import utility_completion
 from chartreux.core.session.resume_sessions import ResumeSessionInfo
 from chartreux.core.session.session_lease import SessionBusyError, SessionLease
 from chartreux.core.session.session_loader import SessionLoader
@@ -100,11 +107,15 @@ from chartreux.core.session.worktrees import (
     SessionWorktrees as WorktreeLifecycle,
     UseExistingWorktree,
 )
+from chartreux.core.usage import UsagePurpose
 from chartreux.utils import AgentEntrypoint
+from tests.app_server.test_usage_attribution import AttemptBackend, read_ledger
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
+from tests.mock.utils import mock_llm_chunk
 from tests.stubs.app_server import create_legacy_app_server, legacy_backend
 from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
+from tests.stubs.fake_mcp_registry import FakeMCPRegistry
 
 _CATALOG_FIELDS = {"models", "providers"}
 _ORDINARY_OVERRIDE_EXCLUDED_FIELDS = {*_CATALOG_FIELDS, "authorized_roots_by_project"}
@@ -149,6 +160,264 @@ class _FakeSessionBackendServices:
         self, method: str, params: ProtocolModel, response_type: type[ResultT]
     ) -> ResultT:
         raise AssertionError("test services do not serve client requests")
+
+
+async def _early_local_accounting(
+    workspace: Path, config_dir: Path
+) -> StartupAccountingContext:
+    context = await create_startup_accounting_context(
+        workspace, usage_dir=config_dir / "usage"
+    )
+    writer = context.early_writer()
+    try:
+        config = build_test_vibe_config()
+        await utility_completion.run_utility_completion(
+            config=config,
+            system_prompt="Name the worktree",
+            user_content="Fix the bug",
+            max_tokens=24,
+            request_timeout_seconds=1.5,
+            retry_budget_seconds=0,
+            accounting_sink=writer,
+            usage_attribution=context.attribution(config.get_active_model()),
+            purpose=UsagePurpose.WORKTREE_NAMING,
+        )
+    finally:
+        await writer.aclose()
+    return context
+
+
+def _configure_local_accounting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, logging_enabled: bool = False
+) -> None:
+    config = build_test_vibe_config(
+        session_logging=SessionLoggingConfig(
+            enabled=logging_enabled,
+            save_dir=str(tmp_path / "sessions"),
+            generate_titles=False,
+        )
+    )
+    monkeypatch.setattr(
+        runtime,
+        "build_default_orchestrator",
+        AsyncMock(return_value=FakeConfigOrchestrator(config)),
+    )
+    monkeypatch.setattr(
+        runtime.HarnessProcess,
+        "_build_mcp_registry_impl",
+        AsyncMock(return_value=FakeMCPRegistry()),
+    )
+    real_loop = runtime.AgentLoop
+
+    def build_loop(**kwargs: Any) -> AgentLoop:
+        return real_loop(
+            backend=AttemptBackend([mock_llm_chunk(content="answer")]), **kwargs
+        )
+
+    monkeypatch.setattr(runtime, "AgentLoop", build_loop)
+    monkeypatch.setattr(
+        utility_completion,
+        "create_backend",
+        lambda **_: AttemptBackend([mock_llm_chunk(content="fix-bug")]),
+    )
+
+
+@pytest.mark.parametrize("fail_output", [False, True])
+def test_programmatic_closes_owned_accounting_process(
+    config_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_output: bool
+) -> None:
+    _configure_local_accounting(monkeypatch, tmp_path)
+    harness = LocalHarness(
+        runtime.LocalHarnessOptions(
+            session_options=SessionOptions(cwd=str(tmp_path), headless=True)
+        )
+    )
+    monkeypatch.setattr(programmatic, "LocalHarness", lambda _: harness)
+    close = harness.close
+
+    async def probe_close() -> None:
+        await close()
+        process = harness._host._process
+        assert process is not None
+        assert process._closed
+        assert process.usage_service._closed
+        assert not process.usage_service._tasks
+        assert not process.usage_service._writers
+        assert not process._root_usage_writers
+        assert not process._root_usage_drains
+        assert not process._accounting_loops
+        assert not process._startup_producers
+
+    monkeypatch.setattr(harness, "close", probe_close)
+    if fail_output:
+        monkeypatch.setattr(
+            programmatic.ProgrammaticOutput,
+            "finalize",
+            Mock(side_effect=ValueError("output failed")),
+        )
+        with pytest.raises(ValueError, match="output failed"):
+            programmatic.run_programmatic(harness_options=harness._options, prompt="hi")
+    else:
+        assert (
+            programmatic.run_programmatic(harness_options=harness._options, prompt="hi")
+            == "answer"
+        )
+    assert len(list((config_dir / "usage").rglob("*.jsonl"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_local_root_close_retires_accounting_and_resume_reopens_ledger(
+    config_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_local_accounting(monkeypatch, tmp_path, logging_enabled=True)
+    harness = LocalHarnessHost()
+    options = runtime.LocalHarnessOptions(
+        session_options=SessionOptions(cwd=str(tmp_path), headless=True)
+    )
+    host = await harness.connect(options)
+    resumed_host = None
+    try:
+        session = await host.open_session()
+        root_id = session.session_id
+        async for _ in session.act("first"):
+            pass
+        process = harness._process
+        assert process is not None
+        writer = process._root_usage_writers[root_id]
+        paths = set((config_dir / "usage").rglob("*.jsonl"))
+        await session.close()
+        assert writer._closed
+        assert not process._closed
+        assert not process.usage_service._closed
+        assert root_id not in process._root_usage_writers
+        assert root_id not in process._root_accounting_owners
+        assert root_id not in process._accounting_loop_roots
+        assert not process._accounting_loops
+        assert set((config_dir / "usage").rglob("*.jsonl")) == paths
+        assert len(read_ledger(config_dir, root_id)) == 1
+
+        resumed_host = await harness.connect(
+            runtime.LocalHarnessOptions(
+                session_options=options.session_options,
+                session=runtime.ResumeSessionIntent(root_id),
+            )
+        )
+        resumed = await resumed_host.open_session()
+        assert resumed.session_id == root_id
+        assert process._root_usage_writers[root_id] is not writer
+        async for _ in resumed.act("second"):
+            pass
+        await resumed.close()
+        records = read_ledger(config_dir, root_id)
+        assert len(records) == 2
+        assert all(record.root_session_id == root_id for record in records)
+        assert set((config_dir / "usage").rglob("*.jsonl")) == paths
+        assert not process._root_usage_writers
+        assert not process._accounting_loops
+    finally:
+        await host.close()
+        if resumed_host is not None:
+            await resumed_host.close()
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_local_startup_contexts_survive_early_loop_and_stay_connection_owned(
+    config_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_local_accounting(monkeypatch, tmp_path)
+    contexts = [
+        await asyncio.to_thread(
+            asyncio.run, _early_local_accounting(tmp_path, config_dir)
+        )
+        for _ in range(2)
+    ]
+    harness = LocalHarnessHost()
+    hosts = []
+    sessions = []
+    try:
+        for context in contexts:
+            hosts.append(
+                await harness.connect(
+                    runtime.LocalHarnessOptions(
+                        session_options=SessionOptions(
+                            cwd=str(tmp_path), headless=True
+                        ),
+                        startup_accounting=context,
+                    )
+                )
+            )
+        # Reverse adoption order proves this isn't a process-wide next-root slot.
+        for host, context in reversed(list(zip(hosts, contexts, strict=True))):
+            session = await host.open_session()
+            sessions.append(session)
+            assert session.session_id == context.identity.root_session_id
+            assert context.state == "adopted"
+            async for _ in session.act("hello"):
+                pass
+            records = read_ledger(config_dir, session.session_id)
+            assert [record.purpose for record in records] == [
+                UsagePurpose.WORKTREE_NAMING,
+                UsagePurpose.CONVERSATION,
+            ]
+            assert all(
+                record.root_session_id == session.session_id for record in records
+            )
+        process = harness._process
+        assert process is not None
+        assert (await process.usage_service.aread()).selected.request_count == 4
+    finally:
+        for session in sessions:
+            await session.close()
+        for host in hosts:
+            await host.close()
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intent", ["resume", "continue", "disconnect", "failure"])
+async def test_local_unused_startup_context_is_abandoned_without_losing_usage(
+    config_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, intent: str
+) -> None:
+    _configure_local_accounting(monkeypatch, tmp_path)
+    context = await asyncio.to_thread(
+        asyncio.run, _early_local_accounting(tmp_path, config_dir)
+    )
+    session_intent: runtime.LocalSessionIntent = runtime.NewSessionIntent()
+    if intent == "resume":
+        session_intent = runtime.ResumeSessionIntent("missing-session")
+    elif intent == "continue":
+        session_intent = runtime.ContinueSessionIntent()
+    elif intent == "failure":
+        monkeypatch.setattr(
+            runtime,
+            "build_default_orchestrator",
+            AsyncMock(side_effect=ValueError("bad")),
+        )
+    harness = LocalHarnessHost()
+    host = await harness.connect(
+        runtime.LocalHarnessOptions(
+            session_options=SessionOptions(cwd=str(tmp_path), headless=True),
+            session=session_intent,
+            startup_accounting=context,
+        )
+    )
+    try:
+        if intent != "disconnect":
+            with pytest.raises(AppServerResponseError):
+                await host.open_session()
+        await host.close()
+        assert context.state == "abandoned"
+        records = read_ledger(config_dir, context.identity.root_session_id)
+        assert len(records) == 1
+        assert records[0].purpose == UsagePurpose.WORKTREE_NAMING
+        process = harness._process
+        assert process is not None
+        assert (await process.usage_service.reconcile()).selected.request_count == 1
+        assert context.identity.root_session_id not in process._root_usage_writers
+    finally:
+        await host.close()
+        await harness.close()
 
 
 def test_local_harness_options_preserves_client_positional_argument() -> None:
@@ -1939,14 +2208,17 @@ async def test_harness_process_configures_globals_once_and_shares_cache(
 
 @pytest.mark.asyncio
 async def test_runtime_is_built_only_when_session_start_crosses_json_rpc(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     process = runtime.HarnessProcess()
     agent_loop = build_test_agent_loop()
     blueprint = Mock()
     blueprint.config = agent_loop.config
+    blueprint.cwd = tmp_path
 
-    def build_root(*, session_id: str, session_lease: SessionLease) -> AgentLoop:
+    def build_root(
+        *, session_id: str, session_lease: SessionLease, **kwargs: Any
+    ) -> AgentLoop:
         del session_id
         agent_loop.replace_session_lease(session_lease)
         return agent_loop
@@ -1960,7 +2232,7 @@ async def test_runtime_is_built_only_when_session_start_crosses_json_rpc(
     )
     client = AppServerClient(client_transport, run_peer=harness.serve)
     client_info = ClientInfo(name="wire-client", version="1", entrypoint="programmatic")
-    options = SessionOptions(headless=True)
+    options = SessionOptions(headless=True, cwd=str(tmp_path.resolve()))
     capabilities = ClientCapabilities()
 
     assert build_blueprint.call_count == 0
@@ -1971,7 +2243,11 @@ async def test_runtime_is_built_only_when_session_start_crosses_json_rpc(
         session_options=options,
     )
     try:
-        build_blueprint.assert_called_once_with(options, client_info, capabilities)
+        build_blueprint.assert_called_once_with(
+            options.model_copy(update={"cwd": str(tmp_path.resolve())}),
+            client_info,
+            capabilities,
+        )
         blueprint.build.assert_called_once()
     finally:
         await session.close()

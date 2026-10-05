@@ -82,7 +82,9 @@ class PostToolFinalization:
     tool_presentation: ToolResultPresentation | None = None
     images: list[ImageAttachment] | None = None
     tool_error: str | None = None
-    duration_ms: float = 0.0
+    duration_ms: float | None = None
+    # Preserve the frozen seconds verbatim rather than round-tripping via ms.
+    duration: float | None = None
     initial_text: str = ""
 
 
@@ -220,7 +222,7 @@ class AgentLoopHooksMixin:
             tool_status=finalization.tool_status,
             tool_output=finalization.tool_output,
             tool_error=finalization.tool_error,
-            duration_ms=finalization.duration_ms,
+            duration_ms=finalization.duration_ms or 0.0,
             initial_text=finalization.initial_text,
         ):
             if isinstance(ev, HookTextReplacement):
@@ -229,13 +231,20 @@ class AgentLoopHooksMixin:
                 yield ev
         persisted_result = (
             PersistedToolResult(
-                output=finalization.tool_output,
-                duration=finalization.duration_ms / 1000.0,
+                output=finalization.tool_output or {},
+                duration=(
+                    finalization.duration
+                    if finalization.duration is not None
+                    else finalization.duration_ms / 1000.0
+                    if finalization.duration_ms is not None
+                    else None
+                ),
                 cancelled=finalization.tool_status == "cancelled",
                 presentation=finalization.tool_presentation,
             )
-            if finalization.response_status == "success"
-            and finalization.tool_output is not None
+            if finalization.tool_output is not None
+            or finalization.duration_ms is not None
+            or finalization.duration is not None
             else None
         )
         self._handle_tool_response(
@@ -377,6 +386,7 @@ class AgentLoopHooksMixin:
         cancel_text: str,
         *,
         tool_started: bool,
+        duration: float | None = None,
     ) -> AsyncGenerator[HookEvent]:
         """Shield post-tool hooks from cancellation so audit/redaction hooks
         still observe the cancelled call.  Yields ``HookEvent`` instances.
@@ -390,21 +400,31 @@ class AgentLoopHooksMixin:
         if not tool_started:
             self._handle_tool_response(tool_call, cancel_text)
             return
-        try:
-            final_text, hook_events = await asyncio.shield(
-                self._collect_post_tool_events(
-                    tool_call,
-                    tool_input=tool_input,
-                    tool_status="cancelled",
-                    tool_error=cancel_text,
-                    initial_text=cancel_text,
-                )
+        persisted_result = (
+            PersistedToolResult(output={}, duration=duration, cancelled=True)
+            if duration is not None
+            else None
+        )
+        collector = asyncio.create_task(
+            self._collect_post_tool_events(
+                tool_call,
+                tool_input=tool_input,
+                tool_status="cancelled",
+                tool_error=cancel_text,
+                duration_ms=duration * 1000.0 if duration is not None else 0.0,
+                initial_text=cancel_text,
             )
-            for ev in hook_events:
-                yield ev
-            self._handle_tool_response(tool_call, final_text)
-        except asyncio.CancelledError:
-            self._handle_tool_response(tool_call, cancel_text)
+        )
+        while True:
+            try:
+                final_text, hook_events = await asyncio.shield(collector)
+                break
+            except asyncio.CancelledError:
+                if collector.cancelled():
+                    raise
+        self._handle_tool_response(tool_call, final_text, persisted_result)
+        for ev in hook_events:
+            yield ev
 
     # ------------------------------------------------------------------
     # Post-turn hook dispatch

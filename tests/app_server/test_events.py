@@ -3,7 +3,7 @@ from __future__ import annotations
 from pydantic import JsonValue, ValidationError
 import pytest
 
-from chartreux.app_server._patch import apply_json_patch
+from chartreux.app_server._patch import apply_json_patch, is_timing_only_patch
 from chartreux.app_server._projector import EventProjector
 from chartreux.app_server.events import (
     AgentsUpdate,
@@ -214,6 +214,8 @@ def test_agents_update_carries_evictions() -> None:
                 profile="worker",
                 availability="evicted",
                 last_run_status="completed",
+                latest_run_id="run-1",
+                run_elapsed_seconds=252,
                 effective_model="strong",
                 effective_thinking="high",
                 result_expired=True,
@@ -239,6 +241,8 @@ def test_agents_update_carries_evictions() -> None:
     assert event == AgentsUpdate(params.agents, params.evictions)
     assert isinstance(event, AgentsUpdate)
     assert event.agents[0].last_run_status == "completed"
+    assert event.agents[0].run_elapsed_seconds == 252
+    assert event.agents[0].latest_run_id == "run-1"
     assert event.agents[0].result_expired
 
 
@@ -491,6 +495,51 @@ def test_tool_is_one_public_lifecycle_entry() -> None:
     assert isinstance(reduced.state, CompletedEffectState)
     assert isinstance(reduced.state.output, dict)
     assert reduced.state.output["content"] == "hello"
+
+
+def test_recovery_replays_duration_to_completed_untimed_consumer() -> None:
+    projector = EventProjector("session-1", "turn-1")
+    projection = _projection()
+    projection.consume(_notification(1, projector.project(_read_call())[0]))
+    terminal = projector.project(_read_result().model_copy(update={"duration": None}))
+    projection.consume(_notification(2, terminal[0]))
+    projector._patch(
+        "tool-1",
+        [JsonPatchOperation(op="replace", path="/state/durationMs", value=250)],
+    )  # Consumer missed the separate duration patch.
+    replay = projector.finalize(replay_timing=True)
+    projection.consume(_notification(3, replay[0]))
+    entry = projection.history[0]
+    assert isinstance(entry, PublicEffectEntry)
+    assert isinstance(entry.state, CompletedEffectState)
+    assert entry.state.duration_ms == 250
+
+
+@pytest.mark.parametrize("output", [{"n": True}, {"nested": [{"n": True}]}])
+def test_completed_state_replay_rejects_json_type_changes(output: dict) -> None:
+    projector = EventProjector("session-1", "turn-1")
+    projector.project(_read_call())
+    projector.project(_read_result())
+    entry = projector.history[0]
+    assert isinstance(entry, PublicEffectEntry)
+    assert isinstance(entry.state, CompletedEffectState)
+    frozen: JsonValue = {"n": 1} if "n" in output else {"nested": [{"n": 1}]}
+    entry.state.output = frozen
+    state = entry.state.model_dump(mode="json", by_alias=True)
+    state["output"] = output
+    with pytest.raises(ValueError, match="frozen"):
+        projector._patch(
+            entry.id, [JsonPatchOperation(op="replace", path="/state", value=state)]
+        )
+
+
+def test_noop_state_replace_requires_existing_field() -> None:
+    projector = EventProjector("session-1", "turn-1")
+    projector.project(AssistantEvent(content="done", message_id="message-1"))
+    assert not is_timing_only_patch(
+        projector.history[0],
+        [JsonPatchOperation(op="replace", path="/state", value=None)],
+    )
 
 
 def test_callback_entry_is_emitted_before_related_effect_is_blocked() -> None:

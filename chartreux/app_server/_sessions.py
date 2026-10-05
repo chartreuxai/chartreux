@@ -36,16 +36,25 @@ from chartreux.app_server.models import (
     CallbackOutput,
     OpenCallbackState,
     PublicCallbackEntry,
+    PublicCheckpointEntry,
+    PublicEntryGenerationStatus,
     PublicHistoryEntry,
     PublicSessionState,
     PublicTurn,
     PublicTurnQueue,
     PublicTurnStatus,
+    PublicTurnStopReason,
     TextContentBlock,
 )
 from chartreux.app_server.protocol import (
     AgentSummaryModel,
     CallbackResultError,
+    HistoryEntryAddedParams,
+    HistoryEntryUpdatedParams,
+    RunStopReason as PublicRunStopReason,
+    SessionCompactedParams,
+    StatsUpdatedParams,
+    TurnCompletedParams,
     TurnInterruptParams,
     TurnStartParams,
 )
@@ -69,10 +78,14 @@ from chartreux.core.subagents import (
     AgentProfileMismatchError,
     AgentResultExpiredError,
     AgentSummary,
+    CancelOutcome,
+    CancelResult,
     LaunchConfig,
     LaunchConfigError,
+    LaunchOutcome,
     ReleaseAgentOutcome,
     RunStatus,
+    RunStopReason,
     SubagentRunAccumulator,
     SubagentRunnerPort,
     TaskArgs,
@@ -131,6 +144,7 @@ class SessionRuntime:
     turns: TurnController
     execution: SessionExecution
     history: SessionHistory
+    retire_accounting: Callable[[], Awaitable[None]] | None = None
     _closed: bool = field(default=False, init=False, repr=False)
     _close_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 
@@ -172,6 +186,10 @@ class SessionRuntime:
             raise errors[0]
         if errors:
             raise BaseExceptionGroup("Failed to close session runtime", errors)
+        # Producers must settle before root writer retirement or child untracking;
+        # failed cleanup retains the accounting binding for retry.
+        if self.retire_accounting is not None:
+            await self.retire_accounting()
         self._closed = True
 
 
@@ -185,10 +203,14 @@ class RunRecord:
     task_summary: str | None = None
     start_count: int = 0
     result: TaskResult | None = None
+    started_at: float | None = None
     completed_at: float | None = None
     terminal_identity: tuple[str, str, str] | None = None
     progress_summaries: list[str] = field(default_factory=list)
     progress_overflow: bool = False
+    stop_reason: RunStopReason | None = None
+    requested_stop_reason: RunStopReason | None = None
+    initial_turn_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -212,6 +234,14 @@ class AgentRecord:
     base_model: str | None = None
     active_provider: str | None = None
     effective_thinking: str | None = None
+    context_tokens: int | None = None
+    context_window: int | None = None
+    compacting: bool = False
+    compaction_entry_id: str | None = None
+    stop_reason: RunStopReason | None = None
+    reserved_for_replacement: bool = False
+    replacement_owner: _ReplacementClaim | None = None
+    work_slot: _ActiveWorkSlot | None = None
 
     def effective_idle_ttl(self, global_ttl: int | float) -> int | float:
         return (
@@ -233,6 +263,17 @@ class AgentRecord:
             if value is AgentAvailability.RUNNING
             else _AgentState.IDLE
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplacementClaim:
+    record: AgentRecord
+    run: RunRecord
+    parent: SessionRuntime
+    parent_identity: tuple[str, int]
+    child_generation: int
+    authority_revision: int
+    slot: _ActiveWorkSlot
 
 
 @dataclass(frozen=True, slots=True)
@@ -1338,7 +1379,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             else None
         )
         return resolve_launch(
-            profile_name=(args.agent if "agent" in args.model_fields_set else profile),
+            profile_name=(
+                args.agent_type if "agent_type" in args.model_fields_set else profile
+            ),
             config=args.config,
             parent_orchestrator=(
                 child.config_orchestrator
@@ -1474,6 +1517,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             if (
                 self._agent_records.get(record.agent_id) is not record
                 or record.state is not _AgentState.RUNNING
+                or record.reserved_for_replacement
                 or record.runtime._closed is True
                 or self._children.get(record.session_id) is not record.runtime
             ):
@@ -1502,6 +1546,201 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         if any(fnmatch.fnmatch(profile, pattern) for pattern in config.denylist):
             raise ToolPermissionError(f"Task denied for agent profile: {profile}")
 
+    @staticmethod
+    def _replacement_refusal(record: AgentRecord, outcome: LaunchOutcome) -> TaskResult:
+        run = record.current_run
+        return TaskResult(
+            response=f"Replacement not launched: {outcome.value}",
+            turns_used=0,
+            completed=False,
+            launch_outcome=outcome,
+            agent_id=record.agent_id,
+            run_id=run.run_id if run is not None else record.latest_run_id,
+            stop_reason=run.requested_stop_reason
+            if run is not None
+            else record.stop_reason,
+        )
+
+    async def _reserve_replacement(
+        self, args: TaskArgs, ctx: InvokeContext
+    ) -> _ReplacementClaim | TaskResult | None:
+        if args.agent_id is None or not args.background:
+            raise ValueError("replace_run requires agent_id and background mode")
+        if ctx.is_subagent:
+            raise RuntimeError("Agent depth limit of 1 reached")
+        parent = self._runtime(ctx.session_id)
+        identity = (parent.agent_loop.session_id, parent.agent_loop._session_generation)
+        async with self._registry_lock:
+            self._validate_background_admission(parent, identity)
+            record = self._agent_records.get(args.agent_id)
+            if record is None:
+                if args.agent_id in self._evicted_agents:
+                    raise AgentEvictedError(
+                        f"Agent evicted: {args.agent_id}; start a new agent"
+                    )
+                raise UnknownAgentError(
+                    f"Unknown agent_id instance handle: {args.agent_id}. Check the agent_id with check_agents"
+                )
+            if ctx.session_id != record.parent_session_id:
+                raise ToolPermissionError(
+                    "Only the owning parent may replace this agent's run"
+                )
+            if (
+                "agent_type" in args.model_fields_set
+                and record.profile != args.agent_type
+            ):
+                raise AgentProfileMismatchError(
+                    f"Agent profile mismatch: expected {record.profile}, got {args.agent_type}"
+                )
+            self._require_task_profile_allowed(parent, record.profile)
+            if record.reserved_for_replacement:
+                return self._replacement_refusal(
+                    record, LaunchOutcome.REJECTED_RESERVATION
+                )
+            if record.state is _AgentState.IDLE:
+                return None
+            run = record.current_run
+            if (
+                record.state is _AgentState.FINALIZING
+                or run is None
+                or run.status is not RunStatus.RUNNING
+                or run.initial_turn_id is None
+                or record.runtime.turns.operation_pending_turn_id(run.initial_turn_id)
+                is None
+            ):
+                return self._replacement_refusal(
+                    record, LaunchOutcome.ALREADY_FINISHING
+                )
+            if run.requested_stop_reason is not None:
+                return self._replacement_refusal(record, LaunchOutcome.ALREADY_STOPPING)
+            if args.config is not None:
+                raise LaunchConfigError(
+                    "Busy replacement cannot change launch configuration"
+                )
+            if (
+                record.runtime._closed is True
+                or self._children.get(record.session_id) is not record.runtime
+                or not self._generation_is_current(record.root_generation)
+                or record.work_slot not in self._active_work_slots
+            ):
+                raise RuntimeError("Agent is no longer eligible for replacement")
+            assert record.work_slot is not None
+            claim = _ReplacementClaim(
+                record,
+                run,
+                parent,
+                identity,
+                record.runtime.agent_loop._session_generation,
+                parent.agent_loop._authority_revision,
+                record.work_slot,
+            )
+            run.requested_stop_reason = RunStopReason.RETASKED
+            record.reserved_for_replacement = True
+            record.replacement_owner = claim
+            return claim
+
+    def _validate_replacement_locked(self, claim: _ReplacementClaim) -> None:
+        record = claim.record
+        self._validate_background_admission(claim.parent, claim.parent_identity)
+        resident = (
+            self._agent_records.get(record.agent_id) is record
+            and self._children.get(record.session_id) is record.runtime
+            and record.runtime._closed is not True
+        )
+        authorized = (
+            record.runtime.agent_loop._session_generation == claim.child_generation
+            and claim.parent.agent_loop._authority_revision == claim.authority_revision
+            and record.parent_session_id == claim.parent_identity[0]
+            and self._generation_is_current(record.root_generation)
+        )
+        if (
+            not resident
+            or not authorized
+            or not record.reserved_for_replacement
+            or record.replacement_owner is not claim
+            or claim.slot not in self._active_work_slots
+        ):
+            raise RuntimeError("Agent replacement admission changed during handoff")
+        self._require_task_profile_allowed(claim.parent, record.profile)
+
+    def _clear_replacement_locked(self, record: AgentRecord) -> None:
+        record.reserved_for_replacement = False
+        record.replacement_owner = None
+        if record.current_run is None:
+            if record.work_slot is not None:
+                self._active_work_slots.discard(record.work_slot)
+            if self._agent_records.get(record.agent_id) is record:
+                latest = record.run_history[-1] if record.run_history else None
+                record.state = (
+                    _AgentState.IDLE
+                    if latest is None or latest.completion_task.done()
+                    else _AgentState.FINALIZING
+                )
+                record.idle_since = self._clock()
+                if latest is not None and not latest.completion_task.done():
+                    task = asyncio.create_task(
+                        self._finish_replacement_unwind(record, latest),
+                        name=f"vibe-subagent-replacement-unwind:{record.agent_id}",
+                    )
+                    self._teardown_tasks.add(task)
+                    task.add_done_callback(self._teardown_tasks.discard)
+        self._rearm_reaper_locked()
+
+    async def _finish_replacement_unwind(
+        self, record: AgentRecord, run: RunRecord
+    ) -> None:
+        # Cancellation may arrive after the monitor's idle/eviction decision,
+        # while its final agents update is still awaiting delivery.
+        with suppress(asyncio.CancelledError):
+            await asyncio.shield(run.completion_task)
+        async with self._registry_lock:
+            resident = (
+                self._agent_records.get(record.agent_id) is record
+                and self._children.get(record.session_id) is record.runtime
+                and self._generation_is_current(record.root_generation)
+            )
+            if (
+                resident
+                and record.latest_run_id == run.run_id
+                and record.current_run is None
+                and record.state is _AgentState.FINALIZING
+                and not record.reserved_for_replacement
+            ):
+                record.state = _AgentState.IDLE
+                record.idle_since = self._clock()
+                self._rearm_reaper_locked()
+
+    @asynccontextmanager
+    async def _replacement_handoff(
+        self, claim: _ReplacementClaim
+    ) -> AsyncIterator[None]:
+        try:
+            self._interrupt_run(claim.record, claim.run)
+            await asyncio.shield(claim.run.completion_task)
+            claim.slot.transferred = False
+            yield
+        finally:
+            # Retry lock acquisition on every cancellation: unwinding must finish
+            # before caller cancellation propagates, even under repeated interrupts.
+            cancelled = False
+            while True:
+                try:
+                    async with self._registry_lock:
+                        owner = claim.record.replacement_owner
+                        if owner is claim and claim.record.reserved_for_replacement:
+                            self._clear_replacement_locked(claim.record)
+                        elif owner is claim:
+                            claim.record.replacement_owner = None
+                        if (
+                            owner is None or owner is claim
+                        ) and not claim.slot.transferred:
+                            self._active_work_slots.discard(claim.slot)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError
+
     async def run(
         self,
         args: TaskArgs,
@@ -1509,6 +1748,38 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         *,
         defer_launch_agents_update: bool = False,
     ) -> AsyncGenerator[ToolStreamEvent | TaskResult, None]:
+        if args.replace_run:
+            claim = await self._reserve_replacement(args, ctx)
+            if isinstance(claim, TaskResult):
+                yield claim
+                return
+            if claim is not None:
+                async with self._replacement_handoff(claim):
+                    replacement_args = args.model_copy(
+                        update={
+                            "task": "This task supersedes the interrupted task.\n\n"
+                            + args.task
+                        }
+                    )
+                    launch = self._run_admitted(
+                        replacement_args,
+                        ctx,
+                        claim.slot,
+                        defer_launch_agents_update=defer_launch_agents_update,
+                        replacement=claim,
+                    )
+                    try:
+                        async for event in launch:
+                            yield event
+                    finally:
+                        await launch.aclose()
+                return
+        if args.agent_id is not None and args.background:
+            record = getattr(self, "_agent_records", {}).get(args.agent_id)
+            if record is not None and (
+                record.reserved_for_replacement or record.state is not _AgentState.IDLE
+            ):
+                raise AgentBusyError("Agent is already running a task")
         # Check and reserve without awaiting: concurrent creation/reuse attempts
         # consume capacity before they can allocate runtimes or call providers.
         if not hasattr(self, "_active_work_slots"):
@@ -1550,6 +1821,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         slot: _ActiveWorkSlot,
         *,
         defer_launch_agents_update: bool = False,
+        replacement: _ReplacementClaim | None = None,
     ) -> AsyncGenerator[ToolStreamEvent | TaskResult, None]:
         if ctx.is_subagent:
             raise RuntimeError("Agent depth limit of 1 reached")
@@ -1573,21 +1845,32 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                             raise AgentEvictedError(
                                 f"Agent evicted: {args.agent_id}; start a new agent"
                             )
-                        raise UnknownAgentError(f"Unknown agent: {args.agent_id}")
+                        raise UnknownAgentError(
+                            f"Unknown agent_id instance handle: {args.agent_id}. Check the agent_id with check_agents"
+                        )
                     if (
-                        "agent" in args.model_fields_set
-                        and record.profile != args.agent
+                        "agent_type" in args.model_fields_set
+                        and record.profile != args.agent_type
                     ):
                         raise AgentProfileMismatchError(
-                            f"Agent profile mismatch: expected {record.profile}, got {args.agent}"
+                            f"Agent profile mismatch: expected {record.profile}, got {args.agent_type}"
                         )
-                    if record.state is not _AgentState.IDLE:
+                    if replacement is not None:
+                        self._validate_replacement_locked(replacement)
+                        if record is not replacement.record:
+                            raise RuntimeError("Agent replacement residency changed")
+                    elif (
+                        record.reserved_for_replacement
+                        or record.state is not _AgentState.IDLE
+                    ):
                         raise AgentBusyError("Agent is already running a task")
                     if (
                         record.runtime._closed is True
                         or self._children.get(record.session_id) is not record.runtime
                     ):
-                        raise UnknownAgentError(f"Unknown agent: {args.agent_id}")
+                        raise UnknownAgentError(
+                            f"Unknown agent_id instance handle: {args.agent_id}. Check the agent_id with check_agents"
+                        )
                     self._require_task_profile_allowed(parent, record.profile)
                     previous_idle_since = record.idle_since
                     reserved_child_generation = (
@@ -1596,6 +1879,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     reserved_parent_authority_revision = (
                         parent.agent_loop._authority_revision
                     )
+                    record.reserved_for_replacement = False
+                    # Keep ownership through the launch acknowledgment: this
+                    # generator's finalizer may run after another retask reserves.
                     record.state = _AgentState.RUNNING
                     record.idle_since = None
                     self._rearm_reaper_locked()
@@ -1653,14 +1939,14 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                         raise
                 runtime = record.runtime
             else:
-                self._require_task_profile_allowed(parent, args.agent)
+                self._require_task_profile_allowed(parent, args.agent_type)
                 runtime, idle_ttl_seconds = await self._create_registered_child(
                     parent, args, ctx
                 )
                 agent_id = await self._issue_agent_id(parent)
                 record = AgentRecord(
                     agent_id=agent_id,
-                    profile=runtime.agent_loop.launch_profile or args.agent,
+                    profile=runtime.agent_loop.launch_profile or args.agent_type,
                     session_id=runtime.agent_loop.session_id,
                     runtime=runtime,
                     root_generation=parent.agent_loop._session_generation,
@@ -1686,6 +1972,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     raise
                 created_record = True
 
+            record.work_slot = slot
             agent_id = record.agent_id
             run_id = self._new_run_id(agent_id)
             prior_current_run = record.current_run
@@ -1733,6 +2020,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 turn_id, action = SessionRuntimeRegistry._start_child_turn(
                     runtime, args, ctx, runtime.agent_loop.session_id
                 )
+                run_record.initial_turn_id = turn_id
 
                 async def monitor() -> None:  # noqa: PLR0912, PLR0915
                     try:
@@ -1755,28 +2043,37 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                                 ),
                             }
                         )
-                        if turn.error is not None:
-                            run_record.status = RunStatus.FAILED
-                        elif turn.status is PublicTurnStatus.COMPLETED:
-                            run_record.status = RunStatus.COMPLETED
-                        else:
-                            run_record.status = RunStatus.CANCELLED
+                        run_record.status, run_record.stop_reason = (
+                            self._resolve_run_outcome(run_record, turn)
+                        )
                     except asyncio.CancelledError:
-                        run_record.status = RunStatus.CANCELLED
-                        run_record.result = TaskResult(
-                            response="",
-                            turns_used=0,
-                            completed=False,
-                            agent_id=agent_id,
-                            run_id=run_id,
-                            metadata=runtime.agent_loop.completion_metadata_since(
-                                completion_metadata_mark
-                            ),
+                        run_record.status, run_record.stop_reason = (
+                            self._resolve_run_outcome(
+                                run_record,
+                                runtime.turns.operation_terminal_turn(turn_id),
+                            )
+                        )
+                        run_record.result = accumulator.build_result(
+                            turns_used=sum(
+                                message.role is Role.assistant
+                                for message in runtime.agent_loop.messages
+                            )
+                            - run_record.start_count,
+                            completed=run_record.status is RunStatus.COMPLETED,
+                        ).model_copy(
+                            update={
+                                "agent_id": agent_id,
+                                "run_id": run_id,
+                                "metadata": runtime.agent_loop.completion_metadata_since(
+                                    completion_metadata_mark
+                                ),
+                            }
                         )
                         raise
                     except Exception as exc:
                         accumulator.record_error(str(exc))
                         run_record.status = RunStatus.FAILED
+                        run_record.stop_reason = RunStopReason.ERROR
                         run_record.result = accumulator.build_result(
                             turns_used=0, completed=False
                         ).model_copy(
@@ -1789,8 +2086,16 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                             }
                         )
                     finally:
+                        if run_record.result is not None:
+                            run_record.result = run_record.result.model_copy(
+                                update={"stop_reason": run_record.stop_reason}
+                            )
                         active_task = runtime.turns._active_task
-                        if active_task is not None and not active_task.done():
+                        if record.reserved_for_replacement:
+                            # The old execution is joined, but its allocation now
+                            # belongs to the handoff, including notification awaits.
+                            pass
+                        elif active_task is not None and not active_task.done():
                             # Release/drain may cancel the monitor before provider
                             # cancellation finishes; keep counting the actual work.
                             active_task.add_done_callback(
@@ -1823,6 +2128,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                                 or agent_id in self._suppressed_notifications
                             )
                             if resident:
+                                record.compacting = False
+                                record.compaction_entry_id = None
+                                record.stop_reason = run_record.stop_reason
                                 committed_model = runtime.agent_loop.committed_model
                                 record.base_model = (
                                     committed_model.base_model
@@ -1839,7 +2147,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                                     if committed_model is not None
                                     else None
                                 )
-                                record.state = _AgentState.FINALIZING
+                                record.state = (
+                                    _AgentState.RUNNING
+                                    if record.reserved_for_replacement
+                                    else _AgentState.FINALIZING
+                                )
                                 record.idle_since = run_record.completed_at
                                 record.last_task_summary = run_record.task_summary
                                 record.last_run_status = run_record.status
@@ -1891,10 +2203,21 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                                 return  # noqa: B012
                             # Notify the parent that a background run completed.
                             status_word = (
-                                "completed"
+                                "budget-stopped (budget exceeded)"
+                                if run_record.stop_reason
+                                is RunStopReason.BUDGET_EXCEEDED
+                                else "budget-stopped (budget unverifiable)"
+                                if run_record.stop_reason
+                                is RunStopReason.BUDGET_UNVERIFIABLE
+                                else "completed"
                                 if run_record.status is RunStatus.COMPLETED
                                 else "failed"
                                 if run_record.status is RunStatus.FAILED
+                                else "cancelled (by user)"
+                                if run_record.stop_reason
+                                is RunStopReason.USER_CANCELLED
+                                else "retasked"
+                                if run_record.stop_reason is RunStopReason.RETASKED
                                 else "cancelled"
                             )
                             notification = (
@@ -1903,7 +2226,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                                 " Use get_agent_result to retrieve the result."
                             )
                             if (
-                                parent.turns.active_turn is None
+                                run_record.stop_reason
+                                is not RunStopReason.USER_CANCELLED
+                                and parent.turns.active_turn is None
                                 and parent.turns._active_task is None
                                 and not parent.turns.queue_state.items
                             ):
@@ -1944,6 +2269,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                                 if (
                                     self._agent_records.get(agent_id) is record
                                     and self._children.get(record.session_id) is runtime
+                                    and not record.reserved_for_replacement
                                     and record.state is _AgentState.FINALIZING
                                     and self._generation_is_current(
                                         record.root_generation
@@ -1973,10 +2299,18 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                                                     initial_task_summary=record.initial_task_summary,
                                                     current_task_summary=run_record.task_summary,
                                                     idle_seconds=0.0,
+                                                    latest_run_id=run_id,
+                                                    run_elapsed_seconds=self._run_elapsed_seconds(
+                                                        run_record, self._clock()
+                                                    ),
                                                     effective_model=record.effective_model,
                                                     base_model=record.base_model,
                                                     active_provider=record.active_provider,
                                                     effective_thinking=record.effective_thinking,
+                                                    context_tokens=record.context_tokens,
+                                                    context_window=record.context_window,
+                                                    compacting=False,
+                                                    stop_reason=record.stop_reason,
                                                     result_expired=(agent_id, run_id)
                                                     in self._expired_results,
                                                 ),
@@ -2017,6 +2351,14 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                         or runtime._closed is True
                     ):
                         raise RuntimeError("Agent admission changed before launch")
+                    if reserved_child_generation is not None and (
+                        runtime.agent_loop._session_generation
+                        != reserved_child_generation
+                        or parent.agent_loop._authority_revision
+                        != reserved_parent_authority_revision
+                    ):
+                        raise RuntimeError("Agent authority changed before launch")
+                    self._require_task_profile_allowed(parent, record.profile)
                     self._result_write_tokens[(agent_id, run_id)] = publication_token
                 monitor_coro = monitor()
                 try:
@@ -2027,6 +2369,15 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     monitor_coro.close()
                     raise
                 run_record.completion_task = completion
+
+                def settle_prepared_waiters(_task: asyncio.Task[None]) -> None:
+                    # A waiter can snapshot the prepared run before its monitor
+                    # is installed. Keep that admission-time future linked to
+                    # the same completion, including a prepared-start stop.
+                    if not completion_placeholder.done():
+                        completion_placeholder.set_result(None)
+
+                completion.add_done_callback(settle_prepared_waiters)
                 self._monitor_tasks.add(completion)
                 completion.add_done_callback(self._monitor_tasks.discard)
                 assert action is not None
@@ -2037,6 +2388,13 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                         )
                     )
                 action()
+                run_record.started_at = self._clock()
+                record.stop_reason = None
+                record.compacting = False
+                record.compaction_entry_id = None
+                record.context_window = (
+                    runtime.agent_loop.config.get_active_model().auto_compact_threshold
+                )
                 if prepared_reconfiguration is not None:
                     # Acceptance makes the new envelope authoritative in memory
                     # before persistence can block on the logger save lock.
@@ -2134,24 +2492,35 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             yield TaskResult(
                 response=(
                     "Background agent launched and running; use check_agents to monitor, "
-                    "get_agent_result or wait_for_agent to retrieve the result."
+                    "get_agent_result or wait_for_agent to retrieve the result. "
+                    f'To continue this instance, use task(agent_id="{agent_id}", '
+                    'background=true, task="...").'
                 ),
                 turns_used=0,
                 completed=True,
                 status="launched",
+                launch_outcome=LaunchOutcome.LAUNCHED,
                 agent_id=agent_id,
                 run_id=run_id,
                 metadata={
                     "base_model": record.base_model,
                     "active_provider": record.active_provider,
                     "effective_model": record.effective_model,
+                    **(
+                        {
+                            "replaced_run_id": replacement.run.run_id,
+                            "replacement_run_id": run_id,
+                        }
+                        if replacement is not None
+                        else {}
+                    ),
                 },
             )
             return
 
         if args.agent_id is not None:
             raise ValueError("agent_id is only supported for background tasks")
-        self._require_task_profile_allowed(parent, args.agent)
+        self._require_task_profile_allowed(parent, args.agent_type)
         runtime, _idle_ttl_seconds = await self._create_registered_child(
             parent, args, ctx
         )
@@ -2250,7 +2619,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     link = ChildSessionLink(
                         session_id=child.session_id,
                         tool_call_id=tool_call_id,
-                        agent=child.launch_profile or args.agent,
+                        agent=child.launch_profile or args.agent_type,
                         relative_path=str(child_dir.relative_to(parent_dir)),
                     )
                     self._stored_children[child.session_id] = StoredChildSession(
@@ -2323,6 +2692,12 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             return record.run_history[-1].result.turns_used
         return None
 
+    def _run_elapsed_seconds(self, run: RunRecord | None, now: float) -> float | None:
+        if run is None or run.started_at is None:
+            return None
+        end = run.completed_at if run.completed_at is not None else now
+        return max(0.0, end - run.started_at)
+
     def _agent_summaries(self) -> list[AgentSummary]:
         now = self._clock()
         global_ttl = (
@@ -2363,6 +2738,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                         else record.last_task_summary
                     ),
                     idle_seconds=idle_seconds,
+                    latest_run_id=latest_run_id,
+                    run_elapsed_seconds=self._run_elapsed_seconds(
+                        run or (record.run_history[-1] if record.run_history else None),
+                        now,
+                    ),
                     ttl_remaining_seconds=(
                         max(0.0, ttl - idle_seconds)
                         if ttl and idle_seconds is not None
@@ -2372,6 +2752,10 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     base_model=record.base_model,
                     active_provider=record.active_provider,
                     effective_thinking=record.effective_thinking,
+                    context_tokens=record.context_tokens,
+                    context_window=record.context_window,
+                    compacting=record.compacting,
+                    stop_reason=record.stop_reason,
                     result_expired=(
                         (record.agent_id, latest_run_id) in self._expired_results
                         if latest_run_id is not None
@@ -2410,11 +2794,21 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     initial_task_summary=summary.initial_task_summary,
                     current_task_summary=summary.current_task_summary,
                     idle_seconds=summary.idle_seconds,
+                    latest_run_id=summary.latest_run_id,
+                    run_elapsed_seconds=summary.run_elapsed_seconds,
                     ttl_remaining_seconds=summary.ttl_remaining_seconds,
                     effective_model=summary.effective_model,
                     base_model=summary.base_model,
                     active_provider=summary.active_provider,
                     effective_thinking=summary.effective_thinking,
+                    context_tokens=summary.context_tokens,
+                    context_window=summary.context_window,
+                    compacting=summary.compacting,
+                    stop_reason=(
+                        PublicRunStopReason(summary.stop_reason.value)
+                        if summary.stop_reason is not None
+                        else None
+                    ),
                     result_expired=summary.result_expired,
                 )
                 for summary in self._agent_summaries()
@@ -2426,6 +2820,139 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         async with self._registry_lock:
             self._expire_results_locked()
             return self._agent_summaries()
+
+    @staticmethod
+    def _interrupt_run(record: AgentRecord, run: RunRecord) -> bool:
+        """Non-destructive and operation-pinned; release owns fallback teardown."""
+        if run.initial_turn_id is None:
+            return False
+        return record.runtime.turns.interrupt_operation(run.initial_turn_id)
+
+    async def cancel_run(  # noqa: PLR0911
+        self,
+        agent_id: str,
+        run_id: str | None = None,
+        *,
+        reason: RunStopReason,
+        requester_session_id: str,
+    ) -> CancelResult:
+        async with self._registry_lock:
+            # Only the server's user route supplies USER_CANCELLED. Tool stops
+            # retain parent ownership; users may stop any run in this registry.
+            user_cancel = reason is RunStopReason.USER_CANCELLED
+            record = self._agent_records.get(agent_id)
+            tombstone = self._evicted_agents.get(agent_id)
+            if record is None and tombstone is None:
+                if (
+                    not user_cancel
+                    and agent_id in self._children
+                    and not any(
+                        item.session_id == agent_id
+                        for item in self._agent_records.values()
+                    )
+                ):
+                    raise ValueError(
+                        "Foreground agents cannot be stopped with cancel_agent; "
+                        "only background runs are supported"
+                    )
+                return CancelResult(outcome=CancelOutcome.UNKNOWN_RUN, run_id=run_id)
+            if self._admission_closed or self._draining_children:
+                return CancelResult(outcome=CancelOutcome.FORBIDDEN, run_id=run_id)
+            if record is None:
+                assert tombstone is not None
+                summary = tombstone.summary
+                if (
+                    not user_cancel
+                    and requester_session_id != tombstone.parent_identity[0]
+                ):
+                    return CancelResult(outcome=CancelOutcome.FORBIDDEN, run_id=run_id)
+                return CancelResult(
+                    outcome=CancelOutcome.NOT_RUNNING,
+                    run_id=summary.latest_run_id or summary.current_run_id,
+                    stop_reason=summary.stop_reason,
+                )
+            if not user_cancel and requester_session_id != record.parent_session_id:
+                return CancelResult(outcome=CancelOutcome.FORBIDDEN, run_id=run_id)
+            if run_id is None:
+                run_id = (
+                    record.current_run.run_id
+                    if record.current_run is not None
+                    else record.latest_run_id
+                )
+            run = next(
+                (
+                    item
+                    for item in [record.current_run, *record.run_history]
+                    if item is not None and item.run_id == run_id
+                ),
+                None,
+            )
+            key = (agent_id, run_id)
+            if run is None and run_id != record.latest_run_id:
+                if key not in self._result_store and key not in self._expired_results:
+                    return CancelResult(
+                        outcome=CancelOutcome.UNKNOWN_RUN, run_id=run_id
+                    )
+            if (
+                record.state is _AgentState.FINALIZING
+                and run_id == record.latest_run_id
+            ):
+                return CancelResult(
+                    outcome=CancelOutcome.ALREADY_FINISHING,
+                    run_id=run_id,
+                    stop_reason=record.stop_reason,
+                )
+            if (
+                run is not None
+                and record.current_run is run
+                and record.state is _AgentState.RUNNING
+                and (
+                    run.initial_turn_id is None
+                    or record.runtime.turns.operation_pending_turn_id(
+                        run.initial_turn_id
+                    )
+                    is None
+                )
+            ):
+                return CancelResult(
+                    outcome=CancelOutcome.ALREADY_FINISHING,
+                    run_id=run_id,
+                    stop_reason=run.stop_reason,
+                )
+            if (
+                run is None
+                or record.current_run is not run
+                or record.state is not _AgentState.RUNNING
+                or run.status is not RunStatus.RUNNING
+            ):
+                return CancelResult(
+                    outcome=CancelOutcome.NOT_RUNNING,
+                    run_id=run_id,
+                    stop_reason=run.stop_reason if run is not None else None,
+                )
+            if run.requested_stop_reason is not None:
+                return CancelResult(
+                    outcome=CancelOutcome.ALREADY_STOPPING,
+                    run_id=run_id,
+                    stop_reason=run.requested_stop_reason,
+                )
+            run.requested_stop_reason = reason
+        # This helper is synchronous: no scheduling gap between arbitration and
+        # interruption, no lock across cleanup awaits, and no monitor cancellation.
+        if not self._interrupt_run(record, run):
+            # No await separates the latch from delivery; a failed delivery did
+            # not accept a stop and must not leave a misleading stopping latch.
+            run.requested_stop_reason = None
+            return CancelResult(
+                outcome=CancelOutcome.ALREADY_FINISHING,
+                run_id=run.run_id,
+                stop_reason=run.stop_reason,
+            )
+        return CancelResult(
+            outcome=CancelOutcome.STOP_REQUESTED,
+            run_id=run.run_id,
+            stop_reason=run.requested_stop_reason,
+        )
 
     def _resolve_run(
         self, agent_id: str, run_id: str | None
@@ -2544,6 +3071,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             record
             for record in self._agent_records.values()
             if record.state is _AgentState.IDLE
+            and not record.reserved_for_replacement
             and record.idle_since is not None
             and self._generation_is_current(record.root_generation)
         ]
@@ -2654,6 +3182,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             if (
                 record is None
                 or record.state is not _AgentState.IDLE
+                or record.reserved_for_replacement
                 or not self._generation_is_current(record.root_generation)
             ):
                 return False
@@ -2695,10 +3224,16 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     initial_task_summary=record.initial_task_summary,
                     current_task_summary=run.task_summary if run is not None else None,
                     idle_seconds=idle_duration,
+                    latest_run_id=latest_run_id,
+                    run_elapsed_seconds=self._run_elapsed_seconds(run, self._clock()),
                     effective_model=record.effective_model,
                     base_model=record.base_model,
                     active_provider=record.active_provider,
                     effective_thinking=record.effective_thinking,
+                    context_tokens=record.context_tokens,
+                    context_window=record.context_window,
+                    compacting=record.compacting,
+                    stop_reason=record.stop_reason,
                     result_expired=(agent_id, latest_run_id) in self._expired_results
                     if latest_run_id is not None
                     else False,
@@ -2827,6 +3362,8 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         async with self._registry_lock:  # noqa: PLR1702
             self._acquire_notification_suppression(agent_id)
             record = self._agent_records.pop(agent_id, None)
+            if record is not None and record.reserved_for_replacement:
+                self._clear_replacement_locked(record)
             known_evicted = self._evicted_agents.pop(agent_id, None) is not None
             release_generation = (
                 record.root_generation
@@ -2875,15 +3412,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                             task.cancel()
                         try:
                             if current_run is not None:
-                                active_turn = record.runtime.turns.active_turn
-                                if active_turn is not None:
-                                    record.runtime.turns.interrupt(
-                                        TurnInterruptParams(
-                                            session_id=active_turn.session_id,
-                                            expected_turn_id=active_turn.id,
-                                        )
-                                    )
-                                elif current_run.status is RunStatus.RUNNING:
+                                interrupted = self._interrupt_run(record, current_run)
+                                if (
+                                    not interrupted
+                                    and current_run.status is RunStatus.RUNNING
+                                ):
                                     await record.runtime.turns.close()
                             if monitor_tasks:
                                 await asyncio.gather(
@@ -2962,6 +3495,153 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             else ReleaseAgentOutcome.RELEASED
         )
 
+    @classmethod
+    def _resolve_run_outcome(
+        cls, run: RunRecord, turn: PublicTurn | None = None
+    ) -> tuple[RunStatus, RunStopReason | None]:
+        """Requested reasons attribute interruption, never completion or failure."""
+        if turn is None:
+            status = (
+                run.status
+                if run.status is not RunStatus.RUNNING
+                else RunStatus.CANCELLED
+            )
+            inferred = run.stop_reason
+            if inferred is None and status is RunStatus.CANCELLED:
+                inferred = RunStopReason.ORCHESTRATOR_CANCELLED
+            elif inferred is None and status is RunStatus.FAILED:
+                inferred = RunStopReason.ERROR
+        else:
+            status = (
+                RunStatus.FAILED
+                if turn.error is not None or turn.status is PublicTurnStatus.FAILED
+                else RunStatus.COMPLETED
+                if turn.status is PublicTurnStatus.COMPLETED
+                else RunStatus.CANCELLED
+            )
+            inferred = cls._run_stop_reason(turn)
+        reason = (
+            run.requested_stop_reason or inferred
+            if status is RunStatus.CANCELLED
+            else inferred
+        )
+        return status, reason
+
+    @staticmethod
+    def _run_stop_reason(turn: PublicTurn) -> RunStopReason | None:
+        if turn.stop_reason is PublicTurnStopReason.LIMIT:
+            return RunStopReason.BUDGET_EXCEEDED
+        if turn.stop_reason is not None:
+            return RunStopReason(turn.stop_reason.value)
+        if turn.error is not None or turn.status is PublicTurnStatus.FAILED:
+            return RunStopReason.ERROR
+        if turn.status is PublicTurnStatus.INTERRUPTED:
+            return RunStopReason.USER_CANCELLED
+        return None
+
+    async def _capture_child_notification(  # noqa: PLR0912
+        self,
+        runtime: SessionRuntime,
+        record: AgentRecord | None,
+        run: RunRecord | None,
+        params: ProtocolModel,
+    ) -> None:
+        # The sink may await arbitrary transport work. Recheck the exact claim,
+        # not just the session id, so reuse and teardown cannot revive old updates.
+        async with self._registry_lock:
+            if record is None or run is None:
+                return
+            if (
+                self._agent_records.get(record.agent_id) is not record
+                or record.runtime is not runtime
+                or self._children.get(record.session_id) is not runtime
+                or record.current_run is not run
+            ):
+                return
+            if (
+                record.state is not _AgentState.RUNNING
+                or runtime._closed
+                or self._draining_children
+                or record.agent_id in self._suppressed_notifications
+                or not self._generation_is_current(record.root_generation)
+            ):
+                return
+            if getattr(params, "session_id", None) != record.session_id:
+                return
+            turn_id = getattr(params, "turn_id", None)
+            active_turn = runtime.turns.active_turn
+            if turn_id is not None and (
+                active_turn is None or turn_id != active_turn.id
+            ):
+                return
+            before = (
+                record.context_tokens,
+                record.context_window,
+                record.compacting,
+                record.stop_reason,
+            )
+            if isinstance(params, StatsUpdatedParams):
+                record.context_tokens = (
+                    params.stats.context_tokens
+                    if params.stats.context_tokens >= 0
+                    else None
+                )
+                record.context_window = params.context_window
+            elif isinstance(params, HistoryEntryAddedParams):
+                entry = params.entry
+                if (
+                    isinstance(entry, PublicCheckpointEntry)
+                    and entry.kind == "compaction"
+                    and entry.generation_status
+                    is PublicEntryGenerationStatus.IN_PROGRESS
+                ):
+                    record.compacting = True
+                    record.compaction_entry_id = entry.id
+            elif isinstance(params, SessionCompactedParams):
+                # This precedes stats and the completed checkpoint patch. Never
+                # expose the old numerator with activity already cleared.
+                record.context_tokens = None
+                record.compacting = False
+                record.compaction_entry_id = None
+            elif isinstance(params, HistoryEntryUpdatedParams):
+                if params.entry_id == record.compaction_entry_id and any(
+                    patch.path == "/generationStatus" and patch.value == "completed"
+                    for patch in params.patch
+                ):
+                    # Finalization also completes checkpoints on error. Only
+                    # CompactEndEvent supplies structured summary details; use
+                    # that proof when logging-off compaction has no ID handoff.
+                    succeeded = any(
+                        patch.path == "/details"
+                        and isinstance(patch.value, dict)
+                        and "summaryLength" in patch.value
+                        and "oldSessionId" in patch.value
+                        and "newSessionId" in patch.value
+                        for patch in params.patch
+                    )
+                    if succeeded:
+                        record.context_tokens = None
+                        record.compacting = False
+                    record.compaction_entry_id = None
+            elif isinstance(params, TurnCompletedParams):
+                if active_turn is not None and params.turn.id != active_turn.id:
+                    return
+                record.compacting = False
+                record.compaction_entry_id = None
+                _, run.stop_reason = self._resolve_run_outcome(run, params.turn)
+                record.stop_reason = run.stop_reason
+            after = (
+                record.context_tokens,
+                record.context_window,
+                record.compacting,
+                record.stop_reason,
+            )
+        if before != after:
+            try:
+                await self._emit_agents_update()
+            except Exception as exc:
+                logger.warning("Failed to publish child context update", exc_info=exc)
+
     def _build_child_runtime(
         self,
         child: AgentLoop,
@@ -2978,9 +3658,25 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 raise RuntimeError("Child session runtime is not bound")
             return self._public_state(runtime, 200)
 
+        async def notify_child(method: str, params: ProtocolModel) -> None:
+            bound = runtime
+            record = next(
+                (
+                    record
+                    for record in self._agent_records.values()
+                    if record.runtime is bound
+                ),
+                None,
+            )
+            run = record.current_run if record is not None else None
+            generation = child._session_generation
+            await self._notify_child(method, params)
+            if bound is not None and child._session_generation == generation:
+                await self._capture_child_notification(bound, record, run, params)
+
         turns = TurnController(
             child,
-            self._notify_child,
+            notify_child,
             self._deliver_callback,
             execution,
             self,
@@ -2989,7 +3685,15 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             event_sink=event_sink,
             session_coordinator=self,
         )
-        runtime = SessionRuntime(child, turns, execution, history)
+        runtime = SessionRuntime(
+            child,
+            turns,
+            execution,
+            history,
+            retire_accounting=lambda: self._runtime_factory.retire_child_accounting(
+                child
+            ),
+        )
         return runtime
 
     def _runtime(self, session_id: str | None) -> SessionRuntime:
@@ -3028,8 +3732,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             ):
                 reasons.append("a decision is pending")
             if self._creating_children or any(
-                record.current_run is not None
-                and record.current_run.status is RunStatus.RUNNING
+                (
+                    record.current_run is not None
+                    and record.current_run.status is RunStatus.RUNNING
+                )
+                or record.reserved_for_replacement
                 for record in self._agent_records.values()
             ):
                 reasons.append("background agents are running")
@@ -3050,6 +3757,10 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
     async def drain_children(self) -> None:  # noqa: PLR0912, PLR0915
         self._require_policy_unreserved()
         self._draining_children = True
+        async with self._registry_lock:
+            for record in self._agent_records.values():
+                if record.reserved_for_replacement:
+                    self._clear_replacement_locked(record)
         errors: list[BaseException] = []
         try:
             reaper = self._reaper_task

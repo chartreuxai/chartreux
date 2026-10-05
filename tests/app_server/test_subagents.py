@@ -26,6 +26,7 @@ from chartreux.app_server._turns import TurnController
 from chartreux.app_server.events import AgentsUpdate, CallbackRequested, TurnCompleted
 from chartreux.app_server.models import (
     CompletedEffectState,
+    FailedEffectState,
     PublicCheckpointEntry,
     PublicEffectEntry,
     PublicMessageEntry,
@@ -34,6 +35,7 @@ from chartreux.app_server.models import (
     PublicTurnStatus,
     SubagentEffectDetail,
     TextContentBlock,
+    TurnErrorCode,
     UserAnswer,
     UserInputCallbackOutput,
     UserQuestionResult,
@@ -50,8 +52,10 @@ from chartreux.app_server.session import AppServerSession
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config import SessionLoggingConfig
+from chartreux.core.events import AssistantEvent
 from chartreux.core.llm_models import FunctionCall, LLMChunk, LLMMessage, Role, ToolCall
 from chartreux.core.message_list import MessageList
+from chartreux.core.middleware import AutoCompactMiddleware
 from chartreux.core.session.session_loader import MESSAGES_FILENAME, SessionLoader
 from chartreux.core.session.session_logger import SessionLogger
 from chartreux.core.session_types import ChildSessionLink
@@ -62,10 +66,14 @@ from chartreux.core.subagents import (
     AgentProfileMismatchError,
     AgentResultExpiredError,
     AgentSummary,
+    CancelOutcome,
+    EmptySubagentResponseError,
     LaunchConfig,
     LaunchConfigError,
+    LaunchOutcome,
     LaunchToolOverride,
     RunStatus,
+    RunStopReason,
     TaskArgs,
     TaskResult,
     UnknownAgentError,
@@ -102,7 +110,7 @@ def _task_call(
 ) -> ToolCall:
     arguments: dict[str, object] = {
         "task": "Inspect the project",
-        "agent": agent,
+        "agent_type": agent,
         "background": background,
     }
     if agent_id is not None:
@@ -142,7 +150,7 @@ class BlockingBackend(FakeBackend):
         self.started.set()
         try:
             await self.release.wait()
-            return mock_llm_chunk(content="")
+            return mock_llm_chunk(content="Child completed")
         finally:
             self.stopped.set()
 
@@ -211,6 +219,1291 @@ async def _background_result(
     return cast(TaskResult, [result async for result in registry.run(args, ctx)][-1])
 
 
+class RetaskBackend(BlockingBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cleanup_started = asyncio.Event()
+        self.cleanup_release = asyncio.Event()
+        self.replacement_started = asyncio.Event()
+        self.calls = 0
+
+    async def complete(self, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            self.started.set()
+            try:
+                await self.release.wait()
+                return mock_llm_chunk(content="old result")
+            finally:
+                self.cleanup_started.set()
+                await self.cleanup_release.wait()
+                self.stopped.set()
+        assert self.stopped.is_set(), "Replacement overlapped old cleanup"
+        self.replacement_started.set()
+        await self.release.wait()
+        return await FakeBackend.complete(self, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retain", [False, True])
+@pytest.mark.parametrize("compacting", [False, True])
+async def test_busy_retask_transfers_capacity_and_preserves_conversation(
+    monkeypatch: pytest.MonkeyPatch, retain: bool, compacting: bool
+) -> None:
+    backend = RetaskBackend()
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    registry._max_running_subagents = 1
+    if retain:
+        registry._retention_policy = (1000, 10)
+    ctx = InvokeContext(tool_call_id="retask", session_id=parent.session_id)
+    replacement = None
+    finalized, finalize_release = asyncio.Event(), asyncio.Event()
+    try:
+        old = await _background_result(registry, TaskArgs(task="old task"), ctx)
+        assert old.agent_id is not None and old.run_id is not None
+        record = registry._agent_records[old.agent_id]
+        record.compacting = compacting
+        old_run, slot, session = record.current_run, record.work_slot, record.session_id
+        assert old_run is not None
+        await asyncio.wait_for(backend.started.wait(), 2)
+
+        async def gate_update(*_args):
+            if record.reserved_for_replacement and record.current_run is None:
+                finalized.set()
+                await finalize_release.wait()
+
+        registry._notify_agents = gate_update
+        replacement = asyncio.create_task(
+            _background_result(
+                registry,
+                TaskArgs(task="new task", agent_id=old.agent_id, replace_run=True),
+                ctx,
+            )
+        )
+        await asyncio.wait_for(backend.cleanup_started.wait(), 2)
+        assert record.reserved_for_replacement
+        assert not backend.replacement_started.is_set()
+        with pytest.raises(RuntimeError, match="cap 1"):
+            await _background_result(registry, TaskArgs(task="competitor"), ctx)
+        competing = await _background_result(
+            registry,
+            TaskArgs(task="competitor", agent_id=old.agent_id, replace_run=True),
+            ctx,
+        )
+        assert competing.launch_outcome is LaunchOutcome.REJECTED_RESERVATION
+        with pytest.raises(AgentBusyError):
+            await _background_result(
+                registry, TaskArgs(task="reuse", agent_id=old.agent_id), ctx
+            )
+        backend.cleanup_release.set()
+        await asyncio.wait_for(finalized.wait(), 2)
+        assert not replacement.done() and record.state is _AgentState.RUNNING
+        assert registry._active_work_slots == {slot}
+        assert not registry._eligible_idle_locked()
+        assert not await registry._evict_agent(record.agent_id, "ttl")
+        assert await registry.get_agent_result(old.agent_id, old.run_id) is not None
+        with pytest.raises(RuntimeError, match="cap 1"):
+            await _background_result(registry, TaskArgs(task="gap competitor"), ctx)
+        assert registry._root is not None
+        with pytest.raises(RuntimeError, match="background agents are running"):
+            await registry.reserve_resume_admission(registry._root)
+        finalize_release.set()
+        new = await asyncio.wait_for(replacement, 2)
+        await asyncio.wait_for(backend.replacement_started.wait(), 2)
+        assert new.status == "launched" and new.launch_outcome is LaunchOutcome.LAUNCHED
+        assert new.metadata is not None
+        assert new.metadata["replaced_run_id"] == old.run_id
+        assert new.metadata["replacement_run_id"] == new.run_id != old.run_id
+        assert registry._agent_records[old.agent_id] is record
+        assert record.session_id == session and record.work_slot is slot
+        assert not record.reserved_for_replacement
+        assert registry._active_work_slots == {slot}
+        prompts = [
+            str(message.content) for message in record.runtime.agent_loop.messages
+        ]
+        assert any("old task" in prompt for prompt in prompts)
+        assert any(
+            "This task supersedes the interrupted task.\n\nnew task" in prompt
+            for prompt in prompts
+        )
+        terminal = await registry.wait_for_agent(old.agent_id, old.run_id)
+        assert terminal.stop_reason is RunStopReason.RETASKED and not terminal.completed
+        backend.release.set()
+        await registry.wait_for_agent(old.agent_id, new.run_id)
+        assert not registry._active_work_slots
+    finally:
+        backend.release.set()
+        backend.cleanup_release.set()
+        finalize_release.set()
+        if replacement is not None and not replacement.done():
+            replacement.cancel()
+            await asyncio.gather(replacement, return_exceptions=True)
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_post_ack_retask_finalizers_are_owner_fenced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = RetaskBackend()
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    registry._retention_policy = (1000, 10)
+    ctx = InvokeContext(tool_call_id="retask", session_id=parent.session_id)
+    first = None
+    second = None
+    entered, release = asyncio.Event(), asyncio.Event()
+    try:
+        old = await _background_result(registry, TaskArgs(task="old"), ctx)
+        assert old.agent_id is not None
+        record = registry._agent_records[old.agent_id]
+        await backend.started.wait()
+        backend.cleanup_release.set()
+        first = registry.run(
+            TaskArgs(task="first", agent_id=old.agent_id, replace_run=True), ctx
+        )
+        ack = await anext(first)
+        assert isinstance(ack, TaskResult) and ack.status == "launched"
+        await backend.replacement_started.wait()
+
+        async def gate_update(*_args):
+            if record.reserved_for_replacement and record.current_run is None:
+                entered.set()
+                await release.wait()
+
+        registry._notify_agents = gate_update
+        second = asyncio.create_task(
+            _background_result(
+                registry,
+                TaskArgs(task="second", agent_id=old.agent_id, replace_run=True),
+                ctx,
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 2)
+        owner, slot = record.replacement_owner, record.work_slot
+        assert owner is not None
+        # First generator is still suspended at its launch acknowledgment.
+        await first.aclose()
+        assert record.replacement_owner is owner and record.reserved_for_replacement
+        assert registry._active_work_slots == {slot}
+        release.set()
+        result = await asyncio.wait_for(second, 2)
+        assert result.status == "launched" and result.run_id != ack.run_id
+    finally:
+        release.set()
+        backend.release.set()
+        backend.cleanup_release.set()
+        if first is not None:
+            await first.aclose()
+        if second is not None:
+            await asyncio.gather(second, return_exceptions=True)
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closed", ["_admission_closed", "_draining_children"])
+async def test_cancel_unknown_agent_precedes_closed_admission(
+    monkeypatch: pytest.MonkeyPatch, closed: str
+) -> None:
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, BlockingBackend())
+    try:
+        setattr(registry, closed, True)
+        result = await registry.cancel_run(
+            "unknown",
+            reason=RunStopReason.USER_CANCELLED,
+            requester_session_id=parent.session_id,
+        )
+        assert result.outcome is CancelOutcome.UNKNOWN_RUN
+    finally:
+        setattr(registry, closed, False)
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["cleanup", "publication", "final_update"])
+@pytest.mark.parametrize("cancellations", [1, 4])
+async def test_retask_caller_cancel_unwinds_without_launch(
+    monkeypatch: pytest.MonkeyPatch, phase: str, cancellations: int
+) -> None:
+    backend = RetaskBackend()
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    registry._retention_policy = (1000, 10)
+    ctx = InvokeContext(tool_call_id="retask", session_id=parent.session_id)
+    entered, release = asyncio.Event(), asyncio.Event()
+    replacement = None
+    try:
+        old = await _background_result(registry, TaskArgs(task="old"), ctx)
+        assert old.agent_id is not None
+        record = registry._agent_records[old.agent_id]
+        run = record.current_run
+        assert run is not None
+        await backend.started.wait()
+
+        publications = 0
+
+        async def gate_update(*_args):
+            nonlocal publications
+            if record.current_run is None:
+                publications += 1
+                if phase != "final_update" or publications == 2:
+                    entered.set()
+                    await release.wait()
+
+        registry._notify_agents = gate_update
+        replacement = asyncio.create_task(
+            _background_result(
+                registry,
+                TaskArgs(task="replacement", agent_id=old.agent_id, replace_run=True),
+                ctx,
+            )
+        )
+        await asyncio.wait_for(backend.cleanup_started.wait(), 2)
+        if phase != "cleanup":
+            backend.cleanup_release.set()
+            await asyncio.wait_for(entered.wait(), 2)
+        async with registry._registry_lock:
+            for _ in range(cancellations):
+                replacement.cancel()
+                # Deliver each interrupt while unwind is waiting on this lock.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+            assert record.reserved_for_replacement
+        with pytest.raises(asyncio.CancelledError):
+            await replacement
+        assert (
+            not record.reserved_for_replacement and not run.completion_task.cancelled()
+        )
+        backend.cleanup_release.set()
+        release.set()
+        await asyncio.wait_for(run.completion_task, 2)
+        await asyncio.gather(*tuple(registry._teardown_tasks))
+        assert record.state is _AgentState.IDLE
+        assert not registry._active_work_slots and backend.calls == 1
+        assert run.stop_reason is RunStopReason.RETASKED
+        new = await _background_result(
+            registry, TaskArgs(task="reuse", agent_id=old.agent_id), ctx
+        )
+        assert new.status == "launched"
+    finally:
+        backend.release.set()
+        backend.cleanup_release.set()
+        release.set()
+        if replacement is not None:
+            await asyncio.gather(replacement, return_exceptions=True)
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "revocation", ["release", "drain", "authority", "generation", "admission"]
+)
+async def test_retask_handoff_revalidates_revocation(
+    monkeypatch: pytest.MonkeyPatch, revocation: str
+) -> None:
+    backend = RetaskBackend()
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    registry._retention_policy = (1000, 10)
+    ctx = InvokeContext(tool_call_id="retask", session_id=parent.session_id)
+    entered, release = asyncio.Event(), asyncio.Event()
+    replacement = None
+    try:
+        old = await _background_result(registry, TaskArgs(task="old"), ctx)
+        assert old.agent_id is not None
+        record = registry._agent_records[old.agent_id]
+        run = record.current_run
+        assert run is not None
+        await backend.started.wait()
+
+        async def gate_update(*_args):
+            if record.reserved_for_replacement and record.current_run is None:
+                entered.set()
+                await release.wait()
+
+        registry._notify_agents = gate_update
+        replacement = asyncio.create_task(
+            _background_result(
+                registry,
+                TaskArgs(task="replacement", agent_id=old.agent_id, replace_run=True),
+                ctx,
+            )
+        )
+        await asyncio.wait_for(backend.cleanup_started.wait(), 2)
+        backend.cleanup_release.set()
+        await asyncio.wait_for(entered.wait(), 2)
+        if revocation == "release":
+            await asyncio.wait_for(registry.release_agent(old.agent_id), 2)
+        elif revocation == "drain":
+            await asyncio.wait_for(registry.drain_children(), 2)
+        elif revocation == "authority":
+            parent._authority_revision += 1
+        elif revocation == "generation":
+            record.runtime.agent_loop._session_generation += 1
+        else:
+            registry._admission_closed = True
+        release.set()
+        result = (
+            await asyncio.wait_for(
+                asyncio.gather(replacement, return_exceptions=True), 2
+            )
+        )[0]
+        assert isinstance(result, BaseException)
+        assert not record.reserved_for_replacement and not registry._active_work_slots
+        assert backend.calls == 1 and run.stop_reason is RunStopReason.RETASKED
+    finally:
+        release.set()
+        backend.release.set()
+        backend.cleanup_release.set()
+        if replacement is not None:
+            await asyncio.gather(replacement, return_exceptions=True)
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restriction", ["owner", "profile", "config", "permission"])
+async def test_retask_validation_precedes_stop(
+    monkeypatch: pytest.MonkeyPatch, restriction: str
+) -> None:
+    backend = BlockingBackend()
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    registry._retention_policy = (1000, 10)
+    ctx = InvokeContext(tool_call_id="retask", session_id=parent.session_id)
+    try:
+        old = await _background_result(registry, TaskArgs(task="old"), ctx)
+        assert old.agent_id is not None
+        record = registry._agent_records[old.agent_id]
+        run = record.current_run
+        assert run is not None
+        await backend.started.wait()
+        values: dict[str, Any] = {
+            "task": "replacement",
+            "agent_id": old.agent_id,
+            "replace_run": True,
+        }
+        if restriction == "owner":
+            record.parent_session_id = "another-parent"
+        elif restriction == "profile":
+            values["agent_type"] = "reviewer"
+        elif restriction == "config":
+            values["config"] = {}
+        else:
+            monkeypatch.setattr(
+                registry,
+                "_require_task_profile_allowed",
+                MagicMock(side_effect=ToolPermissionError("disabled")),
+            )
+        with pytest.raises((
+            ToolPermissionError,
+            AgentProfileMismatchError,
+            LaunchConfigError,
+        )):
+            await _background_result(registry, TaskArgs(**values), ctx)
+        assert run.requested_stop_reason is None and not record.reserved_for_replacement
+        assert not backend.stopped.is_set() and len(registry._active_work_slots) == 1
+    finally:
+        backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["projection", "start"])
+async def test_retask_admission_failure_keeps_old_result_and_rolls_back_slot(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    backend = RetaskBackend()
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    registry._retention_policy = (1000, 10)
+    ctx = InvokeContext(tool_call_id="retask", session_id=parent.session_id)
+    try:
+        old = await _background_result(registry, TaskArgs(task="old"), ctx)
+        assert old.agent_id is not None
+        record = registry._agent_records[old.agent_id]
+        await backend.started.wait()
+        assert registry._root is not None
+        monkeypatch.setattr(
+            registry._root.turns,
+            "start",
+            MagicMock(side_effect=RuntimeError("parent busy")),
+        )
+        if failure == "projection":
+            registry._root.turns.link_subagent = AsyncMock(
+                side_effect=RuntimeError("admission failed")
+            )
+        else:
+            monkeypatch.setattr(
+                SessionRuntimeRegistry,
+                "_start_child_turn",
+                MagicMock(side_effect=RuntimeError("admission failed")),
+            )
+        replacement = asyncio.create_task(
+            _background_result(
+                registry,
+                TaskArgs(task="replacement", agent_id=old.agent_id, replace_run=True),
+                ctx,
+            )
+        )
+        await asyncio.wait_for(backend.cleanup_started.wait(), 2)
+        backend.cleanup_release.set()
+        with pytest.raises(RuntimeError, match="admission failed"):
+            await asyncio.wait_for(replacement, 2)
+        assert not record.reserved_for_replacement and record.state is _AgentState.IDLE
+        assert not registry._active_work_slots and backend.calls == 1
+        terminal = await registry.wait_for_agent(old.agent_id, old.run_id)
+        assert terminal.stop_reason is RunStopReason.RETASKED
+        assert record.latest_run_id == old.run_id
+    finally:
+        backend.release.set()
+        backend.cleanup_release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("window", ["stopping", "execution_terminal", "finalizing"])
+@pytest.mark.parametrize("config", [None, LaunchConfig(model="unused")])
+async def test_busy_retask_typed_refusal_matrix(
+    monkeypatch: pytest.MonkeyPatch, window: str, config: LaunchConfig | None
+) -> None:
+    backend = RetaskBackend()
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    registry._retention_policy = (1000, 10)
+    ctx = InvokeContext(tool_call_id="retask", session_id=parent.session_id)
+    entered, release = asyncio.Event(), asyncio.Event()
+    try:
+        old = await _background_result(registry, TaskArgs(task="old"), ctx)
+        assert old.agent_id is not None
+        record = registry._agent_records[old.agent_id]
+        run = record.current_run
+        assert run is not None
+        await backend.started.wait()
+        if window == "stopping":
+            await registry.cancel_run(
+                old.agent_id,
+                reason=RunStopReason.USER_CANCELLED,
+                requester_session_id=parent.session_id,
+            )
+            await backend.cleanup_started.wait()
+        elif window == "execution_terminal":
+            notify = record.runtime.turns._notify
+
+            async def gate(method, params):
+                if method == "turn/completed":
+                    entered.set()
+                    await release.wait()
+                await notify(method, params)
+
+            monkeypatch.setattr(record.runtime.turns, "_notify", gate)
+            backend.cleanup_release.set()
+            backend.release.set()
+            await asyncio.wait_for(entered.wait(), 2)
+        else:
+
+            async def gate_update(*_args):
+                if record.state is _AgentState.FINALIZING:
+                    entered.set()
+                    await release.wait()
+
+            registry._notify_agents = gate_update
+            backend.cleanup_release.set()
+            backend.release.set()
+            await asyncio.wait_for(entered.wait(), 2)
+        result = await _background_result(
+            registry,
+            TaskArgs(
+                task="new", agent_id=old.agent_id, replace_run=True, config=config
+            ),
+            ctx,
+        )
+        expected = (
+            LaunchOutcome.ALREADY_STOPPING
+            if window == "stopping"
+            else LaunchOutcome.ALREADY_FINISHING
+        )
+        assert result.launch_outcome is expected and result.status is None
+        assert not record.reserved_for_replacement and backend.calls == 1
+        assert run.requested_stop_reason is (
+            RunStopReason.USER_CANCELLED if window == "stopping" else None
+        )
+    finally:
+        release.set()
+        backend.release.set()
+        backend.cleanup_release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_retask_between_turns_interrupts_continuation_before_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = BlockingBackend()
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    registry._retention_policy = (1000, 10)
+    ctx = InvokeContext(tool_call_id="chain", session_id=parent.session_id)
+    entered, joined = asyncio.Event(), asyncio.Event()
+    release = asyncio.Event()
+    try:
+        old = await _background_result(registry, TaskArgs(task="old"), ctx)
+        assert old.agent_id is not None
+        record = registry._agent_records[old.agent_id]
+        run = record.current_run
+        assert run is not None and run.initial_turn_id is not None
+        turns = record.runtime.turns
+        finalize = turns._finalize_turn
+
+        async def linked_finalize(
+            turn, status, error, stop_reason, execution, *, next_turn_id=None
+        ):
+            if turn.id != run.initial_turn_id:
+                assert joined.is_set()
+                return await finalize(
+                    turn,
+                    status,
+                    error,
+                    stop_reason,
+                    execution,
+                    next_turn_id=next_turn_id,
+                )
+            await finalize(
+                turn, status, error, stop_reason, execution, next_turn_id="successor"
+            )
+            entered.set()
+            try:
+                await release.wait()
+            finally:
+                joined.set()
+
+        monkeypatch.setattr(turns, "_finalize_turn", linked_finalize)
+        await backend.started.wait()
+        backend.release.set()
+        await asyncio.wait_for(entered.wait(), 2)
+        assert turns.operation_pending_turn_id(run.initial_turn_id) == "successor"
+        new = await asyncio.wait_for(
+            _background_result(
+                registry,
+                TaskArgs(task="new", agent_id=old.agent_id, replace_run=True),
+                ctx,
+            ),
+            2,
+        )
+        assert joined.is_set() and new.status == "launched"
+        result = await registry.wait_for_agent(old.agent_id, old.run_id)
+        assert result.stop_reason is RunStopReason.RETASKED and not result.completed
+        await registry.wait_for_agent(old.agent_id, new.run_id)
+    finally:
+        release.set()
+        backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["generation", "persistence"])
+async def test_retask_during_actual_compaction_joins_cleanup(
+    monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    backend = FakeBackend([
+        [mock_llm_chunk(content="initial")],
+        [mock_llm_chunk(content="<summary>compacted</summary>")],
+        [mock_llm_chunk(content="replacement")],
+    ])
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    registry._retention_policy = (1000, 10)
+    ctx = InvokeContext(tool_call_id="compact", session_id=parent.session_id)
+    entered, stopped, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    try:
+        first = await _background_result(registry, TaskArgs(task="initial"), ctx)
+        assert first.agent_id is not None
+        await registry.wait_for_agent(first.agent_id, first.run_id)
+        record = registry._agent_records[first.agent_id]
+        child = record.runtime.agent_loop
+        before = AutoCompactMiddleware.before_turn
+        forced = False
+
+        async def force(middleware, context):
+            nonlocal forced
+            if context.stats is child.stats and not forced:
+                forced = True
+                context.stats.context_tokens = 500_000
+            return await before(middleware, context)
+
+        monkeypatch.setattr(AutoCompactMiddleware, "before_turn", force)
+        manager = child.compaction_manager
+        method = "_complete" if phase == "generation" else "_save"
+        original = getattr(manager, method)
+
+        async def gated(*args, **kwargs):
+            entered.set()
+            try:
+                await release.wait()
+                return await original(*args, **kwargs)
+            finally:
+                stopped.set()
+
+        monkeypatch.setattr(manager, method, gated)
+        old = await _background_result(
+            registry, TaskArgs(task="compact", agent_id=record.agent_id), ctx
+        )
+        await asyncio.wait_for(entered.wait(), 3)
+        assert record.compacting
+        # Do not force another compaction when the replacement enters its turn.
+        monkeypatch.setattr(AutoCompactMiddleware, "before_turn", before)
+        new = await asyncio.wait_for(
+            _background_result(
+                registry,
+                TaskArgs(task="new", agent_id=record.agent_id, replace_run=True),
+                ctx,
+            ),
+            3,
+        )
+        assert stopped.is_set() and not record.compacting
+        result = await registry.wait_for_agent(record.agent_id, old.run_id)
+        assert result.stop_reason is RunStopReason.RETASKED and not result.completed
+        release.set()
+        await asyncio.wait_for(registry.wait_for_agent(record.agent_id, new.run_id), 3)
+        assert any("supersedes" in str(message.content) for message in child.messages)
+    finally:
+        release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_idle_replace_is_plain_reuse_with_reconfiguration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, parent, _ = await _zero_retention_registry(
+        monkeypatch, FakeBackend([[mock_llm_chunk(content="child done")]] * 2)
+    )
+    registry._retention_policy = (1000, 10)
+    ctx = InvokeContext(tool_call_id="idle", session_id=parent.session_id)
+    try:
+        old = await _background_result(registry, TaskArgs(task="old"), ctx)
+        assert old.agent_id is not None
+        await registry.wait_for_agent(old.agent_id, old.run_id)
+        record = registry._agent_records[old.agent_id]
+        new = await _background_result(
+            registry,
+            TaskArgs(
+                task="idle continuation",
+                agent_id=old.agent_id,
+                replace_run=True,
+                config=LaunchConfig(thinking="high"),
+            ),
+            ctx,
+        )
+        assert new.launch_outcome is LaunchOutcome.LAUNCHED
+        assert new.metadata is not None and "replaced_run_id" not in new.metadata
+        assert record.effective_thinking == "high"
+        assert not any(
+            "supersedes" in str(message.content)
+            for message in record.runtime.agent_loop.messages
+        )
+        terminal = await registry.wait_for_agent(old.agent_id, old.run_id)
+        assert terminal.completed and terminal.stop_reason is None
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed", [False, True])
+async def test_requested_cancel_cannot_rewrite_genuine_provider_outcome(
+    monkeypatch: pytest.MonkeyPatch, failed: bool
+) -> None:
+    class CompletionWinsBackend(BlockingBackend):
+        async def complete(self, **_kwargs):
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                pass  # Model completion/error wins a concurrent interrupt.
+            if failed:
+                raise RuntimeError("genuine error")
+            return mock_llm_chunk(content="genuine completion")
+
+    backend = CompletionWinsBackend()
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    registry._retention_policy = (1000, 10)
+    try:
+        launch = await _background_result(
+            registry,
+            TaskArgs(task="work"),
+            InvokeContext(tool_call_id="wins", session_id=parent.session_id),
+        )
+        assert launch.agent_id is not None
+        record = registry._agent_records[launch.agent_id]
+        run = record.current_run
+        assert run is not None
+        await backend.started.wait()
+        outcome = await registry.cancel_run(
+            record.agent_id,
+            reason=RunStopReason.USER_CANCELLED,
+            requester_session_id=parent.session_id,
+        )
+        assert outcome.outcome is CancelOutcome.STOP_REQUESTED
+        result = await asyncio.wait_for(registry.wait_for_agent(record.agent_id), 2)
+        assert run.requested_stop_reason is RunStopReason.USER_CANCELLED
+        assert run.status is (RunStatus.FAILED if failed else RunStatus.COMPLETED)
+        assert result.stop_reason is (RunStopReason.ERROR if failed else None)
+        assert result.completed is not failed
+    finally:
+        backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active_parent", [False, True])
+async def test_serialized_user_cancel_injects_without_waking_parent(
+    monkeypatch: pytest.MonkeyPatch, active_parent: bool
+) -> None:
+    child_backend = BlockingBackend()
+    parent_backend = GatedSequenceBackend([
+        [mock_llm_chunk(content="parent done")],
+        [mock_llm_chunk(content="parent continuation done")],
+    ])
+    started, release = parent_backend.add_gate()
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: child_backend
+    )
+    parent = build_test_agent_loop(config=_config(), backend=parent_backend)
+    client = start_test_app_server(parent)
+    assert client._run_peer is not None
+    server = cast(AppServer, cast(Any, client._run_peer).__self__)
+    session = await attach_test_app_server_session(client)
+    root = legacy_backend(server)
+    registry = root.children
+    root.session.turns.link_subagent = AsyncMock()
+    try:
+        parent_turn_id = None
+        if active_parent:
+            response, action = root.session.turns.start(
+                TurnStartParams(
+                    session_id=parent.session_id,
+                    message=[TextContentBlock(text="parent work")],
+                )
+            )
+            parent_turn_id = response.turn.id
+            action()
+            await asyncio.wait_for(started.wait(), 2)
+        launch = await _background_result(
+            registry,
+            TaskArgs(task="child work"),
+            InvokeContext(tool_call_id="child", session_id=parent.session_id),
+        )
+        assert launch.agent_id is not None and launch.run_id is not None
+        await asyncio.wait_for(child_backend.started.wait(), 2)
+        response = await session.cancel_agent(launch.agent_id, launch.run_id)
+        assert response.outcome.value == "stop_requested"
+        assert response.run_id == launch.run_id
+        assert response.stop_reason is not None
+        assert response.stop_reason.value == "user_cancelled"
+        result = await asyncio.wait_for(registry.wait_for_agent(launch.agent_id), 2)
+        assert result.stop_reason is RunStopReason.USER_CANCELLED
+        assert parent._pending_injected_messages
+        assert "cancelled (by user)" in (
+            parent._pending_injected_messages[-1].content or ""
+        )
+        if active_parent:
+            assert root.session.turns.active_turn is not None
+            assert root.session.turns.active_turn.id == parent_turn_id
+            release.set()
+            assert parent_turn_id is not None
+            await root.session.turns.wait_for_operation(parent_turn_id)
+        else:
+            assert not started.is_set()
+            assert root.session.turns.active_turn is None
+            assert parent_backend.requests_messages == []
+            release.set()
+            _ = [event async for event in session.act("next user turn")]
+            # Injection is consumed by the user-started operation's continuation.
+            assert len(parent_backend.requests_messages) == 2
+            assert any(
+                "cancelled (by user)" in (message.content or "")
+                for message in parent_backend.requests_messages[-1]
+            )
+        late = await session.cancel_agent(launch.agent_id, launch.run_id)
+        assert late.outcome.value == "not_running"
+    finally:
+        release.set()
+        child_backend.release.set()
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_user_cancel_bypasses_tool_ownership_and_respects_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = BlockingBackend()
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    try:
+        launch = await _background_result(
+            registry,
+            TaskArgs(task="work"),
+            InvokeContext(tool_call_id="child", session_id=parent.session_id),
+        )
+        assert launch.agent_id is not None
+        await asyncio.wait_for(backend.started.wait(), 2)
+        registry._admission_closed = True
+        denied = await registry.cancel_run(
+            launch.agent_id,
+            reason=RunStopReason.USER_CANCELLED,
+            requester_session_id="user",
+        )
+        assert denied.outcome is CancelOutcome.FORBIDDEN
+        assert not backend.stopped.is_set()
+        registry._admission_closed = False
+        accepted = await registry.cancel_run(
+            launch.agent_id,
+            reason=RunStopReason.USER_CANCELLED,
+            requester_session_id="user",
+        )
+        assert accepted.outcome is CancelOutcome.STOP_REQUESTED
+        await asyncio.wait_for(registry.wait_for_agent(launch.agent_id), 2)
+    finally:
+        backend.release.set()
+        await registry.close()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_user_cancel_does_not_interrupt_executing_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_backend, child_backend = BlockingBackend(), BlockingBackend()
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: child_backend
+    )
+    parent = build_test_agent_loop(config=_config(), backend=parent_backend)
+    registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
+    root = registry._build_child_runtime(parent)
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    try:
+        response, action = root.turns.start(
+            TurnStartParams(
+                session_id=parent.session_id,
+                message=[TextContentBlock(text="parent work")],
+            )
+        )
+        action()
+        await parent_backend.started.wait()
+        launch = await _background_result(
+            registry,
+            TaskArgs(task="child work"),
+            InvokeContext(tool_call_id="child", session_id=parent.session_id),
+        )
+        assert launch.agent_id is not None
+        await child_backend.started.wait()
+        await registry.cancel_run(
+            launch.agent_id,
+            reason=RunStopReason.USER_CANCELLED,
+            requester_session_id=parent.session_id,
+        )
+        await asyncio.wait_for(registry.wait_for_agent(launch.agent_id), 2)
+        assert (
+            root.turns.active_turn is not None
+            and root.turns.active_turn.id == response.turn.id
+        )
+        assert not parent_backend.stopped.is_set()
+        assert parent._pending_injected_messages
+        parent_backend.release.set()
+        await root.turns.wait_for_operation(response.turn.id)
+    finally:
+        parent_backend.release.set()
+        child_backend.release.set()
+        await registry.close()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retain", [False, True])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        RunStopReason.USER_CANCELLED,
+        RunStopReason.ORCHESTRATOR_CANCELLED,
+        RunStopReason.RETASKED,
+    ],
+)
+async def test_cancel_preserves_waiter_result_identity_and_notification(
+    monkeypatch: pytest.MonkeyPatch, retain: bool, reason: RunStopReason
+) -> None:
+    backend = BlockingBackend()
+    registry, parent, notifications = await _zero_retention_registry(
+        monkeypatch, backend
+    )
+    if retain:
+        registry._retention_policy = (1000, 10)
+    ctx = InvokeContext(tool_call_id="cancel", session_id=parent.session_id)
+    try:
+        launch = await _background_result(registry, TaskArgs(task="work"), ctx)
+        assert launch.agent_id is not None and launch.run_id is not None
+        record = registry._agent_records[launch.agent_id]
+        run = record.current_run
+        assert run is not None
+        await asyncio.wait_for(backend.started.wait(), 2)
+        waiter = asyncio.create_task(
+            registry.wait_for_agent(launch.agent_id, launch.run_id)
+        )
+        await asyncio.sleep(0)
+        key = (launch.agent_id, launch.run_id)
+        assert registry._wait_leases[key] == 1
+        outcome = await registry.cancel_run(
+            launch.agent_id, reason=reason, requester_session_id=parent.session_id
+        )
+        assert outcome.outcome is CancelOutcome.STOP_REQUESTED
+        assert outcome.run_id == launch.run_id and outcome.stop_reason is reason
+        assert not run.completion_task.cancelled()
+        assert registry._wait_leases[key] == 1
+        result = await asyncio.wait_for(waiter, 2)
+        assert result.stop_reason is reason and not result.completed
+        assert run.status is RunStatus.CANCELLED and backend.stopped.is_set()
+        assert await registry.get_agent_result(launch.agent_id, launch.run_id) == result
+        late = await registry.cancel_run(
+            launch.agent_id, reason=reason, requester_session_id=parent.session_id
+        )
+        assert late.outcome is CancelOutcome.NOT_RUNNING
+        assert late.run_id == launch.run_id and late.stop_reason is reason
+        if reason is RunStopReason.USER_CANCELLED:
+            assert notifications == []
+            assert parent._pending_injected_messages[-1].content is not None
+            assert (
+                "cancelled (by user)" in parent._pending_injected_messages[-1].content
+            )
+            assert (
+                registry._root is not None and registry._root.turns.active_turn is None
+            )
+        else:
+            assert any(
+                ("retasked" if reason is RunStopReason.RETASKED else "cancelled")
+                in text
+                for text in notifications
+            )
+        if retain:
+            assert registry._agent_records[launch.agent_id] is record
+            assert not record.runtime._closed
+            backend.release.set()
+            next_launch = await _background_result(
+                registry, TaskArgs(task="reuse", agent_id=launch.agent_id), ctx
+            )
+            next_run = record.current_run
+            assert next_run is not None and next_run.requested_stop_reason is None
+            assert next_launch.run_id != launch.run_id
+            stale = await registry.cancel_run(
+                launch.agent_id,
+                launch.run_id,
+                reason=reason,
+                requester_session_id=parent.session_id,
+            )
+            assert stale.outcome is CancelOutcome.NOT_RUNNING
+            await asyncio.wait_for(next_run.completion_task, 2)
+        else:
+            await asyncio.gather(*tuple(registry._teardown_tasks))
+            assert record.runtime._closed
+            assert launch.agent_id in registry._evicted_agents
+    finally:
+        backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_reason", [RunStopReason.USER_CANCELLED, RunStopReason.ORCHESTRATOR_CANCELLED]
+)
+async def test_cancel_first_writer_ownership_and_sibling_isolation(
+    monkeypatch: pytest.MonkeyPatch, first_reason: RunStopReason
+) -> None:
+    backends = [BlockingBackend(), BlockingBackend()]
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backends[0])
+    registry._retention_policy = (1000, 10)
+    root = registry._root
+    assert root is not None
+    parent_start = MagicMock(side_effect=RuntimeError("parent must stay idle"))
+    monkeypatch.setattr(root.turns, "start", parent_start)
+    try:
+        ctx = InvokeContext(tool_call_id="one", session_id=parent.session_id)
+        first = await _background_result(registry, TaskArgs(task="one"), ctx)
+        await asyncio.wait_for(backends[0].started.wait(), 2)
+        monkeypatch.setattr(
+            "chartreux.core.agent_loop._loop.create_backend", lambda **_: backends[1]
+        )
+        second = await _background_result(
+            registry,
+            TaskArgs(task="two"),
+            InvokeContext(tool_call_id="two", session_id=parent.session_id),
+        )
+        assert first.agent_id and second.agent_id
+        assert first.agent_id != second.agent_id
+        await asyncio.wait_for(backends[1].started.wait(), 2)
+        first_record = registry._agent_records[first.agent_id]
+        run = first_record.current_run
+        assert run is not None
+        interrupt = MagicMock(wraps=first_record.runtime.turns.interrupt_operation)
+        monkeypatch.setattr(
+            first_record.runtime.turns, "interrupt_operation", interrupt
+        )
+        denied = await registry.cancel_run(
+            first.agent_id,
+            reason=RunStopReason.ORCHESTRATOR_CANCELLED,
+            requester_session_id="intruder",
+        )
+        unknown = await registry.cancel_run(
+            first.agent_id,
+            "never-launched",
+            reason=first_reason,
+            requester_session_id=parent.session_id,
+        )
+        missing = await registry.cancel_run(
+            "missing", reason=first_reason, requester_session_id=parent.session_id
+        )
+        assert [denied.outcome, unknown.outcome, missing.outcome] == [
+            CancelOutcome.FORBIDDEN,
+            CancelOutcome.UNKNOWN_RUN,
+            CancelOutcome.UNKNOWN_RUN,
+        ]
+        assert run.requested_stop_reason is None
+        other_reason = (
+            RunStopReason.ORCHESTRATOR_CANCELLED
+            if first_reason is RunStopReason.USER_CANCELLED
+            else RunStopReason.USER_CANCELLED
+        )
+        outcomes = await asyncio.gather(
+            registry.cancel_run(
+                first.agent_id,
+                reason=first_reason,
+                requester_session_id=parent.session_id,
+            ),
+            registry.cancel_run(
+                first.agent_id,
+                reason=other_reason,
+                requester_session_id=parent.session_id,
+            ),
+        )
+        assert [result.outcome for result in outcomes] == [
+            CancelOutcome.STOP_REQUESTED,
+            CancelOutcome.ALREADY_STOPPING,
+        ]
+        assert all(result.stop_reason is first_reason for result in outcomes)
+        interrupt.assert_called_once_with(run.initial_turn_id)
+        await asyncio.wait_for(run.completion_task, 2)
+        assert not backends[1].stopped.is_set()
+        assert not registry._agent_records[second.agent_id].runtime._closed
+        assert parent.session_id == root.agent_loop.session_id
+        if first_reason is RunStopReason.USER_CANCELLED:
+            parent_start.assert_not_called()
+        registry._result_store.pop((first.agent_id, run.run_id))
+        registry._expired_results.add((first.agent_id, run.run_id))
+        expired = await registry.cancel_run(
+            first.agent_id,
+            run.run_id,
+            reason=other_reason,
+            requester_session_id=parent.session_id,
+        )
+        assert expired.outcome is CancelOutcome.NOT_RUNNING
+    finally:
+        for backend in backends:
+            backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "window", ["execution_terminal", "outcome_recorded", "finalizing"]
+)
+@pytest.mark.parametrize("failed", [False, True])
+async def test_cancel_rejects_finishing_windows_and_preserves_outcome(
+    monkeypatch: pytest.MonkeyPatch, window: str, failed: bool
+) -> None:
+    backend = (
+        GatedFailureBackend(RuntimeError("genuine failure"))
+        if failed
+        else BlockingBackend()
+    )
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    registry._retention_policy = (1000, 10)
+    entered, release = asyncio.Event(), asyncio.Event()
+    try:
+        launch = await _background_result(
+            registry,
+            TaskArgs(task="work"),
+            InvokeContext(tool_call_id="finish", session_id=parent.session_id),
+        )
+        assert launch.agent_id is not None
+        record = registry._agent_records[launch.agent_id]
+        run = record.current_run
+        assert run is not None
+        await backend.started.wait()
+        if window != "finalizing":
+            notify = record.runtime.turns._notify
+
+            async def gate(method, params):
+                if window == "outcome_recorded":
+                    await notify(method, params)
+                if method == "turn/completed":
+                    entered.set()
+                    await release.wait()
+                if window != "outcome_recorded":
+                    await notify(method, params)
+
+            monkeypatch.setattr(record.runtime.turns, "_notify", gate)
+        else:
+
+            async def gate_update(*_args):
+                if record.state is _AgentState.FINALIZING:
+                    entered.set()
+                    await release.wait()
+
+            registry._notify_agents = gate_update
+        backend.release.set()
+        await asyncio.wait_for(entered.wait(), 2)
+        assert (record.current_run is None) == (window == "finalizing")
+        if window == "outcome_recorded":
+            # Model the monitor having recorded the real terminal outcome before
+            # its final registry transition; the controller is genuinely done.
+            assert run.initial_turn_id is not None
+            run.status, run.stop_reason = registry._resolve_run_outcome(
+                run, record.runtime.turns.operation_terminal_turn(run.initial_turn_id)
+            )
+            assert run.status is not RunStatus.RUNNING
+        cancelled = await registry.cancel_run(
+            launch.agent_id,
+            reason=RunStopReason.USER_CANCELLED,
+            requester_session_id=parent.session_id,
+        )
+        assert cancelled.outcome is CancelOutcome.ALREADY_FINISHING
+        assert cancelled.run_id == run.run_id and run.requested_stop_reason is None
+        release.set()
+        await asyncio.wait_for(run.completion_task, 2)
+        assert run.status is (RunStatus.FAILED if failed else RunStatus.COMPLETED)
+        assert run.stop_reason is (RunStopReason.ERROR if failed else None)
+    finally:
+        release.set()
+        backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup", ["release", "shutdown"])
+async def test_pending_stop_release_and_shutdown_races(
+    monkeypatch: pytest.MonkeyPatch, cleanup: str
+) -> None:
+    backend = BlockingBackend()
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    registry._retention_policy = (1000, 10)
+    try:
+        launch = await _background_result(
+            registry,
+            TaskArgs(task="work"),
+            InvokeContext(tool_call_id="race", session_id=parent.session_id),
+        )
+        assert launch.agent_id is not None
+        record = registry._agent_records[launch.agent_id]
+        await backend.started.wait()
+        result = await registry.cancel_run(
+            launch.agent_id,
+            reason=RunStopReason.USER_CANCELLED,
+            requester_session_id=parent.session_id,
+        )
+        assert result.outcome is CancelOutcome.STOP_REQUESTED
+        if cleanup == "release":
+            await asyncio.wait_for(registry.release_agent(launch.agent_id), 2)
+        else:
+            await asyncio.wait_for(registry.drain_children(), 2)
+        assert record.runtime._closed and backend.stopped.is_set()
+        assert not registry._wait_leases and not registry._pending_notifications
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["provider", "tool"])
+async def test_cancel_publishes_accumulated_partial_and_joins_tool_cleanup(
+    monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    from functools import wraps
+
+    from chartreux.core.tools.builtins.bash import Bash
+
+    backend = GatedSequenceBackend([
+        [
+            mock_llm_chunk(
+                content="partial",
+                tool_calls=[
+                    ToolCall(
+                        id="bash",
+                        index=0,
+                        function=FunctionCall(
+                            name="bash", arguments='{"command":"pwd"}'
+                        ),
+                    )
+                ],
+            )
+        ],
+        [mock_llm_chunk(content="done")],
+    ])
+    started, release, stopped = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    if phase == "provider":
+        backend.add_gate()[1].set()
+        started, release = backend.add_gate()
+    else:
+
+        @wraps(Bash.run)
+        async def gated_tool(self, args, ctx=None):
+            started.set()
+            try:
+                await release.wait()
+            finally:
+                stopped.set()
+            yield "unused"
+
+        monkeypatch.setattr(Bash, "run", gated_tool)
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: backend
+    )
+    parent = build_test_agent_loop(
+        config=_config(enabled_tools=["task", "bash"]), backend=FakeBackend()
+    )
+    registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
+    root = registry._build_child_runtime(parent)
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    try:
+        launch = await _background_result(
+            registry,
+            TaskArgs(task="work"),
+            InvokeContext(tool_call_id="partial", session_id=parent.session_id),
+        )
+        assert launch.agent_id is not None
+        record = registry._agent_records[launch.agent_id]
+        await asyncio.wait_for(started.wait(), 3)
+        run = record.current_run
+        assert run is not None
+        await registry.cancel_run(
+            launch.agent_id,
+            reason=RunStopReason.USER_CANCELLED,
+            requester_session_id=parent.session_id,
+        )
+        result = await asyncio.wait_for(registry.wait_for_agent(launch.agent_id), 3)
+        assert "partial" in result.response and not result.completed
+        if phase == "tool":
+            assert stopped.is_set()
+        assert result.stop_reason is RunStopReason.USER_CANCELLED
+    finally:
+        release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("finish", ["completion", "release"])
 async def test_running_subagent_cap_excludes_idle_and_frees_capacity(
@@ -226,11 +1519,16 @@ async def test_running_subagent_cap_excludes_idle_and_frees_capacity(
     )
     config = _config()
     config.subagents.max_running_subagents = 1
-    parent = build_test_agent_loop(config=config, backend=FakeBackend())
+    parent = build_test_agent_loop(
+        config=config,
+        backend=FakeBackend([
+            [mock_llm_chunk(content="Notification received")] for _ in range(3)
+        ]),
+    )
     registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
     registry.bind_root(registry._build_child_runtime(parent))
     ctx = InvokeContext(tool_call_id="cap", session_id=parent.session_id)
-    args = TaskArgs(task="work", agent="worker", background=True)
+    args = TaskArgs(task="work", agent_type="worker", background=True)
     create_child = AsyncMock(wraps=registry._runtime_factory.create_child)
     monkeypatch.setattr(registry._runtime_factory, "create_child", create_child)
     try:
@@ -295,10 +1593,18 @@ async def test_foreground_subagent_consumes_cap_until_completion(
     launch = asyncio.create_task(_foreground_result(registry, parent, "foreground"))
     try:
         await asyncio.wait_for(backend.started.wait(), timeout=5)
+        foreground_id = next(iter(registry._children))
+        with pytest.raises(ValueError, match="Foreground agents.*only background"):
+            await registry.cancel_run(
+                foreground_id,
+                reason=RunStopReason.ORCHESTRATOR_CANCELLED,
+                requester_session_id=parent.session_id,
+            )
+        assert not backend.stopped.is_set()
         with pytest.raises(RuntimeError, match="cap 1"):
             await _background_result(
                 registry,
-                TaskArgs(task="more", agent="worker", background=True),
+                TaskArgs(task="more", agent_type="worker", background=True),
                 InvokeContext(tool_call_id="more", session_id=parent.session_id),
             )
         if cancel:
@@ -338,7 +1644,7 @@ async def test_subagent_cap_reserves_pending_creation_and_rolls_back_failure(
         raise RuntimeError("creation failed")
 
     monkeypatch.setattr(registry._runtime_factory, "create_child", fail_creation)
-    args = TaskArgs(task="work", agent="worker", background=True)
+    args = TaskArgs(task="work", agent_type="worker", background=True)
     ctx = InvokeContext(tool_call_id="cap", session_id=parent.session_id)
     launch = asyncio.create_task(_background_result(registry, args, ctx))
     try:
@@ -405,7 +1711,7 @@ async def test_subagent_cap_root_config_replacement_and_override_precedence(
         AsyncMock(), AsyncMock(), lambda _: 0, max_running_subagents=override
     )
     registry.bind_root(registry._build_child_runtime(parent))
-    args = TaskArgs(task="work", agent="worker", background=True)
+    args = TaskArgs(task="work", agent_type="worker", background=True)
     ctx = InvokeContext(tool_call_id="config-cap", session_id=parent.session_id)
     try:
         first = await _background_result(registry, args, ctx)
@@ -455,7 +1761,7 @@ async def test_bare_registry_subagent_cap_defaults_to_sixteen(
         yield TaskResult(completed=True, response="done", turns_used=1)
 
     monkeypatch.setattr(SessionRuntimeRegistry, "_run_admitted", admitted)
-    args = TaskArgs(task="work", agent="worker", background=True)
+    args = TaskArgs(task="work", agent_type="worker", background=True)
     ctx = InvokeContext(tool_call_id="bare", session_id="bare")
     launches = [
         asyncio.create_task(_background_result(registry, args, ctx)) for _ in range(16)
@@ -632,6 +1938,154 @@ async def test_task_creates_independently_readable_child_session(monkeypatch) ->
         assert any(
             isinstance(entry, PublicMessageEntry) and entry.text == "Child completed"
             for entry in child_state.history or []
+        )
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("empty_final", [False, True])
+async def test_child_final_response_outcome_through_app_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, background: bool, empty_final: bool
+) -> None:
+    (tmp_path / "final-response.toml").write_text(
+        "\n".join(['agent_type = "subagent"', 'enabled_tools = ["todo"]']),
+        encoding="utf-8",
+    )
+    final = mock_llm_chunk(content="Child completed")
+    if empty_final:
+        final = mock_llm_chunk(content="").model_copy(
+            update={
+                "message": LLMMessage(role=Role.assistant, content="", tool_calls=None)
+            }
+        )
+    child_backend = FakeBackend(
+        [
+            [
+                mock_llm_chunk(
+                    content="Earlier child prose", tool_calls=[_todo_call("read")]
+                )
+            ]
+        ]
+        + [[final]] * (2 if empty_final else 1)
+    )
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: child_backend
+    )
+    config = _config(enabled_tools=["task", "todo"]).model_copy(
+        update={"agent_paths": [tmp_path]}
+    )
+    parent_backend = FakeBackend([
+        [
+            mock_llm_chunk(
+                content="",
+                tool_calls=[_task_call("final-response", background=background)],
+            )
+        ],
+        [mock_llm_chunk(content="Parent completed")],
+    ])
+    parent = build_test_agent_loop(
+        config=config, backend=parent_backend, enable_streaming=True
+    )
+    client = start_test_app_server(parent)
+    run_peer = client._run_peer
+    assert run_peer is not None
+    server = cast(AppServer, cast(Any, run_peer).__self__)
+    session = await attach_test_app_server_session(client)
+    registry = legacy_backend(server).children
+    closed: list[SessionRuntime] = []
+    original_close = SessionRuntime.close
+
+    async def counted_close(runtime: SessionRuntime) -> None:
+        if runtime.agent_loop is not parent:
+            closed.append(runtime)
+        await original_close(runtime)
+
+    monkeypatch.setattr(SessionRuntime, "close", counted_close)
+    try:
+        await _consume(session.act("Delegate this"))
+        effect = next(
+            entry
+            for entry in session.history
+            if isinstance(entry, PublicEffectEntry)
+            and entry.detail.kind is ToolEffectKind.SUBAGENT
+        )
+        if background:
+            assert isinstance(effect.state, CompletedEffectState)
+            record = registry._agent_records["agent-1"]
+            run_id = record.latest_run_id
+            assert run_id is not None
+            result = await asyncio.wait_for(
+                registry.wait_for_agent(record.agent_id, run_id), timeout=30
+            )
+            run = record.run_history[-1]
+            assert run.run_id == run_id
+            assert run.status is (
+                RunStatus.FAILED if empty_final else RunStatus.COMPLETED
+            )
+            assert run.stop_reason is (RunStopReason.ERROR if empty_final else None)
+            assert result.completed is (not empty_final)
+            assert await registry.get_agent_result(record.agent_id, run_id) == result
+            assert result.agent_id == record.agent_id
+            assert result.run_id == run_id
+            assert "Earlier child prose" in result.response
+            if empty_final:
+                assert "empty assistant response" in result.response
+            else:
+                assert "Child completed" in result.response
+            child_runtime = record.runtime
+        else:
+            await registry.drain_children()
+            assert registry._children == {}
+            assert len(closed) == 1
+            child_runtime = closed[0]
+            if empty_final:
+                assert isinstance(effect.state, FailedEffectState)
+                assert "empty assistant response" in effect.state.error.message
+            else:
+                assert isinstance(effect.state, CompletedEffectState)
+                assert isinstance(effect.state.output, dict)
+                assert effect.state.output["completed"] is True
+                assert (
+                    effect.state.output["response"]
+                    == "Earlier child proseChild completed"
+                )
+            await registry.drain_children()
+            assert len(closed) == 1
+
+        turn = child_runtime.turns.completed_turns[-1]
+        assert turn.status is (
+            PublicTurnStatus.FAILED if empty_final else PublicTurnStatus.COMPLETED
+        )
+        if empty_final:
+            assert turn.error is not None
+            assert turn.error.code == TurnErrorCode.EMPTY_LLM_RESPONSE
+            assert len(child_backend.requests_messages) == 3
+            assert (
+                child_backend.requests_messages[1] == child_backend.requests_messages[2]
+            )
+        else:
+            assert turn.error is None
+            assert len(child_backend.requests_messages) == 2
+        assistant_messages = [
+            message
+            for message in child_runtime.agent_loop.messages
+            if message.role is Role.assistant
+        ]
+        assert assistant_messages[0].content == "Earlier child prose"
+        assert all((message.content or "").strip() for message in assistant_messages)
+        assert len(assistant_messages) == (1 if empty_final else 2)
+        task_result = next(
+            message
+            for message in parent_backend.requests_messages[1]
+            if message.role is Role.tool and message.tool_call_id == "task-1"
+        )
+        if empty_final and not background:
+            assert "empty assistant response" in (task_result.content or "")
+        assert any(
+            isinstance(entry, PublicMessageEntry) and entry.text == "Parent completed"
+            for entry in session.history
         )
     finally:
         await session.close()
@@ -1152,6 +2606,8 @@ async def test_background_agent_management_survives_wait_timeout(monkeypatch) ->
             == result
         )
         idle_update = await _wait_for_agents_update(session)
+        while idle_update.agents[0].availability == "running":
+            idle_update = await _wait_for_agents_update(session)
         assert idle_update.agents[0].availability == "finalizing"
         idle_update = await _wait_for_agents_update(session)
         assert idle_update.agents[0].agent_id == summary.agent_id
@@ -1596,7 +3052,7 @@ async def test_concurrent_background_reuse_admits_exactly_one_run(monkeypatch) -
 
         ctx = InvokeContext(tool_call_id="reuse", session_id=session.session_id)
         args = TaskArgs(
-            task="reuse", agent="worker", agent_id="agent-1", background=True
+            task="reuse", agent_type="worker", agent_id="agent-1", background=True
         )
         await _consume(session.act("reuse"))
         await asyncio.wait_for(second_started.wait(), timeout=1)
@@ -1781,6 +3237,8 @@ async def test_background_failure_and_root_shutdown_close_active_runs(
         assert failed_summary.availability is AgentAvailability.IDLE
         assert failed_summary.current_run_status is None
         assert failed_summary.last_run_status is RunStatus.FAILED
+        assert failed_summary.stop_reason is RunStopReason.ERROR
+        assert not failed_summary.compacting
 
         gated_child = BlockingBackend()
         monkeypatch.setattr(
@@ -1900,6 +3358,50 @@ def _idle_record(
         idle_since=clock(),
         last_task_summary=summary,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["ttl", "idle_cap"])
+async def test_run_duration_clock_completion_and_eviction(reason: str) -> None:
+    clock = _ManualClock(10)
+    registry = _retention_registry(clock)
+    record = _idle_record("agent-1", clock=clock)
+    registry._agent_records[record.agent_id] = record
+    assert registry._agent_summaries()[0].run_elapsed_seconds is None
+    run = RunRecord(
+        run_id="run-1",
+        agent_id=record.agent_id,
+        profile="worker",
+        status=RunStatus.RUNNING,
+        completion_task=asyncio.get_running_loop().create_future(),
+        started_at=clock(),
+    )
+    record.current_run = run
+    record.latest_run_id = run.run_id
+    record.state = _AgentState.RUNNING
+    clock.advance(252)
+    assert registry._agent_summaries()[0].run_elapsed_seconds == 252
+    run.completed_at = clock()
+    run.status = RunStatus.COMPLETED
+    record.state = _AgentState.FINALIZING
+    clock.advance(50)
+    assert registry._agent_summaries()[0].run_elapsed_seconds == 252
+    record.current_run = None
+    record.run_history.append(run)
+    record.state = _AgentState.IDLE
+    record.idle_since = run.completed_at
+    summary = registry._agent_summaries()[0]
+    assert summary.run_elapsed_seconds == 252
+    assert summary.latest_run_id == "run-1"
+    if reason == "idle_cap":
+        registry._retention_policy = (0, 1)
+        registry._agent_records["other"] = _idle_record("other", clock=clock)
+    assert await registry._evict_agent(record.agent_id, reason)
+    clock.advance(100)
+    tombstone = registry._evicted_agents[record.agent_id].summary
+    assert tombstone.run_elapsed_seconds == 252
+    assert tombstone.idle_seconds == 50
+    assert tombstone.latest_run_id == "run-1"
 
 
 @pytest.mark.asyncio
@@ -2057,12 +3559,14 @@ async def test_dispatch_and_eviction_race_has_a_deterministic_winner() -> None:
         lambda: None,
     )
     record.runtime.turns.wait_for_operation = AsyncMock(
-        return_value=MagicMock(error=None, status=PublicTurnStatus.COMPLETED)
+        return_value=MagicMock(
+            error=None, status=PublicTurnStatus.COMPLETED, stop_reason=None
+        )
     )
     registry._agent_records[record.agent_id] = record
     registry._children[record.session_id] = record.runtime
     args = TaskArgs(
-        task="reuse", agent="worker", agent_id=record.agent_id, background=True
+        task="reuse", agent_type="worker", agent_id=record.agent_id, background=True
     )
     context = InvokeContext(tool_call_id="reuse", session_id="root")
 
@@ -2070,7 +3574,10 @@ async def test_dispatch_and_eviction_race_has_a_deterministic_winner() -> None:
         dispatch = asyncio.create_task(_background_result(registry, args, context))
         eviction = asyncio.create_task(registry._evict_agent(record.agent_id, "ttl"))
         await asyncio.sleep(0)
-    await dispatch
+    acknowledgement = await dispatch
+    assert acknowledgement.status == "launched"
+    assert acknowledgement.completed
+    assert acknowledgement.turns_used == 0
     assert not await eviction
     assert record.agent_id in registry._agent_records
 
@@ -2078,6 +3585,12 @@ async def test_dispatch_and_eviction_race_has_a_deterministic_winner() -> None:
     monitor = run.completion_task
     assert isinstance(monitor, asyncio.Task)
     await monitor
+    assert run.status is RunStatus.FAILED
+    assert run.stop_reason is RunStopReason.ERROR
+    result = await registry.get_agent_result(record.agent_id, run.run_id)
+    assert result is not None
+    assert not result.completed
+    assert "Completed subagent produced an empty response" in result.response
     assert await registry._evict_agent(record.agent_id, "ttl")
     with pytest.raises(AgentEvictedError):
         await _background_result(registry, args, context)
@@ -2195,11 +3708,21 @@ async def test_reuse_lifecycle_errors_are_typed_and_do_not_substitute_agents() -
     )
 
     def reuse_args(agent_id: str, agent: str = "worker") -> TaskArgs:
-        return TaskArgs(task="reuse", agent=agent, agent_id=agent_id, background=True)
+        return TaskArgs(
+            task="reuse", agent_type=agent, agent_id=agent_id, background=True
+        )
 
     def reuse_context(agent_id: str) -> InvokeContext:
         return InvokeContext(tool_call_id=f"reuse-{agent_id}", session_id="root")
 
+    with pytest.raises(
+        UnknownAgentError, match="Unknown agent_id instance handle"
+    ) as unknown:
+        await _background_result(
+            registry, reuse_args("agent-999"), reuse_context("agent-999")
+        )
+    assert "Check the agent_id with check_agents" in str(unknown.value)
+    assert not registry._active_work_slots
     with pytest.raises(AgentEvictedError):
         await _background_result(
             registry, reuse_args("evicted"), reuse_context("evicted")
@@ -2245,6 +3768,9 @@ async def test_eviction_tombstone_contains_no_runtime_reference() -> None:
     record.effective_model = "strong"
     record.effective_thinking = "high"
     record.last_run_status = RunStatus.COMPLETED
+    record.context_tokens = 12000
+    record.context_window = 45000
+    record.stop_reason = RunStopReason.BUDGET_EXCEEDED
     result = _stored_result("agent-1", "run-1")
     record.run_history.append(
         RunRecord(
@@ -2266,6 +3792,9 @@ async def test_eviction_tombstone_contains_no_runtime_reference() -> None:
         "high",
     )
     assert tombstone.last_run_status is RunStatus.COMPLETED
+    assert (tombstone.context_tokens, tombstone.context_window) == (12000, 45000)
+    assert not tombstone.compacting
+    assert tombstone.stop_reason is RunStopReason.BUDGET_EXCEEDED
     assert not tombstone.result_expired
     await registry._emit_agents_update()
     notification = notifier.await_args
@@ -2797,9 +4326,17 @@ async def test_notification_failure_still_idles_agent_and_cleans_pending_markers
     record.runtime.agent_loop.messages = MessageList()
     record.runtime.agent_loop.session_id = "child"
     record.runtime.turns._event_sink = None
-    record.runtime.turns.wait_for_operation = AsyncMock(
-        return_value=MagicMock(error=None, status=PublicTurnStatus.COMPLETED)
-    )
+
+    async def wait_for_operation(initial_turn_id: str) -> PublicTurn:
+        assert record.runtime.turns._event_sink is not None
+        await record.runtime.turns._event_sink(
+            AssistantEvent(content="Child completed")
+        )
+        return MagicMock(
+            error=None, status=PublicTurnStatus.COMPLETED, stop_reason=None
+        )
+
+    record.runtime.turns.wait_for_operation = wait_for_operation
     registry._agent_records[record.agent_id] = record
     registry._children[record.session_id] = record.runtime
     monkeypatch.setattr(
@@ -2815,7 +4352,7 @@ async def test_notification_failure_still_idles_agent_and_cleans_pending_markers
 
     await _background_result(
         registry,
-        TaskArgs(task="work", agent="worker", agent_id="agent-1", background=True),
+        TaskArgs(task="work", agent_type="worker", agent_id="agent-1", background=True),
         InvokeContext(tool_call_id="work", session_id="root"),
     )
     monitor = next(iter(registry._monitor_tasks))
@@ -2853,7 +4390,13 @@ async def test_drain_cancels_finalizing_monitor_without_stale_notification(
     async def wait_for_operation(initial_turn_id: str) -> PublicTurn:
         assert initial_turn_id == "turn-1"
         await finish.wait()
-        return MagicMock(error=None, status=PublicTurnStatus.COMPLETED)
+        assert record.runtime.turns._event_sink is not None
+        await record.runtime.turns._event_sink(
+            AssistantEvent(content="Child completed")
+        )
+        return MagicMock(
+            error=None, status=PublicTurnStatus.COMPLETED, stop_reason=None
+        )
 
     emit_calls = 0
 
@@ -2876,7 +4419,7 @@ async def test_drain_cancels_finalizing_monitor_without_stale_notification(
 
     launch = await _background_result(
         registry,
-        TaskArgs(task="work", agent="worker", agent_id="agent-1", background=True),
+        TaskArgs(task="work", agent_type="worker", agent_id="agent-1", background=True),
         InvokeContext(tool_call_id="work", session_id="root"),
     )
     assert launch.run_id is not None
@@ -2925,7 +4468,9 @@ async def test_reused_launch_failure_restores_idle_bookkeeping_and_rearms_reaper
     with pytest.raises(RuntimeError, match="projection failed"):
         await _background_result(
             registry,
-            TaskArgs(task="retry", agent="worker", agent_id="agent-1", background=True),
+            TaskArgs(
+                task="retry", agent_type="worker", agent_id="agent-1", background=True
+            ),
             InvokeContext(tool_call_id="retry", session_id="root"),
         )
 
@@ -2969,7 +4514,7 @@ async def test_child_creation_cancellation_at_publication_lock_closes_orphan(
     launch = asyncio.create_task(
         registry._create_registered_child(
             root,
-            TaskArgs(task="new", agent="worker", background=True),
+            TaskArgs(task="new", agent_type="worker", background=True),
             InvokeContext(tool_call_id="new", session_id="root"),
         )
     )
@@ -3013,13 +4558,13 @@ async def test_child_creation_generation_change_discards_orphan_without_registra
     create = asyncio.create_task(
         registry._create_registered_child(
             root,
-            TaskArgs(task="new", agent="worker", background=True),
+            TaskArgs(task="new", agent_type="worker", background=True),
             InvokeContext(tool_call_id="new", session_id="root"),
         )
     )
     await entered.wait()
     resolve.assert_called_once_with(
-        root, TaskArgs(task="new", agent="worker", background=True)
+        root, TaskArgs(task="new", agent_type="worker", background=True)
     )
     root.agent_loop._session_generation = 2
     registry.begin_root_generation()
@@ -3222,7 +4767,7 @@ async def test_post_commit_launch_cancellation_keeps_the_monitor_and_exact_resul
     launch = asyncio.create_task(
         _background_result(
             registry,
-            TaskArgs(task="work", agent="worker", background=True),
+            TaskArgs(task="work", agent_type="worker", background=True),
             InvokeContext(tool_call_id="launch", session_id=parent.session_id),
         )
     )
@@ -3273,8 +4818,9 @@ async def test_post_commit_reused_launch_cancellation_keeps_the_monitor_and_resu
     original_emit = registry._emit_agents_update
 
     async def gated_emit(*values: object) -> None:
-        update_entered.set()
-        await update_release.wait()
+        if not update_entered.is_set():
+            update_entered.set()
+            await update_release.wait()
         await cast(Any, original_emit)(*values)
 
     monkeypatch.setattr(registry, "_emit_agents_update", gated_emit)
@@ -3339,7 +4885,7 @@ async def test_post_commit_update_failure_does_not_cancel_busy_child(
     try:
         acknowledgement = await _background_result(
             registry,
-            TaskArgs(task="work", agent="worker", background=True),
+            TaskArgs(task="work", agent_type="worker", background=True),
             InvokeContext(tool_call_id="launch", session_id=parent.session_id),
         )
         assert acknowledgement.agent_id == "agent-1"
@@ -3347,7 +4893,9 @@ async def test_post_commit_update_failure_does_not_cancel_busy_child(
         assert acknowledgement.status == "launched"
         assert acknowledgement.response == (
             "Background agent launched and running; use check_agents to monitor, "
-            "get_agent_result or wait_for_agent to retrieve the result."
+            "get_agent_result or wait_for_agent to retrieve the result. "
+            'To continue this instance, use task(agent_id="agent-1", '
+            'background=true, task="...").'
         )
         assert acknowledgement.turns_used == 0
         assert acknowledgement.completed is True
@@ -3450,7 +4998,10 @@ async def _real_reused_background() -> tuple[
     SessionRuntimeRegistry, Any, AgentRecord, TaskArgs, InvokeContext
 ]:
     """Build a retained child with real turn controllers for launch rollback tests."""
-    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    parent = build_test_agent_loop(
+        config=_config(),
+        backend=FakeBackend([mock_llm_chunk(content="Notification received")]),
+    )
     child = await AgentRuntimeFactory().create_child(parent, "worker")
     registry = _retention_registry(_ManualClock())
     root = registry._build_child_runtime(parent)
@@ -3474,10 +5025,45 @@ async def _real_reused_background() -> tuple[
         parent,
         record,
         TaskArgs(
-            task="retry", agent="worker", agent_id=record.agent_id, background=True
+            task="retry", agent_type="worker", agent_id=record.agent_id, background=True
         ),
         InvokeContext(tool_call_id="retry", session_id=parent.session_id),
     )
+
+
+@pytest.mark.asyncio
+async def test_cancel_in_aborted_launch_rollback_window_is_not_accepted() -> None:
+    registry, parent, record, args, context = await _real_reused_background()
+    record.parent_session_id = parent.session_id
+    try:
+        turn_id, action = registry._start_child_turn(
+            record.runtime, args, context, record.session_id
+        )
+        run = RunRecord(
+            run_id="attempt",
+            agent_id=record.agent_id,
+            profile=record.profile,
+            status=RunStatus.RUNNING,
+            completion_task=asyncio.get_running_loop().create_future(),
+            initial_turn_id=turn_id,
+        )
+        record.current_run = run
+        record.state = _AgentState.RUNNING
+        # Reproduce the rollback window: real prepared start aborted, but the
+        # registry has not restored its prior current_run yet.
+        action.abort()
+        assert record.runtime.turns.operation_pending_turn_id(turn_id) == turn_id
+        result = await registry.cancel_run(
+            record.agent_id,
+            reason=RunStopReason.USER_CANCELLED,
+            requester_session_id=parent.session_id,
+        )
+        assert result.outcome is CancelOutcome.ALREADY_FINISHING
+        assert result.stop_reason is None and run.requested_stop_reason is None
+    finally:
+        record.current_run = None
+        await registry.drain_children()
+        await parent.aclose()
 
 
 @pytest.mark.asyncio
@@ -3510,7 +5096,8 @@ async def test_reused_start_failure_aborts_real_prepared_turn_and_allows_retry(
     # AgentRuntimeFactory creates a fresh child backend; it does not reuse the
     # parent's injected FakeBackend, so keep the retry path offline explicitly.
     monkeypatch.setattr(
-        "chartreux.core.agent_loop._loop.create_backend", lambda **_: FakeBackend()
+        "chartreux.core.agent_loop._loop.create_backend",
+        lambda **_: FakeBackend([mock_llm_chunk(content="Child completed")]),
     )
     registry, parent, record, args, context = await _real_reused_background()
     root = registry._root
@@ -3535,6 +5122,7 @@ async def test_reused_start_failure_aborts_real_prepared_turn_and_allows_retry(
         assert record.runtime.turns.active_turn is None
         assert record.runtime.turns._active_task is None
         assert not registry._monitor_tasks
+        assert registry._agent_summaries()[0].run_elapsed_seconds is None
         monkeypatch.setattr(record.runtime.turns, "start", original_start)
         result = await _background_result(registry, args, context)
         assert result.run_id is not None
@@ -3572,7 +5160,8 @@ async def test_monitor_creation_failure_aborts_prepared_turn_and_allows_retry(
 ) -> None:
     # The child gets a fresh backend rather than the parent's injected FakeBackend.
     monkeypatch.setattr(
-        "chartreux.core.agent_loop._loop.create_backend", lambda **_: FakeBackend()
+        "chartreux.core.agent_loop._loop.create_backend",
+        lambda **_: FakeBackend([mock_llm_chunk(content="Child completed")]),
     )
     registry, parent, record, args, context = await _real_reused_background()
     root = registry._root
@@ -3665,10 +5254,12 @@ async def test_turn_task_creation_failure_closes_run_and_aborts_controller(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_run", [False, True])
 async def test_prelaunch_registry_lock_cancellation_aborts_real_prepared_turn(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, cancel_run: bool
 ) -> None:
     registry, parent, record, args, context = await _real_reused_background()
+    record.parent_session_id = parent.session_id
     root = registry._root
     assert root is not None
     root.turns._projector = MagicMock()
@@ -3706,10 +5297,30 @@ async def test_prelaunch_registry_lock_cancellation_aborts_real_prepared_turn(
     try:
         await final_lock_entered.wait()
         assert prepared.is_set()
-        launch.cancel()
-        release_final_lock.set()
-        with pytest.raises(asyncio.CancelledError):
-            await launch
+        if cancel_run:
+            run = record.current_run
+            assert run is not None
+            waiter = asyncio.create_task(registry.wait_for_agent(record.agent_id))
+            await asyncio.sleep(0)
+            assert registry._wait_leases[(record.agent_id, run.run_id)] == 1
+            outcome = await registry.cancel_run(
+                record.agent_id,
+                reason=RunStopReason.USER_CANCELLED,
+                requester_session_id=parent.session_id,
+            )
+            assert outcome.outcome is CancelOutcome.STOP_REQUESTED
+            release_final_lock.set()
+            await asyncio.wait_for(launch, 2)
+            result = await asyncio.wait_for(waiter, 2)
+            assert result.stop_reason is RunStopReason.USER_CANCELLED
+            assert run.status is RunStatus.CANCELLED and not result.completed
+            assert len(record.runtime.turns.completed_turns) == 1
+        else:
+            launch.cancel()
+            release_final_lock.set()
+            with pytest.raises(asyncio.CancelledError):
+                await launch
+            assert not record.runtime.turns.completed_turns
         assert record.runtime.execution.active is None
         assert record.runtime.turns._pending_start is None
         assert record.runtime.turns.active_turn is None
@@ -3993,7 +5604,7 @@ async def test_background_creation_fences_live_identity_at_each_admission_bounda
     launch = asyncio.create_task(
         _background_result(
             registry,
-            TaskArgs(task="work", agent="worker", background=True),
+            TaskArgs(task="work", agent_type="worker", background=True),
             InvokeContext(tool_call_id="launch", session_id=parent.session_id),
         )
     )
@@ -4215,7 +5826,7 @@ async def _dynamic_registry(monkeypatch: pytest.MonkeyPatch):
         registry,
         TaskArgs(
             task="first",
-            agent="dynamic",
+            agent_type="dynamic",
             background=True,
             config=LaunchConfig(
                 model="small",
@@ -4275,7 +5886,7 @@ async def test_profile_ttl_overrides_zero_global_retention_at_completion(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="persist", agent="persistent", background=True),
+            TaskArgs(task="persist", agent_type="persistent", background=True),
             InvokeContext(tool_call_id="persistent", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None
@@ -4557,7 +6168,7 @@ async def test_direct_runner_enforces_effective_task_admission(
         with pytest.raises(ToolPermissionError, match=f"Task tool .*{admission}"):
             await _background_result(
                 registry,
-                TaskArgs(task="blocked", agent="dynamic", background=False),
+                TaskArgs(task="blocked", agent_type="dynamic", background=False),
                 InvokeContext(
                     tool_call_id=f"direct-{admission}", session_id=parent.session_id
                 ),
@@ -4586,7 +6197,7 @@ async def test_foreground_dynamic_launch_uses_resolver_and_rejects_retained_hand
             registry,
             TaskArgs(
                 task="foreground",
-                agent="dynamic",
+                agent_type="dynamic",
                 background=False,
                 config=cast(LaunchConfig, {"model": "large", "thinking": "high"}),
             ),
@@ -4637,7 +6248,7 @@ async def test_foreground_turn_start_failure_rolls_back_persisted_child(
         with pytest.raises(RuntimeError, match="foreground turn start failed"):
             await _background_result(
                 registry,
-                TaskArgs(task="fail", agent="dynamic", background=False),
+                TaskArgs(task="fail", agent_type="dynamic", background=False),
                 InvokeContext(
                     tool_call_id="foreground-failure", session_id=parent.session_id
                 ),
@@ -4699,7 +6310,7 @@ async def _persistent_dynamic_registry(tmp_path: Path, monkeypatch: pytest.Monke
     )
     parent = build_test_agent_loop(
         config=_dynamic_config().model_copy(update={"session_logging": logging}),
-        backend=FakeBackend(),
+        backend=FakeBackend([mock_llm_chunk(content="Notification received")]),
     )
     parent.agent_manager._discovered[_DYNAMIC_PROFILE.name] = _DYNAMIC_PROFILE
     registry = _retention_registry()
@@ -4712,7 +6323,7 @@ async def _persistent_dynamic_registry(tmp_path: Path, monkeypatch: pytest.Monke
         registry,
         TaskArgs(
             task="first",
-            agent="dynamic",
+            agent_type="dynamic",
             background=True,
             config=LaunchConfig(
                 model="small",
@@ -5113,7 +6724,7 @@ async def test_ensure_child_rejects_deleted_profile_without_worker_substitution(
 
         with pytest.raises(LaunchConfigError) as raised:
             await registry.ensure_child(child_id)
-        assert raised.value.field == "agent"
+        assert raised.value.field == "agent_type"
         assert "dynamic" in str(raised.value)
         assert registry._children == {}
     finally:
@@ -5151,7 +6762,7 @@ async def test_ensure_child_rejects_removed_builtin_explore_profile(
 
         with pytest.raises(LaunchConfigError) as raised:
             await registry.ensure_child(child_id)
-        assert raised.value.field == "agent"
+        assert raised.value.field == "agent_type"
         assert "explore" in str(raised.value)
         assert registry._children == {}
     finally:
@@ -5373,7 +6984,7 @@ async def _foreground_result(
         [
             item
             async for item in registry.run(
-                TaskArgs(task="foreground", agent="worker", background=False),
+                TaskArgs(task="foreground", agent_type="worker", background=False),
                 InvokeContext(tool_call_id=tool_call_id, session_id=parent.session_id),
             )
         ][-1],
@@ -5385,7 +6996,7 @@ async def test_foreground_completions_detach_and_close_every_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent = await _foreground_registry(
-        monkeypatch, FakeBackend([mock_llm_chunk(content="done")])
+        monkeypatch, FakeBackend([[mock_llm_chunk(content="done")] for _ in range(3)])
     )
     closed: list[SessionRuntime] = []
     original_close = SessionRuntime.close
@@ -5412,6 +7023,48 @@ async def test_foreground_completions_detach_and_close_every_child(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status", [PublicTurnStatus.COMPLETED, PublicTurnStatus.INTERRUPTED]
+)
+async def test_foreground_simulated_empty_child_result(
+    monkeypatch: pytest.MonkeyPatch, status: PublicTurnStatus
+) -> None:
+    registry, parent = await _foreground_registry(monkeypatch, FakeBackend())
+    monkeypatch.setattr(
+        SessionRuntimeRegistry,
+        "_start_child_turn",
+        lambda *_args: ("turn-1", lambda: None),
+    )
+    monkeypatch.setattr(
+        TurnController,
+        "wait_for_operation",
+        AsyncMock(return_value=MagicMock(error=None, status=status)),
+    )
+    closed: list[SessionRuntime] = []
+    original_close = SessionRuntime.close
+
+    async def counted_close(runtime: SessionRuntime) -> None:
+        closed.append(runtime)
+        await original_close(runtime)
+
+    monkeypatch.setattr(SessionRuntime, "close", counted_close)
+    try:
+        if status is PublicTurnStatus.COMPLETED:
+            with pytest.raises(EmptySubagentResponseError, match="empty response"):
+                await _foreground_result(registry, parent)
+        else:
+            result = await _foreground_result(registry, parent)
+            assert result.response == ""
+            assert not result.completed
+        await registry.drain_children()
+        assert registry._children == {}
+        assert len(closed) == 1
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
 async def test_foreground_terminal_generator_close_hands_off_teardown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5419,7 +7072,7 @@ async def test_foreground_terminal_generator_close_hands_off_teardown(
         monkeypatch, FakeBackend([mock_llm_chunk(content="done")])
     )
     stream = registry.run(
-        TaskArgs(task="foreground", agent="worker", background=False),
+        TaskArgs(task="foreground", agent_type="worker", background=False),
         InvokeContext(tool_call_id="terminal-close", session_id=parent.session_id),
     )
     try:
@@ -5609,15 +7262,25 @@ async def _assert_zero_retention_outcome(
         monkeypatch, backend
     )
     runtime: SessionRuntime | None = None
+    clock = _ManualClock(100)
+    registry._clock = clock
+    snapshots = AsyncMock()
+    registry._notify_agents = snapshots
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="zero retention", agent="worker", background=True),
+            TaskArgs(task="zero retention", agent_type="worker", background=True),
             InvokeContext(tool_call_id="zero-retention", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None
         record = registry._agent_records[launch.agent_id]
+        assert record.current_run is not None
+        assert record.current_run.started_at == 100
+        assert registry._agent_summaries()[0].run_elapsed_seconds == 0
+        clock.advance(252)
         runtime = record.runtime
+        record.context_tokens = 321
+        record.context_window = 6543
         completion = record.current_run.completion_task if record.current_run else None
         assert isinstance(completion, asyncio.Task)
         if cancelled:
@@ -5628,6 +7291,34 @@ async def _assert_zero_retention_outcome(
         await asyncio.gather(*tuple(registry._teardown_tasks))
 
         result = await registry.get_agent_result(launch.agent_id, launch.run_id)
+        tombstone = registry._evicted_agents[launch.agent_id].summary
+        assert (tombstone.context_tokens, tombstone.context_window) == (
+            record.context_tokens,
+            record.context_window,
+        )
+        assert tombstone.stop_reason is record.stop_reason
+        assert tombstone.run_elapsed_seconds == 252
+        assert tombstone.latest_run_id == launch.run_id
+        clock.advance(1000)
+        assert registry._agent_summaries()[0].run_elapsed_seconds == 252
+        finishing = [
+            call.args[0][0]
+            for call in snapshots.await_args_list
+            if call.args[0] and call.args[0][0].availability == "finalizing"
+        ]
+        assert finishing
+        expected_reason = (
+            "orchestrator_cancelled"
+            if cancelled
+            else "error"
+            if isinstance(backend, ImmediateFailureBackend)
+            else None
+        )
+        assert finishing[0].stop_reason == expected_reason
+        assert finishing[0].run_elapsed_seconds == 252
+        assert finishing[0].last_run_status == record.last_run_status
+        assert not finishing[0].compacting
+        assert not tombstone.compacting
         assert result is not None and result.run_id == launch.run_id
         assert any("Background agent" in message for message in notifications)
         with pytest.raises(AgentEvictedError):
@@ -5635,7 +7326,7 @@ async def _assert_zero_retention_outcome(
                 registry,
                 TaskArgs(
                     task="reuse",
-                    agent="worker",
+                    agent_type="worker",
                     agent_id=launch.agent_id,
                     background=True,
                 ),
@@ -5645,6 +7336,59 @@ async def _assert_zero_retention_outcome(
     finally:
         if isinstance(backend, BlockingBackend):
             backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_launch_reuse_resets_duration_with_registry_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = BlockingBackend()
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    registry._retention_policy = (1000, 10)
+    clock = _ManualClock(10)
+    registry._clock = clock
+    try:
+        args = TaskArgs(task="first", agent_type="worker", background=True)
+        context = InvokeContext(tool_call_id="first", session_id=parent.session_id)
+        launch = await _background_result(registry, args, context)
+        assert launch.agent_id is not None
+        record = registry._agent_records[launch.agent_id]
+        first = record.current_run
+        assert first is not None and first.started_at == 10
+        await backend.started.wait()
+        clock.advance(252)
+        assert registry._agent_summaries()[0].run_elapsed_seconds == 252
+        backend.release.set()
+        await first.completion_task
+        clock.advance(62)
+        assert registry._agent_summaries()[0].run_elapsed_seconds == 252
+        backend.started.clear()
+        backend.release.clear()
+        await _background_result(
+            registry,
+            TaskArgs(
+                task="second",
+                agent_type="worker",
+                agent_id=launch.agent_id,
+                background=True,
+            ),
+            context,
+        )
+        second = record.current_run
+        assert second is not None and second.started_at == 324
+        assert second.run_id != first.run_id
+        summary = registry._agent_summaries()[0]
+        assert summary.run_elapsed_seconds == 0
+        assert summary.idle_seconds is None
+        await backend.started.wait()
+        clock.advance(2)
+        backend.release.set()
+        await second.completion_task
+        assert registry._agent_summaries()[0].run_elapsed_seconds == 2
+    finally:
+        backend.release.set()
         await registry.drain_children()
         await parent.aclose()
 
@@ -5675,11 +7419,135 @@ async def test_zero_retention_cancellation_publishes_tombstone_then_evicts(
 
 
 @pytest.mark.asyncio
+async def test_child_runtime_compaction_notifications_never_expose_stale_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeBackend([
+        [mock_llm_chunk(content="initial child run")],
+        [mock_llm_chunk(content="<summary>compacted child</summary>")],
+        [mock_llm_chunk(content="child done")],
+    ])
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    registry._retention_policy = (100, 10)
+    snapshots = AsyncMock()
+    registry._notify_agents = snapshots
+    try:
+        launch = await _background_result(
+            registry,
+            TaskArgs(task="compact then work", background=True),
+            InvokeContext(tool_call_id="compact", session_id=parent.session_id),
+        )
+        assert launch.agent_id is not None and launch.run_id is not None
+        record = registry._agent_records[launch.agent_id]
+        first_run = record.current_run
+        assert first_run is not None
+        await first_run.completion_task
+        record.runtime.agent_loop.stats.context_tokens = 500_000
+        record.context_tokens = 500_000
+        before_turn = AutoCompactMiddleware.before_turn
+        forced = False
+
+        async def force_compaction(middleware, context):
+            nonlocal forced
+            if not forced and context.stats is record.runtime.agent_loop.stats:
+                context.stats.context_tokens = 500_000
+                forced = True
+            return await before_turn(middleware, context)
+
+        monkeypatch.setattr(AutoCompactMiddleware, "before_turn", force_compaction)
+        snapshots.reset_mock()
+        await _background_result(
+            registry,
+            TaskArgs(task="reuse", agent_id=record.agent_id, background=True),
+            InvokeContext(tool_call_id="compact-reuse", session_id=parent.session_id),
+        )
+        run = record.current_run
+        assert run is not None
+        await run.completion_task
+        assert forced
+        states = [call.args[0][0] for call in snapshots.await_args_list if call.args[0]]
+        start = next(index for index, state in enumerate(states) if state.compacting)
+        end = next(
+            index
+            for index in range(start + 1, len(states))
+            if not states[index].compacting
+        )
+        assert states[start].context_tokens == 500_000
+        assert states[end].context_tokens is None
+        assert all(state.context_tokens != 500_000 for state in states[end:])
+        assert any(state.context_tokens is not None for state in states[end + 1 :])
+        assert not record.compacting
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retain", [False, True])
+@pytest.mark.parametrize("unverifiable", [False, True])
+async def test_runtime_turn_limit_preserves_budget_outcome_and_parent_wording(
+    monkeypatch: pytest.MonkeyPatch, retain: bool, unverifiable: bool
+) -> None:
+    registry, parent, notifications = await _zero_retention_registry(
+        monkeypatch, FakeBackend()
+    )
+    if retain:
+        registry._retention_policy = (100, 10)
+    create_child = AgentRuntimeFactory.create_child
+
+    async def limited_child(factory, loop, agent_name, **kwargs):
+        child = await create_child(factory, loop, agent_name, **kwargs)
+        if unverifiable:
+            child.stats.has_unknown_cost = True
+            child._max_price = 1.0
+            child._setup_middleware()
+        else:
+            child.set_max_turns(0)
+        return child
+
+    monkeypatch.setattr(AgentRuntimeFactory, "create_child", limited_child)
+    snapshots = AsyncMock()
+    registry._notify_agents = snapshots
+    try:
+        launch = await _background_result(
+            registry,
+            TaskArgs(task="work", background=True),
+            InvokeContext(tool_call_id="budget", session_id=parent.session_id),
+        )
+        assert launch.agent_id is not None and launch.run_id is not None
+        record = registry._agent_records[launch.agent_id]
+        run = record.current_run
+        assert run is not None
+        await run.completion_task
+        result = await registry.get_agent_result(launch.agent_id, launch.run_id)
+        assert result is not None and not result.completed
+        summary = (await registry.check_agents())[0]
+        expected_reason = (
+            RunStopReason.BUDGET_UNVERIFIABLE
+            if unverifiable
+            else RunStopReason.BUDGET_EXCEEDED
+        )
+        assert summary.stop_reason is expected_reason
+        wording = "budget unverifiable" if unverifiable else "budget exceeded"
+        assert any(f"budget-stopped ({wording})" in text for text in notifications)
+        finishing = [
+            call.args[0][0]
+            for call in snapshots.await_args_list
+            if call.args[0] and call.args[0][0].availability == "finalizing"
+        ]
+        assert finishing and finishing[0].stop_reason == expected_reason.value
+        assert finishing[0].last_run_status == "completed"
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
 async def test_foreground_teardown_fd_count_does_not_grow_across_batches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent = await _foreground_registry(
-        monkeypatch, FakeBackend([mock_llm_chunk(content="done")])
+        monkeypatch, FakeBackend([[mock_llm_chunk(content="done")] for _ in range(30)])
     )
     try:
         counts: list[int] = []

@@ -8,6 +8,7 @@ from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Input
@@ -72,11 +73,14 @@ class QuestionApp(VimNavigationMixin, Container):
         self.help_widget: NoMarkupStatic | None = None
         self.tabs_widget: NoMarkupStatic | None = None
         self._mount_time: float = 0.0
+        self._submitted = False
         self._submission_status: str | None = None
         self._body_max_height: int | None = None
 
     def set_submission_status(self, status: str) -> None:
         self._submission_status = status
+        if status.startswith("Failed:"):
+            self._submitted = False
         if self.help_widget is not None:
             self.help_widget.set_class(
                 status.startswith("Warning:"), "submission-warning"
@@ -182,8 +186,13 @@ class QuestionApp(VimNavigationMixin, Container):
             self.call_after_refresh(self._set_body_max_height)
 
     def _set_body_max_height(self) -> None:
-        content = self.query_one("#question-content", Vertical)
-        body = self.query_one("#question-body", VerticalScroll)
+        if not self.is_mounted:
+            return
+        try:
+            content = self.query_one("#question-content", Vertical)
+            body = self.query_one("#question-body", VerticalScroll)
+        except NoMatches:
+            return
         fixed_chrome = (
             self.styles.gutter.height
             + content.virtual_size.height
@@ -587,6 +596,7 @@ class QuestionApp(VimNavigationMixin, Container):
         q = self._current_question
         idx = self.current_question_idx
         selections = self.multi_selections.get(idx, set())
+        self.answers.pop(idx, None)
 
         if not selections:
             return
@@ -624,6 +634,9 @@ class QuestionApp(VimNavigationMixin, Container):
         return all(i in self.answers for i in range(len(self.questions)))
 
     def _submit(self) -> None:
+        if self._submitted:
+            return
+        self._submitted = True
         result: list[UserAnswer] = []
         for i, q in enumerate(self.questions):
             answer_text, is_other = self.answers.get(i, ("", False))
@@ -646,7 +659,7 @@ class QuestionApp(VimNavigationMixin, Container):
         if idx is None:
             return
         self.selected_option = idx
-        if not self._current_question.multi_select:
+        if not self._current_question.multi_select or self._is_submit_selected:
             self.action_select()
             return
         if idx == self._other_option_idx:

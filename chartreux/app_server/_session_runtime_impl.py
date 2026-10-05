@@ -68,13 +68,16 @@ from chartreux.app_server.protocol import (
     ServerErrorParams,
     SessionContinueParams,
     SessionOpenParams,
+    SessionOptions,
     SessionResumeParams,
     SessionStartParams,
     SessionStartResponse,
     SessionUpdatedParams,
     TurnStartParams,
 )
+from chartreux.core._usage_startup import StartupAccountingContext
 from chartreux.core.agent_loop import AgentLoop
+from chartreux.core.agent_loop._loop import RootAccountingOwner
 from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.events import BackgroundWorkEvent, SessionTitleUpdatedEvent
 from chartreux.core.git.errors import GitError
@@ -89,10 +92,19 @@ from chartreux.core.session_types import (
     WorktreeContext,
 )
 from chartreux.core.subagents import AgentEviction
+from chartreux.core.usage import UsageAttribution, UsagePurpose
 from chartreux.observability.logging import logger
 
 type OpenRoot = Callable[[RootOpenRequest], Awaitable[AgentLoop]]
 type StageRoot = Callable[[AgentLoop], Awaitable[None]]
+type AllocateStartupAccounting = Callable[
+    [Path], Awaitable[tuple[StartupAccountingContext, RootAccountingOwner]]
+]
+type StartupAccountingOwner = Callable[[StartupAccountingContext], RootAccountingOwner]
+type AbandonStartupAccounting = Callable[[StartupAccountingContext], Awaitable[None]]
+type TrackStartupProducer = Callable[
+    [StartupAccountingContext, asyncio.Task[WorktreeResolution]], None
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +114,7 @@ class OpenedRuntime:
 
 
 class SessionRuntimeControllerImpl:
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         open_root: OpenRoot,
@@ -111,7 +123,17 @@ class SessionRuntimeControllerImpl:
         stage_root: StageRoot | None,
         services: SessionBackendServices,
         mcp_catalog_service: MCPCatalogService | None = None,
+        allocate_startup_accounting: AllocateStartupAccounting | None = None,
+        abandon_startup_accounting: AbandonStartupAccounting | None = None,
+        track_startup_producer: TrackStartupProducer | None = None,
+        startup_accounting: StartupAccountingContext | None = None,
+        startup_accounting_owner: StartupAccountingOwner | None = None,
     ) -> None:
+        self._initial_startup_accounting = startup_accounting
+        self._startup_accounting_owner = startup_accounting_owner
+        self._allocate_startup_accounting = allocate_startup_accounting
+        self._abandon_startup_accounting = abandon_startup_accounting
+        self._track_startup_producer = track_startup_producer
         self._open_root = open_root
         self._runtime_factory = runtime_factory
         self._host_handler = host_handler
@@ -201,6 +223,7 @@ class SessionRuntimeControllerImpl:
     async def resume(
         self, params: SessionResumeParams
     ) -> tuple[SessionBackendImpl, Callable[[], None] | None]:
+        await self._abandon_initial_startup()
         self._scheduler_enabled = not params.agent_config.headless
         self._worktrees.reject_input(params.agent_config)
         if root := self._root:
@@ -220,6 +243,7 @@ class SessionRuntimeControllerImpl:
     async def continue_latest(
         self, params: SessionContinueParams
     ) -> SessionBackendImpl:
+        await self._abandon_initial_startup()
         self._scheduler_enabled = not params.agent_config.headless
         self._worktrees.reject_input(params.agent_config)
         if root := self._root:
@@ -234,7 +258,18 @@ class SessionRuntimeControllerImpl:
         await self._attach_opened_runtime(opened, params.history_limit, resumed=True)
         return self._require_root()
 
+    async def _abandon_initial_startup(self) -> None:
+        context = self._initial_startup_accounting
+        self._initial_startup_accounting = None
+        if context is not None and context.state == "available":
+            context.claim()
+            if self._abandon_startup_accounting is not None:
+                await self._abandon_startup_accounting(context)
+            else:
+                context.abandon()
+
     async def stop_background_tasks(self, current: object) -> list[BaseException]:
+        await self._abandon_initial_startup()
         tasks = [task for task in self._tasks if task is not current]
         self._tasks.clear()
         scheduler = self._scheduler_task
@@ -342,7 +377,15 @@ class SessionRuntimeControllerImpl:
             background_work_sink=self._handle_background_work,
             session_coordinator=coordinator,
         )
-        session = SessionRuntime(agent_loop, turns, execution, history)
+        session = SessionRuntime(
+            agent_loop,
+            turns,
+            execution,
+            history,
+            retire_accounting=lambda: self._runtime_factory.retire_root_accounting(
+                agent_loop
+            ),
+        )
         handler = CoreRequestHandler(
             agent_loop,
             turns,
@@ -633,7 +676,64 @@ class SessionRuntimeControllerImpl:
             agent_loop.config_orchestrator
         )
 
-    async def _open_runtime(
+    async def _cleanup_failed_startup(
+        self,
+        startup_error: BaseException,
+        agent_loop: AgentLoop | None,
+        worktree_resolution: WorktreeResolution,
+    ) -> None:
+        cleanup_errors: list[BaseException] = []
+        if agent_loop is not None:
+            try:
+                await close_agent_loop(agent_loop)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        try:
+            await self._worktrees.cleanup(worktree_resolution)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise BaseExceptionGroup(
+                "Runtime startup and cleanup failed", [startup_error, *cleanup_errors]
+            )
+
+    async def _resolve_startup_worktree(
+        self,
+        options: SessionOptions,
+        context: StartupAccountingContext | None,
+        owner: RootAccountingOwner | None,
+    ) -> WorktreeResolution:
+        if context is None or owner is None:
+            return await self._worktrees.resolve_for_start(options)
+        producer = asyncio.create_task(
+            self._worktrees.resolve_for_start(
+                options,
+                accounting_sink=owner.writer,
+                # The utility finalizer fills deployment from its selected model.
+                usage_attribution=UsageAttribution(
+                    root_session_id=context.identity.root_session_id,
+                    session_id=context.identity.root_session_id,
+                    parent_session_id=None,
+                    agent_role="startup",
+                    agent_profile=None,
+                    purpose=UsagePurpose.WORKTREE_NAMING,
+                    model="",
+                    provider="",
+                    wire_name="",
+                    project_key=context.identity.project_key,
+                ),
+            )
+        )
+        try:
+            if self._track_startup_producer is not None:
+                self._track_startup_producer(context, producer)
+        except BaseException:
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+            raise
+        return await producer
+
+    async def _open_runtime(  # noqa: PLR0915
         self,
         params: SessionOpenParams,
         session_id: str | None,
@@ -641,8 +741,38 @@ class SessionRuntimeControllerImpl:
         continue_latest: bool = False,
     ) -> OpenedRuntime:
         options = params.agent_config.model_copy(update={"cwd": params.cwd})
+        context = self._initial_startup_accounting
+        self._initial_startup_accounting = None
+        # Disconnect makes the initial slot terminal, even on a reconnectable server.
+        if context is not None and context.state in {"abandoned", "adopted"}:
+            context = None
+        claimed = False
+        owner: RootAccountingOwner | None = None
+        opened = False
+
         try:
-            worktree_resolution = await self._worktrees.resolve_for_start(options)
+            if context is not None:
+                context.claim()
+                claimed = True
+                if self._startup_accounting_owner is None:
+                    raise RuntimeError("Startup accounting owner factory is required")
+                owner = self._startup_accounting_owner(context)
+            elif (
+                session_id is None
+                and not continue_latest
+                and self._allocate_startup_accounting is not None
+            ):
+                original_workspace = (
+                    Path(options.cwd or Path.cwd()).expanduser().resolve()
+                )
+                context, owner = await self._allocate_startup_accounting(
+                    original_workspace
+                )
+                context.claim()
+                claimed = True
+            worktree_resolution = await self._resolve_startup_worktree(
+                options, context, owner
+            )
             agent_loop: AgentLoop | None = None
             try:
                 agent_loop = await self._open_root(
@@ -652,6 +782,8 @@ class SessionRuntimeControllerImpl:
                         client_capabilities=self._services.client_capabilities(),
                         session_id=session_id,
                         continue_latest=continue_latest,
+                        startup_accounting=context,
+                        startup_accounting_claimed=claimed,
                     )
                 )
                 actual_cwd = Path(agent_loop.cwd).expanduser().resolve()
@@ -664,31 +796,22 @@ class SessionRuntimeControllerImpl:
                     worktree_resolution.prepared_worktree is None
                     and actual_cwd != resolved_cwd
                 ):
-                    actual = await self._worktrees.resolve_for_start(
+                    actual = await self._resolve_startup_worktree(
                         worktree_resolution.options.model_copy(
                             update={"cwd": str(actual_cwd)}
-                        )
+                        ),
+                        context,
+                        owner,
                     )
                     await self._worktrees.cleanup(worktree_resolution)
                     worktree_resolution = actual
             except BaseException as startup_error:
-                cleanup_errors: list[BaseException] = []
-                if agent_loop is not None:
-                    try:
-                        await close_agent_loop(agent_loop)
-                    except BaseException as exc:
-                        cleanup_errors.append(exc)
-                try:
-                    await self._worktrees.cleanup(worktree_resolution)
-                except BaseException as exc:
-                    cleanup_errors.append(exc)
-                if cleanup_errors:
-                    raise BaseExceptionGroup(
-                        "Runtime startup and cleanup failed",
-                        [startup_error, *cleanup_errors],
-                    )
+                await self._cleanup_failed_startup(
+                    startup_error, agent_loop, worktree_resolution
+                )
                 raise
             assert agent_loop is not None
+            opened = True
             return OpenedRuntime(
                 agent_loop=agent_loop, worktree_resolution=worktree_resolution
             )
@@ -709,6 +832,12 @@ class SessionRuntimeControllerImpl:
             ) from exc
         except GitError as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
+        finally:
+            if context is not None and claimed and not opened:
+                if self._abandon_startup_accounting is not None:
+                    await self._abandon_startup_accounting(context)
+                else:
+                    context.abandon()
 
     async def _attach_opened_runtime(
         self, opened: OpenedRuntime, history_limit: int, *, resumed: bool = False
@@ -913,7 +1042,7 @@ class SessionRuntimeControllerImpl:
                 )
 
 
-def create_session_backend_host_impl(
+def create_session_backend_host_impl(  # noqa: PLR0913
     *,
     open_root: OpenRoot,
     runtime_factory: AgentRuntimeFactory,
@@ -921,6 +1050,11 @@ def create_session_backend_host_impl(
     stage_root: StageRoot | None,
     services: SessionBackendServices,
     mcp_catalog_service: MCPCatalogService | None = None,
+    allocate_startup_accounting: AllocateStartupAccounting | None = None,
+    abandon_startup_accounting: AbandonStartupAccounting | None = None,
+    track_startup_producer: TrackStartupProducer | None = None,
+    startup_accounting: StartupAccountingContext | None = None,
+    startup_accounting_owner: StartupAccountingOwner | None = None,
 ) -> SessionBackendHostImpl:
     return SessionRuntimeControllerImpl(
         open_root=open_root,
@@ -929,6 +1063,11 @@ def create_session_backend_host_impl(
         stage_root=stage_root,
         services=services,
         mcp_catalog_service=mcp_catalog_service,
+        allocate_startup_accounting=allocate_startup_accounting,
+        abandon_startup_accounting=abandon_startup_accounting,
+        track_startup_producer=track_startup_producer,
+        startup_accounting=startup_accounting,
+        startup_accounting_owner=startup_accounting_owner,
     ).create_host()
 
 

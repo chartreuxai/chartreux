@@ -1282,6 +1282,11 @@ class ChartreuxAcpAgent(AcpAgent):
     def _send_usage_update(self, session: AcpSession) -> None:
         async def send() -> None:
             runtime = session.app_server.resources.runtime
+            context_window = runtime.context_window
+            # ACP requires a known size for usage_update; prompt responses still
+            # publish token usage when the context window cannot be resolved.
+            if context_window is None:
+                return
             stats = runtime.stats
             session_cost = stats.session_cost
             cost = (
@@ -1294,7 +1299,7 @@ class ChartreuxAcpAgent(AcpAgent):
                 update=UsageUpdate(
                     session_update="usage_update",
                     used=stats.context_tokens,
-                    size=runtime.context_window,
+                    size=context_window,
                     cost=cost,
                     **{
                         "_meta": {

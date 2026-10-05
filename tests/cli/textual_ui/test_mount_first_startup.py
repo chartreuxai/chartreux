@@ -13,8 +13,8 @@ from chartreux.app_server.models import AgentStatsSnapshot, ConfigIssue
 from chartreux.app_server.protocol import ConfigReadResponse, StatsUpdatedParams
 from chartreux.cli.textual_ui.widgets.banner.banner import Banner
 from chartreux.cli.textual_ui.widgets.chat_input import ChatInputContainer
-from chartreux.cli.textual_ui.widgets.context_progress import ContextProgress
 from chartreux.cli.textual_ui.widgets.loading import DEFAULT_LOADING_STATUS
+from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLine
 from tests.conftest import build_test_chartreux_app
 from tests.stubs.app_config import build_test_app_config
 
@@ -139,8 +139,9 @@ async def test_registry_swapped_after_session_ready() -> None:
         assert len(entries) > 0
         banner = app.query_one(Banner)
         assert banner.state.active_model != ""
-        context_progress = app.query_one(ContextProgress)
-        assert context_progress.tokens.max_tokens > 0
+        context_progress = app.query_one(SessionStatusLine)
+        assert context_progress.state.auto_compact_threshold is not None
+        assert context_progress.state.auto_compact_threshold > 0
 
 
 @pytest.mark.asyncio
@@ -162,10 +163,10 @@ async def test_stats_update_keeps_context_progress_visible() -> None:
         )
         await pilot.pause()
 
-        context_progress = app.query_one(ContextProgress)
-        assert context_progress.tokens.max_tokens == 200_000
-        assert context_progress.tokens.current_tokens == 12_500
-        assert str(context_progress.render()) == "ctx 12k/200k"
+        context_progress = app.query_one(SessionStatusLine)
+        assert context_progress.state.auto_compact_threshold == 200_000
+        assert context_progress.state.context_tokens == 12_500
+        assert "12k/200k (6%)" in context_progress.render().plain
 
 
 @pytest.mark.asyncio
@@ -177,7 +178,7 @@ async def test_stats_update_while_modal_is_open_updates_main_progress() -> None:
     app = build_test_chartreux_app()
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause(0.2)
-        context_progress = app.query_one(ContextProgress)
+        context_progress = app.query_one(SessionStatusLine)
         app.push_screen(_BlankModal())
         await pilot.pause()
 
@@ -194,8 +195,8 @@ async def test_stats_update_while_modal_is_open_updates_main_progress() -> None:
         )
         await pilot.pause()
 
-        assert context_progress.tokens.max_tokens == 200_000
-        assert context_progress.tokens.current_tokens == 12_500
+        assert context_progress.state.auto_compact_threshold == 200_000
+        assert context_progress.state.context_tokens == 12_500
 
 
 def test_cold_path_force_quit_does_not_access_config() -> None:

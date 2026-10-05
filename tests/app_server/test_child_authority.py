@@ -148,6 +148,82 @@ def register_wp3_agent(
     })
 
 
+async def test_child_scratch_access_survives_rebind_close_and_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "settings.toml"
+    path.write_text("")
+    orchestrator = await make_orchestrator(path)
+    assert not await orchestrator.set_field(
+        "/session_logging",
+        {"enabled": True, "save_dir": str(tmp_path / "sessions")},
+        target_layer=OverridesLayer.NAME,
+    )
+    parent = AgentLoop(
+        config_orchestrator=orchestrator, cwd=tmp_path, backend=FakeBackend()
+    )
+    register_wp3_agent(parent)
+    factory = AgentRuntimeFactory()
+    loops: list[AgentLoop] = []
+    scratch = parent.scratchpad_dir
+    assert scratch is not None
+    try:
+        await parent.persist_empty_session()
+        generation = parent._session_generation
+        await parent._reset_session()
+        assert parent._session_generation == generation + 1
+        assert parent.scratchpad_dir == scratch and scratch.is_dir()
+        # Construction, rebind and resume must not create a child-owned directory.
+        import chartreux.core.agent_loop._loop as loop_module
+
+        def forbidden_init(_session_id: str):
+            pytest.fail("Child attempted to create a scratchpad")
+
+        monkeypatch.setattr(loop_module, "init_scratchpad", forbidden_init)
+        child = await factory.create_child(parent, WP3_AGENT.name)
+        loops.append(child)
+        await child.wait_until_ready()
+        await child.persist_empty_session()
+        directory = child.session_logger.session_dir
+        metadata = child.session_logger.session_metadata
+        assert directory is not None and metadata is not None
+        child_id = child.session_id
+        cached = child.tool_manager.get("read_file")
+        args = ReadFileArgs(file_path=str(scratch / "notes.txt"))
+        decision = cached.resolve_permission(args)
+        assert decision is not None and decision.permission == ToolPermission.ALWAYS
+        assert child.scratchpad_dir is None
+        with pytest.raises(ValueError, match="cannot own"):
+            child.rebind_to_session(
+                child_id,
+                directory,
+                [],
+                session_metadata=metadata,
+                prepared_scratchpad=scratch,
+            )
+        child.rebind_to_session(child_id, directory, [], session_metadata=metadata)
+        assert child.scratchpad_dir is None and scratch.is_dir()
+        decision = cached.resolve_permission(args)
+        assert decision is not None and decision.permission == ToolPermission.ALWAYS
+        await child.aclose()
+        assert scratch.is_dir()
+        resumed = await factory.resume_child(
+            parent, WP3_AGENT.name, child_id, directory
+        )
+        loops.append(resumed)
+        await resumed.wait_until_ready()
+        assert resumed.scratchpad_dir is None
+        decision = resumed.tool_manager.get("read_file").resolve_permission(args)
+        assert decision is not None and decision.permission == ToolPermission.ALWAYS
+        await resumed.aclose()
+        assert scratch.is_dir()
+    finally:
+        for loop in reversed(loops):
+            await loop.aclose()
+        await parent.aclose()
+    assert not scratch.exists()
+
+
 async def test_parent_disabled_tool_remains_unavailable_despite_child_enablement(
     tmp_path: Path,
 ) -> None:

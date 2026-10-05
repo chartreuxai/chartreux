@@ -4,6 +4,7 @@ exposed via get_full_description(); every argument carries a Field description.
 
 from __future__ import annotations
 
+from chartreux.core.tools.builtins.cancel_agent import CancelAgent
 from chartreux.core.tools.builtins.edit import Edit
 from chartreux.core.tools.builtins.read_file import ReadFile
 from chartreux.core.tools.builtins.read_image import ReadImage
@@ -26,7 +27,7 @@ def test_tool_names_are_unified() -> None:
 
 
 def test_new_builtin_descriptions_load_sibling_prompts() -> None:
-    for tool in (ReadImage, WebSearch):
+    for tool in (ReadImage, WebSearch, CancelAgent):
         prompt = tool.get_tool_prompt()
         assert prompt is not None
         assert prompt == tool.get_full_description()

@@ -2,15 +2,25 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from pathlib import Path
 import signal
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from textual.widgets import Static
+from textual.widgets import Button, Static
 
-from chartreux.cli.textual_ui.app import ChartreuxApp, _run_app_with_cleanup
-from chartreux.cli.textual_ui.quit_manager import QUIT_CONFIRM_DELAY, QuitManager
+from chartreux.cli.textual_ui.app import (
+    ChartreuxApp,
+    _run_app_with_cleanup,
+    run_textual_ui,
+)
+from chartreux.cli.textual_ui.quit_manager import (
+    QUIT_CONFIRM_DELAY,
+    ExitConsequencesScreen,
+    QuitManager,
+)
+from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLine
 from tests.conftest import build_test_chartreux_app, build_test_vibe_config
 from tests.stubs.app_config import build_test_app_config
 
@@ -29,7 +39,7 @@ def app_config_view(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def qm() -> QuitManager:
     mock_app = MagicMock()
-    mock_app.query_one.side_effect = Exception("not mounted")
+    mock_app.query_one.return_value = MagicMock(spec=SessionStatusLine)
     mock_app.set_timer.return_value = MagicMock()
     return QuitManager(mock_app)
 
@@ -92,19 +102,41 @@ class TestQuitManager:
         assert qm.is_confirmed("Ctrl+C") is False
         assert qm.confirm_key is None
         assert qm._confirm_timer is None
+        mock_app = qm._app
+        assert isinstance(mock_app, MagicMock)
+        mock_app.query_one.assert_called_with(SessionStatusLine)
+        mock_app.query_one.return_value.clear_feedback.assert_called_once()
 
     def test_cancel_confirmation_noop_when_idle(self, qm: QuitManager) -> None:
         qm.cancel_confirmation()
         assert qm.confirm_key is None
 
 
+@pytest.mark.asyncio
+async def test_quit_confirmation_feedback_restores_status(app: ChartreuxApp) -> None:
+    async with app.run_test(size=(120, 24)) as pilot:
+        status = app.query_one(SessionStatusLine)
+        app._quit_manager.request_confirmation("Ctrl+C")
+        await pilot.pause()
+        assert "again to quit" in status.render().plain
+        assert not app._quit_manager.is_confirmed("Ctrl+D")
+        app._quit_manager.cancel_confirmation()
+        await pilot.pause()
+        assert "again to quit" not in status.render().plain
+        assert app._quit_manager.confirm_key is None
+        assert app._quit_manager._confirm_timer is None
+
+
 class TestActionInterruptOrQuit(_SessionReadyApp):
-    def test_clears_input_when_has_value(self, app: ChartreuxApp) -> None:
-        mock_container = MagicMock()
-        mock_container.value = "some text"
-        with patch.object(app, "_get_chat_input", return_value=mock_container):
-            app.action_interrupt_or_quit()
-        assert mock_container.value == ""
+    @pytest.mark.asyncio
+    async def test_clears_input_when_has_value(self, app: ChartreuxApp) -> None:
+        app._app_server = None
+        async with app.run_test():
+            mock_container = MagicMock()
+            mock_container.value = "some text"
+            with patch.object(app, "_get_chat_input", return_value=mock_container):
+                app.action_interrupt_or_quit()
+            assert mock_container.value == ""
 
     def test_skips_empty_input(self, app: ChartreuxApp) -> None:
         mock_container = MagicMock()
@@ -119,27 +151,34 @@ class TestActionInterruptOrQuit(_SessionReadyApp):
         assert mock_confirm.call_args.args[0] == "Ctrl+C"
         assert "Main work:" in mock_confirm.call_args.args[1]
 
-    def test_quits_on_confirmed(self, app: ChartreuxApp) -> None:
-        app._quit_manager._confirm_time = time.monotonic()
-        app._quit_manager._confirm_key = "Ctrl+C"
-        with (
-            patch.object(app, "_get_chat_input", return_value=None),
-            patch.object(app, "_force_quit") as mock_quit,
-        ):
-            app.action_interrupt_or_quit()
-        mock_quit.assert_called_once()
+    @pytest.mark.asyncio
+    async def test_quits_on_confirmed(self, app: ChartreuxApp) -> None:
+        app._app_server = None
+        async with app.run_test():
+            app._quit_manager.request_confirmation("Ctrl+C")
+            with (
+                patch.object(app, "_get_chat_input", return_value=None),
+                patch.object(app, "_force_quit") as mock_quit,
+            ):
+                app.action_interrupt_or_quit()
+            mock_quit.assert_called_once()
 
-    def test_interrupts_before_requesting_confirmation(self, app: ChartreuxApp) -> None:
-        with (
-            patch.object(app, "_get_chat_input", return_value=None),
-            patch.object(
-                app, "_try_interrupt_no_job_steps", return_value=True
-            ) as mock_interrupt,
-            patch.object(app._quit_manager, "request_confirmation") as mock_confirm,
-        ):
-            app.action_interrupt_or_quit()
-        mock_interrupt.assert_called_once()
-        mock_confirm.assert_not_called()
+    @pytest.mark.asyncio
+    async def test_interrupts_before_requesting_confirmation(
+        self, app: ChartreuxApp
+    ) -> None:
+        app._app_server = None
+        async with app.run_test():
+            with (
+                patch.object(app, "_get_chat_input", return_value=None),
+                patch.object(
+                    app, "_try_interrupt_no_job_steps", return_value=True
+                ) as mock_interrupt,
+                patch.object(app._quit_manager, "request_confirmation") as mock_confirm,
+            ):
+                app.action_interrupt_or_quit()
+            mock_interrupt.assert_called_once()
+            mock_confirm.assert_not_called()
 
     def test_requests_confirmation_when_nothing_to_interrupt(
         self, app: ChartreuxApp
@@ -176,15 +215,17 @@ class TestActionDeleteRightOrQuit(_SessionReadyApp):
         assert mock_confirm.call_args.args[0] == "Ctrl+D"
         assert "pending decisions:" in mock_confirm.call_args.args[1]
 
-    def test_quits_on_confirmed(self, app: ChartreuxApp) -> None:
-        app._quit_manager._confirm_time = time.monotonic()
-        app._quit_manager._confirm_key = "Ctrl+D"
-        with (
-            patch.object(app, "_get_chat_input", return_value=None),
-            patch.object(app, "_force_quit") as mock_quit,
-        ):
-            app.action_delete_right_or_quit()
-        mock_quit.assert_called_once()
+    @pytest.mark.asyncio
+    async def test_quits_on_confirmed(self, app: ChartreuxApp) -> None:
+        app._app_server = None
+        async with app.run_test():
+            app._quit_manager.request_confirmation("Ctrl+D")
+            with (
+                patch.object(app, "_get_chat_input", return_value=None),
+                patch.object(app, "_force_quit") as mock_quit,
+            ):
+                app.action_delete_right_or_quit()
+            mock_quit.assert_called_once()
 
     def test_requests_confirmation_when_no_input(self, app: ChartreuxApp) -> None:
         with (
@@ -252,6 +293,82 @@ async def test_begin_shutdown_stops_the_side_channel(app: ChartreuxApp) -> None:
 
     side_channel_shutdown.assert_awaited_once()
     await app.shutdown_cleanup()
+
+
+@pytest.mark.parametrize("stage", ["bootstrap", "app"])
+@pytest.mark.parametrize("outcome", ["normal", "exception", "cancelled"])
+def test_run_textual_ui_closes_owned_harness_before_loop_exit(
+    app: ChartreuxApp, tmp_path: Path, stage: str, outcome: str
+) -> None:
+    error = (
+        RuntimeError("boom")
+        if outcome == "exception"
+        else asyncio.CancelledError()
+        if outcome == "cancelled"
+        else None
+    )
+    bootstrap = AsyncMock(
+        return_value=MagicMock(), side_effect=error if stage == "bootstrap" else None
+    )
+    events: list[str] = []
+
+    async def session_cleanup() -> None:
+        events.append("session")
+
+    async def close_harness() -> None:
+        assert asyncio.get_running_loop().is_running()
+        await asyncio.sleep(0)
+        events.append("harness")
+
+    close = AsyncMock(side_effect=close_harness)
+    with (
+        patch("chartreux.cli.textual_ui.app.resolve_auto_theme"),
+        patch("chartreux.cli.textual_ui.app.ChartreuxApp", return_value=app),
+        patch.object(
+            app,
+            "run_async",
+            new_callable=AsyncMock,
+            side_effect=error if stage == "app" else None,
+        ),
+        patch.object(app, "shutdown_cleanup", side_effect=session_cleanup),
+    ):
+        if error is None:
+            run_textual_ui(bootstrap, tmp_path / "history", close_app_server=close)
+        else:
+            with pytest.raises(type(error)):
+                run_textual_ui(bootstrap, tmp_path / "history", close_app_server=close)
+    close.assert_awaited_once()
+    assert events == (
+        ["harness"]
+        if stage == "bootstrap" and error is not None
+        else ["session", "harness"]
+    )
+
+
+def test_run_textual_ui_closes_owned_harness_when_startup_plan_is_cancelled(
+    tmp_path: Path,
+) -> None:
+    from chartreux.app_server.host import AppServerHost
+
+    host = MagicMock(spec=AppServerHost)
+    close = AsyncMock()
+    with (
+        patch("chartreux.cli.textual_ui.app.resolve_auto_theme"),
+        patch(
+            "chartreux.cli.textual_ui.startup.resolve_session_open_plan",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+    ):
+        assert (
+            run_textual_ui(
+                AsyncMock(return_value=host),
+                tmp_path / "history",
+                close_app_server=close,
+            )
+            is None
+        )
+    close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -375,24 +492,104 @@ def test_disabled_confirmation_still_checks_agents_and_queued_input(
 
 
 @pytest.mark.asyncio
-async def test_consequential_exit_modal_is_reachable_and_cancelable() -> None:
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+@pytest.mark.parametrize("cancel", ["escape", "enter", "click"])
+async def test_consequential_exit_cancel_preserves_opener_and_work(
+    size: tuple[int, int], cancel: str
+) -> None:
     app = build_test_chartreux_app()
-    async with app.run_test(size=(80, 24)) as pilot:
+    async with app.run_test(size=size) as pilot:
+        opener_screen = app.screen
+        opener = app.screen.focused
+        assert opener is not None
+        app._pending_turn = True
+        with (
+            patch.object(app, "_force_quit") as force,
+            patch.object(app, "_begin_shutdown", new_callable=AsyncMock) as shutdown,
+            patch.object(app, "_try_interrupt") as interrupt,
+            patch.object(app._queue, "pop_last", new_callable=AsyncMock) as pop,
+            patch.object(
+                app._queue, "clear_server_queue", new_callable=AsyncMock
+            ) as clear,
+            patch.object(type(app._queue), "has_removable", True),
+        ):
+            await app._exit_app()
+            await pilot.pause()
+            dialog = app.screen
+            assert isinstance(dialog, ExitConsequencesScreen)
+            assert dialog.focused is dialog.query_one("#exit-cancel", Button)
+            assert "Main work:" in str(
+                dialog.query_one("#exit-consequences Static", Static).content
+            )
+            if cancel == "click":
+                assert await pilot.click("#exit-cancel")
+            else:
+                await pilot.press(cancel)
+            await pilot.pause()
+            assert app.screen is opener_screen
+            assert app.screen.focused is opener
+            assert app._pending_turn
+            force.assert_not_called()
+            shutdown.assert_not_called()
+            interrupt.assert_not_called()
+            pop.assert_not_awaited()
+            clear.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+@pytest.mark.parametrize("activate", ["keyboard", "click"])
+async def test_consequential_exit_requires_explicit_exit_activation(
+    size: tuple[int, int], activate: str
+) -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test(size=size) as pilot:
         app._pending_turn = True
         with patch.object(app, "_force_quit") as force:
             await app._exit_app()
             await pilot.pause()
-            from chartreux.cli.textual_ui.quit_manager import ExitConsequencesScreen
+            if activate == "click":
+                assert await pilot.click("#exit-confirm")
+            else:
+                await pilot.press("tab")
+                assert app.screen.focused is app.screen.query_one(
+                    "#exit-confirm", Button
+                )
+                force.assert_not_called()
+                await pilot.press("enter")
+            await pilot.pause()
+            force.assert_called_once_with()
 
-            dialog = app.screen
-            assert isinstance(dialog, ExitConsequencesScreen)
-            assert "Main work:" in str(dialog.query_one("Static", Static).content)
-            await pilot.press("escape")
+
+@pytest.mark.asyncio
+async def test_quit_key_ladders_are_noops_while_exit_modal_is_up() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test(size=(80, 24)) as pilot:
+        app._pending_turn = True
+        await app._exit_app()
+        await pilot.pause()
+        dialog = app.screen
+        assert isinstance(dialog, ExitConsequencesScreen)
+        with (
+            patch.object(app, "_get_chat_input") as get_input,
+            patch.object(app, "_try_interrupt_no_job_steps") as no_job,
+            patch.object(app, "_try_interrupt_running_job") as job,
+            patch.object(app._queue, "pop_last", new_callable=AsyncMock) as pop,
+            patch.object(app, "_request_intentional_exit") as request,
+            patch.object(app, "_force_quit") as force,
+        ):
+            await pilot.press("ctrl+c", "ctrl+d", "ctrl+c", "ctrl+d")
+            # Also check the ladder entry points directly, independent of bindings.
+            app.action_interrupt_or_quit()
+            app.action_delete_right_or_quit()
             await pilot.pause()
+            assert app.screen is dialog
+            assert dialog.focused is dialog.query_one("#exit-cancel", Button)
+            assert app._pending_turn
+            get_input.assert_not_called()
+            no_job.assert_not_called()
+            job.assert_not_called()
+            pop.assert_not_awaited()
+            request.assert_not_called()
             force.assert_not_called()
-            assert not isinstance(app.screen, ExitConsequencesScreen)
-            await app._exit_app()
-            await pilot.pause()
-            await pilot.press("enter")
-            await pilot.pause()
-            force.assert_called_once()
+        await pilot.press("escape")

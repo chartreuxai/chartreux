@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from dataclasses import replace
+from datetime import UTC, datetime
 import time
 
 import pytest
+from textual.app import App
 
 from chartreux.app_server._turns import TurnController
+from chartreux.app_server.models import (
+    PreparedPrompt,
+    PublicEntryGenerationStatus,
+    PublicMessageEntry,
+    PublicTurnQueue,
+    TextContentBlock,
+)
 from chartreux.app_server.protocol import (
     AppServerResponseError,
     ProtocolError,
@@ -27,6 +37,7 @@ from chartreux.cli.textual_ui.widgets.messages import (
 )
 from chartreux.observability.logging import set_config_log_level, set_session_override
 from chartreux.ui.widgets.theme_picker import ThemePickerApp, sorted_theme_names
+from tests.cli.textual_ui.test_message_queue import _queue_controller, _server_turn
 from tests.conftest import build_test_agent_loop, build_test_chartreux_app
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
@@ -167,6 +178,56 @@ async def test_concurrent_idle_prompts_are_serialized_by_server_queue(
     }
 
 
+@pytest.mark.parametrize(
+    "ordering", ["history-first", "promotion-first", "history-before-restore"]
+)
+@pytest.mark.asyncio
+async def test_restored_queue_reconciles_by_id_across_orderings(ordering: str) -> None:
+    posted = datetime(2026, 7, 12, 14, 32, tzinfo=UTC)
+    canonical = PublicMessageEntry(
+        id="canonical",
+        session_id="session",
+        role="user",
+        created_at=1,
+        updated_at=1,
+        generation_status=PublicEntryGenerationStatus.COMPLETED,
+        content=[TextContentBlock(text="restored")],
+        posted_at=posted,
+    )
+    app = App()
+    async with app.run_test() as pilot:
+
+        async def mount(widget, **_kwargs) -> None:
+            await app.mount(widget)
+
+        controller = _queue_controller(mount_and_scroll=mount)
+        if ordering == "history-before-restore":
+            controller.reconcile_history_entry(canonical)
+        await controller.sync_server_queue(
+            PublicTurnQueue(items=[_server_turn("queued", "restored", "canonical")])
+        )
+        widget = controller.widgets[0]
+        assert widget.pending and widget.header.posted_at is None
+        if ordering == "history-first":
+            controller.reconcile_history_entry(canonical)
+            assert widget.header.posted_at is None
+        await controller.turn_started("queued")
+        if ordering == "promotion-first":
+            assert widget.header.posted_at is None
+            controller.reconcile_history_entry(canonical)
+        assert widget.header.posted_at == posted
+        controller.reconcile_history_entry(canonical)
+        await controller.turn_started("queued")
+        assert widget.header.posted_at == posted
+        await widget.remove()
+        # A remounted history widget receives the same authority, not a new clock.
+        restored = UserMessage("restored", history_entry_id="canonical")
+        controller._track_message(restored)
+        await app.mount(restored)
+        await pilot.pause()
+        assert restored.header.posted_at == posted
+
+
 @pytest.mark.asyncio
 async def test_no_queue_header_when_empty(chartreux_app: ChartreuxApp) -> None:
     async with chartreux_app.run_test():
@@ -193,7 +254,21 @@ async def test_mount_and_scroll_ignores_streaming_message_during_shutdown(
 @pytest.mark.asyncio
 async def test_queued_prompts_merge_into_one_turn() -> None:
     app, backend = _blocked_app()
+
+    def history_message(entry_id: str) -> PublicMessageEntry | None:
+        return next(
+            (
+                entry
+                for entry in (app.app_server.state.history or [])
+                if isinstance(entry, PublicMessageEntry) and entry.id == entry_id
+            ),
+            None,
+        )
+
+    app._queue._ports = replace(app._queue._ports, history_message=history_message)
     async with app.run_test() as pilot:
+        assert app.event_handler is not None
+        app.event_handler.on_user_message = app._queue.reconcile_history_entry
         chat_input = app.query_one(ChatInputContainer)
         chat_input.post_message(ChatInputContainer.Submitted("block queue"))
         assert await _wait_until(pilot, backend.started.is_set)
@@ -207,6 +282,10 @@ async def test_queued_prompts_merge_into_one_turn() -> None:
         assert [
             message._content for message in app.query(UserMessage) if message.pending
         ] == ["first queued", "second queued"]
+        queued_widgets = [
+            message for message in app.query(UserMessage) if message.pending
+        ]
+        assert all(message.header.posted_at is None for message in queued_widgets)
 
         backend.release.set()
         assert await _wait_until(pilot, lambda: len(backend.requests_messages) == 2)
@@ -224,6 +303,14 @@ async def test_queued_prompts_merge_into_one_turn() -> None:
                 == 2
             ),
         )
+
+        canonical = history_message(queued_widgets[0].history_entry_id or "")
+        assert canonical is not None and canonical.posted_at is not None
+        assert queued_widgets[0].header.posted_at == canonical.posted_at
+        assert queued_widgets[1].header.posted_at is None
+        assert not queued_widgets[1].header.display
+        app._queue.reconcile_history_entry(canonical)
+        assert queued_widgets[0].header.posted_at == canonical.posted_at
 
     assert [request[-1].content for request in backend.requests_messages] == [
         "block queue",
@@ -1241,7 +1328,11 @@ async def test_steer_after_ended_turn_does_not_drop_queue() -> None:
 
         async def ended_turn_inject(*_args: object, **_kwargs: object) -> list[object]:
             raise AppServerResponseError(
-                ProtocolError(code=ProtocolErrorCode.CONFLICT, message="No active turn")
+                ProtocolError(
+                    code=ProtocolErrorCode.CONFLICT,
+                    message="No active turn",
+                    data={"steerCommitted": False},
+                )
             )
 
         app.app_server.inject_user_context = ended_turn_inject  # type: ignore[method-assign]
@@ -1299,6 +1390,39 @@ async def test_steer_requests_invoked_skill_injection() -> None:
         assert await _wait_until(
             pilot, lambda: not app._agent_job_active() and len(app._queue) == 0
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+async def test_unresolved_steering_queue_edit_does_not_copy_and_remove_discards(
+    size: tuple[int, int],
+) -> None:
+    app = build_test_chartreux_app()
+
+    async def disconnected(*args, **kwargs):
+        raise OSError("delivery unknown")
+
+    async with app.run_test(size=size) as pilot:
+        app._queue._ports = replace(app._queue._ports, steer_turn=disconnected)
+        with pytest.raises(RuntimeError, match="unresolved"):
+            await app._queue.steer_prepared(
+                "stuck",
+                prepared_prompt=PreparedPrompt(
+                    display_text="stuck", prompt_text="stuck"
+                ),
+                expected_turn_id="retired",
+            )
+        chat_input = app.query_one(ChatInputContainer)
+        app.query_one(ChatTextArea).focus()
+        await pilot.press("up")
+        assert await _wait_until(pilot, lambda: app._queue_selected_widget is not None)
+        chat_input.post_message(ChatInputContainer.QueueEditSubmitted("changed"))
+        assert await _wait_until(pilot, lambda: bool(app.query(ErrorMessage)))
+        assert app._queue.queue_item_texts() == [(0, "stuck")]
+        assert not app.app_server.turn_queue.items
+        chat_input.post_message(ChatInputContainer.QueueRemoveRequested())
+        assert await _wait_until(pilot, lambda: not app._queue)
+        assert not app._queue.has_unresolved_steering
 
 
 @pytest.mark.asyncio

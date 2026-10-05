@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
+from enum import StrEnum
 import fnmatch
 import ntpath
 import os
@@ -10,7 +12,6 @@ from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 import posixpath
 
 from chartreux.core.config.harness_files import HarnessFilesManager
-from chartreux.core.scratchpad import is_scratchpad_path
 from chartreux.core.tools.base import ToolPermission
 from chartreux.core.tools.permissions import PermissionContext
 from chartreux.core.workspace import Workspace
@@ -33,6 +34,43 @@ def matches_sensitive_pattern(resolved_path: str, patterns: list[str]) -> bool:
     """Return True if a resolved path matches any sensitive glob, case-insensitively."""
     lowered = PurePath(resolved_path.lower())
     return any(lowered.match(pattern.lower()) for pattern in patterns)
+
+
+_instruction_read_ceiling: ContextVar[frozenset[Path] | None] = ContextVar(
+    "instruction_read_ceiling", default=None
+)
+
+
+@contextmanager
+def instruction_read_ceiling(files: frozenset[Path]) -> Iterator[None]:
+    """Apply the requesting agent's manifest while checking ancestor denials.
+
+    Ancestors still enforce every NEVER ceiling; their workspace boundary alone
+    must not suppress a document injected into the requesting child's context.
+    Nested ancestors retain the original request manifest.
+    """
+    existing = _instruction_read_ceiling.get()
+    token = _instruction_read_ceiling.set(existing if existing is not None else files)
+    try:
+        yield
+    finally:
+        _instruction_read_ceiling.reset(token)
+
+
+_scratchpad_ceiling: ContextVar[frozenset[Path] | None] = ContextVar(
+    "scratchpad_ceiling", default=None
+)
+
+
+@contextmanager
+def scratchpad_ceiling(roots: frozenset[Path]) -> Iterator[None]:
+    """Carry the original request's live grants through ancestor denial checks."""
+    existing = _scratchpad_ceiling.get()
+    token = _scratchpad_ceiling.set(existing if existing is not None else roots)
+    try:
+        yield
+    finally:
+        _scratchpad_ceiling.reset(token)
 
 
 _active_file_display_harness: ContextVar[HarnessFilesManager | None] = ContextVar(
@@ -196,7 +234,73 @@ def is_path_within_workdir(
     return workspace.allows(resolved)
 
 
-def resolve_file_tool_permission(  # noqa: PLR0911 - ordered independent denial ceilings
+def is_canonical_scratch_path(file_path: Path, root: Path | None) -> bool:
+    """Check a pinned root without redefining its boundary after symlink mutation."""
+    try:
+        return (
+            root is not None
+            and root.resolve() == root.absolute()
+            and file_path.is_relative_to(root.absolute())
+        )
+    except (ValueError, OSError):
+        return False
+
+
+class PathAccess(StrEnum):
+    READ = "read"
+    WRITE = "write"
+    MUTATE = "mutate"
+
+
+@dataclass(frozen=True)
+class PathAuthority:
+    """Immutable path-policy inputs shared by file tools and shell operands.
+
+    A snapshot is an optimization, not an approval: callers still validate the
+    manager token and preserve custom invocation resolvers.
+    """
+
+    tool_name: str
+    permission: ToolPermission
+    allowlist: tuple[str, ...]
+    denylist: tuple[str, ...]
+    sensitive: tuple[str, ...]
+    workspace: Workspace
+    scratchpad: Path | None = None
+    scratchpad_roots: frozenset[Path] = frozenset()
+    instruction_read_files: frozenset[Path] = frozenset()
+    parents: tuple[PathAuthority, ...] = ()
+    plan_file_write_scope: Path | None = None
+    inherited_plan_write_scopes: tuple[tuple[Path, Path | None], ...] = ()
+
+    def resolve(self, path: str, access: PathAccess) -> PermissionContext | None:
+        decision = resolve_file_tool_permission(
+            path,
+            tool_name=self.tool_name,
+            allowlist=list(self.allowlist),
+            denylist=list(self.denylist),
+            config_permission=self.permission,
+            sensitive_patterns=list(self.sensitive),
+            workspace=self.workspace,
+            scratchpad_dir=self.scratchpad,
+            scratchpad_roots=self.scratchpad_roots,
+            instruction_read_files=self.instruction_read_files,
+            plan_file_write_scope=self.plan_file_write_scope,
+            inherited_plan_write_scopes=self.inherited_plan_write_scopes,
+            access=access,
+        )
+        for parent in self.parents:
+            inherited = parent.resolve(path, access)
+            if inherited is not None and inherited.permission == ToolPermission.NEVER:
+                return inherited
+        return decision
+
+    def allows(self, path: Path, access: PathAccess = PathAccess.READ) -> bool:
+        decision = self.resolve(str(path), access)
+        return decision is not None and decision.permission == ToolPermission.ALWAYS
+
+
+def resolve_file_tool_permission(  # noqa: PLR0911, PLR0913 - independent runtime denial ceilings
     path_str: str,
     *,
     tool_name: str,
@@ -206,15 +310,20 @@ def resolve_file_tool_permission(  # noqa: PLR0911 - ordered independent denial 
     sensitive_patterns: list[str],
     workspace: Workspace | None = None,
     scratchpad_dir: Path | None = None,
+    scratchpad_roots: frozenset[Path] = frozenset(),
     plan_file_write_scope: Path | None = None,
     inherited_plan_write_scopes: tuple[tuple[Path, Path | None], ...] = (),
+    instruction_read_files: frozenset[Path] = frozenset(),
+    access: PathAccess | None = None,
 ) -> PermissionContext | None:
     """Resolve permission for a file-based tool invocation.
 
     Checks unconditional, path and sensitive denies before scoped Plan writes or
     scratchpad. Plan scope is runtime-owned, not an ordinary config permission.
-    All other reads and writes require workspace authority; allowlists never
-    expand it. Decisions never manufacture per-call approval requirements.
+    Exact injected instruction files additionally permit read_file/grep and
+    explicitly modeled shell reads, never writes or opaque mutators.
+    Other reads and writes require workspace authority; allowlists never expand
+    it. Decisions never manufacture per-call approval requirements.
     """
     if config_permission == ToolPermission.NEVER:
         return PermissionContext(
@@ -259,18 +368,16 @@ def resolve_file_tool_permission(  # noqa: PLR0911 - ordered independent denial 
                 reason="Parent Plan scope permits writes only to its designated plan file or session scratchpad",
             )
 
-    in_scratchpad = (
-        scratchpad_dir is not None
-        and scratchpad_dir.resolve() == scratchpad_dir.absolute()
-        and is_scratchpad_path(file_str, scratchpad_dir=scratchpad_dir)
-    )
-    if plan_file_write_scope is not None or in_scratchpad:
-        # Compare the canonical invocation with the designated path, not its
-        # symlink target: replacing the plan file with a symlink must not expand
-        # write authority to an arbitrary file. No glob expansion is involved.
-        allowed = in_scratchpad or (
-            plan_file_write_scope is not None
-            and file_path == plan_file_write_scope.absolute()
+    roots = scratchpad_roots
+    if scratchpad_dir is not None:
+        roots |= {scratchpad_dir.absolute()}
+    if (request_roots := _scratchpad_ceiling.get()) is not None:
+        roots = request_roots
+    in_scratchpad = any(is_canonical_scratch_path(file_path, root) for root in roots)
+    if plan_file_write_scope is not None:
+        # A request grant cannot expand this ancestor's own Plan ceiling.
+        allowed = is_canonical_scratch_path(file_path, scratchpad_dir) or (
+            file_path == plan_file_write_scope.absolute()
         )
         return PermissionContext(
             permission=ToolPermission.ALWAYS if allowed else ToolPermission.NEVER,
@@ -279,15 +386,48 @@ def resolve_file_tool_permission(  # noqa: PLR0911 - ordered independent denial 
             else "Plan mode permits file writes only to the designated plan file or session scratchpad",
         )
 
+    if (
+        tool_name == "bash"
+        and is_canonical_scratch_path(file_path, scratchpad_dir)
+        and workspace.ceiling is not None
+        and not workspace.ceiling.allows(file_path)
+    ):
+        return PermissionContext(
+            permission=ToolPermission.NEVER,
+            reason="File access outside authorized project and session scratch roots; only an explicit user scope change can authorize it",
+        )
+    if in_scratchpad:
+        return PermissionContext(permission=ToolPermission.ALWAYS)
+
     # The target passed every inherited ceiling and any local Plan scope above.
     # Preserve that exact runtime grant, including a parent's out-of-workspace plan.
     if inherited_plan_write_scopes:
         return PermissionContext(permission=ToolPermission.ALWAYS)
 
+    # Exact-file read capability, never an effect-kind or directory grant.
+    # Canonical identities were pinned by the loader; do not re-resolve them.
+    read_only = (
+        access == PathAccess.READ and tool_name in {"read_file", "grep", "bash"}
+        if access is not None
+        else tool_name in {"read_file", "grep"}
+    )
+    files = instruction_read_files
+    if read_only and (request_files := _instruction_read_ceiling.get()) is not None:
+        files = request_files
+    if read_only and file_path in files and file_path.is_file():
+        # Request-time check, not a race sandbox: post-injection mutation is accepted, as with prompt refresh.
+        return PermissionContext(permission=ToolPermission.ALWAYS)
+
     if not workspace.allows(file_path):
-        return PermissionContext(
-            permission=ToolPermission.NEVER,
-            reason="File access outside authorized project and session scratch roots; only an explicit user scope change can authorize it",
+        reason = (
+            "File read is outside authorized workspace and session scratch roots "
+            "and is not an instruction file injected into this agent's context. "
+            "Other paths require an explicit user scope change."
+            if read_only
+            else "Injected instruction files are readable only; writes require an explicit user scope change."
+            if tool_name in {"write_file", "edit"} and file_path in files
+            else "File access outside authorized project and session scratch roots; only an explicit user scope change can authorize it"
         )
+        return PermissionContext(permission=ToolPermission.NEVER, reason=reason)
 
     return PermissionContext(permission=ToolPermission.ALWAYS)

@@ -14,6 +14,7 @@ from chartreux.core.events import (
 )
 from chartreux.core.llm_models import LLMMessage
 from chartreux.core.session.title_policy import DEFAULT_TITLE_POLICY, TitlePolicy
+from chartreux.core.usage import AccountingSink, UsageAttribution
 from chartreux.observability.logging import logger
 
 
@@ -27,6 +28,9 @@ class TitleScheduleInputs:
     logging_enabled: bool
     title_is_manual: bool
     periodic: bool
+    # Retain the scheduling-time owner/session binding across cancellation/rebind.
+    accounting_sink: AccountingSink | None = None
+    usage_attribution: UsageAttribution | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +205,8 @@ class TitleController:
                 config=gate_inputs.config,
                 previous_title=gate_inputs.previous_title,
                 policy=self._policy,
+                accounting_sink=inputs.accounting_sink,
+                usage_attribution=inputs.usage_attribution,
             )
             if title is None:
                 self._cadence.restore(ticket)

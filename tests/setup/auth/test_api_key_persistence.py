@@ -48,7 +48,9 @@ def test_persist_writes_api_key_to_env_file_and_process_env(
 ) -> None:
     monkeypatch.delenv("CUSTOM_API_KEY", raising=False)
     assert persist_api_key(provider(), "new-key") == "completed"
-    assert os.environ["CUSTOM_API_KEY"] == "new-key"
+    # Keep pytest assertion introspection away from the live environment.
+    process_key_matches = os.environ.get("CUSTOM_API_KEY") == "new-key"
+    assert process_key_matches, "CUSTOM_API_KEY was not updated in the process"
     assert dotenv_values(GLOBAL_ENV_FILE.path)["CUSTOM_API_KEY"] == "new-key"
 
 

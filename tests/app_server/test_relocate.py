@@ -130,7 +130,9 @@ async def test_a_move_does_not_repeat_the_conversation_it_preserves(
     # the session the move exists to preserve comes back saying everything
     # twice with the relocation mark in between.
     repo, worktree = _repo_and_worktree(tmp_path)
-    session = await _session_in(repo)
+    session = await _session_in(
+        repo, backend=FakeBackend(mock_llm_chunk(content="Hello."))
+    )
 
     try:
         _ = [event async for event in session.act("hello", client_message_id="u1")]

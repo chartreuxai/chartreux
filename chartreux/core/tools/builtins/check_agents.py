@@ -25,6 +25,11 @@ class CheckAgentsArgs(BaseModel):
 class CheckAgentsResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    reuse_guidance: str = Field(
+        default="Continue a retained agent instance with task(agent_id=..., background=true, task=...).",
+        description="How to reuse the instance handles listed in agents.",
+    )
+
     agents: list[AgentSummary] = Field(
         default_factory=list,
         description=(

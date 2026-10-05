@@ -59,7 +59,7 @@ def test_json_rpc_envelopes_reject_malformed_shapes(message: dict[str, object]) 
     ("error", "field_path"),
     [
         (LaunchConfigError("config.model"), "config.model"),
-        (MissingAgentProfileError("agent"), "agent"),
+        (MissingAgentProfileError("agent_type"), "agent_type"),
     ],
 )
 async def test_launch_config_errors_have_stable_protocol_diagnostics(
@@ -155,6 +155,141 @@ async def test_client_accepts_late_response_to_cancelled_request() -> None:
     assert client._abandoned_request_ids == set()
     await client.close()
     await peer_transport.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_error", [False, True])
+async def test_client_accepts_late_response_after_cancellation_during_send(
+    monkeypatch: pytest.MonkeyPatch, late_error: bool
+) -> None:
+    client_transport, peer_transport = memory_transport_pair()
+    client = AppServerClient(client_transport)
+    send_enqueued = asyncio.Event()
+    release_send = asyncio.Event()
+    original_send = client_transport.send
+
+    async def paused_send(message: dict[str, Any]) -> None:
+        await original_send(message)
+        if message.get("method") == "usage/read":
+            # The frame reached the peer, but send() has not returned to request().
+            send_enqueued.set()
+            await release_send.wait()
+
+    monkeypatch.setattr(client_transport, "send", paused_send)
+    cancelled = asyncio.create_task(client.request("usage/read"))
+    active: asyncio.Task[dict[str, Any]] | None = None
+    try:
+        async with asyncio.timeout(2):
+            await send_enqueued.wait()
+            cancelled_request = await anext(peer_transport.messages())
+            future = client._pending[cancelled_request["id"]]
+            assert not future.done()
+            cancelled.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled
+            # Cancellation during send does not propagate into the response future.
+            assert not future.cancelled()
+            assert client._abandoned_request_ids == {cancelled_request["id"]}
+
+            late_response: dict[str, Any] = {
+                "jsonrpc": "2.0",
+                "id": cancelled_request["id"],
+            }
+            if late_error:
+                late_response["error"] = {
+                    "code": ProtocolErrorCode.INTERNAL_ERROR,
+                    "message": "late failure",
+                }
+            else:
+                late_response["result"] = {}
+            active = asyncio.create_task(client.request("test/active"))
+            active_request = await anext(peer_transport.messages())
+            await peer_transport.send(late_response)
+            await peer_transport.send({
+                "jsonrpc": "2.0",
+                "id": active_request["id"],
+                "result": {"accepted": True},
+            })
+
+            assert await active == {"accepted": True}
+            assert client._incoming_error is None
+            assert client._reader_task is not None
+            assert not client._reader_task.done()
+            assert client._abandoned_request_ids == set()
+    finally:
+        cancelled.cancel()
+        if active is not None:
+            active.cancel()
+        await asyncio.gather(
+            cancelled, *([active] if active is not None else []), return_exceptions=True
+        )
+        await client.close()
+        await peer_transport.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during_send", [False, True])
+async def test_client_cancellation_after_response_does_not_abandon_request(
+    monkeypatch: pytest.MonkeyPatch, during_send: bool
+) -> None:
+    client_transport, peer_transport = memory_transport_pair()
+    client = AppServerClient(client_transport)
+    send_enqueued = asyncio.Event()
+    release_send = asyncio.Event()
+    waiting_for_incoming = asyncio.Event()
+    original_send = client_transport.send
+    original_wait = client._wait_until_processed
+
+    async def paused_send(message: dict[str, Any]) -> None:
+        await original_send(message)
+        send_enqueued.set()
+        if during_send:
+            await release_send.wait()
+
+    async def observed_wait(sequence: int) -> None:
+        waiting_for_incoming.set()
+        await original_wait(sequence)
+
+    monkeypatch.setattr(client_transport, "send", paused_send)
+    monkeypatch.setattr(client, "_wait_until_processed", observed_wait)
+    cancelled = asyncio.create_task(
+        client.request("usage/read", wait_for_incoming=True)
+    )
+    try:
+        async with asyncio.timeout(2):
+            await send_enqueued.wait()
+            request = await anext(peer_transport.messages())
+            future = client._pending[request["id"]]
+            # Leave a notification unprocessed so wait_for_incoming stays suspended.
+            await peer_transport.send({
+                "jsonrpc": "2.0",
+                "method": "test/before",
+                "params": {},
+            })
+            await peer_transport.send({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"accepted": True},
+            })
+            response = await asyncio.shield(future)
+            assert response.result == {"accepted": True}
+            if not during_send:
+                await waiting_for_incoming.wait()
+            assert not cancelled.done()
+            cancelled.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled
+
+            assert future.done()
+            assert not future.cancelled()
+            assert client._abandoned_request_ids == set()
+            assert client._pending == {}
+            assert client._incoming_error is None
+    finally:
+        cancelled.cancel()
+        await asyncio.gather(cancelled, return_exceptions=True)
+        await client.close()
+        await peer_transport.close()
 
 
 @pytest.mark.asyncio

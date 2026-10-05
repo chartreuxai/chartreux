@@ -129,15 +129,16 @@ class AppServerClient:
         self._pending[request_id] = future
         if response_boundary is not None:
             self._response_boundaries[request_id] = response_boundary
-        sent = False
+        send_attempted = False
         try:
+            # Cancellation can interrupt send() after the frame reaches the peer.
+            send_attempted = True
             await self._transport.send({
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "method": method,
                 "params": protocol_value(params),
             })
-            sent = True
             try:
                 response = await asyncio.wait_for(future, timeout=self._request_timeout)
             except TimeoutError as exc:
@@ -149,7 +150,7 @@ class AppServerClient:
                 raise response.error
             return response.result or {}
         except asyncio.CancelledError:
-            if sent and future.cancelled():
+            if send_attempted and (not future.done() or future.cancelled()):
                 self._abandoned_request_ids.add(request_id)
             raise
         finally:

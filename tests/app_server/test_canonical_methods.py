@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
+from chartreux.app_server._execution import SessionExecutionKind
 from chartreux.app_server.client import AppServerClient
 from chartreux.app_server.models import PublicEffectEntry
 from chartreux.app_server.protocol import (
@@ -19,12 +21,112 @@ from chartreux.app_server.protocol import (
     SessionHistoryListResponse,
     SessionShellCommandParams,
     SessionShellCommandResponse,
+    WorkspaceBranchReadParams,
+    WorkspaceBranchReadResponse,
 )
 from chartreux.app_server.session import AppServerSession
+from chartreux.app_server.transport import memory_transport_pair
+from chartreux.core.subagents import CancelOutcome, CancelResult, RunStopReason
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
-from tests.stubs.app_server import attach_test_app_server_session, start_test_app_server
+from tests.stubs.app_server import (
+    attach_test_app_server_session,
+    build_test_app_server,
+    legacy_backend,
+    start_test_app_server,
+)
 from tests.stubs.fake_backend import FakeBackend
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", list(CancelOutcome))
+@pytest.mark.parametrize("stop_reason", [None, *RunStopReason])
+async def test_agents_cancel_lifecycle_allow_policy(
+    outcome: CancelOutcome, stop_reason: RunStopReason | None
+) -> None:
+    parent = build_test_agent_loop()
+    client_transport, server_transport = memory_transport_pair()
+    server = build_test_app_server(parent, server_transport)
+    client = AppServerClient(client_transport, run_peer=server.serve)
+    session = await attach_test_app_server_session(client)
+    root = legacy_backend(server)
+    cancel = AsyncMock(
+        return_value=CancelResult(
+            outcome=outcome, run_id="captured", stop_reason=stop_reason
+        )
+    )
+    root.children.cancel_run = cancel
+    owner = root.session.execution.begin(SessionExecutionKind.LIFECYCLE, "lifecycle")
+    try:
+        response = await client.request(
+            "agents/cancel", {"agentId": "child", "runId": "captured"}
+        )
+        assert response == {
+            "outcome": outcome.value,
+            "runId": "captured",
+            "stopReason": stop_reason.value if stop_reason is not None else None,
+        }
+        cancel.assert_awaited_once_with(
+            "child",
+            "captured",
+            reason=RunStopReason.USER_CANCELLED,
+            requester_session_id=parent.session_id,
+        )
+        for method, params in [
+            ("session/read", {"sessionId": parent.session_id}),
+            ("agent/transcript/get", {"agentId": "child"}),
+            ("agents/release", {"agentId": "child"}),
+        ]:
+            with pytest.raises(AppServerResponseError) as exc:
+                await client.request(method, params)
+            assert exc.value.error.code is (
+                ProtocolErrorCode.METHOD_NOT_FOUND
+                if method == "agents/release"
+                else ProtocolErrorCode.CONFLICT
+            )
+        with pytest.raises(AppServerResponseError) as exc:
+            await client.request("agents/cancel", {"agent_id": "child"})
+        assert exc.value.error.code is ProtocolErrorCode.INVALID_PARAMS
+        root.coordinator.attach("stale-session")
+        with pytest.raises(AppServerResponseError) as exc:
+            await client.request("agents/cancel", {"agentId": "child"})
+        assert exc.value.error.code is ProtocolErrorCode.CONFLICT
+        root.coordinator.attach(parent.session_id)
+        root.handler._closed = True
+        with pytest.raises(AppServerResponseError) as exc:
+            await session.cancel_agent("child", "captured")
+        assert exc.value.error.code is ProtocolErrorCode.CONFLICT
+        assert cancel.await_count == 1
+    finally:
+        root.handler._closed = False
+        root.session.execution.finish(owner)
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_workspace_branch_canonical_method(tmp_path: Path) -> None:
+    client, session = await _session_with_history()
+    try:
+        assert "workspace/git/branch" in SERVER_METHODS
+        response = WorkspaceBranchReadResponse.model_validate(
+            await client.request(
+                "workspace/git/branch",
+                WorkspaceBranchReadParams(
+                    session_id=session.session_id, cwd=str(tmp_path)
+                ),
+            )
+        )
+        assert response.session_id == session.session_id
+        assert response.cwd == str(tmp_path)
+        assert response.status == "not_repository"
+        with pytest.raises(AppServerResponseError) as excinfo:
+            await client.request(
+                "workspace/git/branch",
+                {"session_id": session.session_id, "cwd": str(tmp_path)},
+            )
+        assert excinfo.value.error.code is ProtocolErrorCode.INVALID_PARAMS
+    finally:
+        await session.close()
 
 
 async def _session_with_history() -> tuple[AppServerClient, AppServerSession]:

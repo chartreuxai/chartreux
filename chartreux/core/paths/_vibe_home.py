@@ -23,6 +23,7 @@ CACHE_FILE = GlobalPath(lambda: CHARTREUX_HOME.path / "cache.toml")
 PROJECTS_FILE = GlobalPath(lambda: CHARTREUX_HOME.path / "projects.toml")
 HISTORY_FILE = GlobalPath(lambda: CHARTREUX_HOME.path / "chartreuxhistory")
 PLANS_DIR = GlobalPath(lambda: CHARTREUX_HOME.path / "plans")
+USAGE_DIR = GlobalPath(lambda: CHARTREUX_HOME.path / "usage")
 
 
 def ensure_chartreux_home_private() -> None:

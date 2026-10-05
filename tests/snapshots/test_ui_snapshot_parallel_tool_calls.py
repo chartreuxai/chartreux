@@ -83,6 +83,7 @@ class ParallelToolCallsApp(App):
         for i in range(3):
             await self._projection.dispatch(
                 ToolResultEvent(
+                    duration=0.4 + i,
                     tool_name="read_file",
                     tool_class=ReadFile,
                     result=ReadFileResult(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field
 
 from chartreux.app_server._model import ProtocolModel
@@ -22,6 +24,13 @@ class ProxySettingsView(ProtocolModel):
     descriptions: dict[str, str]
 
 
+class StatusLineConfigView(ProtocolModel):
+    segments: list[str] = Field(default_factory=lambda: ["directory", "pid", "context"])
+    directory_style: Literal["name", "path"] = "name"
+    context_style: Literal["tokens", "tokens-percent"] = "tokens-percent"
+    separator: Literal["space", "pipe"] = "pipe"
+
+
 class ConfigView(ProtocolModel):
     active_model: ModelConfigView
     active_model_expression: str = ""
@@ -37,6 +46,8 @@ class ConfigView(ProtocolModel):
     file_watcher_for_autocomplete: bool
     ask_confirmation_on_exit: bool
     show_thinking_nodes: bool
+    show_message_timestamps: bool = True
+    status_line: StatusLineConfigView = Field(default_factory=StatusLineConfigView)
     ascii_chrome: bool = False
     enable_notifications: bool
     enable_system_trust_store: bool = False

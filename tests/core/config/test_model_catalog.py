@@ -32,6 +32,38 @@ def _minimal() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize(
+    "threshold",
+    [0.75, 1.5, 0, -1, True, False, float("nan"), float("inf"), float("-inf"), "1.5"],
+)
+def test_deployment_threshold_rejects_non_positive_whole_integers(
+    threshold: object,
+) -> None:
+    raw = _minimal()
+    raw["models"]["base"]["deployments"][0]["auto_compact_threshold"] = threshold  # type: ignore[index]
+    with pytest.raises(ValidationError, match="positive whole integer"):
+        ModelCatalog.model_validate(raw)
+
+
+@pytest.mark.parametrize("threshold", [None, 1, 400000, 400000.0])
+@pytest.mark.parametrize("global_threshold", [0, 12345])
+def test_deployment_threshold_and_global_fallback_resolve(
+    threshold: int | float | None, global_threshold: int
+) -> None:
+    raw = _minimal()
+    raw["models"]["base"]["deployments"][0]["auto_compact_threshold"] = threshold  # type: ignore[index]
+    catalog = ModelCatalog.model_validate(raw)
+    deployment_threshold = catalog.models["base"].deployments[0].auto_compact_threshold
+    assert deployment_threshold is None or type(deployment_threshold) is int
+    resolver = ModelResolver(CatalogSnapshot(catalog, "test"))
+    resolved = resolver.resolve("base")
+    assert resolved.materialize(
+        auto_compact_threshold=global_threshold
+    ).auto_compact_threshold == (
+        global_threshold if threshold is None else int(threshold)
+    )
+
+
 def test_1_schema_accepts_minimal_valid_catalog() -> None:
     catalog = ModelCatalog.model_validate(_minimal())
     assert catalog.models["base"].deployments[0].name == "wire"

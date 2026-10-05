@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from weakref import WeakKeyDictionary
+
+import pytest
+
 from chartreux.app_server.models import (
     CompletedEffectState,
     EffectCallDisplay,
@@ -24,6 +28,29 @@ from chartreux.cli.textual_ui.widgets.tool_grouping import (
     starts_tool_group,
     tool_group_key,
 )
+from chartreux.cli.textual_ui.widgets.tools import ToolGroup
+from chartreux.cli.textual_ui.windowing.history import build_history_widgets
+
+
+@pytest.mark.parametrize("show", [True, False])
+def test_group_membership_is_shared_by_both_folding_modes(show: bool) -> None:
+    widgets = build_history_widgets(
+        [_effect(1), _effect(2)],
+        start_index=0,
+        history_widget_indices=WeakKeyDictionary(),
+        tools_collapsed=True,
+        show_message_timestamps=show,
+    )
+    assert len(widgets) == 1
+    group = widgets[0]
+    assert isinstance(group, ToolGroup)
+    assert group.show_message_timestamps is show
+    assert group.is_collapsed
+    assert len(group.content_container.children) == 4
+    group.set_show_message_timestamps(not show)
+    assert group.is_collapsed
+    assert group.content_container.display is (not show)
+    assert group.header.display is show
 
 
 def _effect(index: int, state: EffectState | None = None) -> PublicEffectEntry:
