@@ -13,6 +13,7 @@ import httpx
 import pytest
 from textual.app import App, ComposeResult
 from textual.widgets import Input, OptionList, SelectionList, Static
+from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
 from chartreux.core.model_catalog.contracts import (
@@ -43,6 +44,509 @@ from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.ui.providers.management_state import ManagementState, PendingModel
 from chartreux.ui.providers.workbench import ProviderWorkbenchScreen, WorkbenchView
 from tests.snapshots.snapshot_event_loop import install_snapshot_wake
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("view", "editing", "confirm", "stage", "expected"),
+    [
+        (WorkbenchView.ACTIONS, "base", None, None, {"editor"}),
+        (WorkbenchView.ACTIONS, "base", "shared-key", None, {"editor", "confirm"}),
+        (
+            WorkbenchView.ACTIONS,
+            None,
+            "discard",
+            None,
+            {"actions", "provider-operations", "confirm"},
+        ),
+        (WorkbenchView.PICKER, None, None, None, {"picker"}),
+        (WorkbenchView.PROTOCOL, None, None, "connection", {"protocol"}),
+        (WorkbenchView.CHOOSE, None, None, "choose", {"choose"}),
+        (
+            WorkbenchView.CONNECTION,
+            None,
+            None,
+            "connection",
+            {"actions", "connection-actions"},
+        ),
+        (WorkbenchView.MODELS, None, None, "models", {"models", "models-actions"}),
+        (WorkbenchView.MODELS, None, None, None, {"models"}),
+        (WorkbenchView.CATALOG, None, None, None, {"catalog", "catalog-filter"}),
+        (
+            WorkbenchView.PRESETS,
+            None,
+            "discard",
+            None,
+            {"presets", "presets-actions", "confirm"},
+        ),
+        (
+            WorkbenchView.PRESET_EDITOR,
+            None,
+            "discard",
+            None,
+            {"preset-editor", "preset-editor-actions", "confirm"},
+        ),
+    ],
+)
+async def test_visibility_projection_is_idempotent(
+    view: WorkbenchView,
+    editing: str | None,
+    confirm: str | None,
+    stage: str | None,
+    expected: set[str],
+) -> None:
+    screen, _services = setup()
+    async with Host(screen).run_test(size=(80, 24)) as pilot:
+        await expand(pilot, screen)
+        screen._editing = editing
+        screen._confirm = confirm
+        screen._stage = stage
+        screen._activate_view(view)
+
+        def visible_controls() -> set[str]:
+            return {
+                name
+                for name in screen.VIEW_CONTROLS
+                if screen.query_one(f"#wb-{name}").display
+            }
+
+        assert visible_controls() == expected
+        assert screen.focused
+        initial_focus = screen.focused.id
+        assert initial_focus == (
+            "wb-confirm-actions"
+            if confirm
+            else "wb-input"
+            if editing
+            else f"wb-{screen.VIEW_GROUPS[view][0]}"
+        )
+        for size in ((80, 24), (120, 36), (48, 24), (47, 23), (80, 24)):
+            await pilot.resize_terminal(*size)
+            focus = screen.focused
+            for _ in range(3):
+                screen._update_help()
+                screen._sync_view()
+                assert visible_controls() == expected
+                assert screen.focused is focus
+            await pilot.pause()
+            assert visible_controls() == expected
+            # Projection preserves focus, including while the minimum-size
+            # warning hides the workbench; it never redirects focus implicitly.
+            assert screen.focused is focus
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host_display", [False, True])
+async def test_visibility_projection_preserves_host_pending_banner(
+    host_display: bool,
+) -> None:
+    screen, _services = setup()
+    async with Host(screen).run_test() as pilot:
+        await expand(pilot, screen)
+        banner = screen.query_one("#wb-pending-action")
+        banner.display = host_display
+        for confirm in (None, "discard", None):
+            screen._confirm = confirm
+            screen._activate_view(WorkbenchView.ACTIONS)
+            for _ in range(3):
+                screen._update_help()
+                screen._sync_view()
+                assert banner.display is host_display
+                assert banner.has_class("wb-confirm-underlay") is bool(
+                    confirm and host_display
+                )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("replacement", "disabled", "expected"),
+    [
+        (("new", "a", "c", "d"), (), "c"),
+        (("new", "a", "b", "c"), (), "b"),
+        (("a", "b", "c", "d"), ("b", "c"), "a"),
+        (("new", "other", "last"), ("new",), "last"),
+        ((), (), None),
+    ],
+)
+async def test_group_bookmark_repairs_selectable_identity(
+    replacement: tuple[str, ...], disabled: tuple[str, ...], expected: str | None
+) -> None:
+    screen, _services = setup()
+    async with Host(screen).run_test() as pilot:
+        rows = screen.query_one("#wb-providers", OptionList)
+        rows.clear_options()
+        rows.add_options([Option(key, id=key) for key in ("a", "b", "c", "d")])
+        rows.highlighted = 1
+        position = screen._position_before_rebuild(
+            WorkbenchView.PROVIDERS, "wb-providers"
+        )
+        assert position and position.identities == ("a", "b", "c", "d")
+        rows.clear_options()
+        rows.add_options([
+            Option(key, id=key, disabled=key in disabled) for key in replacement
+        ])
+        screen._restore_group_position(position)
+        await pilot.pause()
+        assert (
+            rows.highlighted_option.id if rows.highlighted_option else None
+        ) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)])
+@pytest.mark.parametrize(
+    "view", [WorkbenchView.PROVIDERS, WorkbenchView.ACTIONS, WorkbenchView.CONNECTION]
+)
+async def test_split_groups_bound_arrows_remember_positions_and_fit(size, view) -> None:  # type: ignore[no-untyped-def]
+    screen, services = setup()
+    discovery_calls = 0
+    original_discover = screen.discovery_service
+
+    async def counted_discover(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return await original_discover(*args, **kwargs)
+
+    screen.discovery_service = counted_discover
+    async with Host(screen).run_test(size=size) as pilot:
+        if view == WorkbenchView.ACTIONS:
+            await expand(pilot, screen)
+        elif view == WorkbenchView.CONNECTION:
+            await add_preset(pilot, screen, FULLY_CUSTOM)
+        groups = screen._focus_groups()
+        assert groups == [f"wb-{name}" for name in screen.VIEW_GROUPS[view]]
+        payload = screen.state.catalog.model_dump() if screen.state else None
+        connection = screen.state.connection if screen.state else screen._add
+        positions = []
+        for group in groups:
+            widget = screen.query_one(f"#{group}", OptionList)
+            assert widget.display and widget.region.height > 0
+            assert widget.region.bottom <= screen.query_one("#wb-help").region.y
+            assert widget.has_focus
+            await pilot.press("home")
+            first = widget.highlighted
+            await pilot.press("up", "k", "up")
+            assert widget.highlighted == first and widget.has_focus
+            await pilot.press("end")
+            last = widget.highlighted
+            await pilot.press("down", "j", "down", "space")
+            assert widget.highlighted == last and widget.has_focus
+            assert widget.highlighted_option
+            positions.append(widget.highlighted_option.id)
+            await pilot.press("tab")
+        for group, identity in zip(groups, positions, strict=True):
+            widget = screen.query_one(f"#{group}", OptionList)
+            assert widget.highlighted_option
+            assert widget.has_focus and widget.highlighted_option.id == identity
+            await pilot.press("tab")
+        await pilot.press("shift+tab")
+        assert screen.focused
+        assert screen.focused.id == groups[-1]
+        assert screen.query_one("#wb-hint").region.bottom <= size[1]
+        assert (
+            screen.state.catalog.model_dump() == payload
+            if screen.state
+            else payload is None
+        )
+        assert (screen.state.connection if screen.state else screen._add) == connection
+        assert not services.writes and not services.keys and discovery_calls == 0
+        if view == WorkbenchView.CONNECTION:
+            assert (
+                sum(
+                    option.id == "continue"
+                    for group in groups
+                    for option in screen.query_one(f"#{group}", OptionList).options
+                )
+                == 1
+            )
+            assert not screen.query_one("#wb-connection-form").display
+
+
+@pytest.mark.asyncio
+async def test_root_actions_survive_no_match_filter_and_dirty_rebuild() -> None:
+    screen, services = setup()
+    async with Host(screen).run_test(size=(80, 24)) as pilot:
+        await expand(pilot, screen)
+        assert screen.state
+        screen.state.connection = replace(
+            screen.state.connection, api_base="https://dirty.test"
+        )
+        await pilot.press("escape")
+        browser = screen.query_one("#wb-providers", OptionList)
+        browser.highlighted = browser.get_option_index("two")
+        screen._refresh_browser()
+        assert browser.highlighted_option and browser.highlighted_option.id == "two"
+        await pilot.press("z", "z", "z")
+        assert (
+            browser.highlighted_option and browser.highlighted_option.id == "\x00empty"
+        )
+        await pilot.press("tab")
+        actions = screen.query_one("#wb-root-actions", OptionList)
+        assert actions.has_focus
+        await press_option(pilot, actions, "\x00models")
+        assert screen.view == WorkbenchView.CATALOG
+        await pilot.press("escape")
+        assert actions.highlighted_option
+        assert actions.has_focus and actions.highlighted_option.id == "\x00models"
+        assert screen.state
+        assert screen.filter_text == "zzz" and screen.state.dirty
+        assert not services.writes and not services.keys
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pointer", [False, True])
+@pytest.mark.parametrize(
+    "group,action,expected",
+    [
+        ("wb-root-actions", "\x00models", WorkbenchView.CATALOG),
+        ("wb-root-actions", "\x00presets", WorkbenchView.PRESETS),
+        ("wb-root-actions", "\x00add", WorkbenchView.CONNECTION),
+        ("wb-root-actions", "\x00apply", WorkbenchView.PROVIDERS),
+        ("wb-root-actions", "\x00discard", WorkbenchView.PROVIDERS),
+        ("wb-provider-operations", "discover", WorkbenchView.ACTIONS),
+        ("wb-provider-operations", "apply", WorkbenchView.ACTIONS),
+        ("wb-provider-operations", "collision:b", WorkbenchView.ACTIONS),
+        ("wb-provider-operations", "retry-reload", WorkbenchView.ACTIONS),
+        ("wb-provider-operations", "models", WorkbenchView.MODELS),
+        ("wb-provider-operations", "presets", WorkbenchView.PRESETS),
+        ("wb-provider-operations", "discard", WorkbenchView.ACTIONS),
+        ("wb-connection-actions", "continue", WorkbenchView.MODELS),
+    ],
+)
+async def test_moved_action_pointer_keyboard_parity(
+    pointer, group, action, expected
+) -> None:  # type: ignore[no-untyped-def]
+    screen, services = setup()
+    async with Host(screen).run_test(size=(80, 24)) as pilot:
+        if group == "wb-provider-operations" or action in {"\x00apply", "\x00discard"}:
+            await expand(pilot, screen)
+            assert screen.state
+            if action.removeprefix("\x00") in {"apply", "discard"}:
+                screen.state.connection = replace(
+                    screen.state.connection, api_base="https://dirty.test"
+                )
+            elif action == "collision:b":
+                screen.state.select("b")
+            elif action == "retry-reload":
+                screen._reload_failed = True
+            screen._refresh_actions()
+            if group == "wb-root-actions":
+                screen._refresh_browser()
+                await pilot.press("escape")
+        elif group == "wb-connection-actions":
+            await add_preset(pilot, screen, FULLY_CUSTOM)
+            assert screen._add
+            screen._add = replace(
+                screen._add, name="new", api_base="https://new.test/v1"
+            )
+            screen._refresh_add_connection()
+        widget = screen.query_one(f"#{group}", OptionList)
+        if pointer:
+            index = widget.get_option_index(action)
+            await pilot.click(widget, offset=(8, index))
+        else:
+            await press_option(pilot, widget, action)
+        await wait_until(pilot, lambda: not screen._busy)
+        assert screen.view == expected
+        assert bool(screen._confirm) is (
+            action in {"discard", "\x00discard", "collision:b"}
+        )
+        assert len(services.writes) == (
+            1 if action in {"continue", "apply", "\x00apply"} else 0
+        )
+        if action in {"apply", "\x00apply"}:
+            assert services.writes[0].provider["api_base"] == "https://dirty.test"
+        assert not services.keys
+
+
+@pytest.mark.asyncio
+async def test_group_bookmarks_isolate_providers_and_roles() -> None:
+    screen, _services = setup()
+    async with Host(screen).run_test() as pilot:
+        await expand(pilot, screen)
+        assert screen.state
+        actions = screen.query_one("#wb-actions", OptionList)
+        actions.highlighted = actions.get_option_index("style")
+        operations = screen.query_one("#wb-provider-operations", OptionList)
+        operations.highlighted = operations.get_option_index("models")
+        screen.state.for_provider("two")
+        screen._refresh_actions()
+        assert (
+            operations.highlighted_option
+            and operations.highlighted_option.id == "discover"
+        )
+        operations.highlighted = operations.get_option_index("presets")
+        assert actions.highlighted_option and actions.highlighted_option.id == "base"
+        actions.highlighted = actions.get_option_index("env")
+        screen.state.for_provider("one")
+        screen._refresh_actions()
+        assert actions.highlighted_option and actions.highlighted_option.id == "style"
+        assert (
+            operations.highlighted_option
+            and operations.highlighted_option.id == "models"
+        )
+        screen.state.for_provider("two")
+        screen._refresh_actions()
+        assert (
+            operations.highlighted_option
+            and operations.highlighted_option.id == "presets"
+        )
+        assert actions.highlighted_option and actions.highlighted_option.id == "env"
+
+        screen._preset_role = "orchestrator"
+        screen._preset_draft = screen.state.preset("orchestrator")
+        screen._refresh_preset_editor()
+        editor = screen.query_one("#wb-preset-editor", OptionList)
+        editor.highlighted = editor.get_option_index("thinking")
+        screen._preset_role = "other"
+        screen._preset_draft = screen.state.preset("other")
+        screen._refresh_preset_editor()
+        assert editor.highlighted_option and editor.highlighted_option.id == "model"
+        editor_actions = screen.query_one("#wb-preset-editor-actions", OptionList)
+        editor_actions.highlighted = editor_actions.get_option_index("cancel")
+        screen._preset_role = "orchestrator"
+        screen._refresh_preset_editor()
+        assert editor.highlighted_option and editor.highlighted_option.id == "thinking"
+        assert (
+            editor_actions.highlighted_option
+            and editor_actions.highlighted_option.id == "apply"
+        )
+        screen._preset_role = "other"
+        screen._refresh_preset_editor()
+        assert editor.highlighted_option and editor.highlighted_option.id == "model"
+        assert (
+            editor_actions.highlighted_option
+            and editor_actions.highlighted_option.id == "cancel"
+        )
+
+
+@pytest.mark.asyncio
+async def test_pending_rename_bookmark_uses_wire_not_selection_value() -> None:
+    screen, _services = setup()
+    async with Host(screen).run_test() as pilot:
+        await expand(pilot, screen)
+        assert screen.state
+        screen.state.pending["wire-pending"] = PendingModel(
+            "wire-pending", "old-name", True
+        )
+        screen._refresh_models()
+        models = screen.query_one("#wb-models", SelectionList)
+        models.highlighted = next(
+            i
+            for i, option in enumerate(models.options)
+            if cast(Selection[str], option).value == "old-name"
+        )
+        screen.state.pending["wire-pending"] = replace(
+            screen.state.pending["wire-pending"], canonical_name="z-renamed"
+        )
+        screen.state.pending["other-wire"] = PendingModel(
+            "other-wire", "old-name", True
+        )
+        screen._refresh_models()
+        assert models.highlighted is not None
+        assert (
+            cast(Selection[str], models.get_option_at_index(models.highlighted)).value
+            == "z-renamed"
+        )
+        assert "z-renamed" in models.selected and "old-name" in models.selected
+
+
+@pytest.mark.asyncio
+async def test_nonfocused_rebuild_keeps_focus_and_contents_owner() -> None:
+    screen, _services = setup()
+    async with Host(screen).run_test() as pilot:
+        await expand(pilot, screen)
+        assert screen.state
+        screen._refresh_models()
+        models = screen.query_one("#wb-models", SelectionList)
+        actions = screen.query_one("#wb-actions", OptionList)
+        actions.focus()
+        screen.state.for_provider("two")
+        screen._refresh_models()
+        await pilot.pause()
+        assert actions.has_focus and not models.display
+        assert (
+            WorkbenchView.MODELS,
+            "wb-models",
+            ("one", "management"),
+        ) in screen._positions
+        assert not any(
+            view == WorkbenchView.ACTIONS and group == "wb-models"
+            for view, group, _context in screen._positions
+        )
+        screen._choose_preset(FULLY_CUSTOM)
+        screen._connection_action("name")
+        await pilot.pause()
+        focused = screen.focused
+        assert focused is screen.query_one("#wb-input", Input)
+        screen._refresh_add_connection()
+        await pilot.pause()
+        assert screen.focused is focused
+
+
+@pytest.mark.asyncio
+async def test_catalog_bookmarks_isolate_applied_filter_and_frame_snapshot() -> None:
+    screen, _services = setup()
+    async with Host(screen).run_test() as pilot:
+        screen._open_catalog()
+        await pilot.pause()
+        rows = screen.query_one("#wb-catalog", OptionList)
+        rows.focus()
+        rows.highlighted = rows.get_option_index("model:b")
+        opener = screen._frame()
+        assert opener.position and opener.context == ("all",)
+        screen._model_filter = "one"
+        screen._refresh_catalog()
+        assert rows.highlighted_option and rows.highlighted_option.id == "model:a"
+        screen._model_filter = None
+        screen._refresh_catalog()
+        assert rows.highlighted_option and rows.highlighted_option.id == "model:b"
+        rows.highlighted = rows.get_option_index("model:a")
+        screen._capture_group_position(rows)
+        screen._restore_frame(opener)
+        await pilot.pause()
+        assert (
+            rows.has_focus
+            and rows.highlighted_option
+            and rows.highlighted_option.id == "model:b"
+        )
+        assert (
+            WorkbenchView.GLOBAL_CATALOG,
+            "wb-catalog",
+            ("all",),
+        ) in screen._positions
+
+
+@pytest.mark.asyncio
+async def test_group_bookmark_scroll_and_credential_caret_without_text() -> None:
+    screen, _services = setup()
+    async with Host(screen).run_test(size=(80, 24)) as pilot:
+        await expand(pilot, screen)
+        assert screen.state
+        for index in range(60):
+            wire = f"long-{index:02}"
+            screen.state.pending[wire] = PendingModel(wire, wire, True)
+        screen._refresh_models()
+        screen._activate_view(WorkbenchView.MODELS)
+        models = screen.query_one("#wb-models", SelectionList)
+        models.highlighted = 40
+        await pilot.pause()
+        models.scroll_to(y=25, animate=False, immediate=True, force=True)
+        before = models.scroll_y
+        assert before > 0
+        screen._refresh_models()
+        await pilot.pause()
+        assert models.scroll_y == before and models.highlighted == 40
+        screen._choose_preset(MISTRAL)
+        screen._connection_action("key")
+        await pilot.pause()
+        editor = screen.query_one("#wb-input", Input)
+        editor.value = "bookmark-must-not-retain-this"
+        editor.cursor_position = 4
+        frame = screen._frame()
+        assert frame.position and frame.position.cursor_position == 4
+        assert "bookmark-must-not-retain-this" not in repr(frame)
+        assert "bookmark-must-not-retain-this" not in repr(screen._positions)
 
 
 @pytest.mark.asyncio
@@ -269,7 +773,7 @@ async def test_provider_action_labels_distinguish_draft_from_disk() -> None:
     screen, services = setup()
     async with Host(screen).run_test(size=(80, 24)) as pilot:
         await expand(pilot, screen)
-        actions = screen.query_one("#wb-actions", OptionList)
+        actions = screen.query_one("#wb-provider-operations", OptionList)
         ids = {option.id for option in actions.options}
         assert "name" not in ids
         assert "Provider: one" in str(screen.query_one("#wb-filter").render())
@@ -288,7 +792,7 @@ async def test_provider_action_labels_distinguish_draft_from_disk() -> None:
         assert "Apply all catalog edits to disk later." in str(
             screen.query_one("#wb-help").render()
         )
-        detail = screen.query_one("#wb-detail-fields", OptionList)
+        detail = screen.query_one("#wb-detail-actions", OptionList)
         assert "catalog draft" in str(
             next(o.prompt for o in detail.options if o.id == "save-detail")
         )
@@ -477,11 +981,15 @@ async def test_onboarding_presets_use_configured_custom_model_without_mistral() 
         assert "Save presets and continue" in str(
             next(
                 option.prompt
-                for option in screen.query_one("#wb-presets", OptionList).options
+                for option in screen.query_one(
+                    "#wb-presets-actions", OptionList
+                ).options
                 if option.id == "finish"
             )
         )
-        await press_option(pilot, screen.query_one("#wb-presets", OptionList), "finish")
+        await press_option(
+            pilot, screen.query_one("#wb-presets-actions", OptionList), "finish"
+        )
         await wait_until(pilot, lambda: bool(services.writes))
         assert services.writes[-1].roles is not None
         assert all(
@@ -502,7 +1010,9 @@ async def test_onboarding_no_ready_model_keeps_presets_unavailable() -> None:
         await pilot.pause()
         assert screen.state is not None
         assert not screen.state.role_presets
-        await press_option(pilot, screen.query_one("#wb-presets", OptionList), "finish")
+        await press_option(
+            pilot, screen.query_one("#wb-presets-actions", OptionList), "finish"
+        )
         assert screen.view == WorkbenchView.PRESETS
         assert screen._feedback_kind == "error"
         assert not services.writes
@@ -518,12 +1028,9 @@ async def test_add_provider_retains_existing_catalog_draft() -> None:
         await pilot.press("enter")
         await pilot.press("escape")
         assert screen.state and screen.state.dirty
-        browser = screen.query_one("#wb-providers", OptionList)
-        browser.highlighted = next(
-            i for i, option in enumerate(browser.options) if option.id == "\x00add"
+        await press_option(
+            pilot, screen.query_one("#wb-root-actions", OptionList), "\x00add"
         )
-        browser.focus()
-        await pilot.press("enter")
         assert screen._stage == "connection"
         for key, value in (
             ("name", "other-gateway"),
@@ -563,7 +1070,10 @@ async def test_onboarding_starts_at_provider_and_shipped_mistral_can_be_configur
         await pilot.pause()
         assert screen.query_one("#wb-providers").has_focus
         browser = screen.query_one("#wb-providers", OptionList)
-        assert any(option.id == "\x00presets" for option in browser.options)
+        assert any(
+            option.id == "\x00presets"
+            for option in screen.query_one("#wb-root-actions", OptionList).options
+        )
         assert any("Key Required" in str(option.prompt) for option in browser.options)
         browser.highlighted = next(
             i for i, option in enumerate(browser.options) if option.id == "mistral"
@@ -597,7 +1107,10 @@ async def test_unready_shipped_mistral_root_is_honest(size) -> None:  # type: ig
         mistral = next(option for option in browser.options if option.id == "mistral")
         assert "Key Required" in str(mistral.prompt)
         assert "0 runnable models" in str(mistral.prompt)
-        assert any(option.id == "\x00presets" for option in browser.options)
+        assert any(
+            option.id == "\x00presets"
+            for option in screen.query_one("#wb-root-actions", OptionList).options
+        )
         browser.highlighted = next(
             i for i, option in enumerate(browser.options) if option.id == "mistral"
         )
@@ -629,7 +1142,10 @@ async def test_ready_shipped_mistral_root_manages_and_finishes(size) -> None:  #
         mistral = next(option for option in browser.options if option.id == "mistral")
         assert "Key Set" in str(mistral.prompt)
         assert "1 runnable model" in str(mistral.prompt)
-        assert any(option.id == "\x00presets" for option in browser.options)
+        assert any(
+            option.id == "\x00presets"
+            for option in screen.query_one("#wb-root-actions", OptionList).options
+        )
         browser.highlighted = next(
             i for i, option in enumerate(browser.options) if option.id == "mistral"
         )
@@ -785,21 +1301,24 @@ async def test_dirty_ready_onboarding_saves_before_preset_finish() -> None:
         screen._view = WorkbenchView.PROVIDERS
         screen.query_one("#wb-providers").display = True
         screen._refresh_browser()
-        assert any(option.id == "\x00apply" for option in browser.options)
+        assert any(
+            option.id == "\x00apply"
+            for option in screen.query_one("#wb-root-actions", OptionList).options
+        )
         screen._request_commit()
         await wait_until(pilot, lambda: not screen._busy)
         screen._refresh_browser()
-        assert any(option.id == "\x00presets" for option in browser.options)
+        assert any(
+            option.id == "\x00presets"
+            for option in screen.query_one("#wb-root-actions", OptionList).options
+        )
         screen._open_presets()
         assert screen.view == WorkbenchView.PRESETS
 
 
 async def expand(pilot, screen: ProviderWorkbenchScreen) -> None:  # type: ignore[no-untyped-def]
     browser = screen.query_one("#wb-providers", OptionList)
-    browser.highlighted = next(
-        i for i, option in enumerate(browser.options) if option.id == "one"
-    )
-    await pilot.press("enter")
+    await press_option(pilot, browser, "one")
     assert screen.state is not None and screen.state.provider_id == "one"
 
 
@@ -812,7 +1331,14 @@ async def wait_until(pilot, predicate) -> None:  # type: ignore[no-untyped-def]
 
 
 async def press_option(pilot, widget: OptionList, option_id: str) -> None:
-    """Select an option using the same keys a user would press."""
+    """Enter the requested visible group, then select from its bounded list."""
+    for _ in range(5):
+        if widget.has_focus:
+            break
+        await pilot.press("tab")
+    if not widget.has_focus:
+        raise AssertionError(f"group {widget.id!r} was not reachable")
+    await pilot.press("home")
     for _ in range(widget.option_count + 1):
         if widget.highlighted_option and widget.highlighted_option.id == option_id:
             await pilot.press("enter")
@@ -854,7 +1380,7 @@ async def test_global_catalog_escape_restores_opening_provider_and_draft(size) -
         await pilot.press("enter", "escape")
 
         await press_option(
-            pilot, screen.query_one("#wb-providers", OptionList), "\x00models"
+            pilot, screen.query_one("#wb-root-actions", OptionList), "\x00models"
         )
         await press_option(
             pilot, screen.query_one("#wb-catalog", OptionList), "model:b"
@@ -866,7 +1392,7 @@ async def test_global_catalog_escape_restores_opening_provider_and_draft(size) -
         assert screen.state.connection.api_base == "https://changed.test"
         assert screen.query_one("#wb-actions").display is False
         browser = screen.query_one("#wb-providers", OptionList)
-        assert browser.display and browser.has_focus
+        assert browser.display and screen.query_one("#wb-root-actions").has_focus
 
 
 @pytest.mark.asyncio
@@ -879,13 +1405,15 @@ async def test_discard_confirmation_restores_browser_focus(size) -> None:  # typ
         screen.query_one("#wb-input", Input).value = "https://changed.test"
         await pilot.press("enter", "escape")
         await press_option(
-            pilot, screen.query_one("#wb-providers", OptionList), "\x00discard"
+            pilot, screen.query_one("#wb-root-actions", OptionList), "\x00discard"
         )
         await pilot.press("down", "enter")
 
         browser = screen.query_one("#wb-providers", OptionList)
-        assert browser.display and browser.has_focus
-        await pilot.press("down", "enter")
+        assert browser.display and screen.query_one("#wb-root-actions").has_focus
+        await pilot.press("tab")
+        assert browser.has_focus
+        await press_option(pilot, browser, "two")
         assert screen.state and screen.state.provider_id == "two"
         assert screen.query_one("#wb-actions").has_focus
 
@@ -900,12 +1428,14 @@ async def test_existing_collision_confirmation_restores_actions_focus(size) -> N
         screen.state.select("b")
         screen._refresh_actions()
         await press_option(
-            pilot, screen.query_one("#wb-actions", OptionList), "collision:b"
+            pilot,
+            screen.query_one("#wb-provider-operations", OptionList),
+            "collision:b",
         )
         assert screen._confirm == "existing:b"
         await pilot.press("down", "enter")
 
-        actions = screen.query_one("#wb-actions", OptionList)
+        actions = screen.query_one("#wb-provider-operations", OptionList)
         assert screen.state.pending["b"].decision == "add_existing"
         assert actions.display and actions.has_focus
         previous = actions.highlighted
@@ -919,7 +1449,7 @@ async def test_failed_connection_save_keeps_connection_focus(size) -> None:  # t
     screen, services = setup()
     async with Host(screen).run_test(size=size) as pilot:
         await press_option(
-            pilot, screen.query_one("#wb-providers", OptionList), "\x00add"
+            pilot, screen.query_one("#wb-root-actions", OptionList), "\x00add"
         )
         screen.query_one("#wb-connection-name", Input).value = "new-gateway"
         screen.query_one("#wb-connection-base", Input).value = "https://new.test/v1"
@@ -942,7 +1472,7 @@ async def test_explicit_edit_connection_keeps_saved_new_provider(size) -> None: 
         screen.query_one("#wb-input", Input).value = "https://changed.test"
         await pilot.press("enter", "escape")
         await press_option(
-            pilot, screen.query_one("#wb-providers", OptionList), "\x00add"
+            pilot, screen.query_one("#wb-root-actions", OptionList), "\x00add"
         )
         screen.query_one("#wb-connection-name", Input).value = "new-gateway"
         screen.query_one("#wb-connection-base", Input).value = "https://new.test/v1"
@@ -1148,20 +1678,16 @@ async def test_minimum_48x24_detail_is_keyboard_reachable() -> None:
 async def add_preset(
     pilot, screen: ProviderWorkbenchScreen, preset: ProviderPreset
 ) -> None:  # type: ignore[no-untyped-def]
-    browser = screen.query_one("#wb-providers", OptionList)
     if preset is MISTRAL:
         screen._choose_preset(MISTRAL)
     elif preset is FULLY_CUSTOM:
-        browser.highlighted = next(
-            i for i, option in enumerate(browser.options) if option.id == "\x00add"
+        await press_option(
+            pilot, screen.query_one("#wb-root-actions", OptionList), "\x00add"
         )
-        await pilot.press("enter")
     else:
         screen._choose_preset(preset)
     assert screen._stage == "connection"
-    if preset is MISTRAL:
-        screen.set_focus(screen.query_one("#wb-connection-name", Input))
-        await pilot.pause()
+    await pilot.pause()
 
 
 @pytest.mark.asyncio
@@ -1226,7 +1752,7 @@ async def test_add_preset_saves_connection_then_models() -> None:
         await pilot.pause()
         assert screen.query_one("#wb-presets").has_focus
         await press_option(
-            pilot, screen.query_one("#wb-presets", OptionList), "add-another"
+            pilot, screen.query_one("#wb-presets-actions", OptionList), "add-another"
         )
         assert screen._stage == "choose"
 
@@ -1364,12 +1890,17 @@ async def test_add_probe_failure_manual_retry_shared_key_and_stale() -> None:
         services.discovery_result = DiscoveryError("connection", "Unable to list")  # type: ignore[assignment]
         screen._connection_action("continue")
         await pilot.pause()
-        assert screen._stage == "models" and "Discovery Failed" in str(
-            screen.query_one("#wb-actions", OptionList).options
+        assert screen.state
+        assert screen._stage == "models" and isinstance(
+            screen.state.discovery, DiscoveryError
         )
-        assert {"discover", "edit-connection", "edit-key", "manual"}.issubset({
-            option.id for option in screen.query_one("#wb-actions", OptionList).options
+        assert "Discovery Failed" in str(screen.query_one("#wb-help").render())
+        assert {"retry-discovery", "edit-connection", "manual"}.issubset({
+            option.id
+            for option in screen.query_one("#wb-models-actions", OptionList).options
         })
+        assert screen.query_one("#wb-models-actions").display
+        assert not screen.query_one("#wb-actions").display
         state = screen.state
         assert state
         old = state.discovery_generation
@@ -1723,7 +2254,7 @@ async def test_reload_failure_adopts_saved_snapshot_and_retries_without_write() 
         assert len(services.writes) == 1
         assert "Retry Runtime Reload" in screen._message
         assert "Retry Runtime Reload" in str(
-            screen.query_one("#wb-actions", OptionList).options
+            screen.query_one("#wb-provider-operations", OptionList).options
         )
         screen._select_action("retry-reload")
         await pilot.pause()
@@ -1824,11 +2355,19 @@ async def test_saved_credential_requires_confirmation_even_without_shared_provid
         screen._select_action("key")
         editor = screen.query_one("#wb-input", Input)
         editor.value = "replacement"
+        await pilot.press("home", "right", "right", "right", "right")
+        assert editor.cursor_position == 4
+        help_focus_id = screen._help_focus_id
         await pilot.press("enter")
         assert screen._confirm == "shared-key" and not services.keys
         assert "one" in str(screen.query_one("#wb-confirm-text").render())
+        await pilot.press("tab", "shift+tab")
+        assert screen.query_one("#wb-confirm-actions").has_focus
+        assert screen._help_focus_id == help_focus_id
         await pilot.press("escape")
         assert editor.has_focus and editor.value == "replacement"
+        assert editor.cursor_position == 4
+        assert screen._help_focus_id == help_focus_id
         assert not services.keys
 
 
@@ -2076,9 +2615,18 @@ async def test_primary_region_visibility_and_focus_across_workbench_views() -> N
         visible = [screen.query_one(f"#{name}") for name in primary_ids]
         shown = [widget for widget in visible if widget.display]
         assert len(shown) == 1
+        _, legal = screen._visibility_projection()
+        assert {
+            name
+            for name in screen.VIEW_CONTROLS
+            if screen.query_one(f"#wb-{name}").display
+        } == legal - {"help", "hint"}
         focused = screen.focused
         assert focused is not None
-        assert shown[0] in focused.ancestors_with_self
+        assert any(
+            screen.query_one(f"#wb-{name}") in focused.ancestors_with_self
+            for name in legal
+        )
 
     async with Host(screen).run_test(size=(80, 24)) as pilot:
         assert_primary()
@@ -2102,23 +2650,19 @@ async def test_connection_key_enter_cancel_restores_field_and_accept_saves() -> 
     screen, services = setup()
     async with Host(screen).run_test(size=(80, 24)) as pilot:
         await add_preset(pilot, screen, FULLY_CUSTOM)
-        env = screen.query_one("#wb-connection-env", Input)
-        env.value = "SHARED_KEY"
-        env.focus()
+        screen._connection_action("env")
+        editor = screen.query_one("#wb-input", Input)
+        editor.value = "SHARED_KEY"
         await pilot.press("enter")
-        key = screen.query_one("#wb-connection-key", Input)
-        key.value = "private-secret"
-        key.focus()
-        await pilot.press("enter")
-        assert screen._confirm is None
-        assert screen.query_one("#wb-connection-actions").has_focus
+        screen._connection_action("key")
+        editor.value = "private-secret"
         await pilot.press("enter")
         assert screen._confirm == "shared-key"
         await pilot.press("escape")
         assert screen._confirm is None
-        assert key.value == "private-secret"
-        assert key.has_focus
-        await pilot.press("enter")
+        assert editor.value == "private-secret"
+        assert editor.has_focus
+        assert not screen.query_one("#wb-connection-form").display
         await pilot.press("enter")
         await pilot.press("down", "enter")
         assert services.keys == [("SHARED_KEY", "private-secret")]
@@ -2131,19 +2675,16 @@ async def test_connection_key_enter_without_secret_reports_error_without_hidden_
     screen, services = setup()
     async with Host(screen).run_test(size=(80, 24)) as pilot:
         await add_preset(pilot, screen, FULLY_CUSTOM)
-        env = screen.query_one("#wb-connection-env", Input)
-        env.value = "NEW_KEY"
-        env.focus()
+        await press_option(pilot, screen.query_one("#wb-actions", OptionList), "env")
+        screen.query_one("#wb-input", Input).value = "NEW_KEY"
         await pilot.press("enter")
-        key = screen.query_one("#wb-connection-key", Input)
-        key.focus()
+        await press_option(pilot, screen.query_one("#wb-actions", OptionList), "key")
+        key = screen.query_one("#wb-input", Input)
+        key.value = ""
         await pilot.press("enter")
         assert not services.keys
-        actions = screen.query_one("#wb-connection-actions", OptionList)
-        assert actions.has_focus
-        assert next(
-            option for option in actions.options if option.id == "save-key"
-        ).disabled
+        assert key.has_focus and screen._editing == "key"
+        assert "Error" in str(screen.query_one("#wb-field-error").render())
 
 
 @pytest.mark.asyncio
@@ -2153,16 +2694,14 @@ async def test_legacy_key_confirmation_uses_legacy_editor_after_connection_form(
     screen, services = setup()
     async with Host(screen).run_test(size=(80, 24)) as pilot:
         await add_preset(pilot, screen, FULLY_CUSTOM)
-        env = screen.query_one("#wb-connection-env", Input)
-        env.value = "SHARED_KEY"
-        env.focus()
+        await press_option(pilot, screen.query_one("#wb-actions", OptionList), "env")
+        screen.query_one("#wb-input", Input).value = "SHARED_KEY"
         await pilot.press("enter")
-        connection_key = screen.query_one("#wb-connection-key", Input)
-        connection_key.value = "connection-secret"
-        connection_key.focus()
-        await pilot.press("enter")
+        await press_option(pilot, screen.query_one("#wb-actions", OptionList), "key")
+        screen.query_one("#wb-input", Input).value = "connection-secret"
         await pilot.press("enter")
         assert screen._confirm == "shared-key"
+        await pilot.press("escape")
         await pilot.press("escape")
         await pilot.press("escape")
         assert screen._confirm == "add-discard-simple"
@@ -2212,7 +2751,9 @@ async def test_new_provider_discard_returns_visible_provider_browser() -> None:
         assert screen._confirm == "add-discard-simple"
         await pilot.press("down", "enter")
         assert screen.query_one("#wb-providers").display
-        assert screen.query_one("#wb-providers").has_focus
+        actions = screen.query_one("#wb-root-actions", OptionList)
+        assert actions.has_focus
+        assert actions.highlighted_option and actions.highlighted_option.id == "\x00add"
         assert screen._stage is None
 
 
@@ -2558,9 +3099,11 @@ async def test_forward_actions_visible_and_detail_save_reachable() -> None:
         assert "Save and continue to presets persists the draft." in str(
             screen.query_one("#wb-help").render()
         )
-        assert any(option.id == "save-detail" for option in fields.options)
+        assert not any(option.id == "save-detail" for option in fields.options)
         screen.query_one("#price-input", Input).value = "2"
-        await press_option(pilot, fields, "save-detail")
+        await press_option(
+            pilot, screen.query_one("#wb-detail-actions", OptionList), "save-detail"
+        )
         assert screen._detail is None
         assert screen.query_one("#wb-models").display
 
@@ -2670,12 +3213,9 @@ async def test_discarding_new_provider_restores_global_draft() -> None:
         assert screen.state and screen.state.dirty
         await pilot.press("escape")
 
-        browser = screen.query_one("#wb-providers", OptionList)
-        browser.highlighted = next(
-            i for i, option in enumerate(browser.options) if option.id == "\x00add"
+        await press_option(
+            pilot, screen.query_one("#wb-root-actions", OptionList), "\x00add"
         )
-        browser.focus()
-        await pilot.press("enter")
         assert screen._stage == "connection"
         name = screen.query_one("#wb-connection-name", Input)
         name.value = "draft-provider"
@@ -2685,8 +3225,10 @@ async def test_discarding_new_provider_restores_global_draft() -> None:
         assert screen._confirm == "add-discard-simple"
         await pilot.press("down", "enter")
         assert screen.query_one("#wb-providers").display
-        assert screen.query_one("#wb-providers").has_focus
-        await pilot.press("enter")
+        actions = screen.query_one("#wb-root-actions", OptionList)
+        assert actions.has_focus
+        assert actions.highlighted_option and actions.highlighted_option.id == "\x00add"
+        await pilot.press("shift+tab", "enter")
         assert screen.state and screen.state.provider_id == "one"
         assert screen.state.connection.api_base == "https://draft.test"
 
@@ -2701,17 +3243,13 @@ async def test_catalog_detail_apply_and_discard_keep_root_rows_current() -> None
         screen.query_one("#price-input", Input).value = "2"
         screen._save_detail()
         await pilot.press("escape", "escape")
-        browser = screen.query_one("#wb-providers", OptionList)
+        browser = screen.query_one("#wb-root-actions", OptionList)
         browser_ids = {str(option.id) for option in browser.options}
         assert {"\x00apply", "\x00discard"} <= browser_ids
-        browser.highlighted = next(
-            i for i, option in enumerate(browser.options) if option.id == "\x00apply"
-        )
-        browser.focus()
-        await pilot.press("enter")
+        await press_option(pilot, browser, "\x00apply")
         await pilot.pause()
         assert services.writes
-        browser = screen.query_one("#wb-providers", OptionList)
+        browser = screen.query_one("#wb-root-actions", OptionList)
         assert not {"\x00apply", "\x00discard"} & {
             str(option.id) for option in browser.options
         }
@@ -2722,17 +3260,13 @@ async def test_catalog_detail_apply_and_discard_keep_root_rows_current() -> None
         screen.query_one("#wb-input", Input).value = "https://discard.test"
         await pilot.press("enter")
         await pilot.press("escape")
-        browser = screen.query_one("#wb-providers", OptionList)
+        browser = screen.query_one("#wb-root-actions", OptionList)
         assert {"\x00apply", "\x00discard"} <= {
             str(option.id) for option in browser.options
         }
-        browser.highlighted = next(
-            i for i, option in enumerate(browser.options) if option.id == "\x00discard"
-        )
-        browser.focus()
-        await pilot.press("enter")
+        await press_option(pilot, browser, "\x00discard")
         await pilot.press("down", "enter")
-        browser = screen.query_one("#wb-providers", OptionList)
+        browser = screen.query_one("#wb-root-actions", OptionList)
         assert not {"\x00apply", "\x00discard"} & {
             str(option.id) for option in browser.options
         }
@@ -2818,7 +3352,9 @@ async def test_detail_invalid_price_keeps_focus_and_clears_error_when_fixed() ->
         price = screen.query_one("#price-input", Input)
         price.value = "-1"
         detail_fields = screen.query_one("#wb-detail-fields", OptionList)
-        await press_option(pilot, detail_fields, "save-detail")
+        await press_option(
+            pilot, screen.query_one("#wb-detail-actions", OptionList), "save-detail"
+        )
         await pilot.pause()
         assert detail_fields.has_focus
         highlighted = detail_fields.highlighted_option
@@ -2829,7 +3365,9 @@ async def test_detail_invalid_price_keeps_focus_and_clears_error_when_fixed() ->
 
         price.value = "1"
         detail_fields.focus()
-        await press_option(pilot, detail_fields, "save-detail")
+        await press_option(
+            pilot, screen.query_one("#wb-detail-actions", OptionList), "save-detail"
+        )
         await pilot.pause()
         assert not price.has_class("-invalid")
         assert not str(screen.query_one("#error-input").render()).strip()
@@ -2908,7 +3446,7 @@ async def test_two_provider_onboarding_uses_arrows_and_forward_saves() -> None:
     async def connect(pilot, name: str) -> None:  # type: ignore[no-untyped-def]
         if screen.view == WorkbenchView.PROVIDERS:
             await press_option(
-                pilot, screen.query_one("#wb-providers", OptionList), "\x00add"
+                pilot, screen.query_one("#wb-root-actions", OptionList), "\x00add"
             )
         if screen.view == WorkbenchView.CHOOSE:
             await press_option(
@@ -2921,7 +3459,9 @@ async def test_two_provider_onboarding_uses_arrows_and_forward_saves() -> None:
             screen.query_one("#wb-input", Input).value = value
             await pilot.press("enter")
             assert screen.focused is actions
-        await press_option(pilot, actions, "continue")
+        await press_option(
+            pilot, screen.query_one("#wb-connection-actions", OptionList), "continue"
+        )
         await wait_until(
             pilot, lambda: screen.view == WorkbenchView.MODELS and not screen._busy
         )
@@ -2959,9 +3499,13 @@ async def test_two_provider_onboarding_uses_arrows_and_forward_saves() -> None:
         assert screen.focused is editor
         await press_option(pilot, editor, "thinking")
         await press_option(pilot, screen.query_one("#wb-picker", OptionList), "low")
-        await press_option(pilot, editor, "apply")
+        await press_option(
+            pilot, screen.query_one("#wb-preset-editor-actions", OptionList), "apply"
+        )
         assert screen.focused is presets
-        await press_option(pilot, presets, "finish")
+        await press_option(
+            pilot, screen.query_one("#wb-presets-actions", OptionList), "finish"
+        )
         await wait_until(pilot, lambda: bool(services.writes[-1].roles))
         assert services.writes[-1].roles == {
             "orchestrator": {"model": "alpha-model", "thinking": "low"}
@@ -2984,10 +3528,12 @@ async def test_compact_presets_and_forward_actions_fit_without_scrolling(size) -
         await pilot.pause()
         rows = screen.query_one("#wb-presets", OptionList)
         ids = [str(option.id) for option in rows.options]
-        assert len(ids) == 9
+        assert len(ids) == 7
         assert all(f"preset:{role}" in ids for role in catalog["roles"])
-        assert ids[-2:] == ["finish", "add-another"]
-        assert rows.size.height >= 9
+        actions = screen.query_one("#wb-presets-actions", OptionList)
+        assert [option.id for option in actions.options] == ["finish", "add-another"]
+        assert actions.display and actions.size.height >= 2
+        assert rows.size.height >= 7
         assert rows.virtual_size.height <= rows.size.height
         assert rows.scroll_y == 0
         assert rows.has_focus
@@ -3026,7 +3572,9 @@ async def test_detail_fields_edit_with_arrows_enter_space_and_escape() -> None:
             "supports-images"
             in screen.query_one("#wb-image-support", SelectionList).selected
         )
-        await press_option(pilot, rows, "save-detail")
+        await press_option(
+            pilot, screen.query_one("#wb-detail-actions", OptionList), "save-detail"
+        )
         assert screen._detail is None
         assert screen.query_one("#wb-models").display
 
@@ -3056,7 +3604,9 @@ async def test_preset_thinking_picker_lists_only_supported_levels() -> None:
         ]
         await press_option(pilot, picker, "low")
         assert editor.has_focus
-        await press_option(pilot, editor, "apply")
+        await press_option(
+            pilot, screen.query_one("#wb-preset-editor-actions", OptionList), "apply"
+        )
         assert presets.has_focus
         assert screen.state and screen.state.role_presets["orchestrator"] == (
             "a",
@@ -3078,7 +3628,9 @@ async def test_management_save_keeps_invalid_preset_pair_in_editor() -> None:
         screen._open_presets()
         assert screen.state
         screen.state.set_role_preset("orchestrator", "a", "high")
-        await press_option(pilot, screen.query_one("#wb-presets", OptionList), "finish")
+        await press_option(
+            pilot, screen.query_one("#wb-presets-actions", OptionList), "finish"
+        )
         assert screen.view == WorkbenchView.PRESETS
         assert screen._feedback_kind == "error"
         assert not services.writes
@@ -3090,7 +3642,7 @@ async def test_blank_env_api_key_guides_to_masked_key_and_saves() -> None:
     screen, services = setup()
     async with Host(screen).run_test(size=(80, 24)) as pilot:
         await press_option(
-            pilot, screen.query_one("#wb-providers", OptionList), "\x00add"
+            pilot, screen.query_one("#wb-root-actions", OptionList), "\x00add"
         )
         assert screen._add is not None
         screen._add = replace(screen._add, name="Acme Gateway")
@@ -3136,14 +3688,17 @@ async def test_paired_preset_editor_cancel_and_apply_preserve_thinking() -> None
         editor = screen.query_one("#wb-preset-editor", OptionList)
         await press_option(pilot, editor, "model")
         await press_option(pilot, screen.query_one("#wb-picker", OptionList), "b")
-        assert [option.id for option in editor.options] == [
-            "model",
-            "thinking",
-            "apply",
-            "cancel",
-        ]
+        assert [option.id for option in editor.options] == ["model", "thinking"]
+        assert [
+            option.id
+            for option in screen.query_one(
+                "#wb-preset-editor-actions", OptionList
+            ).options
+        ] == ["apply", "cancel"]
         assert "Thinking  low" in str(editor.get_option_at_index(1).prompt)
-        await press_option(pilot, editor, "cancel")
+        await press_option(
+            pilot, screen.query_one("#wb-preset-editor-actions", OptionList), "cancel"
+        )
         assert screen.state and screen.state.preset("orchestrator") == ("a", "low")
         assert (
             presets.has_focus
@@ -3153,7 +3708,9 @@ async def test_paired_preset_editor_cancel_and_apply_preserve_thinking() -> None
         await pilot.press("enter")
         await press_option(pilot, editor, "model")
         await press_option(pilot, screen.query_one("#wb-picker", OptionList), "b")
-        await press_option(pilot, editor, "apply")
+        await press_option(
+            pilot, screen.query_one("#wb-preset-editor-actions", OptionList), "apply"
+        )
         assert screen.state.preset("orchestrator") == ("b", "low")
         await press_option(pilot, presets, "preset:other")
         assert editor.has_focus
@@ -3180,7 +3737,9 @@ async def test_paired_preset_editor_requires_supported_replacement_before_apply(
         await press_option(pilot, editor, "model")
         await press_option(pilot, screen.query_one("#wb-picker", OptionList), "b")
         assert "unsupported" in str(editor.get_option_at_index(1).prompt)
-        await press_option(pilot, editor, "apply")
+        await press_option(
+            pilot, screen.query_one("#wb-preset-editor-actions", OptionList), "apply"
+        )
         assert screen.state and screen.state.preset("orchestrator") == ("a", "off")
         assert (
             editor.has_focus
@@ -3189,5 +3748,252 @@ async def test_paired_preset_editor_requires_supported_replacement_before_apply(
         )
         await pilot.press("enter")
         await press_option(pilot, screen.query_one("#wb-picker", OptionList), "high")
-        await press_option(pilot, editor, "apply")
+        await press_option(
+            pilot, screen.query_one("#wb-preset-editor-actions", OptionList), "apply"
+        )
         assert screen.state.preset("orchestrator") == ("b", "high")
+
+
+async def open_split_view(pilot, screen, view: str) -> None:
+    await expand(pilot, screen)
+    assert screen.state
+    if view == "catalog":
+        screen.state.set_edits("a", ModelEdits(input_price=OptionalEdit.set(2)))
+        screen._open_catalog()
+    elif view == "detail":
+        screen._select_action("models")
+        screen._open_detail("a")
+        screen.query_one("#price-input", Input).value = "2"
+    else:
+        screen._open_presets()
+        if view == "preset-editor":
+            await press_option(
+                pilot,
+                screen.query_one("#wb-presets", OptionList),
+                "preset:orchestrator",
+            )
+            screen._preset_draft = ("a", "off")
+        else:
+            screen.state.set_role_preset("orchestrator", "a", "off")
+    await pilot.pause()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pointer", [False, True])
+@pytest.mark.parametrize(
+    ("view", "group", "action", "writes"),
+    [
+        ("catalog", "wb-catalog-actions", "\x00apply", 1),
+        ("catalog", "wb-catalog-actions", "\x00discard", 0),
+        ("detail", "wb-detail-actions", "save-detail", 0),
+        ("presets", "wb-presets-actions", "finish", 1),
+        ("presets", "wb-presets-actions", "add-another", 1),
+        ("preset-editor", "wb-preset-editor-actions", "apply", 0),
+        ("preset-editor", "wb-preset-editor-actions", "cancel", 0),
+    ],
+)
+async def test_split_action_has_unique_target_and_pointer_parity(
+    view, group, action, writes, pointer
+) -> None:
+    screen, services = setup()
+    async with Host(screen).run_test(size=(80, 24)) as pilot:
+        await open_split_view(pilot, screen, view)
+        targets = [
+            widget.id
+            for widget in screen.query(OptionList)
+            if widget.display and all(parent.display for parent in widget.ancestors)
+            for option in widget.options
+            if option.id == action
+        ]
+        assert targets == [group]
+        actions = screen.query_one(f"#{group}", OptionList)
+        assert actions.region.bottom <= screen.size.height
+        if pointer:
+            index = actions.get_option_index(action)
+            await pilot.click(actions, offset=(5, index))
+        else:
+            await press_option(pilot, actions, action)
+        await wait_until(pilot, lambda: not screen._busy)
+        assert len(services.writes) == writes
+        assert not services.keys
+        if view == "detail":
+            assert screen.view == WorkbenchView.MODELS
+            assert screen.state and screen.state.edits[
+                "a"
+            ].input_price == OptionalEdit.set(2)
+            assert screen.query_one("#wb-models").has_focus
+        elif view == "preset-editor":
+            assert screen.view == WorkbenchView.PRESETS
+            assert screen.state and screen.state.preset("orchestrator") == (
+                "a",
+                "off" if action == "apply" else "medium",
+            )
+            opener = screen.query_one("#wb-presets", OptionList).highlighted_option
+            assert opener and opener.id == "preset:orchestrator"
+        elif action == "\x00apply":
+            assert screen.view == WorkbenchView.CATALOG
+            assert not actions.display
+            assert screen.query_one("#wb-catalog").has_focus
+        elif action == "\x00discard":
+            assert screen._confirm == "discard"
+        elif action == "add-another":
+            assert screen.view == WorkbenchView.CHOOSE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("view", "group", "body"),
+    [
+        ("catalog", "wb-catalog-actions", "wb-catalog"),
+        ("detail", "wb-detail-actions", "wb-detail-fields"),
+        ("presets", "wb-presets-actions", "wb-presets"),
+        ("preset-editor", "wb-preset-editor-actions", "wb-preset-editor"),
+    ],
+)
+async def test_split_actions_boundaries_and_reversible_tab(view, group, body) -> None:
+    screen, services = setup()
+    async with Host(screen).run_test(size=(80, 24)) as pilot:
+        await open_split_view(pilot, screen, view)
+        rows = screen.query_one(f"#{body}", OptionList)
+        actions = screen.query_one(f"#{group}", OptionList)
+        await pilot.press("end")
+        assert rows.highlighted_option
+        selected = rows.highlighted_option.id
+        await pilot.press("tab")
+        assert actions.has_focus
+        await pilot.press("home", "up", "k")
+        assert actions.highlighted == 0
+        await pilot.press("end", "down", "j")
+        assert actions.highlighted == actions.option_count - 1
+        assert actions.highlighted_option
+        last = actions.highlighted_option.id
+        await pilot.press("space", "shift+tab")
+        assert (
+            rows.has_focus
+            and rows.highlighted_option
+            and rows.highlighted_option.id == selected
+        )
+        await pilot.press("tab")
+        assert (
+            actions.has_focus
+            and actions.highlighted_option
+            and actions.highlighted_option.id == last
+        )
+        groups = screen._focus_groups()
+        for direction, key in ((1, "tab"), (-1, "shift+tab")):
+            index = groups.index(group)
+            for step in range(1, len(groups) + 1):
+                await pilot.press(key)
+                assert (
+                    screen.focused
+                    and screen.focused.id
+                    == groups[(index + direction * step) % len(groups)]
+                )
+        screen._confirm = "discard"
+        screen._sync_view()
+        assert actions.has_class("wb-confirm-underlay")
+        screen.action_confirm_no()
+        screen._set_busy(True)
+        assert actions.disabled
+        screen._set_busy(False)
+        assert not actions.disabled
+        assert not services.writes and not services.keys
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("view", ["catalog", "presets"])
+async def test_long_split_bodies_leave_actions_reachable(view) -> None:
+    screen, services = setup()
+    data = services.catalog.catalog.model_dump()
+    if view == "catalog":
+        data["models"].update({f"long-{i:03}": data["models"]["a"] for i in range(80)})
+    else:
+        data["roles"].update({
+            f"role-{i:03}": {"model": "a", "thinking": "off"} for i in range(80)
+        })
+    services.catalog = CatalogSnapshot(ModelCatalog.model_validate(data), "long")
+    screen.snapshot = services.catalog
+    async with Host(screen).run_test(size=(80, 24)) as pilot:
+        await open_split_view(pilot, screen, view)
+        body = screen.query_one(f"#wb-{view}", OptionList)
+        assert body.max_scroll_y > 0
+        await pilot.press("end", "tab")
+        actions = screen.query_one(f"#wb-{view}-actions", OptionList)
+        assert actions.has_focus and actions.region.bottom <= 24
+        assert actions.size.height >= 2
+        await pilot.press("shift+tab")
+        assert body.has_focus and body.highlighted == body.option_count - 1
+        assert body.scroll_y > 0
+        assert not services.writes
+
+
+@pytest.mark.asyncio
+async def test_catalog_split_filter_model_and_action_bookmarks_are_independent() -> (
+    None
+):
+    screen, services = setup()
+    async with Host(screen).run_test(size=(80, 24)) as pilot:
+        await expand(pilot, screen)
+        screen._open_catalog()
+        await pilot.pause()
+        assert not screen.query_one("#wb-catalog-actions").display
+        assert screen._focus_groups() == ["wb-catalog-filter", "wb-catalog", "wb-help"]
+        models = screen.query_one("#wb-catalog", OptionList)
+        filters = screen.query_one("#wb-catalog-filter", OptionList)
+        await pilot.press("end", "shift+tab")
+        assert filters.has_focus
+        await press_option(pilot, filters, "filter:one")
+        await pilot.press("tab")
+        assert models.highlighted_option and models.highlighted_option.id == "model:a"
+        assert screen.state
+        screen.state.set_edits("a", ModelEdits(input_price=OptionalEdit.set(2)))
+        screen._refresh_catalog()
+        await pilot.press("tab", "end", "shift+tab", "shift+tab")
+        assert filters.has_focus
+        await press_option(pilot, filters, "filter:")
+        await pilot.press("tab")
+        assert models.highlighted_option and models.highlighted_option.id == "model:b"
+        await pilot.press("tab")
+        actions = screen.query_one("#wb-catalog-actions", OptionList)
+        assert (
+            actions.highlighted_option
+            and actions.highlighted_option.id == "\x00discard"
+        )
+        await pilot.press("shift+tab", "shift+tab")
+        assert filters.highlighted_option and filters.highlighted_option.id == "filter:"
+        assert not services.writes
+
+
+@pytest.mark.asyncio
+async def test_role_editor_picker_restore_exact_bookmarks_without_writes() -> None:
+    screen, services = setup()
+    async with Host(screen).run_test(size=(80, 24)) as pilot:
+        screen._open_presets()
+        roles = screen.query_one("#wb-presets", OptionList)
+        await press_option(pilot, roles, "preset:orchestrator")
+        fields = screen.query_one("#wb-preset-editor", OptionList)
+        await pilot.press("down", "enter")
+        assert screen.view == WorkbenchView.PICKER
+        await pilot.press("escape")
+        assert (
+            fields.has_focus
+            and fields.highlighted_option
+            and fields.highlighted_option.id == "thinking"
+        )
+        await pilot.press("tab", "end", "enter")
+        assert (
+            roles.has_focus
+            and roles.highlighted_option
+            and roles.highlighted_option.id == "preset:orchestrator"
+        )
+        await press_option(pilot, roles, "preset:other")
+        assert fields.highlighted_option and fields.highlighted_option.id == "model"
+        await pilot.press("tab")
+        actions = screen.query_one("#wb-preset-editor-actions", OptionList)
+        assert actions.highlighted_option and actions.highlighted_option.id == "apply"
+        await pilot.press("escape")
+        await press_option(pilot, roles, "preset:orchestrator")
+        assert fields.highlighted_option and fields.highlighted_option.id == "thinking"
+        await pilot.press("tab")
+        assert actions.highlighted_option and actions.highlighted_option.id == "cancel"
+        assert not services.writes and not services.keys

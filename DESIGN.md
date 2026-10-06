@@ -534,11 +534,7 @@ permitted in single-list immediate-choice pickers and guided workflows.
   order, remembering each group's last position. Usage cycles period → scope →
   table → Details (while open), wrapping back to period; Enter/Space activates a
   focused selector, while navigation alone never fetches. In text editors, arrows
-  retain caret behavior and Space remains text input. Settings and Providers have
-  not yet migrated to group navigation: their existing row-based Up/Down routes
-  are a listed deferred gap (see section 10), not a conformance exemption, and
-  group navigation there is follow-up work. This deferral does not authorize new
-  cross-group arrow routes.
+  retain caret behavior and Space remains text input.
   Outside composite browsers, Tab/Shift-Tab moves between focusable controls where
   applicable. Every supported action must have a documented keyboard route; it
   need not have an Up/Down route. Text fields retain their editing keys.
@@ -773,13 +769,6 @@ representative focus, overflow, light, dark, no-color, and ASCII states
 recorded. Known inherited or deferred gaps should be listed explicitly and
 are not conformance exemptions. `prefer` and `may` express recommendations;
 `must`, `never`, `do not`, and unqualified requirements are mandatory.
-
-### Deferred gaps
-
-- Settings and Providers have not yet migrated to composite-browser group
-  navigation; their existing row-based Up/Down routes remain a deferred gap,
-  not a conformance exemption. This deferral does not authorize new cross-group
-  arrow routes.
 
 ### Reuse targets
 

@@ -9,7 +9,7 @@ from chartreux.core.utils.async_subprocess import spawn_registered_process
 
 
 async def spawn_shell_command(
-    command: str, *, cwd: Path | None = None
+    command: str, *, cwd: Path | None = None, merge_stderr: bool = False
 ) -> asyncio.subprocess.Process:
     env = _shell_environment()
     cwd = cwd or Path.cwd()
@@ -17,7 +17,9 @@ async def spawn_shell_command(
         asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT
+            if merge_stderr
+            else asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.DEVNULL,
             env=env,
             cwd=cwd,

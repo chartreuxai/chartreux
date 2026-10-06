@@ -157,6 +157,27 @@ User-cancelled completion is injected into the parent: an idle parent learns at
 its next turn and is never auto-started. Root interruption remains the separate
 `turn/interrupt` operation.
 
+## Managed-job state
+
+`PublicSessionState.active_background_job_count` (wire
+`activeBackgroundJobCount`) is a nonnegative, default-zero count of committed
+managed jobs whose owned cleanup has not settled. It includes child-created jobs
+even after the child runtime closes; stored and inactive sessions report zero.
+Clients should use this projected state rather than scan processes or count agent
+summaries. History-less snapshots update the count without replacing existing
+history or turn pages.
+
+Admission and finalization publish state-only updates, including changes between
+turns and count changes such as 1 → 2. Output writes do not publish snapshots;
+these job-state updates contain no commands or output bodies. Output is obtained
+through `bash_read` tool results, with ordinary transcript projection and replay.
+
+`is_quiescent` also accounts for unsettled managed jobs alongside existing
+background work. Non-quiescence is not turn ownership: a long-running server does
+not block new prompts, scheduled turns, or compaction. A bounded `bash_read` wait
+is an ordinary tool call, not a waiting-only subagent wait. Root close/replacement
+cleans up jobs; resumed or forked transcripts do not adopt historical handles.
+
 ## Settings projection and writes
 
 `config/settings/read` returns the curated settings view and the current user

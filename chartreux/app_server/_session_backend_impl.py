@@ -883,27 +883,26 @@ class SessionBackendImpl:
                 )
             except BaseException as exc:
                 errors.append(exc)
-        # Release the liveness marker before the potentially slow runtime close
-        # so a concurrent session deletion does not strand the worktree.
-        try:
-            self._release_worktree_holder()
-        except BaseException as exc:
-            errors.append(exc)
         try:
             await self.session.close()
             core_close_succeeded = True
         except BaseException as exc:
             errors.append(exc)
-        # Runtime shutdown releases MCP and terminal handles before an unstarted
-        # worktree is rolled back, which is required for removal on Windows.
-        try:
-            await self._roll_back_unstarted_worktree()
-        except BaseException as exc:
-            errors.append(exc)
+        # Keep worktree protection until owned processes and runtime handles are
+        # reclaimed. A failed close retains both the holder and rollback for retry.
+        if core_close_succeeded and not errors:
+            try:
+                self._release_worktree_holder()
+            except BaseException as exc:
+                errors.append(exc)
+            try:
+                await self._roll_back_unstarted_worktree()
+            except BaseException as exc:
+                errors.append(exc)
         if self._events_subscribed:
             self._events_idle.clear()
             finish_event_queue(self._events, _EventStreamClosed())
-        if core_close_succeeded:
+        if core_close_succeeded and not errors:
             self._closed = True
         if len(errors) == 1:
             raise errors[0]

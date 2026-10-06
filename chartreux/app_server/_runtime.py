@@ -55,6 +55,7 @@ from chartreux.core.agent_loop import AgentLoop, AgentRuntimePolicy
 from chartreux.core.agent_loop._loop import RootAccountingOwner
 from chartreux.core.agents.launch import FrozenPersona, LaunchCandidate, resolve_launch
 from chartreux.core.agents.manager import AgentManager
+from chartreux.core.background_jobs import BackgroundJobsPort
 from chartreux.core.config import (
     ChartreuxConfigSchema,
     MCPHttp,
@@ -249,6 +250,7 @@ class _AgentLoopBlueprint:
     frozen_instructions: str | None = None
     committed_model: CommittedModelIdentity | None = None
     accounting_owner: RootAccountingOwner | None = None
+    background_jobs: BackgroundJobsPort | None = None
     process: HarnessProcess | None = None
 
     def build(self) -> AgentLoop:
@@ -285,6 +287,7 @@ class _AgentLoopBlueprint:
             session_dir=self.session_dir,
             session_lease=self.session_lease,
             accounting_owner=self.accounting_owner,
+            background_jobs=self.background_jobs,
         )
         if self.process is not None:
             self.process._track_accounting_loop(agent_loop)
@@ -475,6 +478,7 @@ class AgentRuntimeFactory:
             session_path, loaded_messages, metadata = await asyncio.to_thread(
                 _load_session, source.config, session_id
             )
+            await source.retire_background_jobs()
             # Prepare the only fallible part of rebinding before the reload. This
             # keeps a scratchpad failure from leaving the old session's runtime
             # consumers configured for the target session.
@@ -860,6 +864,11 @@ class AgentRuntimeFactory:
             session_dir=session_dir,
             session_lease=session_lease,
             accounting_owner=accounting_owner,
+            background_jobs=(
+                source.background_jobs.borrow()
+                if is_subagent and source.background_jobs is not None
+                else None
+            ),
             process=self._process,
             launch_profile=(
                 launch_candidate.profile.name if launch_candidate else None

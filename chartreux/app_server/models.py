@@ -957,6 +957,7 @@ class PublicSessionState(ProtocolModel):
     event_id: int = Field(ge=0, strict=True)
     session: PublicSession
     is_quiescent: bool | None = None
+    active_background_job_count: int = Field(default=0, ge=0, strict=True)
     history: list[PublicHistoryEntry] | None = None
     history_before_cursor: str | None = None
     turns: list[PublicTurn] | None = None

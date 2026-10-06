@@ -1197,7 +1197,7 @@ async def test_session_stop_saves_the_work_before_removing_a_worktree(
 
 
 @pytest.mark.asyncio
-async def test_session_stop_releases_the_holder_before_shutting_down(
+async def test_session_stop_releases_the_holder_after_shutting_down(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _init_repo(tmp_path)
@@ -1242,11 +1242,9 @@ async def test_session_stop_releases_the_holder_before_shutting_down(
     finally:
         await client.close()
 
-    # The runner caps session/stop at two seconds and then deletes regardless.
-    # A holder released after a slow shutdown is still on disk when the delete
-    # asks for removal, which reads the worktree as in use and strands it with
-    # its session already gone.
-    assert order == ["holder", "close"]
+    # Worktree deletion must remain blocked until all owned jobs and runtime
+    # handles are reclaimed, even when the session/stop caller times out.
+    assert order == ["close", "holder"]
 
 
 @pytest.mark.asyncio

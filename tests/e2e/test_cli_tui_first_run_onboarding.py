@@ -90,10 +90,9 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
 
         wait_for_rendered_text(child, captured, "Provider Settings", timeout=10)
         wait_for_rendered_text(child, captured, "Add custom provider", timeout=10)
-        child.send("\x1b[H")
-        drain_child_output(child, captured, idle_sleep=0.1)
-        child.send("\x1b[B")
-        drain_child_output(child, captured, idle_sleep=0.1)
+        # Root actions are a separate group from the suggested Mistral row.
+        # Configure a custom provider for the local OpenAI-compatible server.
+        _send_and_wait_for_text(child, "\t", "▸ Add custom provider")
         _send_and_wait_for_text(
             child, "\r", "New provider: unnamed — connection", timeout=25
         )
@@ -110,8 +109,9 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
         _send_and_wait_for_text(child, api_key_env_var + "\r", "Credential env var")
         _send_and_wait_for_text(child, "\x1b[B\r", "API Key *")
         _send_and_wait_for_text(child, api_key_value + "\r", "Saved: Credential")
+        _send_and_wait_for_text(child, "\t", "▸ Save and configure models")
         _send_and_wait_for_text(
-            child, "\x1b[B\r", "Models for Local e2e provider", timeout=25
+            child, "\r", "Models for Local e2e provider", timeout=25
         )
         _send_and_wait_for_text(child, "\t", "▸ Retry discovery")
         _send_and_wait_for_text(child, "\x1b[B", "▸ Edit connection")
@@ -119,7 +119,7 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
         _send_and_wait_for_text(child, "\r", "Model ID *")
         child.send("onboarding-mock-model\r")
         wait_for_rendered_text(child, captured, "onboarding-mock-model", timeout=10)
-        _send_and_wait_for_text(child, "\t", "▸ Add model manually")
+        # Closing the model editor restores its action-row opener.
         _send_and_wait_for_text(child, "\x1b[B", "▸ Save and add another provider")
         _send_and_wait_for_text(child, "\x1b[B", "▸ Save and continue to presets")
         _send_and_wait_for_text(child, "\r", "Choose default presets", timeout=25)
@@ -151,11 +151,12 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
             _send_and_wait_for_text(child, "\x1b[B", "▸ low")
             _send_and_wait_for_text(child, "\x1b[B", "▸ medium")
             _send_and_wait_for_text(child, "\r", f"Edit {title} preset", timeout=10)
-            _send_and_wait_for_text(child, "\x1b[B", "▸ Apply model and thinking")
+            _send_and_wait_for_text(child, "\t", "▸ Apply model and thinking")
             _send_and_wait_for_text(child, "\r", "Choose default presets", timeout=10)
+        _send_and_wait_for_text(child, "\t", "▸ Save presets and continue")
         _send_and_wait_for_text(
             child,
-            "\x1b[B\r",
+            "\r",
             "Choose Exa, Brave or DuckDuckGo to set up web search",
             timeout=25,
         )
@@ -197,7 +198,7 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
         # Wait for the main TUI to finish starting up before typing, otherwise
         # the message keystrokes arrive while the app is still entering its
         # input screen and are lost.
-        wait_for_rendered_text(child, captured, "F1 Help", timeout=25)
+        wait_for_rendered_text(child, captured, "F1 Help · /help", timeout=25)
         child.send("Greet from onboarding")
         child.send("\r")
         wait_for_request_count_while_draining_child_output(

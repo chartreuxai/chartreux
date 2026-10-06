@@ -46,6 +46,11 @@ from chartreux.core.agent_loop_hooks import AgentLoopHooksMixin, PostToolFinaliz
 from chartreux.core.agents.launch import LaunchCandidate
 from chartreux.core.agents.manager import AgentManager
 from chartreux.core.autocompletion.path_prompt import build_path_prompt_payload
+from chartreux.core.background_jobs import (
+    BackgroundJobRegistry,
+    BackgroundJobsPort,
+    BashListArgs,
+)
 from chartreux.core.checkpoints import Checkpointer, CheckpointRecorder, FileStore
 from chartreux.core.compaction import (
     CompactionFailedError as CompactionFailedError,
@@ -432,7 +437,15 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         frozen_instructions: str | None = None,
         committed_model: CommittedModelIdentity | None = None,
         accounting_owner: RootAccountingOwner | None = None,
+        background_jobs: BackgroundJobsPort | None = None,
     ) -> None:
+        self._background_job_registry = None if is_subagent else BackgroundJobRegistry()
+        self.background_jobs = (
+            self._background_job_registry.root_port()
+            if self._background_job_registry is not None
+            else background_jobs
+        )
+        self._job_lifetime_generation = 0
         self.accounting_owner = accounting_owner
         self._detached_accounting_producers: set[asyncio.Task[None]] = set()
         self._inherited_restrictions = tuple(inherited_restrictions)
@@ -477,9 +490,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._session_generation: int = 0
         self._init_duration_pending: bool = defer_heavy_init
         self._last_init_duration_ms: int | None = None
-        # Background title results land here. An app-server drain surfaces them
-        # immediately (between turns); otherwise the next turn drains them.
+        # Title and managed-job state results land here. The app-server's one
+        # out-of-band drain surfaces them immediately, including between turns.
         self._out_of_band_events: asyncio.Queue[BaseEvent] = asyncio.Queue()
+        if self._background_job_registry is not None:
+            self._background_job_registry.event_sink = (
+                self._out_of_band_events.put_nowait
+            )
 
         self.session_id = session_id or generate_session_id()
         self._session_lease = session_lease
@@ -538,6 +555,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.skill_manager = SkillManager(
             lambda: self.config, harness_files=self.harness_files
         )
+        self._execution_authority_config = self._job_authority_config(self.config)
         self._max_turns = max_turns
         self._max_price = max_price
         self._max_tokens = max_tokens
@@ -685,6 +703,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             return True
         thread = self._deferred_init_thread
         return thread is not None and not thread.is_alive()
+
+    @property
+    def active_background_job_count(self) -> int:
+        """Live public count; retired runtimes do not advertise borrowed jobs."""
+        if self._closing or self.background_jobs is None:
+            return 0
+        return self.background_jobs.committed_active_count
 
     def _complete_init(self) -> None:
         """Run deferred heavy I/O: MCP discovery.
@@ -891,7 +916,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         await self._save_messages(allow_empty=True)
 
     async def refresh_config(self) -> None:
-        await self._config_orchestrator.reload()
+        async def preflight(config: ChartreuxConfigSchema) -> None:
+            self._guard_job_authority_config(config)
+
+        await self._config_orchestrator.reload(preflight=preflight)
+        self._execution_authority_config = self._job_authority_config(self.config)
         self.scrub_policy = secret_redaction.ScrubPolicy.from_config(self.config)
         secret_redaction.register_session_policy(self, self.scrub_policy)
         secret_redaction.reset_cache()
@@ -950,10 +979,68 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 "Owned agent cleanup failed: %s", self.session_id, exc_info=exc
             )
 
+    @staticmethod
+    def _job_authority_config(config: ChartreuxConfigSchema) -> dict[str, Any]:
+        data = config.model_dump(mode="python")
+        data["tools"] = {
+            # Custom Bash configs may add restriction-bearing fields. Preserve
+            # the whole canonical configuration rather than an incomplete allowlist.
+            name: settings
+            for name, settings in data.get("tools", {}).items()
+            if name in {"bash", "bash_start"}
+        }
+        data["credential_names"] = secret_redaction.ScrubPolicy.from_config(config)
+        return copy.deepcopy({
+            key: data.get(key)
+            for key in (
+                "enabled_tools",
+                "disabled_tools",
+                "tools",
+                "tool_paths",
+                "authorized_roots_by_project",
+                "credential_env_passthrough",
+                "credential_names",
+            )
+        })
+
+    def _guard_job_authority_config(self, config: ChartreuxConfigSchema) -> None:
+        if self._job_authority_config(config) != self._execution_authority_config:
+            self.require_background_jobs_idle()
+
+    async def retire_background_jobs(self) -> None:
+        """Settle the old root lifetime without stranding admission on resume failure."""
+        registry = self._background_job_registry
+        if registry is not None:
+            cleanup = asyncio.create_task(registry.aclose())
+            cancellation: asyncio.CancelledError | None = None
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError as exc:
+                    cancellation = exc
+            cleanup.result()
+            replacement = BackgroundJobRegistry(
+                generation=self._job_lifetime_generation + 1,
+                event_sink=self._out_of_band_events.put_nowait,
+            )
+            self._background_job_registry = replacement
+            self.background_jobs = replacement.root_port()
+            self._job_lifetime_generation += 1
+            if cancellation is not None:
+                raise cancellation
+
+    def require_background_jobs_idle(self) -> None:
+        if self.background_jobs is not None and self.background_jobs.active_count:
+            raise AgentLoopStateError(
+                "Stop live background jobs before changing execution authority"
+            )
+
     async def _aclose_owned(self) -> None:
         with self._deferred_init_lock:
             self._closing = True
             deferred_init_thread = self._deferred_init_thread
+        if self._background_job_registry is not None:
+            await self._background_job_registry.aclose()
         if deferred_init_thread is not None:
             await asyncio.to_thread(deferred_init_thread.join, 5.0)
             if deferred_init_thread.is_alive():
@@ -1079,6 +1166,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if parent_revision != expected_parent_authority_revision:
             raise AgentLoopStateError("Parent authority changed during reservation")
         orchestrator = candidate.orchestrator.copy()
+        self._guard_job_authority_config(orchestrator.config)
         reuse_backend = (
             self._injected_backend is not None
             or orchestrator.config.get_active_provider()
@@ -1213,6 +1301,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             or prepared.parent_authority_revision != parent_revision
         ):
             raise AgentLoopStateError("Stale launch reconfiguration")
+        self._guard_job_authority_config(prepared.orchestrator.config)
         backend_publish = self._backend_lifetime.publish_reversible(
             prepared.consumers.backend
         )
@@ -1304,6 +1393,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
     def finalize_launch_reconfiguration(
         self, prepared: _PreparedLaunchReconfiguration, backend_publish: BackendPublish
     ) -> None:
+        self._execution_authority_config = self._job_authority_config(self.config)
         backend_publish.finalize(whole_turn_active=True)
         if prepared.previous_tool_manager is not prepared.consumers.tool_manager:
             prepared.previous_tool_manager._retire_authority()
@@ -2091,8 +2181,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
     async def out_of_band_events(self) -> AsyncGenerator[BaseEvent, None]:
         """Stream events produced outside a turn.
 
-        The delivery layer drains this as the single consumer, so title and
-        background-work events stay ordered and surface once.
+        The delivery layer drains this as the single consumer, so title,
+        background-work and managed-job state events stay ordered and surface once.
         """
         while True:
             yield await self._out_of_band_events.get()
@@ -2806,6 +2896,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 session_id=self.session_id,
                 mcp_pool=self._mcp_pool,
                 tool_io=self._turn.tool_io,
+                background_jobs=self.background_jobs,
                 is_subagent=self._is_subagent,
                 register_wait_task=lambda task, key=(self._turn.turn_id, tool_call.call_id): (
                     self._register_wait_task(key, task)
@@ -3099,6 +3190,16 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
     def completion_metadata_since(self, mark: tuple[int, int]) -> dict[str, JsonValue]:
         """Return additive result metadata for completions after ``mark``."""
         providers_mark, switches_mark = mark
+        jobs = []
+        if self.background_jobs is not None:
+            with secret_redaction.bind_policy(self.scrub_policy):
+                with contextlib.suppress(ValueError):
+                    jobs = [
+                        job.model_dump(mode="json")
+                        for job in self.background_jobs.list(
+                            BashListArgs(include_finished=True)
+                        ).jobs
+                    ]
         return cast(
             dict[str, JsonValue],
             {
@@ -3107,6 +3208,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     for providers in self._completion_providers[providers_mark:]
                 ],
                 "switch_notices": self._failover_switches[switches_mark:],
+                **({"background_jobs": jobs} if jobs else {}),
             },
         )
 
@@ -3593,6 +3695,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.session_logger.invalidate_transcript_cursor()
 
     async def _reset_session(self, keep_parent: bool = True) -> None:
+        await self.retire_background_jobs()
         old_session_id = self.session_id
         suffix = extract_suffix(self.session_id)
         session_id = generate_session_id(suffix=suffix)
@@ -3685,6 +3788,22 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         the loop untouched. A bug in any commit step would leave the loop
         half-rebound; callers should treat an unexpected raise as fatal.
         """
+        self.require_background_jobs_idle()
+        replacement_jobs = (
+            BackgroundJobRegistry(
+                generation=self._job_lifetime_generation + 1,
+                event_sink=self._out_of_band_events.put_nowait,
+            )
+            if not self._is_subagent
+            else None
+        )
+        replacement_port = (
+            replacement_jobs.root_port()
+            if replacement_jobs is not None
+            else self.background_jobs.borrow()
+            if self.background_jobs is not None
+            else None
+        )
         # Prepare without mutating the live loop. Enabled root accounting must
         # have its replacement allocated by the runtime before this sync boundary.
         owner = accounting_owner or self.accounting_owner
@@ -3716,6 +3835,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             title_task.add_done_callback(self._detached_accounting_producers.discard)
 
         # Commit — assignments and in-place resets only, from here on infallible.
+        if self._background_job_registry is not None:
+            self._background_job_registry.retire()
+        self._background_job_registry = replacement_jobs
+        self.background_jobs = replacement_port
+        self._job_lifetime_generation += 1
         self.accounting_owner = owner
         self._session_generation += 1
         self.session_id = session_id
@@ -3838,6 +3962,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         target = cwd.expanduser().resolve()
         if target == self.cwd:
             return
+        self.require_background_jobs_idle()
         if not target.is_dir():
             raise AgentLoopStateError(f"Not a directory: {target}")
 
@@ -4126,6 +4251,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         inherited_workspace: Workspace | None = None,
     ) -> _PreparedPolicyReplacement:
         inherited_workspace = inherited_workspace or self._inherited_workspace
+        self._guard_job_policy(staged, inherited, inherited_workspace)
 
         # During preparation use the candidate, after synchronous publication use
         # live authority. Stale preparations are rejected, never installed.
@@ -4169,6 +4295,37 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             inherited_workspace,
         )
 
+    def _guard_job_policy(
+        self,
+        staged: ConfigOrchestrator[ChartreuxConfigSchema],
+        inherited: tuple[SourceRestrictions, ...],
+        workspace: Workspace | None,
+    ) -> None:
+        self._guard_job_authority_config(staged.config)
+
+        def shell_sources(sources: tuple[SourceRestrictions, ...]) -> list[object]:
+            return [
+                (
+                    source.identity,
+                    tuple(
+                        tool
+                        for tool in source.tools
+                        if tool.tool_name in {"bash", "bash_start"}
+                    ),
+                    source.authorized_roots,
+                )
+                for source in sources
+            ]
+
+        if (
+            shell_sources(
+                self.config_orchestrator.restrictions + self._inherited_restrictions
+            )
+            != shell_sources(staged.restrictions + inherited)
+            or workspace != self._inherited_workspace
+        ):
+            self.require_background_jobs_idle()
+
     def _validate_policy_replacement(
         self, prepared: _PreparedPolicyReplacement
     ) -> None:
@@ -4180,6 +4337,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         ):
             raise ValueError("Stale policy runtime preparation")
         self._require_policy_idle()
+        self._guard_job_policy(
+            prepared.orchestrator,
+            prepared.inherited_restrictions,
+            prepared.inherited_workspace,
+        )
         self.config_orchestrator._check_policy_commit(
             prepared.expected_token, prepared.orchestrator
         )
@@ -4192,6 +4354,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             prepared.orchestrator, expected_token=prepared.expected_token
         )
         self._inherited_restrictions = prepared.inherited_restrictions
+        self._execution_authority_config = self._job_authority_config(self.config)
         self._inherited_workspace = prepared.inherited_workspace
         if retire:
             prepared.previous_manager._retire_authority()
@@ -4205,6 +4368,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         *,
         mcp_registry: MCPRegistry | None = None,
     ) -> _PreparedReload:
+        self._guard_job_authority_config(target_config)
         # Preserve the retained deployment before constructing a replacement backend.
         # An unchanged selection expression is provenance, not a request to resolve a
         # different deployment for the same base model.
@@ -4312,6 +4476,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
     def _commit_reload(  # noqa: PLR0915
         self, prepared: _PreparedReload, reset_middleware: bool
     ) -> None:
+        self._guard_job_authority_config(prepared.config)
         # Resolve identity before publishing any candidate runtime state. A changed
         # selection is an explicit reconfiguration; an unchanged expression is only
         # provenance and must retain the already committed deployment.
@@ -4401,6 +4566,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.tool_manager = prepared.tool_manager
         self._authority_revision += 1
         self.scrub_policy = secret_redaction.ScrubPolicy.from_config(prepared.config)
+        self._execution_authority_config = self._job_authority_config(prepared.config)
         secret_redaction.register_session_policy(self, self.scrub_policy)
         if prepared.config.mcp_servers:
             self._mcp_pool = self._create_mcp_pool()

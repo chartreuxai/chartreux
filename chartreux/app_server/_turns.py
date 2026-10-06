@@ -80,6 +80,7 @@ from chartreux.app_server.protocol import (
 from chartreux.core.agent_loop import AgentLoop, AgentTurnOptions
 from chartreux.core.events import (
     AssistantEvent,
+    BackgroundJobsChangedEvent,
     BackgroundWorkEvent,
     BaseEvent,
     CompactEndEvent,
@@ -96,7 +97,9 @@ from chartreux.user_content import UserResource
 type Notify = Callable[[str, ProtocolModel], Awaitable[None]]
 type DeliverCallback = Callable[[PublicCallbackEntry], Awaitable[None]]
 type CoreEventSink = Callable[[BaseEvent], Awaitable[None]]
-type BackgroundWorkSink = Callable[[BackgroundWorkEvent], Awaitable[None]]
+type BackgroundWorkSink = Callable[
+    [BackgroundWorkEvent | BackgroundJobsChangedEvent], Awaitable[None]
+]
 type SnapshotState = Callable[[], PublicSessionState]
 
 # Retry hooks may cross a worker thread. Context keeps each notice tied to the
@@ -1256,7 +1259,9 @@ class TurnController:  # noqa: PLR0904
                     await self._clear_retrying()
                     if self._event_sink is not None:
                         await self._event_sink(event)
-                    if isinstance(event, BackgroundWorkEvent):
+                    if isinstance(
+                        event, (BackgroundWorkEvent, BackgroundJobsChangedEvent)
+                    ):
                         if self._background_work_sink is not None:
                             await self._background_work_sink(event)
                         continue

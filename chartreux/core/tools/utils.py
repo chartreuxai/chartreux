@@ -387,7 +387,7 @@ def resolve_file_tool_permission(  # noqa: PLR0911, PLR0913 - independent runtim
         )
 
     if (
-        tool_name == "bash"
+        tool_name in {"bash", "bash_start"}
         and is_canonical_scratch_path(file_path, scratchpad_dir)
         and workspace.ceiling is not None
         and not workspace.ceiling.allows(file_path)
@@ -407,7 +407,8 @@ def resolve_file_tool_permission(  # noqa: PLR0911, PLR0913 - independent runtim
     # Exact-file read capability, never an effect-kind or directory grant.
     # Canonical identities were pinned by the loader; do not re-resolve them.
     read_only = (
-        access == PathAccess.READ and tool_name in {"read_file", "grep", "bash"}
+        access == PathAccess.READ
+        and tool_name in {"read_file", "grep", "bash", "bash_start"}
         if access is not None
         else tool_name in {"read_file", "grep"}
     )

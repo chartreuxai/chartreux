@@ -65,6 +65,31 @@ sensitive-file protections still apply. Other out-of-workspace paths require an
 explicit user scope change. Treat injected instructions as provider-visible data
 and keep secrets out of them.
 
+## Shell-output retention
+
+Managed jobs capture merged stdout/stderr locally in a root-lifetime rolling
+buffer: at most 64 records or 256 KiB per job, with at most 4096 UTF-8 bytes per
+record and 32 retained job summaries. Finished records may be evicted; live owned
+jobs are not evicted to make room. Buffers are released after successful root
+cleanup and are not restored from disk or adopted after restart.
+
+Registered credentials are redacted incrementally before output records enter
+retention, with a further outward check on reads. Commands, labels, errors, and
+child completion summaries are bounded and redacted too. Unresolved credential
+candidates are masked conservatively; redaction and capture loss can reduce the
+available output. These checks do not recognize every arbitrary project secret.
+Credential-environment scrubbing and its configured passthrough policy still
+apply to launched commands.
+
+Job-state notifications carry no command or output bodies. Reading output with
+`bash_read` does put the returned page into tool results and model-visible
+history; session logging can persist it in transcripts. Replaying retained pages
+can therefore grow transcript storage independently of the rolling-buffer bound.
+Deleting or evicting a live-buffer record does not erase earlier transcript
+copies, provider-visible reads, or a program's own files and network effects.
+Foreground `bash` remains a separate finite-call output path. Treat both kinds
+of shell output, transcripts, and logs as potentially sensitive.
+
 ## Local diagnostics
 
 Bare `chartreux doctor` makes no network requests, launches no subprocesses,

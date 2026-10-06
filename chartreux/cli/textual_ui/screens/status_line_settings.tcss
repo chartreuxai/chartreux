@@ -25,23 +25,30 @@
     padding: 0;
     text-wrap: nowrap;
 }
+#status-line-settings-actions { height: 2; width: 100%; border: none; padding: 0; text-wrap: nowrap; }
+#status-line-settings-controls { height: 1; color: $text-muted; text-wrap: nowrap; }
 /* Use a block cursor, not reverse video over Textual's inverted cursor colors. */
+#status-line-settings-actions > .option-list--option-highlighted,
 #status-line-settings-options > .option-list--option-highlighted,
 #status-line-settings-confirmation-actions > .option-list--option-highlighted {
     color: $foreground;
     background: transparent;
     text-style: none;
 }
+#status-line-settings-actions:focus > .option-list--option-highlighted,
 #status-line-settings-options:focus > .option-list--option-highlighted,
 #status-line-settings-confirmation-actions:focus > .option-list--option-highlighted {
     color: $surface;
     background: $foreground;
     text-style: bold;
 }
+#status-line-settings-content.fullscreen #status-line-settings-actions:focus > .option-list--option-highlighted,
 #status-line-settings-content.fullscreen #status-line-settings-options:focus > .option-list--option-highlighted,
 #status-line-settings-content.fullscreen #status-line-settings-confirmation-actions:focus > .option-list--option-highlighted {
     color: $background;
 }
+#status-line-settings-actions:ansi:focus > .option-list--option-highlighted,
+#status-line-settings-content.fullscreen #status-line-settings-actions:ansi:focus > .option-list--option-highlighted,
 #status-line-settings-options:ansi:focus > .option-list--option-highlighted,
 #status-line-settings-confirmation-actions:ansi:focus > .option-list--option-highlighted,
 #status-line-settings-content.fullscreen #status-line-settings-options:ansi:focus > .option-list--option-highlighted,
@@ -49,6 +56,7 @@
     color: $ansi-background;
     background: $ansi-foreground;
 }
+#status-line-settings-actions > .option-list--option-hover,
 #status-line-settings-options > .option-list--option-hover { background: transparent; }
 #status-line-settings-details {
     height: 3;

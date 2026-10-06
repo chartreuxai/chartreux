@@ -128,7 +128,7 @@ async def _discard_confirmation(pilot: Pilot) -> None:
     await _inline_editor(pilot)
     await pilot.press("enter")
     await pilot.pause()
-    await _choose(pilot, "#wb-actions", "discard")
+    await _choose(pilot, "#wb-provider-operations", "discard")
 
 
 async def _onboarding_model_detail(pilot: Pilot) -> None:

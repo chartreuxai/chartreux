@@ -358,7 +358,20 @@ def test_started_turn_prevents_stale_enqueue_reconciliation() -> None:
     assert projection.state.turn_queue.items == []
 
 
-def test_live_snapshot_preserves_loaded_history_and_turn_prefixes() -> None:
+def test_background_job_count_defaults_zero_and_rejects_negative() -> None:
+    state = _projection().state
+    assert state.active_background_job_count == 0
+    with pytest.raises(ValidationError):
+        PublicSessionState.model_validate({
+            **state.model_dump(),
+            "active_background_job_count": -1,
+        })
+
+
+@pytest.mark.parametrize("include_pages", [True, False])
+def test_live_snapshot_preserves_loaded_history_and_turn_prefixes(
+    include_pages: bool,
+) -> None:
     history = [
         PublicMessageEntry(
             id=f"message-{index}",
@@ -399,9 +412,10 @@ def test_live_snapshot_preserves_loaded_history_and_turn_prefixes() -> None:
     snapshot = state.model_copy(
         update={
             "event_id": 1,
-            "history": history[-200:],
-            "history_before_cursor": history[-200].id,
-            "turns": turns[-200:],
+            "history": history[-200:] if include_pages else None,
+            "history_before_cursor": history[-200].id if include_pages else None,
+            "turns": turns[-200:] if include_pages else None,
+            "active_background_job_count": 2,
             "retrying": retrying,
         },
         deep=True,
@@ -426,6 +440,7 @@ def test_live_snapshot_preserves_loaded_history_and_turn_prefixes() -> None:
         turn.id for turn in turns
     ]
     assert projection.state.retrying == retrying
+    assert projection.state.active_background_job_count == 2
 
 
 def _read_call() -> ToolCallEvent:

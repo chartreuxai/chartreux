@@ -199,6 +199,30 @@ parent turn**. An idle parent learns of the cancellation on its next turn. The
 notification attributes the cancellation to the user; orchestrator cancellation
 and retask are attributed separately.
 
+## Managed shell jobs
+
+Managed shell jobs (`bash_start`, `bash_read`, `bash_stop`, `bash_list`) are
+processes, not background agent runs. `cancel_agent`, `wait_for_agent`, and the
+agent browser manage agent runs, not these jobs. A child can access only jobs
+created by its own runtime incarnation; guessing a root or sibling job ID grants
+no access. A resumed child does not inherit its previous incarnation's job access.
+The root can list, read, and stop all jobs, including those created by children.
+
+All children share the root's eight job allocations; there is no separate
+per-child capacity pool. Completion metadata carries bounded, redacted job
+summaries and handles for foreground and background child runs. Committed jobs
+survive child completion, cancellation, eviction, and release. Recover them from
+the root with `bash_list`, then use `bash_read` or `bash_stop` as needed, even if
+the child runtime or its stored result is no longer available.
+
+While jobs or pending launches retain execution authority, authority-reducing
+shell policy/filter, workspace/scratchpad, credential-environment, and relevant
+retained-child reconfiguration changes are rejected before publication. Jobs
+whose creator was evicted still count. Finished retained records do not impose
+this restriction; unrelated display/model/status-line edits remain available.
+Stop active jobs before reducing authority. The root's lifetime, not the child's
+retention policy, controls job cleanup; see [Tools and safety](tools-safety.md#managed-shell-jobs).
+
 ## Active-work admission cap
 
 By default, at most 16 subagent runs can be active under a root session. The cap

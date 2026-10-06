@@ -95,11 +95,20 @@ The same settings can be written in `config.toml`:
 
 ```toml
 [status_line]
-segments = ["directory", "git-branch", "context"]
+segments = ["directory", "git-branch", "context", "background-jobs"]
 directory_style = "name"
 context_style = "tokens-percent"
 separator = "pipe"
 ```
+
+Enable **Background jobs** (`background-jobs`) for `Jobs N`, including `Jobs 0`
+when none are active. This optional count covers managed shell jobs in the current
+root session and all its children, including jobs that survive child completion;
+it does not count background agent runs or finished retained job records. It
+refreshes from live session state between turns. The default row still contains
+only directory, PID, and context. At narrow widths, PID yields first, then
+optional segments from the end, so place Jobs earlier if it should outlast other
+optional details.
 
 Context displays as, for example, `135k/400k (34%)`; the denominator is the
 effective automatic-compaction threshold, not the model's maximum context window.

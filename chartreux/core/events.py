@@ -143,6 +143,15 @@ class SessionTitleUpdatedEvent(BaseEvent):
     session_id: str
 
 
+class BackgroundJobsChangedEvent(BaseEvent):
+    """State-only notification fenced by managed-job lifetime, not transcript."""
+
+    root_lifetime_id: str
+    generation: int = Field(ge=0)
+    revision: int = Field(ge=0)
+    active_count: int = Field(ge=0)
+
+
 class BackgroundWorkEvent(BaseEvent):
     work_id: str
     kind: Literal["session_title"]

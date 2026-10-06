@@ -92,6 +92,7 @@ def build_public_state(
         turns=(turns[-(turns_limit or history_limit) :] if include_turns else None),
         active_callbacks=open_callbacks,
         retrying=retrying,
+        active_background_job_count=agent_loop.active_background_job_count,
     )
 
 
@@ -136,6 +137,7 @@ def build_stored_public_state(
             else None
         ),
         active_callbacks=[],
+        active_background_job_count=0,
     )
 
 

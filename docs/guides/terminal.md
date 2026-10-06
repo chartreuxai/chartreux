@@ -83,6 +83,20 @@ window shows zero totals without a status message. The browser becomes full-scre
 below 84 columns or 28 rows. Opening it while a turn runs does not make a model
 call, interrupt work, or change queued input.
 
+## Managed-job status
+
+In Settings > Status line, enable **Background jobs** to show `Jobs N`, including
+`Jobs 0` when none are active. The count covers the root and all its children,
+including jobs surviving child completion. It is opt-in and may disappear at
+narrow widths. There is no Jobs screen or new slash command: ask the agent to use
+`bash_list`, `bash_read`, or `bash_stop`. The `!` shortcut remains a foreground
+manual shell command, not a managed launch.
+
+Interrupting a turn does not stop an already committed managed job; normal turns
+and compaction also preserve it. Ending or replacing the root session cleans up
+its jobs. See [Tools and safety](tools-safety.md#managed-shell-jobs) for cursor
+reads, readiness checks, and cleanup limits.
+
 ## Input and queueing
 
 A prompt submitted while a turn is running normally joins the queued follow-up

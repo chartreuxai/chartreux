@@ -417,8 +417,13 @@ class ToolManager:
         if id(self) in seen:
             return False
         seen.add(id(self))
+        policy_names = (name, "bash") if name == "bash_start" else (name,)
         with self._lock:
-            variants = tuple(self._tool_variants_by_name.get(name, ()))
+            variants = tuple(
+                cls
+                for policy_name in policy_names
+                for cls in self._tool_variants_by_name.get(policy_name, ())
+            )
         if any(
             getattr(cls.is_available, "__func__", None)
             is not BaseTool.is_available.__func__
@@ -469,6 +474,8 @@ class ToolManager:
         return selected
 
     def _parent_allows_tool(self, tool_name: str) -> bool:
+        if tool_name == "bash_start" and self._available_tool("bash") is None:
+            return False
         parent = self._parent_authority()
         return (
             parent is None
@@ -480,6 +487,11 @@ class ToolManager:
         """Capture local policy with live chain-walked runtime capabilities."""
         if self._authority_retired:
             raise NoSuchToolError("Tool manager authority retired")
+        if tool_name == "bash_start":
+            # Availability is still name-specific; execution paths use bash policy.
+            if self._available_tool(tool_name) is None:
+                raise NoSuchToolError(f"Unknown or disabled tool: {tool_name}")
+            tool_name = "bash"
         config = self.get_tool_config(tool_name)
         tool_class = self._available_tool(tool_name)
         if tool_class is None:
@@ -548,6 +560,45 @@ class ToolManager:
         if self._effective_authority_token() != token:
             return None, None
         return token, replace(states[0], parents=tuple(states[1:]))
+
+    def _shell_execution_permission(self, args: Any, local: Any = None) -> Any:
+        # Launch arguments are not foreground arguments. Custom resolvers
+        # must receive the canonical schema, under the same request ceilings.
+        from chartreux.core.tools.builtins.bash import Bash, BashArgs
+        from chartreux.core.tools.builtins.bash_start import BashStart
+        from chartreux.core.tools.permissions import PermissionContext
+        from chartreux.core.tools.utils import (
+            instruction_read_ceiling,
+            scratchpad_ceiling,
+        )
+
+        try:
+            canonical = self.get("bash")
+            if type(canonical) is Bash and type(self.get("bash_start")) is BashStart:
+                # The builtin adapter already analyzed canonical Bash config and
+                # the complete path-authority chain under these request ceilings.
+                context = local
+            else:
+                with (
+                    instruction_read_ceiling(self.instruction_read_files),
+                    scratchpad_ceiling(self.scratchpad_roots),
+                ):
+                    context = canonical.resolve_permission(
+                        BashArgs(command=args.command)
+                    )
+            if self.get_tool_config("bash").permission == ToolPermission.NEVER:
+                return PermissionContext(
+                    permission=ToolPermission.NEVER,
+                    reason="Shell execution is disabled by canonical bash policy",
+                )
+            if context is not None and context.permission == ToolPermission.NEVER:
+                return context
+            return self._parent_permission("bash_start", args)
+        except Exception:
+            return PermissionContext(
+                permission=ToolPermission.NEVER,
+                reason="Canonical shell authority is unavailable",
+            )
 
     def _parent_permission(self, tool_name: str, args: Any) -> Any:
         """Return a parent invocation denial, including tool-specific guards."""
@@ -982,6 +1033,9 @@ class ToolManager:
     def get_tool_config(  # noqa: PLR0912 - restriction sources and cache guards
         self, tool_name: str
     ) -> BaseToolConfig:
+        # Managed launches have exactly one permission source: [tools.bash].
+        if tool_name == "bash_start":
+            return self.get_tool_config("bash")
         if self._authority_retired:
             raise NoSuchToolError("Tool manager authority retired")
         token = self._effective_authority_token()
@@ -1125,7 +1179,12 @@ class ToolManager:
         instance.inherited_plan_write_scopes = self._inherited_plan_write_scopes
         instance._bind_authority(
             lambda: self._tool_authority_is_current(tool_name, tool_class),
-            lambda args: self._parent_permission(tool_name, args),
+            None
+            if tool_name == "bash_start"
+            else lambda args: self._parent_permission(tool_name, args),
+            local_permission_guard=self._shell_execution_permission
+            if tool_name == "bash_start"
+            else None,
         )
         if tool_name == "grep":
             # Optional per-invocation snapshot hook for the builtin grep tool.

@@ -149,7 +149,8 @@ def _provider_captures() -> list[Capture]:
     async def to_models(pilot: Pilot) -> None:
         screen = pilot.app._capture_screen  # type: ignore[attr-defined]
         await pilot.press("enter")  # provider browser -> actions
-        actions = screen.query_one("#wb-actions")
+        await pilot.press("tab")
+        actions = screen.query_one("#wb-provider-operations")
         actions.highlighted = next(
             i for i, option in enumerate(actions.options) if option.id == "models"
         )
@@ -164,7 +165,8 @@ def _provider_captures() -> list[Capture]:
     async def to_detail(pilot: Pilot) -> None:
         screen = pilot.app._capture_screen  # type: ignore[attr-defined]
         await pilot.press("enter")
-        actions = screen.query_one("#wb-actions")
+        await pilot.press("tab")
+        actions = screen.query_one("#wb-provider-operations")
         actions.highlighted = next(
             i for i, option in enumerate(actions.options) if option.id == "models"
         )

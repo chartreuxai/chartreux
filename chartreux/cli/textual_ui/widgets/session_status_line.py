@@ -42,6 +42,7 @@ class SessionStatusState:
     )
     home_directory: Path | None = field(default_factory=Path.home)
     ascii_chrome: bool = False
+    active_background_job_count: int = 0
     # Global recorded usage across all projects, supplied by the caller.
     usage_day: UsageWindowSummary | None = None
     usage_week: UsageWindowSummary | None = None
@@ -97,6 +98,8 @@ def _format_segment(  # noqa: PLR0911 -- one renderer per configured segment
             if state.branch_status == "branch" and state.branch:
                 return _single_line(state.branch)
             return "Git —"
+        case "background-jobs":
+            return f"Jobs {state.active_background_job_count}"
         case "spend-today":
             return f"Today {format_usage_cost(state.usage_day)}"
         case "spend-week":

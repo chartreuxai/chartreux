@@ -205,6 +205,18 @@ def _normalize_log_level(value: Any) -> Any:
 class ChartreuxConfigSchema(ConfigSchema):
     @model_validator(mode="before")
     @classmethod
+    def _reject_separate_launch_permission(cls, value: Any) -> Any:
+        if isinstance(value, dict) and isinstance(tools := value.get("tools"), dict):
+            launch = tools.get("bash_start")
+            if isinstance(launch, dict) and launch:
+                raise ValueError(
+                    "[tools.bash_start] keys are not supported; "
+                    "configure shell execution permission and restrictions in [tools.bash]."
+                )
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
     def _reject_removed_bypass_tool_permissions(cls, value: Any) -> Any:
         if isinstance(value, dict) and "bypass_tool_permissions" in value:
             raise ValueError(
@@ -561,7 +573,7 @@ class ChartreuxConfigSchema(ConfigSchema):
         persist the returned payload; the in-memory config is kept current so
         repeated calls merge from fresh state.
         """
-        if tool_name == "bash":
+        if tool_name in {"bash", "bash_start"}:
             raise ValueError(
                 "[tools.bash].allowlist was removed in v0.1; remove this key. "
                 "The shell resolver's hard guards are the policy."
@@ -599,5 +611,7 @@ def create_default_config() -> dict[str, Any]:
     )
     if tool_defaults := ToolManager.discover_tool_defaults():
         tool_defaults.get("bash", {}).pop("allowlist", None)
+        # Launch permission is configured only through the canonical bash policy.
+        tool_defaults.pop("bash_start", None)
         config_dict["tools"] = tool_defaults
     return config_dict

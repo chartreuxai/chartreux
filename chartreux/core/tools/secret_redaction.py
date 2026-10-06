@@ -430,6 +430,188 @@ def _b64_variants(text: str) -> set[str]:
     return variants
 
 
+class IncrementalRedactor:
+    """Bounded, fail-closed stream redaction for managed job capture.
+
+    A safe boundary is outside the carrier alphabet and every admitted/live
+    direct-secret variant. A whitespace-terminated short non-hex word also ends
+    a candidate group: the batch grammar admits at most one short trailing word
+    after long wrap lines, while od rows contain only hex words. Direct-secret
+    prefixes spanning that whitespace must still be retained. Overflow and scan
+    exhaustion emit one mask, then discard continuation ONLY while remaining in
+    masking mode until a safe boundary. Timeout is not a boundary.
+    Pending state is at most 8192 characters (32768 UTF-8 bytes).
+    """
+
+    def __init__(self, policy: ScrubPolicy) -> None:
+        self.policy = policy
+        self._pending = ""
+        self._masking = False
+        self._finished = False
+
+    @property
+    def pending_chars(self) -> int:
+        return len(self._pending)
+
+    @property
+    def masking(self) -> bool:
+        return self._masking
+
+    def feed(self, text: str, *, final: bool = False, abnormal: bool = False) -> str:
+        if self._finished:
+            raise RuntimeError("Redactor already finished")
+        policy = ScrubPolicy.for_redaction((self.policy,), current_policy())
+        with bind_policy(policy):
+            values = known_secret_values()
+            direct_chars = frozenset("".join(values))
+            minimum = min(
+                _MIN_ENCODED_RUN, min(map(len, values), default=_MIN_ENCODED_RUN)
+            )
+            output: list[str] = []
+            for character in text:
+                carrier = (
+                    character.isascii()
+                    and (character.isalnum() or character in "+/_=-%.~")
+                ) or character.isspace()
+                boundary = not carrier and character not in direct_chars
+                if (
+                    not self._masking
+                    and character.isspace()
+                    and _ends_candidate_group(self._pending)
+                    and not _direct_prefix_suffix(self._pending + character, values)
+                    and not (
+                        values and _encoded_prefix_suffix(self._pending + character)
+                    )
+                ):
+                    # Include the short final wrap word in the batch scan, but
+                    # do not retain unrelated prose until process teardown.
+                    self._pending += character
+                    character = ""
+                    boundary = True
+                if self._masking:
+                    if boundary:
+                        self._masking = False
+                        output.append(character)
+                    continue
+                if boundary and len(self._pending) < minimum:
+                    output.append(self._pending + character)
+                    self._pending = ""
+                    continue
+                if boundary:
+                    candidates = _encoded_candidates(self._pending)
+                    output.append(
+                        REDACTED_PLACEHOLDER
+                        if len(candidates) >= _MAX_ENCODED_CANDIDATES
+                        else _replace_values(
+                            _redact_encoded_runs(self._pending), values
+                        )
+                        if values
+                        else self._pending
+                    )
+                    output.append(character)
+                    self._pending = ""
+                else:
+                    self._pending += character
+                    if len(self._pending) >= _MAX_ENCODED_CANDIDATE_CHARS:
+                        output.append(REDACTED_PLACEHOLDER)
+                        self._pending = ""
+                        self._masking = True
+            if final:
+                if self._pending:
+                    # Normal EOF closes benign prose, but unresolved literal
+                    # prefixes, encoded carriers and exhausted scans fail closed.
+                    unresolved = (
+                        len(_encoded_candidates(self._pending))
+                        >= _MAX_ENCODED_CANDIDATES
+                        or bool(values)
+                        and (
+                            _direct_prefix_suffix(self._pending, values, minimum=4)
+                            or _encoded_prefix_suffix(self._pending)
+                        )
+                    )
+                    output.append(
+                        REDACTED_PLACEHOLDER
+                        if abnormal or unresolved
+                        else redact(self._pending)
+                    )
+                self._pending = ""
+                self._masking = False
+                self._finished = True
+            return "".join(output)
+
+
+def _ends_candidate_group(text: str) -> bool:
+    """A closed short non-hex word cannot anchor another wrapped/od row."""
+    words = text.rsplit(maxsplit=1)
+    word = words[-1] if words else ""
+    return (
+        bool(word)
+        and not text[-1].isspace()
+        and len(word) < _MIN_ENCODED_RUN
+        and _ENCODED_WORD.fullmatch(word) is not None
+        and any(character not in "0123456789abcdefABCDEF" for character in word)
+    )
+
+
+def _direct_prefix_suffix(
+    text: str, values: frozenset[str], *, minimum: int = 1
+) -> bool:
+    """Whether a literal variant can continue across a proposed boundary."""
+    for value in values:
+        start = text.rfind(value[0])
+        while start >= 0 and len(text) - start < len(value):
+            if len(text) - start >= minimum and value.startswith(text[start:]):
+                return True
+            start = text.rfind(value[0], 0, start)
+    return False
+
+
+def _encoded_prefix_suffix(text: str) -> bool:
+    """At EOF mask known encoded prefixes, not merely decodable prose.
+
+    Four decoded characters are enough to identify a nontrivial secret fragment.
+    Normalizing whitespace also covers incomplete od rows and wrapped carriers.
+    """
+    policy = current_policy()
+    raw = (
+        frozenset(value for _, value in _loaded_credentials())
+        | frozenset(value for _, value in policy.redaction_credentials)
+        | _oauth_secret_values()
+        | policy.redaction_oauth_values
+    )
+    variants: set[str] = set()
+    for secret in raw:
+        for value in (secret, secret[::-1]):
+            data = value.encode("utf-8")
+            variants.update((
+                data.hex(),
+                data.hex().upper(),
+                base64.b64encode(data).decode(),
+                base64.urlsafe_b64encode(data).decode(),
+                base64.b32encode(data).decode(),
+                base64.b32encode(data).decode().lower(),
+                "".join(f"%{byte:02x}" for byte in data),
+                "".join(f"%{byte:02X}" for byte in data),
+            ))
+    compact = "".join(text.split())
+    if _direct_prefix_suffix(compact, frozenset(variants), minimum=8):
+        return True
+    bodies = [body for _, _, body in _encoded_candidates(text)]
+    # The batch grammar requires complete 8-byte od rows; EOF can end sooner.
+    bodies.extend(
+        "".join(match.group().split())
+        for match in re.finditer(r"(?:[0-9a-fA-F]{2}\s+){3,}[0-9a-fA-F]{2}", text)
+    )
+    return any(
+        _direct_prefix_suffix(payload.rstrip(), raw, minimum=4)
+        or _direct_prefix_suffix(
+            payload.rstrip(), frozenset(s[::-1] for s in raw), minimum=4
+        )
+        for body in bodies
+        for payload in _decode_candidate(body)
+    )
+
+
 def redact(text: str) -> str:
     """Replace every known secret value in *text* with a placeholder.
 
@@ -898,7 +1080,7 @@ def sanitize_recorded_tool_call(call: Any) -> Any:
 
     def arguments(payload: Any, tool_name: str) -> Any:
         cleaned = redact_json_value(payload)
-        if tool_name == "bash" and known_secret_values():
+        if tool_name in {"bash", "bash_start"} and known_secret_values():
             if isinstance(cleaned, dict) and isinstance(cleaned.get("command"), str):
                 command = redact_shell_source(cleaned["command"])
                 if command is None:
@@ -937,7 +1119,9 @@ def sanitize_recorded_tool_call(call: Any) -> Any:
 
     tool_name = call.function.name if hasattr(call, "function") else call.tool_name
     updates: dict[str, Any] = {
-        "presentation": safe_model(call.presentation, shell_source=tool_name == "bash")
+        "presentation": safe_model(
+            call.presentation, shell_source=tool_name in {"bash", "bash_start"}
+        )
     }
     if hasattr(call, "function"):
         original = call.function.arguments

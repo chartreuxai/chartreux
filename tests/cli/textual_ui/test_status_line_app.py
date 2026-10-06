@@ -18,8 +18,69 @@ from chartreux.app_server.protocol import (
 )
 from chartreux.cli.textual_ui.widgets.messages import AssistantMessage, UserMessage
 from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLine
+from chartreux.core.background_jobs import BashStartArgs, BashStopArgs
 from tests.cli.textual_ui.test_history_grouping import _message
-from tests.conftest import build_test_chartreux_app
+from tests.conftest import build_test_agent_loop, build_test_chartreux_app
+
+
+@pytest.mark.asyncio
+async def test_live_background_jobs_root_children_reset_and_resize() -> None:
+    root = build_test_agent_loop()
+    assert root.background_jobs is not None
+    child = build_test_agent_loop(
+        is_subagent=True,
+        inherited_workspace=root.tool_manager.workspace,
+        background_jobs=root.background_jobs.borrow(),
+    )
+    root.config.status_line.segments = [
+        "directory",
+        "pid",
+        "context",
+        "background-jobs",
+    ]
+    app = build_test_chartreux_app(agent_loop=root)
+    try:
+        async with app.run_test(size=(100, 32)) as pilot:
+            await app._session_ready.wait()
+            status = app.query_one(SessionStatusLine)
+
+            async def observe(count: int) -> None:
+                async with asyncio.timeout(5):
+                    while (
+                        status.state.active_background_job_count != count
+                        or "background-jobs" not in status.config.segments
+                    ):
+                        await pilot.pause(0.01)
+                assert app.app_server.state.active_background_job_count == count
+                assert f"Jobs {count}" in status.render().plain
+
+            await observe(0)
+            first = await root.background_jobs.start(BashStartArgs(command="sleep 60"))
+            await observe(1)
+            assert child.background_jobs is not None
+            second = await child.background_jobs.start(
+                BashStartArgs(command="sleep 60")
+            )
+            await child.aclose()
+            await observe(2)
+            await pilot.resize_terminal(20, 24)
+            await pilot.pause()
+            assert "Jobs" not in status.render().plain
+            assert "pid" not in status.render().plain
+            await pilot.resize_terminal(100, 32)
+            await pilot.pause()
+            await observe(2)
+            await root.background_jobs.stop(BashStopArgs(job_id=first.job.job_id))
+            await observe(1)
+            await root.background_jobs.stop(BashStopArgs(job_id=second.job.job_id))
+            await observe(0)
+            await root.background_jobs.start(BashStartArgs(command="sleep 60"))
+            await observe(1)
+            await app.app_server.clear_history()
+            await observe(0)
+    finally:
+        await child.aclose()
+        await root.aclose()
 
 
 @pytest.mark.asyncio

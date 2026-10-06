@@ -12,6 +12,7 @@ from chartreux.core.errors import (
 )
 from chartreux.core.events import (
     AssistantEvent,
+    BackgroundJobsChangedEvent,
     BackgroundWorkEvent,
     BaseEvent,
     BaseTool,

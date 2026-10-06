@@ -45,6 +45,25 @@ def test_status_line_defaults_and_partial_config() -> None:
     assert ChartreuxConfigSchema().status_line.separator == "pipe"
 
 
+@pytest.mark.asyncio
+async def test_background_jobs_config_round_trip(tmp_path: Path) -> None:
+    segments = ["background-jobs", "context", "directory"]
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[status_line]\nsegments = ["background-jobs", "context", "directory"]\n'
+    )
+    builder = ConfigBuilder(ChartreuxConfigSchema)
+    builder.add_layers([UserConfigLayer(path=path, name="user")])
+    config = await builder.build()
+    assert config.status_line.segments == segments
+    assert (
+        StatusLineConfig.model_validate_json(
+            config.status_line.model_dump_json()
+        ).segments
+        == segments
+    )
+
+
 @pytest.mark.parametrize(
     "segments",
     [
@@ -86,6 +105,7 @@ def test_all_segments_selectable_and_recorded_global_spend_described() -> None:
         "spend-today",
         "spend-week",
         "spend-month",
+        "background-jobs",
     ]
     assert StatusLineConfig.model_validate({"segments": segments}).segments == segments
     item = EDITABLE_BY_PATH["status_line.segments"]

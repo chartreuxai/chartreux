@@ -10,7 +10,7 @@ from textual.pilot import Pilot
 from textual.widgets import Input, OptionList
 
 from chartreux.core.model_catalog.loader import load_catalog
-from chartreux.ui.providers.workbench import ProviderWorkbenchScreen
+from chartreux.ui.providers.workbench import ProviderWorkbenchScreen, WorkbenchView
 from tests.snapshots.base_snapshot_test_app import BaseSnapshotTestApp
 from tests.snapshots.snap_compare import SnapCompare
 from tests.ui.providers.test_workbench import setup
@@ -28,6 +28,9 @@ def test_models_catalog_view(snap_compare: SnapCompare) -> None:
         screen._open_catalog()
         screen._select_catalog("model:a")
         await pilot.pause()
+        assert screen.view == WorkbenchView.DETAIL
+        assert screen.query_one("#wb-detail-fields").has_focus
+        assert screen.query_one("#wb-detail-actions").display
 
     assert snap_compare(
         "test_ui_snapshot_provider_workbench.py:ProviderWorkbenchSnapshotApp",
@@ -44,6 +47,9 @@ def test_default_presets(snap_compare: SnapCompare) -> None:
         screen.state.set_role_preset("other", "a", "low")
         screen._open_presets()
         await pilot.pause()
+        assert screen.view == WorkbenchView.PRESETS
+        assert screen.query_one("#wb-presets").has_focus
+        assert screen.query_one("#wb-presets-actions").display
 
     assert snap_compare(
         "test_ui_snapshot_provider_workbench.py:ProviderWorkbenchSnapshotApp",
@@ -60,9 +66,26 @@ class ProviderWorkbenchSnapshotApp(BaseSnapshotTestApp):
 
 
 def test_provider_browser(snap_compare: SnapCompare) -> None:
+    async def before(pilot: Pilot) -> None:
+        screen = cast(ProviderWorkbenchScreen, pilot.app.screen)
+        assert screen.view == WorkbenchView.PROVIDERS
+        assert screen.query_one("#wb-providers").has_focus
+        assert screen.query_one("#wb-root-actions").display
+        provider_ids = {
+            option.id
+            for option in screen.query_one("#wb-providers", OptionList).options
+            if not option.disabled
+        }
+        action_ids = {
+            option.id
+            for option in screen.query_one("#wb-root-actions", OptionList).options
+        }
+        assert provider_ids.isdisjoint(action_ids)
+
     assert snap_compare(
         "test_ui_snapshot_provider_workbench.py:ProviderWorkbenchSnapshotApp",
         terminal_size=(80, 24),
+        run_before=before,
     )
 
 
@@ -87,6 +110,9 @@ def test_model_detail_editor(snap_compare: SnapCompare) -> None:
         screen._select_action("models")
         screen._open_detail("a")
         await pilot.pause()
+        assert screen.view == WorkbenchView.DETAIL
+        assert screen.query_one("#wb-detail-fields").has_focus
+        assert screen.query_one("#wb-detail-actions").display
 
     assert snap_compare(
         "test_ui_snapshot_provider_workbench.py:ProviderWorkbenchSnapshotApp",
@@ -106,6 +132,12 @@ def test_add_connection_stage(snap_compare: SnapCompare) -> None:
         )
         await pilot.press("enter")
         await pilot.pause()
+        assert screen.view == WorkbenchView.CONNECTION
+        assert screen.query_one("#wb-actions").has_focus
+        assert screen.query_one("#wb-connection-actions").display
+        assert "continue" not in {
+            option.id for option in screen.query_one("#wb-actions", OptionList).options
+        }
 
     assert snap_compare(
         "test_ui_snapshot_provider_workbench.py:ProviderWorkbenchSnapshotApp",
@@ -153,6 +185,68 @@ def test_invalid_credential_field(snap_compare: SnapCompare) -> None:
         screen._select_action("key")
         await pilot.press("enter")
         await pilot.pause()
+
+    assert snap_compare(
+        "test_ui_snapshot_provider_workbench.py:ProviderWorkbenchSnapshotApp",
+        terminal_size=(80, 24),
+        run_before=before,
+    )
+
+
+def test_dirty_catalog_actions(snap_compare: SnapCompare) -> None:
+    async def before(pilot: Pilot) -> None:
+        await pilot.press("enter")
+        screen = cast(ProviderWorkbenchScreen, pilot.app.screen)
+        assert screen.state
+        screen.state.set_role_preset("other", "a", "low")
+        screen._open_catalog()
+        await pilot.pause()
+        assert screen.query_one("#wb-catalog").has_focus
+        await pilot.press("tab")
+        assert screen.view == WorkbenchView.CATALOG
+        assert screen.state.dirty
+        actions = screen.query_one("#wb-catalog-actions", OptionList)
+        assert actions.display and actions.has_focus
+        assert {option.id for option in actions.options} == {"\0apply", "\0discard"}
+
+    assert snap_compare(
+        "test_ui_snapshot_provider_workbench.py:ProviderWorkbenchSnapshotApp",
+        terminal_size=(80, 24),
+        run_before=before,
+    )
+
+
+def test_provider_operation_focus(snap_compare: SnapCompare) -> None:
+    async def before(pilot: Pilot) -> None:
+        await pilot.press("enter", "tab")
+        screen = cast(ProviderWorkbenchScreen, pilot.app.screen)
+        assert screen.view == WorkbenchView.ACTIONS
+        assert screen.query_one("#wb-actions").display
+        assert screen.query_one("#wb-provider-operations").has_focus
+
+    assert snap_compare(
+        "test_ui_snapshot_provider_workbench.py:ProviderWorkbenchSnapshotApp",
+        terminal_size=(80, 24),
+        run_before=before,
+    )
+
+
+def test_preset_editor_actions(snap_compare: SnapCompare) -> None:
+    async def before(pilot: Pilot) -> None:
+        await pilot.press("enter")
+        screen = cast(ProviderWorkbenchScreen, pilot.app.screen)
+        screen._open_presets()
+        screen._select_preset_action("preset:orchestrator")
+        await pilot.pause()
+        await pilot.press("tab")
+        assert screen.view == WorkbenchView.PRESET_EDITOR
+        actions = screen.query_one("#wb-preset-editor-actions", OptionList)
+        assert actions.display and actions.has_focus
+        assert {option.id for option in actions.options} == {"apply", "cancel"}
+        assert {
+            option.id
+            for option in screen.query_one("#wb-preset-editor", OptionList).options
+        } == {"model", "thinking"}
 
     assert snap_compare(
         "test_ui_snapshot_provider_workbench.py:ProviderWorkbenchSnapshotApp",

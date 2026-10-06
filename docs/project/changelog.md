@@ -2,6 +2,48 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.4.3 (2026-10-05)
+
+### Added
+
+- Root-owned managed shell jobs through `bash_start`, `bash_read`, `bash_stop`,
+  and `bash_list`, with bounded/redacted merged output, replayable sequence
+  cursors, gap reporting, shared root/child capacity, and creator-scoped child
+  access. Jobs survive turns and child completion, use canonical Bash launch
+  policy, and stop through TERM, a grace period, then KILL. Root-session retirement
+  cleans up jobs without cross-restart adoption; relocation and authority guards
+  prevent retargeting live jobs or signaling unowned processes.
+- An opt-in **Background jobs** status-line segment showing `Jobs N` (including
+  `Jobs 0`), backed by projected active-job state and between-turn updates without
+  output-body publication.
+
+### Changed
+
+- Settings separates catalog, entries, choices, membership, and actions into
+  composite-browser groups; the status-line editor separates configuration and
+  actions. Both use bounded arrows, priority Tab/Shift+Tab cycling, identity
+  bookmarks with nearest-surviving-neighbor repair, and a single-owner Escape
+  chain that restores the opener. Pointer actions follow the same guards and
+  outcomes as keyboard actions.
+- Enter no longer saves a Settings collection: saving requires explicit Apply.
+  Failed Apply and reset preserve drafts; boolean rows retain immediate saving.
+- The Providers workbench separates root actions, provider operations, connection
+  actions, conditional catalog actions, visible detail actions, and preset and
+  preset-editor actions. Groups use bounded navigation, remembered focus, and
+  equivalent pointer actions. Back handles busy state before confirmation, then
+  help; confirmation overlays support keyboard scrolling. The Settings and
+  Providers navigation deferral in `DESIGN.md` section 10 is closed.
+
+### Fixed
+
+- Provider discovery is bound to its requester, with per-request feedback tokens
+  preventing stale results from updating another view. Connection actions no
+  longer include a duplicate Continue row, and the inactive save-key affordance
+  is removed.
+- Incremental job-output redaction preserves benign text at normal end-of-output
+  and releases completed short words without waiting for process exit, while
+  still masking split secrets and unresolved encoded prefixes.
+
 ## 0.4.2
 
 ### Added

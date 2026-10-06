@@ -4,7 +4,7 @@ Chartreux exposes file, search, shell, delegation, web, image, and session-manag
 
 ## Built-in tools
 
-The built-ins are `ask_user_question`, `bash`, `cancel_agent`, `check_agents`, `edit`, `get_agent_result`, `grep`, `read_file`, `read_image`, `release_agent`, `skill`, `task`, `todo`, `wait_for_agent`, `web_fetch`, `web_search`, and `write_file`. MCP servers can add tools; their names use `<server>_<tool>`.
+The built-ins are `ask_user_question`, `bash`, `bash_start`, `bash_read`, `bash_stop`, `bash_list`, `cancel_agent`, `check_agents`, `edit`, `get_agent_result`, `grep`, `read_file`, `read_image`, `release_agent`, `skill`, `task`, `todo`, `wait_for_agent`, `web_fetch`, `web_search`, and `write_file`. MCP servers can add tools; their names use `<server>_<tool>`.
 
 `web_search` supports `auto`, `mistral`, `exa`, `brave`, and `duckduckgo`. The runtime default remains `auto`, which selects Mistral only; it does not fall back to another provider. Configure the provider, optional credential environment-variable name, base URL, timeout, result limit, and Mistral search model in `[tools.web_search]`. An unset or blank `base_url` uses the selected provider's default endpoint; the blank value saved by the editor is not treated as a URL override. For a keyed provider, Chartreux selects exactly one credential-variable name: `api_key_env_var` when configured, otherwise the provider default (`EXA_API_KEY` or `BRAVE_SEARCH_API_KEY`); `auto` and `mistral` otherwise use the configured Mistral provider's credential variable or `MISTRAL_API_KEY`. If that selected variable is unavailable, web search reports the missing key. DuckDuckGo needs no key.
 
@@ -81,6 +81,83 @@ Trust can apply to the current folder, the repository root when offered, or the 
 ## Shell safety
 
 `bash` runs a finite command in a fresh POSIX shell. Standard input is closed, a timeout is enforced, and stdout and stderr are returned separately. Shell state, process handles, continued stdin, polling, and cursor-based output do not persist between calls. Configure its `permission`, `max_output_bytes`, `default_timeout`, `denylist`, `denylist_standalone`, and `sensitive_patterns` under `[tools.bash]`; runtime path and sensitive-file protections still apply.
+
+## Managed shell jobs
+
+Use managed jobs for a server, watcher, or other command that must continue across
+turns. Run the target in the foreground inside the managed command; do not add
+`&`, `nohup`, or other detachment syntax. Standard input is closed, there is no
+PTY or continued stdin, and stdout and stderr are merged into one captured stream.
+Launch-time working-directory, environment, and capacity overrides are not accepted.
+
+| Tool | Arguments | Result |
+| --- | --- | --- |
+| `bash_start` | Nonempty `command` (at most 64 KiB UTF-8); optional nullable, single-line `label` (at most 64 characters). | `job` summary and `next_cursor = 0`. Launch acknowledgment is not readiness. |
+| `bash_read` | `job_id`; `cursor = 0`; `max_bytes = 4096` (4096–64000); `wait_seconds = 0` (0–30). | `job`, `records` (`sequence`, `text`), `first_cursor`, `next_cursor`, `end_cursor`, and `lost_records`. |
+| `bash_stop` | `job_id`. | Final `job` summary and `already_finished`. |
+| `bash_list` | `include_finished = false`. | Visible `jobs` summaries, without output bodies. |
+
+Summaries contain an opaque `job_id`, bounded/redacted `command` and `label`,
+`state`, nullable `exit_code` and `error`, and `output_complete` and
+`output_incomplete`. States are `starting`, `running`, `stopping`, `exited`,
+`failed`, and `stopped`. A nonzero command exit is still `exited`; `failed`
+indicates infrastructure or capture failure. `output_complete` means no more
+records will arrive; `output_incomplete` indicates capture loss or abandonment.
+Both flags may be true. Neither flag reports cursor eviction.
+
+Cursors are record sequences starting at zero, not byte offsets. Forward each
+read's `next_cursor` to the next read. Independent readers can replay retained
+records without consuming another reader's position. A cursor below
+`first_cursor` reports the exact gap in `lost_records` and resumes at the first
+retained record; a cursor beyond `end_cursor` is rejected. `max_bytes` bounds
+returned, redacted output-body UTF-8 bytes, not the result envelope. Empty reads
+at the end can wait for output or completion; a timeout does not stop the job.
+Use modest budgets and waits (for example, 5–15 seconds), not busy polling or
+repeated reads of unchanged windows. A bounded read wait is an ordinary tool
+call, not a steerable subagent wait.
+
+One root session and all its children share eight allocations, including pending
+launches and jobs whose cleanup has not settled. The registry retains at most 32
+job records, evicting finished records only. Each job retains at most 64 immutable
+output records or 256 KiB, whichever binds first; each record is at most 4096
+UTF-8 bytes. This is a rolling buffer, not an output archive. Returned pages can
+also be persisted in the transcript, so repeated reads grow history independently
+of these bounds. After compaction, recover handles with `bash_list`.
+
+A bounded workflow (also useful for checking the tool contract) is:
+
+```text
+bash_start(command="printf 'ready\\n'; sleep 30", label="workflow check")
+bash_read(job_id="<returned-job-id>", cursor=0, max_bytes=4096, wait_seconds=5)
+# Continue normal work; use the read result's next_cursor below.
+bash_read(job_id="<returned-job-id>", cursor=<next_cursor>, max_bytes=4096, wait_seconds=0)
+bash_stop(job_id="<returned-job-id>")
+bash_list(include_finished=true)
+```
+
+For a server, start a foreground target such as `python -m http.server 8000`
+instead. Inspect its output and use a separate foreground check to establish
+readiness before relying on it; a launch acknowledgment or a printed marker is
+not itself proof that a service is ready. Stop the job when it is no longer
+needed. Stop requests terminate the owned process group, allowing about two
+seconds for SIGTERM before SIGKILL; stopping does not undo file or remote effects.
+A late stop preserves natural completion.
+
+`bash_start` uses the canonical `[tools.bash]` permission, denylist, sensitive-path,
+workspace, and inherited-parent restrictions. There is no separate
+`[tools.bash_start]` permission key and no interactive launch approval. Ordinary
+tool filtering still controls availability; read, stop, and list have their own
+ordinary tool permissions and ownership checks. Disabling launch does not itself
+disable recovery tools. Live jobs or pending launches restrict execution-authority
+changes and worktree relocation; unrelated display settings remain editable.
+
+Managed jobs survive normal turns, interruption after launch commit, compaction,
+and their creator child's completion. They end with the root runtime; see
+[session lifetime](sessions-workspaces.md#managed-job-lifetime) and
+[child access](subagents.md#managed-shell-jobs). This is neither a sandbox nor a
+daemon manager: arbitrary program effects are not contained, escaped descendants
+may survive, and crashes or forced process termination cannot guarantee cleanup.
+Jobs are not adopted after a restart.
 
 ## Shell authority and diagnostics
 

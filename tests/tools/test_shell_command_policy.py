@@ -1014,66 +1014,77 @@ def bash_tool(tmp_path, monkeypatch) -> Bash:
     return Bash(config_getter=lambda: config, state=BaseToolState())
 
 
-def test_with_args_denylist_denies_matching_prefix(bash_tool) -> None:
-    assert bash_tool._find_denylist_match("bash -i") == "bash -i"
-    assert bash_tool._find_denylist_match("bash -i -x") == "bash -i"
+@pytest.fixture
+def shell_resolver(bash_tool: Bash):
+    from chartreux.core.tools.builtins._shell_permission_resolver import (
+        ShellPermissionResolver,
+    )
+
+    return ShellPermissionResolver(
+        bash_tool.config, bash_tool.cwd, bash_tool.workspace, bash_tool.path_authority
+    )
 
 
-def test_with_args_denylist_normalizes_executable_basename(bash_tool) -> None:
-    assert bash_tool._find_denylist_match("/usr/bin/bash -i") == "bash -i"
+def test_with_args_denylist_denies_matching_prefix(shell_resolver) -> None:
+    assert shell_resolver._find_denylist_match("bash -i") == "bash -i"
+    assert shell_resolver._find_denylist_match("bash -i -x") == "bash -i"
 
 
-def test_with_args_denylist_denies_combined_short_options(bash_tool) -> None:
+def test_with_args_denylist_normalizes_executable_basename(shell_resolver) -> None:
+    assert shell_resolver._find_denylist_match("/usr/bin/bash -i") == "bash -i"
+
+
+def test_with_args_denylist_denies_combined_short_options(shell_resolver) -> None:
     # "bash -ic x" is the interactive shell the "bash -i" pattern blocks.
-    assert bash_tool._find_denylist_match("bash -ic x") == "bash -i"
+    assert shell_resolver._find_denylist_match("bash -ic x") == "bash -i"
 
 
-def test_with_args_denylist_allows_benign_combined_flags(bash_tool) -> None:
-    assert bash_tool._find_denylist_match("ls -la") is None
-    assert bash_tool._find_denylist_match("grep -in pattern file") is None
+def test_with_args_denylist_allows_benign_combined_flags(shell_resolver) -> None:
+    assert shell_resolver._find_denylist_match("ls -la") is None
+    assert shell_resolver._find_denylist_match("grep -in pattern file") is None
 
 
-def test_with_args_denylist_does_not_deny_bare_command(bash_tool) -> None:
+def test_with_args_denylist_does_not_deny_bare_command(shell_resolver) -> None:
     # "bash -i" is a prefix pattern: bare "bash" does not carry the -i argument.
-    assert bash_tool._find_denylist_match("bash") is None
+    assert shell_resolver._find_denylist_match("bash") is None
 
 
-def test_standalone_denylist_denies_bare_command(bash_tool) -> None:
-    assert bash_tool._is_standalone_denylisted("python")
+def test_standalone_denylist_denies_bare_command(shell_resolver) -> None:
+    assert shell_resolver._is_standalone_denylisted("python")
 
 
-def test_standalone_denylist_normalizes_executable_basename(bash_tool) -> None:
-    assert bash_tool._is_standalone_denylisted("/usr/bin/python")
+def test_standalone_denylist_normalizes_executable_basename(shell_resolver) -> None:
+    assert shell_resolver._is_standalone_denylisted("/usr/bin/python")
 
 
-def test_standalone_denylist_allows_command_with_arguments(bash_tool) -> None:
-    assert not bash_tool._is_standalone_denylisted("python script.py")
+def test_standalone_denylist_allows_command_with_arguments(shell_resolver) -> None:
+    assert not shell_resolver._is_standalone_denylisted("python script.py")
 
 
-def test_standalone_denylist_matches_exact_names_only(bash_tool) -> None:
+def test_standalone_denylist_matches_exact_names_only(shell_resolver) -> None:
     # Standalone entries are exact names, not prefixes: python3 is a different binary.
-    assert not bash_tool._is_standalone_denylisted("python3")
+    assert not shell_resolver._is_standalone_denylisted("python3")
 
 
-def test_guardrail_denies_with_args_denylist_match(bash_tool) -> None:
-    context = bash_tool._resolve_guardrail_permission(["/usr/bin/bash -i"])
+def test_guardrail_denies_with_args_denylist_match(shell_resolver) -> None:
+    context = shell_resolver._resolve_guardrail_permission(["/usr/bin/bash -i"])
 
     assert context is not None
     assert context.permission is ToolPermission.NEVER
     assert "matches denylist pattern" in context.reason
 
 
-def test_guardrail_denies_standalone_denylist_match(bash_tool) -> None:
-    context = bash_tool._resolve_guardrail_permission(["python"])
+def test_guardrail_denies_standalone_denylist_match(shell_resolver) -> None:
+    context = shell_resolver._resolve_guardrail_permission(["python"])
 
     assert context is not None
     assert context.permission is ToolPermission.NEVER
     assert "not allowed as a standalone command" in context.reason
 
 
-def test_guardrail_allows_non_denylisted_commands(bash_tool) -> None:
-    assert bash_tool._resolve_guardrail_permission(["echo hi"]) is None
-    assert bash_tool._resolve_guardrail_permission(["python script.py"]) is None
+def test_guardrail_allows_non_denylisted_commands(shell_resolver) -> None:
+    assert shell_resolver._resolve_guardrail_permission(["echo hi"]) is None
+    assert shell_resolver._resolve_guardrail_permission(["python script.py"]) is None
 
 
 def test_rm_plain_file_needs_no_approval() -> None:

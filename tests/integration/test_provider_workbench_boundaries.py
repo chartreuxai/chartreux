@@ -153,11 +153,11 @@ async def wait_for(pilot, predicate, *, tries: int = 100) -> None:  # type: igno
 async def add_provider(pilot, screen: ProviderWorkbenchScreen, name: str) -> None:  # type: ignore[no-untyped-def]
     if screen.view == WorkbenchView.PRESETS:
         await select_option(
-            pilot, screen.query_one("#wb-presets", WorkbenchList), "add-another"
+            pilot, screen.query_one("#wb-presets-actions", WorkbenchList), "add-another"
         )
     if screen.view == WorkbenchView.PROVIDERS:
         await select_option(
-            pilot, screen.query_one("#wb-providers", OptionList), "\x00add"
+            pilot, screen.query_one("#wb-root-actions", OptionList), "\x00add"
         )
     if screen.view == WorkbenchView.CHOOSE:
         await select_option(
@@ -189,6 +189,12 @@ async def add_provider(pilot, screen: ProviderWorkbenchScreen, name: str) -> Non
 async def select_option(
     pilot, widget: WorkbenchList | OptionList, option_id: str
 ) -> None:  # type: ignore[no-untyped-def]
+    for _ in range(5):
+        if widget.has_focus:
+            break
+        await pilot.press("tab")
+    assert widget.has_focus
+    await pilot.press("home")
     for _ in range(widget.option_count + 1):
         if widget.highlighted_option and widget.highlighted_option.id == option_id:
             await pilot.press("enter")
@@ -207,8 +213,12 @@ async def set_orchestrator_preset(
     await select_option(pilot, screen.query_one("#wb-picker", WorkbenchList), model)
     await select_option(pilot, editor, "thinking")
     await select_option(pilot, screen.query_one("#wb-picker", WorkbenchList), thinking)
-    await select_option(pilot, editor, "apply")
-    await select_option(pilot, presets, "finish")
+    await select_option(
+        pilot, screen.query_one("#wb-preset-editor-actions", WorkbenchList), "apply"
+    )
+    await select_option(
+        pilot, screen.query_one("#wb-presets-actions", WorkbenchList), "finish"
+    )
     await wait_for(pilot, lambda: not screen._busy)
 
 

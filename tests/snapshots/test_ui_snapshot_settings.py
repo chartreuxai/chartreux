@@ -11,7 +11,12 @@ from chartreux.app_server.protocol import (
     SettingLeafWire,
 )
 from chartreux.cli.textual_ui.screens.settings import SettingsScreen
+from chartreux.cli.textual_ui.screens.status_line_settings import (
+    StatusLineOptionList,
+    StatusLineSettingsScreen,
+)
 from chartreux.ui.settings_service import SettingsService
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from tests.cli.textual_ui.test_settings_app import FakeService
 from tests.snapshots.base_snapshot_test_app import BaseSnapshotTestApp
 from tests.snapshots.snap_compare import SnapCompare
@@ -44,10 +49,20 @@ def test_settings_browser(snap_compare: SnapCompare) -> None:
 
 
 def test_settings_list_draft(snap_compare: SnapCompare) -> None:
+    async def before(pilot: Pilot) -> None:
+        from tests.cli.textual_ui.test_settings_app import focus_action
+
+        await pilot.press(*"agent_paths", "enter")
+        screen = cast(SettingsScreen, pilot.app.screen)
+        focus_action(screen, "add-item")
+        await pilot.press("enter", *"my-agent", "enter")
+        assert screen._list_draft and screen._list_draft[0].value == "my-agent"
+        await pilot.pause()
+
     assert snap_compare(
         "test_ui_snapshot_settings.py:SettingsSnapshotApp",
         terminal_size=(80, 24),
-        press=[*"agent_paths", "enter", "enter", *"my-agent", "enter"],
+        run_before=before,
     )
 
 
@@ -214,6 +229,32 @@ def test_settings_provenance(snap_compare: SnapCompare) -> None:
     assert snap_compare(
         "test_ui_snapshot_settings.py:SettingsSnapshotApp",
         terminal_size=(80, 24),
+        run_before=before,
+    )
+
+
+def test_status_line_editor_background_jobs(snap_compare: SnapCompare) -> None:
+    async def before(pilot: Pilot) -> None:
+        await pilot.press(*"status_line", "enter")
+        screen = cast(StatusLineSettingsScreen, pilot.app.screen)
+        options = screen.query_one(StatusLineOptionList)
+        options.highlighted = options.get_option_index("background-jobs")
+        await pilot.press("space", *(["alt+up"] * 6))
+        await pilot.pause()
+        assert screen._selected() == "background-jobs" and options.has_focus
+        assert screen.draft.segments == [
+            "directory",
+            "pid",
+            "background-jobs",
+            "context",
+        ]
+        assert "Jobs 2" in str(
+            screen.query_one("#status-line-settings-preview", NoMarkupStatic).content
+        )
+
+    assert snap_compare(
+        "test_ui_snapshot_settings.py:SettingsSnapshotApp",
+        terminal_size=(100, 32),
         run_before=before,
     )
 

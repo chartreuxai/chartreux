@@ -431,7 +431,7 @@ async def test_reload_while_tool_runs_retains_admitted_redaction_names(
             error=f"{value} {live_value}",
         )
 
-    async def reload() -> None:
+    async def reload(**_kwargs: object) -> None:
         return None
 
     monkeypatch.setattr(agent_loop, "_process_one_tool_call", tool)
@@ -481,7 +481,7 @@ async def test_reload_while_tool_runs_retains_admitted_redaction_values(
             tool_name="bash", tool_class=None, tool_call_id="call-0", error=value
         )
 
-    async def reload() -> None:
+    async def reload(**_kwargs: object) -> None:
         return None
 
     monkeypatch.setattr(agent_loop, "_process_one_tool_call", tool)

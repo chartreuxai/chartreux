@@ -396,6 +396,54 @@ async def test_local_question_waits_for_settings_draft_to_close(
 
 
 @pytest.mark.asyncio
+async def test_providers_defers_incoming_decision_preserving_draft_and_bookmark() -> (
+    None
+):
+    from copy import deepcopy
+
+    from textual.widgets import Input, OptionList
+
+    from chartreux.ui.providers.workbench import ProviderWorkbenchScreen
+
+    app = build_test_chartreux_app()
+    callback = _question_callback("callback-providers")
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app._session_ready.wait()
+        assert await app._handle_command("/providers")
+        await _wait_until(
+            pilot, lambda: isinstance(app.screen, ProviderWorkbenchScreen)
+        )
+        screen = app.screen
+        assert isinstance(screen, ProviderWorkbenchScreen)
+        await pilot.press("enter")
+        assert screen.state is not None
+        screen._select_action("base")
+        screen.query_one("#wb-input", Input).value = "https://pending-draft.test/v1"
+        await pilot.press("enter")
+        fields = screen.query_one("#wb-actions", OptionList)
+        fields.highlighted = fields.get_option_index("env")
+        await pilot.pause()
+        frame = screen._frame()
+        payload = deepcopy(screen.state.changes())
+        await app._handle_turn_event(CallbackRequested(callback))
+        await pilot.pause()
+        assert app.screen is screen
+        assert screen.state.changes() == payload
+        assert screen._frame() == frame
+        assert fields.has_focus
+        assert screen.query_one("#wb-pending-action").display
+        assert app._active_callback is None
+        assert not app.query(QuestionApp)
+        # Discard only after verifying the host did not disturb the draft.
+        screen._confirm = "discard"
+        screen._update_help()
+        screen.action_confirm_yes()
+        await pilot.press("escape", "escape")
+        await _wait_until(pilot, lambda: app._active_callback is callback)
+        assert app.query(QuestionApp)
+
+
+@pytest.mark.asyncio
 async def test_settings_defers_incoming_decision_without_replacing_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

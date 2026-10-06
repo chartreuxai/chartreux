@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Coroutine
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from functools import partial
 from math import isfinite
 import re
 from typing import ClassVar, Literal, cast
@@ -22,6 +24,7 @@ from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.content import Content
 from textual.screen import ModalScreen
 from textual.strip import Strip
+from textual.widget import Widget
 from textual.widgets import Input, Label, OptionList, SelectionList
 from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
@@ -82,6 +85,24 @@ class DetailHelp(NoMarkupStatic):
             self.screen.call_after_refresh(self.screen._update_help)
 
     can_focus = True
+
+    def focus_on_click(self) -> bool:
+        return False
+
+    def _on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        if isinstance(self.screen, ProviderWorkbenchScreen) and self.screen._confirm:
+            event.stop()
+            event.prevent_default()
+            return
+        super()._on_mouse_scroll_down(event)
+
+    def _on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        if isinstance(self.screen, ProviderWorkbenchScreen) and self.screen._confirm:
+            event.stop()
+            event.prevent_default()
+            return
+        super()._on_mouse_scroll_up(event)
+
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("down", "scroll_down", "Scroll down", show=False),
         Binding("up", "scroll_up", "Scroll up", show=False),
@@ -111,6 +132,18 @@ class WorkbenchView(StrEnum):
     CONFIRM = "confirm"
 
 
+@dataclass(frozen=True)
+class _GroupPosition:
+    view: WorkbenchView
+    group: str
+    context: tuple[str, ...]
+    identities: tuple[str, ...]
+    ordinal: int
+    scroll_x: float
+    scroll_y: float
+    cursor_position: int | None = None
+
+
 @dataclass
 class NavigationFrame:
     """State needed to return to the exact opener after a nested view."""
@@ -124,6 +157,8 @@ class NavigationFrame:
     detail_cursor: str | None = None
     stage: str | None = None
     provider_id: str | None = None
+    context: tuple[str, ...] = ()
+    position: _GroupPosition | None = None
 
 
 def _bounded_cursor(widget: OptionList, direction: int) -> None:
@@ -145,7 +180,8 @@ class WorkbenchList(NavigableOptionList):
     def focus(self, scroll_visible: bool = True) -> WorkbenchList:
         super().focus(scroll_visible=scroll_visible)
         if isinstance(self.screen, ProviderWorkbenchScreen):
-            self.screen._help_focus_id = self.id
+            if self.id != "wb-confirm-actions":
+                self.screen._help_focus_id = self.id
             self.screen._update_help()
         return self
 
@@ -154,30 +190,106 @@ class WorkbenchList(NavigableOptionList):
         Binding("enter", "select", "Select", priority=True, show=False),
     ]
 
+    def focus_on_click(self) -> bool:
+        if isinstance(self.screen, ProviderWorkbenchScreen):
+            return self.screen._pointer_focus(self.id)
+        return True
+
+    def _on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        if (
+            isinstance(self.screen, ProviderWorkbenchScreen)
+            and self.screen._confirm
+            and self.id != "wb-confirm-actions"
+        ):
+            event.stop()
+            event.prevent_default()
+            return
+        super()._on_mouse_scroll_down(event)
+
+    def _on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        if (
+            isinstance(self.screen, ProviderWorkbenchScreen)
+            and self.screen._confirm
+            and self.id != "wb-confirm-actions"
+        ):
+            event.stop()
+            event.prevent_default()
+            return
+        super()._on_mouse_scroll_up(event)
+
     async def _on_click(self, event: events.Click) -> None:
         # A double click on a provider can land its second click on a control
         # exposed by the first click. The first click already activates the row;
         # later clicks in that gesture must not activate the destination view.
-        if event.chain > 1:
+        if event.chain > 1 or (
+            isinstance(self.screen, ProviderWorkbenchScreen)
+            and (
+                self.screen._consume_help_click(self.id)
+                or not self.screen._can_activate(self.id)
+            )
+        ):
+            event.stop()
+            event.prevent_default()
+            return
+        if self.id == "wb-protocol" and isinstance(
+            self.screen, ProviderWorkbenchScreen
+        ):
+            index = event.style.meta.get("option")
+            if index is not None:
+                option = self.get_option_at_index(index)
+                if not option.disabled and option.id:
+                    self.highlighted = index
+                    self.screen._select_protocol(str(option.id))
             event.stop()
             event.prevent_default()
             return
         await super()._on_click(event)
+        event.stop()
+        event.prevent_default()
+
+    def action_select(self) -> None:
+        if isinstance(self.screen, ProviderWorkbenchScreen):
+            if not self.screen._can_activate(self.id):
+                return
+            if self.id == "wb-protocol":
+                self.screen._accept_protocol()
+                return
+        super().action_select()
 
     def action_cursor_down(self) -> None:
-        if self.id in {"wb-models-actions", "wb-catalog-filter", "wb-catalog"}:
-            _bounded_cursor(self, 1)
-        else:
-            super().action_cursor_down()
+        _bounded_cursor(self, 1)
 
     def action_cursor_up(self) -> None:
-        if self.id in {"wb-models-actions", "wb-catalog-filter", "wb-catalog"}:
+        _bounded_cursor(self, -1)
+
+    def action_page_down(self) -> None:
+        if self.id == "wb-confirm-actions":
+            self.screen.query_one("#wb-confirm", VerticalScroll).scroll_page_down(
+                animate=False
+            )
+            return
+        for _ in range(max(1, self.scrollable_content_region.height)):
+            _bounded_cursor(self, 1)
+
+    def action_page_up(self) -> None:
+        if self.id == "wb-confirm-actions":
+            self.screen.query_one("#wb-confirm", VerticalScroll).scroll_page_up(
+                animate=False
+            )
+            return
+        for _ in range(max(1, self.scrollable_content_region.height)):
             _bounded_cursor(self, -1)
-        else:
-            super().action_cursor_up()
 
     def on_key(self, event: events.Key) -> None:
         screen = self.screen
+        if (
+            event.key == "space"
+            and isinstance(screen, ProviderWorkbenchScreen)
+            and not screen._can_activate(self.id)
+        ):
+            event.stop()
+            event.prevent_default()
+            return
         if (
             event.key == "space"
             and self.id == "wb-detail-fields"
@@ -189,32 +301,20 @@ class WorkbenchList(NavigableOptionList):
             event.stop()
             event.prevent_default()
             return
-        if event.key == "enter" and isinstance(screen, ProviderWorkbenchScreen):
-            option = self.highlighted_option
-            if self.id == "wb-detail-actions" and option and option.id == "save-detail":
-                screen._save_detail()
-                event.stop()
-                event.prevent_default()
-                return
-            if self.id == "wb-models-actions" and option and option.id == "create":
-                if screen.state:
-                    screen._create(screen.state)
-                event.stop()
-                event.prevent_default()
-                return
         if (
             self.id == "wb-protocol"
             and event.key == "space"
             and isinstance(screen, ProviderWorkbenchScreen)
         ):
             if self.highlighted_option and self.highlighted_option.id:
-                screen._protocol_value = str(self.highlighted_option.id)
-                screen._refresh_protocol()
+                screen._select_protocol(str(self.highlighted_option.id))
             event.stop()
             event.prevent_default()
 
     def on_focus(self, event: events.Focus) -> None:
         if isinstance(self.screen, ProviderWorkbenchScreen):
+            if self.id != "wb-confirm-actions":
+                self.screen._help_focus_id = self.id
             self.screen.call_after_refresh(self.screen._update_help)
 
     def render_line(self, y: int) -> Strip:
@@ -262,6 +362,48 @@ class BrowserList(WorkbenchList):
 class ModelChecklist(Checklist):
     """Space toggles a deployment; Enter opens its metadata editor."""
 
+    def focus_on_click(self) -> bool:
+        if isinstance(self.screen, ProviderWorkbenchScreen):
+            return self.screen._pointer_focus(self.id)
+        return True
+
+    def _on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        if isinstance(self.screen, ProviderWorkbenchScreen) and self.screen._confirm:
+            event.stop()
+            event.prevent_default()
+            return
+        super()._on_mouse_scroll_down(event)
+
+    def _on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        if isinstance(self.screen, ProviderWorkbenchScreen) and self.screen._confirm:
+            event.stop()
+            event.prevent_default()
+            return
+        super()._on_mouse_scroll_up(event)
+
+    def _toggle_user_selection(self, value: str) -> None:
+        screen = self.screen
+        if not isinstance(screen, ProviderWorkbenchScreen) or not screen._can_activate(
+            self.id
+        ):
+            return
+        self.toggle(value)
+        # Accept the user intent in this turn, before a queued Help/Back key can
+        # change ownership. Queued programmatic SelectedChanged stays guarded.
+        screen.on_selection_list_selected_changed(SelectionList.SelectedChanged(self))
+
+    def action_select(self) -> None:
+        if isinstance(
+            self.screen, ProviderWorkbenchScreen
+        ) and not self.screen._can_activate(self.id):
+            return
+        if self.id != "wb-models":
+            super().action_select()
+        elif self.highlighted is not None:
+            option = self.get_option_at_index(self.highlighted)
+            if not option.disabled and not option.value.startswith("\x00"):
+                self._toggle_user_selection(option.value)
+
     def on_focus(self, event: events.Focus) -> None:
         if isinstance(self.screen, ProviderWorkbenchScreen):
             self.screen.call_after_refresh(self.screen._update_help)
@@ -301,7 +443,8 @@ class ModelChecklist(Checklist):
         event.prevent_default()
         if (
             not isinstance(self.screen, ProviderWorkbenchScreen)
-            or self.screen._busy
+            or self.screen._consume_help_click(self.id)
+            or not self.screen._can_activate(self.id)
             or event.chain > 1
         ):
             return
@@ -321,7 +464,7 @@ class ModelChecklist(Checklist):
         if details_index is not None:
             self.action_detail()
         else:
-            self.toggle(option.value)
+            self._toggle_user_selection(option.value)
 
     def action_cursor_down(self) -> None:
         if self.id == "wb-models":
@@ -334,6 +477,14 @@ class ModelChecklist(Checklist):
             _bounded_cursor(self, -1)
         else:
             super().action_cursor_up()
+
+    def action_page_down(self) -> None:
+        for _ in range(max(1, self.scrollable_content_region.height)):
+            _bounded_cursor(self, 1)
+
+    def action_page_up(self) -> None:
+        for _ in range(max(1, self.scrollable_content_region.height)):
+            _bounded_cursor(self, -1)
 
     def on_key(self, event: events.Key) -> None:
         if event.key == "space" and self.highlighted is not None and self.option_count:
@@ -348,7 +499,8 @@ class ModelChecklist(Checklist):
         return
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        *SelectionList.BINDINGS,
+        # Process user inclusion intent before a following priority Help/Back key.
+        Binding("space", "select", "Toggle option", priority=True, show=False),
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
         Binding("enter", "detail", "Details", priority=True, show=False),
@@ -356,7 +508,9 @@ class ModelChecklist(Checklist):
 
     def action_detail(self) -> None:
         screen = self.screen
-        if isinstance(screen, ProviderWorkbenchScreen) and not screen._busy:
+        if isinstance(screen, ProviderWorkbenchScreen) and screen._can_activate(
+            self.id
+        ):
             if self.id == "wb-image-support":
                 return
             if (
@@ -367,27 +521,7 @@ class ModelChecklist(Checklist):
                 return
             if self.highlighted is not None:
                 value = self.get_option_at_index(self.highlighted).value
-                if (
-                    value in {"\x00add-another", "\x00continue-presets"}
-                    and screen._stage == "models"
-                    and screen.state
-                ):
-                    screen._advance_models(value.removeprefix("\x00"))
-                elif (
-                    value.startswith("\x00")
-                    and screen._stage == "models"
-                    and screen.state
-                ):
-                    action = value.removeprefix("\x00")
-                    if action == "retry-discovery":
-                        screen.run_worker(
-                            screen._discover(screen.state),
-                            group="workbench-discovery",
-                            exclusive=True,
-                        )
-                    else:
-                        screen._select_add_action(action, screen.state)
-                else:
+                if not value.startswith("\x00"):
                     screen._open_detail(value)
 
 
@@ -406,6 +540,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
     #wb-actions, #wb-choose, #wb-picker, #wb-catalog, #wb-presets, #wb-preset-editor, #wb-detail-fields,
     #wb-protocol { height: 1fr; min-height: 2; border: none; }
     #wb-models { height: 1fr; min-height: 2; border: none; }
+    #wb-root-actions { height: auto; max-height: 8; min-height: 2; border: none; }
+    #wb-actions.wb-management-fields { height: 4; min-height: 4; }
+    #wb-provider-operations { height: 1fr; min-height: 2; border: none; }
     #wb-models-actions { height: 5; min-height: 5; border: none; }
     #wb-help { height: 2; overflow-y: auto; color: $text-muted; }
     #wb-confirm-host {
@@ -421,7 +558,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
     #wb-confirm-actions { height: auto; max-height: 3; border: none; }
     #wb-confirm-help { height: 1; color: $text-muted; }
     .wb-confirm-underlay { opacity: 40%; }
-    #wb-providers, #wb-actions, #wb-choose, #wb-picker, #wb-catalog,
+    .wb-group, #wb-providers, #wb-actions, #wb-choose, #wb-picker, #wb-catalog,
     #wb-presets, #wb-preset-editor, #wb-detail-fields, #wb-protocol, #wb-confirm-actions, #wb-models, #wb-models-actions,
     #wb-connection-actions, #wb-detail-actions, #wb-image-support {
         background: $background; padding: 0; border: none;
@@ -437,7 +574,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
     #wb-editor Label { height: 1; }
     #wb-editor Input { height: 3; border: solid $foreground-muted; }
     #wb-editor Input:focus { border: solid $primary; }
-    #wb-editor .field-error { height: 1; color: $error; }
+    #wb-field-error { height: 1; }
+    #wb-field-error.has-error { color: $error; }
     #wb-editor Input.-invalid { border: solid $error; }
     #wb-connection-form { height: 1fr; overflow-y: auto; }
     #wb-connection-form .connection-row { height: 1; width: 100%; }
@@ -452,6 +590,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
     #wb-connection-actions { height: auto; min-height: 2; border: none; }
     #wb-detail { height: 1fr; overflow-y: auto; }
     #wb-detail-actions { height: auto; min-height: 2; border: none; }
+    #wb-catalog-actions, #wb-presets-actions, #wb-preset-editor-actions {
+        height: auto; min-height: 2; border: none;
+    }
     #wb-detail .price-row { height: 1; width: 100%; }
     #wb-detail .price-row Label {
         width: 22;
@@ -490,6 +631,37 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             "shift+tab", "cycle_group(-1)", "Previous group", priority=True, show=False
         ),
     ]
+    # Reading order and primary body for each view. Auxiliary groups remain in
+    # the inventory even when their backing forms are never displayed.
+    VIEW_GROUPS: ClassVar[dict[WorkbenchView, tuple[str, ...]]] = {
+        WorkbenchView.PROVIDERS: ("providers", "root-actions"),
+        WorkbenchView.CHOOSE: ("choose",),
+        WorkbenchView.ACTIONS: ("actions", "provider-operations"),
+        WorkbenchView.CONNECTION: ("actions", "connection-actions"),
+        WorkbenchView.MODELS: ("models", "models-actions"),
+        WorkbenchView.CATALOG: ("catalog", "catalog-filter", "catalog-actions"),
+        WorkbenchView.DEPLOYMENTS: ("picker",),
+        WorkbenchView.DETAIL: ("detail-fields", "detail-actions"),
+        WorkbenchView.EDITOR: ("editor",),
+        WorkbenchView.PROTOCOL: ("protocol",),
+        WorkbenchView.PICKER: ("picker",),
+        WorkbenchView.PRESETS: ("presets", "presets-actions"),
+        WorkbenchView.PRESET_EDITOR: ("preset-editor", "preset-editor-actions"),
+        WorkbenchView.CONFIRM: ("confirm",),
+    }
+    VIEW_CONTROLS: ClassVar[tuple[str, ...]] = tuple(
+        dict.fromkeys(name for groups in VIEW_GROUPS.values() for name in groups)
+    ) + ("detail", "connection-form")
+    UNDERLAY_CONTROLS: ClassVar[tuple[str, ...]] = (
+        "title",
+        "pending-action",
+        "filter",
+        "count",
+        "help",
+        "hint",
+        "field-error",
+    ) + tuple(name for name in VIEW_CONTROLS if name != "confirm")
+
     MIN_WIDTH = 48
     MIN_HEIGHT = 24
     FIELDS: ClassVar[dict[str, str]] = {
@@ -553,8 +725,18 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._confirm: str | None = None
         self._confirm_opener: str | None = None
         self._connection_approved = False
+        self._connection_scopes: list[str] = []
         self._protocol_value: str | None = None
         self._help_open = False
+        self._help_opener: NavigationFrame | None = None
+        self._presets_opener: NavigationFrame | None = None
+        self._add_opener: NavigationFrame | None = None
+        self._editor_opener: NavigationFrame | None = None
+        self._confirm_position: _GroupPosition | None = None
+        self._resize_frame: NavigationFrame | None = None
+        self._navigation_epoch = 0
+        self._unmounted = False
+        self._resize_owner: tuple[str | None, str | None, bool] | None = None
         self._models_list_open = False
         self._provider_open = False
         self._message = ""
@@ -579,6 +761,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._browser_cursor: str | None = None
         self._provider_visible_count = (0, 0)
         self._stage: str | None = None
+        self._draft_session = 0
         self._add: ProviderDraft | None = None
         self._add_checkpoint: ProviderDraft | None = None
         self._connection_pending: dict[str, PendingModel] | None = None
@@ -587,8 +770,19 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._picker = False
         self._view = WorkbenchView.PROVIDERS
         self._navigation: list[NavigationFrame] = []
+        self._positions: dict[
+            tuple[WorkbenchView, str, tuple[str, ...]], _GroupPosition
+        ] = {}
+        self._group_contents_context: dict[
+            str, tuple[WorkbenchView, tuple[str, ...]]
+        ] = {}
+        self._model_row_identities: tuple[str, ...] = ()
         self._return_focus: str | None = None
         self._help_focus_id: str | None = None
+        self._hint_targets: list[tuple[int, int, str]] | None = None
+        self._restore_scroll: int | None = None
+        self._help_dismiss_click: str | None = None
+        self._feedback_token = 0
         self._credential_input_id = "wb-input"
         self._saved_credential_envs: set[str] = set()
 
@@ -604,15 +798,20 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             yield NoMarkupStatic("Filter: type to filter", id="wb-filter")
             yield NoMarkupStatic("", id="wb-count")
             yield BrowserList(id="wb-providers")
+            yield WorkbenchList(id="wb-root-actions", classes="wb-group")
             yield WorkbenchList(id="wb-choose")
             yield WorkbenchList(id="wb-picker")
             yield WorkbenchList(id="wb-catalog-filter")
             yield WorkbenchList(id="wb-catalog")
+            yield WorkbenchList(id="wb-catalog-actions", classes="wb-group")
             yield WorkbenchList(id="wb-presets")
+            yield WorkbenchList(id="wb-presets-actions", classes="wb-group")
             yield WorkbenchList(id="wb-preset-editor")
+            yield WorkbenchList(id="wb-preset-editor-actions", classes="wb-group")
             yield WorkbenchList(id="wb-detail-fields")
             yield WorkbenchList(id="wb-protocol")
             yield WorkbenchList(id="wb-actions")
+            yield WorkbenchList(id="wb-provider-operations", classes="wb-group")
             yield ModelChecklist(id="wb-models")
             yield WorkbenchList(id="wb-models-actions")
             with VerticalScroll(id="wb-detail"):
@@ -695,7 +894,11 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             too_small = (
                 event.size.width < self.MIN_WIDTH or event.size.height < self.MIN_HEIGHT
             )
-            self.query_one("#workbench").display = not too_small
+            workbench = self.query_one("#workbench")
+            if too_small and workbench.display:
+                self._resize_frame = self._frame()
+                self._resize_owner = (self._confirm, self._editing, self._help_open)
+            workbench.display = not too_small
             self.query_one("#wb-small").display = too_small
             if self._busy or too_small:
                 return
@@ -704,12 +907,26 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     self._refresh_catalog(preserve_filter_cursor=True)
                 elif self._models_list_open:
                     self._refresh_models()
-                elif self._provider_open or self._stage in {"connection", "models"}:
+                elif self._stage == "connection":
+                    if not self._editing and not self._confirm and not self._detail:
+                        self._refresh_add_connection()
+                elif self._provider_open or self._stage == "models":
                     if not self._editing and not self._confirm and not self._detail:
                         self._refresh_actions()
                 else:
                     self._refresh_browser()
                 self._update_help()
+                frame, self._resize_frame = self._resize_frame, None
+                if (
+                    frame is not None
+                    and frame.view == self._view
+                    and frame.stage == self._stage
+                    and self._resize_owner
+                    == (self._confirm, self._editing, self._help_open)
+                ):
+                    self._restore_transient_opener(frame)
+                    if frame.focus_id:
+                        self._defer_focus(self.query_one(f"#{frame.focus_id}"))
 
     def on_mount(self) -> None:
         if getattr(self.app, "_pending_callbacks", None) or getattr(
@@ -717,66 +934,387 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         ):
             self.query_one("#wb-pending-action").display = True
         self.query_one("#wb-small").display = False
-        for widget in (
-            "actions",
-            "choose",
-            "picker",
-            "catalog-filter",
-            "catalog",
-            "presets",
-            "preset-editor",
-            "detail-fields",
-            "protocol",
-            "models",
-            "models-actions",
-            "detail",
-            "detail-actions",
-            "editor",
-            "connection-form",
-            "connection-actions",
-            "confirm",
-        ):
-            self.query_one(f"#wb-{widget}").display = False
+        for name in self.VIEW_CONTROLS:
+            widget = self.query_one(f"#wb-{name}")
+            widget.display = False
+            if isinstance(widget, OptionList):
+                widget.add_class("wb-group")
         self._refresh_browser()
         self._activate_view(WorkbenchView.PROVIDERS, focus_id="wb-providers")
         if self.initial_view == "presets":
             self._open_presets()
 
+    def _can_focus_group(self, group_id: str | None) -> bool:
+        if self._unmounted or self._busy or self._dismissed or group_id is None:
+            return False
+        widget = self.query_one(f"#{group_id}")
+        if (
+            not widget.can_focus
+            or not widget.display
+            or not widget.visible
+            or widget.disabled
+            or any(not ancestor.display for ancestor in widget.ancestors)
+        ):
+            return False
+        if self._confirm:
+            return group_id == "wb-confirm-actions"
+        return True
+
+    def _can_activate(self, group_id: str | None) -> bool:
+        """Resolve interaction ownership before pointer focus can dismiss help."""
+        if not self._can_focus_group(group_id):
+            return False
+        if self._confirm:
+            return group_id == "wb-confirm-actions"
+        if self._help_open:
+            return False
+        if self._editing or self._view == WorkbenchView.EDITOR:
+            return group_id == "wb-input"
+        return True
+
+    def _pointer_focus(self, group_id: str | None) -> bool:
+        if not self._can_focus_group(group_id):
+            return False
+        if self._help_open and group_id != "wb-help":
+            self._help_dismiss_click = group_id
+            self._help_open = False
+            self._help_opener = None
+            self._update_help()
+        return True
+
+    def _consume_help_click(self, group_id: str | None) -> bool:
+        dismissed = self._help_dismiss_click == group_id
+        self._help_dismiss_click = None
+        return dismissed
+
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        if self._confirm and event.widget.id != "wb-confirm-actions":
+            self.set_focus(self.query_one("#wb-confirm-actions"), scroll_visible=False)
+
+    def on_click(self, event: events.Click) -> None:  # noqa: PLR0912
+        if event.chain > 1:
+            return
+        if event.widget is self.query_one("#wb-help"):
+            event.stop()
+            event.prevent_default()
+            self.action_help()
+            return
+        hint = self.query_one("#wb-hint", NoMarkupStatic)
+        if event.widget is not hint:
+            return
+        event.stop()
+        event.prevent_default()
+        x = event.screen_x - hint.region.x
+        key = next(
+            (key for start, end, key in self._hint_targets or [] if start <= x < end),
+            None,
+        )
+        if key == "Esc":
+            self.action_back()
+        elif key == "F1":
+            self.action_help()
+        elif key in {"Tab", "Shift+Tab"}:
+            self.action_cycle_group(1 if key == "Tab" else -1)
+        elif key == "Enter":
+            if self._protocol_picker and self._can_activate("wb-protocol"):
+                self._accept_protocol()
+            elif self._editing and self._can_activate("wb-input"):
+                self._accept_editor()
+            elif isinstance(self.focused, (WorkbenchList, ModelChecklist)):
+                if isinstance(self.focused, ModelChecklist):
+                    self.focused.action_detail()
+                else:
+                    self.focused.action_select()
+        elif key == "Space":
+            if isinstance(self.focused, ModelChecklist):
+                self.focused.action_select()
+            elif isinstance(self.focused, WorkbenchList) and self._can_activate(
+                self.focused.id
+            ):
+                option = self.focused.highlighted_option
+                if option and option.id:
+                    if self.focused.id == "wb-protocol":
+                        self._select_protocol(str(option.id))
+                    elif (
+                        self.focused.id == "wb-detail-fields" and option.id == "images"
+                    ):
+                        self._toggle_detail_images()
+
     def _focus_groups(self) -> list[str]:
         groups = {
+            WorkbenchView.PROVIDERS: ["wb-providers", "wb-root-actions"],
+            WorkbenchView.ACTIONS: ["wb-actions", "wb-provider-operations"],
+            WorkbenchView.CONNECTION: ["wb-actions", "wb-connection-actions"],
             WorkbenchView.MODELS: ["wb-models", "wb-models-actions", "wb-help"],
-            WorkbenchView.CATALOG: ["wb-catalog-filter", "wb-catalog", "wb-help"],
+            WorkbenchView.CATALOG: [
+                "wb-catalog-filter",
+                "wb-catalog",
+                "wb-catalog-actions",
+                "wb-help",
+            ],
+            WorkbenchView.DETAIL: ["wb-detail-fields", "wb-detail-actions"],
+            WorkbenchView.PRESETS: ["wb-presets", "wb-presets-actions"],
+            WorkbenchView.PRESET_EDITOR: [
+                "wb-preset-editor",
+                "wb-preset-editor-actions",
+            ],
         }.get(self._view, [])
+        if self._help_open and "wb-help" not in groups:
+            groups = [*groups, "wb-help"]
         return [
             group
             for group in groups
             if self.query_one(f"#{group}").can_focus
             and self.query_one(f"#{group}").display
+            and self.query_one(f"#{group}").visible
+            and all(
+                ancestor.display for ancestor in self.query_one(f"#{group}").ancestors
+            )
             and not self.query_one(f"#{group}").disabled
         ]
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "cycle_group":
-            return self._view in {WorkbenchView.MODELS, WorkbenchView.CATALOG}
+            if self._busy or self._confirm:
+                return True
+            return (
+                bool(self._focus_groups())
+                and not self._editing
+                and self._view != WorkbenchView.EDITOR
+            )
         return super().check_action(action, parameters)
 
     def action_cycle_group(self, direction: int) -> None:
+        if self._busy:
+            return
         if self._confirm:
             self.query_one("#wb-confirm-actions").focus()
-            return
-        if self._busy:
             return
         groups = self._focus_groups()
         if not groups:
             return
+        self._navigation_epoch += 1
         current = self.focused.id if self.focused else None
         index = (
             groups.index(current) if current in groups else (-1 if direction > 0 else 0)
         )
-        self.query_one(f"#{groups[(index + direction) % len(groups)]}").focus(
-            scroll_visible=False
-        )
+        self._capture_group_position()
+        target = self.query_one(f"#{groups[(index + direction) % len(groups)]}")
+        if target.id != "wb-help":
+            self._help_open = False
+            self._help_opener = None
+        position = self._positions.get((
+            self._view,
+            target.id or "",
+            self._group_context(self._view, target.id or ""),
+        ))
+        if position is not None:
+            self._restore_group_position(position, restore_focus=True)
+        else:
+            target.focus(scroll_visible=False)
         self._update_help()
+
+    def _group_context(  # noqa: PLR0911 - each view owns its semantic context
+        self, view: WorkbenchView, group_id: str
+    ) -> tuple[str, ...]:
+        if group_id == "wb-help" and self._help_focus_id:
+            origin = self._group_contents_context.get(self._help_focus_id)
+            if origin:
+                return (origin[0].value, self._help_focus_id, *origin[1])
+        provider = self.state.provider_id if self.state else ""
+        if view in {
+            WorkbenchView.ACTIONS,
+            WorkbenchView.CONNECTION,
+            WorkbenchView.MODELS,
+        }:
+            if self._add is not None and self._stage == "connection":
+                provider = self._add.provider_id or f"draft:{self._draft_session}"
+            return (provider, self._stage or "management")
+        if view == WorkbenchView.CATALOG:
+            return (self._model_filter or "all",) if group_id == "wb-catalog" else ()
+        if view == WorkbenchView.DETAIL:
+            return (provider, self._detail_preview_wire or self._detail or "")
+        if view == WorkbenchView.PRESET_EDITOR:
+            return (self._preset_role or "",)
+        if view in {WorkbenchView.PICKER, WorkbenchView.DEPLOYMENTS}:
+            return (
+                "preset"
+                if self._preset_field
+                else "deployment"
+                if self._picker
+                else "model",
+                self._preset_role or provider,
+                self._preset_field or self._detail or self._detail_cursor or "",
+            )
+        if view == WorkbenchView.EDITOR:
+            group = self._help_focus_id or "wb-actions"
+            origin = self._group_contents_context.get(group)
+            if origin:
+                return (origin[0].value, group, *origin[1], self._editing or "")
+            if self._navigation:
+                opener = self._navigation[-1]
+                return (
+                    opener.view.value,
+                    opener.focus_id or "",
+                    *opener.context,
+                    self._editing or "",
+                )
+        return ()
+
+    def _row_identity(self, widget: OptionList, index: int) -> str | None:
+        option = widget.get_option_at_index(index)
+        if isinstance(widget, SelectionList):
+            if widget.id == "wb-models" and index < len(self._model_row_identities):
+                return self._model_row_identities[index]
+            return str(cast(Selection[str], option).value)
+        return str(option.id) if option.id is not None else None
+
+    # Keep the identity-neighbour repair algorithm aligned with SettingsScreen's
+    # _capture_group_position/_restore_group_position (and MCPApp's equivalent).
+    def _capture_group_position(
+        self, widget: Widget | None = None
+    ) -> _GroupPosition | None:
+        widget = widget or self.focused
+        if widget is None or widget.id is None:
+            return None
+        owner = self._group_contents_context.get(widget.id)
+        if isinstance(widget, Input) or widget.id == "wb-help":
+            if not widget.display:
+                return None
+            view = WorkbenchView.EDITOR if isinstance(widget, Input) else self._view
+            owner = (view, self._group_context(view, widget.id))
+            self._group_contents_context[widget.id] = owner
+        if owner is None:
+            if not widget.display:
+                return None
+            owner = (self._view, self._group_context(self._view, widget.id))
+            self._group_contents_context[widget.id] = owner
+        view, context = owner
+        identities = (
+            tuple(
+                identity
+                for index, option in enumerate(widget.options)
+                if not option.disabled
+                and (identity := self._row_identity(widget, index)) is not None
+            )
+            if isinstance(widget, OptionList)
+            else ()
+        )
+        selected = (
+            self._row_identity(widget, widget.highlighted)
+            if isinstance(widget, OptionList) and widget.highlighted is not None
+            else None
+        )
+        position = _GroupPosition(
+            view,
+            widget.id,
+            context,
+            identities,
+            identities.index(selected) if selected in identities else 0,
+            widget.scroll_x,
+            widget.scroll_y,
+            widget.cursor_position if isinstance(widget, Input) else None,
+        )
+        self._positions[(view, widget.id, context)] = position
+        return position
+
+    def _position_before_rebuild(
+        self, view: WorkbenchView, group: str
+    ) -> _GroupPosition | None:
+        widget = self.query_one(f"#{group}")
+        context = self._group_context(view, group)
+        owner = self._group_contents_context.get(group)
+        previous = self._capture_group_position(widget) if owner is not None else None
+        position = self._positions.get((view, group, context))
+        if owner != (view, context) and isinstance(widget, OptionList):
+            widget.highlighted = None
+            if group == "wb-catalog" and position is None and previous is not None:
+                position = replace(previous, view=view, context=context)
+        self._group_contents_context[group] = (view, context)
+        return position
+
+    def _restore_group_position(
+        self, position: _GroupPosition | None, *, restore_focus: bool = False
+    ) -> None:
+        if position is None:
+            return
+        widget = self.query_one(f"#{position.group}")
+        if self._group_contents_context.get(position.group) != (
+            position.view,
+            position.context,
+        ):
+            return
+        if isinstance(widget, OptionList):
+            valid = [
+                i for i, option in enumerate(widget.options) if not option.disabled
+            ]
+            ids = {self._row_identity(widget, i): i for i in valid}
+            for ordinal in sorted(
+                range(len(position.identities)),
+                key=lambda i: (abs(i - position.ordinal), i < position.ordinal),
+            ):
+                if position.identities[ordinal] in ids:
+                    widget.highlighted = ids[position.identities[ordinal]]
+                    break
+            else:
+                widget.highlighted = (
+                    valid[min(position.ordinal, len(valid) - 1)] if valid else None
+                )
+        if (
+            restore_focus
+            and self._view == position.view
+            and widget.display
+            and widget.can_focus
+            and self._can_focus_group(position.group)
+        ):
+            if isinstance(widget, WorkbenchList) and widget.id != "wb-confirm-actions":
+                self._help_focus_id = widget.id
+            self.set_focus(widget, scroll_visible=False)
+
+        focused = self.focused
+        view, epoch = self._view, self._navigation_epoch
+        owner = (self._confirm, self._editing, self._help_open, self._busy)
+
+        def finish_restore() -> None:
+            if self._unmounted:
+                return
+            if (
+                self._dismissed
+                or self._navigation_epoch != epoch
+                or self._view != view
+                or self.focused is not focused
+                or (self._confirm, self._editing, self._help_open, self._busy) != owner
+            ):
+                return
+            if not widget.display or any(
+                not ancestor.display for ancestor in widget.ancestors
+            ):
+                return
+            if self._group_contents_context.get(position.group) != (
+                position.view,
+                position.context,
+            ):
+                return
+            if self._group_context(position.view, position.group) != position.context:
+                return
+            if (
+                restore_focus
+                and widget.has_focus
+                and isinstance(widget, Input)
+                and position.cursor_position is not None
+            ):
+                widget.cursor_position = position.cursor_position
+            widget.scroll_to(
+                x=position.scroll_x,
+                y=position.scroll_y,
+                animate=False,
+                force=True,
+                immediate=True,
+            )
+            if isinstance(widget, OptionList):
+                widget.scroll_to_highlight()
+
+        self.call_after_refresh(finish_restore)
 
     def _frame(self) -> NavigationFrame:
         focused = self.focused
@@ -793,6 +1331,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     if selected_option is not None and selected_option.id is not None:
                         selected = str(selected_option.id)
                 scroll = int(getattr(getattr(focused, "scroll_offset", None), "y", 0))
+        position = self._capture_group_position()
         return NavigationFrame(
             self._view,
             focused.id if focused is not None else None,
@@ -803,6 +1342,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             self._detail_cursor,
             self._stage,
             self.state.provider_id if self.state is not None else None,
+            position.context if position else (),
+            position,
         )
 
     @property
@@ -811,6 +1352,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         return self._view
 
     def _push_view(self, view: WorkbenchView) -> None:
+        self._navigation_epoch += 1
         self._navigation.append(self._frame())
         self._view = view
 
@@ -822,58 +1364,53 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         selected_id: str | None = None,
     ) -> None:
         """Display one view and restore focus only after all controls are updated."""
+        self._navigation_epoch += 1
+        self._capture_group_position()
         self._view = view
-        names = {
-            WorkbenchView.PROVIDERS: "providers",
-            WorkbenchView.CHOOSE: "choose",
-            WorkbenchView.ACTIONS: "actions",
-            WorkbenchView.CONNECTION: "actions",
-            WorkbenchView.MODELS: "models",
-            WorkbenchView.CATALOG: "catalog",
-            WorkbenchView.DEPLOYMENTS: "picker",
-            WorkbenchView.DETAIL: "detail-fields",
-            WorkbenchView.EDITOR: "editor",
-            WorkbenchView.PROTOCOL: "protocol",
-            WorkbenchView.PICKER: "picker",
-            WorkbenchView.PRESETS: "presets",
-            WorkbenchView.PRESET_EDITOR: "preset-editor",
-            WorkbenchView.CONFIRM: "confirm",
-        }
-        primary = names[view]
-        for name in (
-            "providers",
-            "actions",
-            "choose",
-            "picker",
-            "catalog-filter",
-            "catalog",
-            "presets",
-            "preset-editor",
-            "detail-fields",
-            "protocol",
-            "models",
-            "models-actions",
-            "detail",
-            "detail-actions",
-            "editor",
-            "connection-form",
-            "connection-actions",
-            "confirm",
-        ):
-            self.query_one(f"#wb-{name}").display = (
-                name == primary
-                or (view == WorkbenchView.CATALOG and name == "catalog-filter")
-                or (view == WorkbenchView.CONNECTION and name == "connection-actions")
-                or (
-                    view == WorkbenchView.MODELS
-                    and name == "models-actions"
-                    and self._stage == "models"
-                )
-            )
-        widget_id = focus_id or f"wb-{primary}"
+        primary = self._sync_view()
+        self._restore_view_focus(
+            focus_id or ("wb-input" if primary == "editor" else f"wb-{primary}"),
+            selected_id=selected_id,
+        )
+
+    def _defer_focus(self, widget: Widget) -> None:
+        view, stage, epoch = self._view, self._stage, self._navigation_epoch
+        context = self._group_context(view, widget.id or "")
+        owner = (self._confirm, self._editing, self._help_open, self._busy)
+
+        def restore() -> None:
+            if not self.is_mounted or self._dismissed or self._unmounted:
+                return
+            if not widget.display or any(
+                not ancestor.display for ancestor in widget.ancestors
+            ):
+                return
+            if (
+                self._navigation_epoch == epoch
+                and self._view == view
+                and self._stage == stage
+                and (self._confirm, self._editing, self._help_open, self._busy) == owner
+                and self._group_context(view, widget.id or "") == context
+            ):
+                widget.focus()
+
+        self.call_after_refresh(restore)
+
+    def _restore_view_focus(
+        self, widget_id: str, *, selected_id: str | None = None
+    ) -> None:
+        """Restore an opener only after the shared projection has been applied."""
         if not widget_id.startswith("wb-"):
             widget_id = f"wb-{widget_id}"
+        if self._confirm:
+            widget_id = "wb-confirm-actions"
         widget = self.query_one(f"#{widget_id}")
+        if (
+            not widget.display
+            or not widget.visible
+            or any(not ancestor.display for ancestor in widget.ancestors)
+        ):
+            return
         if selected_id is not None and isinstance(widget, OptionList):
             ids = [
                 str(cast(Selection[str], option).value)
@@ -885,6 +1422,14 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 widget.highlighted = ids.index(selected_id)
         if getattr(widget, "can_focus", False) or hasattr(widget, "focus"):
             self.set_focus(widget)
+        if selected_id is None:
+            self._restore_group_position(
+                self._positions.get((
+                    self._view,
+                    widget_id,
+                    self._group_context(self._view, widget_id),
+                ))
+            )
         if frame_scroll := getattr(self, "_restore_scroll", None):
             try:
                 widget.scroll_y = frame_scroll
@@ -921,7 +1466,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if frame.view == WorkbenchView.PROVIDERS:
             self._refresh_browser()
             self._activate_view(
-                frame.view, focus_id="wb-providers", selected_id=frame.selected_id
+                frame.view,
+                focus_id=frame.focus_id or "wb-providers",
+                selected_id=frame.selected_id,
             )
         elif frame.view == WorkbenchView.CATALOG:
             self._refresh_catalog()
@@ -930,6 +1477,11 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 focus_id=(
                     frame.focus_id
                     if frame.focus_id in {"wb-catalog", "wb-catalog-filter"}
+                    or (
+                        frame.focus_id == "wb-catalog-actions"
+                        and self.state
+                        and self.state.dirty
+                    )
                     else "wb-catalog"
                 ),
                 selected_id=frame.selected_id,
@@ -951,9 +1503,10 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             else:
                 self._refresh_actions(highlight=frame.selected_id)
             self._activate_view(
-                frame.view, focus_id="wb-actions", selected_id=frame.selected_id
+                frame.view,
+                focus_id=frame.focus_id or "wb-actions",
+                selected_id=frame.selected_id,
             )
-            self.call_after_refresh(self.query_one("#wb-actions", WorkbenchList).focus)
         else:
             # Nested pickers, editors, confirmations, and preset selection all
             # retain their widgets; restore their recorded control directly.
@@ -965,13 +1518,15 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             and frame.focus_id
         ):
             widget = self.query_one(f"#{frame.focus_id}")
-            self.call_after_refresh(
-                widget.scroll_to, y=frame.scroll, animate=False, force=True
-            )
+            widget.scroll_to(y=frame.scroll, animate=False, force=True)
+        self._restore_group_position(frame.position)
         self._restore_scroll = 0
 
     def _refresh_browser(self) -> None:  # noqa: PLR0914
         browser = self.query_one("#wb-providers", BrowserList)
+        position = self._position_before_rebuild(
+            WorkbenchView.PROVIDERS, "wb-providers"
+        )
         current = (
             str(browser.highlighted_option.id)
             if browser.highlighted_option
@@ -1039,7 +1594,12 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     id=name,
                 )
             )
-        browser.add_option(Option("ACTIONS", id="\x00actions", disabled=True))
+        root_actions = self.query_one("#wb-root-actions", WorkbenchList)
+        action_position = self._position_before_rebuild(
+            WorkbenchView.PROVIDERS, "wb-root-actions"
+        )
+        root_actions.clear_options()
+        root_actions.add_option(Option("ACTIONS", id="\x00actions", disabled=True))
         actions = [("\x00add", "Add custom provider"), ("\x00models", "Model catalog")]
         actions.append(("\x00presets", "Choose default presets"))
         if self.state is not None and self.state.dirty:
@@ -1048,17 +1608,18 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 ("\x00discard", "Discard all pending catalog edits"),
             ])
         for key, label in actions:
-            browser.add_option(Option(label, id=key))
+            root_actions.add_option(Option(label, id=key))
+        root_actions.highlighted = 1
+        self._restore_group_position(action_position)
         ids = [str(option.id) for option in browser.options]
         preferred: str | None = None
         if (
-            self.mode == "onboarding"
+            position is None
+            and self.mode == "onboarding"
             and "mistral" in visible
             and self._mistral_needs_setup("mistral")
         ):
             preferred = "mistral"
-        elif self.state is not None and self.state.dirty:
-            preferred = "\x00apply"
         current_option = next(
             (option for option in browser.options if str(option.id) == current), None
         )
@@ -1074,6 +1635,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         )
         self._provider_visible_count = (len(visible), len(names))
         self.query_one("#wb-count", NoMarkupStatic).display = False
+        self._restore_group_position(position)
         self._update_help()
 
     @staticmethod
@@ -1273,6 +1835,10 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
 
     def _refresh_catalog(self, *, preserve_filter_cursor: bool = True) -> None:  # noqa: PLR0914
         filters = self.query_one("#wb-catalog-filter", NavigableOptionList)
+        filter_position = self._position_before_rebuild(
+            WorkbenchView.CATALOG, "wb-catalog-filter"
+        )
+        position = self._position_before_rebuild(WorkbenchView.CATALOG, "wb-catalog")
         current_filter = f"filter:{self._model_filter or ''}"
         state = self.state
         previous_filter = (
@@ -1311,13 +1877,20 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         )
         previous_index = catalog.highlighted or 0
         catalog.clear_options()
+        actions = self.query_one("#wb-catalog-actions", WorkbenchList)
+        action_position = self._position_before_rebuild(
+            WorkbenchView.CATALOG, "wb-catalog-actions"
+        )
+        actions.clear_options()
         if state is not None and state.dirty:
-            catalog.add_option(
+            actions.add_option(
                 Option("Apply all catalog edits to disk", id="\x00apply")
             )
-            catalog.add_option(
+            actions.add_option(
                 Option("Discard all pending catalog edits", id="\x00discard")
             )
+        actions.highlighted = 0 if actions.option_count else None
+        self._restore_group_position(action_position)
         models = state.catalog.models if state else self.snapshot.catalog.models
         pending = (
             {
@@ -1364,6 +1937,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             if target in ids
             else (min(previous_index, len(ids) - 1) if ids else None)
         )
+        self._restore_group_position(position)
+        if preserve_filter_cursor:
+            self._restore_group_position(filter_position)
         self._update_help()
 
     def _catalog_model_owners(self, name: str) -> list[str]:
@@ -1403,7 +1979,6 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         elif key.startswith("model:"):
             name = key.removeprefix("model:")
             self._detail_cursor = name
-            self._refresh_catalog()
             providers = self._catalog_model_owners(name)
             provider = providers[0] if len(providers) == 1 else None
             if provider:
@@ -1423,15 +1998,17 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
     def _open_deployment_picker(self, name: str, providers: list[str]) -> None:
         """Choose the deployment that owns an ambiguous global model row."""
         self._push_view(WorkbenchView.DEPLOYMENTS)
+        self._picker = True
+        self._detail_cursor = name
+        position = self._position_before_rebuild(WorkbenchView.DEPLOYMENTS, "wb-picker")
         picker = self.query_one("#wb-picker", NavigableOptionList)
         picker.clear_options()
         for provider in providers:
             picker.add_option(
                 Option(f"{provider}/{name}", id=f"deployment:{provider}:{name}")
             )
-        self._picker = True
-        self._detail_cursor = name
         picker.highlighted = 0
+        self._restore_group_position(position)
         self._activate_view(WorkbenchView.DEPLOYMENTS, focus_id="wb-picker")
 
     def _request_commit(self) -> None:
@@ -1449,6 +2026,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._apply(self.state)
 
     def _open_presets(self) -> None:
+        # Guided setup advances a stage; management presets are a nested view.
+        self._presets_opener = self._frame() if self._stage is None else None
         if self.state is None:
             first = next(iter(self.snapshot.catalog.providers), None)
             if first is None:
@@ -1463,7 +2042,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._preset_role = None
         self._refresh_presets()
         self._activate_view(WorkbenchView.PRESETS, focus_id="wb-presets")
-        self.call_after_refresh(self.query_one("#wb-presets", WorkbenchList).focus)
+        self._defer_focus(self.query_one("#wb-presets", WorkbenchList))
 
     def _seed_onboarding_presets(self) -> None:
         """Suggest usable configured models without changing catalog defaults."""
@@ -1517,6 +2096,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if state is None:
             return
         rows = self.query_one("#wb-presets", WorkbenchList)
+        position = self._position_before_rebuild(WorkbenchView.PRESETS, "wb-presets")
         previous = highlight or (
             str(rows.highlighted_option.id) if rows.highlighted_option else None
         )
@@ -1542,7 +2122,12 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     id=f"preset:{role}",
                 )
             )
-        rows.add_option(
+        actions = self.query_one("#wb-presets-actions", WorkbenchList)
+        action_position = self._position_before_rebuild(
+            WorkbenchView.PRESETS, "wb-presets-actions"
+        )
+        actions.clear_options()
+        actions.add_option(
             Option(
                 "Save presets and continue"
                 if self.mode == "onboarding"
@@ -1550,9 +2135,13 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 id="finish",
             )
         )
-        rows.add_option(Option("Add another provider", id="add-another"))
+        actions.add_option(Option("Add another provider", id="add-another"))
+        actions.highlighted = 0
+        self._restore_group_position(action_position)
         ids = [str(option.id) for option in rows.options]
         rows.highlighted = ids.index(previous) if previous in ids else 1
+        if highlight is None:
+            self._restore_group_position(position)
         self._update_help()
 
     def _select_preset_action(self, key: str) -> None:
@@ -1576,6 +2165,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     self._refresh_presets(
                         highlight=f"preset:{(validation.unresolved_roles or validation.unusable_roles or ('orchestrator',))[0]}"
                     )
+                    self.query_one("#wb-presets").focus()
                     return
             else:
                 for role, pair in state.role_presets.items():
@@ -1586,6 +2176,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     if error:
                         self._set_feedback("preset", error, "error")
                         self._refresh_presets(highlight=f"preset:{role}")
+                        self.query_one("#wb-presets").focus()
                         return
             if state.dirty:
                 self._after_commit = (
@@ -1601,19 +2192,21 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         field, _, role = key.partition(":")
         if field != "preset" or role not in state.catalog.roles:
             return
+        self._push_view(WorkbenchView.PRESET_EDITOR)
         self._preset_role = role
         self._preset_draft = state.preset(role)
         self._preset_field = None
-        self._refresh_preset_editor(highlight="model")
+        self._refresh_preset_editor()
         self._activate_view(WorkbenchView.PRESET_EDITOR, focus_id="wb-preset-editor")
-        self.call_after_refresh(
-            self.query_one("#wb-preset-editor", WorkbenchList).focus
-        )
+        self._defer_focus(self.query_one("#wb-preset-editor", WorkbenchList))
 
     def _refresh_preset_editor(self, *, highlight: str | None = None) -> None:
         if self._preset_role is None or self._preset_draft is None:
             return
         rows = self.query_one("#wb-preset-editor", WorkbenchList)
+        position = self._position_before_rebuild(
+            WorkbenchView.PRESET_EDITOR, "wb-preset-editor"
+        )
         previous = highlight or (
             str(rows.highlighted_option.id) if rows.highlighted_option else "model"
         )
@@ -1629,10 +2222,19 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 id="thinking",
             )
         )
-        rows.add_option(Option("Apply model and thinking", id="apply"))
-        rows.add_option(Option("Cancel", id="cancel"))
+        actions = self.query_one("#wb-preset-editor-actions", WorkbenchList)
+        action_position = self._position_before_rebuild(
+            WorkbenchView.PRESET_EDITOR, "wb-preset-editor-actions"
+        )
+        actions.clear_options()
+        actions.add_option(Option("Apply model and thinking", id="apply"))
+        actions.add_option(Option("Cancel", id="cancel"))
+        actions.highlighted = 0
+        self._restore_group_position(action_position)
         ids = [str(option.id) for option in rows.options]
         rows.highlighted = ids.index(previous) if previous in ids else 0
+        if highlight is None:
+            self._restore_group_position(position)
 
     def _select_preset_editor(self, key: str) -> None:
         if (
@@ -1654,6 +2256,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     "error",
                 )
                 self._refresh_preset_editor(highlight="thinking")
+                self.query_one("#wb-preset-editor").focus()
                 return
             role = self._preset_role
             self.state.set_role_preset(role, model, thinking)
@@ -1672,7 +2275,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 "warning",
             )
             return
+        self._push_view(WorkbenchView.PICKER)
         self._preset_field = key
+        position = self._position_before_rebuild(WorkbenchView.PICKER, "wb-picker")
         picker = self.query_one("#wb-picker", WorkbenchList)
         picker.clear_options()
         if key == "model":
@@ -1702,20 +2307,26 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                         id=level,
                     )
                 )
-        picker.highlighted = 0
+        picker.highlighted = next(
+            (i for i, option in enumerate(picker.options) if not option.disabled), None
+        )
+        self._restore_group_position(position)
         self._activate_view(WorkbenchView.PICKER, focus_id="wb-picker")
-        self.call_after_refresh(picker.focus)
+        self._defer_focus(picker)
 
     def _close_preset_editor(self) -> None:
+        self._capture_group_position()
         role = self._preset_role
         self._preset_field = None
         self._preset_draft = None
         self._preset_role = None
         self._refresh_presets(highlight=f"preset:{role}")
-        self._activate_view(
-            WorkbenchView.PRESETS, focus_id="wb-presets", selected_id=f"preset:{role}"
-        )
-        self.call_after_refresh(self.query_one("#wb-presets", WorkbenchList).focus)
+        if not self._pop_view():
+            self._activate_view(
+                WorkbenchView.PRESETS,
+                focus_id="wb-presets",
+                selected_id=f"preset:{role}",
+            )
 
     def _choose_preset_value(self, value: str) -> None:
         if (
@@ -1736,26 +2347,38 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     f"@{role}: {candidate} supports {', '.join(supported)}; choose a supported thinking level before Apply.",
                     "warning",
                 )
+        self._capture_group_position()
         self._preset_field = None
         self._refresh_preset_editor(highlight=field)
-        self._activate_view(
-            WorkbenchView.PRESET_EDITOR, focus_id="wb-preset-editor", selected_id=field
-        )
-        self.call_after_refresh(
-            self.query_one("#wb-preset-editor", WorkbenchList).focus
-        )
+        if not self._pop_view():
+            self._activate_view(
+                WorkbenchView.PRESET_EDITOR,
+                focus_id="wb-preset-editor",
+                selected_id=field,
+            )
 
     def _refresh_actions(self, *, highlight: str | None = None) -> None:
+        if self._stage == "models":
+            self._refresh_add_models(highlight=highlight)
+            return
         actions = self.query_one("#wb-actions", NavigableOptionList)
+        position = self._position_before_rebuild(WorkbenchView.ACTIONS, "wb-actions")
+        operations = self.query_one("#wb-provider-operations", WorkbenchList)
+        operation_position = self._position_before_rebuild(
+            WorkbenchView.ACTIONS, "wb-provider-operations"
+        )
+        previous_operation = highlight or (
+            str(operations.highlighted_option.id)
+            if operations.highlighted_option
+            else None
+        )
+        operations.clear_options()
         previous = highlight or (
             str(actions.highlighted_option.id) if actions.highlighted_option else None
         )
         actions.clear_options()
         state = self.state
         if state is None:
-            return
-        if self._stage == "models":
-            self._refresh_add_models(highlight=highlight)
             return
         for key, label, value in (
             ("base", "API base", state.connection.api_base or "Not set"),
@@ -1777,7 +2400,14 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             ),
             ("models", "Models", f"{len(state.model_rows())} available"),
         ):
-            actions.add_option(Option(self._summary(f"{label}  {value}"), id=key))
+            target = operations if key in {"discover", "models"} else actions
+            target.add_option(Option(self._summary(f"{label}  {value}"), id=key))
+        ids = [str(option.id) for option in actions.options]
+        actions.highlighted = ids.index(previous) if previous in ids else 0
+        if highlight is None or highlight not in ids:
+            self._restore_group_position(position)
+        actions = operations
+        previous = previous_operation
         for wire, item in state.pending.items():
             if item.enabled:
                 outcome = match_discovered_model(state.catalog, state.provider_id, wire)
@@ -1809,6 +2439,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             actions.add_option(Option("Retry Runtime Reload", id="retry-reload"))
         ids = [str(option.id) for option in actions.options]
         actions.highlighted = ids.index(previous) if previous in ids else 0
+        if highlight is None or highlight not in ids:
+            self._restore_group_position(operation_position)
         self._update_help()
 
     def _refresh_models(self, *, highlight: str | None = None) -> None:
@@ -1816,6 +2448,10 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if state is None:
             return
         models = self.query_one("#wb-models", ModelChecklist)
+        position = self._position_before_rebuild(WorkbenchView.MODELS, "wb-models")
+        action_position = self._position_before_rebuild(
+            WorkbenchView.MODELS, "wb-models-actions"
+        )
         previous = highlight or (
             models.get_option_at_index(models.highlighted).value
             if models.highlighted is not None and models.option_count
@@ -1825,6 +2461,13 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._model_sync = True
         models.clear_options()
         rows = state.model_rows()
+        configured = state.configured()
+        self._model_row_identities = tuple(
+            f"canonical:{name}"
+            if name in configured and configured[name].name == wire
+            else f"wire:{wire}"
+            for name, wire, _enabled, _found in rows
+        )
         model_actions = self.query_one("#wb-models-actions", WorkbenchList)
         previous_action = (
             str(model_actions.highlighted_option.id)
@@ -1865,6 +2508,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             if previous in ids
             else min(previous_index, len(ids) - 1)
         )
+        if highlight is None:
+            self._restore_group_position(position)
+        self._restore_group_position(action_position)
         self._model_sync = False
         self._update_help()
 
@@ -1878,7 +2524,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
     def on_option_list_option_selected(  # noqa: PLR0911, PLR0912, PLR0915
         self, event: OptionList.OptionSelected
     ) -> None:
-        if self._busy or event.option.id is None:
+        if not self._can_activate(event.option_list.id) or event.option.id is None:
             return
         if self._confirm:
             if event.option_list.id == "wb-confirm-actions":
@@ -1894,7 +2540,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     self.action_confirm_no()
             return
         key = str(event.option.id)
-        if event.option_list.id == "wb-providers":
+        if event.option_list.id in {"wb-providers", "wb-root-actions"}:
             if key == "\x00empty":
                 return
             if key == "\x00add":
@@ -1923,21 +2569,23 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         elif event.option_list.id == "wb-choose":
             if key.startswith("existing:"):
                 self._stage = None
-                self.query_one("#wb-choose").display = False
-                self.query_one("#wb-providers").display = True
                 self._expand(key.removeprefix("existing:"))
             else:
                 preset = next(p for p in PRESETS if p.id == key)
                 self._choose_preset(preset)
         elif event.option_list.id == "wb-protocol":
-            self._accept_protocol()
-        elif event.option_list.id == "wb-presets":
+            self._select_protocol(key)
+        elif event.option_list.id in {"wb-presets", "wb-presets-actions"}:
             self._select_preset_action(key)
-        elif event.option_list.id == "wb-preset-editor":
+        elif event.option_list.id in {"wb-preset-editor", "wb-preset-editor-actions"}:
             self._select_preset_editor(key)
         elif event.option_list.id == "wb-detail-fields":
             self._select_detail_field(key)
-        elif event.option_list.id in {"wb-catalog", "wb-catalog-filter"}:
+        elif event.option_list.id in {
+            "wb-catalog",
+            "wb-catalog-filter",
+            "wb-catalog-actions",
+        }:
             self._select_catalog(key)
         elif event.option_list.id == "wb-picker":
             if self._preset_field is not None:
@@ -1950,7 +2598,6 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             if key.startswith("deployment:"):
                 _prefix, provider, name = key.split(":", 2)
                 self._picker = False
-                self.query_one("#wb-picker").display = False
                 if (
                     self._navigation
                     and self._navigation[-1].view == WorkbenchView.DEPLOYMENTS
@@ -1964,7 +2611,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 self._set_feedback(
                     "picker", "Choose a preset field to edit.", "warning"
                 )
-        elif event.option_list.id == "wb-actions":
+        elif event.option_list.id in {"wb-actions", "wb-provider-operations"}:
             if self._stage == "connection":
                 self._connection_action(key)
             else:
@@ -1975,24 +2622,17 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 self._refresh_connection_form()
                 self.set_focus(self.query_one("#wb-connection-env", Input))
         elif event.option_list.id == "wb-connection-actions":
-            if key == "save-key" and self._add is not None:
-                self._credential_input_id = "wb-connection-key"
-                self._accept_credential(
-                    self.query_one("#wb-connection-key", Input).value.strip(), None
-                )
-            elif key == "continue":
+            if key == "continue":
                 self._connection_action("continue")
         elif event.option_list.id == "wb-detail-actions" and key == "save-detail":
             self._save_detail()
         elif event.option_list.id == "wb-models-actions":
             if key in {"create", "add-another", "continue-presets"}:
                 self._advance_models("continue-presets" if key == "create" else key)
-            elif key == "keep-draft":
-                self._keep_add_draft()
             elif self.state is not None:
                 if key == "retry-discovery":
                     self.run_worker(
-                        self._discover(self.state),
+                        self._discovery_request(self.state),
                         group="workbench-discovery",
                         exclusive=True,
                     )
@@ -2000,6 +2640,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     self._select_add_action(key, self.state)
 
     def _start_add(self) -> None:
+        self._add_opener = (
+            self._frame() if self._view == WorkbenchView.PROVIDERS else None
+        )
         self._pre_add_state = deepcopy(self.state) if self.state is not None else None
         self._provider_open = False
         self._stage = "choose"
@@ -2011,9 +2654,6 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             self.query_one("#wb-connection-key", Input).value = ""
         if self._feedback_kind not in {"error", "warning"}:
             self._message = ""
-        self.query_one("#wb-providers").display = False
-        self.query_one("#wb-actions").display = False
-        self.query_one("#wb-models").display = False
         choose = self.query_one("#wb-choose", NavigableOptionList)
         choose.clear_options()
         for name in sorted(self.snapshot.catalog.providers):
@@ -2024,12 +2664,13 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             )
         for preset in PRESETS:
             choose.add_option(Option(f"{preset.name}", id=preset.id))
-        choose.display = True
         choose.highlighted = 0
-        choose.focus()
+        self._activate_view(WorkbenchView.CHOOSE, focus_id="wb-choose")
         self._update_help()
 
     def _choose_preset(self, preset: ProviderPreset) -> None:
+        if self._view == WorkbenchView.PROVIDERS:
+            self._add_opener = self._frame()
         if self.state is not None and self._add is None and self._pre_add_state is None:
             self._pre_add_state = deepcopy(self.state)
         name = (
@@ -2045,6 +2686,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             else None
         )
         self._mistral_overwrite_approved = False
+        self._draft_session += 1
         self._add = ProviderDraft(
             preset.id,
             "",
@@ -2062,10 +2704,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             self.query_one("#wb-connection-key", Input).value = ""
         self._stage = "connection"
         self._view = WorkbenchView.CONNECTION
-        self.query_one("#wb-providers").display = False
-        self.query_one("#wb-choose").display = False
-        self.query_one("#wb-actions").display = True
         self._refresh_add_connection()
+        self._activate_view(WorkbenchView.CONNECTION, focus_id="wb-actions")
 
     def _refresh_add_connection(
         self, *, highlight: str | None = None, selected_id: str | None = None
@@ -2074,6 +2714,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if draft is None:
             return
         actions = self.query_one("#wb-actions", NavigableOptionList)
+        position = self._position_before_rebuild(WorkbenchView.CONNECTION, "wb-actions")
         previous = (
             highlight
             or selected_id
@@ -2099,11 +2740,11 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 id="key",
             )
         )
-        actions.add_option(Option("Save and configure models", id="continue"))
         ids = [str(option.id) for option in actions.options]
         actions.highlighted = ids.index(previous) if previous in ids else 0
         self._refresh_connection_form()
-        self.set_focus(actions)
+        if highlight is None and selected_id is None:
+            self._restore_group_position(position)
         self._update_help()
 
     def _refresh_connection_form(self) -> None:
@@ -2140,17 +2781,15 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if draft is None:
             return
         actions = self.query_one("#wb-connection-actions", WorkbenchList)
+        position = self._position_before_rebuild(
+            WorkbenchView.CONNECTION, "wb-connection-actions"
+        )
         current = actions.highlighted_option.id if actions.highlighted_option else None
         actions.clear_options()
-        env_var = draft.api_key_env_var.strip()
-        if env_var:
-            has_key = bool(self.query_one("#wb-connection-key", Input).value.strip())
-            actions.add_option(
-                Option("Save API key", id="save-key", disabled=not has_key)
-            )
         actions.add_option(Option("Save and configure models", id="continue"))
         ids = [option.id for option in actions.options]
         actions.highlighted = ids.index(current) if current in ids else len(ids) - 1
+        self._restore_group_position(position)
 
     def _connection_action(self, key: str) -> None:
         if self._busy:
@@ -2259,8 +2898,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 "key": "API Key *",
             }[key]
         )
-        self.query_one("#wb-editor").display = True
-        editor.focus()
+        self._sync_view()
+        self._restore_view_focus("wb-input")
         self._update_help()
 
     def _refresh_protocol(self) -> None:
@@ -2283,10 +2922,16 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             else values.index(self._protocol_value or "openai")
         )
 
+    def _select_protocol(self, value: str) -> None:
+        if self._can_activate("wb-protocol"):
+            self._protocol_value = value
+            self._refresh_protocol()
+
     def _accept_protocol(self) -> None:
+        if not self._can_activate("wb-protocol"):
+            return
         value = self._protocol_value
         self._protocol_picker = False
-        self.query_one("#wb-protocol").display = False
         if value and self._stage == "connection" and self._add:
             self._add = replace(self._add, api_style=value)
             self._refresh_add_connection(highlight="style")
@@ -2301,13 +2946,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if not self._protocol_picker:
             self._push_view(WorkbenchView.PROTOCOL)
         self._protocol_value = current
-        picker = self.query_one("#wb-protocol", NavigableOptionList)
         self._refresh_protocol()
         self._protocol_picker = True
-        self._view = WorkbenchView.PROTOCOL
-        self.query_one("#wb-actions").display = False
-        picker.display = True
-        self.set_focus(picker)
+        self._activate_view(WorkbenchView.PROTOCOL, focus_id="wb-protocol")
         self._update_help()
 
     def _new_provider_id(self, name: str) -> str:
@@ -2331,6 +2972,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if state is None:
             return
         actions = self.query_one("#wb-actions", NavigableOptionList)
+        position = self._position_before_rebuild(WorkbenchView.ACTIONS, "wb-actions")
         previous = highlight or (
             str(actions.highlighted_option.id) if actions.highlighted_option else None
         )
@@ -2378,13 +3020,10 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if self._reload_failed:
             actions.add_option(Option("Retry Runtime Reload", id="retry-reload"))
         ids = [str(option.id) for option in actions.options]
-        actions.highlighted = ids.index(previous) if previous in ids else 0
+        actions.highlighted = ids.index(previous) if previous in ids else 1
+        if highlight is None:
+            self._restore_group_position(position)
         self._update_help()
-
-    def _create(self, state: ManagementState) -> None:
-        if self._busy or self._add is None or state is not self.state:
-            return
-        self._start_commit(state, create=True)
 
     def _advance_models(self, action: str) -> None:
         if self.state is None or action not in {"add-another", "continue-presets"}:
@@ -2404,18 +3043,14 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if self._pop_view():
             self._update_help()
             return
-        self.query_one("#wb-picker").display = False
-        self.query_one("#wb-providers").display = not self._models_view
-        self.query_one("#wb-actions").display = (
-            self.state is not None and not self._models_view
+        view = (
+            WorkbenchView.CATALOG
+            if self._models_view
+            else WorkbenchView.ACTIONS
+            if self.state
+            else WorkbenchView.PROVIDERS
         )
-        if self._models_view:
-            self.query_one("#wb-catalog").display = True
-            self.query_one("#wb-catalog", NavigableOptionList).focus()
-        elif self.state:
-            self.query_one("#wb-actions", NavigableOptionList).focus()
-        else:
-            self.query_one("#wb-providers", BrowserList).focus()
+        self._activate_view(view)
         self._update_help()
 
     def _expand(self, provider_id: str, *, committed: bool = False) -> None:
@@ -2437,14 +3072,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._connection_approved = False
         self._models_list_open = False
         self._provider_open = True
-        self._view = WorkbenchView.ACTIONS
-        self.query_one("#wb-providers").display = False
-        self.query_one("#wb-catalog").display = False
-        self.query_one("#wb-actions").display = True
-        self.query_one("#wb-models").display = False
-        self.query_one("#wb-detail").display = False
         self._refresh_actions()
-        self.set_focus(self.query_one("#wb-actions", NavigableOptionList))
+        self._activate_view(WorkbenchView.ACTIONS, focus_id="wb-actions")
         self._update_help()
 
     def _select_add_action(self, key: str, state: ManagementState) -> bool:
@@ -2463,8 +3092,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             editor.password = False
             editor.value = ""
             self.query_one("#wb-editor-label", Label).update("Model ID *")
-            self.query_one("#wb-editor").display = True
-            editor.focus()
+            self._sync_view()
+            self._restore_view_focus("wb-input")
             self._update_help()
         else:
             return key == "status"
@@ -2472,6 +3101,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
 
     def _begin_saved_connection_edit(self, state: ManagementState) -> None:
         connection = state.connection
+        self._draft_session += 1
         self._add = ProviderDraft(
             "existing",
             state.provider_id,
@@ -2490,8 +3120,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._stage = "connection"
         self._view = WorkbenchView.CONNECTION
         self._models_list_open = False
-        self.query_one("#wb-models").display = False
         self._refresh_add_connection()
+        self._activate_view(WorkbenchView.CONNECTION, focus_id="wb-actions")
 
     def _select_action(self, key: str) -> None:  # noqa: PLR0912, PLR0915
         state = self.state
@@ -2528,20 +3158,21 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     "key": "API Key *",
                 }[key]
             )
-            self.query_one("#wb-editor").display = True
-            editor.focus()
+            self._sync_view()
+            self._restore_view_focus("wb-input")
         elif key == "discover":
             self.run_worker(
-                self._discover(state), group="workbench-discovery", exclusive=True
+                self._discovery_request(state),
+                group="workbench-discovery",
+                exclusive=True,
             )
         elif key == "models":
             if self._view != WorkbenchView.MODELS:
                 self._push_view(WorkbenchView.MODELS)
             self._models_list_open = True
             self._view = WorkbenchView.MODELS
-            self.query_one("#wb-models").display = True
             self._refresh_models()
-            self.set_focus(self.query_one("#wb-models", ModelChecklist))
+            self._activate_view(WorkbenchView.MODELS, focus_id="wb-models")
         elif key.startswith("collision:"):
             wire = key.partition(":")[2]
             item = state.pending[wire]
@@ -2558,8 +3189,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 self.query_one("#wb-editor-label", Label).update(
                     "Separate Canonical Name"
                 )
-                self.query_one("#wb-editor").display = True
-                editor.focus()
+                self._sync_view()
+                self._restore_view_focus("wb-input")
         elif key == "apply":
             self._apply(state)
         elif key == "discard":
@@ -2570,7 +3201,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._update_help()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        if self._busy:
+        if not self._can_activate(event.input.id):
             return
         if event.input.id == "wb-input":
             self._accept_editor()
@@ -2607,7 +3238,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
 
     def _field_error(self, reason: str) -> None:
         self.query_one("#wb-input", Input).add_class("-invalid")
-        self.query_one("#wb-field-error", NoMarkupStatic).update(f"Error: {reason}")
+        error = self.query_one("#wb-field-error", NoMarkupStatic)
+        error.add_class("has-error")
+        error.update(f"Error: {reason}")
         self._set_feedback("field", reason, "error")
 
     def _accept_connection_form_field(self, input_widget: Input) -> None:
@@ -2636,20 +3269,15 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         elif input_widget.id == "wb-connection-key":
             actions = self.query_one("#wb-connection-actions", WorkbenchList)
             if self._add.api_key_env_var:
-                actions.highlighted = next(
-                    (
-                        index
-                        for index, option in enumerate(actions.options)
-                        if option.id == "save-key"
-                    ),
-                    0,
-                )
+                actions.highlighted = 0
             self.set_focus(actions)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "wb-input":
             event.input.remove_class("-invalid")
-            self.query_one("#wb-field-error", NoMarkupStatic).update("")
+            error = self.query_one("#wb-field-error", NoMarkupStatic)
+            error.remove_class("has-error")
+            error.update("")
         elif event.input.id in {
             "detail-thinking",
             "detail-temperature",
@@ -2709,8 +3337,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._editing = None
         editor.value = ""
         editor.remove_class("-invalid")
-        self.query_one("#wb-editor").display = False
+        self._sync_view()
         self._refresh_add_connection(highlight=key)
+        self._return_from_editor()
 
     def _accept_manual_model(self, state: ManagementState) -> None:
         editor = self.query_one("#wb-input", Input)
@@ -2730,10 +3359,10 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._set_feedback("field", "", "info")
         self._editing = None
         editor.value = ""
-        self.query_one("#wb-editor").display = False
+        self._sync_view()
         self._refresh_models(highlight=wire)
         self._refresh_add_models(highlight="manual")
-        self.query_one("#wb-models", ModelChecklist).focus()
+        self._return_from_editor()
 
     def _accept_editor(self) -> None:  # noqa: PLR0911
         if self._busy:
@@ -2766,6 +3395,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             self._activate_view(
                 WorkbenchView.DETAIL, focus_id="wb-detail-fields", selected_id=field
             )
+            self._return_from_editor()
             return
         if self._stage == "connection" and self._add is not None and key != "key":
             self._accept_add_connection(key)
@@ -2802,20 +3432,14 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._editing = None
         editor.value = ""
         editor.remove_class("-invalid")
-        self.query_one("#wb-editor").display = False
+        self._sync_view()
         self._refresh_actions()
         self._refresh_browser()
-        self.query_one("#wb-actions", NavigableOptionList).focus()
+        self._return_from_editor()
 
     def _accept_credential(self, value: str, state: ManagementState | None) -> None:
         if not value:
-            if self._credential_input_id == "wb-input":
-                self._field_error("Enter a key before saving.")
-            else:
-                widget = self.query_one(f"#{self._credential_input_id}", Input)
-                widget.add_class("-invalid")
-                self._set_feedback("field", "Enter a key before saving.", "error")
-                self.set_focus(widget)
+            self._field_error("Enter a key before saving.")
             return
         env = (
             self._add.api_key_env_var
@@ -2852,7 +3476,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         editor = self.query_one("#wb-input", Input)
         credential_input = self.query_one(f"#{self._credential_input_id}", Input)
         editor.value = ""
-        self.query_one("#wb-editor").display = False
+        self._sync_view()
         if self._stage == "connection":
             self._refresh_add_connection(highlight="key")
             self.set_focus(self.query_one("#wb-actions", WorkbenchList))
@@ -2883,6 +3507,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         elif self._stage == "models":
             self._refresh_add_models(highlight="edit-key")
         self._refresh_browser()
+        self._return_from_editor()
         self._update_help()
 
     @staticmethod
@@ -2940,20 +3565,53 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             result.diagnostics,
         )
 
-    async def _discover(self, state: ManagementState) -> None:
+    def _discovery_request(
+        self, state: ManagementState
+    ) -> partial[Coroutine[None, None, None]]:
         provider_id, generation = state.begin_discovery()
-        self._set_feedback(
-            "discovery",
-            f"Discovering models for {provider_id}{chrome_glyph('running')}",
-            "running",
+        return partial(
+            self._discover,
+            state,
+            request=(
+                provider_id,
+                generation,
+                self._stage,
+                deepcopy(state.connection),
+                self._add.name
+                if self._stage == "models" and self._add
+                else self._friendly(provider_id),
+            ),
         )
-        connection = state.connection
+
+    async def _discover(
+        self,
+        state: ManagementState,
+        *,
+        request: tuple[str, int, str | None, ConnectionDraft, str] | None = None,
+    ) -> None:
+        if self._unmounted or self._dismissed or not self.is_mounted or self._busy:
+            return
+        if request is None:
+            if self.state is not state:
+                return
+            provider_id, generation = state.begin_discovery()
+            stage, connection = self._stage, deepcopy(state.connection)
+            display_name = (
+                self._add.name
+                if stage == "models" and self._add
+                else self._friendly(provider_id)
+            )
+        else:
+            provider_id, generation, stage, connection, display_name = request
+        running_message = (
+            f"Discovering models for {provider_id}{chrome_glyph('running')}"
+        )
+        self._set_feedback("discovery", running_message, "running")
+        feedback_token = self._feedback_token
         provider = ProviderDraft(
             None,
             provider_id,
-            self._add.name
-            if self._stage == "models" and self._add
-            else self._friendly(provider_id),
+            display_name,
             connection.api_base,
             connection.api_style,
             connection.api_key_env_var,
@@ -2977,13 +3635,24 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             )
         if isinstance(result, DiscoveryResult):
             result = self._chat_discovery(state, result, provider_id=provider_id)
-        if (
-            self._busy
-            or self._dismissed
-            or self.state is not state
-            or state.provider_id != provider_id
-            or not state.accept_discovery(provider_id, generation, result)
-        ):
+        rejected = self._stage != stage or self._unmounted or not self.is_mounted
+        if not rejected:
+            rejected = (
+                self._busy
+                or self._dismissed
+                or self.state is not state
+                or state.provider_id != provider_id
+                or not state.accept_discovery(provider_id, generation, result)
+            )
+        if rejected:
+            if (
+                self.is_mounted
+                and not self._unmounted
+                and self._feedback_token == feedback_token
+                and self._message == running_message
+            ):
+                self._set_feedback("discovery", "", "info")
+                self._update_help()
             return
         self._set_feedback(
             "discovery",
@@ -2994,7 +3663,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         )
         self._refresh_browser()
         self._refresh_actions()
-        if self.query_one("#wb-models").display:
+        if self._models_list_open or self.query_one("#wb-models").display:
             self._refresh_models()
         self._update_help()
 
@@ -3007,6 +3676,15 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self, event: SelectionList.SelectedChanged
     ) -> None:
         if self._busy or self._model_sync or self.state is None:
+            return
+        if event.selection_list.id == "wb-models" and (
+            not self._can_activate("wb-models")
+            or self._group_contents_context.get("wb-models")
+            != (
+                WorkbenchView.MODELS,
+                self._group_context(WorkbenchView.MODELS, "wb-models"),
+            )
+        ):
             return
         if (
             event.selection_list.id == "wb-models"
@@ -3209,21 +3887,24 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             )
         self._detail_original = self._detail_form_snapshot()
         detail_actions = self.query_one("#wb-detail-actions", WorkbenchList)
+        action_position = self._position_before_rebuild(
+            WorkbenchView.DETAIL, "wb-detail-actions"
+        )
         detail_actions.clear_options()
         detail_actions.add_option(
             Option("Accept model edits into catalog draft", id="save-detail")
         )
         detail_actions.highlighted = 0
-        models.display = False
-        self.query_one("#wb-providers").display = False
-        self.query_one("#wb-actions").display = False
-        self.query_one("#wb-catalog").display = False
-        self._refresh_detail_fields(highlight="thinking")
+        self._restore_group_position(action_position)
+        self._refresh_detail_fields()
         self._activate_view(WorkbenchView.DETAIL, focus_id="wb-detail-fields")
         self._update_help()
 
     def _refresh_detail_fields(self, *, highlight: str | None = None) -> None:
         rows = self.query_one("#wb-detail-fields", WorkbenchList)
+        position = self._position_before_rebuild(
+            WorkbenchView.DETAIL, "wb-detail-fields"
+        )
         previous = highlight or (
             str(rows.highlighted_option.id) if rows.highlighted_option else "thinking"
         )
@@ -3253,11 +3934,10 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 id="images",
             )
         )
-        rows.add_option(
-            Option("Accept model edits into catalog draft", id="save-detail")
-        )
         ids = [str(option.id) for option in rows.options]
         rows.highlighted = ids.index(previous) if previous in ids else 0
+        if highlight is None:
+            self._restore_group_position(position)
 
     def _toggle_detail_images(self) -> None:
         images = self.query_one("#wb-image-support", ModelChecklist)
@@ -3498,7 +4178,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             state.set_edits(name, replacement)
         if self._feedback_kind not in {"error", "warning"}:
             self._message = ""
-        self._close_detail(pop=True)
+        self._close_detail()
         self._refresh_actions()
         self._refresh_browser()
 
@@ -3539,32 +4219,25 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             f"Model details: {name} · {state.provider_id}/{wire}", reserve=4
         )
 
-    def _close_detail(self, *, pop: bool = True) -> None:
+    def _close_detail(self) -> None:
         self._detail = None
         self._detail_edit_row = None
         self._detail_preview_wire = None
         self._detail_original = None
-        if pop and self._pop_view():
+        if self._pop_view():
             return
-        if not pop and self._navigation:
-            self._view = self._navigation[-1].view
-        self.query_one("#wb-detail").display = False
-        self.query_one("#wb-providers").display = False
-        self.query_one("#wb-catalog").display = self._models_view
-        self.query_one("#wb-actions").display = (
-            not self._models_view and not self._models_list_open
-        )
-        self.query_one("#wb-models").display = (
-            not self._models_view and self._models_list_open
-        )
         self._refresh_models(highlight=self._detail_cursor)
         models = self.query_one("#wb-models", ModelChecklist)
         models.scroll_y = self._detail_scroll
         if self._models_view:
             self._refresh_catalog()
-            self.query_one("#wb-catalog", NavigableOptionList).focus()
+            self._activate_view(WorkbenchView.CATALOG, focus_id="wb-catalog")
         else:
-            models.focus()
+            self._activate_view(
+                WorkbenchView.MODELS
+                if self._models_list_open
+                else WorkbenchView.ACTIONS
+            )
         self._update_help()
 
     def _apply(self, state: ManagementState) -> None:
@@ -3723,8 +4396,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 self._provider_open = False
                 self._models_list_open = False
                 self._view = WorkbenchView.PROVIDERS
-                self.query_one("#wb-models").display = False
-                self.query_one("#wb-providers").display = True
+                self._sync_view()
                 self._browser_cursor = state.provider_id
                 self.query_one("#wb-providers", BrowserList).highlighted = None
             await self._reload_catalog()
@@ -3749,7 +4421,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     selected_id=state.provider_id,
                 )
                 browser.focus()
-                self.call_after_refresh(browser.focus)
+                self._defer_focus(browser)
             else:
                 self._refresh_actions(highlight="apply")
                 self._refresh_models()
@@ -3783,7 +4455,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             if saved and create and not self._reload_failed:
                 browser = self.query_one("#wb-providers", BrowserList)
                 browser.focus()
-                self.call_after_refresh(browser.focus)
+                self._defer_focus(browser)
             frame = self._commit_return
             self._commit_return = None
             if frame is not None and (not create or not saved):
@@ -3802,11 +4474,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     self._models_list_open = True
                     self._refresh_models()
                     self._activate_view(WorkbenchView.MODELS, focus_id="wb-models")
-                    self.call_after_refresh(
-                        self.query_one("#wb-models", ModelChecklist).focus
-                    )
+                    self._defer_focus(self.query_one("#wb-models", ModelChecklist))
                     self.run_worker(
-                        self._discover(self.state),
+                        self._discovery_request(self.state),
                         group="workbench-discovery",
                         exclusive=True,
                     )
@@ -3856,6 +4526,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             self._set_busy(False)
 
     async def on_unmount(self) -> None:
+        self._unmounted = True
         if self._commit_task is not None and not self._commit_task.done():
             await asyncio.shield(self._commit_task)
 
@@ -3867,6 +4538,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             opener = self.query(f"#{opener_id}")
             if opener and opener.first().display:
                 opener.first().focus()
+                self._restore_group_position(self._confirm_position, restore_focus=True)
+                self._confirm_position = None
                 return
         for widget_id in ("wb-catalog", "wb-actions", "wb-providers"):
             widget = self.query_one(f"#{widget_id}")
@@ -3874,14 +4547,14 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 widget.focus()
                 return
 
-    def action_confirm_yes(self) -> None:  # noqa: PLR0915
+    def action_confirm_yes(self) -> None:
         if self._busy:
             return
         if not self._confirm:
             return
         decision = self._confirm
         self._confirm = None
-        self.query_one("#wb-confirm").display = False
+        self._sync_view()
         state = self.state
         if decision == "replace-connection" and state:
             self._connection_approved = True
@@ -3893,10 +4566,6 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             self._save_key(
                 self.query_one(f"#{self._credential_input_id}", Input).value.strip()
             )
-        elif decision == "add-switch":
-            self.state = None
-            self._pre_add_state = None
-            self._start_add()
         elif decision in {"add-discard", "add-discard-simple"}:
             if self.state:
                 self.state.begin_discovery()
@@ -3910,10 +4579,10 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             self._provider_open = False
             self._models_list_open = False
             self._view = WorkbenchView.PROVIDERS
-            self.query_one("#wb-actions").display = False
-            self.query_one("#wb-providers").display = True
             self._refresh_browser()
-            self.query_one("#wb-providers", BrowserList).focus()
+            self._activate_view(WorkbenchView.PROVIDERS, focus_id="wb-providers")
+            self._restore_transient_opener(self._add_opener)
+            self._add_opener = None
         elif decision == "discard" and state:
             state.begin_discovery()
             self.state = ManagementState.from_snapshot(self.snapshot, state.provider_id)
@@ -3923,8 +4592,6 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 self._refresh_catalog()
         elif decision == "close":
             self._finish()
-        elif decision.startswith("switch:"):
-            self._expand(decision.partition(":")[2])
         elif decision.startswith("existing:") and state:
             wire = decision.partition(":")[2]
             item = state.pending[wire]
@@ -3938,7 +4605,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if self._busy or self._confirm != "add-discard" or self._add_state is None:
             return
         self._confirm = None
-        self.query_one("#wb-confirm").display = False
+        self._sync_view()
         self._confirm_opener = None
         self._connection_action("continue")
 
@@ -3946,7 +4613,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if self._busy or self._confirm != "detail-discard":
             return
         self._confirm = None
-        self.query_one("#wb-confirm").display = False
+        self._sync_view()
         self._confirm_opener = None
         self._save_detail()
 
@@ -3954,7 +4621,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if self._busy or self._confirm != "detail-discard":
             return
         self._confirm = None
-        self.query_one("#wb-confirm").display = False
+        self._sync_view()
         self._confirm_opener = None
         self._close_detail()
 
@@ -3965,18 +4632,13 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             return
         decision = self._confirm
         self._confirm = None
-        self.query_one("#wb-confirm").display = False
+        self._sync_view()
         if decision == "shared-key":
-            if self._credential_input_id == "wb-connection-key":
-                self.query_one("#wb-connection-form").display = True
-                self.set_focus(self.query_one("#wb-connection-key", Input))
-            else:
-                self.query_one("#wb-editor").display = True
-                self.set_focus(self.query_one("#wb-input", Input))
-        elif self._confirm_opener and not decision.startswith("existing:"):
-            opener = self.query(f"#{self._confirm_opener}")
-            if opener:
-                opener.first().focus()
+            self._restore_view_focus(self._credential_input_id)
+        elif self._confirm_opener:
+            self._restore_view_focus(self._confirm_opener)
+        self._restore_group_position(self._confirm_position, restore_focus=True)
+        self._confirm_position = None
         self._confirm_opener = None
         if decision.startswith("existing:") and self.state:
             wire = decision.partition(":")[2]
@@ -3998,32 +4660,10 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._provider_open = False
         self._navigation.clear()
         self._view = WorkbenchView.PROVIDERS
-        self.query_one("#wb-choose").display = False
-        self.query_one("#wb-actions").display = False
-        self.query_one("#wb-models").display = False
-        self.query_one("#wb-providers").display = True
-        self.query_one("#wb-providers", BrowserList).focus()
+        self._activate_view(WorkbenchView.PROVIDERS, focus_id="wb-providers")
+        self._restore_transient_opener(self._add_opener)
+        self._add_opener = None
         self._update_help()
-
-    def _keep_add_draft(self) -> None:
-        """Return to the browser while retaining the staged provider and models."""
-        if self.state is None or self._stage != "models":
-            return
-        provider_id = self.state.provider_id
-        self.state.begin_discovery()
-        self._stage = None
-        self._add = None
-        self._add_state = None
-        self._add_checkpoint = None
-        self._pre_add_state = None
-        self._models_list_open = False
-        self._provider_open = False
-        self._navigation.clear()
-        self._browser_cursor = provider_id
-        self._refresh_browser()
-        self._activate_view(
-            WorkbenchView.PROVIDERS, focus_id="wb-providers", selected_id=provider_id
-        )
 
     def _back_add(self) -> None:
         if self._stage == "models":
@@ -4055,40 +4695,77 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         elif self._stage == "choose":
             self._leave_add()
 
-    def action_help(self) -> None:
-        self._help_open = not self._help_open
-        self._update_help()
+    def _restore_transient_opener(self, frame: NavigationFrame | None) -> None:
+        if frame is None:
+            return
+        self._sync_view()
+        self._restore_view_focus(frame.focus_id or "wb-providers")
+        self._restore_group_position(frame.position, restore_focus=True)
 
-    def action_back(self) -> None:  # noqa: PLR0911, PLR0912, PLR0915
+    def _return_from_editor(self) -> None:
+        opener = self._editor_opener
+        self._editor_opener = None
+        self._restore_transient_opener(opener)
+
+    def action_help(self) -> None:
+        if self._busy or self._confirm:
+            return
         if self._help_open:
             self._help_open = False
+            opener = self._help_opener
+            self._help_opener = None
             self._update_help()
-            return
+            self._restore_transient_opener(opener)
+        else:
+            self._help_opener = self._frame()
+            self._help_open = True
+            self._update_help()
+
+    def action_back(self) -> None:  # noqa: PLR0911, PLR0912, PLR0915
         if self._busy:
             self._update_help()
             return
         if self._confirm:
             self.action_confirm_no()
             return
+        if self._help_open:
+            self.action_help()
+            return
+        if self._editing:
+            self._key_after_env = False
+            row = self._detail_edit_row
+            self._editing = None
+            self._detail_edit_row = None
+            self.query_one("#wb-input", Input).value = ""
+            if row:
+                self._refresh_detail_fields(highlight=row)
+            self._return_from_editor()
+            self._update_help()
+            return
         if self._preset_field is not None:
+            self._capture_group_position()
             field = self._preset_field
             self._preset_field = None
             self._refresh_preset_editor(highlight=field)
-            self._activate_view(
-                WorkbenchView.PRESET_EDITOR, focus_id="wb-preset-editor"
-            )
+            if not self._pop_view():
+                self._activate_view(
+                    WorkbenchView.PRESET_EDITOR,
+                    focus_id="wb-preset-editor",
+                    selected_id=field,
+                )
             return
         if self._view == WorkbenchView.PRESET_EDITOR:
             self._close_preset_editor()
             return
         if self._view == WorkbenchView.PRESETS:
             self._stage = None
-            self._refresh_browser()
-            self._activate_view(
-                WorkbenchView.PROVIDERS,
-                focus_id="wb-providers",
-                selected_id="\x00presets",
-            )
+            opener = self._presets_opener
+            self._presets_opener = None
+            if opener and opener.focus_id:
+                self._restore_frame(opener)
+            else:
+                self._refresh_browser()
+                self._activate_view(WorkbenchView.PROVIDERS, focus_id="wb-providers")
             return
         if (
             self.filter_text
@@ -4102,7 +4779,6 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             return
         if self._protocol_picker:
             self._protocol_picker = False
-            self.query_one("#wb-protocol").display = False
             if not self._pop_view():
                 self._activate_view(WorkbenchView.ACTIONS, focus_id="wb-actions")
             return
@@ -4123,33 +4799,11 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 self._activate_view(WorkbenchView.PROVIDERS, focus_id="wb-providers")
             self._update_help()
             return
-        if self._editing:
-            self._key_after_env = False
-            if self._editing.startswith("detail:"):
-                row = self._detail_edit_row or self._editing.removeprefix("detail:")
-                self._editing = None
-                self._detail_edit_row = None
-                self.query_one("#wb-input", Input).value = ""
-                self._refresh_detail_fields(highlight=row)
-                self._activate_view(
-                    WorkbenchView.DETAIL, focus_id="wb-detail-fields", selected_id=row
-                )
-                return
-            self._editing = None
-            self.query_one("#wb-input", Input).value = ""
-            self.query_one("#wb-editor").display = False
-            if self._models_list_open:
-                self._view = WorkbenchView.MODELS
-                self.set_focus(self.query_one("#wb-models", ModelChecklist))
-            else:
-                self.set_focus(self.query_one("#wb-actions", NavigableOptionList))
-        elif self._detail:
+        if self._detail:
             if self._detail_is_modified():
                 self._confirm = "detail-discard"
             else:
                 self._close_detail()
-        elif self._picker:
-            self._close_picker()
         elif self._stage == "models" and self._models_list_open:
             self._models_list_open = False
             if not self._pop_view():
@@ -4161,7 +4815,6 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             self._refresh_browser()
         elif self._models_list_open:
             self._models_list_open = False
-            self.query_one("#wb-models").display = False
             if not self._pop_view():
                 self._activate_view(WorkbenchView.ACTIONS, focus_id="wb-actions")
         elif self.state:
@@ -4170,10 +4823,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     self.state.begin_discovery()
                     self.state = None
                 self._provider_open = False
-                self.query_one("#wb-actions").display = False
-                self.query_one("#wb-providers").display = True
-                self._view = WorkbenchView.PROVIDERS
-                self.query_one("#wb-providers", BrowserList).focus()
+                self._activate_view(WorkbenchView.PROVIDERS, focus_id="wb-providers")
             elif self.state.dirty:
                 self._confirm = "close"
             else:
@@ -4274,23 +4924,11 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 "Unsaved model edits are still local to this form. Keep editing, save them into the catalog draft, or discard them.",
                 "Discard model edits",
             )
-        if decision == "add-switch":
-            return (
-                "Discard all catalog edits across providers and global roles to start a new provider? "
-                "Saved credentials remain saved. Keep editing preserves your edits.",
-                "Discard edits",
-            )
         if decision == "close":
             return (
                 "Discard all catalog edits across providers and global roles and close? "
                 "Saved credentials remain saved. Keep editing preserves your edits and leaves the workbench open.",
                 "Discard and close",
-            )
-        if decision and decision.startswith("switch:"):
-            return (
-                f"Discard all catalog edits across providers and global roles to open {decision.partition(':')[2]}? "
-                "Saved credentials remain saved. Keep editing preserves your edits.",
-                "Discard edits",
             )
         return (
             "Discard all catalog edits across providers and global roles? "
@@ -4298,7 +4936,46 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             "Discard all pending changes",
         )
 
+    def _visibility_projection(self) -> tuple[str, set[str]]:
+        """Resolve body, replacement editor, and overlay without changing state."""
+        groups = self.VIEW_GROUPS[self._view]
+        if self._editing:
+            groups = self.VIEW_GROUPS[WorkbenchView.EDITOR]
+        elif self._detail:
+            groups = self.VIEW_GROUPS[WorkbenchView.DETAIL]
+        primary = groups[0]
+        visible = set(groups)
+        if primary == "models" and self._stage != "models":
+            visible.discard("models-actions")
+        if primary == "catalog" and not (self.state and self.state.dirty):
+            visible.discard("catalog-actions")
+        if self._confirm:
+            visible.add("confirm")
+        else:
+            visible.update(("help", "hint"))
+        return primary, visible
+
+    def _apply_visibility(self, visible: set[str]) -> None:
+        """The only view-control display writer; pending-action is host-owned."""
+        for name in (*self.VIEW_CONTROLS, "help", "hint"):
+            self.query_one(f"#wb-{name}").display = name in visible
+        self.query_one("#wb-actions").set_class(
+            self._view == WorkbenchView.ACTIONS, "wb-management-fields"
+        )
+        self.query_one("#wb-confirm-host").display = "confirm" in visible
+        for name in self.UNDERLAY_CONTROLS:
+            widget = self.query_one(f"#wb-{name}")
+            widget.set_class(
+                bool(self._confirm and widget.display), "wb-confirm-underlay"
+            )
+
     def _sync_view(self) -> str:
+        if self._editing and self._editor_opener is None:
+            self._editor_opener = self._frame()
+        primary, visible = self._visibility_projection()
+        opening_confirmation = bool(
+            self._confirm and not self.query_one("#wb-confirm").display
+        )
         if self._confirm:
             confirm = self.query_one("#wb-confirm")
             confirm.border_title = "Confirm change"
@@ -4308,9 +4985,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 max(0, (self.size.width - width) // 2),
                 max(0, (self.size.height - 10) // 2),
             )
-            host.display = True
-            if not confirm.display:
+            if opening_confirmation:
                 self._confirm_opener = self.focused.id if self.focused else None
+                self._confirm_position = self._capture_group_position()
                 message, label = self._confirmation_content()
                 self.query_one("#wb-confirm-text", NoMarkupStatic).update(message)
                 actions = self.query_one("#wb-confirm-actions", NavigableOptionList)
@@ -4340,92 +5017,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                         )
                     )
                 actions.highlighted = 0
-                confirm.display = True
-                actions.focus()
-        else:
-            self.query_one("#wb-confirm").display = False
-            self.query_one("#wb-confirm-host").display = False
-        primary = {
-            WorkbenchView.PROVIDERS: "providers",
-            WorkbenchView.CHOOSE: "choose",
-            WorkbenchView.CONNECTION: "actions",
-            WorkbenchView.ACTIONS: "actions",
-            WorkbenchView.MODELS: "models",
-            WorkbenchView.CATALOG: "catalog",
-            WorkbenchView.DEPLOYMENTS: "picker",
-            WorkbenchView.DETAIL: "detail-fields",
-            WorkbenchView.EDITOR: "editor",
-            WorkbenchView.PROTOCOL: "protocol",
-            WorkbenchView.PICKER: "picker",
-            WorkbenchView.PRESETS: "presets",
-            WorkbenchView.PRESET_EDITOR: "preset-editor",
-            WorkbenchView.CONFIRM: "confirm",
-        }[self._view]
-        if self._editing:
-            primary = "editor"
-        elif self._detail:
-            primary = "detail-fields"
-        for name in (
-            "providers",
-            "actions",
-            "choose",
-            "picker",
-            "catalog-filter",
-            "catalog",
-            "presets",
-            "preset-editor",
-            "detail-fields",
-            "protocol",
-            "models",
-            "models-actions",
-            "detail",
-            "detail-actions",
-            "editor",
-            "connection-form",
-            "connection-actions",
-            "confirm",
-        ):
-            self.query_one(f"#wb-{name}").display = (
-                name == primary
-                or (name == "confirm" and self._confirm is not None)
-                or (primary == "catalog" and name == "catalog-filter")
-                or (primary == "connection-form" and name == "connection-actions")
-                or (
-                    primary == "models"
-                    and name == "models-actions"
-                    and self._stage == "models"
-                )
-            )
-        self.query_one("#wb-help").display = self._confirm is None
-        self.query_one("#wb-hint").display = self._confirm is None
-        underlay_ids = (
-            "wb-title",
-            "wb-pending-action",
-            "wb-filter",
-            "wb-count",
-            "wb-providers",
-            "wb-actions",
-            "wb-choose",
-            "wb-picker",
-            "wb-catalog-filter",
-            "wb-catalog",
-            "wb-protocol",
-            "wb-models",
-            "wb-models-actions",
-            "wb-detail",
-            "wb-detail-actions",
-            "wb-editor",
-            "wb-connection-form",
-            "wb-connection-actions",
-            "wb-help",
-            "wb-hint",
-        )
-        for widget_id in underlay_ids:
-            widget = self.query_one(f"#{widget_id}")
-            if self._confirm and widget.display:
-                widget.add_class("wb-confirm-underlay")
-            else:
-                widget.remove_class("wb-confirm-underlay")
+        self._apply_visibility(visible)
+        if opening_confirmation:
+            self._restore_view_focus("wb-confirm-actions")
         context = (
             "Unsaved provider draft"
             if self._confirm in {"add-discard", "add-discard-simple"}
@@ -4466,6 +5060,10 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         )
         self.query_one("#wb-filter", NoMarkupStatic).update(context)
         self.query_one("#wb-count").display = False
+        self._group_contents_context["wb-help"] = (
+            self._view,
+            self._group_context(self._view, "wb-help"),
+        )
         return primary
 
     def _set_feedback(
@@ -4474,6 +5072,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         message: str,
         kind: Literal["running", "success", "error", "warning", "info"],
     ) -> None:
+        self._feedback_token += 1
         if kind in {"error", "warning"}:
             self._unresolved[operation] = (message, kind)
         elif kind in {"success", "info"}:
@@ -4564,8 +5163,17 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             )
         return Text(message)
 
+    def _root_option(self) -> Option | None:
+        group = (
+            "#wb-root-actions"
+            if self.query_one("#wb-root-actions").has_focus
+            or self._help_focus_id == "wb-root-actions"
+            else "#wb-providers"
+        )
+        return self.query_one(group, OptionList).highlighted_option
+
     def _root_enter_hint(self) -> str:  # noqa: PLR0911
-        option = self.query_one("#wb-providers", BrowserList).highlighted_option
+        option = self._root_option()
         if option is not None and option.id == "\x00models":
             return "Open model catalog"
         if option is not None and option.id == "\x00finish":
@@ -4593,7 +5201,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         return "Cancel setup" if self.mode == "onboarding" else "Close"
 
     def _update_help(self) -> None:  # noqa: PLR0912, PLR0914, PLR0915
-        if not self.is_mounted:
+        if not self.is_mounted or self._unmounted:
             return
         primary = self._sync_view()
         state = self.state
@@ -4622,7 +5230,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             )
             description = (
                 f"{self._detail}: {chrome_glyph('vertical')} move; Enter edits a field; "
-                "Space toggles images. Accept model edits returns to the opener; "
+                "Space toggles images. Tab moves to acceptance actions. Accept model edits returns to the opener; "
                 f"{save_destination}"
             )
         elif primary == "models" and state:
@@ -4665,9 +5273,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                         description += " Configured but not returned by discovery; remains editable."
                 model_value = name
         elif primary == "presets":
-            description = "Each preset has one model and thinking level. Enter edits the selected pair; Esc returns to providers."
+            description = "Each preset has one model and thinking level. Enter edits the selected pair; Tab moves to Save/Add another actions; Esc returns to providers."
         elif primary == "preset-editor":
-            description = "Edit Model and Thinking in this preset, then Apply or Cancel. Up/Down move between fields and actions; Esc cancels."
+            description = "Edit Model and Thinking in this preset; Tab moves to Apply/Cancel actions. Apply accepts into the draft, never disk; Esc cancels."
         elif primary == "catalog":
             description = ""
             filter_focused = (
@@ -4685,9 +5293,13 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 )
                 option = None
             else:
-                option = self.query_one(
-                    "#wb-catalog", NavigableOptionList
-                ).highlighted_option
+                group = (
+                    "#wb-catalog-actions"
+                    if self._help_focus_id == "wb-catalog-actions"
+                    or self.query_one("#wb-catalog-actions").has_focus
+                    else "#wb-catalog"
+                )
+                option = self.query_one(group, NavigableOptionList).highlighted_option
             catalog = state.catalog if state else self.snapshot.catalog
             model = (
                 catalog.models.get(str(option.id).removeprefix("model:"))
@@ -4705,6 +5317,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     )
                     + ". Enter edits model."
                     if option and str(option.id).startswith("model:")
+                    else self.DESCRIPTIONS[str(option.id).removeprefix("\x00")]
+                    if option and option.id in {"\x00apply", "\x00discard"}
                     else "Select a provider filter or a model to inspect."
                 )
             )
@@ -4718,24 +5332,15 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 if self._view == WorkbenchView.DEPLOYMENTS
                 else "No models configured."
             )
-        elif primary == "connection-form" and self._add:
-            focused_id = (self.focused.id or "") if self.focused else ""
-            field_help = {
-                "wb-connection-name": "Enter accepts the provider name; Tab moves to API base.",
-                "wb-connection-base": "Enter accepts the API base URL; Tab moves to API style.",
-                "wb-connection-env": "Enter accepts the credential environment variable; Tab moves to API key.",
-                "wb-connection-key": "Enter moves to Save API key; select that action to save.",
-                "wb-connection-style": f"{chrome_glyph('vertical')} choose API style; Enter accepts the current style.",
-                "wb-connection-actions": "Select Save API key, then Continue to Models; Esc keeps this draft and goes back.",
-            }
-            description = field_help.get(
-                focused_id,
-                "Complete the labeled fields, then choose Continue to Models.",
-            )
         elif primary == "actions" and (state or self._add):
-            option = self.query_one(
-                "#wb-actions", NavigableOptionList
-            ).highlighted_option
+            group = self._help_focus_id
+            if group not in {
+                "wb-actions",
+                "wb-provider-operations",
+                "wb-connection-actions",
+            }:
+                group = "wb-actions"
+            option = self.query_one(f"#{group}", NavigableOptionList).highlighted_option
             key = str(option.id) if option and option.id else ""
             description = self.DESCRIPTIONS.get(
                 key, "Enter accepts fields into the catalog draft; only Apply saves it."
@@ -4758,7 +5363,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 display_value = value or ("Not required" if key == "env" else "Not set")
                 description = f"{display_value}. {description}"
         elif primary == "providers":
-            option = self.query_one("#wb-providers", BrowserList).highlighted_option
+            option = self._root_option()
             catalog = self.state.catalog if self.state else self.snapshot.catalog
             if option and option.id in catalog.providers:
                 action = (
@@ -4843,7 +5448,12 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 ("↑↓", "Move"),
                 ("Tab", "Provider filter"),
                 ("Shift+Tab", "Provider filter"),
-                ("Enter", "Edit"),
+                (
+                    "Enter",
+                    "Select"
+                    if self.query_one("#wb-catalog-actions").has_focus
+                    else "Edit",
+                ),
                 ("Esc", "Back"),
             ]
         )
@@ -4855,6 +5465,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 "wb-models-actions": "Actions",
                 "wb-catalog-filter": "Filter",
                 "wb-catalog": "Models",
+                "wb-catalog-actions": "Actions",
                 "wb-help": "Help",
             }
             current = self.focused.id if self.focused else None
@@ -4881,7 +5492,12 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         detail_bindings = [
             ("↑↓", "Move"),
             ("Space", "Toggle images"),
-            ("Enter", "Edit or save"),
+            (
+                "Enter",
+                "Accept edits"
+                if self.query_one("#wb-detail-actions").has_focus
+                else "Edit field",
+            ),
             ("Esc", "Back"),
         ]
         bindings = (
@@ -4900,8 +5516,6 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             if self._detail
             else model_bindings
             if primary == "models"
-            else [("Enter", "Accept field"), ("Tab", "Next field"), ("Esc", "Back")]
-            if primary == "connection-form"
             else picker_bindings
             if primary == "picker"
             else catalog_bindings
@@ -4914,6 +5528,35 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             if primary == "providers"
             else [("↑↓", "Move"), ("Enter", "Select"), ("Esc", "Back")]
         )
+        if (
+            primary
+            in {"providers", "actions", "detail-fields", "presets", "preset-editor"}
+            and groups
+            and not self._confirm
+            and not self._busy
+            and not self._editing
+        ):
+            labels = {
+                "wb-providers": "Providers",
+                "wb-root-actions": "Actions",
+                "wb-actions": "Fields",
+                "wb-provider-operations": "Operations",
+                "wb-connection-actions": "Actions",
+                "wb-detail-fields": "Fields",
+                "wb-detail-actions": "Actions",
+                "wb-presets": "Roles",
+                "wb-presets-actions": "Actions",
+                "wb-preset-editor": "Fields",
+                "wb-preset-editor-actions": "Actions",
+                "wb-help": "Help",
+            }
+            current = self.focused.id if self.focused else None
+            index = groups.index(current) if current in groups else 0
+            traversal = [
+                ("Tab", labels[groups[(index + 1) % len(groups)]]),
+                ("Shift+Tab", labels[groups[(index - 1) % len(groups)]]),
+            ]
+            bindings = traversal + bindings
         width = max(1, self.size.width - 2)
         shown = bindings
 
@@ -4927,7 +5570,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 (item for item in bindings if item[0] == "Esc"), ("Esc", "Back")
             )
             if (
-                primary in {"catalog", "models"}
+                primary
+                in {"catalog", "models", "detail-fields", "presets", "preset-editor"}
                 and groups
                 and not self._confirm
                 and not self._busy
@@ -4943,4 +5587,10 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 ]
             if hint_content(shown).cell_length > width:
                 shown = shown[:2]
+        self._hint_targets = []
+        offset = 0
+        for key, label in shown:
+            width = hint_content([(key, label)]).cell_length
+            self._hint_targets.append((offset, offset + width, key))
+            offset += width + 2
         self.query_one("#wb-hint", NoMarkupStatic).update(hint_content(shown))

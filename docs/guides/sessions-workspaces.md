@@ -29,6 +29,27 @@ validates and restores that identity rather than resolving a role again.
 creates a separate resumable copy. See the [command reference](../reference/commands.md)
 for the complete command surface.
 
+## Managed-job lifetime
+
+Managed shell jobs belong to one live root runtime, including jobs launched by
+its children. Normal turns, interruption after launch commit, and compaction
+preserve them. `/clear`, a new or replacement root, and resume/continue handoff
+stop the departing root's jobs before changing session identity. Ending the root
+session or shutting down the server also performs owned-job cleanup.
+
+A fork or clone has a fresh, empty job registry; it does not share or adopt the
+source root's jobs. If a session-changing rewind retires the old root, its jobs
+are stopped; an in-place transcript rewind does not itself stop them. Saved
+transcripts can contain historical job IDs and read results, but those handles
+do not authorize access in a resumed or forked runtime. No processes or live
+output buffers are adopted across a Chartreux restart.
+
+Actual worktree relocation is rejected while jobs or pending launches exist;
+a same-directory no-op is allowed. Stop jobs before relocating or reducing shell,
+workspace, or credential authority. Cleanup is bounded for owned process groups,
+not a guarantee against escaped descendants or forced-process-exit leakage; see
+[Tools and safety](tools-safety.md#managed-shell-jobs).
+
 ## Usage storage
 
 Recorded usage is stored independently of transcripts at

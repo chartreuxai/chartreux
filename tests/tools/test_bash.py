@@ -2198,14 +2198,16 @@ def test_executor_unknown_missing_and_ambiguous_forms_deny(
 
 
 def test_executor_argv_is_not_reparsed_as_shell(tmp_path: Path, monkeypatch) -> None:
+    from chartreux.core.tools.builtins import _shell_permission_resolver as resolver
+
     calls: list[str] = []
-    original = bash_module._analyze_guardrail_source
+    original = resolver._analyze_guardrail_source
 
     def record(source: str, *, nested_source: bool = False):
         calls.append(source)
         return original(source, nested_source=nested_source)
 
-    monkeypatch.setattr(bash_module, "_analyze_guardrail_source", record)
+    monkeypatch.setattr(resolver, "_analyze_guardrail_source", record)
     command = "uv run echo 'x; rm -r build' 'a b' 'print(1 * 2)'"
     assert _w11_permission(command, tmp_path).permission is ToolPermission.ALWAYS
     assert calls == [command]

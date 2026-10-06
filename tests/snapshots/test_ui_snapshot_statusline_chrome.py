@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -209,6 +210,37 @@ def test_status_line_degradation(snap_compare: SnapCompare, width: int) -> None:
         if width < 68:
             assert "Today" not in rendered
         assert "135k/400k" in rendered or width == 12
+
+    assert snap_compare(
+        "test_ui_snapshot_statusline_chrome.py:ChromeSnapshotApp",
+        terminal_size=(width, 12),
+        run_before=before,
+    )
+
+
+@pytest.mark.parametrize("count,width", [(0, 80), (2, 80), (2, 40), (2, 24)])
+def test_background_jobs_status_line(
+    snap_compare: SnapCompare, count: int, width: int
+) -> None:
+    async def before(pilot: Pilot) -> None:
+        status = pilot.app.query_one(SessionStatusLine)
+        status.set_state(replace(status.state, active_background_job_count=count))
+        status.set_config(
+            StatusLineConfigView(
+                segments=["directory", "pid", "context", "background-jobs", "model"]
+            )
+        )
+        await pilot.pause()
+        rendered = status.render().plain
+        assert status.state.active_background_job_count == count
+        assert status.size.height == 1
+        assert cell_len(rendered) <= width
+        if width >= 40:
+            assert f"Jobs {count}" in rendered
+        else:
+            assert "Jobs" not in rendered
+        if width <= 40:
+            assert "pid" not in rendered and "ZAI" not in rendered
 
     assert snap_compare(
         "test_ui_snapshot_statusline_chrome.py:ChromeSnapshotApp",

@@ -40,6 +40,7 @@ from chartreux.utils.io import read_safe
 
 if TYPE_CHECKING:
     from chartreux.core.agents.manager import AgentManager
+    from chartreux.core.background_jobs import BackgroundJobsPort
     from chartreux.core.callbacks import ClearContextCallback
     from chartreux.core.config import ChartreuxConfigSchema
     from chartreux.core.hooks.models import HookConfigResult
@@ -83,6 +84,7 @@ class InvokeContext:
     session_id: str | None = field(default=None)
     mcp_pool: MCPConnectionPool | None = field(default=None)
     tool_io: ToolIOPort | None = field(default=None)
+    background_jobs: BackgroundJobsPort | None = field(default=None)
     is_subagent: bool = field(default=False)
     register_wait_task: Callable[[asyncio.Task[TaskResult] | None], None] | None = None
 
@@ -264,6 +266,10 @@ class BaseTool[
         self,
         is_current: Callable[[], bool],
         parent_permission: Callable[[ToolArgs], PermissionContext | None] | None = None,
+        local_permission_guard: Callable[
+            [ToolArgs, PermissionContext | None], PermissionContext | None
+        ]
+        | None = None,
     ) -> None:
         """Bind manager lifetime without replacing tool-specific resolution.
 
@@ -275,7 +281,7 @@ class BaseTool[
         self._authority_is_current = is_current
         resolve = self.resolve_permission
 
-        def resolve_current(args: ToolArgs) -> PermissionContext | None:
+        def resolve_owned(args: ToolArgs) -> PermissionContext | None:
             if not is_current():
                 return PermissionContext(
                     permission=ToolPermission.NEVER,
@@ -283,10 +289,24 @@ class BaseTool[
                 )
             self._check_authority()
             local = resolve(args)
+            if local_permission_guard is not None:
+                guarded = local_permission_guard(args, local)
+                if guarded is not None and guarded.permission == ToolPermission.NEVER:
+                    return guarded
             parent = parent_permission(args) if parent_permission is not None else None
             if parent is not None and parent.permission == ToolPermission.NEVER:
                 return parent
             return local
+
+        def resolve_current(args: ToolArgs) -> PermissionContext | None:
+            if self.get_name() == "bash_start":
+                from chartreux.core.tools.builtins._shell_permission_resolver import (
+                    shell_analysis_scope,
+                )
+
+                with shell_analysis_scope():
+                    return resolve_owned(args)
+            return resolve_owned(args)
 
         self.resolve_permission = resolve_current
 

@@ -51,6 +51,7 @@ def state() -> SessionStatusState:
         ("git-branch", "feature/topic"),
         ("spend-today", "Today —"),
         ("spend-week", "Week —"),
+        ("background-jobs", "Jobs 0"),
         ("spend-month", "Month —"),
     ],
 )
@@ -149,7 +150,15 @@ def test_last_recorded_and_unavailable_identities(state):
 
 @pytest.mark.parametrize("separator", ["pipe", "space"])
 def test_order_and_pid_first_then_optional_tail(state, separator):
-    names = ["model", "context", "spend-today", "pid", "git-branch", "directory"]
+    names = [
+        "model",
+        "context",
+        "spend-today",
+        "pid",
+        "background-jobs",
+        "git-branch",
+        "directory",
+    ]
     config = StatusLineConfigView(segments=names, separator=separator)
     sep = " | " if separator == "pipe" else " "
 
@@ -159,7 +168,7 @@ def test_order_and_pid_first_then_optional_tail(state, separator):
     assert format_status_line(state, config, 200) == row(names)
     names.remove("pid")
     assert format_status_line(state, config, cell_len(row(names))) == row(names)
-    for name in ["git-branch", "spend-today", "model"]:
+    for name in ["git-branch", "background-jobs", "spend-today", "model"]:
         names.remove(name)
         assert format_status_line(state, config, cell_len(row(names))) == row(names)
 
@@ -324,6 +333,19 @@ def test_spend_settings_help_describes_live_global_cost(segment):
         "+" in description and "Unknown" in description and "unavailable" in description
     )
     assert "Requires" not in description and "currently" not in description
+
+
+@pytest.mark.parametrize("count", [0, 2])
+@pytest.mark.parametrize("ascii_chrome", [False, True])
+def test_jobs_opt_in(state, count, ascii_chrome):
+    snapshot = replace(
+        state, active_background_job_count=count, ascii_chrome=ascii_chrome
+    )
+    config = StatusLineConfigView(segments=["directory", "background-jobs", "context"])
+    assert f"Jobs {count}" in format_status_line(snapshot, config, 100)
+    assert "Jobs" not in format_status_line(snapshot, StatusLineConfigView(), 100)
+    assert "root session" in DESCRIPTIONS["background-jobs"]
+    assert "children" in DESCRIPTIONS["background-jobs"]
 
 
 def test_settings_preview_uses_deterministic_supplied_costs():

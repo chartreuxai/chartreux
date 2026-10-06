@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 from typing import Literal, cast
 
 import pytest
+from textual import events
 from textual.app import App
 from textual.content import Content
 from textual.widgets import Input, OptionList
+from textual.widgets.option_list import Option
 
 from chartreux.app_server._resources import _inventory_item_states
 from chartreux.app_server.protocol import (
@@ -16,11 +19,12 @@ from chartreux.app_server.protocol import (
     SettingsReadResponse,
 )
 from chartreux.cli.textual_ui.screens.settings import (
-    ADD_PATTERN,
     ConfirmationText,
     SettingsChecklist,
+    SettingsHints,
     SettingsOptionList,
     SettingsScreen,
+    _draft_values,
     inventory_item_state,
     inventory_name_matches,
     parse_setting_value,
@@ -41,6 +45,796 @@ from chartreux.core.config.settings_catalog import (
 from chartreux.core.utils.matching import name_matches
 from chartreux.ui.settings_service import SettingsSaveOutcome, SettingsService
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
+
+
+def focus_action(screen: SettingsScreen, identifier: str) -> OptionList:
+    actions = screen.query_one("#settings-actions", OptionList)
+    actions.highlighted = next(
+        i for i, row in enumerate(actions.options) if row.id == identifier
+    )
+    actions.focus()
+    return actions
+
+
+def navigation_payload(screen: SettingsScreen) -> object:
+    return (
+        _draft_values(screen._list_draft),
+        screen._enum_draft,
+        {
+            side: _draft_values(entries)
+            for side, entries in (screen._inventory_draft or {}).items()
+        },
+        screen.snapshot.model_dump(),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "group",
+    [
+        "settings-options",
+        "settings-entries",
+        "settings-choices",
+        "settings-checklist",
+        "settings-actions",
+    ],
+)
+@pytest.mark.parametrize("count", [0, 1, 30])
+@pytest.mark.parametrize("last", [False, True])
+async def test_wp3_bounded_keyboard_groups(group: str, count: int, last: bool) -> None:
+    service = FakeService()
+    path = (
+        "system_prompt_id"
+        if group == "settings-choices"
+        else "inventory_tools"
+        if group == "settings-checklist"
+        else "agent_paths"
+    )
+    next(
+        field for field in service.snapshot.fields if field.path == "agent_paths"
+    ).effective_value = [f"value-{i}" for i in range(count)]
+    service.snapshot.inventories["tools"] = [f"member-{i}" for i in range(count)]
+    next(
+        item for item in service.snapshot.catalog if item.path == "system_prompt_id"
+    ).choices = tuple(f"choice-{i}" for i in range(count))
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        catalog = screen.query_one(SettingsOptionList)
+        if group != "settings-options":
+            catalog.highlighted = catalog.get_option_index(path)
+            await pilot.press("enter")
+        options = screen.query_one(f"#{group}", OptionList)
+        if group == "settings-options":
+            # Include disabled headings at both ends and between selectable rows.
+            screen._replace_group(
+                options,
+                [Option("heading", disabled=True)]
+                + [Option("same", id=f"row:{i}") for i in range(count)]
+                + [Option("heading", disabled=True)],
+            )
+        options.focus()
+        await pilot.press("end" if last else "home")
+        before = options.highlighted
+        payload = navigation_payload(screen)
+        await pilot.press(
+            *(
+                ["down", "j", "pagedown", "end"]
+                if last
+                else ["up", "k", "pageup", "home"]
+            )
+        )
+        assert options.highlighted == before
+        assert options.has_focus
+        assert navigation_payload(screen) == payload
+        assert not service.saved
+        if group == "settings-options" and count > 1:
+            await pilot.press("home", "down")
+            assert options.highlighted == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize(
+    "path,body_id",
+    [
+        ("agent_paths", "settings-entries"),
+        ("system_prompt_id", "settings-choices"),
+        ("inventory_tools", "settings-checklist"),
+    ],
+)
+async def test_wp3_tab_order_and_row_scroll_reentry(
+    reverse: bool, path: str, body_id: str
+) -> None:
+    service = FakeService()
+    next(
+        field for field in service.snapshot.fields if field.path == "agent_paths"
+    ).effective_value = [f"value-{i}" for i in range(40)]
+    next(
+        item for item in service.snapshot.catalog if item.path == "system_prompt_id"
+    ).choices = tuple(f"choice-{i}" for i in range(40))
+    service.snapshot.inventories["tools"] = [f"member-{i}" for i in range(40)]
+    next(
+        field for field in service.snapshot.fields if field.path == "system_prompt_id"
+    ).effective_value = "choice-39"
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        catalog = screen.query_one(SettingsOptionList)
+        catalog.highlighted = catalog.get_option_index(path)
+        await pilot.press("enter")
+        body = screen.query_one(f"#{body_id}", OptionList)
+        if path == "system_prompt_id":
+            await pilot.pause()
+            assert body.highlighted == 39 and body.scroll_y > 0
+        body.highlighted = 25
+        await pilot.pause()
+        body.scroll_to(y=20, animate=False, immediate=True, force=True)
+        await pilot.pause()
+        selected = body.highlighted_option
+        scroll = body.scroll_y
+        assert selected is not None and scroll > 0
+        payload = navigation_payload(screen)
+        groups = ["settings-options", body_id] + (
+            [] if path == "system_prompt_id" else ["settings-actions"]
+        )
+        index = groups.index(body_id)
+        direction = -1 if reverse else 1
+        for _ in groups:
+            await pilot.press("shift+tab" if reverse else "tab")
+            index = (index + direction) % len(groups)
+            assert screen.focused is not None and screen.focused.id == groups[index]
+        await pilot.pause()
+        assert (
+            body.highlighted_option is not None
+            and body.highlighted_option.id == selected.id
+        )
+        assert body.scroll_y == scroll
+        screen._refresh_options()
+        await pilot.pause()
+        assert body.has_focus and body.scroll_y == scroll
+        assert navigation_payload(screen) == payload
+        assert not service.saved
+        # Catalog typing is suppressed throughout expansion, even when focused.
+        catalog.focus()
+        await pilot.press("x", "backspace")
+        assert catalog._query == ""
+        assert navigation_payload(screen) == payload
+        body.focus()
+        await pilot.press("f1", "tab")
+        assert not screen._help_open and catalog.has_focus
+        await pilot.press("shift+tab")
+        assert screen.focused is not None and screen.focused.id == groups[-1]
+        assert not service.saved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "selected,new_ids,expected",
+    [
+        (0, ["b", "c", "d"], "b"),
+        (1, ["a", "c", "d"], "c"),
+        (3, ["a", "b", "c"], "c"),
+        (2, ["b", "c", "d"], "c"),
+        (1, ["a", "d"], "a"),
+        (2, ["new0", "new1"], "new1"),
+        (1, [], None),
+    ],
+)
+async def test_wp3_position_repair(
+    selected: int, new_ids: list[str], expected: str | None
+) -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        options = screen.query_one(SettingsOptionList)
+        screen._replace_group(
+            options,
+            [Option("duplicate", id=identifier) for identifier in ["a", "b", "c", "d"]],
+        )
+        options.highlighted = selected
+        screen._replace_group(
+            options,
+            [Option("heading", disabled=True)]
+            + [Option("duplicate", id=identifier) for identifier in new_ids],
+        )
+        await pilot.pause()
+        assert (
+            options.highlighted_option.id if options.highlighted_option else None
+        ) == expected
+        assert options.has_focus and not service.saved
+        if not new_ids:
+            screen._replace_group(options, [Option("new", id="new")])
+            await pilot.pause()
+            assert (
+                options.highlighted_option is not None
+                and options.highlighted_option.id == "new"
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opener", ["entries", "actions"])
+async def test_wp3_nested_openers_and_exact_escape(opener: str) -> None:
+    service = FakeService()
+    values = [f"value-{i}" for i in range(40)]
+    next(
+        field for field in service.snapshot.fields if field.path == "agent_paths"
+    ).effective_value = [value for value in values]
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        catalog = screen.query_one(SettingsOptionList)
+        catalog.highlighted = catalog.get_option_index("agent_paths")
+        await pilot.pause()
+        catalog.scroll_to(y=2, animate=False, immediate=True, force=True)
+        expansion_position = screen._capture_group_position(catalog)
+        await pilot.press("enter")
+        entries = screen.query_one("#settings-entries", OptionList)
+        entries.highlighted = 25
+        await pilot.pause()
+        entries.scroll_to(y=20, animate=False, immediate=True, force=True)
+        await pilot.pause()
+        entry_id = entries.highlighted_option.id if entries.highlighted_option else None
+        entry_scroll = entries.scroll_y
+        if opener == "actions":
+            await pilot.press("tab", "home")
+        origin = screen.focused
+        assert origin is not None
+        origin_position = screen._capture_group_position(origin)
+        payload = navigation_payload(screen)
+        await pilot.press("enter", "tab", "shift+tab")
+        editor = screen.query_one("#settings-input", Input)
+        assert editor.has_focus
+        editor.value = "temporary"
+        await pilot.pause()
+        editor.cursor_position = 2
+        await pilot.press("f1")
+        assert screen._help_open
+        item = next(item for item in screen.catalog if item.path == "agent_paths")
+        screen._open_confirmation(
+            "discard", item, None, "Inspect nested confirmation", "Discard"
+        )
+        await pilot.press("escape")
+        assert screen._confirmation is None and screen._help_open
+        assert (
+            screen.query_one("#settings-help").has_focus and screen._editing is not None
+        )
+        await pilot.press("escape")
+        assert (
+            not screen._help_open and editor.has_focus and editor.cursor_position == 2
+        )
+        await pilot.press("escape")
+        await pilot.pause()
+        assert (
+            screen._editing is None
+            and origin.has_focus
+            and screen._expanded == "agent_paths"
+        )
+        assert origin_position is not None
+        assert screen._capture_group_position(origin) == origin_position
+        assert (
+            entries.highlighted_option is not None
+            and entries.highlighted_option.id == entry_id
+        )
+        assert entries.scroll_y == entry_scroll
+        assert navigation_payload(screen) == payload and not service.saved
+        # A dirty discard cancellation returns to this exact entry/action.
+        screen._list_draft = (
+            [*screen._list_draft, screen._new_draft_entry("new")]
+            if screen._list_draft
+            else []
+        )
+        await pilot.press("escape")
+        assert screen._confirmation is not None
+        await pilot.press("escape")
+        await pilot.pause()
+        assert origin.has_focus and screen._expanded == "agent_paths"
+        assert screen._capture_group_position(origin) == origin_position
+        # Confirm discard unwinds expansion, not the filter or Settings itself.
+        await pilot.press("escape", "down", "enter")
+        await pilot.pause()
+        assert screen._expanded is None and catalog.has_focus
+        assert screen._capture_group_position(catalog) == expansion_position
+        assert not service.saved
+
+
+@pytest.mark.asyncio
+async def test_wp3_confirmation_over_editor_and_help_group_exit() -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        await pilot.press(*"agent_paths", "enter", "tab", "enter")
+        screen = cast(SettingsScreen, pilot.app.screen)
+        editor = screen.query_one("#settings-input", Input)
+        editor.value = "untouched"
+        editor.cursor_position = 3
+        item = next(item for item in screen.catalog if item.path == "agent_paths")
+        screen._open_confirmation(
+            "discard", item, None, "Confirmation over editor", "Discard"
+        )
+        await pilot.press("tab", "shift+tab", "escape")
+        assert (
+            editor.has_focus
+            and editor.value == "untouched"
+            and editor.cursor_position == 3
+        )
+        assert screen._editing is not None
+        await pilot.press("escape")
+        actions = screen.query_one("#settings-actions", OptionList)
+        assert actions.has_focus
+        await pilot.press("down", "f1", "shift+tab")
+        assert actions.has_focus and not screen._help_open
+        assert (
+            actions.highlighted_option is not None
+            and actions.highlighted_option.id == "apply"
+        )
+        await pilot.press("f1")
+        screen.query_one("#settings-entries").focus()
+        await pilot.pause()
+        assert not screen._help_open and screen.query_one("#settings-entries").has_focus
+        assert not service.saved
+
+
+@pytest.mark.asyncio
+async def test_wp3_filter_opener_repair_and_escape_purity() -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        catalog = screen.query_one(SettingsOptionList)
+        catalog.highlighted = catalog.get_option_index("agent_paths")
+        await pilot.pause()
+        catalog.scroll_to(y=2, animate=False, immediate=True, force=True)
+        await pilot.pause()
+        opener = screen._capture_group_position(catalog)
+        payload = navigation_payload(screen)
+        await pilot.press(*"system_prompt")
+        assert (
+            catalog.highlighted_option is not None
+            and catalog.highlighted_option.id == "system_prompt_id"
+        )
+        await pilot.press("escape")
+        await pilot.pause()
+        assert (
+            catalog._query == "" and screen._capture_group_position(catalog) == opener
+        )
+        assert navigation_payload(screen) == payload and not service.saved
+        await pilot.press("escape")
+        assert not isinstance(pilot.app.screen, SettingsScreen)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path,body_id",
+    [
+        ("system_prompt_id", "settings-choices"),
+        ("inventory_tools", "settings-checklist"),
+    ],
+)
+async def test_wp3_dirty_collection_confirmation_and_help_openers(
+    path: str, body_id: str
+) -> None:
+    service = FakeService()
+    next(
+        item for item in service.snapshot.catalog if item.path == "system_prompt_id"
+    ).choices = ("default", "other")
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        catalog = screen.query_one(SettingsOptionList)
+        catalog.highlighted = catalog.get_option_index(path)
+        await pilot.press("enter", "down", "space")
+        body = screen.query_one(f"#{body_id}", OptionList)
+        opener = screen._capture_group_position(body)
+        payload = navigation_payload(screen)
+        await pilot.press("f1")
+        item = next(item for item in screen.catalog if item.path == path)
+        screen._open_confirmation(
+            "discard", item, None, "Inspect confirmation over help", "Discard"
+        )
+        await pilot.press("escape")
+        assert screen._help_open and screen.query_one("#settings-help").has_focus
+        await pilot.press("escape")
+        assert body.has_focus and screen._capture_group_position(body) == opener
+        await pilot.press("escape")
+        assert screen._confirmation is not None
+        await pilot.press("escape")
+        assert body.has_focus and screen._capture_group_position(body) == opener
+        assert navigation_payload(screen) == payload and not service.saved
+        await pilot.press("escape", "down", "enter")
+        assert screen._expanded is None and catalog.has_focus and not service.saved
+
+
+@pytest.mark.asyncio
+async def test_wp3_busy_escape_owns_press_before_confirmation_help_editor() -> None:
+    import asyncio
+
+    class DelayedService(FakeService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def save(
+            self, changed_leaves: dict[str, object], expected_revision: str | None
+        ) -> SettingsSaveOutcome:
+            self.started.set()
+            await self.release.wait()
+            return await super().save(changed_leaves, expected_revision)
+
+    service = DelayedService()
+    service.outcome = SettingsSaveOutcome(
+        "not_saved", "unchanged", error="write failed"
+    )
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        await pilot.press(*"agent_paths", "enter", "tab", "enter", "f1")
+        screen = cast(SettingsScreen, pilot.app.screen)
+        item = next(item for item in screen.catalog if item.path == "agent_paths")
+        screen._open_confirmation(
+            "discard", item, None, "Nested busy confirmation", "Discard"
+        )
+        worker = screen.run_worker(screen._write(item, []), group="settings-write")
+        await service.started.wait()
+        await pilot.press("escape")
+        assert screen._busy and screen._confirmation is not None and screen._help_open
+        assert screen._editing == item.path and screen._expanded == item.path
+        assert "Wait for save" in str(
+            screen.query_one("#settings-hint", NoMarkupStatic).content
+        )
+        service.release.set()
+        await worker.wait()
+        await pilot.press("escape")
+        assert (
+            screen._confirmation is None
+            and screen._help_open
+            and screen._editing == item.path
+        )
+
+
+@pytest.mark.asyncio
+async def test_wp3_catalog_jk_filter_text_not_movement() -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        catalog = screen.query_one(SettingsOptionList)
+        await pilot.press("j", "k")
+        assert catalog._query == ""
+        await pilot.press("a", "j", "k")
+        assert catalog._query == "ajk"
+        assert not service.saved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["status_line", "theme"])
+async def test_wp3_child_and_link_return_identity_scroll(path: str) -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        catalog = screen.query_one(SettingsOptionList)
+        catalog.highlighted = catalog.get_option_index(path)
+        await pilot.pause()
+        catalog.scroll_to(y=2, animate=False, immediate=True, force=True)
+        await pilot.pause()
+        scroll = catalog.scroll_y
+        await pilot.press("enter")
+        if path == "status_line":
+            assert isinstance(pilot.app.screen, StatusLineSettingsScreen)
+            await pilot.press("escape")
+            assert pilot.app.screen is screen
+        else:
+            assert screen.return_state == ("", path, int(scroll), "settings-options")
+            # The host's four-field tuple is the only state passed to a new screen.
+            restored = SettingsScreen(cast(SettingsService, service), service.snapshot)
+            restored.return_state = screen.return_state
+            pilot.app.push_screen(restored)
+            await pilot.pause()
+            screen = restored
+            catalog = screen.query_one(SettingsOptionList)
+        await pilot.pause()
+        assert catalog.has_focus
+        assert (
+            catalog.highlighted_option is not None
+            and catalog.highlighted_option.id == path
+        )
+        assert catalog.scroll_y == scroll and not service.saved
+
+
+@pytest.mark.asyncio
+async def test_wp3_action_bookmarks_are_collection_context_local() -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        catalog = screen.query_one(SettingsOptionList)
+        actions = screen.query_one("#settings-actions", OptionList)
+        catalog.highlighted = catalog.get_option_index("agent_paths")
+        await pilot.press("enter", "tab", "down", "escape")
+        catalog.highlighted = catalog.get_option_index("skill_paths")
+        await pilot.press("enter", "tab")
+        assert (
+            actions.highlighted_option is not None
+            and actions.highlighted_option.id == "add-item"
+        )
+        await pilot.press("escape")
+        catalog.highlighted = catalog.get_option_index("agent_paths")
+        await pilot.press("enter", "tab")
+        assert (
+            actions.highlighted_option is not None
+            and actions.highlighted_option.id == "apply"
+        )
+        assert not service.saved
+
+
+def test_draft_tokens_unique_monotonic_and_reconciled_by_occurrence() -> None:
+    service = FakeService()
+    screen = SettingsScreen(cast(SettingsService, service), service.snapshot)
+    entries = screen._make_draft(["same", "other", "same"])
+    assert len({entry.token for entry in entries}) == 3
+    reconciled = screen._reconcile_draft(entries, ["same", "same", "new"])
+    assert reconciled[:2] == [entries[0], entries[2]]
+    assert reconciled[2].token > max(entry.token for entry in entries)
+    assert screen._make_draft(["same"])[0].token > reconciled[2].token
+
+
+@pytest.mark.asyncio
+async def test_list_edit_preserves_identity_and_string_payload() -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        await pilot.press(*"agent_paths", "enter")
+        screen = cast(SettingsScreen, pilot.app.screen)
+        item = next(item for item in screen.catalog if item.path == "agent_paths")
+        screen._list_draft = screen._make_draft(["same", "same"])
+        first, second = screen._list_draft
+        screen._refresh_options()
+        screen._begin_list_input(item, str(second.token))
+        editor = screen.query_one("#settings-input", Input)
+        editor.value = "edited"
+        await pilot.press("enter")
+        assert screen._list_draft == [first, type(second)(second.token, "edited")]
+        options = screen.query_one("#settings-entries", OptionList)
+        assert options.highlighted_option is not None
+        assert options.highlighted_option.id == f"list:{item.path}:{second.token}"
+        screen._save_list(item)
+        await pilot.pause()
+        assert service.saved == [{item.path: ["same", "edited"]}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("position", [0, 1, 2])
+@pytest.mark.parametrize("inventory", [False, True])
+async def test_duplicate_deletion_targets_token(position: int, inventory: bool) -> None:
+    service = FakeService()
+    path = "inventory_tools" if inventory else "agent_paths"
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        await pilot.press(*path, "enter")
+        screen = cast(SettingsScreen, pilot.app.screen)
+        entries = screen._make_draft(["duplicate-*"] * 3)
+        token = entries[position].token
+        if inventory:
+            screen._inventory_draft = {"enabled": [], "disabled": entries}
+            screen._render_checklist(highlight=f"\x00pattern:disabled:{token}")
+            checklist = screen.query_one(SettingsChecklist)
+            assert (
+                checklist.get_option_at_index(position + 2).id
+                == f"pattern:{path}:disabled:{token}"
+            )
+        else:
+            screen._list_draft = entries
+            screen._refresh_options()
+            options = screen.query_one("#settings-entries", OptionList)
+            options.highlighted = next(
+                i
+                for i, row in enumerate(options.options)
+                if row.id == f"list:{path}:{token}"
+            )
+        screen.action_delete_item()
+        assert screen._confirmation is not None
+        screen._dismiss_confirmation(apply=True)
+        remaining = (
+            screen._inventory_draft["disabled"]
+            if inventory and screen._inventory_draft
+            else screen._list_draft
+        )
+        assert remaining is not None
+        assert remaining == entries[:position] + entries[position + 1 :]
+        survivor = remaining[min(position, len(remaining) - 1)]
+        group = screen.query_one(
+            "#settings-checklist" if inventory else "#settings-entries", OptionList
+        )
+        assert group.highlighted_option is not None
+        assert group.highlighted_option.id == (
+            f"pattern:{path}:disabled:{survivor.token}"
+            if inventory
+            else f"list:{path}:{survivor.token}"
+        )
+        assert group.has_focus
+        assert not service.saved
+        item = next(item for item in screen.catalog if item.path == path)
+        if inventory:
+            screen._save_inventory(item)
+        else:
+            screen._save_list(item)
+        await pilot.pause()
+        assert service.saved == [
+            {"disabled_tools" if inventory else path: ["duplicate-*"] * 2}
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inventory", [False, True])
+async def test_token_changes_alone_are_clean(inventory: bool) -> None:
+    service = FakeService()
+    path = "inventory_tools" if inventory else "agent_paths"
+    field = next(
+        field
+        for field in service.snapshot.fields
+        if field.path == ("disabled_tools" if inventory else path)
+    )
+    field.effective_value = ["same", "same"]
+    field.saved_value = ["same", "same"]
+    field.saved_explicit = True
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        await pilot.press(*path, "enter")
+        screen = cast(SettingsScreen, pilot.app.screen)
+        item = next(item for item in screen.catalog if item.path == path)
+        if inventory:
+            assert screen._inventory_draft is not None
+            screen._inventory_draft["disabled"] = screen._make_draft(["same", "same"])
+        else:
+            screen._list_draft = screen._make_draft(["same", "same"])
+        assert not screen._draft_is_dirty(item)
+        await pilot.press("escape")
+        assert screen._expanded is None and screen._confirmation is None
+        assert not service.saved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path,body_id",
+    [
+        ("agent_paths", "settings-entries"),
+        ("inventory_tools", "settings-checklist"),
+        ("system_prompt_id", "settings-choices"),
+    ],
+)
+async def test_expanded_groups_and_minimum_size_layout(path: str, body_id: str) -> None:
+    service = FakeService()
+    if path == "agent_paths":
+        next(
+            field for field in service.snapshot.fields if field.path == path
+        ).effective_value = [f"entry-{i}" for i in range(40)]
+    elif path == "inventory_tools":
+        service.snapshot.inventories["tools"] = [f"member-{i}" for i in range(40)]
+    else:
+        next(
+            item for item in service.snapshot.catalog if item.path == path
+        ).choices = tuple(f"choice-{i}" for i in range(40))
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        catalog = screen.query_one("#settings-options", SettingsOptionList)
+        catalog.highlighted = next(
+            i for i, row in enumerate(catalog.options) if row.id == path
+        )
+        await pilot.press("enter")
+        await pilot.pause()
+        body = screen.query_one(f"#{body_id}", OptionList)
+        label = screen.query_one("#settings-active-editor", NoMarkupStatic)
+        actions = screen.query_one("#settings-actions", OptionList)
+        assert body.has_focus and body.option_count == 40
+        assert all(
+            row.id is None
+            or row.id == "empty"
+            or row.id in {item.path for item in screen.catalog}
+            for row in catalog.options
+        )
+        assert "Editing" in str(label.content) and "draft" in str(label.content)
+        assert catalog.has_class("compact-catalog") and body.has_class("expanded-body")
+        for widget in (
+            catalog,
+            label,
+            body,
+            screen.query_one("#settings-help"),
+            screen.query_one("#settings-hint"),
+        ):
+            assert widget.display and widget.region.height >= 1
+            assert 0 <= widget.region.y < widget.region.bottom <= 24
+        assert catalog.highlighted is not None
+        assert (
+            catalog.scroll_y
+            <= catalog.highlighted
+            < catalog.scroll_y + catalog.scrollable_content_region.height
+        )
+        body.highlighted = body.option_count - 1
+        await pilot.pause()
+        assert body.scroll_y > 0
+        if path != "system_prompt_id":
+            assert actions.display and actions.option_count == 2
+            assert actions.region.bottom <= screen.query_one("#settings-help").region.y
+            focus_action(
+                screen, "add-pattern" if path == "inventory_tools" else "add-item"
+            )
+            await pilot.press("enter")
+            await pilot.pause()
+            editor = screen.query_one("#settings-editor")
+            assert editor.region.y == screen.query_one("#settings-filter").region.bottom
+            assert screen.query_one("#settings-input", Input).has_focus
+            assert all(
+                not screen.query_one(f"#{identifier}").display
+                for identifier in (
+                    "settings-options",
+                    body_id,
+                    "settings-actions",
+                    "settings-active-editor",
+                )
+            )
+            assert editor.region.bottom <= screen.query_one("#settings-help").region.y
+        assert not service.saved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path,body_id",
+    [
+        ("agent_paths", "settings-entries"),
+        ("inventory_tools", "settings-checklist"),
+        ("system_prompt_id", "settings-choices"),
+    ],
+)
+async def test_empty_collection_state_rows_are_focusable_and_inert(
+    path: str, body_id: str
+) -> None:
+    service = FakeService()
+    service.snapshot.inventories["tools"] = []
+    if path == "system_prompt_id":
+        next(
+            item for item in service.snapshot.catalog if item.path == path
+        ).choices = ()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        await pilot.press(*path, "enter")
+        screen = cast(SettingsScreen, pilot.app.screen)
+        body = screen.query_one(f"#{body_id}", OptionList)
+        assert body.has_focus and body.option_count == 1
+        assert body.highlighted_option and str(body.highlighted_option.id).startswith(
+            "state:"
+        )
+        before = (screen._list_draft, screen._enum_draft, screen._inventory_draft)
+        await pilot.press("enter", "space", "ctrl+d")
+        assert (
+            screen._expanded == path
+            and screen._editing is None
+            and screen._confirmation is None
+        )
+        assert (
+            screen._list_draft,
+            screen._enum_draft,
+            screen._inventory_draft,
+        ) == before
+        assert not service.saved
+
+
+@pytest.mark.asyncio
+async def test_focused_group_owns_commands_and_expanded_catalog_does_not_filter() -> (
+    None
+):
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        await pilot.press(*"agent_paths", "enter")
+        screen = cast(SettingsScreen, pilot.app.screen)
+        screen._list_draft = screen._make_draft(["draft-entry"])
+        screen._refresh_options()
+        catalog = screen.query_one("#settings-options", SettingsOptionList)
+        catalog._query = ""
+        screen._filter("")
+        catalog.highlighted = next(
+            i for i, row in enumerate(catalog.options) if row.id == "show_greeting"
+        )
+        entries = screen.query_one("#settings-entries", OptionList)
+        assert entries.has_focus and screen._current_item().path == "agent_paths"  # type: ignore[union-attr]
+        catalog.focus()
+        await pilot.pause()
+        assert screen._current_item().path == "show_greeting"  # type: ignore[union-attr]
+        await pilot.press("x", "ctrl+d")
+        assert catalog._query == "" and screen._confirmation is None
+        assert _draft_values(screen._list_draft) == ["draft-entry"]
+        focus_action(screen, "add-item")
+        await pilot.pause()
+        assert screen._current_item().path == "agent_paths"  # type: ignore[union-attr]
+        await pilot.press("enter")
+        assert screen._editing == "agent_paths"
+        assert not service.saved
 
 
 class FakeService:
@@ -228,19 +1022,88 @@ async def test_empty_filter_is_focusable_and_does_not_activate() -> None:
 
 @pytest.mark.asyncio
 async def test_footer_help_is_reachable_and_restores_list_focus() -> None:
-    async with Harness(FakeService()).run_test(size=(80, 24)) as pilot:
+    async with Harness(FakeService()).run_test(size=(50, 20)) as pilot:
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
         options = screen.query_one(SettingsOptionList)
         hint = screen.query_one("#settings-hint", NoMarkupStatic)
         assert "Ctrl+D" not in str(hint.content)
         await pilot.press("f1")
-        assert screen.query_one("#settings-help").has_focus
-        assert "Ctrl+D" in str(
-            screen.query_one("#settings-help", NoMarkupStatic).content
-        )
+        help_widget = screen.query_one("#settings-help", NoMarkupStatic)
+        assert help_widget.has_focus
+        assert "Ctrl+D" in str(help_widget.content)
+        assert "Tab/Shift+Tab" in str(help_widget.content)
+        assert "Tab/Shift+Tab" in str(hint.content)
+        await pilot.pause()
+        assert help_widget.max_scroll_y > 0 and help_widget.scroll_y == 0
+        text = screen.query_one("#settings-help-text", NoMarkupStatic)
+        opening_y = text.region.y
+        await pilot.press("down")
+        await pilot.pause()
+        assert help_widget.scroll_y > 0
+        assert text.region.y < opening_y
+        await pilot.press("home")
+        await pilot.pause()
+        assert help_widget.scroll_y == 0
+        await pilot.press("pagedown")
+        await pilot.pause()
+        assert help_widget.scroll_y > 0
         await pilot.press("escape")
         assert options.has_focus
+
+
+@pytest.mark.asyncio
+async def test_help_over_confirmation_escape_unwinds_one_level() -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"enable_system_trust_store", "enter")
+        confirmation = screen._confirmation
+        assert confirmation is not None
+        actions = screen.query_one("#settings-confirmation-actions", OptionList)
+        assert actions.has_focus
+        await pilot.press("f1")
+        assert screen._help_open and screen.query_one("#settings-help").has_focus
+        await pilot.press("escape")
+        assert not screen._help_open and screen._confirmation == confirmation
+        assert actions.has_focus and actions.highlighted_option is not None
+        assert actions.highlighted_option.id == "cancel" and not service.saved
+        await pilot.press("escape")
+        assert screen._confirmation is None and not screen._help_open
+        assert screen.query_one(SettingsOptionList).has_focus
+        assert isinstance(pilot.app.screen, SettingsScreen) and not service.saved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dirty", [False, True])
+async def test_space_on_compact_catalog_boolean_uses_navigation_guard(
+    dirty: bool,
+) -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        catalog = screen.query_one(SettingsOptionList)
+        catalog.highlighted = catalog.get_option_index("agent_paths")
+        await pilot.press("enter")
+        if dirty:
+            focus_action(screen, "add-item")
+            await pilot.press("enter", *"new-entry", "enter")
+        catalog.focus()
+        catalog.highlighted = catalog.get_option_index("show_greeting")
+        await pilot.pause()
+        assert screen._expanded == "agent_paths" and catalog.has_focus
+        assert "Tab/Shift+Tab" in str(
+            screen.query_one("#settings-hint", NoMarkupStatic).content
+        )
+        await pilot.press("space")
+        if dirty:
+            assert screen._confirmation is not None and not service.saved
+            await pilot.press("escape")
+            assert _draft_values(screen._list_draft) == ["new-entry"]
+            await pilot.press("space", "down", "enter")
+        await pilot.pause()
+        assert screen._expanded is None
+        assert service.saved == [{"show_greeting": True}]
 
 
 @pytest.mark.asyncio
@@ -345,6 +1208,7 @@ async def test_mouse_click_selects_and_double_click_saves_boolean() -> None:
         await pilot.pause()
         assert options.highlighted_option is not None
         assert options.highlighted_option.id == "show_greeting"
+        assert options.has_focus
         assert service.saved == []
         await pilot.click(options, offset=(5, 1), times=2)
         await pilot.pause()
@@ -528,7 +1392,7 @@ async def test_detail_view_contains_selected_description_and_can_scroll() -> Non
         assert detail.has_focus and detail.can_focus
         assert "Empty uses built-in agent locations" in str(detail.content)
         await pilot.press("down", "escape")
-        assert screen.query_one(SettingsOptionList).has_focus
+        assert screen.query_one("#settings-entries").has_focus
 
 
 @pytest.mark.asyncio
@@ -539,14 +1403,18 @@ async def test_checklist_action_rows_have_no_membership_and_hints_follow_cursor(
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
-        await pilot.press(*"inventory_tools", "enter", "down", "down")
+        await pilot.press(*"inventory_tools", "enter")
         checklist = screen.query_one(SettingsChecklist)
-        line = "".join(segment.text for segment in checklist.render_line(2))
-        assert "Add Pattern" in line and "[ ]" not in line
+        actions = focus_action(screen, "add-pattern")
+        await pilot.pause()
+        line = actions.render_line(0).text
+        assert "Add pattern" in line and "[ ]" not in line
+        assert all(row.id != "add-pattern" for row in checklist.options)
         assert "Add pattern" in str(
             screen.query_one("#settings-hint", NoMarkupStatic).content
         )
-        await pilot.press("up")
+        checklist.focus()
+        await pilot.pause()
         assert "Toggle" in str(
             screen.query_one("#settings-hint", NoMarkupStatic).content
         )
@@ -649,10 +1517,9 @@ async def test_confirmation_overflow_is_keyboard_reachable() -> None:
             "\n".join(f"Consequence {i}" for i in range(30))
         )
         await pilot.pause()
-        await pilot.press("tab")
-        assert confirmation.has_focus
-        for _ in range(18):
-            await pilot.press("down")
+        await pilot.press("tab", "shift+tab")
+        assert screen.query_one("#settings-confirmation-actions").has_focus
+        await pilot.press("pagedown", "pagedown")
         await pilot.pause()
         assert confirmation.scroll_offset.y > 0, (
             confirmation.virtual_size,
@@ -953,8 +1820,9 @@ async def test_workbench_escape_unwinds_before_dismissal() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("query", ["", "models/providers"])
 async def test_settings_provider_link_returns_to_settings(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, query: str
 ) -> None:
     from types import SimpleNamespace
 
@@ -971,7 +1839,17 @@ async def test_settings_provider_link_returns_to_settings(
         await app._session_ready.wait()
         assert await app._handle_command("/settings")
         await pilot.pause()
-        await pilot.press(*"models/providers", "enter")
+        assert isinstance(app.screen, SettingsScreen)
+        settings = app.screen
+        await pilot.press(*query)
+        options = settings.query_one(SettingsOptionList)
+        options.highlighted = options.get_option_index("models/providers")
+        options.scroll_to_highlight()
+        await pilot.pause()
+        scroll = options.scroll_y
+        if not query:
+            assert scroll > 0
+        await pilot.press("enter")
         for _ in range(50):
             if isinstance(app.screen, ProviderWorkbenchScreen):
                 break
@@ -984,10 +1862,11 @@ async def test_settings_provider_link_returns_to_settings(
             await pilot.pause()
         assert isinstance(app.screen, SettingsScreen)
         options = app.screen.query_one(SettingsOptionList)
-        assert options._query == "models/providers"
+        assert options._query == query
         assert options.highlighted_option is not None
         assert options.highlighted_option.id == "models/providers"
         assert app.screen.focused is options
+        assert options.scroll_y == scroll
 
 
 @pytest.mark.asyncio
@@ -1016,16 +1895,23 @@ async def test_enum_choice_editor() -> None:
         await pilot.press(*"ui_color_scheme", "enter")
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
-        options = screen.query_one(SettingsOptionList)
+        options = screen.query_one("#settings-choices", OptionList)
         choice = options.highlighted_option
         assert choice is not None and choice.id == "choice:ui_color_scheme:dark"
-        assert options._query == "ui_color_scheme"
-        assert "Save choice to user settings" in str(
+        assert (
+            screen.query_one("#settings-options", SettingsOptionList)._query
+            == "ui_color_scheme"
+        )
+        assert "Accept selected" in str(
             screen.query_one("#settings-hint", NoMarkupStatic).content
         )
         await pilot.press("escape")
         await pilot.pause()
-        assert not any(str(row.id).startswith("choice:") for row in options.options)
+        assert not options.display
+        assert not any(
+            str(row.id).startswith("choice:")
+            for row in screen.query_one("#settings-options", OptionList).options
+        )
         await pilot.press("enter", "up", "space", "down", "enter")
         await pilot.pause()
         assert service.saved == [{"ui_color_scheme": "light"}]
@@ -1039,14 +1925,15 @@ async def test_list_add_edit_delete_discard_and_empty_help() -> None:
         await pilot.press(*"agent_paths", "enter")
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
-        options = screen.query_one(SettingsOptionList)
+        options = screen.query_one("#settings-entries", OptionList)
         assert (
             options.highlighted_option
-            and options.highlighted_option.id == "list:agent_paths:add"
+            and options.highlighted_option.id == "state:entries"
         )
         assert "Empty uses built-in agent locations" in str(
             screen.query_one("#settings-help", NoMarkupStatic).content
         )
+        focus_action(screen, "add-item")
         await pilot.press("enter")
         await pilot.pause()
         assert screen.query_one("#settings-input", Input).has_focus
@@ -1057,41 +1944,52 @@ async def test_list_add_edit_delete_discard_and_empty_help() -> None:
         assert screen._expanded == "agent_paths"
         await pilot.press("escape")
         assert screen._expanded is None
-        await pilot.press("enter", "enter")
+        await pilot.press("enter")
+        focus_action(screen, "add-item")
+        await pilot.press("enter")
         await pilot.pause()
         await pilot.press(*"  tool-*  ", "enter")
         await pilot.pause()
-        assert screen._list_draft == ["tool-*"] and not service.saved
-        await pilot.press("down", "down", "enter")
+        assert _draft_values(screen._list_draft) == ["tool-*"] and not service.saved
+        focus_action(screen, "apply")
+        await pilot.press("enter")
         await pilot.pause()
         assert service.saved == [{"agent_paths": ["tool-*"]}]
         assert screen._expanded is None
         await pilot.press("enter")
         assert (
             options.highlighted_option
-            and options.highlighted_option.id == "list:agent_paths:0"
+            and screen._list_draft
+            and options.highlighted_option.id
+            == f"list:agent_paths:{screen._list_draft[0].token}"
         )
-        await pilot.press("down", "enter")
+        focus_action(screen, "add-item")
+        await pilot.press("enter")
         await pilot.press(*"  other  ", "enter")
-        assert screen._list_draft == ["tool-*", "other"] and len(service.saved) == 1
-        await pilot.press("down", "down", "enter")
+        assert (
+            _draft_values(screen._list_draft) == ["tool-*", "other"]
+            and len(service.saved) == 1
+        )
+        focus_action(screen, "apply")
+        await pilot.press("enter")
         await pilot.pause()
         assert service.saved[-1] == {"agent_paths": ["tool-*", "other"]}
-        await pilot.press("enter", "ctrl+d", "down", "enter")
-        assert screen._list_draft == ["other"] and len(service.saved) == 2
-        await pilot.press("down", "down", "enter")
+        await pilot.press("enter", "home", "ctrl+d", "down", "enter")
+        assert (
+            _draft_values(screen._list_draft) == ["other"] and len(service.saved) == 2
+        )
+        focus_action(screen, "apply")
+        await pilot.press("enter")
         await pilot.pause()
         assert service.saved[-1] == {"agent_paths": ["other"]}
         await pilot.press("enter", "enter", "ctrl+u", "space", "enter")
         assert screen.query_one("#settings-input", Input).has_class("-invalid")
-        assert screen._list_draft == ["other"] and len(service.saved) == 3
-        await pilot.press("escape", "ctrl+d", "down", "enter")
-        assert screen._list_draft == [] and len(service.saved) == 3
-        options.highlighted = next(
-            i
-            for i, row in enumerate(options.options)
-            if row.id == "list:agent_paths:apply"
+        assert (
+            _draft_values(screen._list_draft) == ["other"] and len(service.saved) == 3
         )
+        await pilot.press("escape", "ctrl+d", "down", "enter")
+        assert _draft_values(screen._list_draft) == [] and len(service.saved) == 3
+        focus_action(screen, "apply")
         await pilot.press("enter")
         await pilot.pause()
         assert service.saved[-1] == {"agent_paths": []}
@@ -1107,21 +2005,23 @@ async def test_navigation_from_dirty_list_requires_explicit_discard(
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
         options = screen.query_one(SettingsOptionList)
-        await pilot.press(*"agent_paths", "enter", "enter")
+        options.highlighted = options.get_option_index("agent_paths")
+        await pilot.press("enter", "tab", "enter")
         await pilot.press(*"new-entry", "enter")
-        assert screen._list_draft == ["new-entry"]
+        assert _draft_values(screen._list_draft) == ["new-entry"]
 
-        options._query = ""
-        screen._filter("")
+        await pilot.press("tab")
+        assert options.has_focus
         options.highlighted = next(
             index
             for index, row in enumerate(options.options)
             if row.id == "show_greeting"
         )
+        options.focus()
         await pilot.press("enter")
         assert screen._confirmation is not None
         await pilot.press("escape")
-        assert screen._list_draft == ["new-entry"]
+        assert _draft_values(screen._list_draft) == ["new-entry"]
         assert options.has_focus
 
         await pilot.press("enter")
@@ -1143,32 +2043,25 @@ async def test_apply_list_draft_then_continue_to_highlighted_setting(
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
         options = screen.query_one(SettingsOptionList)
-        await pilot.press(*"agent_paths", "enter", "enter")
+        options.highlighted = options.get_option_index("agent_paths")
+        await pilot.press("enter", "tab", "enter")
         await pilot.press(*"new-entry", "enter")
-        options._query = ""
-        screen._filter("")
+        await pilot.press("tab")
+        assert options.has_focus
         options.highlighted = next(
             index
             for index, row in enumerate(options.options)
             if row.id == "show_greeting"
         )
+        options.focus()
         await pilot.press("enter", "escape")
-        assert screen._list_draft == ["new-entry"]
+        assert _draft_values(screen._list_draft) == ["new-entry"]
 
-        options.highlighted = next(
-            index
-            for index, row in enumerate(options.options)
-            if row.id == "list:agent_paths:apply"
-        )
-        await pilot.press("enter")
+        await pilot.press("shift+tab", "down", "enter")
         await pilot.pause()
         assert service.saved == [{"agent_paths": ["new-entry"]}]
-
-        options.highlighted = next(
-            index
-            for index, row in enumerate(options.options)
-            if row.id == "show_greeting"
-        )
+        assert options.highlighted_option is not None
+        assert options.highlighted_option.id == "show_greeting"
         await pilot.press("enter")
         await pilot.pause()
         assert service.saved[-1] == {"show_greeting": True}
@@ -1285,7 +2178,9 @@ async def test_inventory_overlapping_tools_save_and_reopen(
         assert screen._inventory_item_state("bash") == (False, locked)
         await pilot.press("space")
         assert ("bash" in checklist.selected) is not locked
-        await pilot.press("down", "space", "enter")
+        await pilot.press("down", "space")
+        focus_action(screen, "apply")
+        await pilot.press("enter")
         await pilot.pause()
         assert service.saved == [
             {"enabled_tools": enabled[:-1]}
@@ -1306,8 +2201,12 @@ async def test_inventory_unchanged_default_does_not_write() -> None:
     service = FakeService()
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        await pilot.press(*"inventory_tools", "enter", "enter")
+        await pilot.press(*"inventory_tools", "enter")
+        screen = cast(SettingsScreen, pilot.app.screen)
+        focus_action(screen, "apply")
+        await pilot.press("enter")
         await pilot.pause()
+        assert screen._expanded is None
         assert service.saved == []
 
 
@@ -1337,10 +2236,11 @@ async def test_inventory_toggle_commit_discard_and_pattern_lock() -> None:
         assert "Cancel preserves both saved lists and the current draft" in str(
             screen.query_one("#settings-confirmation-text", NoMarkupStatic).content
         )
-        await pilot.press("enter", "down", "enter")
-        assert screen._expanded is None
-        await pilot.press("enter", "enter")
+        await pilot.press("enter")  # Cancel discard; Apply explicitly persists.
+        focus_action(screen, "apply")
+        await pilot.press("enter")
         await pilot.pause()
+        assert screen._expanded is None
         assert service.saved == [{"enabled_tools": ["read_*"]}]
 
 
@@ -1368,6 +2268,7 @@ async def test_inventory_last_allowed_item_restores_default() -> None:
         assert checklist.selected == ["worker"]
         await pilot.press("space")
         assert checklist.selected == ["reviewer"]
+        focus_action(cast(SettingsScreen, pilot.app.screen), "apply")
         await pilot.press("enter")
         await pilot.pause()
         assert service.saved == [{"enabled_agents": []}]
@@ -1386,15 +2287,19 @@ async def test_inventory_add_pattern_space_does_not_activate(
     service = FakeService()
     async with Harness(service).run_test(size=size) as pilot:
         await pilot.pause()
-        await pilot.press(*"inventory_skills", "enter", "space", "down", "down")
+        await pilot.press(*"inventory_skills", "enter", "space")
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
         checklist = screen.query_one(SettingsChecklist)
+        actions = focus_action(screen, "add-pattern")
         assert (
-            checklist.get_option_at_index(checklist.highlighted or 0).value
-            == ADD_PATTERN
+            actions.highlighted_option
+            and actions.highlighted_option.id == "add-pattern"
         )
-        assert screen._inventory_draft == {"enabled": [], "disabled": ["review"]}
+        assert {
+            side: _draft_values(entries)
+            for side, entries in (screen._inventory_draft or {}).items()
+        } == {"enabled": [], "disabled": ["review"]}
         assert screen._inventory_draft is not None
         draft = {key: list(values) for key, values in screen._inventory_draft.items()}
         snapshot = service.snapshot.model_dump()
@@ -1408,7 +2313,7 @@ async def test_inventory_add_pattern_space_does_not_activate(
         assert pilot.app.screen is screen
         assert screen._expanded == expanded
         assert screen._editing is None
-        assert checklist.display and checklist.has_focus
+        assert checklist.display and actions.has_focus
         assert not screen.query_one("#settings-editor").display
         assert checklist.highlighted == highlighted
         assert checklist.selected == selected
@@ -1430,20 +2335,33 @@ async def test_inventory_pattern_add_delete_and_reset() -> None:
     service = FakeService()
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        await pilot.press(
-            *"inventory_skills", "enter", "space", "down", "down", "enter"
-        )
-        await pilot.pause()
+        await pilot.press(*"inventory_skills", "enter", "space")
         screen = cast(SettingsScreen, pilot.app.screen)
+        focus_action(screen, "add-pattern")
+        await pilot.press("enter")
+        await pilot.pause()
         assert screen.query_one("#settings-input", Input).has_focus
         await pilot.press(*"re:^my-", "enter")
         await pilot.pause()
         assert service.saved == []
-        assert screen._inventory_draft == {
-            "enabled": [],
-            "disabled": ["review", "re:^my-"],
-        }
-        await pilot.press("up", "enter")
+        assert {
+            side: _draft_values(entries)
+            for side, entries in (screen._inventory_draft or {}).items()
+        } == {"enabled": [], "disabled": ["review", "re:^my-"]}
+        checklist = screen.query_one(SettingsChecklist)
+        added = (screen._inventory_draft or {})["disabled"][-1]
+        assert checklist.highlighted is not None
+        assert (
+            checklist.get_option_at_index(checklist.highlighted).value
+            == f"\x00pattern:disabled:{added.token}"
+        )
+        assert (
+            checklist.scroll_y
+            <= (checklist.highlighted or 0)
+            < checklist.scroll_y + checklist.scrollable_content_region.height
+        )
+        focus_action(screen, "apply")
+        await pilot.press("enter")
         await pilot.pause()
         assert service.saved == [{"disabled_skills": ["review", "re:^my-"]}]
         await pilot.press("enter", "down", "down")
@@ -1452,7 +2370,11 @@ async def test_inventory_pattern_add_delete_and_reset() -> None:
             checklist.highlighted or 0
         ).value.startswith("\x00pattern:")
         await pilot.press("ctrl+d", "down", "enter")
-        assert screen._inventory_draft == {"enabled": [], "disabled": ["review"]}
+        assert {
+            side: _draft_values(entries)
+            for side, entries in (screen._inventory_draft or {}).items()
+        } == {"enabled": [], "disabled": ["review"]}
+        focus_action(screen, "apply")
         await pilot.press("enter")
         await pilot.pause()
         assert service.saved[-1] == {"disabled_skills": ["review"]}
@@ -1469,17 +2391,47 @@ async def test_inventory_pattern_add_delete_and_reset() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pattern_add_highlights_and_reveals_new_row_in_long_checklist() -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"inventory_tools", "enter")
+        assert screen._inventory_draft is not None
+        screen._inventory_draft["disabled"] = screen._make_draft([
+            f"existing-{index}-*" for index in range(40)
+        ])
+        screen._render_checklist()
+        focus_action(screen, "add-pattern")
+        await pilot.press("enter", *"new-pattern-*", "enter")
+        await pilot.pause()
+        entry = screen._inventory_draft["disabled"][-1]
+        checklist = screen.query_one(SettingsChecklist)
+        assert checklist.highlighted is not None
+        assert checklist.get_option_at_index(checklist.highlighted).value == (
+            f"\x00pattern:disabled:{entry.token}"
+        )
+        assert checklist.scroll_y > 0
+        assert (
+            checklist.scroll_y
+            <= checklist.highlighted
+            < checklist.scroll_y + checklist.scrollable_content_region.height
+        )
+        assert not service.saved
+
+
+@pytest.mark.asyncio
 async def test_inventory_default_consecutive_unchecks_stay_unchecked() -> None:
     service = FakeService()
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
         await pilot.press(*"inventory_tools", "enter", "space", "down", "space")
         screen = cast(SettingsScreen, pilot.app.screen)
-        assert screen._inventory_draft == {
-            "enabled": [],
-            "disabled": ["bash", "read_file"],
-        }
+        assert {
+            side: _draft_values(entries)
+            for side, entries in (screen._inventory_draft or {}).items()
+        } == {"enabled": [], "disabled": ["bash", "read_file"]}
         assert screen.query_one(SettingsChecklist).selected == []
+        focus_action(screen, "apply")
         await pilot.press("enter")
         await pilot.pause()
         assert service.saved == [{"disabled_tools": ["bash", "read_file"]}]
@@ -1501,12 +2453,21 @@ async def test_inventory_pattern_deletion_recomputes_and_unlocks() -> None:
         checklist = screen.query_one(SettingsChecklist)
         assert checklist.selected == ["bash"]
         await pilot.press("down", "space")
-        assert screen._inventory_draft == {"enabled": [], "disabled": ["read_*"]}
+        assert {
+            side: _draft_values(entries)
+            for side, entries in (screen._inventory_draft or {}).items()
+        } == {"enabled": [], "disabled": ["read_*"]}
         await pilot.press("down", "ctrl+d", "down", "enter")
-        assert screen._inventory_draft == {"enabled": [], "disabled": []}
+        assert {
+            side: _draft_values(entries)
+            for side, entries in (screen._inventory_draft or {}).items()
+        } == {"enabled": [], "disabled": []}
         assert checklist.selected == ["bash", "read_file"]
         await pilot.press("down", "space")
-        assert screen._inventory_draft == {"enabled": [], "disabled": ["read_file"]}
+        assert {
+            side: _draft_values(entries)
+            for side, entries in (screen._inventory_draft or {}).items()
+        } == {"enabled": [], "disabled": ["read_file"]}
 
 
 @pytest.mark.asyncio
@@ -1521,8 +2482,13 @@ async def test_inventory_project_values_not_copied_to_user() -> None:
         await pilot.pause()
         await pilot.press(*"inventory_tools", "enter")
         screen = cast(SettingsScreen, pilot.app.screen)
-        assert screen._inventory_draft == {"enabled": [], "disabled": []}
-        await pilot.press("space", "enter")
+        assert {
+            side: _draft_values(entries)
+            for side, entries in (screen._inventory_draft or {}).items()
+        } == {"enabled": [], "disabled": []}
+        await pilot.press("space")
+        focus_action(screen, "apply")
+        await pilot.press("enter")
         await pilot.pause()
         assert service.saved == [{"disabled_tools": ["bash"]}]
         assert "project_*" not in str(service.saved)
@@ -1555,9 +2521,11 @@ async def test_inventory_reset_closes_open_pattern_editor() -> None:
     service = FakeService()
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        await pilot.press(*"inventory_tools", "enter", "down", "down", "enter")
+        await pilot.press(*"inventory_tools", "enter")
         screen = cast(SettingsScreen, pilot.app.screen)
-        assert screen.query("#settings-input")
+        focus_action(screen, "add-pattern")
+        await pilot.press("enter")
+        assert screen.query_one("#settings-input", Input).has_focus
         screen.action_remove_override()
         await pilot.pause()
         assert not screen.query_one("#settings-editor").display
@@ -1575,9 +2543,14 @@ async def test_inventory_save_failure_visible_in_help() -> None:
     )
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        await pilot.press(*"inventory_agents", "enter", "down", "down", "enter")
+        await pilot.press(*"inventory_agents", "enter")
+        screen = cast(SettingsScreen, pilot.app.screen)
+        focus_action(screen, "add-pattern")
+        await pilot.press("enter")
         await pilot.pause()
-        await pilot.press(*"re:[", "enter", "up", "enter")
+        await pilot.press(*"re:[", "enter")
+        focus_action(screen, "apply")
+        await pilot.press("enter")
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
         assert service.saved == [{"disabled_agents": ["re:["]}]
@@ -1600,7 +2573,7 @@ async def test_prompt_enum_runtime_choices() -> None:
         await pilot.press(*"system_prompt_id", "enter")
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
-        options = screen.query_one(SettingsOptionList)
+        options = screen.query_one("#settings-choices", OptionList)
         assert (
             options.highlighted_option
             and options.highlighted_option.id == "choice:system_prompt_id:custom-prompt"
@@ -1653,20 +2626,21 @@ async def test_failed_list_save_retains_editable_draft_and_retry(failure: str) -
         screen = cast(SettingsScreen, pilot.app.screen)
         item = next(item for item in screen.catalog if item.path == "agent_paths")
         draft = ["my-agent", "other-agent"]
-        screen._list_draft = draft.copy()
+        screen._list_draft = screen._make_draft(draft)
         screen._refresh_options()
         screen._save_list(item)
         await pilot.pause()
         assert screen._expanded == item.path
-        assert screen._list_draft == draft
+        assert _draft_values(screen._list_draft) == draft
         options = screen.query_one(SettingsOptionList)
-        assert options.editing and options.has_focus
+        assert options.editing
+        assert screen.query_one("#settings-entries").has_focus
         assert "invalid list" in str(
             screen.query_one("#settings-help", NoMarkupStatic).content
         )
         assert not screen.fields[item.path].saved_explicit
         service.outcome = None
-        screen._list_draft = ["my-agent"]
+        screen._list_draft = screen._make_draft(["my-agent"])
         screen._save_list(item)
         await pilot.pause()
         assert service.saved[-1] == {item.path: ["my-agent"]}
@@ -1768,7 +2742,17 @@ async def test_status_line_focused_rows_remain_readable(
         assert not any(
             segment.style and segment.style.bold for segment in options.render_line(3)
         )
-        await pilot.press("escape", "space", "escape")
+        await pilot.press("escape")
+        action_rows = screen.query_one("#status-line-settings-actions", OptionList)
+        action_rows.focus()
+        action_rows.highlighted = action_rows.get_option_index("apply")
+        await pilot.pause()
+        assert_readable(action_rows, 0, "Apply changes")
+        await pilot.press("down")
+        await pilot.pause()
+        assert_readable(action_rows, 1, "Back")
+        options.focus()
+        await pilot.press("space", "escape")
         await pilot.pause()
         actions = screen.query_one(
             "#status-line-settings-confirmation-actions", OptionList
@@ -1780,6 +2764,215 @@ async def test_status_line_focused_rows_remain_readable(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("group", ["options", "actions"])
+@pytest.mark.parametrize("edge", ["first", "last"])
+async def test_status_line_group_arrows_are_bounded(group: str, edge: str) -> None:
+    service = FakeService()
+    async with StatusLineHarness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(StatusLineSettingsScreen, pilot.app.screen)
+        options = screen.query_one(f"#status-line-settings-{group}", OptionList)
+        options.focus()
+        options.highlighted = 0 if edge == "first" else options.option_count - 1
+        await pilot.pause()
+        selected = options.highlighted_option
+        before = screen.draft.model_copy(deep=True)
+        order = screen.order.copy()
+        keys = (
+            ("up", "k", "pageup", "home")
+            if edge == "first"
+            else ("down", "j", "pagedown", "end")
+        )
+        await pilot.press(*keys)
+        assert options.has_focus and options.highlighted_option is selected
+        assert screen.draft == before and screen.order == order and not service.saved
+        assert [
+            row.id
+            for row in screen.query_one(
+                "#status-line-settings-actions", OptionList
+            ).options
+        ] == ["apply", "back"]
+
+
+@pytest.mark.asyncio
+async def test_status_line_tab_bookmarks_and_reorder_identity() -> None:
+    service = FakeService()
+    async with StatusLineHarness(service).run_test(size=(50, 20)) as pilot:
+        screen = cast(StatusLineSettingsScreen, pilot.app.screen)
+        config = screen.query_one("#status-line-settings-options", OptionList)
+        actions = screen.query_one("#status-line-settings-actions", OptionList)
+        config.highlighted = config.get_option_index("spend-month")
+        await pilot.pause()
+        scroll = config.scroll_y
+        await pilot.press("tab", "down")
+        assert actions.has_focus and screen._selected() == "back"
+        await pilot.press("tab")
+        assert config.has_focus and screen._selected() == "spend-month"
+        assert config.scroll_y == scroll
+        await pilot.press("alt+up")
+        assert screen._selected() == "spend-month"
+        await pilot.press("shift+tab")
+        assert actions.has_focus and screen._selected() == "back"
+        await pilot.press("shift+tab")
+        assert config.has_focus and screen._selected() == "spend-month"
+        await pilot.press("f1")
+        assert screen.query_one("#status-line-settings-details").has_focus
+        await pilot.press("shift+tab")
+        assert actions.has_focus and screen._selected() == "back"
+        assert not screen._help_open
+        await pilot.press("d", "tab")
+        assert config.has_focus and screen._selected() == "spend-month"
+        assert not screen._details_open
+        assert not service.saved and not screen.dirty
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["directory", "pid", "context", "separator"])
+async def test_status_line_enter_space_cycle_config_without_saving(name: str) -> None:
+    service = FakeService()
+    async with StatusLineHarness(service).run_test() as pilot:
+        screen = cast(StatusLineSettingsScreen, pilot.app.screen)
+        config = screen.query_one("#status-line-settings-options", OptionList)
+        config.highlighted = config.get_option_index(name)
+        await pilot.pause()
+        before = screen.draft.model_copy(deep=True)
+        await pilot.press("enter")
+        assert screen.draft != before and not service.saved
+        await pilot.press("space")
+        assert screen.draft == before and not service.saved
+        await pilot.press("tab")
+        actions = screen.query_one("#status-line-settings-actions", OptionList)
+        for action in ("apply", "back"):
+            actions.highlighted = actions.get_option_index(action)
+            await pilot.press("space", "alt+up", "alt+down")
+            assert pilot.app.screen is screen and not screen._confirmation
+            assert screen.draft == before and not service.saved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opener", ["directory", "separator", "apply", "back"])
+async def test_status_line_inspection_confirmation_restores_exact_opener(
+    opener: str,
+) -> None:
+    service = FakeService()
+    async with StatusLineHarness(service).run_test(size=(50, 20)) as pilot:
+        screen = cast(StatusLineSettingsScreen, pilot.app.screen)
+        await pilot.press("space")
+        group = "actions" if opener in {"apply", "back"} else "options"
+        options = screen.query_one(f"#status-line-settings-{group}", OptionList)
+        options.highlighted = options.get_option_index(opener)
+        options.focus()
+        await pilot.pause()
+        scroll = options.scroll_y
+        await pilot.press("d", "f1", "escape")
+        assert screen._details_open and not screen._help_open
+        assert screen.query_one("#status-line-settings-details").has_focus
+        await pilot.press("escape")
+        assert options.has_focus and screen._selected() == opener
+        assert options.scroll_y == scroll
+        await pilot.press("escape")
+        assert screen._confirmation == "discard"
+        await pilot.press("tab", "shift+tab")
+        assert screen.query_one("#status-line-settings-confirmation-actions").has_focus
+        await pilot.press("escape")
+        assert options.has_focus and screen._selected() == opener
+        assert options.scroll_y == scroll and screen.dirty and not service.saved
+        # Confirmation owns this press even with an inspection region underneath.
+        await pilot.press("f1")
+        screen._confirm("discard", "Discard?")
+        await pilot.press("escape")
+        assert screen._help_open and not screen._confirmation
+        assert screen.query_one("#status-line-settings-details").has_focus
+        await pilot.press("escape")
+        assert options.has_focus and screen._selected() == opener
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pointer", [False, True])
+async def test_status_line_action_pointer_keyboard_parity(pointer: bool) -> None:
+    service = FakeService()
+    async with StatusLineHarness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(StatusLineSettingsScreen, pilot.app.screen)
+        await pilot.press("space")
+        actions = screen.query_one("#status-line-settings-actions", OptionList)
+        if pointer:
+            await pilot.click("#status-line-settings-actions", offset=(3, 1), times=2)
+        else:
+            actions.highlighted = actions.get_option_index("back")
+            actions.focus()
+            await pilot.press("enter")
+        assert screen._confirmation == "discard" and not service.saved
+        if pointer:
+            await pilot.click(
+                "#status-line-settings-confirmation-actions", offset=(3, 0)
+            )
+        else:
+            await pilot.press("enter")
+        assert not screen._confirmation and screen.dirty
+        assert actions.has_focus and screen._selected() == "back"
+        if pointer:
+            await pilot.click("#status-line-settings-actions", offset=(3, 0), times=2)
+        else:
+            actions.highlighted = actions.get_option_index("apply")
+            await pilot.press("enter")
+        await pilot.pause()
+        assert service.saved == [{"status_line.directory_style": "path"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pointer", [False, True])
+async def test_status_line_controls_pointer_keyboard_parity(pointer: bool) -> None:
+    service = FakeService()
+    service.outcome = SettingsSaveOutcome(
+        "not_saved", "unchanged", error="reset failed"
+    )
+    for field in service.snapshot.fields:
+        if field.path == "status_line.separator":
+            field.saved_explicit = True
+            field.saved_value = "space"
+    async with StatusLineHarness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(StatusLineSettingsScreen, pilot.app.screen)
+        config = screen.query_one("#status-line-settings-options", OptionList)
+        config.highlighted = config.get_option_index("pid")
+        await pilot.pause()
+
+        async def command(key: str, x: int) -> None:
+            if pointer:
+                await pilot.click("#status-line-settings-controls", offset=(x, 0))
+            else:
+                await pilot.press(key)
+
+        await command("alt+down", 10)
+        assert screen.order.index("pid") == 2 and screen._selected() == "pid"
+        await command("alt+up", 1)
+        assert screen.order.index("pid") == 1 and not screen.dirty
+        await command("d", 28)
+        assert screen._details_open
+        await command("f1", 37)
+        assert screen._help_open and screen._details_open
+        before = screen.draft.model_copy(deep=True)
+        await command("alt+down", 10)
+        await command("ctrl+r", 21)
+        await pilot.click("#status-line-settings-actions", offset=(3, 0))
+        assert screen.draft == before and not service.saved and not screen._confirmation
+        await command("escape", 43)
+        assert not screen._help_open and screen._details_open
+        await command("escape", 43)
+        assert not screen._details_open and config.has_focus
+        await command("ctrl+r", 21)
+        assert screen._confirmation == "reset"
+        if pointer:
+            await pilot.click(
+                "#status-line-settings-confirmation-actions", offset=(3, 1)
+            )
+        else:
+            await pilot.press("down", "enter")
+        await pilot.pause()
+        assert service.saved == [{"status_line.separator": None}]
+        assert config.has_focus and screen._selected() == "pid"
+        assert "reset failed" in screen._feedback
+
+
+@pytest.mark.asyncio
 async def test_status_line_two_apply_events_before_worker_start_save_once() -> None:
     service = FakeService()
     app = StatusLineHarness(service)
@@ -1787,14 +2980,19 @@ async def test_status_line_two_apply_events_before_worker_start_save_once() -> N
         await pilot.pause()
         screen = cast(StatusLineSettingsScreen, app.screen)
         screen.draft.directory_style = "path"
-        options = screen.query_one(StatusLineOptionList)
+        options = screen.query_one("#status-line-settings-actions", OptionList)
         apply = options.get_option("apply")
         # Two Enter selections dispatched without yielding to the save worker.
         for _ in range(2):
             screen.on_option_list_option_selected(
-                OptionList.OptionSelected(options, apply, 9)
+                OptionList.OptionSelected(
+                    options, apply, options.get_option_index("apply")
+                )
             )
         assert screen._busy
+        assert "Wait for save" in str(
+            screen.query_one("#status-line-settings-hint", NoMarkupStatic).content
+        )
         await pilot.pause()
         assert service.saved == [{"status_line.directory_style": "path"}]
 
@@ -1815,10 +3013,12 @@ async def test_status_line_cycles_reorders_and_saves_only_changed_leaves() -> No
         assert screen.draft.segments == ["directory", "context"]
         assert screen._selected() == "pid"
         assert not service.saved
-        options.highlighted = 8
+        options.highlighted = options.get_option_index("separator")
         await pilot.press("space", "alt+up")
         assert screen.draft.separator == "space" and screen._selected() == "separator"
-        options.highlighted = 9
+        actions = screen.query_one("#status-line-settings-actions", OptionList)
+        actions.highlighted = actions.get_option_index("apply")
+        actions.focus()
         await pilot.press("space")
         assert not service.saved
         await pilot.press("enter")
@@ -1832,6 +3032,41 @@ async def test_status_line_cycles_reorders_and_saves_only_changed_leaves() -> No
         ]
         assert service.revisions == ["revision"]
         assert app.result and not app.result.needs_refresh
+
+
+@pytest.mark.asyncio
+async def test_background_jobs_settings_toggle_reorder_preview_and_save() -> None:
+    service = FakeService()
+    app = StatusLineHarness(service)
+    async with app.run_test(size=(100, 32)) as pilot:
+        screen = cast(StatusLineSettingsScreen, app.screen)
+        options = screen.query_one(StatusLineOptionList)
+        options.highlighted = options.get_option_index("background-jobs")
+        await pilot.press("space")
+        assert screen.draft.segments == [
+            "directory",
+            "pid",
+            "context",
+            "background-jobs",
+        ]
+        preview = screen.query_one("#status-line-settings-preview", NoMarkupStatic)
+        assert "Jobs 2" in str(preview.content)
+        await pilot.press("space")
+        assert "background-jobs" not in screen.draft.segments
+        assert "Jobs" not in str(preview.content)
+        await pilot.press("space", *(["alt+up"] * 6))
+        assert screen._selected() == "background-jobs"
+        assert screen.draft.segments == [
+            "directory",
+            "pid",
+            "background-jobs",
+            "context",
+        ]
+        expected = list(screen.draft.segments)
+        screen.action_apply()
+        await pilot.pause()
+        assert service.saved == [{"status_line.segments": expected}]
+        assert service.revisions == ["revision"]
 
 
 @pytest.mark.asyncio
@@ -1878,11 +3113,12 @@ async def test_status_line_failure_retains_draft_focus_and_conflict_blocks_retry
     )
     async with StatusLineHarness(service).run_test() as pilot:
         screen = cast(StatusLineSettingsScreen, pilot.app.screen)
-        await pilot.press("enter")
-        screen.action_apply()
+        await pilot.press("enter", "tab", "enter")
         await pilot.pause()
         assert pilot.app.screen is screen and screen.dirty
-        assert screen.query_one(StatusLineOptionList).has_focus
+        actions = screen.query_one("#status-line-settings-actions", OptionList)
+        assert actions.has_focus
+        assert actions.highlighted_option and actions.highlighted_option.id == "apply"
         assert "Failed:" in screen._feedback
         if failure == "conflict":
             screen.action_apply()
@@ -2056,8 +3292,9 @@ async def test_status_line_warning_survives_unchanged_child_return(
         child = cast(StatusLineSettingsScreen, pilot.app.screen)
         assert not child.dirty and not child._feedback
         if dismissal == "back":
-            options = child.query_one(StatusLineOptionList)
+            options = child.query_one("#status-line-settings-actions", OptionList)
             options.highlighted = options.get_option_index("back")
+            options.focus()
             await pilot.press("enter")
         else:
             await pilot.press("escape")
@@ -2234,3 +3471,589 @@ async def test_status_line_details_scroll_and_narrow_footer_exit_visible() -> No
         await pilot.press("escape")
         assert screen.query_one(StatusLineOptionList).has_focus
         assert screen._selected() == "directory"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gesture", ["enter", "space", "click", "double-click"])
+async def test_wp4_membership_is_draft_only(gesture: str) -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"inventory_tools", "enter")
+        checklist = screen.query_one(SettingsChecklist)
+        if "click" in gesture:
+            await pilot.click(
+                checklist, offset=(5, 0), times=2 if gesture == "double-click" else 1
+            )
+        else:
+            await pilot.press(gesture)
+        assert _draft_values((screen._inventory_draft or {})["disabled"]) == ["bash"]
+        assert checklist.has_focus
+        assert not service.saved
+        actions = focus_action(screen, "apply")
+        await pilot.press("space")
+        assert not service.saved and screen._editing is None
+        await pilot.click(actions, offset=(5, 1), times=2)
+        await pilot.pause()
+        assert service.saved == [{"disabled_tools": ["bash"]}]
+        assert screen._expanded is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gesture", ["enter", "space", "click"])
+@pytest.mark.parametrize("row", ["pattern", "locked", "state"])
+async def test_wp4_inert_inventory_rows(row: str, gesture: str) -> None:
+    service = FakeService()
+    field = next(f for f in service.snapshot.fields if f.path == "disabled_tools")
+    if row != "state":
+        field.saved_value = ["read_*"]
+        field.saved_explicit = True
+    else:
+        service.snapshot.inventories["tools"] = []
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"inventory_tools", "enter")
+        checklist = screen.query_one(SettingsChecklist)
+        checklist.highlighted = 2 if row == "pattern" else 1 if row == "locked" else 0
+        await pilot.pause()
+        before = navigation_payload(screen)
+        if gesture == "click":
+            await pilot.click(checklist, offset=(5, checklist.highlighted or 0))
+        else:
+            await pilot.press(gesture)
+        assert navigation_payload(screen) == before
+        assert not service.saved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pointer", [False, True])
+async def test_wp4_radio_accepts_selected_not_cursor(pointer: bool) -> None:
+    service = FakeService()
+    descriptor = next(
+        d for d in service.snapshot.catalog if d.path == "system_prompt_id"
+    )
+    descriptor.choices = ("first", "second")
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"system_prompt_id", "enter")
+        choices = screen.query_one("#settings-choices", OptionList)
+        if pointer:
+            await pilot.click(choices, offset=(5, 0), times=2)
+        else:
+            await pilot.press("space")
+        assert screen._enum_draft == "first" and not service.saved
+        await pilot.press("down")
+        assert choices.highlighted == 1
+        if pointer:
+            assert "Accept selected" in str(
+                screen.query_one("#settings-hint", NoMarkupStatic).content
+            )
+            await pilot.click("#settings-hint", offset=(8, 0))
+        else:
+            await pilot.press("enter")
+        await pilot.pause()
+        assert service.saved == [{"system_prompt_id": "first"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pointer", [False, True])
+@pytest.mark.parametrize(
+    "path",
+    ["agent_paths", "displayed_workdir", "auto_compact_threshold", "show_greeting"],
+)
+async def test_wp4_editor_and_scalar_pointer_parity(path: str, pointer: bool) -> None:
+    service = FakeService()
+    if path == "agent_paths":
+        next(f for f in service.snapshot.fields if f.path == path).effective_value = [
+            "original"
+        ]
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        catalog = screen.query_one(SettingsOptionList)
+        catalog.highlighted = catalog.get_option_index(path)
+        await pilot.pause()
+        if pointer:
+            catalog.scroll_to_highlight()
+            await pilot.pause()
+            y = int(catalog.highlighted or 0) - int(catalog.scroll_y)
+            await pilot.click(catalog, offset=(5, y))
+            assert catalog.has_focus and not service.saved
+            await pilot.click(catalog, offset=(5, y), times=2)
+        else:
+            await pilot.press("enter")
+        if path == "show_greeting":
+            await pilot.pause()
+            assert service.saved == [{path: True}]
+            return
+        if path == "agent_paths":
+            entries = screen.query_one("#settings-entries", OptionList)
+            if pointer:
+                await pilot.click(entries, offset=(5, 0))
+                assert entries.has_focus and screen._editing is None
+                await pilot.click(entries, offset=(5, 0), times=2)
+            else:
+                await pilot.press("enter")
+        editor = screen.query_one("#settings-input", Input)
+        assert editor.has_focus
+        editor.value = "3" if path == "auto_compact_threshold" else "replacement value"
+        if pointer:
+            await pilot.click("#settings-hint", offset=(8, 0))
+        else:
+            await pilot.press("enter")
+        await pilot.pause()
+        if path == "agent_paths":
+            assert (
+                _draft_values(screen._list_draft) == ["replacement value"]
+                and not service.saved
+            )
+            actions = focus_action(screen, "apply")
+            if pointer:
+                await pilot.click(actions, offset=(5, 1), times=2)
+            else:
+                await pilot.press("enter")
+            await pilot.pause()
+        assert service.saved == [
+            {
+                path: ["replacement value"]
+                if path == "agent_paths"
+                else 3
+                if path == "auto_compact_threshold"
+                else "replacement value"
+            }
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reset", [False, True])
+@pytest.mark.parametrize("failure", ["not_saved", "conflict", "exception", "unknown"])
+async def test_wp4_inventory_failure_retains_identity_opener_and_scroll(
+    reset: bool, failure: str
+) -> None:
+    class FailingService(FakeService):
+        async def save(
+            self, changed_leaves: dict, expected_revision: str | None
+        ) -> SettingsSaveOutcome:
+            if failure == "exception":
+                self.saved.append(changed_leaves)
+                raise RuntimeError("transport failed")
+            return await super().save(changed_leaves, expected_revision)
+
+    service = FailingService()
+    service.outcome = (
+        SettingsSaveOutcome("saved", "applied")
+        if failure == "unknown"
+        else SettingsSaveOutcome(
+            "not_saved",
+            "unchanged",
+            error="conflict" if failure == "conflict" else "write failed",
+        )
+    )
+    service.snapshot.inventories["tools"] = [f"member-{i}" for i in range(30)]
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"inventory_tools", "enter", "enter")
+        checklist = screen.query_one(SettingsChecklist)
+        checklist.highlighted = 20
+        await pilot.pause()
+        checklist.scroll_to(y=18, animate=False, immediate=True, force=True)
+        await pilot.pause()
+        position = screen._capture_group_position(checklist)
+        draft = {
+            side: list(entries)
+            for side, entries in (screen._inventory_draft or {}).items()
+        }
+        identities = [o.id for o in checklist.options]
+        if reset:
+            focus_action(screen, "add-pattern")
+            await pilot.press("enter", "ctrl+r")
+            assert screen._editing is None  # Explicit editor-reset remains supported.
+            await pilot.press("down", "enter")
+        else:
+            focus_action(screen, "apply")
+            await pilot.press("enter")
+        await pilot.pause()
+        assert len(service.saved) == 1 and not screen._busy
+        if failure == "unknown":
+            assert screen._inventory_draft is None and screen._expanded is None
+            assert screen._needs_refresh and "current state unknown" in screen._error
+        else:
+            assert (
+                screen._inventory_draft == draft
+                and screen._expanded == "inventory_tools"
+            )
+            assert [o.id for o in checklist.options] == identities
+            assert position is not None and checklist.scroll_y == position.scroll_y
+            actions = screen.query_one("#settings-actions", OptionList)
+            assert actions.has_focus and actions.highlighted_option is not None
+            assert actions.highlighted_option.id == (
+                "add-pattern" if reset else "apply"
+            )
+            assert screen._needs_refresh is (failure == "conflict")
+            if failure == "conflict":
+                before = navigation_payload(screen)
+                screen._toggle_inventory("member-1")
+                screen._save_inventory(
+                    next(d for d in screen.catalog if d.path == screen._expanded)
+                )
+                assert navigation_payload(screen) == before and len(service.saved) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["inventory_tools", "agent_paths"])
+async def test_wp4_apply_reserves_busy_before_worker_and_blocks_mutation(
+    path: str,
+) -> None:
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class DelayedService(FakeService):
+        async def save(
+            self, changed_leaves: dict, expected_revision: str | None
+        ) -> SettingsSaveOutcome:
+            started.set()
+            await release.wait()
+            return await super().save(changed_leaves, expected_revision)
+
+    service = DelayedService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*path, "enter")
+        if path == "inventory_tools":
+            await pilot.press("space")
+        else:
+            screen._list_draft = screen._make_draft(["pending"])
+            screen._refresh_options()
+        actions = focus_action(screen, "apply")
+        item = next(d for d in screen.catalog if d.path == path)
+        screen._apply_collection(item)
+        screen._apply_collection(item)  # No await: second activation precedes startup.
+        assert screen._busy and "Wait for save" in str(
+            screen.query_one("#settings-hint", NoMarkupStatic).content
+        )
+        await started.wait()
+        before = navigation_payload(screen)
+        await pilot.press("escape", "enter", "space", "ctrl+r", "ctrl+d", "f1")
+        await pilot.click(actions, offset=(5, 1), times=2)
+        screen._toggle_inventory("bash")
+        assert pilot.app.screen is screen and screen._expanded == path
+        assert navigation_payload(screen) == before and not service.saved
+        release.set()
+        await pilot.app.workers.wait_for_complete()
+        assert len(service.saved) == 1 and screen._expanded is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "owner", ["help", "confirmation", "editor", "view_only", "needs_refresh"]
+)
+async def test_wp4_mutation_guards_cover_keyboard_and_pointer(owner: str) -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"inventory_tools", "enter")
+        checklist = screen.query_one(SettingsChecklist)
+        if owner == "help":
+            await pilot.press("f1")
+        elif owner == "confirmation":
+            await pilot.press("ctrl+r")
+        elif owner == "editor":
+            focus_action(screen, "add-pattern")
+            await pilot.press("enter")
+        elif owner == "view_only":
+            screen.snapshot.user_revision = None
+        else:
+            screen._needs_refresh = True
+        before = navigation_payload(screen)
+        screen._toggle_inventory("bash")
+        checklist.action_select()
+        screen._apply_collection(
+            next(d for d in screen.catalog if d.path == "inventory_tools")
+        )
+        screen.action_delete_item()
+        if owner != "editor":
+            screen.action_remove_override()
+        if checklist.display:
+            await pilot.click(checklist, offset=(5, 0), times=2)
+        assert navigation_payload(screen) == before and not service.saved
+
+
+def pointer_shortcut_offset(
+    screen: SettingsScreen, identifier: str, action: str
+) -> tuple[int, int]:
+    widget = screen.query_one(identifier, SettingsHints)
+    for y in range(widget.region.height):
+        for x in range(widget.region.width):
+            if widget.pointer_action_at(x, y) == action:
+                return x, y
+    raise AssertionError(f"No visible pointer target for {action} in {identifier}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["agent_paths", "inventory_tools"])
+async def test_wp4_pointer_add_help_delete_reset_and_back(path: str) -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*path, "enter")
+        actions = screen.query_one("#settings-actions", OptionList)
+        await pilot.click(actions, offset=(5, 0), times=2)
+        assert screen._editing == path and not service.saved
+        editor = screen.query_one("#settings-input", Input)
+        editor.value = "custom-*"
+        await pilot.click(
+            "#settings-hint",
+            offset=pointer_shortcut_offset(
+                screen, "#settings-hint", "activate_focused"
+            ),
+        )
+        assert screen._editing is None and not service.saved
+        await pilot.pause()
+        body = screen.query_one(
+            "#settings-checklist" if path == "inventory_tools" else "#settings-entries",
+            OptionList,
+        )
+        body.focus()
+        body.highlighted = body.option_count - 1
+        await pilot.pause()
+        await pilot.click("#settings-help", offset=(1, 1))
+        assert screen._help_open
+        await pilot.click(
+            "#settings-hint",
+            offset=pointer_shortcut_offset(screen, "#settings-hint", "close"),
+        )
+        assert not screen._help_open and body.has_focus
+        await pilot.pause()
+        await pilot.click(
+            "#settings-hint",
+            offset=pointer_shortcut_offset(screen, "#settings-hint", "delete_item"),
+        )
+        assert screen._confirmation is not None
+        choices = screen.query_one("#settings-confirmation-actions", OptionList)
+        await pilot.click(choices, offset=(3, 0))
+        assert screen._confirmation is None and not service.saved
+        await pilot.pause()
+        await pilot.click(
+            "#settings-hint",
+            offset=pointer_shortcut_offset(screen, "#settings-hint", "delete_item"),
+        )
+        await pilot.click(choices, offset=(3, 1), times=2)
+        assert screen._confirmation is None and not service.saved
+        if path == "inventory_tools":
+            await pilot.pause()
+            await pilot.click(
+                "#settings-help",
+                offset=pointer_shortcut_offset(
+                    screen, "#settings-help", "remove_override"
+                ),
+            )
+            assert screen._confirmation is not None
+            await pilot.click(choices, offset=(3, 1), times=2)
+            await pilot.pause()
+            assert service.saved == [{"enabled_tools": None, "disabled_tools": None}]
+        else:
+            assert screen._list_draft == []
+            await pilot.click(
+                "#settings-hint",
+                offset=pointer_shortcut_offset(screen, "#settings-hint", "close"),
+            )
+            assert screen._expanded is None
+
+
+@pytest.mark.asyncio
+async def test_wp4_hover_and_wheel_only_affect_pointed_region() -> None:
+    service = FakeService()
+    next(
+        f for f in service.snapshot.fields if f.path == "agent_paths"
+    ).effective_value = [f"item-{i}" for i in range(40)]
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        catalog = screen.query_one(SettingsOptionList)
+        catalog.highlighted = catalog.get_option_index("agent_paths")
+        await pilot.press("enter")
+        entries = screen.query_one("#settings-entries", OptionList)
+        await pilot.pause()
+        before = navigation_payload(screen)
+        selected = entries.highlighted_option
+        catalog_scroll = catalog.scroll_y
+        for offset in [(3, 0), (3, 2)]:
+            await pilot.hover(entries, offset=offset)
+        assert entries.highlighted_option is selected
+        assert entries.has_focus and navigation_payload(screen) == before
+        x, y = entries.region.x + 3, entries.region.y + 1
+        for _ in range(4):
+            screen._forward_event(
+                events.MouseScrollDown(None, x, y, 0, 1, 0, False, False, False)
+            )
+        await pilot.pause()
+        assert entries.scroll_y > 0 and catalog.scroll_y == catalog_scroll
+        assert navigation_payload(screen) == before and not service.saved
+
+
+@pytest.mark.asyncio
+async def test_wp4_unfiltered_apply_double_click_does_not_activate_new_catalog_row() -> (
+    None
+):
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        catalog = screen.query_one(SettingsOptionList)
+        catalog.highlighted = catalog.get_option_index("agent_paths")
+        await pilot.press("enter")
+        screen._list_draft = screen._make_draft(["new"])
+        screen._refresh_options()
+        actions = focus_action(screen, "apply")
+        await pilot.pause()
+        await pilot.click(actions, offset=(5, 1), times=2)
+        await pilot.pause()
+        assert service.saved == [{"agent_paths": ["new"]}]
+        assert (
+            screen._expanded is None
+            and screen._editing is None
+            and screen._confirmation is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_review_confirmation_apply_closes_help_before_save() -> None:
+    service = FakeService()
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        item = next(item for item in screen.catalog if item.path == "show_greeting")
+        screen._open_confirmation("value", item, True, "Confirm change", "Apply")
+        await pilot.press("f1")
+        assert screen._help_open
+        await pilot.click("#settings-confirmation-actions", offset=(3, 1), times=2)
+        await pilot.pause()
+        assert not screen._help_open and screen._confirmation is None
+        assert service.saved == [{"show_greeting": True}]
+
+
+@pytest.mark.asyncio
+async def test_review_boolean_override_pointer_reset_at_minimum_size() -> None:
+    service = FakeService()
+    field = next(f for f in service.snapshot.fields if f.path == "show_greeting")
+    field.saved_explicit = True
+    field.effective_value = True
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"show_greeting", "f1")
+        await pilot.click(
+            "#settings-help",
+            offset=pointer_shortcut_offset(screen, "#settings-help", "remove_override"),
+        )
+        await pilot.pause()
+        assert not screen._help_open and screen._confirmation is not None
+        await pilot.click("#settings-confirmation-actions", offset=(3, 1))
+        await pilot.pause()
+        assert service.saved == [{"show_greeting": None}]
+
+
+@pytest.mark.asyncio
+async def test_review_narrow_enum_accept_pointer_target() -> None:
+    service = FakeService()
+    next(
+        i for i in service.snapshot.catalog if i.path == "system_prompt_id"
+    ).choices = ("first", "second")
+    async with Harness(service).run_test(size=(50, 20)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"system_prompt_id", "enter")
+        await pilot.click("#settings-choices", offset=(3, 1))
+        assert screen._enum_draft == "second" and not service.saved
+        await pilot.click(
+            "#settings-hint",
+            offset=pointer_shortcut_offset(
+                screen, "#settings-hint", "activate_focused"
+            ),
+        )
+        await pilot.pause()
+        assert service.saved == [{"system_prompt_id": "second"}]
+
+
+@pytest.mark.asyncio
+async def test_review_added_pattern_bookmark_reentry() -> None:
+    service = FakeService()
+    field = next(f for f in service.snapshot.fields if f.path == "disabled_tools")
+    field.saved_value = [f"existing-{index}-*" for index in range(40)]
+    field.saved_explicit = True
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"inventory_tools", "enter")
+        focus_action(screen, "add-pattern")
+        await pilot.press("enter")
+        screen.query_one("#settings-input", Input).value = "custom-*"
+        await pilot.press("enter")
+        checklist = screen.query_one(SettingsChecklist)
+        opener = checklist.highlighted_option
+        assert opener is not None and str(opener.id).startswith("pattern:")
+        added = (screen._inventory_draft or {})["disabled"][-1]
+        assert opener.id == f"pattern:inventory_tools:disabled:{added.token}"
+        scroll = checklist.scroll_y
+        assert scroll > 0
+        await pilot.press("shift+tab")
+        assert checklist.has_focus and checklist.highlighted_option is opener
+        assert checklist.scroll_y == scroll
+        assert checklist.highlighted is not None
+        assert (
+            checklist.scroll_y
+            <= checklist.highlighted
+            < checklist.scroll_y + checklist.scrollable_content_region.height
+        )
+        await pilot.press("shift+tab", "tab")
+        assert checklist.has_focus and checklist.highlighted_option is opener
+        assert checklist.scroll_y == scroll
+        assert not service.saved
+
+
+@pytest.mark.asyncio
+async def test_review_double_cancel_preserves_pattern_opener() -> None:
+    service = FakeService()
+    field = next(f for f in service.snapshot.fields if f.path == "disabled_tools")
+    field.saved_value = ["long-pattern-" * 40]
+    field.saved_explicit = True
+    service.snapshot.inventories["tools"] = [f"member-{i}" for i in range(20)]
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"inventory_tools", "enter")
+        checklist = screen.query_one(SettingsChecklist)
+        checklist.highlighted = checklist.option_count - 1
+        await pilot.pause()
+        # Inspect earlier members without changing the selected pattern opener.
+        checklist.scroll_to(y=0, animate=False, immediate=True, force=True)
+        await pilot.pause()
+        opener = checklist.highlighted_option
+        assert opener is not None and str(opener.id).startswith("pattern:")
+        payload = navigation_payload(screen)
+        await pilot.press("ctrl+d")
+        assert screen._confirmation is not None
+        await pilot.click("#settings-confirmation-actions", offset=(3, 0), times=2)
+        await pilot.pause()
+        assert screen._confirmation is None and checklist.has_focus
+        assert checklist.highlighted_option is opener
+        assert navigation_payload(screen) == payload and not service.saved
+
+
+@pytest.mark.asyncio
+async def test_review_help_reopen_restores_full_geometry() -> None:
+    async with Harness(FakeService()).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press("f1")
+        height = screen.query_one("#settings-help").region.height
+        assert height > 4
+        await pilot.press("escape", "f1")
+        assert screen._help_open
+        assert screen.query_one("#settings-help").region.height == height
+
+
+@pytest.mark.asyncio
+async def test_review_clean_enum_enter_collapses_without_override() -> None:
+    service = FakeService()
+    next(
+        i for i in service.snapshot.catalog if i.path == "system_prompt_id"
+    ).choices = ("first", "second")
+    next(
+        f for f in service.snapshot.fields if f.path == "system_prompt_id"
+    ).effective_value = "first"
+    async with Harness(service).run_test(size=(80, 24)) as pilot:
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"system_prompt_id", "enter", "down", "enter")
+        assert screen._expanded is None and not service.saved
+        assert not screen.fields["system_prompt_id"].saved_explicit

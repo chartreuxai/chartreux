@@ -1345,6 +1345,11 @@ class CoreRequestHandler:
             target, changes_worktree = await asyncio.to_thread(
                 _relocation_target, params.cwd, previous_cwd
             )
+            if target != previous_cwd:
+                try:
+                    self._agent_loop.require_background_jobs_idle()
+                except AgentLoopStateError as exc:
+                    raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
             transfer: TransferAttempt | None = None
             acquired_token: OwnershipToken | None = None
             if changes_worktree:

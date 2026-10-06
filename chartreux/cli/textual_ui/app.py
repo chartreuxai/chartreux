@@ -6230,6 +6230,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 auto_compact_threshold=runtime.context_window,
                 compacting=self._root_compacting,
                 ascii_chrome=self.config.ascii_chrome,
+                active_background_job_count=self.app_server.state.active_background_job_count,
                 usage_day=self._usage_summaries.day if self._usage_summaries else None,
                 usage_week=self._usage_summaries.week
                 if self._usage_summaries

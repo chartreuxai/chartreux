@@ -5,7 +5,7 @@ Execute a shell command and return its output.
 - Commands run under a fixed allow/deny policy; there is no approval mechanism. A policy denial is not a user refusal. Adjust your approach and do not retry the same denied command verbatim.
 - Environment prefixes are limited to safe uppercase names with literal values. General variable expansion and heredocs are unsupported in v0.1 because they can change argument count or meaning.
 - Destructive commands are denied by policy. Ask the user to run them manually; do not attempt to bypass the guard.
-- `timeout` is in seconds (default 300). The command is killed if it exceeds the timeout; there is no background execution, so avoid launching long-running or blocking processes.
+- `timeout` is in seconds (default 300). This tool runs foreground work and kills commands that exceed the timeout. For managed long-running jobs use `bash_start`, read output with `bash_read`, recover handles with `bash_list`, and stop unneeded jobs with `bash_stop`.
 
 # Git
 - Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in this environment.

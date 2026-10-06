@@ -31,7 +31,7 @@ Unless noted, list defaults are `[]`, map defaults are `{}`, and booleans shown 
 | `credential_env_passthrough` | `[]` | Environment-variable names exempt from credential scrubbing in child processes (shell commands, MCP stdio servers, hooks, client terminals). This setting is accepted only from the user configuration layer; project and other layers, including generic config patches, are rejected. |
 | `mcp_servers` | `[]` | Array of [MCP server tables](#mcp-server-tables). |
 
-Every `[tools.<name>]` table except `tools.bash` accepts `permission` (`always` or `never`), `allowlist`, `denylist`, and `sensitive_patterns`; defaults are `always`, `[]`, `[]`, and `[]`. A tool implementation can accept additional fields. Shipped tool fields are:
+Every ordinary `[tools.<name>]` table accepts `permission` (`always` or `never`), `allowlist`, `denylist`, and `sensitive_patterns`; defaults are `always`, `[]`, `[]`, and `[]`. The shell exceptions are `tools.bash`, which does not accept `allowlist`, and `bash_start`, which uses the canonical `tools.bash` configuration rather than a separate permission table. A tool implementation can accept additional fields. Shipped tool fields are:
 
 | Tool table | Additional fields and defaults |
 | --- | --- |
@@ -39,6 +39,7 @@ Every `[tools.<name>]` table except `tools.bash` accepts `permission` (`always` 
 | `tools.write_file` | `max_write_bytes = 64000`, `create_parent_dirs = true`. |
 | `tools.grep` | `max_output_bytes = 64000`, `default_max_matches = 100`, `default_timeout = 60`, `exclude_patterns` (the built-in exclusion list), `codeignore_file = ".chartreuxignore"`; permission `always`. |
 | `tools.bash` | `max_output_bytes = 16000`, `default_timeout = 300`, `denylist`, `denylist_standalone`, and `sensitive_patterns`; it does not accept `allowlist`. |
+| `tools.bash_read`, `tools.bash_stop`, `tools.bash_list` | Permission `always`; no additional documented fields. Job ownership checks also apply. |
 | `tools.web_fetch` | `default_timeout = 30`, `max_timeout = 120`, `max_content_bytes = 120000`, `user_agent` (the built-in browser-like value). |
 | `tools.web_search` | `provider = "auto"`, `api_key_env_var` and `base_url` unset, `timeout = 120` (> 0), `max_results = 5`, `model = "mistral-vibe-cli-with-tools"`. A blank or unset `base_url` uses the selected provider's default endpoint. Provider is `auto`, `mistral`, `exa`, `brave`, or `duckduckgo`; `auto` means Mistral only and never falls back. Configure it in Settings > Web search or with `/web-search`. `Configured; connection not verified` reflects configuration and credential availability, not a connectivity check. |
 | `tools.task` | `allowlist = ["worker"]`; permission `always`. |
@@ -46,6 +47,15 @@ Every `[tools.<name>]` table except `tools.bash` accepts `permission` (`always` 
 | `tools.read_image` | Permission `always`; no additional documented fields. |
 | `tools.edit` | Permission `always`; no additional documented fields. |
 | `tools.wait_for_agent`, `tools.ask_user_question`, `tools.get_agent_result`, `tools.skill`, `tools.check_agents`, `tools.cancel_agent`, `tools.release_agent` | Permission `always`; no additional documented fields. |
+
+`bash_start` honors `[tools.bash]` launch permission and shell restrictions,
+including parent restrictions; there is no separate `[tools.bash_start]`
+permission key. `enabled_tools` and `disabled_tools` still filter the launch tool,
+and canonical Bash denial cannot be bypassed by enabling it. Read, stop, and list
+use their own ordinary permission tables; disabling launch alone does not disable
+those recovery tools. Shell allowlists are not restored by the job API. Live jobs
+or pending admissions can block execution-authority reductions, not cosmetic
+status-line changes. See [managed shell jobs](../guides/tools-safety.md#managed-shell-jobs).
 
 The built-in read/edit/write/image/grep configurations include sensitive patterns for `.env`-style files. Do not remove those protections casually.
 
@@ -96,12 +106,21 @@ The `[status_line]` table controls the bottom session status row. Unknown fields
 
 | Key | Default | Accepted value |
 | --- | --- | --- |
-| `segments` | `["directory", "pid", "context"]` | Ordered, unique list of `directory`, `pid`, `model`, `context`, `git-branch`, `spend-today`, `spend-week`, or `spend-month`. Both `directory` and `context` are required. |
+| `segments` | `["directory", "pid", "context"]` | Ordered, unique list of `directory`, `pid`, `model`, `context`, `git-branch`, `spend-today`, `spend-week`, `spend-month`, or `background-jobs`. Both `directory` and `context` are required. |
 | `directory_style` | `"name"` | `name` or `path`. |
 | `context_style` | `"tokens-percent"` | `tokens` or `tokens-percent`. |
 | `separator` | `"pipe"` | `space` or `pipe`. |
 
 Context renders without a label, for example `135k/400k (34%)`; the denominator is the effective automatic-compaction threshold, not the model's maximum context window. The `tokens` variant omits the percentage. Git branch lookup is asynchronous and cached. Configure this row in Settings > Status line; see the [configuration guide](../guides/configuration.md#status-line-and-message-timing) for editor controls.
+
+`background-jobs` is opt-in and renders `Jobs N`, including `Jobs 0` when no
+managed jobs are active. It counts committed jobs whose owned cleanup has not
+settled across the current root and all its children, including jobs surviving
+child completion. It is not a count of background agent runs or retained finished
+job records. The default segments remain `directory`, `pid`, and `context`.
+The count comes from projected session state and refreshes between turns; it is
+not an OS process scan. As an optional segment, it follows the same width
+degradation as the other optional segments.
 
 Spend segments show recorded USD cost estimates across all projects:
 `spend-today` renders `Today $12.34`, `spend-week` renders `Week $12.34`,

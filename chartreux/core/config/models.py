@@ -93,6 +93,7 @@ type StatusLineSegment = Literal[
     "spend-today",
     "spend-week",
     "spend-month",
+    "background-jobs",
 ]
 
 

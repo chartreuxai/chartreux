@@ -79,7 +79,11 @@ from chartreux.core._usage_startup import StartupAccountingContext
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._loop import RootAccountingOwner
 from chartreux.core.config import ChartreuxConfigSchema
-from chartreux.core.events import BackgroundWorkEvent, SessionTitleUpdatedEvent
+from chartreux.core.events import (
+    BackgroundJobsChangedEvent,
+    BackgroundWorkEvent,
+    SessionTitleUpdatedEvent,
+)
 from chartreux.core.git.errors import GitError
 from chartreux.core.git.worktree import PreparedWorktree, acquire_for_attachment
 from chartreux.core.git.worktree.record import AcquireResult, release_holder
@@ -552,6 +556,13 @@ class SessionRuntimeControllerImpl:
             raise RuntimeError("Unable to reserve replacement worktree")
         pending_token = acquired.token
         try:
+            await previous.session.agent_loop.retire_background_jobs()
+        except BaseException:
+            if pending_token is not None:
+                release_holder(pending_token)
+            await close_agent_loop(replacement)
+            raise
+        try:
             await self._sessions.drain_children()
         except Exception:
             logger.exception(
@@ -941,7 +952,9 @@ class SessionRuntimeControllerImpl:
             try:
                 if isinstance(event, SessionTitleUpdatedEvent):
                     await self._notify_title(event)
-                elif isinstance(event, BackgroundWorkEvent):
+                elif isinstance(
+                    event, (BackgroundWorkEvent, BackgroundJobsChangedEvent)
+                ):
                     await self._handle_background_work(event)
             except asyncio.CancelledError:
                 raise
@@ -950,8 +963,15 @@ class SessionRuntimeControllerImpl:
                     "error", ServerErrorParams(error=public_error(exc))
                 )
 
-    async def _handle_background_work(self, event: BackgroundWorkEvent) -> None:
-        if self._root_session.update_background_work(event):
+    async def _handle_background_work(
+        self, event: BackgroundWorkEvent | BackgroundJobsChangedEvent
+    ) -> None:
+        changed = (
+            self._root_session.update_background_jobs(event)
+            if isinstance(event, BackgroundJobsChangedEvent)
+            else self._root_session.update_background_work(event)
+        )
+        if changed:
             await self._turns.emit_snapshot(include_history=False, include_turns=False)
 
     async def _notify_title(self, event: SessionTitleUpdatedEvent) -> None:

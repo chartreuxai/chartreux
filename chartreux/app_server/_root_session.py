@@ -22,7 +22,7 @@ from chartreux.app_server.models import (
     SessionLogSummary,
 )
 from chartreux.core.agent_loop import AgentLoop
-from chartreux.core.events import BackgroundWorkEvent
+from chartreux.core.events import BackgroundJobsChangedEvent, BackgroundWorkEvent
 from chartreux.observability.logging import logger
 
 
@@ -79,6 +79,7 @@ class RootSessionCoordinator:
         self._history = history
         self._handoffs: dict[str, str] = {}
         self._background_work: dict[str, set[str]] = {}
+        self._jobs_state: BackgroundJobsChangedEvent | None = None
 
     @property
     def current_session_id(self) -> str:
@@ -98,8 +99,45 @@ class RootSessionCoordinator:
         return self.is_current(session_id) and self._attached_session_id == session_id
 
     @property
+    def active_background_job_count(self) -> int:
+        port = self._agent_loop.background_jobs
+        if port is None:
+            return 0
+        # Publish the ordered transition's count, not a later registry value:
+        # rapid admissions must still expose 1 -> 2 as distinct snapshots.
+        state = self._jobs_state
+        if state is not None and (
+            state.root_lifetime_id == port.lifetime_id
+            and state.generation == port.generation
+        ):
+            return state.active_count
+        return port.committed_active_count
+
+    @property
     def is_quiescent(self) -> bool:
-        return not self._background_work.get(self.current_session_id)
+        port = self._agent_loop.background_jobs
+        return (
+            not self._background_work.get(self.current_session_id)
+            and self.active_background_job_count == 0
+            and (port is None or port.active_count == 0)
+        )
+
+    def update_background_jobs(self, event: BackgroundJobsChangedEvent) -> bool:
+        port = self._agent_loop.background_jobs
+        if port is None or (
+            event.root_lifetime_id != port.lifetime_id
+            or event.generation != port.generation
+        ):
+            return False
+        previous = self._jobs_state
+        if previous is not None and (
+            previous.root_lifetime_id == event.root_lifetime_id
+            and previous.generation == event.generation
+            and event.revision <= previous.revision
+        ):
+            return False
+        self._jobs_state = event
+        return True
 
     def update_background_work(self, event: BackgroundWorkEvent) -> bool:
         was_quiescent = self.is_quiescent
@@ -173,6 +211,7 @@ class RootSessionCoordinator:
         update: dict[str, object] = {
             "event_id": self._event_watermark(state.session.id),
             "is_quiescent": self.is_quiescent,
+            "active_background_job_count": self.active_background_job_count,
         }
         if turn_queue is not None:
             update["turn_queue"] = turn_queue

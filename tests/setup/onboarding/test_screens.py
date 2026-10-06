@@ -42,3 +42,9 @@ async def test_provider_workbench_is_keyboard_reachable_at_80_by_24() -> None:
         assert screen.state is not None
         assert screen.query_one("#wb-actions").region.height > 0
         assert screen.query_one("#wb-actions").region.bottom <= screen.app.size.height
+        await pilot.press("tab")
+        operations = screen.query_one("#wb-provider-operations")
+        assert operations.display and operations.has_focus
+        assert operations.region.height > 0
+        assert operations.region.bottom <= screen.query_one("#wb-help").region.y
+        assert screen.query_one("#wb-hint").region.bottom <= screen.app.size.height
