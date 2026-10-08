@@ -43,8 +43,8 @@ On its first run, Chartreux creates `~/.chartreux/config.toml` for ordinary
 settings and `~/.chartreux/.env` for credentials. The saved main and subagent
 presets live in `~/.chartreux/models.toml`. Interactive onboarding presents a
 welcome, then follows **Connect provider → Configure models → Add another
-provider or continue → Choose default presets → [optional Web search] →
-Finish**. Mistral is the initial model-provider route. Discovery filters out
+provider or continue → Automatic role summary → Finish**. Customize opens
+preset choices when needed. Mistral is the initial model-provider route. Discovery filters out
 non-chat models such as embeddings; you can also configure a model manually.
 Each provider and model save advances without requiring a return to an earlier
 screen. Presets assign
@@ -52,16 +52,12 @@ one model and thinking level to the main assistant and each subagent role.
 Ready preset choices stay selected. When a current preset is not runnable,
 setup suggests a model from a configured provider only when its deployment is
 enabled, its supported thinking level is valid, and the credential resolver
-finds any required key. Saving presets persists that choice. If web search is
-already ready, onboarding preserves the current search choice and skips that
-step. Otherwise the optional Web search step offers Exa, Brave, and DuckDuckGo;
-it does not offer `auto` or a second Mistral choice. Standalone Settings shows
-one Mistral choice; `auto` remains a supported configuration alias for Mistral.
-The Web search step lets you save settings and finish, go back to presets, or
-choose **Skip for now**. Skipping leaves web-search settings unchanged and does
-not disable the tool. Finishing checks required presets and, if the search
-step is shown, web-search configuration and credentials; it does not test live
-connectivity. Entered
+finds any required key. Saving presets persists that choice. Setup finishes
+after presets without checking or changing web-search settings. Configure
+optional web search afterward via **Settings > Web search** or `/web-search`.
+Settings shows one Mistral choice; `auto` remains a supported configuration
+alias for Mistral. Finishing checks required presets, not live connectivity.
+Entered
 credentials are saved in the `.env` file when possible; setup reports if a key
 is available only for the current session. You can run onboarding explicitly
 with:

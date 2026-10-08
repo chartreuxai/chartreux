@@ -124,7 +124,26 @@ Shipped roles are the four presets above; they can be patched one role at a
 time in `models.toml`. Custom roles are TOML-only: define `[roles.<name>]` with
 `description`, `model`, and `thinking`; the preset editor selects built-in
 roles. Old `models = [...]` role tables are rejected with a conversion hint.
-See [Subagents](subagents.md).
+Role descriptions are brief model-preset descriptions, not dispatch policy:
+routing semantics are defined by the dispatch purpose vocabulary and rendered
+slots. To select dispatch behavior, add a `[dispatch]` overlay in `models.toml`:
+
+```toml
+[dispatch]
+mode = "orchestrated"
+
+[dispatch.slots.implementor]
+role = "@medium"
+```
+
+Without an explicit mode, fresh sessions use `standalone` (direct implementation,
+with delegated verification and independent review). The example above explicitly
+selects `orchestrated`; existing explicit selections remain authoritative, and
+legacy tier roles do not imply orchestration. Multi-model users can follow the
+dismissible graduation nudge to the presets screen; it never switches mode
+automatically. Dispatch changes are bound when a session
+starts and apply to the next session. See [Subagents](subagents.md) and
+[Configuration](configuration.md) for routing and overlay details.
 
 ## Thinking levels
 

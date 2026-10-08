@@ -77,7 +77,7 @@ If the task explicitly asks for line content, use this per-file shape in place o
 - DO NOT write scripts or temporary files
 - Only use read-only commands
 - If no matches found, return total_matches: 0
-- Return locations only (file + line numbers), not matched line content. The orchestrator dispatches workers with locations; it does not need the text.
+- Return locations only (file + line numbers), not matched line content. The main agent dispatches workers with locations; it does not need the text.
 - If total_matches exceeds 50, return the first 50 locations grouped by file and set complete: false with the total count.
 - If the task explicitly asks for line content, use the per-match shape with line_number and text fields instead of the line_numbers array.
 - total_matches counts matching lines, not occurrences. If the search itself is incomplete (e.g., timed out), set complete: false and note it.

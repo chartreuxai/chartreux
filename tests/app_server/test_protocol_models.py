@@ -982,6 +982,7 @@ def test_agents_update_carries_retention_metadata() -> None:
     assert update.model_dump(mode="json")["agents"][0] == {
         "agentId": "agent-1",
         "profile": "worker",
+        "slotPurposes": [],
         "availability": "evicted",
         "currentRunId": None,
         "currentRunStatus": None,

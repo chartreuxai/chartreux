@@ -132,6 +132,67 @@ def test_preserves_tool_specific_fields_from_overrides():
     assert config.default_timeout == 600  # type: ignore[attr-defined]
 
 
+def test_cleared_bash_denylist_removes_shipped_git_defaults(tmp_path: Path):
+    from chartreux.core.tools.builtins.bash import BashArgs
+
+    vibe_config = build_test_vibe_config(tools={"bash": {"denylist": []}})
+    manager = ToolManager(lambda: vibe_config, cwd=tmp_path, defer_mcp=True)
+
+    config = manager.get_tool_config("bash")
+
+    assert config.denylist == []  # type: ignore[attr-defined]
+    tool = manager.get("bash")
+    for command in (
+        "git push",
+        "git -C . push",
+        "git checkout main",
+        "git stash drop",
+        "git stash clear",
+        "git restore file.txt",
+        "git switch --discard-changes",
+        "git switch -f main",
+        "git -C . switch --discard-changes",
+        "git reflog expire --all",
+        "git reflog delete main",
+    ):
+        result = tool.resolve_permission(BashArgs(command=command))
+        assert result is not None and result.permission is ToolPermission.ALWAYS
+    # The policy layer's hard guards survive the configured removal.
+    for command in ("git reset --hard HEAD", "git clean -fd"):
+        result = tool.resolve_permission(BashArgs(command=command))
+        assert result is not None and result.permission is ToolPermission.NEVER
+
+
+def test_replaced_bash_denylist_keeps_unrelated_defaults(tmp_path: Path):
+    from chartreux.core.tools.builtins.bash import BashArgs
+
+    vibe_config = build_test_vibe_config(tools={"bash": {"denylist": ["curl"]}})
+    manager = ToolManager(lambda: vibe_config, cwd=tmp_path, defer_mcp=True)
+
+    config = manager.get_tool_config("bash")
+
+    assert config.denylist == ["curl"]  # type: ignore[attr-defined]
+    tool = manager.get("bash")
+    for command in (
+        "git push",
+        "git -C . push",
+        "git checkout main",
+        "git stash drop",
+        "git stash clear",
+        "git restore file.txt",
+        "git switch --discard-changes",
+        "git switch -f main",
+        "git -C . switch --discard-changes",
+        "git reflog expire --all",
+        "git reflog delete main",
+    ):
+        result = tool.resolve_permission(BashArgs(command=command))
+        assert result is not None and result.permission is ToolPermission.ALWAYS
+    result = tool.resolve_permission(BashArgs(command="curl example.org"))
+    assert result is not None and result.permission is ToolPermission.NEVER
+    assert "matches denylist pattern 'curl'" in (result.reason or "")
+
+
 def test_falls_back_to_base_config_for_unknown_tool(tool_manager):
     config = tool_manager.get_tool_config("nonexistent_tool")
 

@@ -2269,6 +2269,7 @@ async def test_production_legacy_root_holds_lease_until_runtime_shutdown(
     blueprint = Mock()
     blueprint.config = config
     blueprint.config_orchestrator = FakeConfigOrchestrator(config)
+    blueprint.harness_files = saved.harness_files
     blueprint.cwd = tmp_path
     blueprint.build.side_effect = lambda **kwargs: build_test_agent_loop(
         config=config, **kwargs

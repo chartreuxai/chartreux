@@ -51,6 +51,7 @@ class ConfigView(ProtocolModel):
     ascii_chrome: bool = False
     enable_notifications: bool
     enable_system_trust_store: bool = False
+    dispatch_mode: Literal["standalone", "orchestrated"] | None = None
     models: list[ModelConfigView]
     validation_warnings: list[str]
 

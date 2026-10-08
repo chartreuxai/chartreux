@@ -960,6 +960,10 @@ async def test_onboarding_presets_use_configured_custom_model_without_mistral() 
     catalog["models"]["my-model"] = {
         "deployments": [{"provider": "custom", "name": "my-model"}]
     }
+    catalog["models"]["other-model"] = {
+        "deployments": [{"provider": "custom", "name": "other-model"}]
+    }
+    catalog["roles"]["custom-review"] = {"model": "other-model", "thinking": "low"}
     services.catalog = CatalogSnapshot(
         ModelCatalog.model_validate(catalog), "custom", frozenset({"custom"})
     )
@@ -975,10 +979,16 @@ async def test_onboarding_presets_use_configured_custom_model_without_mistral() 
             screen.state.preset(role)[0] == "my-model"
             for role in ("orchestrator", "large", "medium", "small")
         )
+        assert screen.state.preset("custom-review") == ("other-model", "low")
         screen.state.set_role_preset("large", "my-model", "low")
         screen._open_presets()
         assert screen.state.preset("large") == ("my-model", "low")
-        assert "Save presets and continue" in str(
+        assert screen.state.preset("custom-review") == ("other-model", "low")
+        assert not any(
+            str(option.id).startswith("preset:")
+            for option in screen.query_one("#wb-presets", OptionList).options
+        )
+        assert "Finish setup" in str(
             next(
                 option.prompt
                 for option in screen.query_one(
@@ -3425,6 +3435,12 @@ async def test_discard_confirmation_context_names_the_available_choices() -> Non
 @pytest.mark.asyncio
 async def test_two_provider_onboarding_uses_arrows_and_forward_saves() -> None:
     screen, services = setup()
+    catalog = services.catalog.catalog.model_dump()
+    catalog["roles"].update({
+        role: {"model": "a", "thinking": "off"} for role in SHIPPED_CATALOG.roles
+    })
+    services.catalog = CatalogSnapshot(ModelCatalog.model_validate(catalog), "test")
+    screen.snapshot = services.catalog
     screen.mode = "onboarding"
 
     async def model_action(pilot, value: str) -> None:  # type: ignore[no-untyped-def]
@@ -3490,6 +3506,10 @@ async def test_two_provider_onboarding_uses_arrows_and_forward_saves() -> None:
         assert {"alpha", "beta"} <= screen.snapshot.catalog.providers.keys()
 
         presets = screen.query_one("#wb-presets", OptionList)
+        assert not any(
+            str(option.id).startswith("preset:") for option in presets.options
+        )
+        await press_option(pilot, presets, "customize")
         await press_option(pilot, presets, "preset:orchestrator")
         editor = screen.query_one("#wb-preset-editor", OptionList)
         await press_option(pilot, editor, "model")
@@ -3528,7 +3548,8 @@ async def test_compact_presets_and_forward_actions_fit_without_scrolling(size) -
         await pilot.pause()
         rows = screen.query_one("#wb-presets", OptionList)
         ids = [str(option.id) for option in rows.options]
-        assert len(ids) == 7
+        assert len(ids) == 10
+        assert {"mode:standalone", "mode:orchestrated", "next-session"} <= set(ids)
         assert all(f"preset:{role}" in ids for role in catalog["roles"])
         actions = screen.query_one("#wb-presets-actions", OptionList)
         assert [option.id for option in actions.options] == ["finish", "add-another"]

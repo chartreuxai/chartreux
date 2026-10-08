@@ -444,6 +444,94 @@ def test_network_clients_are_denied_by_default(command):
 
 
 @pytest.mark.parametrize(
+    ("command", "pattern"),
+    [
+        ("git push", "git push"),
+        ("git push --force origin main", "git push"),
+        ("git checkout main", "git checkout"),
+        ("git checkout -b feature", "git checkout"),
+        ("git checkout -- file.txt", "git checkout"),
+        ("git checkout HEAD -- file.txt", "git checkout"),
+        ("git stash drop", "git stash drop"),
+        ("git stash drop stash@{1}", "git stash drop"),
+        ("git stash clear", "git stash clear"),
+        ("git restore file.txt", "git restore"),
+        ("git restore .", "git restore"),
+        ("git restore --source HEAD file.txt", "git restore"),
+        ("git restore --staged file.txt", "git restore"),
+        ("git switch --discard-changes", "git switch --discard-changes"),
+        ("git switch --discard-changes main", "git switch --discard-changes"),
+        ("git switch -f", "git switch -f"),
+        ("git switch -f main", "git switch -f"),
+        ("git reflog expire", "git reflog expire"),
+        ("git reflog expire --expire=now --all", "git reflog expire"),
+        ("git reflog delete", "git reflog delete"),
+        ("git reflog delete main", "git reflog delete"),
+        # Recognized git global options are normalized before prefix matching.
+        ("git -C . push", "git push"),
+        ("git --no-pager checkout main", "git checkout"),
+        ("git -C . switch --discard-changes", "git switch --discard-changes"),
+        ("git --no-pager switch -f main", "git switch -f"),
+        ("git -C . reflog expire --all", "git reflog expire"),
+        ("git -C . reflog delete main", "git reflog delete"),
+    ],
+)
+def test_destructive_git_forms_are_denied_by_default(command, pattern):
+    bash_tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    assert f"matches denylist pattern '{pattern}'" in (permission.reason or "")
+
+
+@pytest.mark.parametrize(
+    ("command", "pattern"),
+    [
+        # End-of-options marker: canonicalizes to the plain subcommand form.
+        ("git -- push", "git push"),
+        # Environment-assignment prefixes do not smuggle a denied command.
+        ("FOO=1 git push", "git push"),
+        # Nested shell source is analyzed and matched too.
+        ("sh -c 'git -C . push'", "git push"),
+    ],
+)
+def test_denylist_git_spelling_variants_are_denied(command, pattern):
+    bash_tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    assert f"matches denylist pattern '{pattern}'" in (permission.reason or "")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Non-destructive git forms stay permitted by the default denylist.
+        "git switch main",
+        "git switch -c feature",
+        "git stash pop",
+        "git branch -D feature",
+        "git tag -d v1",
+        "git reflog",
+        "git reflog show",
+        # Dangling global options canonicalize to bare git and match no entry.
+        "git -C",
+        "git --git-dir",
+    ],
+)
+def test_non_destructive_git_forms_stay_permitted(command, tmp_path):
+    tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=tmp_path
+    )
+    result = tool.resolve_permission(BashArgs(command=command))
+    assert result is not None and result.permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize(
     "command",
     [
         "python -c 'import os'",
@@ -1383,6 +1471,26 @@ def test_destructive_guard_lookalikes_are_allowed(command, tmp_path):
     )
     result = tool.resolve_permission(BashArgs(command=command))
     assert result is not None and result.permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git reset --hard HEAD",
+        "git --git-dir .git reset --hard",
+        "git -C . reset --hard HEAD",
+        "git clean -fd",
+        "git clean -f -d",
+        "git clean -e -- -fd",
+    ],
+)
+def test_cleared_denylist_keeps_git_hard_guards(command, tmp_path):
+    # The configurable denylist is replaceable; the policy layer's hard
+    # guards are not, so clearing the denylist must not permit these forms.
+    config = BashToolConfig(denylist=[])
+    tool = Bash(config_getter=lambda: config, state=BaseToolState(), cwd=tmp_path)
+    result = tool.resolve_permission(BashArgs(command=command))
+    assert result is not None and result.permission is ToolPermission.NEVER
 
 
 def test_denylist_precedes_syntax_and_nested_wrapper_denial():

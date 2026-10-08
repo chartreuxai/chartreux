@@ -25,7 +25,11 @@ from chartreux.app_server._execution import (
     SessionExecutionKind,
 )
 from chartreux.app_server._model import ProtocolModel
-from chartreux.app_server._projection import project_history, project_session_log
+from chartreux.app_server._projection import (
+    project_history,
+    project_launch_slot_purposes,
+    project_session_log,
+)
 from chartreux.app_server._root_session import SessionHandoff, rebind_history
 from chartreux.app_server._runtime import AgentRuntimeFactory, close_agent_loop
 from chartreux.app_server._session_history import SessionHistory
@@ -2778,6 +2782,14 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 AgentSummaryModel(
                     agent_id=summary.agent_id,
                     profile=summary.profile,
+                    slot_purposes=(
+                        project_launch_slot_purposes(
+                            record.runtime.agent_loop, summary.profile
+                        )
+                        if (record := self._agent_records.get(summary.agent_id))
+                        is not None
+                        else []
+                    ),
                     availability=summary.availability.value,
                     current_run_id=summary.current_run_id,
                     current_run_status=(

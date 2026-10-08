@@ -146,7 +146,7 @@ done
 
 ## Step 3: Execute Operation
 
-Safe operations (commit, branch, stash, normal push) are executed by the agent with user approval. History-rewriting operations (rebase, squash, amend, any history-moving reset, force push) are NEVER executed here — they follow the handoff-only protocol in their sections and in Step 4.
+Safe operations (commit, branch, stash) are executed by the agent with user approval. Push is runtime-denied by default — handoff-only: the user runs it or intentionally removes the denylist entry. History-rewriting operations (rebase, squash, amend, any history-moving reset, force push) are NEVER executed here — they follow the handoff-only protocol in their sections and in Step 4.
 
 ### Operation: Commit Message Generation (`/main-git-workflow commit` or "generate commit message")
 
@@ -213,7 +213,7 @@ Use this message? (y/n/Edit)
    - **Length**: Must be ≤50 characters
    - **Not exists**: Must not exist locally or remotely
 4. If validation fails, prompt: "Invalid branch name. Must be prefixed (feature/fix/chore/refactor), kebab-case, ≤50 chars, and unique. Try again?"
-5. Create and checkout branch: `git checkout -b <branch-name>` (branch creation only — this does not discard any files; if uncommitted changes would conflict with the switch, warn and get approval first)
+5. Create and switch to the branch: `git switch -c <branch-name>` (branch creation only — this does not discard any files; if uncommitted changes would conflict with the switch, warn and get approval first)
 6. Set upstream if remote branch exists: `git branch --set-upstream-to=origin/<branch-name>`
 
 **Example Output:**
@@ -447,7 +447,7 @@ Select option: [1-5]
 2. Check if branch has upstream: `git rev-parse --abbrev-ref @{u} 2>/dev/null`
 3. If no upstream:
    - Prompt: "No upstream set. Set upstream to origin/<branch>? (y/n)"
-   - If yes: `git push --set-upstream origin <branch>`
+   - If yes: handoff-only — `git push --set-upstream origin <branch>` is runtime-denied by default; give the user the exact command to run themselves (or point to the `[tools.bash]` denylist entry)
 4. If upstream exists:
    - Check if branch is behind/ahead: `git log --oneline @{u}..HEAD` and `git log --oneline HEAD..@{u}`
    - If behind: "Your branch is behind remote. Pull first? (y/n)"
@@ -455,7 +455,7 @@ Select option: [1-5]
 5. If shared branch and diverged:
    - **BLOCK**: Explain that force push overwrites remote history — handoff-only: provide the `git push --force-with-lease` command; the user runs it themselves
    - Suggest `--force-with-lease` instead of `--force`
-6. Execute push: `git push` (normal fast-forward push only). Force pushes are never executed by the agent — handoff-only.
+6. Push is handoff-only: `git push` is runtime-denied by default — give the user the exact command to run themselves (or point to the `[tools.bash]` denylist entry). Force pushes are never executed by the agent — handoff-only.
 
 **Example Output:**
 ```
@@ -497,7 +497,7 @@ Suggested Actions:
 1. Review changes: git diff
 2. Stage changes: git add -p (interactive) or git add .
 3. Commit: /main-git-workflow commit
-4. Push: git push
+4. Push: `git push` (handoff-only; you run it — runtime-denied by default)
 5. Rebase onto main: /main-git-workflow rebase (guidance + handoff; you run the rebase)
 
 What would you like to do?
@@ -550,9 +550,8 @@ These can be executed directly (read-only or additive, no history rewrite):
 - `git commit` (new commits only, with generated message)
 - `git pull` (without rebase)
 - `git fetch`
-- `git push` (normal fast-forward push only)
 
-`git checkout` is NOT blanket-safe: switching branches is fine, but `git checkout <file>`/`git checkout -- <path>` discards unsaved work — state the action and get user approval every time. `git stash drop` and `git stash clear` permanently discard stashed work — user approval every time.
+`git checkout` and `git restore` are runtime-denied by default — handoff-only: the user runs them or intentionally removes the denylist entry; use `git switch` for branch creation (`git switch -c <branch>`) and plain branch switching (`git switch <branch>`). Plain `git switch <branch>` and `git switch -c` are safe; `git switch --discard-changes`, `git switch -f`, and branch-resetting `git switch -C` discard working-tree changes or reset a branch — treat them as destructive operations under the handoff guidance (and note `git switch --discard-changes` and `git switch -f` are runtime-denied by the default denylist). `git push` is runtime-denied by default — handoff-only: the user runs it or intentionally removes the denylist entry. `git stash drop` and `git stash clear` permanently discard stashed work — runtime-denied by default; the user runs them or intentionally removes the denylist entry.
 
 ---
 
@@ -580,7 +579,7 @@ When merge or rebase conflicts occur, guide user through resolution:
 **3. Abort Operation:**
 - For rebase: `git rebase --abort` — HANDOFF-ONLY: the user executes this to abort a rebase the USER started; the agent never runs it or starts a rebase
 - For merge: `git merge --abort`
-- For stash: `git stash drop stash@{n}` permanently discards that stash — state the action and get user approval every time before running it
+- For stash: `git stash drop stash@{n}` permanently discards that stash — runtime-denied by default; the user runs it or intentionally removes the denylist entry
 
 **4. Common Resolution Patterns:**
 - **Keep ours**: Keep current branch changes, discard incoming

@@ -6,14 +6,20 @@ import tempfile
 import threading
 import time
 import tomllib
-from typing import cast
+from typing import Any, cast
 
+from chartreux.core.dispatch import ORCHESTRATED_PRESET, STANDALONE_PRESET
 from chartreux.core.model_catalog.contracts import (
     CatalogChanges,
     CatalogValidationError,
     CatalogWriteResult,
 )
-from chartreux.core.model_catalog.loader import CatalogStore, load_catalog
+from chartreux.core.model_catalog.loader import (
+    CatalogSnapshot,
+    CatalogStore,
+    load_catalog,
+)
+from chartreux.core.model_catalog.resolver import ModelResolver
 
 
 def test_overlay_provenance_includes_explicit_shipped_default(tmp_path: Path) -> None:
@@ -78,6 +84,12 @@ def _changes(**kwargs: object) -> CatalogChanges:
 
 def _written(path: Path) -> dict[str, object]:
     return tomllib.loads(path.read_text())
+
+
+def _dispatch_table(path: Path) -> dict[str, Any]:
+    section = _written(path)["dispatch"]
+    assert isinstance(section, dict)
+    return section
 
 
 def test_catalog_wide_provider_and_role_move_is_single_transaction(
@@ -262,7 +274,11 @@ def test_append_uses_shipped_stubs_without_losing_inherited_metadata(
     assert deployments[0] == {"provider": "mistral"}
     model = result.snapshot.catalog.models["glm-5-3"]
     assert model.thinking == "high"
-    assert model.temperature == 0.2
+    assert model.temperature is None
+    resolved = ModelResolver(CatalogSnapshot(result.snapshot.catalog, "test")).resolve(
+        "glm-5-3"
+    )
+    assert resolved.materialize(auto_compact_threshold=200000).temperature == 1.0
     assert model.deployments[0].auto_compact_threshold == 400000
 
 
@@ -463,3 +479,180 @@ def test_atomic_writes_use_unique_temp_files(tmp_path: Path, monkeypatch) -> Non
     assert names[0] != names[1]
     assert all(Path(name).parent == tmp_path for name in names)
     assert not any(Path(name).exists() for name in names)
+
+
+def test_dispatch_only_edit_changes_revision_and_writes_section(tmp_path: Path) -> None:
+    path = tmp_path / "models.toml"
+    store = CatalogStore(path)
+    before = load_catalog(path)
+
+    result = store.apply_changes(
+        CatalogChanges("", {}, dispatch={"mode": "orchestrated"})
+    )
+
+    assert isinstance(result, CatalogWriteResult) and result.changed
+    assert result.snapshot.revision != before.revision
+    assert result.snapshot.catalog == before.catalog
+    assert result.snapshot.dispatch == ORCHESTRATED_PRESET
+    assert result.snapshot.dispatch_diagnostics == ()
+    assert _written(path) == {"dispatch": {"mode": "orchestrated"}}
+    assert load_catalog(path).dispatch == ORCHESTRATED_PRESET
+
+    repeated = store.apply_changes(
+        CatalogChanges("", {}, dispatch={"mode": "orchestrated"})
+    )
+    assert isinstance(repeated, CatalogWriteResult) and not repeated.changed
+
+
+def test_stale_dispatch_save_fails_without_losing_the_write(tmp_path: Path) -> None:
+    path = tmp_path / "models.toml"
+    store = CatalogStore(path)
+    original = load_catalog(path).revision
+
+    first = store.apply_changes(
+        CatalogChanges(
+            "", {}, dispatch={"mode": "orchestrated"}, expected_revision=original
+        )
+    )
+    assert isinstance(first, CatalogWriteResult)
+
+    stale = store.apply_changes(
+        CatalogChanges(
+            "", {}, dispatch={"mode": "standalone"}, expected_revision=original
+        )
+    )
+    assert isinstance(stale, CatalogValidationError)
+    assert "changed since" in stale.message
+    assert _written(path)["dispatch"] == {"mode": "orchestrated"}
+    assert load_catalog(path).revision == first.snapshot.revision
+
+
+def test_provider_edit_preserves_dispatch(tmp_path: Path) -> None:
+    path = tmp_path / "models.toml"
+    store = CatalogStore(path)
+    written = store.apply_changes(
+        CatalogChanges("", {}, dispatch={"mode": "standalone"})
+    )
+    assert isinstance(written, CatalogWriteResult)
+
+    result = store.apply_changes(
+        _changes(provider={"api_base": "https://other.example"})
+    )
+
+    assert isinstance(result, CatalogWriteResult) and result.changed
+    raw = _written(path)
+    assert raw["dispatch"] == {"mode": "standalone"}
+    assert result.snapshot.dispatch == STANDALONE_PRESET
+    assert result.snapshot.revision != written.snapshot.revision
+    assert "test" in result.snapshot.catalog.providers
+
+
+def test_invalid_dispatch_write_leaves_disk_unchanged(tmp_path: Path) -> None:
+    path = tmp_path / "models.toml"
+    store = CatalogStore(path)
+    saved = store.apply_changes(CatalogChanges("", {}, dispatch={"mode": "standalone"}))
+    assert isinstance(saved, CatalogWriteResult)
+    before = path.read_bytes()
+
+    for invalid in (
+        {"mode": "implement directly and delegate"},
+        {"unknown": "value"},
+        {"slots": {"implementor": {"purposes": ["typo"]}}},
+    ):
+        outcome = store.apply_changes(CatalogChanges("", {}, dispatch=invalid))
+        assert isinstance(outcome, CatalogValidationError)
+        assert path.read_bytes() == before
+
+    assert load_catalog(path).dispatch == STANDALONE_PRESET
+
+
+def test_incidental_provider_save_preserves_invalid_dispatch_table(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "models.toml"
+    path.write_text("""
+[providers.custom]
+api_base = "https://custom.test"
+
+[dispatch]
+mode = "standalone"
+
+[dispatch.slots.implementor]
+purposes = ["not-a-purpose"]
+""")
+    store = CatalogStore(path)
+    broken = load_catalog(path)
+    assert broken.dispatch == STANDALONE_PRESET
+    assert broken.dispatch_diagnostics
+    assert "custom" in broken.catalog.providers
+
+    incidental = store.apply_changes(
+        CatalogChanges("other", {"api_base": "https://other.test"})
+    )
+
+    assert isinstance(incidental, CatalogWriteResult) and incidental.changed
+    # The invalid table survives an incidental provider save verbatim.
+    assert _dispatch_table(path)["slots"]["implementor"]["purposes"] == [
+        "not-a-purpose"
+    ]
+    assert set(cast("dict[str, object]", _written(path)["providers"])) == {
+        "custom",
+        "other",
+    }
+    assert incidental.snapshot.dispatch == STANDALONE_PRESET
+    assert incidental.snapshot.dispatch_diagnostics
+
+
+def test_repair_replaces_only_the_invalid_dispatch_section(tmp_path: Path) -> None:
+    path = tmp_path / "models.toml"
+    path.write_text("""
+[providers.custom]
+api_base = "https://custom.test"
+
+[models.custom-model]
+deployments = [{ provider = "custom", name = "custom-wire" }]
+
+[dispatch]
+mode = "standalone"
+
+[dispatch.slots.implementor]
+purposes = ["not-a-purpose"]
+""")
+    store = CatalogStore(path)
+    broken = load_catalog(path)
+    assert broken.dispatch_diagnostics
+
+    repair = store.apply_changes(
+        CatalogChanges(
+            "", {}, dispatch={"mode": "standalone"}, expected_revision=broken.revision
+        )
+    )
+
+    assert isinstance(repair, CatalogWriteResult) and repair.changed
+    # Atomic replacement of only the dispatch section.
+    assert _dispatch_table(path) == {"mode": "standalone"}
+    assert set(cast("dict[str, object]", _written(path)["providers"])) == {"custom"}
+    models = cast("dict[str, Any]", _written(path)["models"])
+    assert models["custom-model"]["deployments"] == [
+        {"provider": "custom", "name": "custom-wire"}
+    ]
+    assert repair.snapshot.dispatch == STANDALONE_PRESET
+    assert repair.snapshot.dispatch_diagnostics == ()
+    assert repair.snapshot.catalog.models["custom-model"].deployments[0].name == (
+        "custom-wire"
+    )
+    assert load_catalog(path).dispatch == STANDALONE_PRESET
+
+
+def test_repair_validates_the_existing_overlay_before_writing(tmp_path: Path) -> None:
+    path = tmp_path / "models.toml"
+    original = '[providers.bad]\nunknown = true\n\n[dispatch]\nmode = "bogus"\n'
+    path.write_text(original)
+    store = CatalogStore(path)
+
+    outcome = store.apply_changes(
+        CatalogChanges("", {}, dispatch={"mode": "standalone"})
+    )
+
+    assert isinstance(outcome, CatalogValidationError)
+    assert path.read_text() == original

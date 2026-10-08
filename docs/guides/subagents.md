@@ -19,8 +19,7 @@ names report `Unknown agent_type profile`, while unknown retained handles report
 `Unknown agent_id instance handle`. The old Task field `agent` is not accepted.
 
 For the built-in role profiles, dispatch the task directly. Their role prompts
-already contain the noninteractive subagent contract and role guidance; do not
-add a role-specific skill-loading instruction:
+already contain the noninteractive subagent contract and role guidance:
 
 ```text
 task(task="Implement the bounded change in the issue", agent_type="worker")
@@ -28,9 +27,12 @@ task(task="Recommend an approach and identify risks", agent_type="advisor")
 task(task="Review the authentication changes", agent_type="reviewer")
 ```
 
-Task-type skills remain explicit. For example, a search assignment can ask the
-worker to load `sub-finder`; the role profile and the task skill serve different
-purposes:
+Workers dispatch skill-first. When the task names a skill, the worker loads it
+first and follows its methodology and output format; otherwise the worker
+selects the applicable task skill itself (`sub-implementor` for edits,
+`sub-finder` for searches, `sub-verifier` for verification, `sub-explorer` for
+exploration). Name a skill only when a specific methodology or output format is
+required; the role profile and the task skill serve different purposes:
 
 ```text
 task(task="Load the sub-finder skill and locate all callers of the parser.", agent_type="worker")
@@ -49,7 +51,7 @@ The built-in profiles are presets for common delegated work:
 
 | Profile | Model role | Prompt ID | Use it for |
 | --- | --- | --- | --- |
-| `worker` | `medium` | `worker` | General-purpose bounded implementation or miscellaneous work. |
+| `worker` | `medium` | `worker` | General-purpose bounded implementation. |
 | `advisor` | `large` | `advisor` | Independent architectural guidance, second opinions, and risk analysis. |
 | `reviewer` | `medium` | `reviewer` | Independent read-only reviews of code, documentation, specifications, and plans. |
 
@@ -67,10 +69,25 @@ profile with a built-in name overrides that built-in profile according to
 profile discovery precedence. This lets users replace a profile or its prompt
 without changing Chartreux's shipped defaults.
 
-Use the profile's role binding by default. Set `config={model="@small"}` for
-lighter work or `config={model="@large"}` when a task needs more capacity.
-Runtime configuration overrides the model for that launch; it does not change
-the profile or its role prompt.
+Profiles and dispatch slots are different concepts. A profile supplies an agent's
+prompt, tools, and defaults; a slot names a launch binding (profile plus a model
+role) and the purposes it serves. Roles remain saved model-and-thinking pairs.
+Fresh sessions default to `standalone`: the main assistant implements within
+approved scope, while verification and independent review remain delegated.
+All approval gates still apply. Select `orchestrated` explicitly in user
+`models.toml` (or the presets screen):
+
+```toml
+[dispatch]
+mode = "orchestrated"
+```
+
+This delegates implementation too, even with one model. Legacy tier entries do
+not select a mode. The rendered slot table and purpose vocabulary are
+authoritative for routing. A
+single-model roster renders task-kind routing without tier names; multi-model
+orchestrated routing retains the compatibility guidance. Saved dispatch changes
+apply to the next session, not the running session.
 
 ## Dynamic launch configuration
 

@@ -120,6 +120,10 @@ class CatalogChanges:
     roles: Mapping[str, Mapping[str, object]] | None = None
     providers: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
     expected_revision: str | None = None
+    # A sparse [dispatch] overlay table that atomically replaces the overlay's
+    # dispatch section; it is validated before write and never merged into the
+    # existing table, so a corrected table can replace an invalid one.
+    dispatch: Mapping[str, object] | None = None
 
     @property
     def provider_patches(self) -> dict[str, Mapping[str, object]]:

@@ -1,0 +1,7 @@
+[dispatch]
+mode = "orchestrated"
+
+[dispatch.slots.implementor]
+role = "@medium"
+purposes = ["implementation"]
+implements = "routine"

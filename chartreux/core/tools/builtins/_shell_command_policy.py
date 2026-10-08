@@ -1885,6 +1885,23 @@ def _git_global_options(args: list[str]) -> tuple[int, list[str]] | None:
     return index, paths
 
 
+def canonical_git_command(tokens: list[str]) -> list[str] | None:
+    """Canonical git command form with recognized global options elided.
+
+    The canonical form keeps the executable and the full subcommand suffix:
+    ``git -C . stash drop`` becomes ``git stash drop``. Returns None when the
+    executable is not git or the leading global options are unrecognized; the
+    policy layer denies those spellings, so declining to normalize is safe.
+    """
+    if not tokens or Path(tokens[0]).name != "git":
+        return None
+    globals_result = _git_global_options(tokens[1:])
+    if globals_result is None:
+        return None
+    index, _paths = globals_result
+    return [tokens[0], *tokens[1 + index :]]
+
+
 def _git_policy(args: list[str]) -> ShellCommandPolicy:
     if _git_destructive_policy(args):
         return ShellCommandPolicy(requires_approval=True)

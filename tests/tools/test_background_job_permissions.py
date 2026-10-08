@@ -55,6 +55,17 @@ def manager_for(tmp_path, *, parent=None, **config):
         "eval true",
         "cat /outside/file",
         "echo x > .git/config",
+        # Shipped default denylist entries, including the normalized git form.
+        "git push",
+        "git -C . push",
+        "git checkout main",
+        "git stash drop",
+        "git stash clear",
+        "git restore file.txt",
+        "git switch --discard-changes",
+        "git switch -f main",
+        "git reflog expire --all",
+        "git reflog delete main",
     ],
 )
 @pytest.mark.parametrize("child", [False, True])
@@ -74,6 +85,69 @@ def test_foreground_start_permission_parity(tmp_path, command, child):
     resolved = shared.resolve_permission(BashStartArgs(command=command))
     assert resolved is not None
     assert resolved.permission == foreground.permission
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_cleared_denylist_parity_for_git_forms(tmp_path, child):
+    # A configured empty denylist removes the shipped git defaults; both
+    # adapters agree that the forms are then permitted.
+    parent = manager_for(tmp_path, tools={"bash": {"denylist": []}})
+    manager = (
+        manager_for(tmp_path, parent=parent, tools={"bash": {"denylist": []}})
+        if child
+        else parent
+    )
+    for command in (
+        "git push",
+        "git -C . push",
+        "git checkout main",
+        "git stash drop",
+        "git stash clear",
+        "git restore file.txt",
+        "git switch --discard-changes",
+        "git switch -f main",
+        "git reflog expire --all",
+        "git reflog delete main",
+    ):
+        foreground = manager.get("bash").resolve_permission(BashArgs(command=command))
+        launch = manager.get("bash_start").resolve_permission(
+            BashStartArgs(command=command)
+        )
+        assert foreground is not None and launch is not None
+        assert foreground.permission == launch.permission
+        assert foreground.permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_replaced_denylist_parity_for_git_forms(tmp_path, child):
+    # A replacement list omitting the git entries permits those forms while
+    # preserving unrelated defaults; both adapters agree.
+    parent = manager_for(tmp_path, tools={"bash": {"denylist": ["curl"]}})
+    manager = (
+        manager_for(tmp_path, parent=parent, tools={"bash": {"denylist": ["curl"]}})
+        if child
+        else parent
+    )
+    for command, expected in (
+        ("git push", ToolPermission.ALWAYS),
+        ("git -C . push", ToolPermission.ALWAYS),
+        ("git checkout main", ToolPermission.ALWAYS),
+        ("git stash drop", ToolPermission.ALWAYS),
+        ("git stash clear", ToolPermission.ALWAYS),
+        ("git restore file.txt", ToolPermission.ALWAYS),
+        ("git switch --discard-changes", ToolPermission.ALWAYS),
+        ("git switch -f main", ToolPermission.ALWAYS),
+        ("git reflog expire --all", ToolPermission.ALWAYS),
+        ("git reflog delete main", ToolPermission.ALWAYS),
+        ("curl example.org", ToolPermission.NEVER),
+    ):
+        foreground = manager.get("bash").resolve_permission(BashArgs(command=command))
+        launch = manager.get("bash_start").resolve_permission(
+            BashStartArgs(command=command)
+        )
+        assert foreground is not None and launch is not None
+        assert foreground.permission == expected
+        assert launch.permission == expected
 
 
 @pytest.mark.parametrize("child", [False, True])
@@ -214,6 +288,20 @@ def test_parent_denylist_cannot_be_removed_by_child(tmp_path):
     )
     assert result is not None and result.permission is ToolPermission.NEVER
     assert "denylist" in (result.reason or "")
+
+
+def test_parent_git_denial_cannot_be_removed_by_child(tmp_path):
+    # The shipped git defaults are removable by configuration, but a parent's
+    # configured denial is inherited authority the child cannot drop.
+    parent = manager_for(tmp_path, tools={"bash": {"denylist": ["git push"]}})
+    child = manager_for(tmp_path, parent=parent, tools={"bash": {"denylist": []}})
+    for tool_name, args in (
+        ("bash", BashArgs(command="git push")),
+        ("bash_start", BashStartArgs(command="git push")),
+    ):
+        result = child.get(tool_name).resolve_permission(args)
+        assert result is not None and result.permission is ToolPermission.NEVER
+        assert "denylist" in (result.reason or "")
 
 
 def test_unavailable_parent_authority_fails_closed(tmp_path):

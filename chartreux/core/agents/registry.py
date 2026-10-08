@@ -152,6 +152,45 @@ class AgentRegistry:
         self._harness_files = harness_files
         self.search_paths = self._compute_search_paths()
         self.discovered = self._discover()
+        self.validate_dispatch()
+
+    def validate_dispatch(self) -> None:
+        """Bind policy profile references only after discovery has completed.
+
+        Child configuration copies never create a registry, so this boundary
+        cannot recurse through profile validation. Session-policy freezing is
+        intentionally separate from discovery.
+        """
+        from chartreux.core.dispatch.lint import lint_activation, lint_catalog
+        from chartreux.core.model_catalog.loader import fallback_dispatch_snapshot
+
+        self._orchestrator.config.attach_dispatch_diagnostics(())
+        snapshot = self._orchestrator.config.catalog_snapshot
+        if snapshot is None:
+            return
+        diagnostics = (
+            *lint_catalog(snapshot.dispatch, snapshot.catalog),
+            *lint_activation(
+                snapshot.dispatch,
+                self.discovered,
+                shadowed_profiles=self._shadowed_profiles,
+            ),
+        )
+        if any(item.severity == "error" for item in diagnostics):
+            recovered = fallback_dispatch_snapshot(
+                snapshot, "; ".join(map(str, diagnostics))
+            )
+            self._orchestrator.config.attach_catalog_snapshot(recovered)
+            logger.warning("%s", recovered.dispatch_diagnostics[-1])
+            # Recovery is a preset selection, not a candidate repair. The shipped
+            # standalone slots may still be unavailable in this catalog; do not
+            # re-lint recovery into a session-start failure or invent role bindings.
+            return
+        self._orchestrator.config.attach_dispatch_diagnostics(
+            tuple(map(str, diagnostics))
+        )
+        for diagnostic in diagnostics:
+            logger.warning("%s", diagnostic)
 
     def rediscover(self, harness_files: HarnessFilesManager) -> None:
         """Point discovery at a different set of project directories.
@@ -174,6 +213,7 @@ class AgentRegistry:
     def _discover(self) -> dict[str, AgentProfile]:
         agents: dict[str, AgentProfile] = dict(BUILTIN_SUBAGENTS)
         custom_names: set[str] = set()
+        self._shadowed_profiles: set[str] = set()
 
         for base in self.search_paths:
             if not base.is_dir():
@@ -193,9 +233,13 @@ class AgentRegistry:
                         continue
                     custom_names.add(agent.name)
                     if agent.name in BUILTIN_SUBAGENTS:
-                        logger.info(
-                            "Custom agent '%s' overrides builtin agent", agent.name
+                        self._shadowed_profiles.add(agent.name)
+                        logger.warning(
+                            "S2 Rejected custom profile %r at %s: builtin names cannot be shadowed",
+                            agent.name,
+                            agent_file,
                         )
+                        continue
                     agents[agent.name] = agent
 
         return agents

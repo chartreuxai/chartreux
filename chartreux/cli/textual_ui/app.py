@@ -21,6 +21,7 @@ from weakref import WeakKeyDictionary
 import webbrowser
 
 from rich import print as rprint
+from rich.text import Text
 from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, VerticalGroup, VerticalScroll
@@ -215,6 +216,7 @@ from chartreux.ui.clipboard import (
     copy_selection_to_clipboard,
     copy_text_to_clipboard,
 )
+from chartreux.ui.providers.graduation import GraduationStore
 from chartreux.ui.theme import resolve_auto_theme, resolve_theme, resolve_theme_name
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.utils.paths import get_chartreux_home, is_dangerous_directory
@@ -915,6 +917,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._last_conversation_focus: Widget | None = None
         self._agent_browser_anchor: TranscriptAnchor | None = None
         self._agent_bar: AgentBar | None = None
+        self._graduation = GraduationStore()
+        self._graduation_notice: InlineNotice | None = None
+        self._graduation_live_attempts: dict[str, str] = {}
+        self._session_only_credential_envs: set[str] = set()
         self._agent_summaries: list[AgentSummaryModel] = []
         self._agent_evictions: dict[str, AgentEvictionModel] = {}
         self._agent_transcript_viewer: AgentTranscriptViewer | None = None
@@ -1241,6 +1247,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._turn_outcome_notice.styles.width = "100%"
         self._turn_outcome_notice.styles.height = 1
         yield self._turn_outcome_notice
+
+        self._graduation_notice = InlineNotice(id="graduation-notice")
+        self._graduation_notice.styles.height = "auto"
+        yield self._graduation_notice
 
         self._agent_bar = AgentBar()
         yield self._agent_bar
@@ -3296,7 +3306,12 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 self._show_no_output_outcome()
 
     def _refresh_status_for_event(self, event: AppServerEvent) -> None:
+        if isinstance(event, AgentsUpdate):
+            self._track_graduation_attempts(event)
+            self.call_after_refresh(self._maybe_show_graduation)
         if isinstance(event, SessionCompacted):
+            self._graduation.state.compacted()
+            self.call_after_refresh(self._maybe_show_graduation)
             self._root_context_unknown = True
         elif isinstance(event, SessionContextCleared):
             self._root_context_unknown = False
@@ -3711,6 +3726,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._clear_active_turn_pins()
             self._request_transcript_reconcile()
             self._terminal_notifier.notify(NotificationContext.COMPLETE)
+            self.call_after_refresh(self._maybe_show_graduation)
 
     def _resolve_turn_error_message(self, e: Exception) -> str:
         from chartreux.app_server.session import AppServerTurnError
@@ -4240,6 +4256,79 @@ class ChartreuxApp(App):  # noqa: PLR0904
             else:
                 await self._present_pending_callback()
 
+    def _track_graduation_attempts(self, event: AgentsUpdate) -> None:
+        for agent in event.agents:
+            run_id = agent.current_run_id or agent.latest_run_id
+            task = agent.current_task_summary
+            if not run_id or not task:
+                continue
+            # Only attempts observed running in this UI are live evidence. A
+            # resumed terminal summary is not a newly consumed attempt.
+            key = f"{self.app_server.session_id}:{agent.agent_id}:{run_id}"
+            if agent.current_run_status == "running":
+                if "implementation" in agent.slot_purposes:
+                    self._graduation_live_attempts[key] = (
+                        f"{self.app_server.session_id}:{agent.agent_id}:{task}"
+                    )
+            elif key in self._graduation_live_attempts:
+                # ERROR does not distinguish provider exhaustion from an
+                # implementation failure. Only the structured budget outcome
+                # supplies unambiguous consumed-attempt evidence here.
+                # Conservative v1: budget-exceeded runs with retained identity only;
+                # generic implementation-failure coverage is a follow-up.
+                # Accepted v1: fresh workers retrying the same task have separate
+                # agent-identity buckets; cross-worker aggregation is not inferred.
+                if agent.stop_reason == "budget_exceeded":
+                    self._graduation.state.implementation_failed(
+                        self._graduation_live_attempts[key], key, attempt_budgeted=True
+                    )
+                if agent.availability == "idle":
+                    self._graduation_live_attempts.pop(key, None)
+
+    def _graduation_models_saved(
+        self, usable: frozenset[str], added: frozenset[str]
+    ) -> None:
+        self._graduation.state.model_saved(usable, added)
+        self._graduation.save()
+
+    def _maybe_show_graduation(self) -> None:
+        notice = self._graduation_notice
+        if notice is None or self.config.dispatch_mode is None:
+            return
+        idle = (
+            not self._is_busy()
+            and len(self.screen_stack) == 1
+            and self._active_callback is None
+            and not any(agent_is_active(agent) for agent in self._agent_summaries)
+        )
+        if not self._graduation.state.eligible(
+            mode=self.config.dispatch_mode, idle=idle, headless=False
+        ):
+            return
+        self._graduation.state.shown = True
+        if not self._graduation.save():
+            return
+        notice.update(
+            Text.from_markup(
+                "More models can share the work. "
+                "[@click=app.graduation_customize]Customize[/] · "
+                "[@click=app.graduation_dismiss]Dismiss[/] (applies next session)"
+            )
+        )
+        notice.display = True
+
+    def action_graduation_dismiss(self) -> None:
+        self._graduation.state.dismissed = True
+        self._graduation.save()
+        if self._graduation_notice is not None:
+            self._graduation_notice.hide()
+
+    async def action_graduation_customize(self) -> None:
+        if self._is_busy():
+            return
+        self.action_graduation_dismiss()
+        await self._show_providers(initial_view="presets")
+
     async def _show_providers(self, **kwargs: Any) -> None:
         """Open Provider Settings only while the session is idle."""
         if self._is_busy():
@@ -4259,22 +4348,29 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
             return
         self._provider_management_worker = self.run_worker(
-            self._wait_for_provider_management_from_settings(),
+            self._wait_for_provider_management_from_settings(
+                initial_view=kwargs.get("initial_view", "providers")
+            ),
             exclusive=False,
             name="provider-management",
         )
 
-    async def _wait_for_provider_management_from_settings(self) -> None:
+    async def _wait_for_provider_management_from_settings(
+        self, *, initial_view: str = "providers"
+    ) -> None:
         try:
-            await self._wait_for_provider_management()
+            await self._wait_for_provider_management(initial_view=initial_view)
         finally:
             if self._settings_return_providers:
                 self._settings_return_providers = False
                 await self._show_settings()
             else:
                 await self._present_pending_callback()
+                self._maybe_show_graduation()
 
-    async def _wait_for_provider_management(self) -> None:
+    async def _wait_for_provider_management(
+        self, *, initial_view: str = "providers"
+    ) -> None:
         """Wait outside the dismissed screen, then explicitly report adoption."""
         try:
             workbench = import_module("chartreux.ui.providers.workbench")
@@ -4291,6 +4387,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     credential_resolver=credentials.resolve_key,
                     config=config,
                     snapshot=catalog_loader.load_catalog(),
+                    initial_view=initial_view,
+                    on_models_saved=self._graduation_models_saved,
+                    session_only_credential_envs=self._session_only_credential_envs,
                     tls=contracts.TLSConfig(
                         enable_system_trust_store=self.config.enable_system_trust_store
                     ),

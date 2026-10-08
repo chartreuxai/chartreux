@@ -45,12 +45,14 @@ class FakeConfigOrchestrator[C: ChartreuxConfigSchema](ConfigOrchestrator[C]):
         self._policy_owner = uuid4()
         self._accepted_token = uuid4()
         self._availability_registry = AvailabilityRegistry()
+        self.bound_dispatch_policy = config.bound_dispatch_policy
 
     def copy(self, *, config: C | None = None) -> FakeConfigOrchestrator[C]:
         base_config = self._base_config if config is None else config
         clone = FakeConfigOrchestrator(base_config.model_copy(deep=True))
         clone._policy_owner = self._policy_owner
         clone._availability_registry = self._availability_registry
+        clone.bound_dispatch_policy = self.bound_dispatch_policy
         clone._extra_layers = [copy.deepcopy(layer) for layer in self._extra_layers]
         clone.rebuild()
         return clone
@@ -112,6 +114,7 @@ class FakeConfigOrchestrator[C: ChartreuxConfigSchema](ConfigOrchestrator[C]):
 
     @property
     def config(self) -> C:
+        self._config.attach_dispatch_policy(self.bound_dispatch_policy)
         return self._config
 
     @property

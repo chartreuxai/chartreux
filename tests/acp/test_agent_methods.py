@@ -46,6 +46,43 @@ def _client(agent: ChartreuxAcpAgent) -> FakeClient:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True])
+async def test_session_responses_expose_validation_warnings(
+    acp_agent_loop: ChartreuxAcpAgent, monkeypatch: pytest.MonkeyPatch, resume: bool
+) -> None:
+    notes = [
+        "R3 contrasts: purpose mismatch",
+        "Dispatch slot 'mechanical': unavailable",
+    ]
+    session = Mock(id="diagnostic-session")
+    session.app_server.resources.config.current.validation_warnings = notes
+    session.app_server.state = Mock()
+    monkeypatch.setattr(
+        acp_agent_loop, "_create_session", AsyncMock(return_value=session)
+    )
+    monkeypatch.setattr(acp_agent_loop, "_config_options", Mock(return_value=[]))
+    monkeypatch.setattr(
+        acp_agent_loop,
+        "_trust_meta",
+        AsyncMock(return_value={"workspace_trust": {"status": "trusted"}}),
+    )
+    monkeypatch.setattr(acp_agent_loop, "_send_usage_update", Mock())
+    monkeypatch.setattr(acp_agent_loop, "_load_complete_history", AsyncMock())
+    monkeypatch.setattr("chartreux.acp.agent.replay_session_updates", lambda _: [])
+
+    if resume:
+        response = await acp_agent_loop.load_session(cwd=".", session_id=session.id)
+    else:
+        response = await acp_agent_loop.new_session(cwd=".")
+    assert response is not None
+    assert response.field_meta == {
+        "workspace_trust": {"status": "trusted"},
+        "validation_warnings": notes,
+    }
+    assert response.model_dump(by_alias=True)["_meta"]["validation_warnings"] == notes
+
+
+@pytest.mark.asyncio
 async def test_close_session_remains_retryable_after_cleanup_failure(
     acp_agent_loop: ChartreuxAcpAgent, monkeypatch: pytest.MonkeyPatch
 ) -> None:

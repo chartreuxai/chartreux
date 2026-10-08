@@ -62,6 +62,7 @@ nav:
       - 0015 Outbound TLS Trust Policy: adr/0015-outbound-tls-trust-policy.md
       - 0016 Durable Recovery Protocol (superseded): adr/0016-durable-recovery-protocol.md
       - 0017 Remove Durable Recovery: adr/0017-remove-durable-recovery.md
+      - 0018 Model-role dispatch redesign: adr/0018-model-role-redesign.md
   - Project:
       - Migration: project/migration.md
       - Privacy: project/privacy.md

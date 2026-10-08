@@ -45,5 +45,5 @@ For a simple confirmation, a concise paragraph is acceptable. If user input is r
 
 **Issue:** {what is blocking}
 **Why it cannot be resolved here:** {what information or authority is missing}
-**What the orchestrator needs to provide or decide:** {specific question}
+**What the main agent needs to provide or decide:** {specific question}
 ```

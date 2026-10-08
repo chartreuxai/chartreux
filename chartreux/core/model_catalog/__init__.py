@@ -8,6 +8,8 @@ from chartreux.core.model_catalog.loader import (
     CatalogSnapshot,
     load_catalog,
     merge_catalog_overlay,
+    merge_dispatch_overlay,
+    resolve_dispatch_overlay,
 )
 from chartreux.core.model_catalog.schema import (
     BaseModelDefinition,
@@ -28,4 +30,6 @@ __all__ = [
     "ProviderDefinition",
     "load_catalog",
     "merge_catalog_overlay",
+    "merge_dispatch_overlay",
+    "resolve_dispatch_overlay",
 ]

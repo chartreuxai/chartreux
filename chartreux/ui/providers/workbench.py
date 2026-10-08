@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -29,6 +29,7 @@ from textual.widgets import Input, Label, OptionList, SelectionList
 from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
+from chartreux.core.dispatch.schema import DispatchMode
 from chartreux.core.model_catalog.contracts import (
     CatalogChanges,
     CatalogValidationError,
@@ -68,6 +69,7 @@ from chartreux.ui.providers.management_state import (
     ManagementState,
     PendingModel,
     credential_status,
+    usable_canonical_models,
 )
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 from chartreux.ui.widgets.checklist import CHECKBOX_SEGMENTS, Checklist
@@ -681,7 +683,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         "discard": "Discard all pending catalog edits across providers and role presets; saved keys remain saved.",
     }
 
-    def __init__(  # noqa: PLR0915
+    def __init__(  # noqa: PLR0913, PLR0915 - host-owned dependencies and runtime state
         self,
         *,
         snapshot: CatalogSnapshot,
@@ -693,8 +695,11 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         tls: TLSConfig | None = None,
         mode: Literal["management", "onboarding"] = "management",
         initial_view: Literal["providers", "presets"] = "providers",
+        on_models_saved: Callable[[frozenset[str], frozenset[str]], None] | None = None,
+        session_only_credential_envs: set[str] | None = None,
     ) -> None:
         super().__init__()
+        self.on_models_saved = on_models_saved
         self.snapshot = snapshot
         self.discovery_service = discovery
         self.catalog_writer = catalog_writer
@@ -707,6 +712,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._setup_ready = False
         self._models_view = False
         self._model_filter: str | None = None
+        self._customize_presets = False
         self._preset_role: str | None = None
         self._preset_field: str | None = None
         self._preset_draft: tuple[str, str] | None = None
@@ -785,6 +791,13 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._feedback_token = 0
         self._credential_input_id = "wb-input"
         self._saved_credential_envs: set[str] = set()
+        # Keep the host's runtime provenance by reference across screen instances.
+        self._session_only_credential_envs = (
+            session_only_credential_envs
+            if session_only_credential_envs is not None
+            else set()
+        )
+        self._onboarding_presets_seeded = False
 
     def compose(self) -> ComposeResult:  # noqa: PLR0915 - declarative widget tree
         with Vertical(id="workbench"):
@@ -2040,13 +2053,19 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._add = None
         self._preset_field = None
         self._preset_role = None
+        self._customize_presets = False
         self._refresh_presets()
         self._activate_view(WorkbenchView.PRESETS, focus_id="wb-presets")
         self._defer_focus(self.query_one("#wb-presets", WorkbenchList))
 
     def _seed_onboarding_presets(self) -> None:
-        """Suggest usable configured models without changing catalog defaults."""
+        """Seed usable roles; shipped dispatch slots resolve through these bindings.
+
+        A single canonical model (even at different thinking levels) needs no
+        explicit slot overlay. Keep the saved mode, including one-model orchestration.
+        """
         state = self.state
+        self._onboarding_presets_seeded = False
         if state is None:
             return
         configured = {
@@ -2078,6 +2097,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 "warning",
             )
             return
+        self._onboarding_presets_seeded = True
         for role in state.catalog.roles:
             model, thinking = state.preset(role)
             if state._preset_readiness(model, thinking, self._credential_value) is None:
@@ -2102,13 +2122,47 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         )
         rows.clear_options()
         rows.add_option(Option("DEFAULT PRESETS", id="heading", disabled=True))
+        summary = self.mode == "onboarding" and not self._customize_presets
+        if summary:
+            models = sorted({state.preset(role)[0] for role in state.catalog.roles})
+            rows.add_option(
+                Option(
+                    self._summary(
+                        f"Roles bound automatically to {', '.join(models)}"
+                        if self._onboarding_presets_seeded
+                        else "Role presets need repair; no ready configured model found"
+                    ),
+                    id="summary",
+                    disabled=True,
+                )
+            )
+            rows.add_option(Option("Customize role presets", id="customize"))
+        for dispatch_mode in DispatchMode:
+            label = (
+                "Standalone — direct implementation"
+                if dispatch_mode == DispatchMode.STANDALONE
+                else "Orchestrated — including with one model"
+            )
+            marker = chrome_glyph(
+                "radio_selected"
+                if state._dispatch.mode == dispatch_mode
+                else "radio_empty"
+            )
+            rows.add_option(
+                Option(
+                    self._summary(f"{marker} {label}"), id=f"mode:{dispatch_mode.value}"
+                )
+            )
+        rows.add_option(
+            Option("Mode changes apply next session", id="next-session", disabled=True)
+        )
         ordered_roles = [
             role
             for role in ("orchestrator", "large", "medium", "small")
             if role in state.catalog.roles
         ]
         ordered_roles.extend(sorted(set(state.catalog.roles) - set(ordered_roles)))
-        for role in ordered_roles:
+        for role in () if summary else ordered_roles:
             model, thinking = state.preset(role)
             title = {
                 "orchestrator": "Main assistant (@orchestrator)",
@@ -2129,9 +2183,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         actions.clear_options()
         actions.add_option(
             Option(
-                "Save presets and continue"
-                if self.mode == "onboarding"
-                else "Save presets",
+                "Finish setup" if self.mode == "onboarding" else "Save presets",
                 id="finish",
             )
         )
@@ -2139,14 +2191,27 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         actions.highlighted = 0
         self._restore_group_position(action_position)
         ids = [str(option.id) for option in rows.options]
-        rows.highlighted = ids.index(previous) if previous in ids else 1
+        rows.highlighted = (
+            ids.index(previous) if previous in ids else (2 if summary else 1)
+        )
         if highlight is None:
             self._restore_group_position(position)
         self._update_help()
 
-    def _select_preset_action(self, key: str) -> None:
+    def _select_preset_action(self, key: str) -> None:  # noqa: PLR0911, PLR0912
         state = self.state
         if state is None or self._busy:
+            return
+        if key == "customize":
+            self._customize_presets = True
+            self._refresh_presets(highlight="preset:orchestrator")
+            return
+        if key.startswith("mode:"):
+            state.dispatch_mode = DispatchMode(key.partition(":")[2])
+            self._set_feedback(
+                "preset", "Mode staged; save to apply next session.", "info"
+            )
+            self._refresh_presets(highlight=key)
             return
         if key == "add-another":
             if state.dirty:
@@ -2161,6 +2226,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     mode="onboarding", credential_resolver=self._credential_value
                 )
                 if validation.errors:
+                    self._customize_presets = True
                     self._set_feedback("preset", "; ".join(validation.errors), "error")
                     self._refresh_presets(
                         highlight=f"preset:{(validation.unresolved_roles or validation.unusable_roles or ('orchestrator',))[0]}"
@@ -3456,7 +3522,22 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             return
         self._save_key(value)
 
+    def _persisted_credential_value(self, env_var: str) -> str | None:
+        if env_var in self._session_only_credential_envs:
+            return None
+        return self._credential_value(env_var)
+
+    def _notify_models_saved(self, previously_usable: frozenset[str]) -> None:
+        if self.on_models_saved is not None:
+            usable = usable_canonical_models(
+                self.snapshot, self._persisted_credential_value
+            )
+            self.on_models_saved(usable, usable - previously_usable)
+
     def _save_key(self, value: str) -> None:
+        previously_usable = usable_canonical_models(
+            self.snapshot, self._persisted_credential_value
+        )
         state = self.state
         env = (
             self._add.api_key_env_var
@@ -3470,6 +3551,11 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         result = self.credentials.save_key(env, value)
         if result.status != "invalid_env_var":
             self._saved_credential_envs.add(env)
+        if result.status == "session_only":
+            self._session_only_credential_envs.add(env)
+        if result.status == "saved":
+            self._session_only_credential_envs.discard(env)
+            self._notify_models_saved(previously_usable)
         self._unresolved.pop("field", None)
         self._confirm = None
         self._editing = None
@@ -4357,6 +4443,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
     async def _commit(  # noqa: PLR0912, PLR0915
         self, changes: CatalogChanges, state: ManagementState, *, create: bool
     ) -> None:
+        previously_usable = usable_canonical_models(
+            self.snapshot, self._persisted_credential_value
+        )
         write = asyncio.create_task(
             asyncio.to_thread(self.catalog_writer.apply_changes, changes)
         )
@@ -4386,6 +4475,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             self.state = ManagementState.from_snapshot(
                 result.snapshot, state.provider_id
             )
+            if result.changed:
+                self._notify_models_saved(previously_usable)
             if create:
                 self._stage = None
                 self._add = None
@@ -4758,6 +4849,11 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             self._close_preset_editor()
             return
         if self._view == WorkbenchView.PRESETS:
+            if self.mode == "onboarding" and self._customize_presets:
+                self._customize_presets = False
+                self._refresh_presets(highlight="customize")
+                self.query_one("#wb-presets").focus()
+                return
             self._stage = None
             opener = self._presets_opener
             self._presets_opener = None

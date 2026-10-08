@@ -18,6 +18,7 @@ from chartreux.core.tools.base import ToolPermission
 from chartreux.core.tools.builtins._shell_command_policy import (
     ShellCommandPolicy,
     analyze_shell_command_policy,
+    canonical_git_command,
     executor_boundary,
     git_metadata_paths,
     git_repository_config_risk,
@@ -335,6 +336,22 @@ def _get_default_denylist() -> list[str]:
         "nc",
         "ncat",
         "socat",
+        # Destructive or working-tree-mutating Git forms. These are configurable
+        # defaults: [tools.bash] denylist replaces the whole list, while the
+        # policy layer's hard guards (git reset --hard, forced non-dry-run
+        # git clean) cannot be configured away. switch --discard-changes/-f
+        # discard working-tree changes (switch is the blessed checkout
+        # replacement); reflog expire/delete destroys the recovery path for
+        # lost commits.
+        "git push",
+        "git checkout",
+        "git stash drop",
+        "git stash clear",
+        "git restore",
+        "git switch --discard-changes",
+        "git switch -f",
+        "git reflog expire",
+        "git reflog delete",
     ]
 
 
@@ -682,11 +699,18 @@ class ShellPermissionResolver:
             for token in shell_options
         )
         interpreter = inline_interpreter_switch(tokens)
+        canonical = canonical_git_command(tokens)
         return next(
             (
                 pattern
                 for pattern in self.config.denylist
                 if matches_command_prefix(tokens, _split_command_tokens(pattern))
+                or (
+                    canonical is not None
+                    and matches_command_prefix(
+                        canonical, _split_command_tokens(pattern)
+                    )
+                )
                 or pattern == interpreter
                 or (interpreter == "python3 -c" and pattern == "python -c")
                 or (shell_interactive and pattern == f"{name} -i")

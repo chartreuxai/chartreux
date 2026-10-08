@@ -5,6 +5,8 @@ from pathlib import Path
 from pydantic import ValidationError
 import pytest
 
+from chartreux.core.agents.models import AgentProfile
+from chartreux.core.agents.registry import apply_profile_overrides
 from chartreux.core.config._catalog import validate_catalog_scope
 from chartreux.core.config.builder import ConfigBuilder
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
@@ -174,3 +176,110 @@ async def test_environment_catalog_name_is_redacted_before_settings_decode(
         await layer.load()
     assert "private" not in str(raised.value)
     assert layer.cached_data is None
+
+
+@pytest.mark.parametrize("value", [{}, [], "dispatch-payload"])
+async def test_dispatch_tables_are_rejected_before_payload_decoding(
+    value: object, tmp_path: Path
+) -> None:
+    layers = [
+        OverridesLayer(data={"dispatch": value}),
+        ProjectConfigLayer(path=tmp_path, trust_store=TrustedFoldersManager()),
+        EnvironmentLayer(schema=ChartreuxConfigSchema),
+    ]
+    for layer in layers:
+        with pytest.raises(ValidationError, match="models\\.toml") as raised:
+            validate_catalog_scope(
+                ChartreuxConfigSchema, {"dispatch"}, layer=layer, source=layer.name
+            )
+        assert "dispatch-payload" not in raised.value.json()
+
+
+async def test_user_and_project_config_dispatch_tables_are_rejected(
+    tmp_path: Path,
+) -> None:
+    user_path = tmp_path / "user.toml"
+    user_path.write_text('[dispatch]\nmode = "standalone"\ntheme = "user"\n')
+    project_root = tmp_path / "project"
+    project_path = project_root / ".chartreux" / "config.toml"
+    project_path.parent.mkdir(parents=True)
+    project_path.write_text('[dispatch]\nmode = "standalone"\n')
+    trust = TrustedFoldersManager()
+    trust.trust_for_session(project_root)
+    for layer in [
+        UserConfigLayer(path=user_path),
+        ProjectConfigLayer(path=project_root, trust_store=trust),
+    ]:
+        builder = ConfigBuilder(ChartreuxConfigSchema)
+        builder.add_layers([DefaultConfigLayer(schema=ChartreuxConfigSchema), layer])
+        with pytest.raises(ValidationError, match="models\\.toml"):
+            await builder.build()
+
+
+async def test_runtime_dispatch_table_is_rejected_and_keeps_accepted_state() -> None:
+    session = OverridesLayer(data={"theme": "accepted"})
+    orch = await ConfigOrchestrator.create(
+        schema=ChartreuxConfigSchema,
+        layers=[DefaultConfigLayer(schema=ChartreuxConfigSchema), session],
+        default_layer_resolver=lambda: session,
+    )
+    before = orch.config, orch.accepted_token
+    session._data["dispatch"] = {"mode": "standalone"}
+    with pytest.raises(ValidationError, match="models\\.toml"):
+        await orch.reload()
+    assert (orch.config, orch.accepted_token) == before
+
+
+async def test_environment_dispatch_path_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CHARTREUX_DISPATCH__MODE", "standalone")
+    layer = EnvironmentLayer(schema=ChartreuxConfigSchema)
+    with pytest.raises(LayerImplementationError) as raised:
+        await layer.load()
+    assert "models.toml" in str(raised.value.__cause__)
+    assert layer.cached_data is None
+
+
+async def test_dispatch_patch_attempt_is_rejected_without_mutating_disk(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    before_bytes = b'# retained\ntheme = "original"\n'
+    path.write_bytes(before_bytes)
+    user = UserConfigLayer(path=path, name="user")
+    session = OverridesLayer(data={}, name="session")
+    orch = await ConfigOrchestrator.create(
+        schema=ChartreuxConfigSchema,
+        layers=[DefaultConfigLayer(schema=ChartreuxConfigSchema), user, session],
+        default_layer_resolver=lambda: session,
+    )
+    with pytest.raises(ConfigPatchValidationError, match="models\\.toml"):
+        await orch.set_field("/dispatch", {"mode": "standalone"})
+    assert path.read_bytes() == before_bytes
+
+
+async def test_project_profiles_stay_valid_but_never_carry_dispatch_authority(
+    tmp_path: Path,
+) -> None:
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    profile_path = agents_dir / "dispatching.toml"
+    profile_path.write_text('[dispatch]\nmode = "standalone"\n')
+    profile = AgentProfile.from_toml(profile_path)
+    session = OverridesLayer(data={})
+    orch = await ConfigOrchestrator.create(
+        schema=ChartreuxConfigSchema,
+        layers=[DefaultConfigLayer(schema=ChartreuxConfigSchema), session],
+        default_layer_resolver=lambda: session,
+    )
+
+    with pytest.raises(ValidationError, match="models\\.toml"):
+        apply_profile_overrides(orch, profile.overrides, role=profile.role)
+
+    # Trusted project profiles remain valid as profile definitions.
+    plain_path = agents_dir / "plain.toml"
+    plain_path.write_text('description = "plain profile"\nrole = "medium"\n')
+    plain = AgentProfile.from_toml(plain_path)
+    apply_profile_overrides(orch, plain.overrides, role=plain.role)
+    assert orch.config.active_model == "@medium"

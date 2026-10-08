@@ -345,7 +345,9 @@ def make_test_models(auto_compact_threshold: int) -> list[ModelConfig]:
             "provider": deployment.provider,
             "alias": "glm-5-3",
             "thinking": definition.thinking,
-            "temperature": definition.temperature,
+            "temperature": (
+                definition.temperature if definition.temperature is not None else 1.0
+            ),
             "input_price": (
                 deployment.prices.input if deployment.prices.input is not None else 0.0
             ),
@@ -492,6 +494,53 @@ def build_test_vibe_config(
 
 def build_test_vibe_config_schema(**kwargs: Any) -> ChartreuxConfigSchema:
     return build_test_vibe_config(ChartreuxConfigSchema, **kwargs)
+
+
+def multi_model_catalog() -> ModelCatalog:
+    """A deterministic two-canonical-model catalog with the tier roles.
+
+    The shipped dispatch slots bind ``@small``/``@medium`` to one base model
+    and ``@large`` to another, so the roster shape is multi-model and the
+    orchestrated rendering keeps its tier routing.
+    """
+    return ModelCatalog.model_validate({
+        "providers": {
+            "alpha": {"api_base": "https://alpha.test"},
+            "beta": {"api_base": "https://beta.test"},
+        },
+        "models": {
+            "alpha-model": {
+                "thinking": "medium",
+                "deployments": [{"provider": "alpha", "name": "alpha-wire"}],
+            },
+            "beta-model": {
+                "thinking": "high",
+                "deployments": [{"provider": "beta", "name": "beta-wire"}],
+            },
+        },
+        "roles": {
+            "orchestrator": {
+                "model": "beta-model",
+                "thinking": "high",
+                "description": "main assistant preset",
+            },
+            "small": {
+                "model": "alpha-model",
+                "thinking": "low",
+                "description": "small preset",
+            },
+            "medium": {
+                "model": "alpha-model",
+                "thinking": "medium",
+                "description": "medium preset",
+            },
+            "large": {
+                "model": "beta-model",
+                "thinking": "high",
+                "description": "large preset",
+            },
+        },
+    })
 
 
 type ConfigBuilder = Callable[..., ChartreuxConfigSchema]

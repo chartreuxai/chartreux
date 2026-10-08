@@ -11,12 +11,18 @@ from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.layers.default import DefaultConfigLayer
 from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
+from chartreux.core.dispatch import (
+    DEFAULT_DISPATCH_MODE,
+    ORCHESTRATED_PRESET,
+    SHIPPED_PRESETS,
+)
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import (
     CatalogLoadError,
     CatalogSnapshot,
     load_catalog,
     merge_catalog_overlay,
+    merge_dispatch_overlay,
 )
 from chartreux.core.model_catalog.resolver import ModelResolutionError, ModelResolver
 from chartreux.core.model_catalog.schema import ModelCatalog, Prices, ProviderDefinition
@@ -289,6 +295,10 @@ def test_16_shipped_defaults_validate_and_have_verified_wire_names() -> None:
 
 
 def test_shipped_catalog_json_dump_round_trips() -> None:
+    resolved = ModelResolver(CatalogSnapshot(SHIPPED_CATALOG, "test")).resolve(
+        "glm-5-3"
+    )
+    assert resolved.materialize(auto_compact_threshold=200000).temperature == 1.0
     dumped = SHIPPED_CATALOG.model_dump_json()
 
     assert ModelCatalog.model_validate_json(dumped) == SHIPPED_CATALOG
@@ -698,3 +708,45 @@ def test_allowlist_exclusion_does_not_change_preset_model() -> None:
         ModelResolver(CatalogSnapshot(catalog, "test")).resolve(
             "@priority", allowed_models=["backup-model"]
         )
+
+
+def test_catalog_overlay_accepts_dispatch_table_without_catalog_authority() -> None:
+    catalog = merge_catalog_overlay(
+        SHIPPED_CATALOG, {"dispatch": {"mode": "standalone"}}
+    )
+    assert catalog == SHIPPED_CATALOG
+    with pytest.raises(ValueError, match="unknown fields"):
+        merge_catalog_overlay(SHIPPED_CATALOG, {"dispatching": {}})
+
+
+def test_snapshot_default_dispatch_is_the_shipped_default() -> None:
+    snapshot = CatalogSnapshot(SHIPPED_CATALOG, "test")
+    assert snapshot.dispatch == SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE]
+    assert snapshot.dispatch_diagnostics == ()
+
+
+def test_load_catalog_resolves_dispatch_and_revision(tmp_path: Path) -> None:
+    plain = tmp_path / "plain.toml"
+    plain.write_text('[roles.small]\nthinking = "low"\n')
+    dispatched = tmp_path / "dispatched.toml"
+    dispatched.write_text(
+        '[roles.small]\nthinking = "low"\n\n[dispatch]\nmode = "orchestrated"\n'
+    )
+
+    base = load_catalog(plain)
+    selected = load_catalog(dispatched)
+
+    assert base.catalog == selected.catalog
+    assert base.dispatch == SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE]
+    assert selected.dispatch == ORCHESTRATED_PRESET
+    assert selected.dispatch.mode == DEFAULT_DISPATCH_MODE.ORCHESTRATED
+    assert selected.revision != base.revision
+    assert selected.dispatch_diagnostics == ()
+
+
+def test_dispatch_overlay_sparse_merge_inherits_shipped_preset() -> None:
+    policy = merge_dispatch_overlay({"slots": {"implementor": {"role": "@small"}}})
+    assert policy.slots["implementor"].role == "@small"
+    assert policy.slots["implementor"].purposes == ("implementation",)
+    assert policy.slots["advisor"].role == "@large"
+    assert policy.identity == SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE].identity

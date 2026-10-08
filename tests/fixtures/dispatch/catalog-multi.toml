@@ -1,0 +1,29 @@
+[providers.fake-provider-a]
+api_base = "https://provider-a.invalid/v1"
+api_key_env_var = "CHARTREUX_FAKE_PROVIDER_A_KEY"
+
+[providers.fake-provider-b]
+api_base = "https://provider-b.invalid/v1"
+api_key_env_var = "CHARTREUX_FAKE_PROVIDER_B_KEY"
+
+[models.fake-model-a]
+thinking = "medium"
+[[models.fake-model-a.deployments]]
+provider = "fake-provider-a"
+name = "fake-deployment-a"
+
+[models.fake-model-b]
+thinking = "high"
+[[models.fake-model-b.deployments]]
+provider = "fake-provider-b"
+name = "fake-deployment-b"
+
+[roles.implementation]
+description = "Fake implementation role"
+model = "fake-model-a"
+thinking = "medium"
+
+[roles.review]
+description = "Fake review role"
+model = "fake-model-b"
+thinking = "high"

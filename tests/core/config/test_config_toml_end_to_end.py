@@ -116,3 +116,62 @@ async def test_toml_subagent_cap_rejects_invalid_values(
     builder.add_layer(UserConfigLayer(path=path))
     with pytest.raises(ValidationError, match="max_running_subagents"):
         await builder.build()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("denylist", "curl_denied"), [([], False), (["curl", "wget"], True)]
+)
+async def test_toml_bash_denylist_removes_shipped_git_defaults(
+    tmp_path: Path, denylist: list[str], curl_denied: bool
+) -> None:
+    # A configured [tools.bash] denylist replaces the shipped defaults, so a
+    # list omitting the git entries permits those forms end to end.
+    from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+    from chartreux.core.config.layers.user import UserConfigLayer
+    from chartreux.core.config.orchestrator import ConfigOrchestrator
+    from chartreux.core.tools.base import ToolPermission
+    from chartreux.core.tools.builtins.bash import BashArgs
+    from chartreux.core.tools.manager import ToolManager
+
+    toml_path = tmp_path / "config.toml"
+    rendered = ", ".join(f'"{entry}"' for entry in denylist)
+    toml_path.write_text(f"[tools.bash]\ndenylist = [{rendered}]\n")
+    layer = UserConfigLayer(path=toml_path)
+    orchestrator = await ConfigOrchestrator.create(
+        schema=ChartreuxConfigSchema,
+        layers=[layer],
+        default_layer_resolver=lambda: layer,
+    )
+    manager = ToolManager(
+        lambda: orchestrator.config,
+        cwd=tmp_path,
+        defer_mcp=True,
+        restriction_getter=lambda: orchestrator.restrictions,
+        accepted_token_getter=lambda: orchestrator.accepted_token,
+    )
+
+    assert manager.get_tool_config("bash").denylist == denylist  # type: ignore[attr-defined]
+    tool = manager.get("bash")
+    for command in (
+        "git push",
+        "git -C . push",
+        "git checkout main",
+        "git stash drop",
+        "git stash clear",
+        "git restore file.txt",
+        "git switch --discard-changes",
+        "git switch -f main",
+        "git -C . switch --discard-changes",
+        "git reflog expire --all",
+        "git reflog delete main",
+    ):
+        result = tool.resolve_permission(BashArgs(command=command))
+        assert result is not None and result.permission is ToolPermission.ALWAYS
+    # The policy layer's hard guards survive the configured removal.
+    for command in ("git reset --hard HEAD", "git clean -fd"):
+        result = tool.resolve_permission(BashArgs(command=command))
+        assert result is not None and result.permission is ToolPermission.NEVER
+    result = tool.resolve_permission(BashArgs(command="curl example.org"))
+    assert result is not None
+    assert (result.permission is ToolPermission.NEVER) is curl_denied

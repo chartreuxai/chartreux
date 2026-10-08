@@ -114,7 +114,7 @@ folders to see a different set. The explicit `--resume <SESSION_ID>` form is
 **not** folder-scoped: it resolves the session by id regardless of which folder
 it ran in.
 
-Each session commits the resolved base model and concrete provider deployment when it is assigned. On resume, Chartreux validates that stored identity and never re-selects a role or deployment. An explicit re-task can reconfigure a retained child; `/clear` starts a new conversation that follows the current configuration. `/model` and `/thinking` change the current session; edit the orchestrator preset in `models.toml` to change the saved main default.
+Each session commits the resolved base model and concrete provider deployment when it is assigned. On resume, Chartreux validates that stored identity and never re-selects a role or deployment. An explicit re-task can reconfigure a retained child; `/clear` starts a new conversation that follows the current configuration. `/model` and `/thinking` change the current session; edit `[roles.orchestrator]` in `models.toml` to change the saved main-model default. That role name does not select the dispatch mode: `[dispatch].mode` selects a session-level shipped preset, and saved dispatch changes apply next session.
 
 ## Configuration (config.toml)
 
@@ -164,6 +164,8 @@ from `~/.chartreux/prompts/`, and finally from the built-in bundled prompts.
 ```toml
 # Model selection
 # Saved main model and thinking live in [roles.orchestrator] in models.toml.
+# Dispatch slots and purposes live in [dispatch]; mode is standalone or orchestrated.
+# Saved dispatch changes apply next session.
 
 # UI preferences
 theme = "auto"  # Follow terminal background, then OS light/dark preference
@@ -221,12 +223,13 @@ Chartreux does not create product analytics or OpenTelemetry spans, configure te
 
 ### Model Catalog
 
-Providers, models, and roles live in `~/.chartreux/models.toml` (or
+Providers, models, roles, and dispatch selection live in `~/.chartreux/models.toml` (or
 `$CHARTREUX_HOME/models.toml`), a sparse user overlay on the shipped catalog.
-`config.toml` contains runtime settings; it cannot define catalog tables or save
-the main-model selection. The `[roles.orchestrator]` preset is the saved default,
-while `/model` and `/thinking` override the current session. If a legacy
-`config.toml` contains `active_model`, edit the orchestrator preset; if it
+`config.toml` contains runtime settings; it cannot define catalog or dispatch tables or save
+the main-model selection. The `[roles.orchestrator]` preset is the saved main-model default,
+not a dispatch-mode selector. `[dispatch]` configures the mode, slots, and purposes;
+saved dispatch changes apply next session. `/model` and `/thinking` override the current session. If a legacy
+`config.toml` contains `active_model`, edit `[roles.orchestrator]`; if it
 contains `providers` or `models` tables, run `chartreux models migrate` (then
 `chartreux models migrate --apply` after reviewing the preview). Use `/providers`
 to manage providers in Provider Settings, or `chartreux --setup` for onboarding.
@@ -291,10 +294,10 @@ credential. Use Settings > Web search or `/web-search`; `Save API key` is
 independent of `Save search settings`, and reports whether the key was saved or
 is available only for the current session. Readiness does not verify a live
 connection. Standalone Settings shows Mistral once; `auto` remains a supported
-configuration alias for Mistral. First-run setup preserves ready search
-settings and skips the Web search step. If the step is needed, it offers Exa,
-Brave, and DuckDuckGo, not `auto` or Mistral fallback choices. **Skip for now**
-leaves existing web-search settings and tool enablement unchanged. `read_image`
+configuration alias for Mistral. First-run setup finishes after the role
+summary or customized presets without checking or changing web-search settings.
+Configure optional search afterward via Settings > Web search or `/web-search`.
+`read_image`
 is available only when the active deployment in `models.toml` has
 `supports_images = true`.
 
@@ -679,11 +682,22 @@ scope checks remain enforced.
 
 ### Subagents
 
-- **worker**: General-purpose subagent bound to the `@medium` capacity preset with the `worker` role prompt.
-- **advisor**: Independent, read-only advisor bound to the `@large` capacity preset with the `advisor` role prompt. Its tools are limited to `read_file`, `grep`, `web_search`, and `web_fetch`, and its TTL is `0`.
-- **reviewer**: Independent, read-only reviewer bound to the `@medium` capacity preset with the `reviewer` role prompt.
+- **worker**: General-purpose subagent with the `worker` role prompt.
+- **advisor**: Independent, read-only advisor with the `advisor` role prompt. Its tools are limited to `read_file`, `grep`, `web_search`, and `web_fetch`, and its TTL is `0`.
+- **reviewer**: Independent, read-only reviewer with the `reviewer` role prompt.
 
-Use `task(agent_type="worker", task=...)` to create an agent instance. The agent type is a profile name (default `worker`); `agent_id` identifies a retained agent instance instead. The `agent-N` syntax (digits after `agent-`) is reserved for instance handles and rejected in `agent_type` before dispatch. Profiles are presets: the orchestrator can choose a configured canonical model or role, predefined system prompt, inline instructions, tools, and thinking for an individual launch, but never beyond the parent authority ceiling. Per-call configuration is not written to `config.toml`; committed child launch state is retained in child-session metadata and revalidated fail-closed on resume. For a bounded design, feature, or review loop,
+Routing is configured separately from profiles. Inspect the rendered dispatch
+slot table for the current session's purposes and eligible slots. Each slot
+specifies a profile, a model-role binding, purposes, and implementation/review
+eligibility; use its profile as `agent_type` and its launch binding in
+`config.model`, rather than guessing a model or relying on the profile default.
+View or configure `[dispatch]` in the user `models.toml` overlay. `mode` is the
+session-level enum `standalone` or `orchestrated`, selecting a shipped preset;
+slot entries may override its bindings and purposes. Dispatch is not defined in
+project configuration or agent profiles. Saved dispatch changes apply next
+session, not as a mid-session mode switch.
+
+Use `task(agent_type="worker", task=...)` to create an agent instance. The agent type is a profile name (default `worker`); `agent_id` identifies a retained agent instance instead. The `agent-N` syntax (digits after `agent-`) is reserved for instance handles and rejected in `agent_type` before dispatch. Profiles are presets: the main agent can choose a configured canonical model or role, predefined system prompt, inline instructions, tools, and thinking for an individual launch, but never beyond the parent authority ceiling. Per-call configuration is not written to `config.toml`; committed child launch state is retained in child-session metadata and revalidated fail-closed on resume. For a bounded design, feature, or review loop,
 keep the engagement cast — advisors, planner, implementors, and reviewers —
 resident while exchanging findings, requirements, and plan updates between them.
 Background launches return stable `agent_id` and per-invocation `run_id` handles,

@@ -38,6 +38,26 @@ export CHARTREUX_HOME="/path/to/chartreux-home"
 
 This changes the locations of the files above as well as user prompts, agent profiles, and related user data.
 
+Dispatch policy is owned only by the user catalog overlay in `models.toml`,
+not `config.toml` or trusted project configuration. Its `[dispatch]` table
+selects a shipped `mode` (`orchestrated` or `standalone`) and may sparsely
+replace named `slots`. Slot fields include `profile`, `role`, `purposes`, and
+`implements`; omitted fields inherit the selected preset, while list-valued
+fields replace the whole list. Invalid dispatch data falls back atomically to
+the standalone preset and emits a visible diagnostic; unrelated valid model
+catalog entries remain available. This fallback does not repair or overwrite
+the invalid file. Absent an explicit selection, fresh sessions use standalone:
+direct implementation with delegated verification and independent review, with
+all approval gates intact. Select orchestration explicitly with:
+
+```toml
+[dispatch]
+mode = "orchestrated"
+```
+
+Legacy tier entries do not infer a mode. A saved change takes effect in the next session.
+See the [configuration reference](../reference/configuration.md#dispatch-overlay).
+
 ## API keys and `.env`
 
 A provider declares the name of its credential variable. For example, the shipped Mistral provider uses `MISTRAL_API_KEY`:
@@ -47,28 +67,30 @@ export MISTRAL_API_KEY="your-api-key"
 ```
 
 Run `chartreux --setup` from an interactive terminal to configure a provider,
-credentials, and models, then choose the default presets. It uses the theme
-already configured for Chartreux (`auto` by default); setup does not ask for or
-save a theme choice. Provider and model screens show explicit Save and Continue
-actions, so advancing does not require returning to an earlier screen. After
-presets, setup checks whether web search is already ready. If Mistral's
-automatic search or an explicit saved search provider is ready, it preserves
-that choice and skips the Web search step. Otherwise the step offers Exa,
-Brave, and DuckDuckGo; it does not offer `auto` or a second Mistral choice.
-Standalone Settings presents one Mistral choice, while `auto` remains an
-accepted Mistral configuration alias. Readiness uses the configured credential
-variable through the credential resolver; a provider or model merely appearing
-in the catalog does not establish readiness. **Save and finish** saves and
-applies edited search settings, then completes only when the resulting
-configuration and any required key are ready; otherwise setup stays open with
-a repair cue. **Finish setup** completes when the current configuration and any
-required key are ready. **Skip for now** leaves web-search settings unchanged and does not
-disable the tool.
-**Back to presets** returns to the preset editor. Unsaved search edits require
-an explicit discard before leaving, while an API key already saved separately
-remains saved. Setup saves configured provider keys in `$CHARTREUX_HOME/.env`;
-if disk persistence fails, it reports when a key is available only for the
-current session.
+credentials, and models. Provider and model saves remain explicit. Setup then
+shows an automatically seeded summary: usable existing role selections are
+preserved, and unavailable bindings are assigned a ready configured model.
+No per-role questions are required. **Finish setup** saves the seeded presets
+and completes setup; **Customize role presets** opens the existing model/thinking
+editor for optional changes or repairs. Invalid or unavailable bindings block
+completion with repair guidance.
+
+The presets screen defaults to **Standalone** (direct implementation) for fresh
+users and also offers **Orchestrated**, including orchestration with one canonical
+model. Explicit existing selections are preserved. After saving a second usable
+canonical model, a live compaction event is the primary reliable need signal
+for a passive graduation nudge at an idle boundary. The conservative v1 failure
+trigger counts only two deduplicated, budget-exceeded implementation-purpose
+attempts on the same task by the same retained agent; other failures and
+ambiguous slot identities do not count.
+It opens the presets screen, never changes mode automatically, and
+can be dismissed permanently; headless sessions do not show it. Saved mode
+changes apply next session, not to an already running conversation. Setup uses
+the configured theme (`auto` by default), without asking for a theme choice.
+Web search is not a required setup stage: saved choices remain unchanged, and
+Settings > Web search or `/web-search` remains available later.
+Setup saves configured provider keys in `$CHARTREUX_HOME/.env`; if persistence
+fails, it reports when a key is available only for the current session.
 Without an interactive terminal, setup prints actionable guidance instead of
 launching the TUI. You can also create that file yourself:
 

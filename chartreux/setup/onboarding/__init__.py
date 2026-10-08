@@ -28,10 +28,9 @@ from chartreux.setup.auth.api_key_persistence import persist_api_key
 from chartreux.setup.onboarding.base import OnboardingHost
 from chartreux.setup.onboarding.context import OnboardingContext
 from chartreux.setup.onboarding.screens import WelcomeScreen
-from chartreux.setup.onboarding.web_search_settings import OnboardingWebSearchSettings
+from chartreux.ui.providers.graduation import GraduationStore
 from chartreux.ui.providers.workbench import ProviderWorkbenchScreen
 from chartreux.ui.theme import resolve_auto_theme, resolve_theme, resolve_theme_name
-from chartreux.ui.web_search import WebSearchScreen
 from chartreux.utils.api_keys import resolve_api_key
 
 _TEXTUAL_THEME_MAP = {"auto": None, "light": "ansi-light", "dark": "ansi-dark"}
@@ -117,6 +116,7 @@ class OnboardingApp(App[ProviderWorkbenchResult | OnboardingFailure | None]):
         self._discovery = discovery
         self._catalog_writer = catalog_writer or CatalogStore()
         self._credentials = credentials or OnboardingCredentialService(config.provider)
+        self._graduation = GraduationStore()
         self._initial_theme = resolve_theme_name(config.theme)
         resolve_auto_theme()
         self._resolved_theme = resolve_theme(self._initial_theme)
@@ -145,82 +145,50 @@ class OnboardingApp(App[ProviderWorkbenchResult | OnboardingFailure | None]):
         self._config_service = OnboardingConfigService(self._orchestrator)
         return self._config_service
 
-    async def _search_service(self) -> OnboardingWebSearchSettings:
-        if self._orchestrator is None:
-            self._orchestrator = await build_default_orchestrator()
-        return OnboardingWebSearchSettings(self._orchestrator)
+    def _graduation_models_saved(
+        self, usable: frozenset[str], newly_usable: frozenset[str]
+    ) -> None:
+        self._graduation.state.model_saved(usable, newly_usable)
+        self._graduation.save()
 
     async def _run_workbench(self) -> None:
         config_service = await self._services()
-        changed = False
         initial_view = "presets" if self._config.repair_default_preset else "providers"
-        while True:
-            result = await self.push_screen_wait(
-                ProviderWorkbenchScreen(
-                    discovery=self._discovery,
-                    catalog_writer=self._catalog_writer,
-                    credentials=self._credentials,
-                    credential_resolver=self._credentials.resolve_key,
-                    config=config_service,
-                    snapshot=load_catalog(),
-                    mode="onboarding",
-                    initial_view=initial_view,
-                    tls=TLSConfig(
-                        enable_system_trust_store=self._config.enable_system_trust_store
-                    ),
-                )
+        result = await self.push_screen_wait(
+            ProviderWorkbenchScreen(
+                discovery=self._discovery,
+                catalog_writer=self._catalog_writer,
+                credentials=self._credentials,
+                credential_resolver=self._credentials.resolve_key,
+                config=config_service,
+                snapshot=load_catalog(),
+                mode="onboarding",
+                initial_view=initial_view,
+                on_models_saved=self._graduation_models_saved,
+                tls=TLSConfig(
+                    enable_system_trust_store=self._config.enable_system_trust_store
+                ),
             )
-            changed = changed or result.changed
-            if result.changed:
-                reloaded = await config_service.reload_catalog_and_config()
-                if reloaded.snapshot is None:
-                    self.exit(
-                        OnboardingFailure(
-                            "Could not apply the provider changes: "
-                            f"{reloaded.message or 'catalog reload failed'}. "
-                            "Retry setup to adopt the saved changes."
-                        )
-                    )
-                    return
-            if result.status != "completed":
-                self.exit(ProviderWorkbenchResult("cancelled", changed, result.warning))
-                return
-            try:
-                search_service = await self._search_service()
-                snapshot = await search_service.read()
-                if snapshot.web_search is None:
-                    raise ValueError("Web search settings are unavailable")
-            except Exception as error:
+        )
+        if result.changed:
+            reloaded = await config_service.reload_catalog_and_config()
+            if reloaded.snapshot is None:
                 self.exit(
-                    OnboardingFailure(f"Could not open Web search setup: {error}")
+                    OnboardingFailure(
+                        "Could not apply the provider changes: "
+                        f"{reloaded.message or 'catalog reload failed'}. "
+                        "Retry setup to adopt the saved changes."
+                    )
                 )
                 return
-            if (
-                not snapshot.view_only
-                and snapshot.web_search.readiness == "ready"
-                and all(
-                    field.origin != "live config"
-                    for field in snapshot.web_search.fields
-                )
-            ):
-                self.exit(ProviderWorkbenchResult("completed", changed, result.warning))
-                return
-            search_result = await self.push_screen_wait(
-                WebSearchScreen(
-                    search_service,
-                    snapshot,
-                    credentials=self._credentials,
-                    mode="onboarding",
-                )
+        if result.status != "completed":
+            self.exit(
+                ProviderWorkbenchResult("cancelled", result.changed, result.warning)
             )
-            if search_result == "back":
-                initial_view = "presets"
-                continue
-            if search_result in {"finish", "skip"}:
-                self.exit(ProviderWorkbenchResult("completed", changed, result.warning))
-                return
-            self.exit(ProviderWorkbenchResult("cancelled", changed, result.warning))
             return
+        # Search is optional and remains configurable from Settings/commands.
+        # Do not read or rewrite saved search choices on the setup critical path.
+        self.exit(ProviderWorkbenchResult("completed", result.changed, result.warning))
 
 
 def run_onboarding(

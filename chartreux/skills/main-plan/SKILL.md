@@ -12,22 +12,22 @@ allowed-tools:
 
 # Main Plan
 
-Plan how to deliver an approved design without expanding scope. The orchestrator reads the design and frames the planning question; the advisor profile does the deep planning analysis. The orchestrator synthesizes and owns the final plan.
+Plan how to deliver an approved design without expanding scope. The main agent reads the design and frames the planning question; the advisor profile does the deep planning analysis. The main agent synthesizes and owns the final plan.
 
 ## Process
 
 1. **Read the design.** Read the approved design artifact (inline or workspace `state.md`), applicable AGENTS.md files, and relevant code or configuration.
 2. **Frame the planning question.** Define: the design goal, the files and subsystems involved, any cross-cutting concerns, and what the plan must address (dependencies, parallelism, verification, rollback).
-3. **Dispatch the advisor for planning analysis.** Send a self-contained task to the `advisor` profile:
+3. **Dispatch the advisor for planning analysis.** Request `planning-analysis`; use the eligible slot the rendered slot table lists for that purpose and pass its profile and launch binding explicitly:
 
 ```text
-task(task="Planning analysis for: <design goal>. Design: <approved approach>. Files and subsystems: <list>. Constraints: <dependencies, shared interfaces, preserved behavior>. Return: bounded work packages, dependency order, safe parallelism, acceptance checks per package, verification commands, and rollback approach.", agent_type="advisor", config={model="@large"})
+task(task="Planning analysis for: <design goal>. Design: <approved approach>. Files and subsystems: <list>. Constraints: <dependencies, shared interfaces, preserved behavior>. Return: bounded work packages, dependency order, safe parallelism, acceptance checks per package, verification commands, and rollback approach.", agent_type="<slot.profile>", config={model="<slot launch binding>"})
 ```
 
 For cross-cutting changes that span multiple subsystems, dispatch the `advisor` profile (or `worker`) with `sub-architecture-mapper` first to map interfaces and dependencies, then use that output to frame the planning question.
 
-4. **Synthesize.** Review the advisor's plan. The orchestrator owns the final plan — adjust work package boundaries, fix missing dependencies, and ensure the plan matches the approved design. If the advisor's plan contradicts the design, trust the design.
-5. **Present to the user.** Share the plan inline in the conversation. Wait for the user to react before proceeding to implementation.
+4. **Synthesize.** Review the advisor's plan. The main agent owns the final plan — adjust work package boundaries, fix missing dependencies, and ensure the plan matches the approved design. If the advisor's plan contradicts the design, trust the design.
+5. **Present to the user.** Share the plan inline in the conversation. Obtain the user's explicit plan acceptance before proceeding to implementation; continued discussion, questions, or silence are not acceptance.
 
 ## Plan content
 
@@ -54,5 +54,5 @@ When the change spans multiple subsystems or touches shared interfaces, addition
 ## Constraints
 
 - Do not implement the plan — planning only.
-- The orchestrator owns the plan — the advisor advises, the orchestrator decides.
+- The main agent owns the plan — the advisor advises, the main agent decides.
 - Do not use `ask_user_question` — discuss planning topics inline in the conversation.

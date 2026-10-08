@@ -69,6 +69,7 @@ from chartreux.core.config import (
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
+from chartreux.core.dispatch.session import BoundDispatchPolicy, resume_policy
 from chartreux.core.hooks.config import load_hooks_from_fs
 from chartreux.core.hooks.models import HookConfigResult
 from chartreux.core.llm_models import LLMMessage, Role
@@ -249,6 +250,7 @@ class _AgentLoopBlueprint:
     frozen_system_prompt_id: str | None = None
     frozen_instructions: str | None = None
     committed_model: CommittedModelIdentity | None = None
+    bound_dispatch_policy: BoundDispatchPolicy | None = None
     accounting_owner: RootAccountingOwner | None = None
     background_jobs: BackgroundJobsPort | None = None
     process: HarnessProcess | None = None
@@ -277,6 +279,7 @@ class _AgentLoopBlueprint:
             frozen_system_prompt_id=self.frozen_system_prompt_id,
             frozen_instructions=self.frozen_instructions,
             committed_model=self.committed_model,
+            bound_dispatch_policy=self.bound_dispatch_policy,
             mcp_registry=self.mcp_registry,
             cache_store=self.policy.cache_store,
             auto_title_enabled=self.policy.auto_title_enabled,
@@ -328,6 +331,7 @@ class _RootRuntimeBlueprint:
         session_dir: Path | None = None,
         session_lease: SessionLease | None = None,
         committed_model: CommittedModelIdentity | None = None,
+        bound_dispatch_policy: BoundDispatchPolicy | None = None,
         accounting_owner: RootAccountingOwner | None = None,
     ) -> AgentLoop:
         policy = AgentRuntimePolicy(
@@ -363,6 +367,7 @@ class _RootRuntimeBlueprint:
             session_dir=session_dir,
             session_lease=session_lease,
             committed_model=committed_model,
+            bound_dispatch_policy=bound_dispatch_policy,
             accounting_owner=accounting_owner,
             process=self.process,
             mcp_registry=self.mcp_registry,
@@ -594,6 +599,13 @@ class AgentRuntimeFactory:
         )
         await blueprint.config_orchestrator.reload()
         session_metadata = SessionMetadata.model_validate(metadata)
+        bound_policy = resume_policy(
+            blueprint.config,
+            session_metadata.dispatch_policy,
+            AgentManager(
+                blueprint.config_orchestrator, harness_files=blueprint.harness_files
+            ).available_agents,
+        )
         # Blueprint resume (fresh session open) has no interactive recovery:
         # an unusable persisted committed model fails fast as a configuration
         # error instead of loading the session unpinned.
@@ -622,6 +634,7 @@ class AgentRuntimeFactory:
             session_dir=session_path,
             session_lease=session_lease,
             committed_model=resume_identity,
+            bound_dispatch_policy=bound_policy,
             accounting_owner=accounting_owner,
         )
         # Set messages and stats immediately so the UI can render the stored
@@ -733,10 +746,16 @@ class AgentRuntimeFactory:
             raise InvalidLaunchConfigError(
                 "launch_config.profile", "Stored child launch profile is missing"
             )
+        child_source = parent.config_orchestrator.copy()
+        child_source.bound_dispatch_policy = resume_policy(
+            parent.config,
+            metadata.dispatch_policy,
+            parent.agent_manager.available_agents,
+        )
         candidate = resolve_launch(
             profile_name=envelope.profile if envelope is not None else agent_name,
             config=None,
-            parent_orchestrator=parent.config_orchestrator,
+            parent_orchestrator=child_source,
             tool_inventory={
                 name: object() for name in parent.tool_manager.registered_tools
             },
@@ -771,6 +790,12 @@ class AgentRuntimeFactory:
                 session_id, session_dir, metadata
             )
             if child.session_logger.session_metadata is not None:
+                child.session_logger.session_metadata.dispatch_policy = (
+                    child.bound_dispatch_policy.model_dump(mode="json")
+                )
+                child.session_logger.session_metadata.dispatch_policy_notes = list(
+                    child.bound_dispatch_policy.diagnostics
+                )
                 child.session_logger.session_metadata.launch_config = (
                     _launch_metadata(candidate) if envelope is not None else None
                 )

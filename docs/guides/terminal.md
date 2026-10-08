@@ -16,17 +16,12 @@ For commands, session controls, and programmatic invocation, see the [command re
 Use `/settings` to browse curated settings, `/providers` to open Provider
 Settings, and `/web-search` to configure the search provider and credentials.
 The first-run `chartreux --setup` flow connects a provider, configures its
-models, offers **Add another provider** or **Continue to presets**, and checks
-web-search readiness after presets. A ready automatic Mistral configuration or
-ready explicit search provider is preserved without opening the Web search
-step. If the step opens, it offers Exa, Brave, and DuckDuckGo; setup does not
-offer `auto` or a second Mistral choice. **Back to presets** returns to preset
-choices, **Skip for now** leaves current search settings unchanged, and
-**Finish setup** completes when the configuration and required key are ready.
-With edited settings, **Save and finish** saves and applies them before
-completing setup. In standalone Settings, Mistral appears once; `auto` is still
-accepted as a Mistral config alias. Follow each screen's labeled Save and
-forward actions; you do not need to backtrack to advance.
+models, offers **Add another provider** or **Continue to presets**, and finishes
+after the automatic role summary or customized presets. Setup does not check
+or change web-search settings. Configure optional web search afterward through
+Settings > Web search or `/web-search`. Settings shows Mistral once; `auto`
+remains accepted as a Mistral configuration alias. Follow each screen's labeled
+Save and forward actions; you do not need to backtrack to advance.
 
 On Provider Settings browser screens, Tab/Shift+Tab moves between visible focus
 groups; arrows move within the current group and stop at its boundaries. Enter

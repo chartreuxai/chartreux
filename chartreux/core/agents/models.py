@@ -20,6 +20,7 @@ class AgentProfile:
     instructions: str | None = None
     idle_ttl_seconds: int | None = None
     role: str | None = None
+    source_path: Path | None = None
 
     @classmethod
     def from_toml(cls, path: Path) -> AgentProfile:
@@ -55,6 +56,7 @@ class AgentProfile:
             idle_ttl_seconds=idle_ttl_seconds,
             role=role,
             overrides=data,
+            source_path=path,
         )
 
 

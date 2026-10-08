@@ -228,6 +228,23 @@ class ChartreuxConfigSchema(ConfigSchema):
     _validation_warnings: list[str] = PrivateAttr(default_factory=list)
     _catalog_snapshot: Any = PrivateAttr(default=None)
     _committed_model: Any = PrivateAttr(default=None)
+    _bound_dispatch_policy: Any = PrivateAttr(default=None)
+    _dispatch_activation_diagnostics: tuple[str, ...] = PrivateAttr(default=())
+
+    def attach_dispatch_diagnostics(
+        self, diagnostics: tuple[str, ...]
+    ) -> ChartreuxConfigSchema:
+        """Replace registry activation notes with the current validation result."""
+        object.__setattr__(self, "_dispatch_activation_diagnostics", diagnostics)
+        return self
+
+    @property
+    def bound_dispatch_policy(self) -> Any:
+        return self._bound_dispatch_policy
+
+    def attach_dispatch_policy(self, policy: Any) -> ChartreuxConfigSchema:
+        object.__setattr__(self, "_bound_dispatch_policy", policy)
+        return self
 
     @property
     def catalog_snapshot(self) -> Any:
@@ -246,7 +263,24 @@ class ChartreuxConfigSchema(ConfigSchema):
 
     @property
     def validation_warnings(self) -> tuple[str, ...]:
-        return tuple(self._validation_warnings)
+        catalog_notes = (
+            self._catalog_snapshot.dispatch_diagnostics
+            if self._catalog_snapshot
+            else ()
+        )
+        session_notes = (
+            self._bound_dispatch_policy.diagnostics
+            if self._bound_dispatch_policy
+            else ()
+        )
+        return tuple(
+            dict.fromkeys((
+                *self._validation_warnings,
+                *catalog_notes,
+                *self._dispatch_activation_diagnostics,
+                *session_notes,
+            ))
+        )
 
     # Models
     active_model: Annotated[str, WithReplaceMerge()] = UNPINNED_ACTIVE_MODEL

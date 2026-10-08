@@ -1863,6 +1863,7 @@ class TurnCompletedParams(EventNotificationParams):
 class AgentSummaryModel(ProtocolModel):
     agent_id: str
     profile: str
+    slot_purposes: list[str] = Field(default_factory=list)
     availability: str
     current_run_id: str | None = None
     current_run_status: str | None = None

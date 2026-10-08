@@ -130,6 +130,15 @@ def _resolved_model(
 
         try:
             resolver = resolver_for(config)
+            if committed is None and config.bound_dispatch_policy is not None:
+                committed = config.bound_dispatch_policy.identity_for(expression)
+                if committed is None and any(
+                    slot.role == expression
+                    for slot in config.bound_dispatch_policy.policy.slots.values()
+                ):
+                    raise InvalidLaunchModelError(
+                        "config.model", "Bound dispatch slot is unavailable"
+                    )
             resolved = (
                 resolver.resolve_committed(
                     committed, allowed_models=config.allowed_models
@@ -371,7 +380,11 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     )
     semantic = _merge_semantic_overrides(accumulated_overrides, config)
     explicit_model = config is not None and "model" in config.model_fields_set
-    explicit_profile = retained_profile is None and profile.role is not None
+    # A restored persona identifies an existing conversation, not a new profile
+    # assignment: preserve its committed model even if the profile role changed.
+    explicit_profile = (
+        retained_profile is None and profile.role is not None and frozen_persona is None
+    )
     inputs = semantic.model_dump(exclude_unset=True, mode="python")
     # Persona is loop-owned rather than a mutable configuration-layer concern.
     inputs.pop("instructions", None)
@@ -513,6 +526,7 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     )
     _validate_tools(semantic, known_tools, authorized_tools)
     effective_thinking = _effective_thinking(staged_config, model, thinking, history)
+    staged_config.attach_committed_model(identity)
     return LaunchCandidate(
         profile=profile,
         config_inputs=_freeze(inputs),

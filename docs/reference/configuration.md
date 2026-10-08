@@ -8,6 +8,8 @@ This page defines the accepted configuration surface. For locations, layering, a
 
 `models.toml` is a separate user-only catalog overlay at `$CHARTREUX_HOME/models.toml`. Provider and deployment tables in `config.toml` are rejected. To move a legacy catalog, run `chartreux models migrate --apply`.
 
+`graduation.toml` at `$CHARTREUX_HOME/graduation.toml` (`~/.chartreux/graduation.toml` by default) stores the graduation nudge's durable `second_model_saved`, `shown`, and `dismissed` flags. Need signals and attempt counters are session-local and are not stored there. This file does not select dispatch mode.
+
 ## `config.toml` keys
 
 Unless noted, list defaults are `[]`, map defaults are `{}`, and booleans shown below are defaults. Pattern lists accept exact names, shell-style globs, or full-match regular expressions prefixed with `re:`.
@@ -199,7 +201,7 @@ Set the orchestrator or other role's `thinking` in `models.toml`; use
 | `disabled` | `false`; valid on providers, models, and deployments. |
 | `[models."base"]` | Base-model definition; it must have at least one deployment. |
 | `thinking` | `"medium"`; `off`, `low`, `medium`, `high`, or `max`. |
-| `temperature` | Unset number. |
+| `temperature` | Optional model-level key; when omitted, requests use the runtime default of `1.0`. |
 | `[[models."base".deployments]]` | Deployment definition. `provider` and `name` are required. |
 | `supports_images` | `false`. |
 | `supported_thinking_levels` | Unset, or a list of known thinking levels. |
@@ -210,6 +212,37 @@ Set the orchestrator or other role's `thinking` in `models.toml`; use
 The shipped role presets are `orchestrator` (the main assistant), `large`,
 `medium`, and `small`. Worker and Reviewer profiles use `medium`; Advisor uses
 `large`. The preset editor labels `orchestrator` as **Main**.
+
+### Dispatch overlay
+
+Dispatch policy is accepted only in the user-owned `models.toml` catalog
+overlay. Project configuration and project profiles cannot select dispatch
+policy. The `[dispatch]` table accepts `mode = "orchestrated"` or
+`mode = "standalone"`; absent selection defaults to `standalone`. Explicit
+selections are authoritative, regardless of legacy tier roles or roster size.
+Standalone permits approved direct implementation but keeps delegated verification,
+independent review, and all approval gates. Select `mode = "orchestrated"` to
+delegate implementation too. A dismissible multi-model graduation nudge opens the
+presets editor without changing mode automatically. Slots are keyed tables and may
+sparsely patch a shipped slot. Omitted fields inherit; lists replace, rather
+than append. New slots require their complete definition.
+
+| Table and field | Accepted value |
+| --- | --- |
+| `[dispatch]` | Dispatch overlay table. |
+| `mode` | `orchestrated` or `standalone`; no free-form values. |
+| `[dispatch.slots.<name>]` | Slot binding table. |
+| `profile` | Discovered agent profile name. |
+| `role` | `@`-prefixed role from the merged model catalog. |
+| `purposes` | List of purpose identifiers; replaces the inherited list. |
+| `implements` | `never`, `routine`, or `escalation`. |
+| `review_eligible` | Boolean review eligibility. |
+
+Invalid dispatch overlays are rejected as a whole; startup uses the shipped
+standalone policy and emits a visible diagnostic while retaining valid catalog
+entries. The invalid source is not overwritten. Dispatch binds to a session;
+saved changes apply only to the next session. See the [models guide](../guides/models.md)
+for examples and [Subagents](../guides/subagents.md) for routing behavior.
 
 ```toml
 [providers."example-openai"]

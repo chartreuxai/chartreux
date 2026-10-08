@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from unittest.mock import AsyncMock
 
 import pytest
@@ -20,9 +21,22 @@ from chartreux.setup.onboarding import (
 )
 from chartreux.setup.onboarding.context import OnboardingContext
 from chartreux.ui.providers.workbench import ProviderWorkbenchScreen
-from chartreux.ui.web_search import WebSearchScreen
 from tests.cli.textual_ui.web_search_fixture import make_snapshot
 from tests.conftest import build_test_vibe_config
+
+
+@pytest.fixture(autouse=True)
+def search_io(monkeypatch: pytest.MonkeyPatch) -> Iterator[AsyncMock]:
+    from chartreux.setup.onboarding.web_search_settings import (
+        OnboardingWebSearchSettings,
+    )
+
+    service = AsyncMock()
+    monkeypatch.setattr(OnboardingWebSearchSettings, "read", service.read)
+    monkeypatch.setattr(OnboardingWebSearchSettings, "save", service.save)
+    yield service
+    service.read.assert_not_awaited()
+    service.save.assert_not_awaited()
 
 
 def test_from_config_keeps_only_initial_provider_input() -> None:
@@ -138,14 +152,10 @@ async def test_reload_failure_returns_retry_guidance_instead_of_success() -> Non
 
 
 @pytest.mark.asyncio
-async def test_host_opens_search_after_presets_and_back_reopens_saved_presets() -> None:
+async def test_host_finishes_after_presets_without_opening_search() -> None:
     config = AsyncMock()
-    search = AsyncMock()
-    search.read.return_value = make_snapshot(
-        {"provider": "exa"}, readiness="missing_key"
-    )
     app = OnboardingApp(config=build_test_vibe_config(), config_service=config)
-    app._search_service = AsyncMock(return_value=search)  # type: ignore[method-assign]
+    assert not hasattr(app, "_search_service")
     app.push_screen_wait = AsyncMock(
         side_effect=[
             ProviderWorkbenchResult("completed", changed=True),
@@ -162,18 +172,15 @@ async def test_host_opens_search_after_presets_and_back_reopens_saved_presets() 
     screens = [call.args[0] for call in app.push_screen_wait.await_args_list]
     assert isinstance(screens[0], ProviderWorkbenchScreen)
     assert screens[0].initial_view == "providers"
-    assert isinstance(screens[1], WebSearchScreen)
-    assert screens[1].mode == "onboarding"
-    assert isinstance(screens[2], ProviderWorkbenchScreen)
-    assert screens[2].initial_view == "presets"
-    assert isinstance(screens[3], WebSearchScreen)
+    assert len(screens) == 1
+    assert not hasattr(app, "_search_service")
     assert exits == [ProviderWorkbenchResult("completed", changed=True)]
     config.reload_catalog_and_config.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
 async def test_host_uses_configured_custom_mistral_search_without_prompt_or_write(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, search_io: AsyncMock
 ) -> None:
     monkeypatch.setenv("CUSTOM_MISTRAL_KEY", "available")
     mistral_config = build_test_vibe_config(
@@ -195,11 +202,10 @@ async def test_host_uses_configured_custom_mistral_search_without_prompt_or_writ
     snapshot = SettingsReadResponse(
         fields=[], web_search=projected, user_layer="user", user_revision="revision"
     )
-    service = AsyncMock()
-    service.read.return_value = snapshot
+    search_io.read.return_value = snapshot
     config_service = AsyncMock()
     app = OnboardingApp(config=mistral_config, config_service=config_service)
-    app._search_service = AsyncMock(return_value=service)  # type: ignore[method-assign]
+    assert not hasattr(app, "_search_service")
     app.push_screen_wait = AsyncMock(return_value=ProviderWorkbenchResult("completed"))
     exits: list[ProviderWorkbenchResult | OnboardingFailure | None] = []
     app.exit = exits.append  # type: ignore[method-assign]
@@ -208,17 +214,19 @@ async def test_host_uses_configured_custom_mistral_search_without_prompt_or_writ
 
     assert app.push_screen_wait.await_count == 1
     assert exits == [ProviderWorkbenchResult("completed")]
-    service.save.assert_not_awaited()
     config_service.reload_catalog_and_config.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["exa", "brave", "duckduckgo"])
-async def test_host_preserves_ready_explicit_search_provider(provider: str) -> None:
-    search = AsyncMock()
-    search.read.return_value = make_snapshot({"provider": provider}, readiness="ready")
+async def test_host_preserves_ready_explicit_search_provider(
+    provider: str, search_io: AsyncMock
+) -> None:
+    search_io.read.return_value = make_snapshot(
+        {"provider": provider}, readiness="ready"
+    )
     app = OnboardingApp(config=build_test_vibe_config(), config_service=AsyncMock())
-    app._search_service = AsyncMock(return_value=search)  # type: ignore[method-assign]
+    assert not hasattr(app, "_search_service")
     app.push_screen_wait = AsyncMock(return_value=ProviderWorkbenchResult("completed"))
     exits: list[ProviderWorkbenchResult | OnboardingFailure | None] = []
     app.exit = exits.append  # type: ignore[method-assign]
@@ -227,20 +235,15 @@ async def test_host_preserves_ready_explicit_search_provider(provider: str) -> N
 
     assert app.push_screen_wait.await_count == 1
     assert exits == [ProviderWorkbenchResult("completed")]
-    search.save.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_unready_explicit_search_is_not_bypassed_by_mistral_key(
+async def test_unready_search_does_not_block_model_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MISTRAL_API_KEY", "available")
-    search = AsyncMock()
-    search.read.return_value = make_snapshot(
-        {"provider": "exa"}, readiness="missing_key"
-    )
     app = OnboardingApp(config=build_test_vibe_config(), config_service=AsyncMock())
-    app._search_service = AsyncMock(return_value=search)  # type: ignore[method-assign]
+    assert not hasattr(app, "_search_service")
     app.push_screen_wait = AsyncMock(
         side_effect=[ProviderWorkbenchResult("completed"), "skip"]
     )
@@ -250,15 +253,14 @@ async def test_unready_explicit_search_is_not_bypassed_by_mistral_key(
     await app._run_workbench()
 
     screens = [call.args[0] for call in app.push_screen_wait.await_args_list]
-    assert len(screens) == 2
-    assert isinstance(screens[1], WebSearchScreen)
+    assert len(screens) == 1
     assert exits == [ProviderWorkbenchResult("completed")]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("view_only", [True, False])
-async def test_host_does_not_skip_search_on_unverifiable_ready_projection(
-    view_only: bool,
+async def test_search_projection_does_not_affect_setup_completion(
+    view_only: bool, search_io: AsyncMock
 ) -> None:
     snapshot = make_snapshot(readiness="ready", revision=None if view_only else "rev")
     if not view_only:
@@ -275,10 +277,9 @@ async def test_host_does_not_skip_search_on_unverifiable_ready_projection(
                 )
             }
         )
-    search = AsyncMock()
-    search.read.return_value = snapshot
+    search_io.read.return_value = snapshot
     app = OnboardingApp(config=build_test_vibe_config(), config_service=AsyncMock())
-    app._search_service = AsyncMock(return_value=search)  # type: ignore[method-assign]
+    assert not hasattr(app, "_search_service")
     app.push_screen_wait = AsyncMock(
         side_effect=[ProviderWorkbenchResult("completed"), "skip"]
     )
@@ -287,17 +288,17 @@ async def test_host_does_not_skip_search_on_unverifiable_ready_projection(
 
     await app._run_workbench()
 
-    assert app.push_screen_wait.await_count == 2
-    assert isinstance(app.push_screen_wait.await_args_list[1].args[0], WebSearchScreen)
+    assert app.push_screen_wait.await_count == 1
     assert exits == [ProviderWorkbenchResult("completed")]
 
 
 @pytest.mark.asyncio
-async def test_host_read_failure_cannot_auto_complete_search() -> None:
-    search = AsyncMock()
-    search.read.side_effect = OSError("synthetic read failure")
+async def test_search_read_failure_does_not_block_model_setup(
+    search_io: AsyncMock,
+) -> None:
+    search_io.read.side_effect = OSError("synthetic read failure")
     app = OnboardingApp(config=build_test_vibe_config(), config_service=AsyncMock())
-    app._search_service = AsyncMock(return_value=search)  # type: ignore[method-assign]
+    assert not hasattr(app, "_search_service")
     app.push_screen_wait = AsyncMock(return_value=ProviderWorkbenchResult("completed"))
     exits: list[ProviderWorkbenchResult | OnboardingFailure | None] = []
     app.exit = exits.append  # type: ignore[method-assign]
@@ -305,9 +306,7 @@ async def test_host_read_failure_cannot_auto_complete_search() -> None:
     await app._run_workbench()
 
     assert app.push_screen_wait.await_count == 1
-    assert exits == [
-        OnboardingFailure("Could not open Web search setup: synthetic read failure")
-    ]
+    assert exits == [ProviderWorkbenchResult("completed")]
 
 
 @pytest.mark.asyncio

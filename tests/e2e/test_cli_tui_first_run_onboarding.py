@@ -12,7 +12,6 @@ import pytest
 from tests import TESTS_ROOT
 from tests.e2e.common import (
     ansi_tolerant_pattern,
-    drain_child_output,
     send_ctrl_c_until_quit_confirmation,
     strip_ansi,
     wait_for_rendered_text,
@@ -25,7 +24,9 @@ def _send_and_wait_for_text(
     child: pexpect.spawn, keys: str, text: str, *, timeout: float = 10
 ) -> None:
     """Send keyboard input and wait for the resulting screen state."""
-    if keys.startswith(("\x1b[A", "\x1b[B", "\x1b[F")) and keys.endswith("\r"):
+    if keys.startswith(("\x1b[A", "\x1b[B", "\x1b[F", "\x1b[H")) and keys.endswith(
+        "\r"
+    ):
         child.send(keys[:-1])
         time.sleep(0.1)
         child.send("\r")
@@ -52,8 +53,10 @@ def _advance_welcome_with_keyboard(child: pexpect.spawn, timeout: float) -> None
     )
 
 
-@pytest.mark.timeout(60)
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize("customize", [False, True], ids=["auto-seeded", "customize"])
 def test_empty_home_onboarding_reaches_first_streaming_turn(
+    customize: bool,
     streaming_mock_server: StreamingMockServer,
     e2e_workdir: Path,
     tmp_path: Path,
@@ -122,56 +125,40 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
         # Closing the model editor restores its action-row opener.
         _send_and_wait_for_text(child, "\x1b[B", "▸ Save and add another provider")
         _send_and_wait_for_text(child, "\x1b[B", "▸ Save and continue to presets")
-        _send_and_wait_for_text(child, "\r", "Choose default presets", timeout=25)
+        _send_and_wait_for_text(child, "\r", "Roles bound automatically", timeout=25)
         catalog_path = chartreux_home / "models.toml"
-        deadline = time.monotonic() + 8
-        while not catalog_path.is_file() and time.monotonic() < deadline:
-            drain_child_output(child, captured, idle_sleep=0.1)
-        assert catalog_path.is_file(), strip_ansi(captured.getvalue())[-1200:]
-        presets = (
-            ("orchestrator", "Main Assistant"),
-            ("large", "Large"),
-            ("medium", "Medium"),
-            ("small", "Small"),
-        )
-        for index, (role, title) in enumerate(presets):
-            if index:
-                _send_and_wait_for_text(
-                    child, "\x1b[B", f"▸ {title} (@{role})", timeout=10
-                )
-            _send_and_wait_for_text(child, "\r", f"Edit {title} preset", timeout=10)
-            _send_and_wait_for_text(child, "\r", f"Choose model for {role}", timeout=10)
+        # The model stage has already committed provider/model state; presets
+        # remain staged until Finish. This checks transitions, not just headings.
+        catalog = tomllib.loads(catalog_path.read_text(encoding="utf-8"))
+        assert "onboarding-mock-model" in catalog["models"]
+        assert "Local e2e provider" in catalog["providers"]
+        summary_output = strip_ansi(captured.getvalue())
+        assert "(*) Standalone" in summary_output
+        assert "Edit Main Assistant preset" not in summary_output
+        assert "Choose thinking for" not in summary_output
+        assert "Choose model for" not in summary_output
+        if customize:
+            _send_and_wait_for_text(child, "\r", "Main assistant (@orchestrator)")
+            _send_and_wait_for_text(child, "\r", "Edit Main Assistant preset")
             _send_and_wait_for_text(
-                child, "\x1b[F\r", "Model  onboarding-mock-model", timeout=10
+                child, "\x1b[B\r", "Choose thinking for orchestrator"
             )
-            _send_and_wait_for_text(child, "\x1b[B", "▸ Thinking")
-            _send_and_wait_for_text(
-                child, "\r", f"Choose thinking for {role}", timeout=10
-            )
-            _send_and_wait_for_text(child, "\x1b[B", "▸ low")
-            _send_and_wait_for_text(child, "\x1b[B", "▸ medium")
-            _send_and_wait_for_text(child, "\r", f"Edit {title} preset", timeout=10)
+            _send_and_wait_for_text(child, "\x1b[H\r", "Thinking  off")
             _send_and_wait_for_text(child, "\t", "▸ Apply model and thinking")
-            _send_and_wait_for_text(child, "\r", "Choose default presets", timeout=10)
-        _send_and_wait_for_text(child, "\t", "▸ Save presets and continue")
-        _send_and_wait_for_text(
-            child,
-            "\r",
-            "Choose Exa, Brave or DuckDuckGo to set up web search",
-            timeout=25,
-        )
-        # From the provider list, Shift+Tab visits the form, then Skip for now.
-        # Pace the keys so focus moves before Enter reaches the button.
-        child.send("\x1b[Z")
-        drain_child_output(child, captured, idle_sleep=0.1)
-        child.send("\x1b[Z")
-        drain_child_output(child, captured, idle_sleep=0.1)
+            _send_and_wait_for_text(child, "\r", "Choose default presets")
+            wait_for_rendered_text(
+                child, captured, "Mode changes apply next session", timeout=10
+            )
+        _send_and_wait_for_text(child, "\t", "▸ Finish setup")
         _send_and_wait_for_text(child, "\r", "Setup complete", timeout=25)
+        assert "Choose Exa, Brave or DuckDuckGo" not in strip_ansi(captured.getvalue())
         config_path = chartreux_home / "config.toml"
-        env_path = chartreux_home / ".env"
-        catalog_path = chartreux_home / "models.toml"
-        assert env_path.is_file()
         assert catalog_path.is_file()
+        env_path = chartreux_home / ".env"
+        assert env_path.is_file()
+        assert f"{api_key_env_var}='{api_key_value}'" in env_path.read_text(
+            encoding="utf-8"
+        )
 
         config = (
             tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -193,7 +180,12 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
             role["model"] == "onboarding-mock-model"
             for role in catalog["roles"].values()
         )
-        assert f"{api_key_env_var}=" in env_path.read_text(encoding="utf-8")
+        # Fresh setup keeps the standalone default without role questions.
+        assert catalog.get("dispatch", {}).get("mode", "standalone") == "standalone"
+        if customize:
+            assert catalog["roles"]["orchestrator"]["thinking"] == "off"
+        else:
+            assert "Choose thinking for" not in strip_ansi(captured.getvalue())
 
         # Wait for the main TUI to finish starting up before typing, otherwise
         # the message keystrokes arrive while the app is still entering its

@@ -10,6 +10,7 @@ from chartreux.core.compaction import CompactionFailedError, CompactionManager
 from chartreux.core.compaction.context import (
     parse_previous_user_messages,
     render_compaction_context,
+    select_model_context,
 )
 from chartreux.core.errors import ContextTooLongError
 from chartreux.core.llm_models import (
@@ -121,6 +122,52 @@ def _conversation() -> MessageList:
         LLMMessage(role=Role.assistant, content="work"),
         LLMMessage(role=Role.user, content="newest ask"),
     ])
+
+
+# A scripted compaction response carrying a pending-approval handoff: design
+# accepted, plan pending, approved scope with evidence, one consumed and one
+# unconsumed one-time grant, and active agent/run handles.
+PENDING_APPROVAL_HANDOFF = """\
+Goal: implement the retry policy from the user's approved design.
+Task classification: implementation (non-trivial)
+Current workflow phase: plan
+Dispatch policy identity: orchestrated; policy version: 1; snapshot version: 1
+Contributor authorship: scope=retry.py; slot=implementor; evidence=changed retry helper; status=partial
+Consumed attempt budget: scope=retry.py; used=2; remaining=0
+Current recovery route: scope=retry.py; advisor diagnosis pending; no implementation retry
+Design acceptance state: accepted
+Plan acceptance state: pending
+Approved scope: design work only; no implementation until the plan is accepted
+Approval evidence: the user's message 'the design looks good, go ahead' approved the design
+One-time grants:
+- target: scratchpad draft of the plan; state: consumed
+- target: one focused test run; state: unconsumed
+Active agent/run handles: agent-7 (run-3, idle), agent-9 (run-5, running)
+Outstanding dependencies: agent-9's findings feed the plan; run-3's result is uncollected
+Next step: present the plan to the user and wait for explicit plan acceptance
+"""
+
+
+def _assert_pending_approval_handoff_intact(text: str) -> None:
+    for fragment in (
+        "Design acceptance state: accepted",
+        "Dispatch policy identity:",
+        "Contributor authorship: scope=retry.py",
+        "status=partial",
+        "used=2; remaining=0",
+        "advisor diagnosis pending",
+        "Plan acceptance state: pending",
+        "Approved scope:",
+        "Approval evidence:",
+        "state: consumed",
+        "state: unconsumed",
+        "agent-7",
+        "run-3",
+        "agent-9",
+        "run-5",
+        "uncollected",
+    ):
+        assert fragment in text
 
 
 @pytest.mark.asyncio
@@ -530,3 +577,118 @@ async def test_terminal_failure_after_empty_summary_preserves_context() -> None:
     assert exc_info.value.reason == "empty_summary"
     assert list(messages) == original
     assert stats.context_tokens == 1234
+
+
+@pytest.mark.asyncio
+async def test_primary_compaction_preserves_pending_approval_handoff() -> None:
+    messages = _conversation()
+    stats = AgentStats()
+    manager, complete = _build_manager(
+        [mock_llm_chunk(content=f"<summary>{PENDING_APPROVAL_HANDOFF}</summary>")],
+        messages=messages,
+        stats=stats,
+    )
+
+    summary = await manager.compact()
+
+    assert summary == PENDING_APPROVAL_HANDOFF.strip()
+    assert len(complete.calls) == 1  # primary only; no fallback needed
+    envelope = messages[-1]
+    assert envelope.context_boundary == "compaction"
+    _assert_pending_approval_handoff_intact(envelope.content or "")
+    # The handoff reaches the next model-facing request intact.
+    model_context = select_model_context(messages)
+    assert any(
+        PENDING_APPROVAL_HANDOFF.strip() in (message.content or "")
+        for message in model_context
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_compaction_preserves_pending_approval_handoff() -> None:
+    messages = _conversation()
+    stats = AgentStats()
+    manager, complete = _build_manager(
+        [
+            _tool_call_chunk(),  # primary fails (tool call)
+            mock_llm_chunk(content=f"<summary>{PENDING_APPROVAL_HANDOFF}</summary>"),
+        ],
+        messages=messages,
+        stats=stats,
+    )
+
+    summary = await manager.compact()
+
+    assert summary == PENDING_APPROVAL_HANDOFF.strip()
+    assert len(complete.calls) == 2  # primary + fallback
+    envelope = messages[-1]
+    assert envelope.context_boundary == "compaction"
+    _assert_pending_approval_handoff_intact(envelope.content or "")
+
+
+@pytest.mark.asyncio
+async def test_repeated_compaction_preserves_pending_approval_handoff() -> None:
+    # Two compaction rounds back to back: the second round summarizes the
+    # first round's handoff, and the acceptance states, grant consumption,
+    # and agent/run handles must survive both compactions.
+    messages = _conversation()
+    stats = AgentStats()
+    manager, complete = _build_manager(
+        [
+            mock_llm_chunk(content=f"<summary>{PENDING_APPROVAL_HANDOFF}</summary>"),
+            mock_llm_chunk(content=f"<summary>{PENDING_APPROVAL_HANDOFF}</summary>"),
+        ],
+        messages=messages,
+        stats=stats,
+    )
+
+    first_summary = await manager.compact()
+    second_summary = await manager.compact()
+
+    assert first_summary == PENDING_APPROVAL_HANDOFF.strip()
+    assert second_summary == PENDING_APPROVAL_HANDOFF.strip()
+    assert len(complete.calls) == 2  # one primary per compaction round
+    # The second round summarized the first round's handoff, not a fresh start.
+    second_request = complete.calls[1]["messages"]
+    assert any(
+        PENDING_APPROVAL_HANDOFF.strip() in (message.content or "")
+        for message in second_request
+    )
+    # Both boundaries remain, with the latest carrying the handoff forward.
+    envelopes = [m for m in messages if m.context_boundary == "compaction"]
+    assert len(envelopes) == 2
+    _assert_pending_approval_handoff_intact(envelopes[-1].content or "")
+    # The handoff reaches the next model-facing request intact.
+    model_context = select_model_context(messages)
+    assert any(
+        PENDING_APPROVAL_HANDOFF.strip() in (message.content or "")
+        for message in model_context
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_handoff_survives_repeated_overflow_and_fallback() -> None:
+    messages = _conversation()
+    stats = AgentStats()
+    manager, complete = _build_manager(
+        [
+            mock_llm_chunk(content=f"<summary>{PENDING_APPROVAL_HANDOFF}</summary>"),
+            ContextTooLongError("p", "m"),
+            _tool_call_chunk(),
+            mock_llm_chunk(content=f"<summary>{PENDING_APPROVAL_HANDOFF}</summary>"),
+        ],
+        messages=messages,
+        stats=stats,
+    )
+    await manager.compact()
+    messages.extend([
+        LLMMessage(role=Role.user, content="old continuation"),
+        LLMMessage(role=Role.assistant, content="work"),
+        LLMMessage(role=Role.user, content="latest continuation"),
+    ])
+    await manager.compact()
+    for call in complete.calls[1:]:
+        text = "\n".join(message.content or "" for message in call["messages"])
+        _assert_pending_approval_handoff_intact(text)
+        assert "missing budget means consumed" in text.lower()
+    _assert_pending_approval_handoff_intact(messages[-1].content or "")

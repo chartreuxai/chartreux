@@ -10,12 +10,21 @@ from chartreux.app_server._sessions import SessionRuntimeRegistry
 from chartreux.core.agents.manager import AgentManager
 from chartreux.core.agents.models import BUILTIN_SUBAGENTS, AgentType
 from chartreux.core.config import ChartreuxConfigSchema
+from chartreux.core.dispatch.presets import ORCHESTRATED_PRESET, STANDALONE_PRESET
+from chartreux.core.dispatch.renderer import (
+    render_task_description,
+    roster_for,
+    task_skeleton,
+)
+from chartreux.core.dispatch.schema import DispatchPolicy
 from chartreux.core.events import ToolResultEvent, ToolStreamEvent
 from chartreux.core.llm.format import (
     APIToolFormatHandler,
     ParsedMessage,
     ParsedToolCall,
 )
+from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
+from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.subagents import LaunchOutcome
 from chartreux.core.tools.base import (
     BaseToolState,
@@ -30,7 +39,7 @@ from chartreux.core.tools.builtins.task import (
     TaskToolConfig,
 )
 from chartreux.core.tools.permissions import PermissionContext
-from tests.conftest import ConfigBuilder, OrchestratorLoader
+from tests.conftest import ConfigBuilder, OrchestratorLoader, multi_model_catalog
 from tests.mock.utils import collect_result
 from tests.stubs.fake_interaction_requests import FakeInteractionRequests
 
@@ -70,21 +79,74 @@ class TestTaskArgs:
         assert "providers_used" in prompt
         assert "committed base model" in prompt
 
-    def test_task_prompt_documents_single_preset_semantics(self) -> None:
-        prompt = (
-            Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/task.md"
-        ).read_text()
+    @pytest.mark.parametrize("policy", [ORCHESTRATED_PRESET, STANDALONE_PRESET])
+    @pytest.mark.parametrize("catalog", [multi_model_catalog(), SHIPPED_CATALOG])
+    def test_task_prompt_documents_single_preset_semantics(
+        self, policy: DispatchPolicy, catalog: ModelCatalog
+    ) -> None:
+        shape = roster_for(catalog, policy)
+        prompt = render_task_description(policy, shape, task_skeleton())
         prompt = " ".join(prompt.split())
 
-        assert '"model": "@large"' in prompt
+        if shape.single_model:
+            assert "fresh reviewer on a deep-review slot" in prompt
+            assert '"model": "@large"' not in prompt
+        else:
+            assert '"model": "@large"' in prompt
+            assert 'config={"model": "@large"}' in prompt
         assert '"model": "strong"' not in prompt
-        assert "A role such as `@large`" in prompt
+        assert "A slot binds a profile, a role, and purposes." in prompt
+        assert "A slot's role is one default model and thinking level." in prompt
         assert "@reviewers" not in prompt
         assert "one default model and thinking level" in prompt
         assert (
             "Roles are single presets. Launch separate tasks with explicit "
             "presets/models for multiple agents."
         ) in prompt
+
+    @pytest.mark.parametrize("policy", [ORCHESTRATED_PRESET, STANDALONE_PRESET])
+    @pytest.mark.parametrize("catalog", [multi_model_catalog(), SHIPPED_CATALOG])
+    def test_task_prompt_documents_mechanical_small_override(
+        self, policy: DispatchPolicy, catalog: ModelCatalog
+    ) -> None:
+        shape = roster_for(catalog, policy)
+        prompt = render_task_description(policy, shape, task_skeleton())
+        prompt = " ".join(prompt.split())
+
+        if policy == ORCHESTRATED_PRESET and not shape.single_model:
+            assert "pass the tier explicitly in `config`" in prompt
+            assert 'config={"model": "@small"}' in prompt
+            assert (
+                'task="Rename add to plus in utils.py and update its call sites."'
+                in prompt
+            )
+            assert (
+                'task="Add a retry helper with exponential backoff to utils.py and use '
+                'it in app.py."' in prompt
+            )
+            assert '"model": "@large"' in prompt
+        else:
+            assert "launches on the `mechanical` slot" in prompt
+            assert "implementation launches on the `implementor` slot" in prompt
+            assert 'config={"model": "@small"}' not in prompt
+        if policy == STANDALONE_PRESET:
+            assert "Delegation is optional" in prompt
+        if shape.single_model:
+            assert "re-state the slot explicitly on every reuse" in prompt
+            assert "previously `@small`" not in prompt
+
+    def test_task_prompt_opener_covers_routine_bounded_delegation(self) -> None:
+        prompt = (
+            Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/task.md"
+        ).read_text()
+
+        assert "bounded delegated work of any size" in prompt
+        assert "do not treat delegation as limited to exceptional work" in prompt
+        # The retired opener and escalation example are gone.
+        assert "complex multi-step work" not in prompt
+        assert "To escalate an idle agent" not in prompt
+        assert "stronger `model`" not in prompt
+        assert "for corrective work, including" not in prompt
 
     def test_default_subagent_is_worker(self) -> None:
         args = TaskArgs(task="do something")

@@ -6,6 +6,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
+from chartreux.core.dispatch.lint import lint_catalog
+from chartreux.core.dispatch.presets import SHIPPED_PRESETS
+from chartreux.core.dispatch.schema import DispatchMode, DispatchPolicy
 from chartreux.core.llm.thinking_levels import get_thinking_levels
 from chartreux.core.model_catalog.contracts import (
     ApiStyle,
@@ -25,6 +28,18 @@ from chartreux.core.model_catalog.schema import (
 
 type CredentialStatusResolver = Callable[[str], str | None]
 type CollisionDecision = Literal["add_existing", "separate"]
+
+
+def usable_canonical_models(
+    snapshot: CatalogSnapshot, credential_resolver: CredentialStatusResolver
+) -> frozenset[str]:
+    """Project catalog readiness into identities for the core-free graduation state."""
+    state = ManagementState.from_snapshot(snapshot, "")
+    return frozenset(
+        name
+        for name in snapshot.catalog.models
+        if state._usable(name, credential_resolver=credential_resolver)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +95,7 @@ class ManagementState:
     canonical_edits: dict[str, dict[str, OptionalEdit[object]]] = field(
         default_factory=dict
     )
+    dispatch_mode: DispatchMode | None = None
     role_presets: dict[str, tuple[str, str]] = field(default_factory=dict)
     pending_by_provider: dict[str, dict[str, PendingModel]] = field(
         default_factory=dict
@@ -108,9 +124,7 @@ class ManagementState:
         catalog = self.catalog.model_copy(
             update={"providers": {**self.catalog.providers, provider_id: definition}}
         )
-        self.snapshot = CatalogSnapshot(
-            catalog, self.snapshot.revision, self.snapshot.overlaid_providers
-        )
+        self.snapshot = replace(self.snapshot, catalog=catalog)
         self.provider_id = provider_id
         self.connections[provider_id] = ConnectionDraft.from_definition(definition)
 
@@ -563,6 +577,30 @@ class ManagementState:
             entries.append(entry)
         return CatalogChanges(self.provider_id, self._provider_patch(), patches)
 
+    @property
+    def _dispatch(self) -> DispatchPolicy:
+        from chartreux.core.model_catalog.loader import merge_dispatch_overlay
+
+        patch = self._dispatch_patch()
+        return merge_dispatch_overlay(patch) if patch else self.snapshot.dispatch
+
+    def _dispatch_patch(self) -> Mapping[str, object] | None:
+        if self.dispatch_mode is None:
+            return None
+        if self.snapshot.dispatch_diagnostics:
+            # Explicit mode selection is also the repair affordance. Never erase
+            # an invalid table as a side effect of provider/role auto-seeding.
+            return {"mode": self.dispatch_mode.value}
+        if self.dispatch_mode == self.snapshot.dispatch.mode:
+            return None
+        # Writes replace the table. Preserve custom fields, but inherit the new
+        # mode's shipped instructions rather than freezing the previous preset.
+        original = SHIPPED_PRESETS[self.snapshot.dispatch.mode].model_dump(mode="json")
+        current = self.snapshot.dispatch.model_dump(mode="json")
+        patch = {key: value for key, value in current.items() if value != original[key]}
+        patch["mode"] = self.dispatch_mode.value
+        return patch
+
     def _build(self) -> CatalogChanges:
         focused = self.provider_id
         providers: dict[str, Mapping[str, object]] = {}
@@ -596,12 +634,18 @@ class ManagementState:
             models,
             self._role_patches() or None,
             providers,
+            dispatch=self._dispatch_patch(),
         )
 
     @property
     def dirty(self) -> bool:
         changes = self._build()
-        return bool(changes.provider_patches or changes.models or changes.roles)
+        return bool(
+            changes.provider_patches
+            or changes.models
+            or changes.roles
+            or changes.dispatch
+        )
 
     def _usable(
         self,
@@ -749,6 +793,40 @@ class ManagementState:
                 errors.append(f"Canonical name {name} is already occupied.")
         return errors
 
+    def _completion_roles(
+        self, mode: Literal["management", "onboarding"], errors: list[str]
+    ) -> set[str]:
+        if mode != "onboarding":
+            return set(self.catalog.roles)
+        candidate = self.catalog.model_copy(
+            update={
+                "roles": {
+                    role: definition.model_copy(
+                        update={
+                            "model": self.preset(role)[0],
+                            "thinking": self.preset(role)[1],
+                        }
+                    )
+                    for role, definition in self.catalog.roles.items()
+                }
+            }
+        )
+        errors.extend(
+            str(diagnostic)
+            for diagnostic in lint_catalog(self._dispatch, candidate)
+            if diagnostic.severity == "error"
+        )
+        if self.snapshot.dispatch_diagnostics and self.dispatch_mode is None:
+            errors.append(
+                "Dispatch needs repair: Customize and explicitly select a mode, "
+                "or repair the user catalog. "
+                + "; ".join(self.snapshot.dispatch_diagnostics)
+            )
+        return {
+            "orchestrator",
+            *(slot.role.removeprefix("@") for slot in self._dispatch.slots.values()),
+        }
+
     def validate(
         self,
         active_expression: str | None = None,
@@ -776,7 +854,15 @@ class ManagementState:
         unresolved: list[str] = []
         unusable: list[str] = []
         if completion:
-            for role in self.catalog.roles:
+            required_roles = self._completion_roles(mode, errors)
+            for role in (
+                *[role for role in self.catalog.roles if role in required_roles],
+                *sorted(required_roles - self.catalog.roles.keys()),
+            ):
+                if role not in self.catalog.roles:
+                    unresolved.append(role)
+                    errors.append(f"Dispatch role @{role}: configure the missing role.")
+                    continue
                 model, thinking = self.preset(role)
                 if model not in self.catalog.models and model not in changes.models:
                     unresolved.append(role)

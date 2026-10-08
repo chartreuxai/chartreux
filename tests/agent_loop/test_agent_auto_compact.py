@@ -440,7 +440,9 @@ async def test_compact_uses_configured_compaction_prompt(
     await agent.compact()
 
     compaction_prompt = backend.requests_messages[0][-1].content
-    assert compaction_prompt == "Summarize theorem progress"
+    assert compaction_prompt is not None
+    assert compaction_prompt.startswith("Summarize theorem progress\n\n")
+    assert "Bound dispatch policy identity:" in compaction_prompt
 
 
 @pytest.mark.asyncio

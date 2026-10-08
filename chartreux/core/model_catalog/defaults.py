@@ -26,7 +26,6 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
     "models": {
         "glm-5-3": {
             "thinking": "high",
-            "temperature": 0.2,
             "deployments": [
                 {
                     "provider": "mistral",
@@ -40,24 +39,20 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
     },
     "roles": {
         "orchestrator": {
-            "description": "main assistant default model and thinking level",
+            "description": "main assistant preset",
             "model": "glm-5-3",
             "thinking": "high",
         },
         "large": {
-            "description": "capacity preset for complex tasks",
+            "description": "large preset",
             "model": "glm-5-3",
             "thinking": "high",
         },
         "medium": {
-            "description": "capacity preset for routine tasks",
+            "description": "medium preset",
             "model": "glm-5-3",
             "thinking": "medium",
         },
-        "small": {
-            "description": "capacity preset for focused tasks",
-            "model": "glm-5-3",
-            "thinking": "low",
-        },
+        "small": {"description": "small preset", "model": "glm-5-3", "thinking": "low"},
     },
 })

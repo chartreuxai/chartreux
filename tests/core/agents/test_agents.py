@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,9 @@ from chartreux.core.agents.models import (
 from chartreux.core.agents.registry import AgentRegistry
 from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.config.harness_files import HarnessFilesManager
+from chartreux.core.dispatch.presets import STANDALONE_PRESET
+from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
+from chartreux.core.model_catalog.loader import CatalogSnapshot, load_catalog
 from tests.conftest import ConfigBuilder, OrchestratorLoader
 
 
@@ -202,7 +206,7 @@ class TestAgentManager:
             manager.get_agent("invalid")
 
     @pytest.mark.parametrize("name", ["worker", "advisor", "reviewer"])
-    def test_user_profile_overrides_builtin_role_profile(
+    def test_user_profile_cannot_shadow_builtin_at_activation(
         self,
         name: str,
         tmp_path: Path,
@@ -214,14 +218,135 @@ class TestAgentManager:
         (agents_dir / f"{name}.toml").write_text(
             'description = "Custom role profile"\n', encoding="utf-8"
         )
-        manager = AgentManager(
-            load_orchestrator(build_config(agent_paths=[agents_dir]))
+        orchestrator = load_orchestrator(build_config(agent_paths=[agents_dir]))
+        manager = AgentManager(orchestrator)
+        assert manager.get_agent(name) is BUILTIN_SUBAGENTS[name]
+        assert any("S2" in note for note in orchestrator.config.validation_warnings)
+        snapshot = orchestrator.config.catalog_snapshot
+        assert snapshot.dispatch is STANDALONE_PRESET
+        assert any(
+            "S2" in item and name in item for item in snapshot.dispatch_diagnostics
         )
 
-        assert manager.get_agent(name).description == "Custom role profile"
+    def test_dispatch_activation_warning_is_projected_and_recomputed(
+        self,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+    ) -> None:
+        from chartreux.app_server._projection import project_config_view
+
+        orchestrator = load_orchestrator(build_config())
+        snapshot = orchestrator.config.catalog_snapshot
+        policy = snapshot.dispatch.model_copy(
+            update={
+                "contrasts": "Use slot `mechanical` for purpose `implementation`; use slot `implementor` for purpose `implementation`."
+            }
+        )
+        orchestrator.config.attach_catalog_snapshot(replace(snapshot, dispatch=policy))
+        registry = AgentRegistry(orchestrator, HarnessFilesManager(sources=()))
+        warnings = project_config_view(orchestrator.config).validation_warnings
+        assert any(note.startswith("R3 ") for note in warnings)
+        assert orchestrator.config.catalog_snapshot.dispatch == policy
+        orchestrator.config.attach_catalog_snapshot(snapshot)
+        registry.validate_dispatch()
+        assert not any(
+            note.startswith("R3 ") for note in orchestrator.config.validation_warnings
+        )
 
     def test_get_builtin_subagent(self, manager: AgentManager) -> None:
         assert manager.get_agent("worker") is WORKER
+
+    @pytest.mark.parametrize("available", [False, True])
+    def test_dispatch_profile_binding_uses_completed_discovery(
+        self,
+        tmp_path: Path,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+        available: bool,
+    ) -> None:
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        if available:
+            (agents_dir / "custom.toml").write_text('role = "small"\n')
+        orchestrator = load_orchestrator(build_config(agent_paths=[agents_dir]))
+        snapshot = orchestrator.config.catalog_snapshot
+        slots = dict(snapshot.dispatch.slots)
+        slots["mechanical"] = slots["mechanical"].model_copy(
+            update={"profile": "custom"}
+        )
+        policy = snapshot.dispatch.model_copy(
+            update={
+                "slots": slots,
+                "contrasts": "Use slot `mechanical` for searches; use slot `implementor` for implementation.",
+            }
+        )
+        orchestrator.config.attach_catalog_snapshot(replace(snapshot, dispatch=policy))
+        if available:
+            registry = AgentRegistry(orchestrator, HarnessFilesManager(sources=()))
+            assert (
+                registry.discovered["custom"].source_path == agents_dir / "custom.toml"
+            )
+        else:
+            AgentRegistry(orchestrator, HarnessFilesManager(sources=()))
+            recovered = orchestrator.config.catalog_snapshot
+            assert recovered.dispatch is STANDALONE_PRESET
+            assert any(
+                "R1 slots.mechanical.profile" in item and "custom" in item
+                for item in recovered.dispatch_diagnostics
+            )
+            assert policy.slots["mechanical"].profile == "custom"
+
+    @pytest.mark.parametrize("user_overlay", [False, True])
+    def test_activation_falls_back_visibly_without_repair(
+        self,
+        tmp_path: Path,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+        monkeypatch: pytest.MonkeyPatch,
+        user_overlay: bool,
+    ) -> None:
+        from unittest.mock import Mock
+
+        warning = Mock()
+        monkeypatch.setattr("chartreux.core.agents.registry.logger.warning", warning)
+        orchestrator = load_orchestrator(build_config())
+        path = tmp_path / "models.toml"
+        original = b""
+        if user_overlay:
+            path.write_text(
+                '[dispatch.slots.mechanical]\nprofile = "missing-profile"\n'
+                '[providers.mistral]\napi_base = "https://preserved.example/v1"\n'
+            )
+            original = path.read_bytes()
+            snapshot = load_catalog(path)
+        else:
+            catalog = SHIPPED_CATALOG.model_copy(update={"roles": {}})
+            snapshot = CatalogSnapshot(catalog, "no-tier-roles")
+        orchestrator.config.attach_catalog_snapshot(snapshot)
+
+        AgentManager(orchestrator)
+
+        recovered = orchestrator.config.catalog_snapshot
+        assert recovered.dispatch is STANDALONE_PRESET
+        assert recovered.catalog is snapshot.catalog
+        assert recovered.overlaid_providers == snapshot.overlaid_providers
+        assert recovered.revision == snapshot.revision
+        diagnostic = recovered.dispatch_diagnostics[-1]
+        assert "using the shipped standalone preset" in diagnostic
+        warning.assert_called_with("%s", diagnostic)
+        if user_overlay:
+            assert "R1 slots.mechanical.profile" in diagnostic
+            assert "dispatch config was bypassed" in diagnostic
+            assert (
+                recovered.catalog.providers["mistral"].api_base
+                == "https://preserved.example/v1"
+            )
+            assert snapshot.dispatch.slots["mechanical"].profile == "missing-profile"
+            assert path.read_bytes() == original
+        else:
+            assert "S1 slots.mechanical.role" in diagnostic
+            assert recovered.catalog.roles == {}
+            assert recovered.dispatch.slots["mechanical"].role == "@small"
 
     def test_get_nonexistent_agent_raises(self, manager: AgentManager) -> None:
         with pytest.raises(ValueError, match="not found"):

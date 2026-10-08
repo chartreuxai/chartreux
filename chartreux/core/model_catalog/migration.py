@@ -224,7 +224,7 @@ def _build_catalog(  # noqa: PLR0912, PLR0914, PLR0915
     models: dict[str, Any] = {}
     for base, entries in grouped.items():
         semantic = {
-            (entry.get("temperature", 0.2), entry.get("thinking", "off"))
+            (entry.get("temperature", 1.0), entry.get("thinking", "off"))
             for entry in entries
         }
         if len(semantic) != 1:

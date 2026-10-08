@@ -66,6 +66,12 @@ from chartreux.core.config.harness_files import (
 )
 from chartreux.core.config.layers.project import ProjectConfigLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
+from chartreux.core.dispatch.renderer import task_description_for_config
+from chartreux.core.dispatch.session import (
+    BoundDispatchPolicy,
+    bind_policy,
+    resume_policy,
+)
 from chartreux.core.errors import ContextTooLongError
 from chartreux.core.events import (
     AssistantEvent,
@@ -438,6 +444,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         committed_model: CommittedModelIdentity | None = None,
         accounting_owner: RootAccountingOwner | None = None,
         background_jobs: BackgroundJobsPort | None = None,
+        bound_dispatch_policy: BoundDispatchPolicy | None = None,
     ) -> None:
         self._background_job_registry = None if is_subagent else BackgroundJobRegistry()
         self.background_jobs = (
@@ -508,6 +515,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.agent_manager = AgentManager(
             self._config_orchestrator, harness_files=self.harness_files
         )
+        self.bound_dispatch_policy = (
+            bound_dispatch_policy
+            or (self.config_orchestrator.bound_dispatch_policy if is_subagent else None)
+            or bind_policy(self.config)
+        )
+        self.config_orchestrator.bound_dispatch_policy = self.bound_dispatch_policy
         # Configuration parsing is pure; runtime IO is explicit and must precede
         # construction of any clients, including the MCP pool.
         _ = self.config.system_prompt, self.config.compaction_prompt
@@ -551,6 +564,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             cwd=self.cwd,
             harness_files=self.harness_files,
             scratchpad_dir=self.scratchpad_dir,
+            task_description=task_description_for_config(config),
         )
         self.skill_manager = SkillManager(
             lambda: self.config, harness_files=self.harness_files
@@ -1116,8 +1130,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         config: ChartreuxConfigSchema | None = None,
         tool_manager: ToolManager | None = None,
         agent_manager: AgentManager | None = None,
+        *,
+        bound_policy: BoundDispatchPolicy | None = None,
+        scratchpad_dir: Path | None | _PrepareScratchpad = _PREPARE_SCRATCHPAD,
     ) -> str:
-        prompt_config = config or self.config
+        prompt_config = (config or self.config).model_copy()
+        prompt_config.attach_dispatch_policy(bound_policy or self.bound_dispatch_policy)
         if self.frozen_system_prompt_id is not None:
             prompt_config = prompt_config.model_copy(
                 update={"system_prompt_id": self.frozen_system_prompt_id}
@@ -1126,7 +1144,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             prompt_config,
             skill_manager,
             agent_manager or self.agent_manager,
-            scratchpad_dir=self.scratchpad_dir,
+            scratchpad_dir=(
+                self.scratchpad_dir
+                if isinstance(scratchpad_dir, _PrepareScratchpad)
+                else scratchpad_dir
+            ),
             headless=self._headless,
             cwd=self.cwd,
             harness_files=self.harness_files,
@@ -1245,6 +1267,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         reuse_backend: bool,
     ) -> _PreparedReload:
         """Build the narrow consumer set required by a retained re-task."""
+        target_config.attach_dispatch_policy(self.bound_dispatch_policy)
         config_source = _SwappableConfigSource(lambda: target_config)
         tool_manager = self.tool_manager
         if replace_tools:
@@ -1267,6 +1290,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 cwd=self.cwd,
                 harness_files=self.harness_files,
                 scratchpad_dir=self.scratchpad_dir,
+                task_description=task_description_for_config(target_config),
             )
         system_prompt = self._render_system_prompt(
             self.skill_manager, target_config, tool_manager, self.agent_manager
@@ -1376,6 +1400,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
     def install_launch_metadata(self) -> None:
         """Synchronously install accepted launch state before any lock wait."""
+        metadata = self.session_logger.session_metadata
+        if metadata is not None:
+            metadata.dispatch_policy = self.bound_dispatch_policy.model_dump(
+                mode="json"
+            )
+            metadata.dispatch_policy_notes = list(
+                self.bound_dispatch_policy.diagnostics
+            )
         if (metadata := self._launch_metadata()) is not None:
             self.session_logger.install_launch_config(metadata)
 
@@ -3717,6 +3749,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             else None
         )
         try:
+            new_policy = self.bound_dispatch_policy
+            if not keep_parent and not self._is_subagent:
+                new_policy = bind_policy(self.config)
+            new_config = self.config.model_copy().attach_dispatch_policy(new_policy)
+            new_task_description = task_description_for_config(new_config)
+            new_prompt = self._render_system_prompt(
+                self.skill_manager, new_config, bound_policy=new_policy
+            )
             owner = self.accounting_owner
             if (
                 owner is not None
@@ -3745,6 +3785,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._session_generation += 1
         self.session_id = session_id
         self.parent_session_id = parent_session_id
+        self.bound_dispatch_policy = new_policy
+        self.config_orchestrator.bound_dispatch_policy = new_policy
+        self.install_launch_metadata()
+        self.tool_manager._install_task_description(new_task_description)
+        self._publish_system_prompt(new_prompt)
         self.replace_session_lease(lease)
         self._reset_title_state()
 
@@ -3789,6 +3834,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         half-rebound; callers should treat an unexpected raise as fatal.
         """
         self.require_background_jobs_idle()
+        resumed_policy = resume_policy(
+            self.config,
+            session_metadata.dispatch_policy,
+            self.agent_manager.available_agents,
+        )
         replacement_jobs = (
             BackgroundJobRegistry(
                 generation=self._job_lifetime_generation + 1,
@@ -3826,6 +3876,15 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if self._is_subagent and scratchpad_dir is not None:
             raise ValueError("Child sessions cannot own a prepared scratchpad")
 
+        resumed_config = self.config.model_copy().attach_dispatch_policy(resumed_policy)
+        resumed_task_description = task_description_for_config(resumed_config)
+        resumed_prompt = self._render_system_prompt(
+            self.skill_manager,
+            resumed_config,
+            bound_policy=resumed_policy,
+            scratchpad_dir=scratchpad_dir,
+        )
+
         # Retain title work before reset drops its reference. Cancellation is not
         # settlement: its frozen sink may still submit after this rebind. The old
         # writer stays process-owned; retirement requires producer settlement.
@@ -3846,6 +3905,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.parent_session_id = parent_session_id
         self.scratchpad_dir = scratchpad_dir
         self.tool_manager.set_scratchpad_dir(scratchpad_dir)
+        self.bound_dispatch_policy = resumed_policy
+        self.config_orchestrator.bound_dispatch_policy = resumed_policy
+        session_metadata.dispatch_policy = resumed_policy.model_dump(mode="json")
+        session_metadata.dispatch_policy_notes = list(resumed_policy.diagnostics)
         self.session_logger.apply_resumed_session(
             session_id, session_dir, session_metadata
         )
@@ -3860,6 +3923,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             self._apply_active_model_pricing()
         self._reset_session_scoped_state()
         self._restore_todo_state(loaded_messages)
+        self.tool_manager._install_task_description(resumed_task_description)
+        self._publish_system_prompt(resumed_prompt)
         cleanup_scratchpad(previous_scratchpad)
 
     def _restore_todo_state(self, messages: Sequence[LLMMessage]) -> None:
@@ -4277,6 +4342,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             cwd=self.cwd,
             harness_files=self.harness_files,
             scratchpad_dir=self.scratchpad_dir,
+            task_description=task_description_for_config(authority().config),
         )
         manager.set_instruction_read_files(previous_manager._instruction_read_files)
         for name in manager.registered_tools:
@@ -4423,6 +4489,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         reuse_backend: bool = False,
     ) -> _PreparedReload:
         skills_adopted = self._skills_adopted
+        target_config.attach_dispatch_policy(self.bound_dispatch_policy)
         config_source = _SwappableConfigSource(lambda: target_config)
         tool_manager = ToolManager(
             config_source.get,
@@ -4443,6 +4510,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             cwd=self.cwd,
             harness_files=self.harness_files,
             scratchpad_dir=self.scratchpad_dir,
+            task_description=task_description_for_config(target_config),
         )
         skill_manager = SkillManager(
             config_source.get, harness_files=self.harness_files

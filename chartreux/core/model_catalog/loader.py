@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fcntl
 from hashlib import sha256
 import json
@@ -17,6 +17,13 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from chartreux.core.dispatch import (
+    DEFAULT_DISPATCH_MODE,
+    SHIPPED_PRESETS,
+    STANDALONE_PRESET,
+    DispatchMode,
+    DispatchPolicy,
+)
 from chartreux.core.model_catalog.contracts import (
     CatalogChanges,
     CatalogValidationError,
@@ -31,6 +38,7 @@ from chartreux.core.model_catalog.schema import (
     RoleDefinition,
     valid_provider_name,
 )
+from chartreux.observability.logging import logger
 from chartreux.utils.paths import get_chartreux_home
 
 
@@ -49,6 +57,8 @@ class CatalogSnapshot:
     catalog: ModelCatalog
     revision: str
     overlaid_providers: frozenset[str] = frozenset()
+    dispatch: DispatchPolicy = SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE]
+    dispatch_diagnostics: tuple[str, ...] = ()
 
 
 def _require_mapping(value: Any, location: str) -> dict[str, Any]:
@@ -103,8 +113,13 @@ def _merge_deployments(
 def merge_catalog_overlay(
     shipped: ModelCatalog, overlay: Mapping[str, Any]
 ) -> ModelCatalog:
-    """Apply a sparse overlay without giving ordinary config layers authority."""
-    _check_keys(overlay, {"providers", "models", "roles"}, "catalog")
+    """Apply a sparse overlay without giving ordinary config layers authority.
+
+    The optional ``dispatch`` table is accepted here but not merged: dispatch
+    resolution is owned by :func:`resolve_dispatch_overlay`, which rejects an
+    invalid table atomically instead of failing the whole catalog.
+    """
+    _check_keys(overlay, {"providers", "models", "roles", "dispatch"}, "catalog")
     result = shipped.model_dump(mode="python")
 
     if "providers" in overlay:
@@ -146,13 +161,196 @@ def merge_catalog_overlay(
     return ModelCatalog.model_validate(result)
 
 
-def _snapshot(
-    catalog: ModelCatalog, overlaid_providers: frozenset[str] = frozenset()
+_DISPATCH_TABLE_FIELDS = frozenset(DispatchPolicy.model_fields)
+_DISPATCH_ENTRY_MERGE_FIELDS = frozenset({"vocabulary", "slots"})
+
+
+def _dispatch_error_summary(exc: Exception) -> str:
+    if isinstance(exc, ValidationError):
+        parts = []
+        for error in exc.errors(
+            include_input=False, include_context=False, include_url=False
+        ):
+            location = ".".join(str(item) for item in error["loc"])
+            parts.append(f"{location}: {error['msg']}" if location else error["msg"])
+        return "; ".join(parts) or "invalid dispatch table"
+    return str(exc)
+
+
+def _selected_dispatch_preset(mode: Any) -> DispatchPolicy:
+    if isinstance(mode, DispatchMode):
+        selected = mode
+    else:
+        try:
+            selected = DispatchMode(str(mode))
+        except ValueError:
+            raise ValueError(
+                "S9 dispatch.mode must be a shipped mode name: "
+                f"{sorted(item.value for item in DispatchMode)}"
+            ) from None
+    return SHIPPED_PRESETS[selected]
+
+
+def _merge_dispatch_table(
+    base: dict[str, Any], patch: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Sparse-merge one ``[dispatch]`` table over a shipped preset dump.
+
+    Absent fields inherit the preset. Entry tables (``vocabulary``, ``slots``)
+    merge per entry; list-valued fields such as slot ``purposes`` replace
+    wholesale rather than merging within the list.
+    """
+    merged = dict(base)
+    for key, value in patch.items():
+        if key in _DISPATCH_ENTRY_MERGE_FIELDS:
+            if not isinstance(value, Mapping):
+                raise ValueError(f"dispatch.{key} must be a TOML table")
+            table = dict(merged[key])
+            for name, entry in value.items():
+                if not isinstance(entry, Mapping):
+                    raise ValueError(f"dispatch.{key}.{name} must be a TOML table")
+                current = table.get(name)
+                if not isinstance(current, Mapping):
+                    current = {}
+                table[name] = {**current, **entry}
+            merged[key] = table
+        else:
+            merged[key] = value
+    return merged
+
+
+def merge_dispatch_overlay(patch: Mapping[str, Any]) -> DispatchPolicy:
+    """Resolve a sparse ``[dispatch]`` overlay table against its shipped preset.
+
+    ``mode`` selects the shipped preset to patch (absent means the shipped
+    default); every other absent field inherits that preset.
+    """
+    if not isinstance(patch, Mapping):
+        raise ValueError("dispatch must be a TOML table")
+    unknown = set(patch) - _DISPATCH_TABLE_FIELDS
+    if unknown:
+        raise ValueError(f"dispatch has unknown fields: {sorted(unknown)!r}")
+    base = _selected_dispatch_preset(patch.get("mode", DEFAULT_DISPATCH_MODE))
+    merged = _merge_dispatch_table(base.model_dump(mode="json"), patch)
+    return DispatchPolicy.model_validate(merged)
+
+
+def resolve_dispatch_overlay(
+    overlay: Mapping[str, Any],
+    *,
+    source: str = "user catalog overlay",
+    catalog: ModelCatalog | None = None,
+) -> tuple[DispatchPolicy, tuple[str, ...]]:
+    """Resolve the effective dispatch policy carried by a raw catalog overlay.
+
+    An invalid ``[dispatch]`` table is rejected atomically: the shipped
+    standalone preset is selected with a visible diagnostic, and the invalid
+    table is never rewritten. Valid provider, model, and role entries in the
+    same file are unaffected.
+    """
+    from chartreux.core.dispatch.lint import lint_catalog, reject_errors
+
+    # Provider/model validation stays outside dispatch recovery.
+    merged_catalog = (
+        catalog
+        if catalog is not None
+        else merge_catalog_overlay(SHIPPED_CATALOG, overlay)
+    )
+    raw = overlay.get("dispatch")
+    try:
+        policy = (
+            SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE]
+            if raw is None
+            else merge_dispatch_overlay(raw)
+        )
+        reject_errors(lint_catalog(policy, merged_catalog))
+        return policy, ()
+    except (ValidationError, ValueError, TypeError) as exc:
+        return dispatch_fallback(_dispatch_error_summary(exc), source=source)
+
+
+def dispatch_fallback(
+    reason: str, *, source: str
+) -> tuple[DispatchPolicy, tuple[str, ...]]:
+    """Reject a dispatch candidate intact, without repairing catalog bindings."""
+    repair = (
+        "repair the catalog role binding named by S1 (not only [dispatch])"
+        if "S1 " in reason
+        else "repair [dispatch] or the rejected profile named below"
+    )
+    diagnostic = (
+        f"S10 Invalid dispatch policy in {source}: using the shipped standalone "
+        "preset. The candidate dispatch config was bypassed and is left unchanged; "
+        f"{repair} in the user catalog overlay. {reason}"
+    )
+    return STANDALONE_PRESET, (diagnostic,)
+
+
+def fallback_dispatch_snapshot(
+    snapshot: CatalogSnapshot, reason: str
 ) -> CatalogSnapshot:
-    encoded = json.dumps(
-        catalog.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
-    ).encode()
-    return CatalogSnapshot(catalog, sha256(encoded).hexdigest(), overlaid_providers)
+    """Apply activation recovery while retaining all validated catalog entries."""
+    policy, diagnostics = dispatch_fallback(reason, source="registry activation")
+    # Activation does not reload or edit the source catalog. Preserve its revision
+    # so committed model/deployment identities and child isolation stay stable.
+    return replace(
+        snapshot,
+        dispatch=policy,
+        dispatch_diagnostics=(*snapshot.dispatch_diagnostics, *diagnostics),
+    )
+
+
+def _snapshot(
+    catalog: ModelCatalog,
+    overlaid_providers: frozenset[str] = frozenset(),
+    dispatch: DispatchPolicy | None = None,
+    dispatch_diagnostics: tuple[str, ...] = (),
+) -> CatalogSnapshot:
+    policy = (
+        dispatch if dispatch is not None else SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE]
+    )
+    payload = {
+        "catalog": catalog.model_dump(mode="json"),
+        "dispatch": policy.model_dump(mode="json"),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return CatalogSnapshot(
+        catalog,
+        sha256(encoded).hexdigest(),
+        overlaid_providers,
+        policy,
+        dispatch_diagnostics,
+    )
+
+
+def _snapshot_for_overlay(
+    overlay: Mapping[str, Any], *, source: str
+) -> CatalogSnapshot:
+    """Validate one raw overlay end to end: catalog fatally, dispatch with fallback."""
+    catalog = merge_catalog_overlay(SHIPPED_CATALOG, overlay)
+    dispatch, diagnostics = resolve_dispatch_overlay(
+        overlay, source=source, catalog=catalog
+    )
+    snapshot = _snapshot(
+        catalog,
+        frozenset(valid_provider_name(name) for name in overlay.get("providers", {})),
+        dispatch,
+        diagnostics,
+    )
+    if diagnostics:
+        # Recovery changes the served policy, not the source identity. Include the
+        # rejected candidate so distinct invalid tables cannot evade stale saves.
+        candidate = overlay.get(
+            "dispatch", SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE].model_dump(mode="json")
+        )
+        encoded = json.dumps(
+            {"catalog": catalog.model_dump(mode="json"), "dispatch": candidate},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode()
+        snapshot = replace(snapshot, revision=sha256(encoded).hexdigest())
+    return snapshot
 
 
 def load_catalog(path: Path | None = None) -> CatalogSnapshot:
@@ -167,14 +365,12 @@ def load_catalog(path: Path | None = None) -> CatalogSnapshot:
         raise CatalogLoadError(catalog_path, str(exc)) from exc
 
     try:
-        return _snapshot(
-            merge_catalog_overlay(SHIPPED_CATALOG, overlay),
-            frozenset(
-                valid_provider_name(name) for name in overlay.get("providers", {})
-            ),
-        )
+        snapshot = _snapshot_for_overlay(overlay, source=str(catalog_path))
     except (ValidationError, ValueError) as exc:
         raise CatalogLoadError(catalog_path, str(exc)) from exc
+    for diagnostic in snapshot.dispatch_diagnostics:
+        logger.warning("%s", diagnostic)
+    return snapshot
 
 
 class CatalogStore:
@@ -220,26 +416,34 @@ class CatalogStore:
         Model deployment patches are additions or edits keyed by provider.  Because
         the overlay loader treats deployment arrays as replacements, a changed array
         is rebuilt from the effective order while retaining every raw overlay entry.
+        A supplied dispatch table atomically replaces only the overlay's ``[dispatch]``
+        section and is validated before anything is written; an invalid batch leaves
+        the file unchanged, including an invalid pre-existing dispatch table.
         """
         with self._write_lock, self._file_lock():
             overlay = self._read_overlay()
             try:
-                current = merge_catalog_overlay(SHIPPED_CATALOG, overlay)
+                current = _snapshot_for_overlay(overlay, source=str(self.path))
                 if (
                     changes.expected_revision is not None
-                    and _snapshot(current).revision != changes.expected_revision
+                    and current.revision != changes.expected_revision
                 ):
                     return CatalogValidationError(
                         "Catalog changed since this draft was opened; reload before saving."
                     )
-                candidate = _apply_catalog_changes(overlay, current, changes)
-                snapshot = _snapshot(
-                    merge_catalog_overlay(SHIPPED_CATALOG, candidate),
-                    frozenset(
-                        valid_provider_name(name)
-                        for name in candidate.get("providers", {})
-                    ),
-                )
+                if changes.dispatch is not None:
+                    # Validate the replacement dispatch table before touching disk.
+                    merge_dispatch_overlay(changes.dispatch)
+                candidate = _apply_catalog_changes(overlay, current.catalog, changes)
+                snapshot = _snapshot_for_overlay(candidate, source=str(self.path))
+                if changes.dispatch is not None:
+                    from chartreux.core.dispatch.lint import lint_catalog, reject_errors
+
+                    reject_errors(
+                        lint_catalog(
+                            merge_dispatch_overlay(changes.dispatch), snapshot.catalog
+                        )
+                    )
             except (ValidationError, ValueError, TypeError) as exc:
                 return CatalogValidationError(str(exc))
 
@@ -333,6 +537,13 @@ def _apply_catalog_changes(
             if not isinstance(raw_patch, Mapping):
                 raise ValueError(f"roles.{role_name} must be a TOML table")
             _patch_table(roles, role_name, raw_patch, "roles")
+
+    if changes.dispatch is not None:
+        # The supplied table atomically replaces only the dispatch section;
+        # every other section of the overlay is preserved verbatim.
+        if not isinstance(changes.dispatch, Mapping):
+            raise ValueError("dispatch must be a TOML table")
+        candidate["dispatch"] = _copy_catalog_value(dict(changes.dispatch))
 
     for name in ("providers", "models"):
         if not candidate.get(name) and name not in overlay:

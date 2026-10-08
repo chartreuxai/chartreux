@@ -15,23 +15,10 @@ transfer/protocol error; untrusted exception text is not shown.
 
 In standalone Settings, the provider list shows Mistral once. The saved `auto`
 value remains a supported Mistral alias for existing configuration, not a
-second provider choice. First-run setup preserves any already-ready search
-configuration and skips that editor. If it must open the editor, its choices
-are Exa, Brave, and DuckDuckGo; it does not offer `auto` or Mistral as fallback
-choices. Readiness comes from resolved settings and credential lookup, including
-a custom configured credential-variable name, rather than catalog presence.
+second provider choice. First-run setup finishes after default presets and does
+not read or rewrite web-search configuration.
 
 Use Settings > Web search or `/web-search` to edit these values. `Save search settings` saves the settings draft; `Save API key` is a separate credential action, so a saved key remains saved if you later discard the settings draft. The key action reports whether the key was saved or is available only for the current session. Switching providers resets custom credential-variable and endpoint overrides to the new provider defaults and clears an unsaved key. The `Configured; connection not verified` readiness label means the selected configuration and any required key are available; Chartreux does not test live connectivity or switch providers automatically. See the [Configuration guide](configuration.md) and [command reference](../reference/commands.md).
-
-After default presets, first-run onboarding preserves ready automatic Mistral
-search or an already-ready explicit provider and skips the editor. If neither
-is ready, the editor offers Exa, Brave, and DuckDuckGo only. **Skip for now**
-keeps the existing web-search settings and tool enablement unchanged; unsaved
-edits must be discarded before leaving, and a key already saved with **Save API
-key** remains saved. The **Finish setup** and **Save and finish** actions
-require valid search settings and any required credential; **Skip for now**
-can complete setup without them. Readiness does not include a live provider
-request.
 
 Search-settings feedback reports persistence and runtime application separately. If settings were saved but not applied, use **Retry runtime reload**; if runtime applied but the screen did not refresh, use **Retry UI refresh**. These retries apply already saved settings without repeating the write. If a revision conflict occurs or the saved state could not be read, refresh before editing again; **Refresh (discard draft)** discards unsaved search settings. The editor also identifies fields controlled by a higher-priority configuration layer.
 
@@ -81,6 +68,8 @@ Trust can apply to the current folder, the repository root when offered, or the 
 ## Shell safety
 
 `bash` runs a finite command in a fresh POSIX shell. Standard input is closed, a timeout is enforced, and stdout and stderr are returned separately. Shell state, process handles, continued stdin, polling, and cursor-based output do not persist between calls. Configure its `permission`, `max_output_bytes`, `default_timeout`, `denylist`, `denylist_standalone`, and `sensitive_patterns` under `[tools.bash]`; runtime path and sensitive-file protections still apply.
+
+The default `denylist` denies `git push`, `git checkout`, `git stash drop`, `git stash clear`, `git restore`, `git switch --discard-changes`, `git switch -f`, `git reflog expire`, and `git reflog delete`. These entries are user-removable: clear or replace `denylist` under `[tools.bash]` to let the agent run them. Hard guards are separate and non-overridable: `git reset --hard` and forced non-dry-run `git clean` stay denied regardless of `denylist` or `permission` settings, and `git -c ...`/`--config-env` spellings are denied by the policy layer even with the denylist cleared. The denylist covers direct command spellings and modeled wrappers (for example `git -C . push`); it does not cover arbitrary unmodeled executors such as make targets, scripts, or inline interpreter code.
 
 ## Managed shell jobs
 
@@ -144,7 +133,13 @@ seconds for SIGTERM before SIGKILL; stopping does not undo file or remote effect
 A late stop preserves natural completion.
 
 `bash_start` uses the canonical `[tools.bash]` permission, denylist, sensitive-path,
-workspace, and inherited-parent restrictions. There is no separate
+workspace, and inherited-parent restrictions. The default denylist applies at
+launch as well: `git push`, `git checkout`, `git stash drop`, `git stash clear`,
+`git restore`, `git switch --discard-changes`, `git switch -f`,
+`git reflog expire`, and `git reflog delete` are denied by default, and a
+denied launch creates no active job. Those entries are user-removable under
+`[tools.bash]`; the hard guards
+(`git reset --hard`, forced non-dry-run `git clean`) are not. There is no separate
 `[tools.bash_start]` permission key and no interactive launch approval. Ordinary
 tool filtering still controls availability; read, stop, and list have their own
 ordinary tool permissions and ownership checks. Disabling launch does not itself

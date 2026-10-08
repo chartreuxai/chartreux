@@ -502,6 +502,18 @@ class SessionLogger:  # noqa: PLR0904
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _install_dispatch_policy(
+        metadata: SessionMetadata, config: ChartreuxConfigSchema
+    ) -> None:
+        if config.bound_dispatch_policy is not None:
+            metadata.dispatch_policy = config.bound_dispatch_policy.model_dump(
+                mode="json"
+            )
+            metadata.dispatch_policy_notes = list(
+                config.bound_dispatch_policy.diagnostics
+            )
+
     # Keep cancellation draining and error handling in one lock scope.
     async def save_interaction(  # noqa: PLR0915 - one serialized commit boundary
         self,
@@ -538,6 +550,7 @@ class SessionLogger:  # noqa: PLR0904
                 logger.debug("Discarding stale interaction save for %s", session_dir)
                 return
             session_metadata.config = config_snapshot
+            self._install_dispatch_policy(session_metadata, config)
             launch_config_generation = self._launch_config_generation
             metadata_snapshot = session_metadata.model_copy(deep=True)
             cursor_snapshot = self._transcript_cursor

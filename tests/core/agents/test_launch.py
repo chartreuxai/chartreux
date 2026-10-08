@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -514,3 +515,58 @@ def test_missing_profile_is_typed(config: ChartreuxConfigSchema) -> None:
             tool_inventory={},
             profile_lookup=lambda _: (_ for _ in ()).throw(ValueError()),
         )
+
+
+def test_bound_role_launch_ignores_later_catalog_edits(config, profile):
+    from chartreux.core.dispatch.presets import ORCHESTRATED_PRESET
+    from chartreux.core.dispatch.session import bind_policy
+
+    _with_role(config, "bound", ("small",), "off")
+    slot = ORCHESTRATED_PRESET.slots["implementor"].model_copy(
+        update={"role": "@bound"}
+    )
+    snapshot = config.catalog_snapshot
+    config.attach_catalog_snapshot(
+        replace(
+            snapshot,
+            dispatch=ORCHESTRATED_PRESET.model_copy(
+                update={"slots": {"implementor": slot}}
+            ),
+        )
+    )
+    parent = FakeConfigOrchestrator(config)
+    bound = bind_policy(config)
+    parent.bound_dispatch_policy = bound
+    _with_role(config, "bound", ("large",), "high")
+    child = resolve(
+        config, profile, LaunchConfig(model="@bound"), parent_orchestrator=parent
+    )
+    assert child.committed_model.base_model == "small"
+    assert child.effective_thinking == "off"
+    assert child.orchestrator.bound_dispatch_policy == bound
+    override = resolve(
+        config,
+        profile,
+        LaunchConfig(model="@bound", thinking="high"),
+        parent_orchestrator=parent,
+    )
+    assert override.committed_model.base_model == "small"
+    assert override.effective_thinking == "high"
+    retained = resolve(
+        config,
+        profile,
+        retained_profile=profile,
+        committed_model=child.committed_model,
+        parent_orchestrator=child.orchestrator,
+    )
+    assert retained.committed_model == child.committed_model
+    changed_profile = AgentProfile(**{**profile.__dict__, "role": "bound"})
+    restored = resolve(
+        config,
+        changed_profile,
+        parent_orchestrator=parent,
+        frozen_persona=child.persona,
+        committed_model=child.committed_model,
+    )
+    assert restored.committed_model == child.committed_model
+    assert restored.orchestrator.config.get_active_model().thinking == "off"

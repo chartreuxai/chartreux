@@ -15,6 +15,10 @@ from chartreux.core.config.harness_files import (
     HarnessFilesManager,
     get_harness_files_manager,
 )
+from chartreux.core.dispatch.renderer import (
+    contains_dispatch_placeholder,
+    render_task_description_for_config,
+)
 from chartreux.core.llm_models import AvailableFunction
 from chartreux.core.paths import DEFAULT_TOOL_DIR
 from chartreux.core.tools.base import BaseTool, BaseToolConfig, ToolPermission
@@ -103,6 +107,7 @@ class ToolManager:
         parent_authority_getter: Callable[[], ToolManager] | None = None,
         parent_authority_revision_getter: Callable[[], int] | None = None,
         accepted_token_getter: Callable[[], object] | None = None,
+        task_description: str | None = None,
     ) -> None:
         self._config_getter = config_getter
         self._cwd = (cwd or Path.cwd()).resolve()
@@ -171,8 +176,37 @@ class ToolManager:
             self._tool_descriptions: dict[str, str] = dict(
                 self._iter_tool_descriptions(self._search_paths)
             )
+        discovered_task = self._tool_descriptions.get("task")
+        self._custom_task_description = (
+            discovery_source._custom_task_description
+            if discovery_source is not None
+            else discovered_task is not None
+            and not contains_dispatch_placeholder(discovered_task)
+        )
+        self._install_task_description(task_description)
         if not defer_mcp:
             self.integrate_all()
+
+    def _install_task_description(self, task_description: str | None) -> None:
+        """Install the policy-bound `task` tool description.
+
+        The shipped ``prompts/task.md`` is a skeleton carrying the dispatch
+        placeholders; the rendered description replaces it, bypassing the
+        process-global ``Task.get_tool_prompt`` cache. A custom
+        ``prompts/task.md`` without placeholders is user-owned and always wins.
+        The per-instance spec cache already keys on the description, so a
+        different policy re-keys it.
+        """
+        if self._custom_task_description:
+            return
+        if task_description is None:
+            skeleton = self._tool_descriptions.get("task")
+            if skeleton is None or not contains_dispatch_placeholder(skeleton):
+                return
+            task_description = render_task_description_for_config(
+                self._config_getter(), skeleton
+            )
+        self._tool_descriptions["task"] = task_description
 
     def set_mcp_registry(self, mcp_registry: MCPRegistry | None) -> None:
         self._mcp_registry = mcp_registry

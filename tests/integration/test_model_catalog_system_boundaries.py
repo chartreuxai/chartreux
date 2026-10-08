@@ -32,6 +32,7 @@ from chartreux.core.model_catalog.loader import CatalogSnapshot, load_catalog
 from chartreux.core.model_catalog.migration import apply_migration, plan_migration
 from chartreux.core.model_catalog.resolver import ModelResolutionError, ModelResolver
 from chartreux.core.model_catalog.schema import ModelCatalog, RoleDefinition
+from chartreux.core.session.session_loader import SessionLoader
 from chartreux.core.session_types import CommittedModelIdentity
 from chartreux.core.subagents import LaunchConfig, TaskArgs, TaskResult
 from chartreux.core.tools.base import InvokeContext
@@ -168,8 +169,10 @@ async def test_role_bound_child_uses_its_role_instead_of_parent_committed_model(
 
 
 @pytest.mark.asyncio
-async def test_resumed_role_bound_child_reresolves_its_role(tmp_path: Path) -> None:
-    """Cross-restart resume follows the current role instead of its saved identity."""
+async def test_snapshotted_child_keeps_binding_and_new_session_resolves_current_role(
+    tmp_path: Path,
+) -> None:
+    """Saved policy freezes a resumed child; catalog edits apply next session."""
     snapshot = _snapshot("A")
     logging = SessionLoggingConfig(enabled=True, save_dir=str(tmp_path / "sessions"))
     config = ChartreuxConfigSchema.model_validate(
@@ -194,7 +197,13 @@ async def test_resumed_role_bound_child_reresolves_its_role(tmp_path: Path) -> N
         child_id = child.session_id
         child_dir = child.session_logger.session_dir
         assert child_dir is not None
+        saved_policy = child.bound_dispatch_policy
+        saved_identity = child.committed_model
+        assert saved_identity is not None
+        assert saved_identity.base_model == "first"
         await child.aclose()
+        metadata = SessionLoader.load_metadata(child_dir)
+        assert metadata.dispatch_policy == saved_policy.model_dump(mode="json")
 
         updated_catalog = snapshot.catalog.model_copy(
             update={
@@ -207,16 +216,54 @@ async def test_resumed_role_bound_child_reresolves_its_role(tmp_path: Path) -> N
                 }
             }
         )
-        parent.config.attach_catalog_snapshot(CatalogSnapshot(updated_catalog, "B"))
+        updated_snapshot = CatalogSnapshot(updated_catalog, "B")
+        parent.config.attach_catalog_snapshot(updated_snapshot)
         resumed = await AgentRuntimeFactory().resume_child(
             parent, "worker", child_id, child_dir
         )
         try:
             assert resumed.config.active_model == "@ordered"
             assert resumed.committed_model is not None
-            assert resumed.committed_model.base_model == "later"
+            # Revalidate the same deployment against B without rebinding @ordered.
+            assert resumed.committed_model == saved_identity.model_copy(
+                update={"catalog_revision": "B"}
+            )
+            assert resumed.bound_dispatch_policy == saved_policy
+            assert not any(
+                "Legacy session" in note
+                for note in resumed.bound_dispatch_policy.diagnostics
+            )
         finally:
             await resumed.aclose()
+
+        fresh_config = ChartreuxConfigSchema.model_validate(
+            {"active_model": "@ordered", "session_logging": logging.model_dump()},
+            context={"catalog_snapshot": updated_snapshot},
+        ).attach_catalog_snapshot(updated_snapshot)
+        fresh_parent = build_test_agent_loop(config=fresh_config, backend=FakeBackend())
+        fresh_parent.agent_manager._discovered["worker"] = profile
+        try:
+            await fresh_parent.persist_empty_session()
+            fresh_candidate = resolve_launch(
+                profile_name="worker",
+                config=None,
+                parent_orchestrator=fresh_parent.config_orchestrator,
+                tool_inventory={},
+                profile_lookup=lambda _name: profile,
+            )
+            fresh_child = await AgentRuntimeFactory().create_child(
+                fresh_parent, fresh_candidate
+            )
+            try:
+                await fresh_child.wait_until_ready()
+                assert fresh_child.config.active_model == "@ordered"
+                assert fresh_child.committed_model is not None
+                assert fresh_child.committed_model.base_model == "later"
+                assert fresh_child.committed_model.catalog_revision == "B"
+            finally:
+                await fresh_child.aclose()
+        finally:
+            await fresh_parent.aclose()
     finally:
         await parent.aclose()
 

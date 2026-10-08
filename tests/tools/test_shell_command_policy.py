@@ -10,6 +10,7 @@ from chartreux.core.tools.builtins._shell_command_policy import (
     EXECUTOR_REGISTRY,
     _package_module_tokens,
     analyze_shell_command_policy,
+    canonical_git_command,
     executor_boundary,
     git_repository_config_risk,
     inline_interpreter_switch,
@@ -1025,6 +1026,41 @@ def shell_resolver(bash_tool: Bash):
     )
 
 
+@pytest.fixture
+def git_denylist_tool(tmp_path, monkeypatch) -> Bash:
+    # Explicit git entries only: the shipped defaults are extended elsewhere and
+    # must not be pinned by these tests.
+    monkeypatch.chdir(tmp_path)
+    config = BashToolConfig(
+        denylist=[
+            "git push",
+            "git checkout",
+            "git stash drop",
+            "git stash clear",
+            "git restore",
+            "git switch --discard-changes",
+            "git switch -f",
+            "git reflog expire",
+            "git reflog delete",
+        ]
+    )
+    return Bash(config_getter=lambda: config, state=BaseToolState())
+
+
+@pytest.fixture
+def git_denylist_resolver(git_denylist_tool: Bash):
+    from chartreux.core.tools.builtins._shell_permission_resolver import (
+        ShellPermissionResolver,
+    )
+
+    return ShellPermissionResolver(
+        git_denylist_tool.config,
+        git_denylist_tool.cwd,
+        git_denylist_tool.workspace,
+        git_denylist_tool.path_authority,
+    )
+
+
 def test_with_args_denylist_denies_matching_prefix(shell_resolver) -> None:
     assert shell_resolver._find_denylist_match("bash -i") == "bash -i"
     assert shell_resolver._find_denylist_match("bash -i -x") == "bash -i"
@@ -1085,6 +1121,187 @@ def test_guardrail_denies_standalone_denylist_match(shell_resolver) -> None:
 def test_guardrail_allows_non_denylisted_commands(shell_resolver) -> None:
     assert shell_resolver._resolve_guardrail_permission(["echo hi"]) is None
     assert shell_resolver._resolve_guardrail_permission(["python script.py"]) is None
+
+
+@pytest.mark.parametrize(
+    "tokens, expected",
+    [
+        (["git", "push"], ["git", "push"]),
+        (["git", "-C", ".", "push"], ["git", "push"]),
+        (["git", "-Csubdir", "push"], ["git", "push"]),
+        (["git", "-C.", "push"], ["git", "push"]),
+        (["git", "--no-pager", "push"], ["git", "push"]),
+        (["git", "-C", ".", "--no-pager", "-C", "sub", "push"], ["git", "push"]),
+        (["git", "--git-dir", ".", "push"], ["git", "push"]),
+        (["git", "--git-dir=.", "push"], ["git", "push"]),
+        # The full subcommand suffix is retained, never truncated.
+        (["git", "-C", ".", "stash", "drop"], ["git", "stash", "drop"]),
+        (["git", "-C", ".", "stash", "clear"], ["git", "stash", "clear"]),
+        (["git", "-C", ".", "checkout", "file"], ["git", "checkout", "file"]),
+        (["git", "-C", ".", "restore", "file"], ["git", "restore", "file"]),
+        (["/usr/bin/git", "-C", ".", "push"], ["/usr/bin/git", "push"]),
+        # The walker stops at the subcommand: later tokens are never stripped.
+        (["git", "push", "--no-pager"], ["git", "push", "--no-pager"]),
+        (["git", "status", "--", "push"], ["git", "status", "--", "push"]),
+        (["git", "stash", "list"], ["git", "stash", "list"]),
+        # A global option's operand is consumed even when it names a subcommand.
+        (["git", "-C", "push", "status"], ["git", "status"]),
+    ],
+)
+def test_canonical_git_command_elides_recognized_global_options(
+    tokens: list[str], expected: list[str]
+) -> None:
+    assert canonical_git_command(tokens) == expected
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        ["git", "--unknown", "push"],
+        ["git", "-c", "alias.pwn=!touch pwn", "push"],
+        ["git", "--config-env", "foo=bar", "push"],
+        ["git", "--config-env=foo=bar", "push"],
+        ["ls", "-la"],
+        ["gitx", "-C", ".", "push"],
+        [],
+    ],
+)
+def test_canonical_git_command_fails_closed_on_unrecognized_globals(
+    tokens: list[str],
+) -> None:
+    assert canonical_git_command(tokens) is None
+
+
+@pytest.mark.parametrize(
+    "command, pattern",
+    [
+        ("git -C . push", "git push"),
+        ("git -Csubdir push", "git push"),
+        ("git --no-pager push", "git push"),
+        ("git -C . --no-pager -C sub push", "git push"),
+        ("git --git-dir . push", "git push"),
+        ("git --git-dir=. push", "git push"),
+        ("git -C . checkout file", "git checkout"),
+        ("git -C . restore file", "git restore"),
+        ("git -C . stash drop", "git stash drop"),
+        ("git -C . stash clear", "git stash clear"),
+        ("git -C . switch --discard-changes", "git switch --discard-changes"),
+        ("git -C . switch -f main", "git switch -f"),
+        ("git -C . reflog expire --all", "git reflog expire"),
+        ("git -C . reflog delete main", "git reflog delete"),
+        ("/usr/bin/git -C . push", "git push"),
+    ],
+)
+def test_denylist_matches_canonical_git_form(
+    git_denylist_resolver, command: str, pattern: str
+) -> None:
+    assert git_denylist_resolver._find_denylist_match(command) == pattern
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Unrecognized globals get no normalization; the policy layer denies them.
+        "git --unknown push",
+        "git -c alias.pwn=!touch pwn push",
+        "git --config-env foo=bar push",
+        # A global option's operand is consumed, even when it names a subcommand.
+        "git -C push status",
+        # Tokens after the subcommand are never stripped.
+        "git status -- push",
+        "git stash -- drop",
+        # A shorter subcommand suffix never matches a longer pattern.
+        "git stash list",
+        "git stash",
+        # Only the destructive switch/reflog forms match; plain forms do not.
+        "git switch main",
+        "git switch -c feature",
+        "git stash pop",
+        "git reflog",
+        "git reflog show",
+    ],
+)
+def test_denylist_canonical_git_form_rejects_non_matching_commands(
+    git_denylist_resolver, command: str
+) -> None:
+    assert git_denylist_resolver._find_denylist_match(command) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git --unknown push",
+        "git -c alias.pwn=!touch pwn push",
+        "git --config-env foo=bar push",
+    ],
+)
+def test_unparsable_git_globals_stay_denied_by_policy_layer(
+    git_denylist_resolver, command: str
+) -> None:
+    # No denylist normalization applies, and the policy layer hard-denies the
+    # spelling, so the command never runs.
+    assert git_denylist_resolver._find_denylist_match(command) is None
+    assert analyze_shell_command_policy(shlex.split(command)).requires_approval
+
+
+def test_guardrail_denies_command_builtin_wrapped_git_global_form(
+    git_denylist_resolver,
+) -> None:
+    # The "command" builtin is unwrapped before the denylist lookup, so the
+    # canonical git form applies to the wrapped command too.
+    context = git_denylist_resolver._resolve_guardrail_permission([
+        "command git -C . push"
+    ])
+
+    assert context is not None
+    assert context.permission is ToolPermission.NEVER
+    assert "matches denylist pattern 'git push'" in context.reason
+
+
+def test_bash_tool_denies_git_global_form_via_denylist(git_denylist_tool) -> None:
+    result = git_denylist_tool.resolve_permission(BashArgs(command="git -C . push"))
+
+    assert result is not None
+    assert result.permission == ToolPermission.NEVER
+    assert "matches denylist pattern 'git push'" in (result.reason or "")
+
+
+def test_option_specific_denylist_pattern_retains_raw_matching(
+    tmp_path, monkeypatch
+) -> None:
+    # Only the command side is canonicalized: a pattern that carries options
+    # still matches its raw spelling and nothing else.
+    from chartreux.core.tools.builtins._shell_permission_resolver import (
+        ShellPermissionResolver,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    config = BashToolConfig(denylist=["git -C . push"])
+    bash_tool = Bash(config_getter=lambda: config, state=BaseToolState())
+    resolver = ShellPermissionResolver(
+        bash_tool.config, bash_tool.cwd, bash_tool.workspace, bash_tool.path_authority
+    )
+
+    assert resolver._find_denylist_match("git -C . push") == "git -C . push"
+    assert resolver._find_denylist_match("git -C sub push") is None
+    assert resolver._find_denylist_match("git --no-pager -C . push") is None
+
+
+def test_sensitive_patterns_stay_raw_prefix_only(tmp_path, monkeypatch) -> None:
+    # Normalization applies only to the configurable denylist lookup.
+    from chartreux.core.tools.builtins._shell_permission_resolver import (
+        ShellPermissionResolver,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    config = BashToolConfig(sensitive_patterns=["git push"])
+    bash_tool = Bash(config_getter=lambda: config, state=BaseToolState())
+    resolver = ShellPermissionResolver(
+        bash_tool.config, bash_tool.cwd, bash_tool.workspace, bash_tool.path_authority
+    )
+
+    assert resolver._is_sensitive("git push")
+    assert not resolver._is_sensitive("git -C . push")
 
 
 def test_rm_plain_file_needs_no_approval() -> None:

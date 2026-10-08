@@ -418,7 +418,7 @@ class ModelConfig(BaseModel):
     provider: str
     alias: str
     display_name: str | None = None
-    temperature: float = 0.2
+    temperature: float = 1.0
     input_price: float = 0.0  # Price per million input tokens
     output_price: float = 0.0  # Price per million output tokens
     cached_input_price: float | None = (

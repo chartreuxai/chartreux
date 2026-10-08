@@ -91,7 +91,7 @@ class ResolvedModel:
             temperature=(
                 self.definition.temperature
                 if self.definition.temperature is not None
-                else 0.2
+                else 1.0
             ),
             input_price=prices.input if prices.input is not None else 0.0,
             output_price=prices.output if prices.output is not None else 0.0,

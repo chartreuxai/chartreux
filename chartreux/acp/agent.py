@@ -468,7 +468,12 @@ class ChartreuxAcpAgent(AcpAgent):
         return NewSessionResponse(
             session_id=session.id,
             config_options=self._config_options(session),
-            field_meta=await self._trust_meta(session, cwd),
+            field_meta={
+                **await self._trust_meta(session, cwd),
+                "validation_warnings": list(
+                    session.app_server.resources.config.current.validation_warnings
+                ),
+            },
         )
 
     @override
@@ -495,7 +500,12 @@ class ChartreuxAcpAgent(AcpAgent):
         self._send_usage_update(session)
         return LoadSessionResponse(
             config_options=self._config_options(session),
-            field_meta=await self._trust_meta(session, cwd),
+            field_meta={
+                **await self._trust_meta(session, cwd),
+                "validation_warnings": list(
+                    session.app_server.resources.config.current.validation_warnings
+                ),
+            },
         )
 
     async def _create_session(

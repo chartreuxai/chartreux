@@ -67,6 +67,45 @@ class TestBuiltinSkills:
         )
         assert "cannot yet be reused" in prompt
 
+    def test_bash_prompt_documents_runtime_denial_not_lifted_by_approval(self) -> None:
+        prompt = (
+            Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/bash.md"
+        ).read_text()
+
+        assert "not lifted by conversational approval" in prompt
+        assert "user-removable" in prompt
+        assert "git reset --hard" in prompt
+        assert "--config-env" in prompt
+
+    def test_git_workflow_skill_recommends_switch_and_handoff_only_push(self) -> None:
+        skill = (
+            Path(__file__).parents[2] / "chartreux/skills/main-git-workflow/SKILL.md"
+        ).read_text()
+
+        assert "`git switch -c <branch-name>`" in skill
+        assert "`git switch <branch>`" in skill
+        assert "git checkout -b" not in skill
+        assert "switching branches is fine" not in skill
+        assert "runtime-denied by default" in skill
+        assert "`git stash apply" in skill
+
+    def test_design_and_plan_skills_gate_on_explicit_acceptance(self) -> None:
+        root = Path(__file__).parents[2]
+        design = (root / "chartreux/skills/main-design/SKILL.md").read_text()
+        plan = (root / "chartreux/skills/main-plan/SKILL.md").read_text()
+
+        assert (
+            "Obtain the user's explicit design acceptance before proceeding; "
+            "continued discussion, questions, or silence are not acceptance."
+        ) in design
+        assert (
+            "Obtain the user's explicit plan acceptance before proceeding to "
+            "implementation; continued discussion, questions, or silence are not "
+            "acceptance."
+        ) in plan
+        for skill in (design, plan):
+            assert "wait for the user to react" not in skill.lower()
+
     def test_chartreux_skill_is_standalone_reference(self) -> None:
         prompt = BUILTIN_SKILLS["chartreux"].prompt
         assert "standalone reference for the running Chartreux version" in prompt

@@ -408,8 +408,19 @@ async def test_loop_invocation_hooks_persistence_and_generic_projection(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("policy", [{"permission": "never"}, {"denylist": ["sleep"]}])
-async def test_loop_policy_denial_does_not_launch(tmp_path, policy):
+@pytest.mark.parametrize(
+    ("policy", "command"),
+    [
+        ({"permission": "never"}, "sleep 30"),
+        ({"denylist": ["sleep"]}, "sleep 30"),
+        # The shipped default denylist denies these without any override.
+        ({}, "git push"),
+        ({}, "git -C . push"),
+        ({}, "git switch --discard-changes"),
+        ({}, "git reflog expire --all"),
+    ],
+)
+async def test_loop_policy_denial_does_not_launch(tmp_path, policy, command):
     loop = build_test_agent_loop(
         cwd=tmp_path, config=build_test_vibe_config(tools={"bash": policy})
     )
@@ -417,7 +428,7 @@ async def test_loop_policy_denial_does_not_launch(tmp_path, policy):
         call = ResolvedToolCall(
             tool_name="bash_start",
             tool_class=BashStart,
-            validated_args=BashStartArgs(command="sleep 30"),
+            validated_args=BashStartArgs(command=command),
             call_id="denied-start",
         )
         events = [event async for event in loop._process_one_tool_call(call)]

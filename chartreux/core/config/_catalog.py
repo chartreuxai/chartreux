@@ -10,6 +10,11 @@ from chartreux.core.config.layer import ConfigLayer, RawConfig
 from chartreux.core.config.schema import ConfigSchema
 
 CATALOG_DEFINITION_FIELDS = frozenset({"models", "providers"})
+DISPATCH_AUTHORITY_FIELDS = frozenset({"dispatch"})
+DISPATCH_AUTHORITY_MESSAGE = (
+    "Dispatch policy tables are only supported in the user models.toml catalog "
+    "overlay; remove [dispatch] from this source."
+)
 
 
 def layer_allows_catalog_definitions(layer: ConfigLayer[RawConfig]) -> bool:
@@ -29,7 +34,9 @@ def validate_catalog_scope(
         schema, ChartreuxConfigSchema
     ) or layer_allows_catalog_definitions(layer):
         return
-    forbidden = CATALOG_DEFINITION_FIELDS.intersection(fields)
+    # Materialize once: callers may pass single-use iterables of field names.
+    present = set(fields)
+    forbidden = CATALOG_DEFINITION_FIELDS.intersection(present)
     if forbidden:
         raise ValidationError.from_exception_data(
             schema.__name__,
@@ -43,6 +50,21 @@ def validate_catalog_scope(
                     "input": None,
                 }
                 for field in sorted(forbidden)
+            ],
+            hide_input=True,
+        ) from None
+    if dispatch_fields := DISPATCH_AUTHORITY_FIELDS.intersection(present):
+        raise ValidationError.from_exception_data(
+            schema.__name__,
+            [
+                {
+                    "type": PydanticCustomError(
+                        "dispatch_authority", DISPATCH_AUTHORITY_MESSAGE
+                    ),
+                    "loc": (source, field),
+                    "input": None,
+                }
+                for field in sorted(dispatch_fields)
             ],
             hide_input=True,
         ) from None

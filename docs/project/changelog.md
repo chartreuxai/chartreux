@@ -2,6 +2,46 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.5.0 (2026-10-07)
+
+### Added
+
+- Rendered, session-bound dispatch policies with named launch slots, task purposes,
+  configurable model-roster rendering, and linted dispatch overlays. `standalone`
+  is the default, with direct implementation and delegated verification and review;
+  `orchestrated` remains selectable. A dismissible graduation nudge helps
+  multi-model users consider the transition.
+- Compaction handoffs preserve dispatch policy identity, contributor authorship,
+  consumed attempt budgets, and recovery routes.
+- The default `bash` denylist blocks destructive Git forms including `git push`,
+  `git checkout`, `git stash drop`, `git stash clear`, `git restore`, forced
+  `git switch`, and `git reflog` deletion or expiration. Denylist entries are
+  user-removable through `[tools.bash]`; hard guards remain non-overridable.
+  Git global-option spellings are normalized, and `bash_start` applies the same
+  policy without creating a job when launch is denied.
+
+### Changed
+
+- Subagent dispatch is routed by task rather than difficulty. `@small` handles
+  search, exploration, verification, and mechanical edits; `@medium` handles
+  substantive implementation; `@large` handles architecture, design, planning,
+  and deep review. Single-model rosters use task-kind routing. The reviewer stays
+  `@medium`; deep review uses a `@large` model override.
+- The system prompt requires approval before mutating or authoritative work and
+  preserves approval evidence and workflow state through compaction. The worker
+  persona is skill-first, and design and planning require explicit user acceptance.
+- `standalone` is the shipped dispatch default; onboarding is collapsed, with a
+  graduation nudge for multi-model users. `orchestrated` remains available.
+- The default model temperature is now `1.0`; the shipped GLM-5.3 temperature pin
+  was removed.
+
+### Fixed
+
+### Security
+
+- Runtime denylist denials cannot be lifted through conversational approval.
+  Agent guidance and the Git workflow skill reflect the policy.
+
 ## 0.4.3 (2026-10-05)
 
 ### Added

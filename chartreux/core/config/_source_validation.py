@@ -16,6 +16,7 @@ from pydantic import (
 from pydantic_core import InitErrorDetails, PydanticCustomError
 from pydantic_settings.sources import EnvSettingsSource
 
+from chartreux.core.config._catalog import DISPATCH_AUTHORITY_MESSAGE
 from chartreux.core.config._root_authority import ROOTS_FIELD
 from chartreux.core.config.chartreux_schema import _expand_paths, _non_empty
 from chartreux.core.config.models import SessionLoggingConfig
@@ -208,6 +209,16 @@ def validate_source(
                     "type": PydanticCustomError(
                         "legacy_catalog",
                         "Catalog tables are no longer supported in config.toml. Run `chartreux models migrate`.",
+                    ),
+                    "loc": (source, key),
+                    "input": None,
+                })
+            elif key == "dispatch" and schema.__name__ == "ChartreuxConfigSchema":
+                # Dispatch authority lives only in the user models.toml overlay;
+                # no config source, profile, or runtime path may carry it.
+                errors.append({
+                    "type": PydanticCustomError(
+                        "dispatch_authority", DISPATCH_AUTHORITY_MESSAGE
                     ),
                     "loc": (source, key),
                     "input": None,

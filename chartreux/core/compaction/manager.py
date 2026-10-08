@@ -108,7 +108,15 @@ class CompactionManager:
     async def _summarize(
         self, snapshot: list[LLMMessage], extra_instructions: str
     ) -> str:
-        request = self._config().compaction_prompt
+        config = self._config()
+        request = config.compaction_prompt
+        if (bound := config.bound_dispatch_policy) is not None:
+            policy = bound.policy
+            request += (
+                f"\n\nBound dispatch policy identity: {policy.identity}; policy version: {policy.version}; "
+                f"snapshot version: {bound.version}; session mode: {bound.render_policy.mode.value}. "
+                "Copy these session-bound fields into the handoff; do not adopt saved policy edits."
+            )
         if extra_instructions:
             request += f"\n\n## Additional Instructions\n{extra_instructions}"
 

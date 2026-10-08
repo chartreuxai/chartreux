@@ -19,3 +19,4 @@ These records document design decisions and their rationale. See the [architectu
 - [0015 Outbound TLS Trust Policy](0015-outbound-tls-trust-policy.md)
 - [0016 Durable Recovery Protocol (superseded)](0016-durable-recovery-protocol.md)
 - [0017 Remove Durable Recovery](0017-remove-durable-recovery.md)
+- [0018 Model-role dispatch redesign](0018-model-role-redesign.md)

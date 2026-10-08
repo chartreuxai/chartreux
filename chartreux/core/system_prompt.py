@@ -14,6 +14,7 @@ from chartreux.core.config.harness_files import (
     HarnessFilesManager,
     get_harness_files_manager,
 )
+from chartreux.core.dispatch.renderer import render_cli_prompt_for_config
 from chartreux.core.prompts import UtilityPrompt
 from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils import get_platform_display_name
@@ -275,9 +276,13 @@ def _get_model_catalog_section(config: ChartreuxConfigSchema) -> str | None:
         "| --- | --- | --- | --- |",
     ])
     for name, role in snapshot.catalog.roles.items():
-        if role.model in models:
+        bound = config.bound_dispatch_policy
+        identity = bound.identity_for(f"@{name}") if bound is not None else None
+        model_name = identity.base_model if identity is not None else role.model
+        thinking = identity.thinking if identity is not None else role.thinking
+        if model_name in models:
             lines.append(
-                f"| @{_markdown_cell(name)} | {_markdown_cell(role.model)} | {_markdown_cell(role.thinking)} | {_markdown_cell(role.description)} |"
+                f"| @{_markdown_cell(name)} | {_markdown_cell(model_name)} | {_markdown_cell(thinking)} | {_markdown_cell(role.description)} |"
             )
     return "\n".join(lines)
 
@@ -312,6 +317,18 @@ def _interpolate_prompt(prompt: str) -> str:
     return Template(prompt).safe_substitute(current_date=_format_current_date())
 
 
+def _render_system_prompt_document(config: ChartreuxConfigSchema) -> str:
+    """Compose the prompt skeleton with its rendered dispatch section.
+
+    The shipped skeleton carries ``$dispatch_*`` placeholders where the
+    mode-variable paragraphs live; the session's bound dispatch policy renders
+    them. A custom prompt without placeholders is served unchanged.
+    """
+    return render_cli_prompt_for_config(
+        config, _interpolate_prompt(config.system_prompt)
+    )
+
+
 def _get_headless_section() -> str:
     return (
         "# Headless Mode\n\n"
@@ -344,7 +361,7 @@ def get_universal_system_prompt(  # noqa: PLR0914 - prompt sections and their pr
     cwd = (cwd or Path.cwd()).resolve()
     harness_files = harness_files or get_harness_files_manager()
     instruction_read_files: set[Path] = set()
-    sections = [_interpolate_prompt(config.system_prompt)]
+    sections = [_render_system_prompt_document(config)]
 
     if role_instructions is not None:
         sections.append(role_instructions)

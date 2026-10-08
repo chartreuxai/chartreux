@@ -14,6 +14,18 @@ chartreux "List the public API changes"
 Use `--trust` when unattended work must load configuration from a project that
 has not already been trusted.
 
+## Approval gates in unattended runs
+
+Headless mode disables the approval gates: the headless prompt overrides any
+earlier instruction to wait for confirmation or ask the user, and when the task
+is ambiguous it makes the best judgment call and proceeds. With no human to
+accept a design or plan mid-run, the run does whatever the prompt authorizes —
+send only pre-authorized work headless. The gates are a usage discipline, not a
+runtime enforcement, in unattended runs: pre-authorize the phase and scope of
+work up front in the prompt (or a trusted `AGENTS.md`). Compaction handoffs
+carry the acceptance state, approval evidence, and one-time grants forward, so
+a resumed run cannot infer approval that was never given.
+
 ## Limits and tool filters
 
 Apply budgets to bound a run:

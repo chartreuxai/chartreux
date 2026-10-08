@@ -244,6 +244,22 @@ class SessionMetadata(BaseModel):
     import_provenance: dict[str, JsonValue] | None = None
     created_worktree: WorktreeContext | None = None
     launch_config: LaunchMetadata | None = None
+    dispatch_policy: dict[str, JsonValue] | None = None
+    dispatch_policy_notes: list[str] = Field(default_factory=list)
+
+    @field_validator("dispatch_policy", mode="before")
+    @classmethod
+    def _validate_dispatch_policy(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        from chartreux.core.dispatch.session import (
+            BoundDispatchPolicy,
+            SessionPolicyError,
+        )
+
+        if not isinstance(value, dict) or value.get("version") != 1:
+            raise SessionPolicyError("Unsupported dispatch policy snapshot version")
+        return BoundDispatchPolicy.model_validate(value).model_dump(mode="json")
 
     @model_serializer(mode="wrap")
     def _omit_absent_launch_config(self, handler: Any) -> dict[str, Any]:
