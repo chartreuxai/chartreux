@@ -32,7 +32,8 @@ logger = logging.getLogger(__name__)
 class MissingAPIKeyError(RuntimeError):
     def __init__(self, env_key: str, provider_name: str) -> None:
         super().__init__(
-            f"Missing {env_key} environment variable for {provider_name} provider"
+            f"Missing {env_key} environment variable for {provider_name} provider. "
+            "Run `chartreux --setup` or configure this provider in Settings > Providers (/providers)."
         )
         self.env_key = env_key
         self.provider_name = provider_name

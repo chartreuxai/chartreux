@@ -40,6 +40,7 @@ from chartreux.core.model_catalog.loader import (
     merge_catalog_overlay,
 )
 from chartreux.core.model_catalog.presets import FULLY_CUSTOM, MISTRAL, ProviderPreset
+from chartreux.core.model_catalog.resolver import ModelResolver
 from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.ui.providers.management_state import ManagementState, PendingModel
 from chartreux.ui.providers.workbench import ProviderWorkbenchScreen, WorkbenchView
@@ -970,19 +971,20 @@ async def test_onboarding_presets_use_configured_custom_model_without_mistral() 
     screen.snapshot = services.catalog
     screen.mode = "onboarding"
     screen.initial_view = "presets"
+    screen.selected_model = "other-model"
 
     async with Host(screen).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
         assert screen.view == WorkbenchView.PRESETS
         assert screen.state is not None
         assert all(
-            screen.state.preset(role)[0] == "my-model"
-            for role in ("orchestrator", "large", "medium", "small")
+            screen.state.preset(role)[0] == "other-model"
+            for role in ("orchestrator", "worker", "scout", "heavy")
         )
         assert screen.state.preset("custom-review") == ("other-model", "low")
-        screen.state.set_role_preset("large", "my-model", "low")
+        screen.state.set_role_preset("heavy", "my-model", "low")
         screen._open_presets()
-        assert screen.state.preset("large") == ("my-model", "low")
+        assert screen.state.preset("heavy") == ("my-model", "low")
         assert screen.state.preset("custom-review") == ("other-model", "low")
         assert not any(
             str(option.id).startswith("preset:")
@@ -1003,8 +1005,10 @@ async def test_onboarding_presets_use_configured_custom_model_without_mistral() 
         await wait_until(pilot, lambda: bool(services.writes))
         assert services.writes[-1].roles is not None
         assert all(
-            pair["model"] == "my-model" for pair in services.writes[-1].roles.values()
+            services.writes[-1].roles[role]["model"] == "other-model"
+            for role in ("orchestrator", "worker", "scout")
         )
+        assert services.writes[-1].roles["heavy"]["model"] == "my-model"
 
 
 @pytest.mark.asyncio
@@ -1015,6 +1019,7 @@ async def test_onboarding_no_ready_model_keeps_presets_unavailable() -> None:
     screen.snapshot = services.catalog
     screen.mode = "onboarding"
     screen.initial_view = "presets"
+    screen.selected_model = "glm-5-3"
     screen.credential_resolver = lambda _env: None
     async with Host(screen).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
@@ -1025,7 +1030,83 @@ async def test_onboarding_no_ready_model_keeps_presets_unavailable() -> None:
         )
         assert screen.view == WorkbenchView.PRESETS
         assert screen._feedback_kind == "error"
+        assert "credential MISTRAL_API_KEY is unavailable" in str(screen._message)
         assert not services.writes
+
+
+@pytest.mark.asyncio
+async def test_onboarding_seeding_readiness_selects_the_thinking_compatible_deployment() -> (
+    None
+):
+    """Seeding must validate the deployment the runtime selects for the role."""
+    screen, services = setup()
+    catalog = ModelCatalog.model_validate({
+        "providers": {
+            "one": {"api_base": "https://one.test", "api_key_env_var": "ONE_KEY"},
+            "two": {"api_base": "https://two.test", "api_key_env_var": "TWO_KEY"},
+        },
+        "models": {
+            "a": {
+                "deployments": [
+                    {
+                        "provider": "one",
+                        "name": "wire-a",
+                        "supported_thinking_levels": ["off", "low", "medium"],
+                    },
+                    {
+                        "provider": "two",
+                        "name": "wire-a-2",
+                        "supported_thinking_levels": [
+                            "off",
+                            "low",
+                            "medium",
+                            "high",
+                            "max",
+                        ],
+                    },
+                ]
+            },
+            "b": {"deployments": [{"provider": "one", "name": "wire-b"}]},
+        },
+        "roles": {
+            "orchestrator": {"model": "a", "thinking": "medium"},
+            "heavy": {"model": "a", "thinking": "high"},
+        },
+    })
+    services.catalog = CatalogSnapshot(catalog, "tiered", frozenset({"one", "two"}))
+    screen.snapshot = services.catalog
+    screen.mode = "onboarding"
+    screen.initial_view = "presets"
+    credentials = lambda env: "key" if env == "ONE_KEY" else None
+    screen.credential_resolver = credentials
+
+    # The runtime resolves @heavy past the low/medium deployment to the second
+    # deployment, whose credential is unavailable.
+    selected = ModelResolver(services.catalog).resolve("@heavy")
+    assert (selected.deployment.provider, selected.deployment.name) == (
+        "two",
+        "wire-a-2",
+    )
+    assert credentials(selected.provider.api_key_env_var) is None
+
+    # Seeding readiness reports the credential problem, not ready, for both the
+    # bare pair check and the role check.
+    draft = ManagementState.from_snapshot(services.catalog, "one")
+    pair_reason = draft._preset_readiness("a", "high", credentials)
+    assert pair_reason is not None and "TWO_KEY" in pair_reason
+    role_reason = draft._preset_readiness("a", "high", credentials, role="heavy")
+    assert role_reason is not None and "TWO_KEY" in role_reason
+
+    async with Host(screen).run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        assert screen.state is not None
+        assert screen._onboarding_presets_seeded
+        # The ready orchestrator preset is preserved; the unusable @heavy binding
+        # is replaced with a ready candidate instead of preserved.
+        assert screen.state.preset("orchestrator") == ("a", "medium")
+        assert screen.state.preset("heavy") == ("b", "high")
+        assert screen.state.validate_preset("orchestrator", credentials) is None
+        assert screen.state.validate_preset("heavy", credentials) is None
 
 
 @pytest.mark.asyncio
@@ -1151,7 +1232,7 @@ async def test_ready_shipped_mistral_root_manages_and_finishes(size) -> None:  #
         browser = screen.query_one("#wb-providers", OptionList)
         mistral = next(option for option in browser.options if option.id == "mistral")
         assert "Key Set" in str(mistral.prompt)
-        assert "1 runnable model" in str(mistral.prompt)
+        assert "2 runnable models" in str(mistral.prompt)
         assert any(
             option.id == "\x00presets"
             for option in screen.query_one("#wb-root-actions", OptionList).options

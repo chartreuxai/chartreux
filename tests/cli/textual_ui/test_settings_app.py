@@ -819,13 +819,15 @@ async def test_focused_group_owns_commands_and_expanded_catalog_does_not_filter(
         catalog._query = ""
         screen._filter("")
         catalog.highlighted = next(
-            i for i, row in enumerate(catalog.options) if row.id == "show_greeting"
+            i
+            for i, row in enumerate(catalog.options)
+            if row.id == "ask_confirmation_on_exit"
         )
         entries = screen.query_one("#settings-entries", OptionList)
         assert entries.has_focus and screen._current_item().path == "agent_paths"  # type: ignore[union-attr]
         catalog.focus()
         await pilot.pause()
-        assert screen._current_item().path == "show_greeting"  # type: ignore[union-attr]
+        assert screen._current_item().path == "ask_confirmation_on_exit"  # type: ignore[union-attr]
         await pilot.press("x", "ctrl+d")
         assert catalog._query == "" and screen._confirmation is None
         assert _draft_values(screen._list_draft) == ["draft-entry"]
@@ -1089,7 +1091,7 @@ async def test_space_on_compact_catalog_boolean_uses_navigation_guard(
             focus_action(screen, "add-item")
             await pilot.press("enter", *"new-entry", "enter")
         catalog.focus()
-        catalog.highlighted = catalog.get_option_index("show_greeting")
+        catalog.highlighted = catalog.get_option_index("ask_confirmation_on_exit")
         await pilot.pause()
         assert screen._expanded == "agent_paths" and catalog.has_focus
         assert "Tab/Shift+Tab" in str(
@@ -1103,7 +1105,7 @@ async def test_space_on_compact_catalog_boolean_uses_navigation_guard(
             await pilot.press("space", "down", "enter")
         await pilot.pause()
         assert screen._expanded is None
-        assert service.saved == [{"show_greeting": True}]
+        assert service.saved == [{"ask_confirmation_on_exit": True}]
 
 
 @pytest.mark.asyncio
@@ -1134,12 +1136,12 @@ async def test_flat_sections_filter_and_navigation() -> None:
         )
         assert (
             options.highlighted_option
-            and options.highlighted_option.id == "show_greeting"
+            and options.highlighted_option.id == "autocopy_to_clipboard"
         )
         await pilot.press("down", "up", "j", "k")
         assert (
             options.highlighted_option
-            and options.highlighted_option.id == "show_greeting"
+            and options.highlighted_option.id == "autocopy_to_clipboard"
         )
         await pilot.press(*"timeout")
         assert "timeout" in str(
@@ -1178,20 +1180,20 @@ async def test_bool_toggle_and_help_on_highlight() -> None:
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
         help_row = screen.query_one("#settings-help", NoMarkupStatic)
-        assert "startup greeting" in str(help_row.content)
+        assert "clipboard" in str(help_row.content)
         assert "Not Set" in str(help_row.content)
         assert "saves the toggle to user settings" in str(help_row.content)
         await pilot.press("down")
         await pilot.pause()
-        assert "clipboard" in str(help_row.content)
+        assert "closing the conversation" in str(help_row.content)
         await pilot.press("up", "enter")
         await pilot.pause()
-        assert service.saved == [{"show_greeting": True}]
+        assert service.saved == [{"autocopy_to_clipboard": True}]
         assert screen._display_value(service.snapshot.catalog[0]) == "[■]"
         assert "Saved user value: True" in str(help_row.content)
         await pilot.press("space")
         await pilot.pause()
-        assert service.saved[-1] == {"show_greeting": False}
+        assert service.saved[-1] == {"autocopy_to_clipboard": False}
 
 
 @pytest.mark.asyncio
@@ -1207,12 +1209,12 @@ async def test_mouse_click_selects_and_double_click_saves_boolean() -> None:
         await pilot.click(options, offset=(5, 1))
         await pilot.pause()
         assert options.highlighted_option is not None
-        assert options.highlighted_option.id == "show_greeting"
+        assert options.highlighted_option.id == "autocopy_to_clipboard"
         assert options.has_focus
         assert service.saved == []
         await pilot.click(options, offset=(5, 1), times=2)
         await pilot.pause()
-        assert service.saved == [{"show_greeting": True}]
+        assert service.saved == [{"autocopy_to_clipboard": True}]
 
 
 @pytest.mark.asyncio
@@ -1329,7 +1331,7 @@ async def test_conflict_keeps_old_row() -> None:
             screen.query_one("#settings-help", NoMarkupStatic).content
         )
         assert screen._display_value(service.snapshot.catalog[0]) == "[ ]"
-        assert service.saved == [{"show_greeting": True}]
+        assert service.saved == [{"autocopy_to_clipboard": True}]
 
 
 @pytest.mark.asyncio
@@ -1355,7 +1357,7 @@ async def test_save_failure_persists_on_navigation_and_success_resolves_it() -> 
         assert "✗ Failed:" not in str(
             screen.query_one("#settings-help", NoMarkupStatic).content
         )
-        assert service.saved[-1] == {"show_greeting": True}
+        assert service.saved[-1] == {"autocopy_to_clipboard": True}
 
 
 @pytest.mark.asyncio
@@ -1446,7 +1448,7 @@ async def test_ctrl_r_removes_saved_user_override() -> None:
         await pilot.pause()
         await pilot.press("ctrl+r", "down", "enter")
         await pilot.pause()
-        assert service.saved == [{"show_greeting": None}]
+        assert service.saved == [{"autocopy_to_clipboard": None}]
 
 
 @pytest.mark.asyncio
@@ -2015,7 +2017,7 @@ async def test_navigation_from_dirty_list_requires_explicit_discard(
         options.highlighted = next(
             index
             for index, row in enumerate(options.options)
-            if row.id == "show_greeting"
+            if row.id == "ask_confirmation_on_exit"
         )
         options.focus()
         await pilot.press("enter")
@@ -2030,7 +2032,7 @@ async def test_navigation_from_dirty_list_requires_explicit_discard(
         await pilot.pause()
         assert screen._expanded is None
         assert screen._list_draft is None
-        assert service.saved == [{"show_greeting": True}]
+        assert service.saved == [{"ask_confirmation_on_exit": True}]
 
 
 @pytest.mark.asyncio
@@ -2051,7 +2053,7 @@ async def test_apply_list_draft_then_continue_to_highlighted_setting(
         options.highlighted = next(
             index
             for index, row in enumerate(options.options)
-            if row.id == "show_greeting"
+            if row.id == "ask_confirmation_on_exit"
         )
         options.focus()
         await pilot.press("enter", "escape")
@@ -2061,10 +2063,10 @@ async def test_apply_list_draft_then_continue_to_highlighted_setting(
         await pilot.pause()
         assert service.saved == [{"agent_paths": ["new-entry"]}]
         assert options.highlighted_option is not None
-        assert options.highlighted_option.id == "show_greeting"
+        assert options.highlighted_option.id == "ask_confirmation_on_exit"
         await pilot.press("enter")
         await pilot.pause()
-        assert service.saved[-1] == {"show_greeting": True}
+        assert service.saved[-1] == {"ask_confirmation_on_exit": True}
 
 
 @pytest.mark.parametrize("name", ["bash", "read_file", "BASH"])
@@ -3261,7 +3263,9 @@ async def test_status_line_nested_save_restores_opener_and_revision() -> None:
         assert child.opening.directory_style == "path"
         await pilot.press("escape")
         await pilot.pause()
-        item = next(item for item in parent.catalog if item.path == "show_greeting")
+        item = next(
+            item for item in parent.catalog if item.path == "ask_confirmation_on_exit"
+        )
         await parent._write(item, True)
         assert service.revisions == ["revision", "revision-1"]
 
@@ -3346,7 +3350,9 @@ async def test_status_line_parent_unknown_snapshot_blocks_writes_and_grouped_res
         assert "current state unknown" in str(
             parent.query_one("#settings-help", NoMarkupStatic).content
         )
-        item = next(item for item in parent.catalog if item.path == "show_greeting")
+        item = next(
+            item for item in parent.catalog if item.path == "ask_confirmation_on_exit"
+        )
         await parent._write(item, True)
         assert len(service.saved) == 2
 
@@ -3559,7 +3565,12 @@ async def test_wp4_radio_accepts_selected_not_cursor(pointer: bool) -> None:
 @pytest.mark.parametrize("pointer", [False, True])
 @pytest.mark.parametrize(
     "path",
-    ["agent_paths", "displayed_workdir", "auto_compact_threshold", "show_greeting"],
+    [
+        "agent_paths",
+        "displayed_workdir",
+        "auto_compact_threshold",
+        "ask_confirmation_on_exit",
+    ],
 )
 async def test_wp4_editor_and_scalar_pointer_parity(path: str, pointer: bool) -> None:
     service = FakeService()
@@ -3581,7 +3592,7 @@ async def test_wp4_editor_and_scalar_pointer_parity(path: str, pointer: bool) ->
             await pilot.click(catalog, offset=(5, y), times=2)
         else:
             await pilot.press("enter")
-        if path == "show_greeting":
+        if path == "ask_confirmation_on_exit":
             await pilot.pause()
             assert service.saved == [{path: True}]
             return
@@ -3917,25 +3928,29 @@ async def test_review_confirmation_apply_closes_help_before_save() -> None:
     service = FakeService()
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         screen = cast(SettingsScreen, pilot.app.screen)
-        item = next(item for item in screen.catalog if item.path == "show_greeting")
+        item = next(
+            item for item in screen.catalog if item.path == "ask_confirmation_on_exit"
+        )
         screen._open_confirmation("value", item, True, "Confirm change", "Apply")
         await pilot.press("f1")
         assert screen._help_open
         await pilot.click("#settings-confirmation-actions", offset=(3, 1), times=2)
         await pilot.pause()
         assert not screen._help_open and screen._confirmation is None
-        assert service.saved == [{"show_greeting": True}]
+        assert service.saved == [{"ask_confirmation_on_exit": True}]
 
 
 @pytest.mark.asyncio
 async def test_review_boolean_override_pointer_reset_at_minimum_size() -> None:
     service = FakeService()
-    field = next(f for f in service.snapshot.fields if f.path == "show_greeting")
+    field = next(
+        f for f in service.snapshot.fields if f.path == "ask_confirmation_on_exit"
+    )
     field.saved_explicit = True
     field.effective_value = True
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         screen = cast(SettingsScreen, pilot.app.screen)
-        await pilot.press(*"show_greeting", "f1")
+        await pilot.press(*"ask_confirmation_on_exit", "f1")
         await pilot.click(
             "#settings-help",
             offset=pointer_shortcut_offset(screen, "#settings-help", "remove_override"),
@@ -3944,7 +3959,7 @@ async def test_review_boolean_override_pointer_reset_at_minimum_size() -> None:
         assert not screen._help_open and screen._confirmation is not None
         await pilot.click("#settings-confirmation-actions", offset=(3, 1))
         await pilot.pause()
-        assert service.saved == [{"show_greeting": None}]
+        assert service.saved == [{"ask_confirmation_on_exit": None}]
 
 
 @pytest.mark.asyncio

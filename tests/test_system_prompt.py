@@ -75,21 +75,17 @@ def test_model_catalog_section_renders_thin_descriptions_and_routes_by_vocabular
                 "thinking": "high",
                 "description": "main assistant preset",
             },
-            "small": {
+            "quick": {
                 "model": "base",
                 "thinking": "low",
-                "description": "small preset",
+                "description": "quick preset",
             },
-            "medium": {
+            "standard": {
                 "model": "base",
                 "thinking": "medium",
-                "description": "medium preset",
+                "description": "standard preset",
             },
-            "large": {
-                "model": "base",
-                "thinking": "high",
-                "description": "large preset",
-            },
+            "deep": {"model": "base", "thinking": "high", "description": "deep preset"},
             "unavailable": {
                 "model": "disabled",
                 "thinking": "high",
@@ -108,15 +104,15 @@ def test_model_catalog_section_renders_thin_descriptions_and_routes_by_vocabular
     assert "| backup | test-provider/wire-backup | test-provider |" in prompt
     # The catalog section renders the thin preset descriptions from the catalog.
     assert "| @worker | base | high | worker preset |" in prompt
-    assert "| @small | base | low | small preset |" in prompt
+    assert "| @quick | base | low | quick preset |" in prompt
     assert "| disabled |" not in prompt
     assert "@unavailable" not in prompt
     # The routing prose renders from the bound dispatch policy: every slot
     # binds the single canonical model `base`, so the rendering is task-kind
-    # and tier-free rather than tier-routed.
+    # and role-free rather than role-routed.
     assert "route by purpose through the configured slots" in prompt
     assert "| `mechanical` | `worker` |" in prompt
-    assert "`@small` for search" not in prompt
+    assert "`@scout` for search" not in prompt
     assert "$dispatch" not in prompt
 
     restricted = config.model_copy(update={"allowed_models": ["base"]})
@@ -199,21 +195,17 @@ def test_model_catalog_escapes_configured_table_cells(
                 "thinking": "high",
                 "description": "main assistant preset",
             },
-            "small": {
+            "quick": {
                 "model": "base",
                 "thinking": "low",
-                "description": "small preset",
+                "description": "quick preset",
             },
-            "medium": {
+            "standard": {
                 "model": "base",
                 "thinking": "medium",
-                "description": "medium preset",
+                "description": "standard preset",
             },
-            "large": {
-                "model": "base",
-                "thinking": "high",
-                "description": "large preset",
-            },
+            "deep": {"model": "base", "thinking": "high", "description": "deep preset"},
         },
     })
     config.attach_catalog_snapshot(CatalogSnapshot(catalog, "escaped"))
@@ -268,9 +260,9 @@ def test_shipped_catalog_role_descriptions_are_thin_and_vocabulary_carries_routi
     # Role descriptions are thin preset labels; the task-routing vocabulary
     # renders from the developer-owned dispatch purposes, not from the catalog.
     assert roles["orchestrator"].description == "main assistant preset"
-    assert roles["large"].description == "large preset"
-    assert roles["medium"].description == "medium preset"
-    assert roles["small"].description == "small preset"
+    assert roles["worker"].description == "worker preset"
+    assert roles["scout"].description == "scout preset"
+    assert roles["heavy"].description == "heavy preset"
     # The retired capacity wording is gone from every role description.
     for role in roles.values():
         assert "capacity preset" not in role.description
@@ -431,11 +423,11 @@ def test_default_prompt_renders_delegation_protocol(
     )
     assert "$role" not in prompt
     # The delegation protocol's mode-variable regions render from the bound
-    # dispatch policy at assembly; the shipped catalog is single-model, so
-    # the routing prose is task-kind and no placeholder or tier name leaks.
+    # dispatch policy at assembly; the standalone preset renders task-kind
+    # routing regardless of roster size, so no placeholder or role name leaks.
     assert "route by purpose through the configured slots" in prompt
     assert "$dispatch" not in prompt
-    assert "`@small` for search" not in prompt
+    assert "`@scout` for search" not in prompt
 
 
 def test_system_prompt_builtin_ids_and_default_are_explicit() -> None:
@@ -519,6 +511,16 @@ def test_role_prompts_contain_subagent_contract(prompt_id: str) -> None:
         "Report the files changed, checks actually run and their outcomes",
     ):
         assert clause in prompt
+
+    if prompt_id in {"advisor", "reviewer"}:
+        assert (
+            "report denied commands and the runtime's rejection reason in your result"
+            in prompt
+        )
+        assert "do not persist them to task-note files" in prompt
+        assert "do not modify files to reconcile them" in prompt
+        assert "persist failed commands" not in prompt
+        assert "maintain a cumulative record" not in prompt
 
 
 def test_user_prompt_overrides_builtin_role_prompt_by_id(
@@ -654,7 +656,7 @@ def test_rendered_orchestrated_multi_model_prompt_routes_by_task_not_difficulty(
 ) -> None:
     # The routing prose is no longer baked into the prompt skeleton: it
     # renders from the bound dispatch policy at assembly. A multi-model
-    # roster keeps the legacy tier routing (the WP0 compatibility contract).
+    # roster keeps the tier routing, now named for the roster roles.
     config = build_config(
         system_prompt_id="cli", include_model_info=False, include_commit_signature=False
     )
@@ -668,35 +670,45 @@ def test_rendered_orchestrated_multi_model_prompt_routes_by_task_not_difficulty(
     )
 
     assert (
-        "`@small` for search, grep, exploration, verification, and mechanical "
+        "`@scout` for search, grep, exploration, verification, and mechanical "
         "single-file edits" in prompt
     )
-    assert "`@medium` for all substantive implementation, however demanding" in prompt
+    assert "`@worker` for all substantive implementation, however demanding" in prompt
     assert (
-        "`@large` for architecture, cross-subsystem design, design and planning "
-        "analysis, and deep review only — never implementation." in prompt
+        "`@heavy` for architecture, cross-subsystem design, design and planning "
+        "analysis, and deep review, plus demanding execution with a settled "
+        "approach through the escalation-implementor route — never routine "
+        "implementation. The worker and reviewer profiles use `@worker` by "
+        "default; the advisor profile uses `@heavy` for architecture, design, "
+        "planning, and destructive-operation analysis only; it never implements. "
+        "Demanding execution with a settled approach runs through the "
+        "worker-profile escalation-implementor route." in prompt
     )
-    # The reviewer profile stays @medium; deep review at @large is a model override.
+    # The reviewer profile stays @worker; deep review at @heavy is a model override.
     assert (
-        'The reviewer profile stays `@medium`; "deep review at `@large`" means '
-        "the reviewer profile with a `@large` model override." in prompt
+        'The reviewer profile stays `@worker`; "deep review at `@heavy`" means '
+        "the reviewer profile with a `@heavy` model override." in prompt
     )
-    # Failed implementation is retried at @medium or analyzed by a @large advisor.
-    assert "never re-dispatch implementation to `@large`" in prompt
-    # The tier is passed explicitly: mechanical work carries a @small override,
-    # substantive implementation launches at the @medium default.
+    # Failed implementation is retried at @worker or analyzed by a @heavy
+    # advisor; the advisor seat never implements.
+    assert "never re-dispatch implementation to the `@heavy` advisor" in prompt
+    # The tier is passed explicitly: mechanical work carries a @scout override,
+    # substantive implementation launches at the @worker default.
     assert "the profile default is not the routing decision" in prompt
-    assert 'config={"model": "@small"}' in prompt
+    assert 'config={"model": "@scout"}' in prompt
     assert 'task="Rename add to plus in utils.py and update its call sites."' in prompt
     assert (
         'task="Add a retry helper with exponential backoff to utils.py and use '
         'it in app.py."' in prompt
     )
-    # The rendered routing region reproduces the WP0 legacy baseline bytes.
+    # ADR 0018-G.1's byte-equality baseline is superseded: the roster rename
+    # rewrote the curated prose, so the regenerated active goldens are the
+    # byte baseline now and the WP0 legacy bytes no longer appear.
     legacy = (
         Path(__file__).parent / "fixtures/dispatch/legacy-orchestrated/cli-routing.md"
     ).read_text()
-    assert legacy.rstrip("\n") in prompt
+    assert legacy.rstrip("\n") not in prompt
+    assert "`@scout` for search" in prompt
 
 
 def test_cli_prompt_uses_ascii_tree_and_arrow_characters() -> None:

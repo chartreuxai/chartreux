@@ -352,6 +352,22 @@ class TestBuiltinSkillCommandDrift:
             f"Either register them or delete them from the skill text."
         )
 
+    def test_builtin_skill_documents_dynamic_authorized_roots(self) -> None:
+        prompt = VIBE_SKILL.prompt
+        for phrase in (
+            "Allow this session",
+            "Always for this project",
+            "once per canonical root",
+            "revision-checked policy/roots/save",
+            "child requests never write configuration",
+            "session-only",
+            "`/reload` applies saved grants immediately",
+            "Esc or cancel denies",
+            "Programmatic and ACP sessions never prompt",
+            "`$HOME`",
+        ):
+            assert phrase in prompt, phrase
+
     def test_builtin_skill_documents_the_user_facing_commands(self) -> None:
         # Guards the reverse direction: a newly registered command that never
         # makes it into the skill text is invisible to the model. Add the command

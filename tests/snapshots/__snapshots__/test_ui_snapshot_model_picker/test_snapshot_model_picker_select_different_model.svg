@@ -185,8 +185,8 @@
 </text><text class="terminal-r1" x="0" y="532.4" textLength="97.6" clip-path="url(#terminal-line-21)">&#160;⢸⠸⣀⡔⢉⠱⣃</text><text class="terminal-r2" x="97.6" y="532.4" textLength="12.2" clip-path="url(#terminal-line-21)">⡢</text><text class="terminal-r2" x="109.8" y="532.4" textLength="12.2" clip-path="url(#terminal-line-21)">⣂</text><text class="terminal-r1" x="122" y="532.4" textLength="12.2" clip-path="url(#terminal-line-21)">⡣</text><text class="terminal-r1" x="1220" y="532.4" textLength="12.2" clip-path="url(#terminal-line-21)">
 </text><text class="terminal-r1" x="0" y="556.8" textLength="134.2" clip-path="url(#terminal-line-22)">&#160;&#160;⠉⠒⠣⠤⠵⠤⠬⠮⠆</text><text class="terminal-r1" x="1220" y="556.8" textLength="12.2" clip-path="url(#terminal-line-22)">
 </text><text class="terminal-r1" x="1220" y="581.2" textLength="12.2" clip-path="url(#terminal-line-23)">
-</text><text class="terminal-r3" x="0" y="605.6" textLength="109.8" clip-path="url(#terminal-line-24)">Chartreux</text><text class="terminal-r1" x="109.8" y="605.6" textLength="524.6" clip-path="url(#terminal-line-24)">&#160;v0.0.0&#160;·&#160;mistral/mistral-large-latest[off]</text><text class="terminal-r1" x="1220" y="605.6" textLength="12.2" clip-path="url(#terminal-line-24)">
-</text><text class="terminal-r1" x="0" y="630" textLength="427" clip-path="url(#terminal-line-25)">6&#160;models&#160;·&#160;0&#160;MCP&#160;servers&#160;·&#160;0&#160;skills</text><text class="terminal-r1" x="1220" y="630" textLength="12.2" clip-path="url(#terminal-line-25)">
+</text><text class="terminal-r3" x="0" y="605.6" textLength="109.8" clip-path="url(#terminal-line-24)">Chartreux</text><text class="terminal-r1" x="109.8" y="605.6" textLength="475.8" clip-path="url(#terminal-line-24)">&#160;v0.0.0&#160;·&#160;mistral/mistral-large-4[high]</text><text class="terminal-r1" x="1220" y="605.6" textLength="12.2" clip-path="url(#terminal-line-24)">
+</text><text class="terminal-r1" x="0" y="630" textLength="427" clip-path="url(#terminal-line-25)">7&#160;models&#160;·&#160;0&#160;MCP&#160;servers&#160;·&#160;0&#160;skills</text><text class="terminal-r1" x="1220" y="630" textLength="12.2" clip-path="url(#terminal-line-25)">
 </text><text class="terminal-r1" x="0" y="654.4" textLength="183" clip-path="url(#terminal-line-26)">F1&#160;Help&#160;·&#160;/help</text><text class="terminal-r1" x="1220" y="654.4" textLength="12.2" clip-path="url(#terminal-line-26)">
 </text><text class="terminal-r1" x="1220" y="678.8" textLength="12.2" clip-path="url(#terminal-line-27)">
 </text><text class="terminal-r1" x="1220" y="703.2" textLength="12.2" clip-path="url(#terminal-line-28)">
@@ -196,7 +196,7 @@
 </text><text class="terminal-r5" x="0" y="800.8" textLength="1220" clip-path="url(#terminal-line-32)">────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1220" y="800.8" textLength="12.2" clip-path="url(#terminal-line-32)">
 </text><text class="terminal-r6" x="0" y="825.2" textLength="12.2" clip-path="url(#terminal-line-33)">&gt;</text><text class="terminal-r1" x="1220" y="825.2" textLength="12.2" clip-path="url(#terminal-line-33)">
 </text><text class="terminal-r5" x="0" y="849.6" textLength="1220" clip-path="url(#terminal-line-34)">────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1220" y="849.6" textLength="12.2" clip-path="url(#terminal-line-34)">
-</text><text class="terminal-r1" x="0" y="874" textLength="353.8" clip-path="url(#terminal-line-35)">workdir&#160;|&#160;pid&#160;0&#160;|&#160;0/200k&#160;(0%)</text>
+</text><text class="terminal-r1" x="0" y="874" textLength="353.8" clip-path="url(#terminal-line-35)">workdir&#160;|&#160;pid&#160;0&#160;|&#160;0/400k&#160;(0%)</text>
     </g>
     </g>
 </svg>

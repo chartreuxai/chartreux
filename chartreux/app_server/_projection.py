@@ -127,6 +127,9 @@ def project_config_view(
     bound = config.bound_dispatch_policy
     return ConfigView(
         dispatch_mode=bound.render_policy.mode if bound is not None else None,
+        bound_roster=(
+            sorted(bound.bound_canonical_identities) if bound is not None else None
+        ),
         active_model=_project_model_config(config.get_active_model()),
         active_model_expression=config.active_model,
         allowed_models=list(config.allowed_models),
@@ -138,7 +141,6 @@ def project_config_view(
         theme=config.theme,
         log_level=config.log_level,
         disable_welcome_banner_animation=config.disable_welcome_banner_animation,
-        show_greeting=config.show_greeting,
         autocopy_to_clipboard=config.autocopy_to_clipboard,
         file_watcher_for_autocomplete=config.file_watcher_for_autocomplete,
         ask_confirmation_on_exit=config.ask_confirmation_on_exit,

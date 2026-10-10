@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Mapping
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Mapping,
+    Sequence,
+)
 from contextlib import aclosing, suppress
 from dataclasses import dataclass, replace
 from enum import StrEnum, auto
@@ -159,7 +166,6 @@ from chartreux.cli.textual_ui.widgets.messages import (
     AssistantMessage,
     CustomToolsDeprecationMessage,
     ErrorMessage,
-    GreetingMessage,
     InterruptMessage,
     PlanFileMessage,
     ReasoningMessage,
@@ -480,6 +486,32 @@ class _ProviderConfigService:
         return None
 
 
+async def _session_selection_restrictions(
+    app: ChartreuxApp,
+) -> tuple[Sequence[str], dict[str, str]]:
+    """The session's effective allowed_models and thinking overrides.
+
+    ``allowed_models`` comes from the projected session config; the per-model
+    thinking overrides are read from the server-side config fields, which the
+    projection does not carry. Both are optional host inputs for the workbench.
+    """
+    allowed_models = getattr(app.config, "allowed_models", ())
+    app_server = getattr(app, "app_server", None)
+    if app_server is None:
+        return allowed_models, {}
+    response = await app_server.resources.config.read_fields()
+    entry = next(
+        (item for item in response.fields if item.name == "thinking_overrides"), None
+    )
+    value = entry.value if entry is not None else None
+    overrides = (
+        {str(name): str(level) for name, level in value.items()}
+        if isinstance(value, dict)
+        else {}
+    )
+    return allowed_models, overrides
+
+
 def persist_api_key_for_provider(env_var: str, key: str) -> str:
     """Persist an explicit provider key while retaining session-only fallback."""
     provider_config = import_module("chartreux.core.config").ProviderConfig
@@ -694,8 +726,6 @@ def _split_app_server_source(
 _REJECT_HINT_BUSY = "wait for the current job to finish."
 _REJECT_HINT_PAUSED = "clear the queue first or remove this input."
 
-# Greeting interval in seconds (default: 24 hours)
-_GREETING_INTERVAL_SECONDS = 24 * 60 * 60
 _UNTRUSTED_CONFIG_WARNING_SECTION = "untrusted_config_warning"
 _USAGE_POLL_INTERVAL_SECONDS = 60
 
@@ -754,7 +784,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
         ),
     ]
 
-    _greeting_message: GreetingMessage | None = None
     _turn_ui_generation: int = 0
     _turn_ui_mutex: asyncio.Lock | None = None
     _main_ui_mounted: bool = False
@@ -1495,7 +1524,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
             and not self._continue_latest
         ):
             await self._show_custom_tools_deprecation_warning_after_initial_history()
-        await self._show_greeting_message()
         self._refresh_banner()
         if self._show_resume_picker:
             return
@@ -4146,6 +4174,24 @@ class ChartreuxApp(App):  # noqa: PLR0904
 - **Last Turn Tokens**: {stats.last_turn_total_tokens:,}{last_turn_cached}
 - **Cost**: ${stats.session_cost:.4f}
 """
+        try:
+            roots = await self.app_server.resources.config.read_roots()
+            effective = (
+                "\n".join(f"  - `{root}`" for root in roots.effective_roots)
+                or "  - None"
+            )
+            saved = (
+                "unavailable"
+                if roots.saved_roots is None
+                else "\n".join(f"  - `{root}`" for root in roots.saved_roots)
+                or "  - None"
+            )
+            status_text += (
+                f"\n## Authorized Roots\n\nProject: `{roots.project}`\n\n"
+                f"**Effective roots**\n{effective}\n\n**Saved roots**\n{saved}\n"
+            )
+        except Exception:
+            status_text += "\n## Authorized Roots\n\nProject roots unavailable.\n"
         await self._mount_and_scroll(UserCommandMessage(status_text))
 
     async def _show_model(self, **kwargs: Any) -> None:
@@ -4286,9 +4332,19 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     self._graduation_live_attempts.pop(key, None)
 
     def _graduation_models_saved(
-        self, usable: frozenset[str], added: frozenset[str]
+        self,
+        roster_before: frozenset[str],
+        roster_after: frozenset[str],
+        saved_models: frozenset[str],
     ) -> None:
-        self._graduation.state.model_saved(usable, added)
+        # The session-bound roster is the authoritative pre-save side: saved
+        # edits apply next session, so the live policy still reflects the
+        # roster this session dispatches to. An attached policy with an empty
+        # roster stays empty — a live 0->2 transition never latches — and only
+        # a missing policy falls back to the workbench's pre-save resolution.
+        bound_roster = getattr(self.config, "bound_roster", None)
+        before = roster_before if bound_roster is None else frozenset(bound_roster)
+        self._graduation.state.model_saved(before, roster_after, saved_models)
         self._graduation.save()
 
     def _maybe_show_graduation(self) -> None:
@@ -4379,6 +4435,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
             discovery_module = import_module("chartreux.core.model_catalog.discovery")
             credentials = _ProviderCredentials()
             config = _ProviderConfigService(self)
+            allowed_models, thinking_overrides = await _session_selection_restrictions(
+                self
+            )
             result = await self.push_screen_wait(
                 workbench.ProviderWorkbenchScreen(
                     discovery=discovery_module.discover_models,
@@ -4388,6 +4447,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     config=config,
                     snapshot=catalog_loader.load_catalog(),
                     initial_view=initial_view,
+                    allowed_models=allowed_models,
+                    thinking_overrides=thinking_overrides,
                     on_models_saved=self._graduation_models_saved,
                     session_only_credential_envs=self._session_only_credential_envs,
                     tls=contracts.TLSConfig(
@@ -4976,7 +5037,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     async def _apply_config_to_ui(self) -> None:
         await self._apply_theme(self.config.theme)
-        self._sync_greeting_message()
 
         if self._banner:
             self._banner.set_state(
@@ -6399,39 +6459,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
         )
 
-    async def _should_show_greeting(self) -> bool:
-        from chartreux.utils.cache_store import FileSystemCacheStore
-
-        if self._whats_new_message:
-            return False
-        if not self.config.show_greeting:
-            return False
-        try:
-            cache = FileSystemCacheStore()
-            greeting_data = await asyncio.to_thread(cache.read_section, "greeting")
-            last_shown = greeting_data.get("last_shown_at")
-            if last_shown is None:
-                return True
-            now = time.time()
-            return now - last_shown > _GREETING_INTERVAL_SECONDS
-        except Exception:
-            return True  # Fail open
-
-    async def _mark_greeting_shown(self) -> None:
-        """Mark that greeting was shown with current timestamp."""
-        from chartreux.utils.cache_store import FileSystemCacheStore
-
-        try:
-            cache = FileSystemCacheStore()
-            await asyncio.to_thread(
-                cache.write_section, "greeting", {"last_shown_at": int(time.time())}
-            )
-        except Exception:
-            pass
-
-    def _username(self) -> str | None:
-        return None
-
     def _refresh_banner(self) -> None:
         if self._banner:
             self._banner.set_state(
@@ -6933,19 +6960,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 "Failed to check for untrusted config folders", exc_info=True
             )
 
-    async def _show_greeting_message(self) -> None:
-        if not await self._should_show_greeting():
-            return
-        username = self._username()
-        if username is None:
-            return
-        greeting_message = GreetingMessage(username)
-        chat = self._chat_widget
-        # Mount after banner so it appears below banner and scrolls up with messages
-        await chat.mount(greeting_message, after=self._banner)
-        self._greeting_message = greeting_message
-        await self._mark_greeting_shown()
-
     async def _show_custom_tools_deprecation_warning_after_initial_history(
         self,
     ) -> None:
@@ -6966,16 +6980,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
             message = CustomToolsDeprecationMessage(tool_names)
             await self._mount_and_scroll(message)
             self._custom_tools_deprecation_message = message
-
-    def _sync_greeting_message(self) -> None:
-        # Config edit can turn show_greeting off mid-session: tear down an
-        # already-mounted greeting so the change takes effect immediately.
-        if self.config.show_greeting or self._greeting_message is None:
-            return
-        greeting = self._greeting_message
-        self._greeting_message = None
-        if greeting.parent:
-            greeting.remove()
 
     async def _mount_and_scroll(
         self,

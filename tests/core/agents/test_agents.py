@@ -54,16 +54,16 @@ class TestAgentProfile:
             "thinking",
         ),
         [
-            (WORKER, "medium", "worker", None, None, None),
+            (WORKER, "worker", "worker", None, None, None),
             (
                 ADVISOR,
-                "large",
+                "heavy",
                 "advisor",
                 ["read_file", "grep", "web_search", "web_fetch", "skill"],
                 0,
                 None,
             ),
-            (REVIEWER, "medium", "reviewer", None, None, None),
+            (REVIEWER, "worker", "reviewer", None, None, None),
         ],
     )
     def test_builtin_profiles_have_role_prompt_and_tools(
@@ -123,6 +123,23 @@ class TestAgentProfile:
             "advisor": ADVISOR,
             "reviewer": REVIEWER,
         }
+
+    @pytest.mark.parametrize(
+        ("profile", "base_model", "thinking"),
+        [
+            (WORKER, "glm-5-3", "medium"),
+            (ADVISOR, "mistral-large-4", "high"),
+            (REVIEWER, "glm-5-3", "medium"),
+        ],
+    )
+    def test_builtin_profile_default_roles_resolve_against_the_shipped_catalog(
+        self, profile: AgentProfile, base_model: str, thinking: str
+    ) -> None:
+        from chartreux.core.model_catalog.resolver import ModelResolver
+
+        resolver = ModelResolver(CatalogSnapshot(SHIPPED_CATALOG, "builtin-roles"))
+        resolved = resolver.resolve(f"@{profile.role}")
+        assert (resolved.base_model, resolved.thinking) == (base_model, thinking)
 
 
 class TestAgentManager:
@@ -267,7 +284,7 @@ class TestAgentManager:
         agents_dir = tmp_path / "agents"
         agents_dir.mkdir()
         if available:
-            (agents_dir / "custom.toml").write_text('role = "small"\n')
+            (agents_dir / "custom.toml").write_text('role = "scout"\n')
         orchestrator = load_orchestrator(build_config(agent_paths=[agents_dir]))
         snapshot = orchestrator.config.catalog_snapshot
         slots = dict(snapshot.dispatch.slots)
@@ -346,7 +363,7 @@ class TestAgentManager:
         else:
             assert "S1 slots.mechanical.role" in diagnostic
             assert recovered.catalog.roles == {}
-            assert recovered.dispatch.slots["mechanical"].role == "@small"
+            assert recovered.dispatch.slots["mechanical"].role == "@scout"
 
     def test_get_nonexistent_agent_raises(self, manager: AgentManager) -> None:
         with pytest.raises(ValueError, match="not found"):

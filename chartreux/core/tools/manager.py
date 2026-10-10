@@ -108,12 +108,14 @@ class ToolManager:
         parent_authority_revision_getter: Callable[[], int] | None = None,
         accepted_token_getter: Callable[[], object] | None = None,
         task_description: str | None = None,
+        session_root_grants: object | None = None,
     ) -> None:
         self._config_getter = config_getter
         self._cwd = (cwd or Path.cwd()).resolve()
         self._harness_files = harness_files or get_harness_files_manager()
         self._scratchpad_dir = scratchpad_dir
         self._plan_file_write_scope_getter = plan_file_write_scope_getter
+        self._session_root_grants = session_root_grants
         # Only accepted runtime contributions belong here, never a preview getter.
         # Fixed parent authority is independent of later local profile changes.
         self._restriction_getter = restriction_getter
@@ -667,6 +669,12 @@ class ToolManager:
                 parent_context is not None
                 and parent_context.permission == ToolPermission.NEVER
             ):
+                # A parent's out-of-root denial is this agent's ceiling, not a
+                # grantable gap: no session grant can lift the live parent.
+                if parent_context.denial_kind == "out_of_root":
+                    parent_context = parent_context.model_copy(
+                        update={"denial_kind": "parent_ceiling"}
+                    )
                 return parent_context
         except Exception:
             return PermissionContext(
@@ -1142,6 +1150,12 @@ class ToolManager:
                     self._authority_cache[tool_name] = (token, config_class, frozen)
         return resolved
 
+    def _invalidate_session_root_grants(self) -> None:
+        """Invalidate cached authority after a runtime session grant."""
+        self._authority_generation += 1
+        self._workspace_cache = None
+        self._authority_cache.clear()
+
     @property
     def workspace(self) -> Workspace:
         """Current accepted file authority, independent of effective/discovery data."""
@@ -1157,6 +1171,13 @@ class ToolManager:
             + (self._restriction_getter() if self._restriction_getter else ()),
             ceiling=self._inherited_workspace,
         )
+        if self._session_root_grants is not None:
+            roots = tuple(getattr(self._session_root_grants, "roots", ()))
+            workspace = Workspace(
+                workspace.cwd,
+                tuple(dict.fromkeys((*workspace.authorized_roots, *roots))),
+                workspace.ceiling,
+            )
         if token is not None:
             if self._effective_authority_token() != token:
                 raise NoSuchToolError("Tool authority changed during resolution")

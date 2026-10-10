@@ -33,7 +33,7 @@ def _config(path: Path) -> ChartreuxConfigSchema:
 
 def test_dispatch_overlay_to_frozen_rendered_and_concrete_launch(tmp_path: Path):
     path = tmp_path / "models.toml"
-    path.write_text('[dispatch]\nmode="standalone"\n[roles.small]\nthinking="medium"\n')
+    path.write_text('[dispatch]\nmode="standalone"\n[roles.scout]\nthinking="medium"\n')
     config = _config(path)
     bound = bind_policy(config)
     config.attach_dispatch_policy(bound)
@@ -55,7 +55,7 @@ def test_dispatch_overlay_to_frozen_rendered_and_concrete_launch(tmp_path: Path)
         '[dispatch]\nmode="orchestrated"\n'
         '[models.later]\nthinking="high"\n'
         'deployments=[{provider="mistral", name="later-wire"}]\n'
-        '[roles.small]\nmodel="later"\nthinking="high"\n'
+        '[roles.scout]\nmodel="later"\nthinking="high"\n'
     )
     config.attach_catalog_snapshot(load_catalog(path))
     candidate = resolve_launch(

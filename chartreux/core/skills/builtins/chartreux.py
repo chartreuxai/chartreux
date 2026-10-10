@@ -114,7 +114,7 @@ folders to see a different set. The explicit `--resume <SESSION_ID>` form is
 **not** folder-scoped: it resolves the session by id regardless of which folder
 it ran in.
 
-Each session commits the resolved base model and concrete provider deployment when it is assigned. On resume, Chartreux validates that stored identity and never re-selects a role or deployment. An explicit re-task can reconfigure a retained child; `/clear` starts a new conversation that follows the current configuration. `/model` and `/thinking` change the current session; edit `[roles.orchestrator]` in `models.toml` to change the saved main-model default. That role name does not select the dispatch mode: `[dispatch].mode` selects a session-level shipped preset, and saved dispatch changes apply next session.
+Each session commits the resolved base model and concrete provider deployment when it is assigned. On resume, Chartreux validates that stored identity and never re-selects a role or deployment. However, a saved dispatch policy referencing a role removed from the current configuration fails resume with `SessionPolicyError` ("Bound dispatch role removed"); no role substitution is performed. Committed model identities still resolve. An explicit re-task can reconfigure a retained child; `/clear` starts a new conversation that follows the current configuration. `/model` and `/thinking` change the current session; edit `[roles.orchestrator]` in `models.toml` to change the saved main-model default. That role name does not select the dispatch mode: `[dispatch].mode` selects a session-level shipped preset, and saved dispatch changes apply next session.
 
 ## Configuration (config.toml)
 
@@ -137,7 +137,16 @@ user-owned `models.toml` overlay, not a `config.toml` layer. Project, environmen
 agent-profile, and session sources may select canonical catalog models or roles but cannot define
 catalogs. `authorized_roots_by_project` is accepted only from an installed user
 layer. General `config/write` cannot grant or change roots; persistent roots must
-be saved explicitly in the user configuration. Session-only `policy/roots/read`
+be saved explicitly in the user configuration. In an interactive TUI session, an
+out-of-root file-tool request prompts once per canonical root: **Allow this session**
+grants it until the session ends (not after resume), while **Always for this project**
+saves it to the user layer for future sessions. Saving uses the root orchestrator's
+revision-checked policy/roots/save path; child requests never write configuration.
+Save conflicts can be retried, and failed, uncertain, or cancelled saves leave the
+grant session-only. `/reload` applies saved grants immediately. The prompt explains
+that access includes read and write through shell and warns for roots at or above
+`$HOME`; Esc or cancel denies. Programmatic and ACP sessions never prompt and point
+to `authorized_roots_by_project` in user `config.toml`. Session-only `policy/roots/read`
 and `policy/roots/replace` can change in-memory roots only, and replacement
 requires an expected revision plus literal `userInitiated: true`. These RPCs never
 write disk.
@@ -174,7 +183,6 @@ autocopy_to_clipboard = true  # Enable automatic copying of selected text to cli
 file_watcher_for_autocomplete = false
 ask_confirmation_on_exit = true  # Confirm idle Ctrl+C/Ctrl+D quits
 ascii_chrome = false  # Use ASCII equivalents for application chrome glyphs
-show_greeting = true  # Show "Hello {name}" greeting below the banner at startup (Mistral providers, once per 24h)
 log_level = "WARNING"  # Optional. DEBUG | INFO | WARNING | ERROR | CRITICAL — log level for ~/.chartreux/logs/chartreux.log
 displayed_workdir = ""  # Optional working-directory label shown in the UI
 context_warnings = false  # Show context-window warnings
@@ -682,9 +690,9 @@ scope checks remain enforced.
 
 ### Subagents
 
-- **worker**: General-purpose subagent with the `worker` role prompt.
-- **advisor**: Independent, read-only advisor with the `advisor` role prompt. Its tools are limited to `read_file`, `grep`, `web_search`, and `web_fetch`, and its TTL is `0`.
-- **reviewer**: Independent, read-only reviewer with the `reviewer` role prompt.
+- **worker**: General-purpose subagent with the `worker` role prompt; its default model role is `@worker`.
+- **advisor**: Independent, read-only advisor with the `advisor` role prompt; its default model role is `@heavy`. Its tools are limited to `read_file`, `grep`, `web_search`, and `web_fetch`, and its TTL is `0`.
+- **reviewer**: Independent, read-only reviewer with the `reviewer` role prompt; its default model role is `@worker`.
 
 Routing is configured separately from profiles. Inspect the rendered dispatch
 slot table for the current session's purposes and eligible slots. Each slot

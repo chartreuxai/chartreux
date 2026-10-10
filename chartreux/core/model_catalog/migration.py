@@ -39,6 +39,9 @@ _LEGACY_PROVIDER_DEFAULTS = {"project_id": "", "region": ""}
 # after removed shipped identities still target their replacement, independently
 # of aliases collected from those preserved tables.
 _LEGACY_SHIPPED_MODEL_ALIASES = {"glm-5-2": "glm-5-3"}
+# Alias decision (2026-10-09): the runtime-confirmed Mistral wire ID is
+# `mistral-large-4`, so no speculative `mistral-large-4-0` alias is recorded here;
+# account for the `-0` spelling only if it is actually encountered.
 _MIGRATION_LOCKS: dict[Path, Any] = {}
 _MIGRATION_LOCKS_GUARD = threading.Lock()
 _MIGRATION_LOCK_STATE = threading.local()

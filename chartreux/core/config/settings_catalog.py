@@ -108,13 +108,6 @@ def _field(
 
 EDITABLE_SETTINGS: tuple[SettingDescriptor, ...] = (
     _field(
-        "show_greeting",
-        "Show Greeting",
-        "Show the startup greeting for Mistral providers, at most once per day.",
-        "bool",
-        "Interface",
-    ),
-    _field(
         "autocopy_to_clipboard",
         "Auto-Copy",
         "Copy selected text to the clipboard automatically.",

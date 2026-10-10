@@ -497,10 +497,10 @@ def build_test_vibe_config_schema(**kwargs: Any) -> ChartreuxConfigSchema:
 
 
 def multi_model_catalog() -> ModelCatalog:
-    """A deterministic two-canonical-model catalog with the tier roles.
+    """A deterministic two-canonical-model catalog with the roster roles.
 
-    The shipped dispatch slots bind ``@small``/``@medium`` to one base model
-    and ``@large`` to another, so the roster shape is multi-model and the
+    The shipped dispatch slots bind ``@scout``/``@worker`` to one base model
+    and ``@heavy`` to another, so the roster shape is multi-model and the
     orchestrated rendering keeps its tier routing.
     """
     return ModelCatalog.model_validate({
@@ -524,20 +524,61 @@ def multi_model_catalog() -> ModelCatalog:
                 "thinking": "high",
                 "description": "main assistant preset",
             },
-            "small": {
+            "scout": {
                 "model": "alpha-model",
                 "thinking": "low",
-                "description": "small preset",
+                "description": "scout preset",
             },
-            "medium": {
+            "worker": {
                 "model": "alpha-model",
                 "thinking": "medium",
-                "description": "medium preset",
+                "description": "worker preset",
             },
-            "large": {
+            "heavy": {
                 "model": "beta-model",
                 "thinking": "high",
-                "description": "large preset",
+                "description": "heavy preset",
+            },
+        },
+    })
+
+
+def single_model_catalog() -> ModelCatalog:
+    """A deterministic one-canonical-model catalog with the roster roles.
+
+    Every role the shipped policies reference binds the same canonical model,
+    so the roster shape is single-model regardless of how the shipped catalog
+    roster evolves. Kept named and isolated from ``SHIPPED_CATALOG`` so the
+    single-model rendering fixtures stay stable.
+    """
+    return ModelCatalog.model_validate({
+        "providers": {"solo": {"api_base": "https://solo.test"}},
+        "models": {
+            "solo-model": {
+                "thinking": "medium",
+                "deployments": [{"provider": "solo", "name": "solo-wire"}],
+            }
+        },
+        "roles": {
+            "orchestrator": {
+                "model": "solo-model",
+                "thinking": "high",
+                "description": "main assistant preset",
+            },
+            "worker": {
+                "model": "solo-model",
+                "thinking": "medium",
+                "description": "worker preset",
+            },
+            "scout": {
+                "model": "solo-model",
+                "thinking": "low",
+                "description": "scout preset",
+            },
+            "heavy": {
+                "model": "solo-model",
+                "thinking": "high",
+                "description": "heavy preset",
             },
         },
     })

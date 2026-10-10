@@ -228,7 +228,9 @@ def test_task_launch_unknown_model_lists_canonical_choices(
         resolve(config, profile, LaunchConfig(model="luna"))
     assert raised.value.field == "config.model"
     assert "Unknown model expression 'luna'" in str(raised.value)
-    assert "Valid canonical models: glm-5-3, large, small" in str(raised.value)
+    assert "Valid canonical models: glm-5-3, large, mistral-large-4, small" in str(
+        raised.value
+    )
 
     config = _with_role(config, "specialist", ("small",))
     with pytest.raises(InvalidLaunchModelError) as raised:

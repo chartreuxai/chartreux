@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from chartreux.core.dispatch.lint import RosterShape, lint_rendered
+from chartreux.core.dispatch.lint import RosterShape, lint_rendered, parse_references
 from chartreux.core.dispatch.presets import (
     ORCHESTRATED_PRESET,
     SHIPPED_PRESETS,
@@ -27,15 +27,20 @@ from chartreux.core.dispatch.renderer import (
 from chartreux.core.dispatch.schema import DispatchPolicy
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.model_catalog.resolver import ModelResolver
 from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.prompts import SystemPrompt
 from chartreux.core.system_prompt import _interpolate_prompt
 from chartreux.core.tools.manager import ToolManager
-from tests.conftest import build_test_vibe_config, multi_model_catalog
+from tests.conftest import (
+    build_test_vibe_config,
+    multi_model_catalog,
+    single_model_catalog,
+)
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "dispatch"
 PINNED_DATE = date(2000, 1, 1)
-TIER_NAMES = ("@small", "@medium", "@large")
+ROSTER_ROLES = ("@scout", "@worker", "@heavy", "@orchestrator")
 
 STANDALONE_SENTENCES = (
     "You may implement directly: make the approved repo edits yourself. "
@@ -90,7 +95,13 @@ def _without_final_newline(text: str) -> str:
     [
         ("standalone", STANDALONE_PRESET, multi_model_catalog()),
         ("orchestrated", ORCHESTRATED_PRESET, multi_model_catalog()),
-        ("orchestrated-singlemodel", ORCHESTRATED_PRESET, SHIPPED_CATALOG),
+        # The single-model case uses an explicit one-model fixture, not
+        # SHIPPED_CATALOG: the shipped roster is two-model since the ML4 entry
+        # landed, and the single-model rendering must stay stable regardless of
+        # how the shipped roster evolves (ADR 0018-G.1's byte baseline is
+        # superseded by these regenerated goldens; see the compatibility tests
+        # below).
+        ("orchestrated-singlemodel", ORCHESTRATED_PRESET, single_model_catalog()),
     ],
     ids=["standalone", "orchestrated", "orchestrated-singlemodel"],
 )
@@ -131,47 +142,50 @@ def test_standalone_context_valve_is_operational_and_prominent(
     assert prompt.index(valve) < prompt.index("Delegation is optional")
 
 
-# --- WP0 baseline compatibility (contracts G.1) -----------------------------
+# --- WP0 baseline compatibility (contract G.1, superseded) ------------------
+#
+# ADR 0018-G.1 pinned the orchestrated multi-model rendering to the WP0 legacy
+# routing bytes. The roster rename (large/medium/small -> worker/scout/heavy)
+# rewrote the curated prose blocks, so that byte baseline is superseded by the
+# regenerated active goldens; the legacy captures under legacy-orchestrated/
+# are preserved untouched as historical artifacts.
 
 
-def test_orchestrated_multi_model_routing_preserves_legacy_cli_bytes() -> None:
-    legacy = (FIXTURES / "legacy-orchestrated" / "cli-routing.md").read_text()
-    region = render_routing_region(
-        ORCHESTRATED_PRESET, _shape(ORCHESTRATED_PRESET, multi_model_catalog())
-    )
-    # The baseline captured the physical source lines, including the final
-    # newline of the last paragraph.
-    assert region.encode().startswith(legacy.rstrip("\n").encode() + b"\n\n")
+def test_orchestrated_multi_model_routing_uses_the_current_roster_roles() -> None:
+    shape = _shape(ORCHESTRATED_PRESET, multi_model_catalog())
+    region = render_routing_region(ORCHESTRATED_PRESET, shape)
+    assert "`@scout` for search, grep, exploration, verification" in region
+    assert "`@worker` for all substantive implementation" in region
+    assert "`@heavy` for architecture, cross-subsystem design" in region
+    task_region = render_task_regions(ORCHESTRATED_PRESET, shape)["routing"]
+    assert 'config={"model": "@scout"}' in task_region
+    assert "`@heavy` launches are for architecture, design, planning" in task_region
 
 
-def test_orchestrated_multi_model_routing_preserves_legacy_task_bytes() -> None:
-    legacy = (FIXTURES / "legacy-orchestrated" / "task-routing.md").read_text()
-    region = render_task_regions(
-        ORCHESTRATED_PRESET, _shape(ORCHESTRATED_PRESET, multi_model_catalog())
-    )["routing"]
-    assert region.encode().startswith(legacy.rstrip("\n").encode() + b"\n\n")
-
-
-def test_orchestrated_multi_model_golden_contains_legacy_bytes() -> None:
+def test_orchestrated_multi_model_golden_supersedes_legacy_bytes() -> None:
     cli = (FIXTURES / "orchestrated" / "cli.md").read_text()
     task = (FIXTURES / "orchestrated" / "task.md").read_text()
     legacy_cli = (FIXTURES / "legacy-orchestrated" / "cli-routing.md").read_text()
     legacy_task = (FIXTURES / "legacy-orchestrated" / "task-routing.md").read_text()
-    assert legacy_cli.rstrip("\n") in cli
-    assert legacy_task.rstrip("\n") in task
+    # The regenerated goldens render the renamed roster; the WP0 legacy bytes
+    # no longer appear (G.1 superseded by the regenerated goldens).
+    assert legacy_cli.rstrip("\n") not in cli
+    assert legacy_task.rstrip("\n") not in task
+    assert "`@scout` for search" in cli
+    assert 'config={"model": "@scout"}' in task
 
 
 # --- Roster-aware rendering (contracts D/G) --------------------------------
 
 
 def test_single_model_routing_is_tier_free() -> None:
-    shape = _shape(ORCHESTRATED_PRESET, SHIPPED_CATALOG)
+    shape = _shape(ORCHESTRATED_PRESET, single_model_catalog())
     assert shape.single_model
     region = render_routing_region(ORCHESTRATED_PRESET, shape)
     task_region = render_task_regions(ORCHESTRATED_PRESET, shape)["routing"]
-    for tier in TIER_NAMES:
-        assert tier not in region
-        assert tier not in task_region
+    for role in ROSTER_ROLES:
+        assert role not in region
+        assert role not in task_region
     assert "Route by task kind through the configured slots" in region
     assert "`mechanical` (profile `worker`) takes search" in region
 
@@ -180,13 +194,53 @@ def test_multi_model_routing_uses_tiers() -> None:
     shape = _shape(ORCHESTRATED_PRESET, multi_model_catalog())
     assert not shape.single_model
     region = render_routing_region(ORCHESTRATED_PRESET, shape)
-    assert "`@small` for search, grep, exploration, verification" in region
-    assert "`@medium` for all substantive implementation" in region
+    assert "`@scout` for search, grep, exploration, verification" in region
+    assert "`@worker` for all substantive implementation" in region
+
+
+def test_shipped_roster_renders_deep_review_without_three_model_diversity_claim() -> (
+    None
+):
+    # The shipped two-model roster renders deep review honestly: ML4 analytical
+    # and peer seats plus the GLM execution seat, with no diversity claim.
+    shape = _shape(ORCHESTRATED_PRESET, SHIPPED_CATALOG)
+    assert not shape.single_model
+    region = render_routing_region(ORCHESTRATED_PRESET, shape)
+    assert (
+        "| `analytical-reviewer` | `reviewer` | `@heavy` | `mistral-large-4` | high |"
+        in region
+    )
+    assert (
+        "| `peer-reviewer` | `reviewer` | `@heavy` | `mistral-large-4` | high |"
+        in region
+    )
+    assert (
+        "| `execution-reviewer` | `reviewer` | `@worker` | `glm-5-3` | medium |"
+        in region
+    )
+
+
+def test_every_role_reference_in_rendered_shipped_prompts_resolves() -> None:
+    resolver = ModelResolver(CatalogSnapshot(SHIPPED_CATALOG, "rendered-roles"))
+    for policy in SHIPPED_PRESETS.values():
+        shape = _shape(policy, SHIPPED_CATALOG)
+        texts = (
+            _render_cli(policy, SHIPPED_CATALOG),
+            _render_task(policy, SHIPPED_CATALOG),
+        )
+        assert shape.bindings
+        for text in texts:
+            for role in dict.fromkeys(parse_references(text).roles):
+                if role == "role":
+                    continue
+                assert resolver.resolve(f"@{role}").base_model
 
 
 def test_roster_shape_ignores_thinking_and_provider_diversity() -> None:
     # One canonical model across thinking levels stays single-model.
-    assert _shape(ORCHESTRATED_PRESET, SHIPPED_CATALOG).single_model
+    assert _shape(ORCHESTRATED_PRESET, single_model_catalog()).single_model
+    # The shipped roster is two-model since the ML4 entry landed.
+    assert not _shape(ORCHESTRATED_PRESET, SHIPPED_CATALOG).single_model
     # The same canonical model reached through two providers is still a
     # single-model roster: provider deployments never manufacture diversity.
     shared = ModelCatalog.model_validate({
@@ -209,20 +263,20 @@ def test_roster_shape_ignores_thinking_and_provider_diversity() -> None:
                 "thinking": "high",
                 "description": "main assistant preset",
             },
-            "small": {
+            "scout": {
                 "model": "shared-model",
                 "thinking": "low",
-                "description": "small preset",
+                "description": "scout preset",
             },
-            "medium": {
+            "worker": {
                 "model": "shared-model",
                 "thinking": "medium",
-                "description": "medium preset",
+                "description": "worker preset",
             },
-            "large": {
+            "heavy": {
                 "model": "shared-model",
                 "thinking": "high",
-                "description": "large preset",
+                "description": "heavy preset",
             },
         },
     })
@@ -235,13 +289,13 @@ def test_standalone_slot_table_is_roster_aware() -> None:
         STANDALONE_PRESET, _shape(STANDALONE_PRESET, multi_model_catalog())
     )
     single = render_routing_region(
-        STANDALONE_PRESET, _shape(STANDALONE_PRESET, SHIPPED_CATALOG)
+        STANDALONE_PRESET, _shape(STANDALONE_PRESET, single_model_catalog())
     )
     assert "| Slot | Profile | Role | Model | Thinking | Purposes |" in multi
-    assert "| `mechanical` | `worker` | `@small` | `alpha-model` | low |" in multi
-    assert "| `mechanical` | `worker` | — | `glm-5-3` | low |" in single
-    for tier in TIER_NAMES:
-        assert tier not in single
+    assert "| `mechanical` | `worker` | `@scout` | `alpha-model` | low |" in multi
+    assert "| `mechanical` | `worker` | — | `solo-model` | low |" in single
+    for role in ROSTER_ROLES:
+        assert role not in single
 
 
 # --- Standalone preset (contracts B) ---------------------------------------
@@ -335,7 +389,7 @@ def test_tool_manager_serves_policy_bound_task_description() -> None:
     manager = ToolManager(lambda: config)
     description = _task_spec_description(manager)
     assert "$dispatch" not in description
-    # The shipped catalog is single-model: the served routing is task-kind.
+    # Standalone task routing is slot-based regardless of roster size.
     assert "Route by the work, not the profile default" in description
     assert "Delegation is optional" in description
     assert description == _render_task(STANDALONE_PRESET, SHIPPED_CATALOG)
@@ -352,7 +406,7 @@ def test_task_description_is_keyed_by_policy() -> None:
     multi_description = _task_spec_description(ToolManager(lambda: multi))
     assert single_description != multi_description
     assert "Delegation is optional" in single_description
-    assert 'config={"model": "@small"}' in multi_description
+    assert 'config={"model": "@scout"}' in multi_description
     # Each manager's spec cache serves its own policy's description.
     assert _task_spec_description(ToolManager(lambda: single)) == single_description
 

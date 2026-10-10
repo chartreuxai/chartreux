@@ -11,11 +11,13 @@ from chartreux.core.dispatch.session import (
     BoundDispatchPolicy,
     SessionPolicyError,
     bind_policy,
+    bind_snapshot_policy,
     resume_policy,
 )
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import CatalogSnapshot
-from chartreux.core.model_catalog.schema import RoleDefinition
+from chartreux.core.model_catalog.resolver import ModelResolver
+from chartreux.core.model_catalog.schema import ModelCatalog, RoleDefinition
 from tests.conftest import build_test_vibe_config
 
 
@@ -37,12 +39,76 @@ def test_snapshot_round_trip_is_resolved_and_immutable():
         restored.version = 2  # type: ignore[assignment]
 
 
+def test_bound_canonical_identities_counts_wire_names_and_thinking_once():
+    # One canonical model served through two providers under different wire
+    # names, bound by every slot at different thinking levels, is one identity
+    # (ADR 0018-G.4: a single-model roster is one canonical model).
+    catalog = ModelCatalog.model_validate({
+        "providers": {
+            "one": {"api_base": "https://one.test"},
+            "two": {"api_base": "https://two.test"},
+        },
+        "models": {
+            "a": {
+                "deployments": [
+                    {"provider": "one", "name": "wire-one"},
+                    {"provider": "two", "name": "wire-two"},
+                ]
+            }
+        },
+        "roles": {
+            "worker": {"model": "a", "thinking": "medium"},
+            "scout": {"model": "a", "thinking": "low"},
+            "heavy": {"model": "a", "thinking": "high"},
+        },
+    })
+    bound = bind_snapshot_policy(CatalogSnapshot(catalog, "wires"))
+    assert len(bound.bindings) == len(STANDALONE_PRESET.slots)
+    assert bound.bound_canonical_identities == frozenset({"a"})
+
+
+def test_bound_canonical_identities_distinguishes_canonical_models():
+    config = config_for_policy()
+    bound = bind_policy(config)
+    # The shipped roster binds glm-5-3 through several slots and
+    # mistral-large-4 through the rest: exactly two identities.
+    assert bound.bound_canonical_identities == frozenset({"glm-5-3", "mistral-large-4"})
+
+
+def test_bound_canonical_identities_excludes_unbound_slots():
+    snapshot = CatalogSnapshot(SHIPPED_CATALOG, "original")
+    models = dict(snapshot.catalog.models)
+    models.pop("mistral-large-4")
+    snapshot = replace(
+        snapshot, catalog=snapshot.catalog.model_copy(update={"models": models})
+    )
+    bound = bind_snapshot_policy(snapshot)
+    # @heavy no longer resolves: those slots stay unbound and out of the
+    # identity set, exactly as identity_for skips them.
+    assert bound.bound_canonical_identities == frozenset({"glm-5-3"})
+    assert bound.identity_for("@heavy") is None
+    assert all(identity.base_model == "glm-5-3" for identity in bound.bindings.values())
+
+
+def test_bind_snapshot_policy_resolves_the_runtime_roster():
+    config = config_for_policy()
+    bound = bind_policy(config)
+    resolved = bind_snapshot_policy(
+        config.catalog_snapshot,
+        allowed_models=config.allowed_models,
+        auto_compact_threshold=config.auto_compact_threshold,
+    )
+    assert resolved.bindings == bound.bindings
+    assert resolved.diagnostics == bound.diagnostics
+    assert resolved.bound_canonical_identities == bound.bound_canonical_identities
+
+
 def test_catalog_edit_does_not_rebind_resumed_slots():
     config = config_for_policy()
     bound = bind_policy(config)
     snapshot = config.catalog_snapshot
     roles = dict(snapshot.catalog.roles)
-    roles["medium"] = RoleDefinition(model="glm-5-3", thinking="off")
+    roles["worker"] = RoleDefinition(model="glm-5-3", thinking="off")
     config.attach_catalog_snapshot(
         replace(
             snapshot,
@@ -99,6 +165,38 @@ def test_removed_bound_reference_is_explicit_error(removed):
         resume_policy(config, saved, profiles)
 
 
+def test_pre_upgrade_policy_with_removed_roles_fails_resume_without_substitution():
+    # A policy saved before the roster rename binds the removed tier roles:
+    # resume fails explicitly (ADR 0018-H forbids substitution), while the
+    # committed model identities are role-free and still resolve.
+    config = config_for_policy()
+    legacy_roles = (
+        "@small",
+        "@medium",
+        "@medium",
+        "@large",
+        "@medium",
+        "@large",
+        "@large",
+        "@medium",
+    )
+    slots = {
+        name: slot.model_copy(update={"role": role})
+        for (name, slot), role in zip(
+            STANDALONE_PRESET.slots.items(), legacy_roles, strict=True
+        )
+    }
+    saved = bind_policy(config).model_dump(mode="json")
+    saved["policy"] = STANDALONE_PRESET.model_copy(update={"slots": slots}).model_dump(
+        mode="json"
+    )
+    with pytest.raises(SessionPolicyError, match="Bound dispatch role removed"):
+        resume_policy(config, saved, BUILTIN_SUBAGENTS)
+    resolver = ModelResolver(CatalogSnapshot(SHIPPED_CATALOG, "committed"))
+    for identity in BoundDispatchPolicy.model_validate(saved).bindings.values():
+        assert resolver.resolve_committed(identity).base_model
+
+
 def test_deployment_unavailable_degrades_without_substitution():
     config = config_for_policy()
     bound = bind_policy(config)
@@ -127,7 +225,7 @@ def test_resume_repair_clears_degradation_diagnostics(monkeypatch):
     models = dict(snapshot.catalog.models)
     models["secondary"] = models["glm-5-3"]
     roles = dict(snapshot.catalog.roles)
-    roles["small"] = RoleDefinition(model="secondary", thinking="low")
+    roles["scout"] = RoleDefinition(model="secondary", thinking="low")
     healthy = replace(
         snapshot,
         catalog=snapshot.catalog.model_copy(update={"models": models, "roles": roles}),

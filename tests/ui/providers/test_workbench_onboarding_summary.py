@@ -138,7 +138,7 @@ def test_completion_checks_dispatch_roles_not_unreferenced_drafts(
 ) -> None:
     snapshot = load_catalog(tmp_path / "models.toml")
     roles = dict(snapshot.catalog.roles)
-    roles["draft"] = roles["small"].model_copy(update={"model": "not-configured"})
+    roles["draft"] = roles["scout"].model_copy(update={"model": "not-configured"})
     state = ManagementState.from_snapshot(
         replace(snapshot, catalog=snapshot.catalog.model_copy(update={"roles": roles})),
         "mistral",
@@ -146,9 +146,9 @@ def test_completion_checks_dispatch_roles_not_unreferenced_drafts(
     assert not state.validate(
         mode="onboarding", credential_resolver=lambda _: "ready"
     ).errors
-    state.set_role_preset("small", "not-configured", "low")
+    state.set_role_preset("scout", "not-configured", "low")
     assert (
-        "small"
+        "scout"
         in state.validate(
             mode="onboarding", credential_resolver=lambda _: "ready"
         ).unresolved_roles
@@ -158,7 +158,7 @@ def test_completion_checks_dispatch_roles_not_unreferenced_drafts(
 def test_mode_save_preserves_custom_slots_and_uses_new_preset(tmp_path: Path) -> None:
     snapshot = load_catalog(tmp_path / "models.toml")
     slots = dict(snapshot.dispatch.slots)
-    slots["mechanical"] = slots["mechanical"].model_copy(update={"role": "@medium"})
+    slots["mechanical"] = slots["mechanical"].model_copy(update={"role": "@heavy"})
     snapshot = replace(
         snapshot, dispatch=snapshot.dispatch.model_copy(update={"slots": slots})
     )
@@ -167,7 +167,7 @@ def test_mode_save_preserves_custom_slots_and_uses_new_preset(tmp_path: Path) ->
     changes = state.changes()
     assert changes.dispatch is not None
     assert changes.dispatch["mode"] == "orchestrated"
-    assert state._dispatch.slots["mechanical"].role == "@medium"
+    assert state._dispatch.slots["mechanical"].role == "@heavy"
     assert (
         state._dispatch.instructions
         == SHIPPED_PRESETS[DispatchMode.ORCHESTRATED].instructions

@@ -214,8 +214,8 @@ def test_settings_provenance(snap_compare: SnapCompare) -> None:
             for screen in pilot.app.screen_stack
             if isinstance(screen, SettingsScreen)
         )
-        field = screen.fields["show_greeting"]
-        screen.fields["show_greeting"] = field.model_copy(
+        field = screen.fields["autocopy_to_clipboard"]
+        screen.fields["autocopy_to_clipboard"] = field.model_copy(
             update={
                 "saved_explicit": True,
                 "saved_value": True,

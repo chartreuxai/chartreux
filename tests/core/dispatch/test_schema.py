@@ -3,7 +3,6 @@ from __future__ import annotations
 from copy import deepcopy
 from hashlib import sha256
 import json
-from pathlib import Path
 import tomllib
 from typing import Any
 
@@ -164,17 +163,18 @@ def test_vocabulary_has_all_developer_owned_descriptions() -> None:
 def test_presets_and_legacy_curated_blocks() -> None:
     assert DEFAULT_DISPATCH_MODE == DispatchMode.STANDALONE
     assert set(SHIPPED_PRESETS) == {"standalone", "orchestrated"}
-    baseline = (
-        (
-            Path(__file__).parents[2]
-            / "fixtures/dispatch/legacy-orchestrated/cli-routing.md"
-        )
-        .read_text()
-        .split("\n\n")
+    # The WP0 byte-equality baseline (ADR 0018-G.1) is superseded: the roster
+    # rename rewrote the curated prose blocks, and the regenerated active
+    # goldens are the byte baseline now. The legacy captures stay untouched.
+    assert (
+        "The shipped model roles are `orchestrator` for the main assistant and "
+        "`worker`, `scout`, and `heavy` for subagent work."
+        in ORCHESTRATED_PRESET.instructions
     )
-    assert ORCHESTRATED_PRESET.instructions == baseline[0]
-    assert ORCHESTRATED_PRESET.contrasts == baseline[1]
-    assert ORCHESTRATED_PRESET.failure_routing == baseline[2]
+    assert 'config={"model": "@scout"}' in ORCHESTRATED_PRESET.contrasts
+    assert "retry at `@worker` with a different approach" in (
+        ORCHESTRATED_PRESET.failure_routing
+    )
     assert "You may implement directly:" in STANDALONE_PRESET.instructions
     assert (
         "Never run tests, builds, or other verification yourself"
@@ -204,7 +204,8 @@ def test_policy_is_revision_hashable_as_canonical_data() -> None:
 
 
 def test_shipped_model_payload_and_role_bindings_preserved() -> None:
-    # Payload captured from WP0 HEAD (30751cb), before thinning descriptions.
+    # GLM payload captured from WP0 HEAD (30751cb), before thinning
+    # descriptions.
     assert SHIPPED_CATALOG.models["glm-5-3"].model_dump() == {
         "thinking": "high",
         "temperature": None,
@@ -221,21 +222,38 @@ def test_shipped_model_payload_and_role_bindings_preserved() -> None:
             },
         ),
     }
-    assert set(SHIPPED_CATALOG.models) == {"glm-5-3"}
+    # The ML4 entry ships the runtime-confirmed wire ID at launch-sale prices.
+    assert SHIPPED_CATALOG.models["mistral-large-4"].model_dump() == {
+        "thinking": "high",
+        "temperature": None,
+        "disabled": False,
+        "deployments": (
+            {
+                "provider": "mistral",
+                "name": "mistral-large-4",
+                "prices": {"input": 0.68, "output": 2.09, "cached_input": 0.07},
+                "supports_images": True,
+                "supported_thinking_levels": None,
+                "auto_compact_threshold": 400000,
+                "disabled": False,
+            },
+        ),
+    }
+    assert set(SHIPPED_CATALOG.models) == {"glm-5-3", "mistral-large-4"}
     assert {
         name: (role.model, role.thinking)
         for name, role in SHIPPED_CATALOG.roles.items()
     } == {
         "orchestrator": ("glm-5-3", "high"),
-        "large": ("glm-5-3", "high"),
-        "medium": ("glm-5-3", "medium"),
-        "small": ("glm-5-3", "low"),
+        "worker": ("glm-5-3", "medium"),
+        "scout": ("glm-5-3", "low"),
+        "heavy": ("mistral-large-4", "high"),
     }
     assert {role.description for role in SHIPPED_CATALOG.roles.values()} == {
         "main assistant preset",
-        "large preset",
-        "medium preset",
-        "small preset",
+        "worker preset",
+        "scout preset",
+        "heavy preset",
     }
     slots = ORCHESTRATED_PRESET.slots
     assert "implementor" != slots["implementor"].role[1:]
@@ -247,5 +265,5 @@ def test_shipped_model_payload_and_role_bindings_preserved() -> None:
         )
         for slot in slots.values()
     }
-    assert len({model for model, _ in bindings}) == 1
+    assert len({model for model, _ in bindings}) == 2
     assert len(bindings) == 3

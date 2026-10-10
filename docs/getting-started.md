@@ -74,6 +74,11 @@ using onboarding:
 export MISTRAL_API_KEY="your-api-key"
 ```
 
+If startup reports a missing credential, the message names the selected provider
+and required environment variable. Repair that provider with `chartreux --setup`
+or **Settings > Providers** (`/providers`). Supplying a credential for a different
+provider does not change routing; select/configure the provider you intend to use.
+
 ## Check setup
 
 Run `chartreux doctor` from the project directory to validate local

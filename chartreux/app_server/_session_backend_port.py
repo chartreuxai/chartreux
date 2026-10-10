@@ -32,6 +32,8 @@ from chartreux.app_server.protocol import (
     RootsReadResponse,
     RootsReplaceParams,
     RootsReplaceResponse,
+    RootsSaveParams,
+    RootsSaveResponse,
     RuntimeUpdatedParams,
     SessionCompactParams,
     SessionCompactResponse,
@@ -256,6 +258,8 @@ class SessionBackend(Protocol):  # noqa: PLR0904 - unified backend contract
     async def replace_roots(
         self, params: RootsReplaceParams
     ) -> SessionBackendResult[RootsReplaceResponse]: ...
+
+    async def save_roots(self, params: RootsSaveParams) -> RootsSaveResponse: ...
 
     async def read_mcp(self) -> SessionMCPState: ...
 

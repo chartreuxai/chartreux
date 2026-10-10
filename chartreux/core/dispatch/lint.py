@@ -212,7 +212,7 @@ def lint_catalog(
 
 def _contrast_slots(policy: DispatchPolicy) -> set[str]:
     slots = set(parse_references(policy.contrasts).slots)
-    # Preserve the verbatim legacy examples: a worker @small override and a
+    # Preserve the verbatim legacy examples: a worker @scout override and a
     # worker default (implementation) represent distinct named launch seats.
     for match in re.finditer(
         r"task\(agent_type=\"([^\"]+)\"(.*?)(?=\. `|`\.|$)", policy.contrasts

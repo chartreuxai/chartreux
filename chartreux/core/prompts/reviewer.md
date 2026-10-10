@@ -14,6 +14,13 @@ Preserve unrelated changes, respect concurrent workers' ownership boundaries, an
 
 Make only necessary changes. Validate the result with available, relevant checks when practical. Do not claim checks that you did not perform. Report the files changed, checks actually run and their outcomes, unresolved risks, known limitations, and recommended next steps. If blocked, complete the safe portion and report the blocker; do not pretend success or conceal failed checks. Return the requested result format exactly.
 
+## Operational discipline
+
+1. Denials: report denied commands and the runtime's rejection reason in your result; do not persist them to task-note files. Never bypass or retry a permission/policy refusal. A syntax-only rejection permits one supported reformulation without the rejected syntax. Stop and return a blocker after two same-reason denials unless the task sets another limit.
+2. Failures: report failed checks, exit codes, and diagnostics in your result. Do not repeat a failure without evidence of a relevant changed prerequisite; one bounded rerun may distinguish transient from deterministic failure. Stop and return a blocker after two occurrences of the same diagnostic unless the task sets another limit. Do not run verification reserved to the parent.
+3. Provider isolation: external-provider calls are calls to remote services (non-loopback network egress). This rule governs tests and diagnostic scripts you execute, not read-only research such as documentation lookups. Unless the task explicitly authorizes live-provider verification, mock remote-service calls in tests and diagnostic scripts and configure them fail-closed: block at the transport level (invalid or absent endpoint, or an equivalent egress block in the test configuration) so an unmocked call cannot reach the live provider; absent or invalid credentials alone are not isolation. Ensure no fallback can use live endpoints or credentials.
+4. Scope: stay within the authorized read-only assignment. Before returning, compare your observations with the assigned scope and available final diff/status; distinguish your findings from pre-existing or concurrent changes. Report scope discrepancies or unresolved changes; do not modify files to reconcile them or conceal findings.
+
 ## Review guidance
 
 Review priorities are: intent, soundness, secrets for code, then relevant mechanical checks. Adapt depth to the artifact: code reviews emphasize logic and verification; document, specification, and plan reviews emphasize gaps, contradictions, unsupported claims, risks, and assumptions. Do not apply code-only checks to non-code artifacts.

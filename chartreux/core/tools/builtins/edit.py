@@ -38,7 +38,15 @@ from chartreux.utils.tool_presentation import ToolEffectKind
 
 
 class EditArgs(BaseModel):
-    file_path: ToolPath = Field(description="The absolute path to the file to modify")
+    file_path: ToolPath = Field(
+        description=(
+            "The absolute path to the file to modify. Paths outside the session's authorized "
+            "roots may still be attempted: in interactive sessions the runtime asks the user to "
+            "grant access and the operation proceeds on approval; the tool result states when "
+            "access is unavailable or was declined, and only then is config or manual fallback "
+            "appropriate."
+        )
+    )
     old_string: str = Field(
         description=(
             "The text to replace; may be empty only when populating an empty "

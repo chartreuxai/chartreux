@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -69,6 +69,7 @@ from chartreux.core.config import (
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
+from chartreux.core.config.types import ConfigSaveResult
 from chartreux.core.dispatch.session import BoundDispatchPolicy, resume_policy
 from chartreux.core.hooks.config import load_hooks_from_fs
 from chartreux.core.hooks.models import HookConfigResult
@@ -272,8 +273,10 @@ class _AgentLoopBlueprint:
             inherited_restrictions=self.policy.inherited_restrictions,
             inherited_mode_restrictions=self.policy.inherited_mode_restrictions,
             inherited_plan_write_scopes=self.policy.inherited_plan_write_scopes,
+            inherited_root_grants=self.policy.inherited_root_grants,
             parent_authority_getter=self.policy.parent_authority_getter,
             parent_authority_revision_getter=self.policy.parent_authority_revision_getter,
+            user_input_capability=self.policy.user_input_capability,
             launch_profile=self.launch_profile,
             launch_overrides=self.launch_overrides,
             frozen_system_prompt_id=self.frozen_system_prompt_id,
@@ -350,6 +353,11 @@ class _RootRuntimeBlueprint:
             headless=self.options.headless,
             hook_config_result=self.hook_config_result,
             cache_store=self.cache_store,
+            user_input_capability=(
+                self.client_info.entrypoint == "cli"
+                and not self.options.headless
+                and "user_input" in self.client_capabilities.callback_kinds
+            ),
             # The legacy AgentLoop generates background titles for CLI and Desktop.
             # Other clients retain the preview, and config can disable generation.
             auto_title_enabled=(
@@ -919,6 +927,39 @@ class AgentRuntimeFactory:
             ),
         ).build()
         return replacement
+
+
+class SessionRootGrantPort:
+    """Runtime-owned port applying and persisting approved root grants.
+
+    A mid-turn grant is session authority only: no config write, no policy or
+    roots replacement, and no tree-idle reservation. The registry resolves the
+    calling session; the loop's store and authority caches carry the grant.
+    Saving is the dedicated user-layer persistence path: the registry routes
+    it to the root orchestrator keyed by the registered caller's cwd, so child
+    orchestrators never write.
+    """
+
+    def __init__(
+        self,
+        resolve_session: Callable[[str], AgentLoop | None],
+        save_grant: Callable[[str, Path, str], Awaitable[ConfigSaveResult]],
+    ) -> None:
+        self._resolve_session = resolve_session
+        self._save_grant = save_grant
+
+    async def grant_root(self, session_id: str, root: Path) -> None:
+        loop = self._resolve_session(session_id)
+        if loop is None:
+            raise RuntimeError(
+                f"Root grant requires a registered session: {session_id}"
+            )
+        loop.apply_root_grant(root)
+
+    async def save_root(
+        self, session_id: str, root: Path, expected_revision: str
+    ) -> ConfigSaveResult:
+        return await self._save_grant(session_id, root, expected_revision)
 
 
 class HarnessProcess:

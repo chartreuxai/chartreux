@@ -83,7 +83,6 @@ The active-work cap counts foreground and background runs, including reuse and p
 | --- | --- | --- |
 | `theme` | `"auto"` | `auto`, `light`, or `dark`. |
 | `disable_welcome_banner_animation` | `false` | Boolean. |
-| `show_greeting` | `true` | Boolean. |
 | `autocopy_to_clipboard` | `true` | Boolean. |
 | `file_watcher_for_autocomplete` | `false` | Boolean. |
 | `ask_confirmation_on_exit` | `true` | Boolean. Controls confirmation for idle Ctrl-C/Ctrl-D quits; `/exit` exits immediately while idle. Confirmation for consequential active work is always shown. |
@@ -158,7 +157,7 @@ from the end, preserving directory and context.
 | `[session_logging].session_prefix` | `"session"` | String. |
 | `[session_logging].enabled` | `true` | Boolean. |
 | `[session_logging].generate_titles` | `false` | Boolean. |
-| `authorized_roots_by_project` | `{}` | User-layer-only map of absolute project paths to lists of absolute additional roots. It cannot be changed through general configuration writes. |
+| `authorized_roots_by_project` | `{}` | User-layer-only map of absolute project paths to lists of absolute additional roots. It cannot be changed through general configuration writes. In the interactive TUI, choosing **Always for this project** saves an out-of-root grant here; saved grants apply at the next session start, and `/reload` applies them immediately. |
 
 ## MCP server tables
 
@@ -209,9 +208,9 @@ Set the orchestrator or other role's `thinking` in `models.toml`; use
 | `[models."base".deployments.prices]` | `input`, `output`, and `cached_input`: non-negative price per million tokens. Omit an unknown price; zero means explicitly free. |
 | `[roles."name"]` | Default preset: `model` is one canonical base-model name; `thinking` is one of `off`, `low`, `medium`, `high`, or `max`; `description` is optional. Old `models` lists are rejected. |
 
-The shipped role presets are `orchestrator` (the main assistant), `large`,
-`medium`, and `small`. Worker and Reviewer profiles use `medium`; Advisor uses
-`large`. The preset editor labels `orchestrator` as **Main**.
+The shipped role presets are `orchestrator` (the main assistant), `worker`,
+`scout`, and `heavy`. Worker and Reviewer profiles use `worker`; Advisor uses
+`heavy`. The preset editor labels `orchestrator` as **Main**.
 
 ### Dispatch overlay
 

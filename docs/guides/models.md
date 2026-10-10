@@ -14,7 +14,7 @@ A provider describes an endpoint, credential variable, and protocol. The shipped
 - A generic OpenAI-style endpoint (`api_style = "openai"`, `backend = "generic"`).
 - An Anthropic-style endpoint (`api_style = "anthropic"`, `backend = "generic"`).
 
-Provider names are the keys you choose (for example, `example-openai`); leading and trailing whitespace is trimmed, and `/`, `@`, control characters, and empty names are rejected. Names retain their spelling and case and must be unique. A provider’s `api_key_env_var` identifies its credential; see [Configuration](configuration.md) for `.env` and process-environment precedence.
+Provider names are the keys you choose (for example, `example-openai`); leading and trailing whitespace is trimmed, and `/`, `@`, control characters, and empty names are rejected. Names retain their spelling and case and must be unique. A provider’s `api_key_env_var` identifies its credential; see [Configuration](configuration.md) for `.env` and process-environment precedence. If the selected provider's credential is missing, startup names that provider and variable. Repair it with `chartreux --setup` or **Settings > Providers** (`/providers`); another provider's credential does not change routing.
 
 ## Catalog overlays
 
@@ -107,12 +107,12 @@ compaction_model = "example-model"
 allowed_models = ["example-model"]
 ```
 
-The shipped presets are `orchestrator` (the main assistant), `large`,
-`medium`, and `small`. Built-in Worker and Reviewer profiles use `medium` by
-default; Advisor uses `large`. The UI labels `orchestrator` as **Main**.
+The shipped presets are `orchestrator` (the main assistant), `worker`, `scout`,
+and `heavy`. Built-in Worker and Reviewer profiles use `worker` by default;
+Advisor uses `heavy`. The UI labels `orchestrator` as **Main**.
 
 A role is one default preset: a canonical model and a thinking level. A role
-expression such as `@medium` selects that exact pair. Different roles can use
+expression such as `@worker` selects that exact pair. Different roles can use
 the same model with different thinking levels. An unavailable model or
 credential produces an explicit error; Chartreux does not select another
 canonical model from the role. A session or retained child preserves its
@@ -124,6 +124,27 @@ Shipped roles are the four presets above; they can be patched one role at a
 time in `models.toml`. Custom roles are TOML-only: define `[roles.<name>]` with
 `description`, `model`, and `thinking`; the preset editor selects built-in
 roles. Old `models = [...]` role tables are rejected with a conversion hint.
+
+The former thinking-tier roles `small`, `medium`, `large`, and `peer` are no
+longer shipped; the current model-tier roles are `orchestrator`, `worker`,
+`scout`, and `heavy`. Review every `[roles.<name>]` and `[dispatch.slots.*]`
+entry in an existing overlay after upgrading:
+
+- A sparse patch of a removed role loses the shipped fields it inherited and
+  fails validation. Replace it with a complete role definition including
+  `description`, `model`, and `thinking`, or bind it to an available shipped
+  role.
+- Complete definitions of old roles remain as custom roles; they are not
+  deleted. Rename or remove them yourself if you no longer want them.
+- A dispatch overlay that references a role that does not exist falls back to
+  the applicable default and emits a diagnostic. Update the `role` binding to
+  an existing role in `models.toml`.
+- A saved session dispatch policy that references a removed role fails resume
+  with `SessionPolicyError` ("Bound dispatch role removed"). No role
+  substitution is performed; start a new session with a repaired dispatch
+  configuration. Committed model identities still resolve independently of
+  roles.
+
 Role descriptions are brief model-preset descriptions, not dispatch policy:
 routing semantics are defined by the dispatch purpose vocabulary and rendered
 slots. To select dispatch behavior, add a `[dispatch]` overlay in `models.toml`:
@@ -133,7 +154,7 @@ slots. To select dispatch behavior, add a `[dispatch]` overlay in `models.toml`:
 mode = "orchestrated"
 
 [dispatch.slots.implementor]
-role = "@medium"
+role = "@worker"
 ```
 
 Without an explicit mode, fresh sessions use `standalone` (direct implementation,

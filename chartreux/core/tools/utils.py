@@ -200,6 +200,7 @@ def resolve_path_permission(
         return PermissionContext(
             permission=ToolPermission.NEVER,
             reason="Foreign Windows paths are not supported on POSIX",
+            denial_kind="path_rule",
         )
     file_str = str(_make_absolute(path_str, cwd).resolve())
 
@@ -208,6 +209,7 @@ def resolve_path_permission(
             return PermissionContext(
                 permission=ToolPermission.NEVER,
                 reason="File access denied by a configured path rule",
+                denial_kind="path_rule",
             )
 
     for pattern in allowlist:
@@ -292,6 +294,10 @@ class PathAuthority:
         for parent in self.parents:
             inherited = parent.resolve(path, access)
             if inherited is not None and inherited.permission == ToolPermission.NEVER:
+                if inherited.denial_kind == "out_of_root":
+                    return inherited.model_copy(
+                        update={"denial_kind": "parent_ceiling"}
+                    )
                 return inherited
         return decision
 
@@ -300,7 +306,7 @@ class PathAuthority:
         return decision is not None and decision.permission == ToolPermission.ALWAYS
 
 
-def resolve_file_tool_permission(  # noqa: PLR0911, PLR0913 - independent runtime denial ceilings
+def resolve_file_tool_permission(  # noqa: PLR0911, PLR0912, PLR0913 - independent runtime denial ceilings
     path_str: str,
     *,
     tool_name: str,
@@ -327,7 +333,9 @@ def resolve_file_tool_permission(  # noqa: PLR0911, PLR0913 - independent runtim
     """
     if config_permission == ToolPermission.NEVER:
         return PermissionContext(
-            permission=ToolPermission.NEVER, reason=f"Tool denied: {tool_name}"
+            permission=ToolPermission.NEVER,
+            reason=f"Tool denied: {tool_name}",
+            denial_kind="tool_policy",
         )
     workspace = workspace or ambient_workspace()
     cwd = workspace.cwd
@@ -345,6 +353,7 @@ def resolve_file_tool_permission(  # noqa: PLR0911, PLR0913 - independent runtim
         return PermissionContext(
             permission=ToolPermission.NEVER,
             reason=f"Sensitive file access denied ({tool_name})",
+            denial_kind="sensitive",
         )
 
     # Every parent scope is a ceiling, never a union of descendant allowances.
@@ -366,6 +375,7 @@ def resolve_file_tool_permission(  # noqa: PLR0911, PLR0913 - independent runtim
             return PermissionContext(
                 permission=ToolPermission.NEVER,
                 reason="Parent Plan scope permits writes only to its designated plan file or session scratchpad",
+                denial_kind="plan_scope",
             )
 
     roots = scratchpad_roots
@@ -384,6 +394,7 @@ def resolve_file_tool_permission(  # noqa: PLR0911, PLR0913 - independent runtim
             reason=None
             if allowed
             else "Plan mode permits file writes only to the designated plan file or session scratchpad",
+            denial_kind=None if allowed else "plan_scope",
         )
 
     if (
@@ -395,6 +406,7 @@ def resolve_file_tool_permission(  # noqa: PLR0911, PLR0913 - independent runtim
         return PermissionContext(
             permission=ToolPermission.NEVER,
             reason="File access outside authorized project and session scratch roots; only an explicit user scope change can authorize it",
+            denial_kind="plan_scope",
         )
     if in_scratchpad:
         return PermissionContext(permission=ToolPermission.ALWAYS)
@@ -429,6 +441,23 @@ def resolve_file_tool_permission(  # noqa: PLR0911, PLR0913 - independent runtim
             if tool_name in {"write_file", "edit"} and file_path in files
             else "File access outside authorized project and session scratch roots; only an explicit user scope change can authorize it"
         )
-        return PermissionContext(permission=ToolPermission.NEVER, reason=reason)
+        own_roots_allow = False
+        try:
+            own_roots_allow = any(
+                root.resolve() == root and file_path.is_relative_to(root)
+                for root in workspace.authorized_roots
+            )
+        except (ValueError, OSError):
+            own_roots_allow = False
+        ceiling_allows = workspace.ceiling is None or workspace.ceiling.allows(
+            file_path
+        )
+        return PermissionContext(
+            permission=ToolPermission.NEVER,
+            reason=reason,
+            denial_kind="out_of_root"
+            if not own_roots_allow and ceiling_allows
+            else "parent_ceiling",
+        )
 
     return PermissionContext(permission=ToolPermission.ALWAYS)

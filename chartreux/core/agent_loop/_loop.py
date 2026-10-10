@@ -20,6 +20,18 @@ from uuid import uuid4
 from pydantic import BaseModel, JsonValue
 
 from chartreux.core.agent_loop._request_broker import InteractionRequestBroker
+from chartreux.core.agent_loop._root_grants import (
+    ROOT_GRANT_DECLINED_FEEDBACK,
+    ROOT_GRANT_DENY,
+    ROOT_GRANT_PROJECT,
+    ROOT_GRANT_TOOLS,
+    SessionRootGrants,
+    parse_root_grant_result,
+    propose_root_grant,
+    root_grant_request,
+    root_grant_save_note,
+    root_grant_target,
+)
 from chartreux.core.agent_loop._title_cadence import TitleCadence
 from chartreux.core.agent_loop.backend_lifetime import BackendLifetime, BackendPublish
 from chartreux.core.agent_loop.errors import (
@@ -60,6 +72,7 @@ from chartreux.core.compaction import (
 from chartreux.core.compaction.context import select_model_context
 from chartreux.core.config import ChartreuxConfigSchema, ModelConfig, ProviderConfig
 from chartreux.core.config._restrictions import SourceRestrictions
+from chartreux.core.config._root_persistence import read_saved_roots
 from chartreux.core.config.harness_files import (
     HarnessFilesManager,
     get_harness_files_manager,
@@ -136,6 +149,7 @@ from chartreux.core.model_catalog.availability import (
 from chartreux.core.plan_session import PlanSession
 from chartreux.core.review import ReviewManager
 from chartreux.core.rewind import RewindManager
+from chartreux.core.root_grants import RootGrantPort
 from chartreux.core.scratchpad import cleanup_scratchpad, init_scratchpad
 from chartreux.core.session.session_id import extract_suffix, generate_session_id
 from chartreux.core.session.session_lease import SessionLease
@@ -177,6 +191,7 @@ from chartreux.core.tools.builtins.todo import TodoState
 from chartreux.core.tools.builtins.wait_for_agent import WaitForAgent
 from chartreux.core.tools.io_port import ToolIOPort
 from chartreux.core.tools.manager import NoSuchToolError, ToolManager
+from chartreux.core.tools.permissions import PermissionContext
 from chartreux.core.tools.ui import ToolUIDataAdapter
 from chartreux.core.usage import AsyncUsageWriter, UsageAttribution, UsagePurpose
 from chartreux.core.utils import (
@@ -191,8 +206,35 @@ from chartreux.core.utils import (
 from chartreux.core.workspace import Workspace
 from chartreux.observability.logging import logger
 from chartreux.user_content import UserDisplayContent, UserResource
+from chartreux.utils import VIBE_WARNING_TAG
 from chartreux.utils.cache_store import CacheStore, InMemoryCacheStore
 from chartreux.utils.http import get_user_agent
+
+
+def _retrieve_future_exception(future: asyncio.Future[str]) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
+def _out_of_root_denial(ctx: PermissionContext, tool_name: str) -> ToolDecision:
+    """Denial decision that names the persistent config knob for the path."""
+    reason = ctx.reason or f"Tool '{tool_name}' is disabled by policy"
+    return ToolDecision(
+        verdict=ToolExecutionResponse.SKIP,
+        approval_type=ToolPermission.NEVER,
+        feedback=(
+            f"{reason} Add the path to authorized_roots_by_project for this "
+            "project in your user config.toml to authorize it."
+        ),
+    )
+
+
+def _declined_root_decision() -> ToolDecision:
+    return ToolDecision(
+        verdict=ToolExecutionResponse.SKIP,
+        approval_type=ToolPermission.NEVER,
+        feedback=ROOT_GRANT_DECLINED_FEEDBACK,
+    )
 
 
 def _is_git_executable_available() -> bool:
@@ -220,6 +262,7 @@ class ToolDecision(BaseModel):
     verdict: ToolExecutionResponse
     approval_type: ToolPermission
     feedback: str | None = None
+    result_note: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +291,7 @@ class AgentRuntimePolicy:
     headless: bool
     hook_config_result: HookConfigResult | None
     cache_store: CacheStore
+    user_input_capability: bool = False
     # Whether this surface wants background LLM session titles. Core owns the
     # capability; the delivery layer (app server) owns this policy decision.
     auto_title_enabled: bool = False
@@ -255,6 +299,10 @@ class AgentRuntimePolicy:
     inherited_restrictions: tuple[SourceRestrictions, ...] = ()
     inherited_mode_restrictions: tuple[SourceRestrictions, ...] = ()
     inherited_plan_write_scopes: tuple[tuple[Path, Path | None], ...] = ()
+    # Bare canonical roots granted to the launching session at dispatch time.
+    # A dedicated slot, never a synthesized config-source authority, so policy
+    # replacement and partitioning never treat session grants as policy.
+    inherited_root_grants: tuple[Path, ...] = ()
     parent_authority_getter: Callable[[], ToolManager] | None = None
     parent_authority_revision_getter: Callable[[], int] | None = None
 
@@ -425,6 +473,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         mcp_registry: MCPRegistry | None = None,
         cache_store: CacheStore | None = None,
         auto_title_enabled: bool = False,
+        user_input_capability: bool = False,
         parent_session_id: str | None = None,
         cwd: Path | None = None,
         harness_files: HarnessFilesManager | None = None,
@@ -435,6 +484,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         inherited_restrictions: tuple[SourceRestrictions, ...] = (),
         inherited_mode_restrictions: tuple[SourceRestrictions, ...] = (),
         inherited_plan_write_scopes: tuple[tuple[Path, Path | None], ...] = (),
+        inherited_root_grants: tuple[Path, ...] = (),
         parent_authority_getter: Callable[[], ToolManager] | None = None,
         parent_authority_revision_getter: Callable[[], int] | None = None,
         launch_profile: str | None = None,
@@ -445,6 +495,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         accounting_owner: RootAccountingOwner | None = None,
         background_jobs: BackgroundJobsPort | None = None,
         bound_dispatch_policy: BoundDispatchPolicy | None = None,
+        root_grant_port: RootGrantPort | None = None,
     ) -> None:
         self._background_job_registry = None if is_subagent else BackgroundJobRegistry()
         self.background_jobs = (
@@ -475,11 +526,19 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if is_subagent and inherited_workspace is None:
             raise ValueError("Subagent construction requires inherited_workspace")
         self._inherited_workspace = inherited_workspace
+        self._session_root_grants = SessionRootGrants()
+        # Inherited grants seed this session's own store: they are launch-time
+        # authority, frozen here, and never widened by later parent grants.
+        for inherited_root in inherited_root_grants:
+            self._session_root_grants.grant(inherited_root)
+        self._root_grant_port = root_grant_port
+        self._root_grant_askers: set[asyncio.Task[None]] = set()
         self.harness_files = replace(
             harness_files or get_harness_files_manager(), cwd=self.cwd
         )
         self._config_orchestrator = config_orchestrator
         self._auto_title_enabled = auto_title_enabled
+        self._user_input_capability = user_input_capability
         self._headless = headless
         self._is_subagent = is_subagent
         self.cache_store = cache_store or InMemoryCacheStore()
@@ -565,6 +624,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             harness_files=self.harness_files,
             scratchpad_dir=self.scratchpad_dir,
             task_description=task_description_for_config(config),
+            session_root_grants=self._session_root_grants,
         )
         self.skill_manager = SkillManager(
             lambda: self.config, harness_files=self.harness_files
@@ -791,6 +851,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             headless=self._headless,
             hook_config_result=self._hook_config_result,
             cache_store=self.cache_store,
+            user_input_capability=self._user_input_capability,
             auto_title_enabled=self._auto_title_enabled,
             inherited_restrictions=self._inherited_restrictions,
             inherited_mode_restrictions=self._inherited_mode_restrictions,
@@ -799,6 +860,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             parent_authority_getter=self._parent_authority_getter,
             parent_authority_revision_getter=self._parent_authority_revision_getter,
         )
+
+    @property
+    def _dispatch_root_grants(self) -> tuple[Path, ...]:
+        """Sorted bare canonical roots granted to this session at a dispatch."""
+        store = getattr(self, "_session_root_grants", None)
+        return tuple(sorted(store.roots)) if store is not None else ()
 
     @property
     def child_runtime_policy(self) -> AgentRuntimePolicy:
@@ -820,6 +887,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     + tuple(source for source in sources if source.kind == "source")
                 )
             ),
+            inherited_root_grants=self._dispatch_root_grants,
         )
 
     async def record_child_session(
@@ -956,6 +1024,23 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
     def reject_request(self, request_id: str, error: BaseException) -> None:
         self._request_broker.reject(request_id, error)
+
+    def bind_root_grant_port(self, port: RootGrantPort) -> None:
+        """Bind the runtime-owned port that applies approved session root grants."""
+        self._root_grant_port = port
+
+    def apply_root_grant(self, root: Path) -> bool:
+        """Apply a user-approved root grant to this session's live authority."""
+        granted = self._session_root_grants.grant(root)
+        self.tool_manager._invalidate_session_root_grants()
+        return granted
+
+    async def _apply_approved_root_grant(self, root: Path) -> None:
+        port = self._root_grant_port
+        if port is not None:
+            await port.grant_root(self.session_id, root)
+        else:
+            self.apply_root_grant(root)
 
     @property
     def init_duration_ms(self) -> int | None:
@@ -1291,6 +1376,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 harness_files=self.harness_files,
                 scratchpad_dir=self.scratchpad_dir,
                 task_description=task_description_for_config(target_config),
+                session_root_grants=self._session_root_grants,
             )
         system_prompt = self._render_system_prompt(
             self.skill_manager, target_config, tool_manager, self.agent_manager
@@ -2722,7 +2808,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             for key in keys:
                 self._tool_invocations.pop(key, None)
             self._publish_wait_state(turn_id)
-            self._request_broker.unbind(queue)
+            self._close_tool_batch(queue)
             self._tool_event_queue = None
             if not monitor.done():
                 monitor.cancel()
@@ -2791,7 +2877,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         timing = InvocationTiming()
         try:
             decision = await self._should_execute_tool(
-                tool_instance, tool_call.validated_args
+                tool_instance, tool_call.validated_args, tool_call.call_id
             )
 
             if decision.verdict == ToolExecutionResponse.SKIP:
@@ -2951,6 +3037,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         extra = tool_instance.get_result_extra(result_model)
         if extra:
             text += "\n\n" + extra
+        if decision.result_note:
+            text += (
+                f"\n\n<{VIBE_WARNING_TAG}>{decision.result_note}</{VIBE_WARNING_TAG}>"
+            )
 
         result_cancelled = (
             isinstance(result_model, CancellableToolResult) and result_model.cancelled
@@ -2999,7 +3089,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         )
 
     async def _should_execute_tool(
-        self, tool: BaseTool, args: BaseModel
+        self, tool: BaseTool, args: BaseModel, tool_call_id: str | None = None
     ) -> ToolDecision:
         tool_name = tool.get_name()
         # Always evaluate invocation guards, even with old grants/bypass flags.
@@ -3008,6 +3098,16 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if config_perm == ToolPermission.NEVER or (
             ctx is not None and ctx.permission == ToolPermission.NEVER
         ):
+            if (
+                ctx is not None
+                and ctx.denial_kind == "out_of_root"
+                and config_perm != ToolPermission.NEVER
+            ):
+                decision = await self._resolve_out_of_root_grant(
+                    tool, args, ctx, tool_name, tool_call_id
+                )
+                if decision is not None:
+                    return decision
             return ToolDecision(
                 verdict=ToolExecutionResponse.SKIP,
                 approval_type=ToolPermission.NEVER,
@@ -3020,6 +3120,165 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         return ToolDecision(
             verdict=ToolExecutionResponse.EXECUTE, approval_type=ToolPermission.ALWAYS
         )
+
+    async def _resolve_out_of_root_grant(
+        self,
+        tool: BaseTool,
+        args: BaseModel,
+        ctx: PermissionContext,
+        tool_name: str,
+        tool_call_id: str | None,
+    ) -> ToolDecision | None:
+        """Resolve an out-of-root file denial, prompting when the runtime allows.
+
+        Returns None when the denial must keep the existing behavior: the tool
+        is not a promptable file tool, or no promptable target can be proposed.
+        """
+        if tool_name not in ROOT_GRANT_TOOLS:
+            return None
+        if not self._user_input_capability or (
+            self._is_subagent and self._root_grant_port is None
+        ):
+            # A runtime-managed session that cannot prompt names the persistent
+            # config knob; a bare loop keeps the existing denial text unchanged.
+            # A runtime-bound child may prompt: its approved grant resolves back
+            # to this child's own store, never to the parent or a sibling.
+            return (
+                _out_of_root_denial(ctx, tool_name)
+                if self._root_grant_port is not None
+                else None
+            )
+        target = root_grant_target(tool_name, args, self.cwd)
+        root = propose_root_grant(target) if target is not None else None
+        if root is None:
+            return None
+        store = self._session_root_grants
+        try:
+            decision = (
+                ROOT_GRANT_DENY
+                if root in store.denied_roots
+                else await self._prompt_session_root_grant(root, tool_call_id)
+            )
+        except Exception:
+            logger.warning(
+                "Session root grant prompt failed; keeping the denial", exc_info=True
+            )
+            return _out_of_root_denial(ctx, tool_name)
+        if decision == ROOT_GRANT_DENY:
+            store.deny(root)
+            return _declined_root_decision()
+        return await self._resume_after_root_grant(
+            tool, args, tool_name, root, decision
+        )
+
+    async def _resume_after_root_grant(
+        self, tool: BaseTool, args: BaseModel, tool_name: str, root: Path, decision: str
+    ) -> ToolDecision:
+        """Apply an approved grant, then re-resolve and resume the original call."""
+        # The session grant is applied first: the tool call resumes only with
+        # the grant in force, whatever the optional project save reports.
+        await self._apply_approved_root_grant(root)
+        result_note = None
+        if decision == ROOT_GRANT_PROJECT:
+            result_note = await self._persist_project_root_grant(root)
+        resolved = tool.resolve_permission(args)
+        if resolved is not None and resolved.permission == ToolPermission.NEVER:
+            return ToolDecision(
+                verdict=ToolExecutionResponse.SKIP,
+                approval_type=ToolPermission.NEVER,
+                feedback=(
+                    resolved.reason or f"Tool '{tool_name}' is disabled by policy"
+                ),
+            )
+        return ToolDecision(
+            verdict=ToolExecutionResponse.EXECUTE,
+            approval_type=ToolPermission.ALWAYS,
+            result_note=result_note,
+        )
+
+    async def _persist_project_root_grant(self, root: Path) -> str:
+        """Attempt to persist an approved grant; report grant and save apart.
+
+        The user revision is fetched from the saved-roots read surface at
+        decision time and never cached across turns. A failed or uncertain save
+        never blocks the already-applied session grant; cancellation propagates
+        so the tool cannot resume without the session grant.
+        """
+        port = self._root_grant_port
+        if port is None:
+            return (
+                f"Root grant for {root} applies to this session; this session "
+                "cannot save roots to your user config."
+            )
+        try:
+            saved = await read_saved_roots(self.config_orchestrator, project=self.cwd)
+        except Exception:
+            logger.warning("Saved roots read failed for %s", self.cwd, exc_info=True)
+            saved = None
+        if saved is None or saved.unavailable is not None or not saved.user_revision:
+            return (
+                f"Root grant for {root} applies to this session only; your saved "
+                "roots could not be read, so it was not saved to your config."
+            )
+        try:
+            result = await port.save_root(self.session_id, root, saved.user_revision)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Project root grant save failed for %s", root, exc_info=True)
+            return (
+                f"Root grant for {root} applies to this session only; saving it "
+                "to your user config failed."
+            )
+        return root_grant_save_note(root, self.cwd, result)
+
+    def _close_tool_batch(self, queue: asyncio.Queue[BaseEvent | None]) -> None:
+        self._request_broker.unbind(queue)
+        # Every waiter is settled when a tool batch ends, so no prompt can
+        # still have one; a lingering asker only holds an abandoned request.
+        for asker in tuple(self._root_grant_askers):
+            asker.cancel()
+
+    async def _prompt_session_root_grant(
+        self, root: Path, tool_call_id: str | None
+    ) -> str:
+        """Ask about *root*, coalescing concurrent waiters on one shared decision."""
+        store = self._session_root_grants
+        pending = store.pending.get(root)
+        if pending is None:
+            pending = asyncio.get_running_loop().create_future()
+            store.pending[root] = pending
+            asker = asyncio.create_task(
+                self._ask_session_root_grant(root, pending, tool_call_id)
+            )
+            self._root_grant_askers.add(asker)
+            asker.add_done_callback(self._root_grant_askers.discard)
+        # One waiter's cancellation must not cancel the shared decision.
+        return await asyncio.shield(pending)
+
+    async def _ask_session_root_grant(
+        self, root: Path, pending: asyncio.Future[str], tool_call_id: str | None
+    ) -> None:
+        """Own the single user-input request behind a shared root decision."""
+        try:
+            answer = await self._request_broker.request_user_input(
+                root_grant_request(root), tool_call_id or ""
+            )
+            decision = parse_root_grant_result(answer)
+        except asyncio.CancelledError:
+            if not pending.done():
+                pending.cancel()
+            raise
+        except Exception as exc:
+            if not pending.done():
+                pending.set_exception(exc)
+                pending.add_done_callback(_retrieve_future_exception)
+            logger.warning("Session root grant prompt failed for %s: %s", root, exc)
+        else:
+            if not pending.done():
+                pending.set_result(decision)
+        finally:
+            self._session_root_grants.pending.pop(root, None)
 
     def _handle_tool_response(
         self,
@@ -4343,6 +4602,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             harness_files=self.harness_files,
             scratchpad_dir=self.scratchpad_dir,
             task_description=task_description_for_config(authority().config),
+            session_root_grants=self._session_root_grants,
         )
         manager.set_instruction_read_files(previous_manager._instruction_read_files)
         for name in manager.registered_tools:
@@ -4511,6 +4771,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             harness_files=self.harness_files,
             scratchpad_dir=self.scratchpad_dir,
             task_description=task_description_for_config(target_config),
+            session_root_grants=self._session_root_grants,
         )
         skill_manager = SkillManager(
             config_source.get, harness_files=self.harness_files

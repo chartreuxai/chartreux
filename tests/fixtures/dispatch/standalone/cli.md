@@ -126,14 +126,14 @@ The active table overrides compatibility examples and profile defaults. Pass the
 
 | Slot | Profile | Role | Model | Thinking | Purposes | Implements | Review eligible |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `mechanical` | `worker` | `@small` | `alpha-model` | low | search, exploration, verification, mechanical-edit | routine | False |
-| `implementor` | `worker` | `@medium` | `alpha-model` | medium | implementation | routine | False |
-| `escalation-implementor` | `worker` | `@medium` | `alpha-model` | medium | implementation-demanding-settled | escalation | False |
-| `advisor` | `advisor` | `@large` | `beta-model` | high | design-analysis, planning-analysis | never | False |
-| `reviewer` | `reviewer` | `@medium` | `alpha-model` | medium | review.quick, review.standard | never | True |
-| `analytical-reviewer` | `reviewer` | `@large` | `beta-model` | high | review.deep | never | True |
-| `peer-reviewer` | `reviewer` | `@large` | `beta-model` | high | review.deep | never | True |
-| `execution-reviewer` | `reviewer` | `@medium` | `alpha-model` | medium | review.deep | never | True |
+| `mechanical` | `worker` | `@scout` | `alpha-model` | low | search, exploration, verification, mechanical-edit | routine | False |
+| `implementor` | `worker` | `@worker` | `alpha-model` | medium | implementation | routine | False |
+| `escalation-implementor` | `worker` | `@heavy` | `beta-model` | high | implementation-demanding-settled | escalation | False |
+| `advisor` | `advisor` | `@heavy` | `beta-model` | high | design-analysis, planning-analysis | never | False |
+| `reviewer` | `reviewer` | `@worker` | `alpha-model` | medium | review.quick, review.standard | never | True |
+| `analytical-reviewer` | `reviewer` | `@heavy` | `beta-model` | high | review.deep | never | True |
+| `peer-reviewer` | `reviewer` | `@heavy` | `beta-model` | high | review.deep | never | True |
+| `execution-reviewer` | `reviewer` | `@worker` | `alpha-model` | medium | review.deep | never | True |
 
 ### Purpose meanings
 - `search`: Bounded searches, grep, and symbol or reference lookups.
@@ -154,10 +154,10 @@ review.deep: use slots `analytical-reviewer`, `peer-reviewer`, and `execution-re
 For one canonical model, including multiple thinking levels, use fresh-context review on the available model instead of claiming model diversity. Fail closed if a required independent slot is unavailable; never silently substitute.
 
 ### Failure routes
-Select a tier afresh for each task. Uncertainty, file count, session length, or wanting a better answer are not escalation criteria. If an implementation attempt fails, diagnose the failure, retry at `@medium` with a different approach, or dispatch a `@large` advisor for read-only analysis; never re-dispatch implementation to `@large`. Escalate architectural blockers to an advisor and authorization or scope blockers to the user.
+Select a tier afresh for each task. Uncertainty, file count, session length, or wanting a better answer are not escalation criteria. If an implementation attempt fails, diagnose the failure, retry at `@worker` with a different approach, or dispatch a `@heavy` advisor for read-only analysis; never re-dispatch implementation to the `@heavy` advisor. Escalate architectural blockers to an advisor and authorization or scope blockers to the user.
 
 ### Contrasts
-Use slot `mechanical` for bounded searches, verification runs, and mechanical single-file edits; use slot `implementor` for substantive implementation. Use slot `escalation-implementor` for demanding execution with a settled approach and state the reason; use slot `advisor` for read-only design and planning analysis, never implementation.
+Use slot `mechanical` for bounded searches, verification runs, and mechanical single-file edits; use slot `implementor` for substantive implementation. Use slot `escalation-implementor` for demanding execution with a settled approach and state the reason; it is a worker-profile route. Use slot `advisor` for read-only design and planning analysis only; the advisor profile never implements.
 
 The opening gate and acceptance lattice remain unchanged. Saved policy changes apply next session.
 

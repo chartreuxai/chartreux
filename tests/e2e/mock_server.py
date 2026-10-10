@@ -190,10 +190,13 @@ class StreamingMockServer:
         *,
         chunk_factory: ChunkFactory | None = None,
         ssl_context: ssl.SSLContext | None = None,
+        error_status: int | None = None,
     ) -> None:
         self.requests: list[ChatCompletionsRequestPayload] = []
+        self.request_headers: list[dict[str, str]] = []
         self._lock = threading.Lock()
         self._chunk_factory = chunk_factory
+        self._error_status = error_status
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._build_handler())
         self._scheme = "https" if ssl_context is not None else "http"
         if ssl_context is not None:
@@ -223,7 +226,27 @@ class StreamingMockServer:
 
                 with parent._lock:
                     parent.requests.append(payload)
+                    parent.request_headers.append({
+                        name.lower(): value for name, value in self.headers.items()
+                    })
                     request_index = len(parent.requests) - 1
+
+                if parent._error_status is not None:
+                    # Rejected-credential mode: record the attempt, then answer
+                    # with a provider-style error body instead of a stream.
+                    error_body = json.dumps({
+                        "error": {
+                            "message": "Incorrect API key provided",
+                            "type": "invalid_request_error",
+                        }
+                    }).encode()
+                    self.send_response(parent._error_status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(error_body)))
+                    self.end_headers()
+                    self.wfile.write(error_body)
+                    self.wfile.flush()
+                    return
 
                 chunks = (
                     parent._chunk_factory(request_index, payload)

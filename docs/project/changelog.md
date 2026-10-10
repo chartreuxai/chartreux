@@ -2,6 +2,75 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.5.1 (2026-10-10)
+
+### Added
+
+- The shipped catalog now includes `mistral-large-4` on the Mistral provider
+  (runtime-confirmed wire ID `mistral-large-4`, thinking `high`, image support,
+  400000-token compaction threshold) at launch-sale prices below the published
+  list prices (input 0.68, output 2.09, cached input 0.07 per million tokens).
+- Completing onboarding without saving a catalog now writes
+  `~/.chartreux/models.toml` from a shipped template: both default models
+  (`glm-5-3` and `mistral-large-4`) with their deployments, the four role
+  presets, and sparse `[dispatch]` slot role bindings, with no provider tables
+  (they stay inherited from the shipped catalog, so `overlaid_providers`
+  provenance is unchanged). The template is identified by a content
+  fingerprint rather than a comment marker, materializing is revision-neutral,
+  and publication is an exclusive create — an existing `models.toml`, whether
+  migrated, saved, or created concurrently, always wins.
+
+### Changed
+
+- The shipped role roster is now `orchestrator`, `worker`, `scout`, and `heavy`:
+  `orchestrator` (glm-5-3, high) is the main assistant, `worker` (glm-5-3,
+  medium) covers implementation and quick/standard review, `scout` (glm-5-3,
+  low) covers mechanical work, and `heavy` (mistral-large-4, high) covers the
+  advisor, analytical and peer review, and escalation-implementor seats. The
+  tier roles `large`, `medium`, and `small` are removed; dispatch slot
+  bindings, the rendered routing prose, and the built-in profile defaults
+  (`worker` -> `@worker`, `advisor` -> `@heavy`, `reviewer` -> `@worker`)
+  follow the new roster. Deep review renders as ML4 analytical + ML4 peer + GLM
+  execution seats, with no three-model diversity claim.
+- Removed the dead `show_greeting` setting (the greeting never displayed);
+  existing config files that still contain the removed TOML key load cleanly,
+  with the key ignored. In contrast, `CHARTREUX_SHOW_GREETING` is rejected at
+  environment validation, breaking for anyone who set that variable; remove it.
+- Session resume break: pre-upgrade sessions with a saved dispatch policy
+  referencing the removed `large`/`medium`/`small` roles fail resume with
+  `SessionPolicyError` ("Bound dispatch role removed"). No substitution is
+  performed; committed model identities are role-free and still resolve.
+- Onboarding seeds role presets from the selected model: when first-run setup
+  runs with a selected model, replacement presets for unready roles are drawn
+  from that model's ready (model, thinking) pairs instead of any configured
+  model.
+- The non-interactive missing-credential error now includes repair guidance:
+  it names the required environment variable and points at `chartreux --setup`
+  or Settings > Providers (/providers), and notes that credentials do not
+  change provider routing.
+
+### Fixed
+
+- The graduation nudge ("More models can share the work") no longer latches for
+  fresh installs. The latch is now a bound-roster transition: it sets only when
+  the roster the runtime would select moves from exactly one distinct canonical
+  model to two or more across a save, with the saved model part of the new
+  roster. Entering a provider key that makes both shipped default models usable
+  at once, and saves against an already multi-model roster, no longer trigger
+  the nudge; latches persisted by earlier releases remain honored.
+- Workbench readiness now validates the deployment the runtime would select:
+  preset validation, finish checks, and the graduation roster resolve the
+  staged candidate catalog through the model resolver — deployment ordering,
+  thinking-level compatibility, and `allowed_models` restrictions — and gate on
+  the selected deployment's credential instead of any deployment's.
+- Saving an unchanged shipped Mistral preset no longer force-writes a
+  `[providers.mistral]` table into `models.toml`: an unchanged preset over an
+  existing shipped provider persists nothing, so `overlaid_providers`
+  provenance stays clean and first-run materialization of the default template
+  is not blocked.
+
+## Unreleased
+
 ## 0.5.0 (2026-10-07)
 
 ### Added

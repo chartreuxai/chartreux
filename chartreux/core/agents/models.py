@@ -68,7 +68,7 @@ WORKER = AgentProfile(
     agent_type=AgentType.SUBAGENT,
     overrides={"system_prompt_id": "worker"},
     instructions=None,
-    role="medium",
+    role="worker",
 )
 
 ADVISOR = AgentProfile(
@@ -83,7 +83,7 @@ ADVISOR = AgentProfile(
     },
     instructions=None,
     idle_ttl_seconds=0,
-    role="large",
+    role="heavy",
 )
 
 REVIEWER = AgentProfile(
@@ -94,7 +94,7 @@ REVIEWER = AgentProfile(
     agent_type=AgentType.SUBAGENT,
     overrides={"system_prompt_id": "reviewer"},
     instructions=None,
-    role="medium",
+    role="worker",
 )
 
 BUILTIN_SUBAGENTS: dict[str, AgentProfile] = {

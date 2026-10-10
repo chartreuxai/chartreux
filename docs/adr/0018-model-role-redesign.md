@@ -104,3 +104,10 @@ The cli.md read path strips the whole file; task.md read path does not strip, so
 
 - Dogfood the default path for a week after WP11. Roll back if any gate-relevant failure (direct implementation violating approved scope, skipped verification, gate bypass) occurs twice in the week: flip default back to orchestrated while investigating.
 - User-level skill copies diverge from shipped; re-sync before the dogfooding week.
+
+## Amendments
+
+### N. Roster release R1 (2026-10-10)
+
+- **G.1 superseded.** The orchestrated multi-model rendering no longer preserves the WP0 legacy routing bytes: the roster rename (`large`/`medium`/`small` -> `worker`/`scout`/`heavy`) rewrote the curated prose blocks, so the regenerated active goldens under `tests/fixtures/dispatch/{standalone,orchestrated,orchestrated-singlemodel}/` are the byte baseline now. The `legacy-orchestrated/` captures are preserved untouched as historical artifacts, and the single-model rendering fixtures use an explicit one-model catalog rather than the (now two-model) shipped catalog.
+- **G.6 amended (re-gate landed in R2, 2026-10-10).** The graduation latch keyed on saving a second usable canonical model would fire immediately for fresh installs, because the shipped catalog now carries two canonical models (`glm-5-3` and `mistral-large-4`). The latch is now a bound-roster transition: it sets only when the roster the runtime would select moves from exactly one distinct canonical identity to two or more across a save, with a saved identity part of the multi-model post-save roster, so saves against an already multi-model roster and empty-roster transitions never latch; latches persisted by older stores remain honored. Repointing a role to an already-usable second model without saving or newly readying a model does not latch the notice. This is accepted for this release because the latch is save-driven, and the discoverability nudge is not guaranteed on every path to a multi-model roster.

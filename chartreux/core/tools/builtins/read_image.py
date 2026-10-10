@@ -302,7 +302,13 @@ def _read_validated_image(path: Path) -> tuple[bytes, str]:
 
 class ReadImageArgs(BaseModel):
     file_path: ToolPath = Field(
-        description="The image file path, relative to the tool working directory or absolute"
+        description=(
+            "The image file path, relative to the tool working directory or absolute. Paths "
+            "outside the session's authorized roots may still be attempted: in interactive "
+            "sessions the runtime asks the user to grant access and the operation proceeds on "
+            "approval; the tool result states when access is unavailable or was declined, and "
+            "only then is config or manual fallback appropriate."
+        )
     )
 
 

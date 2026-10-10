@@ -112,6 +112,9 @@ class TestBuiltinSkills:
         assert "https://github.com/mistralai/mistral-vibe" not in prompt
         assert "https://docs.mistral.ai/vibe/code/overview" not in prompt
 
+        assert "Bound dispatch role removed" in prompt
+        assert "Committed model identities still resolve" in prompt
+
     def test_chartreux_skill_keeps_cli_command_reference(self) -> None:
         prompt = BUILTIN_SKILLS["chartreux"].prompt
         for command in ("help", "model", "mcp", "resume", "exit"):

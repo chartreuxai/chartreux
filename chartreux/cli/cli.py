@@ -94,8 +94,9 @@ def require_api_key_or_onboard(
     except (MissingAPIKeyError, ValueError) as e:
         if not interactive:
             print(
-                f"Error: {e}. Set the environment variable (e.g. in ~/.chartreux/.env "
-                "or your shell), or run `chartreux --setup` once interactively.",
+                f"Error: {e} Set the required environment variable (e.g. in "
+                "~/.chartreux/.env or your shell). Credentials do not change "
+                "provider routing.",
                 file=sys.stderr,
             )
             sys.exit(1)

@@ -88,10 +88,6 @@ def load_dotenv_values(
         environ[key] = value
 
 
-DEFAULT_ACTIVE_MODEL_CONFIG = ModelConfig(
-    name="zai-glm-5-3", provider="mistral", alias="glm-5-3", thinking="high"
-)
-
 # The catalog is deliberately not a field of ChartreuxConfigSchema.  It is loaded
 # separately from shipped definitions plus models.toml and attached privately.
 UNPINNED_ACTIVE_MODEL = ""
@@ -421,10 +417,6 @@ class ChartreuxConfigSchema(ConfigSchema):
     # Top-level scalars
     theme: Annotated[str, WithReplaceMerge()] = DEFAULT_THEME
     disable_welcome_banner_animation: Annotated[bool, WithReplaceMerge()] = False
-    show_greeting: Annotated[bool, WithReplaceMerge()] = Field(
-        default=True,
-        description="Show greeting at startup (Mistral providers only, once per 24h).",
-    )
     autocopy_to_clipboard: Annotated[bool, WithReplaceMerge()] = True
     file_watcher_for_autocomplete: Annotated[bool, WithReplaceMerge()] = False
     ask_confirmation_on_exit: Annotated[bool, WithReplaceMerge()] = True
@@ -587,12 +579,6 @@ class ChartreuxConfigSchema(ConfigSchema):
                     ModelConfig(name="", provider=provider_id, alias="")
                 )
         return None
-
-    def is_active_model_mistral(self) -> bool:
-        try:
-            return self.get_active_provider().backend == Backend.MISTRAL
-        except ValueError:
-            return False
 
     def build_tool_allowlist_update(
         self,

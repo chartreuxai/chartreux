@@ -63,12 +63,15 @@ async def test_launch_purposes_distinguish_shared_worker_profile():
 
     loop = build_test_agent_loop()
     try:
-        loop.launch_overrides = LaunchConfig(model="@small")
+        loop.launch_overrides = LaunchConfig(model="@scout")
         assert "verification" in project_launch_slot_purposes(loop, "worker")
         assert "implementation" not in project_launch_slot_purposes(loop, "worker")
-        loop.launch_overrides = LaunchConfig(model="@medium")
-        # The shipped implementor and escalation slots share @medium but differ
-        # in purposes, so role identity alone cannot attribute implementation.
-        assert project_launch_slot_purposes(loop, "worker") == []
+        loop.launch_overrides = LaunchConfig(model="@worker")
+        # The worker profile's implementor seat is unambiguous, but the
+        # reviewer profile's reviewer and execution-reviewer slots share
+        # @worker with different purposes, so role identity alone cannot
+        # attribute review seats.
+        assert project_launch_slot_purposes(loop, "worker") == ["implementation"]
+        assert project_launch_slot_purposes(loop, "reviewer") == []
     finally:
         await loop.aclose()

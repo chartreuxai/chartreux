@@ -57,7 +57,14 @@ def _display_relative(path: Path, base: Path) -> Path:
 
 
 class ReadFileArgs(BaseModel):
-    file_path: ToolPath = Field(description="The absolute path to the file to read")
+    file_path: ToolPath = Field(
+        description=(
+            "The absolute path to the file to read. Paths outside the session's authorized roots "
+            "may still be attempted: in interactive sessions the runtime asks the user to grant "
+            "access and the operation proceeds on approval; the tool result states when access is "
+            "unavailable or was declined, and only then is config or manual fallback appropriate."
+        )
+    )
     offset: int | None = Field(
         default=None,
         ge=1,

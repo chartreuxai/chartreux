@@ -110,7 +110,7 @@ def ledger_config(workspace: Path, *, logging_enabled: bool) -> ChartreuxConfigS
                 }
                 for alias in ("base", "compact")
             },
-            "roles": {"medium": {"model": "base", "thinking": "off"}},
+            "roles": {"worker": {"model": "base", "thinking": "off"}},
         }),
         "integration-ledger",
     )

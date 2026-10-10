@@ -5,7 +5,9 @@ Mistral public API and models Mistral actually serves (wire names re-verified
 against the Mistral models API on 2026-09-26). Personal setups — local
 proxies, LAN endpoints, private model pins — belong in the user overlay at
 ``$CHARTREUX_HOME/models.toml``, never here. Prices are published list
-prices; genuinely unknown values are represented by ``None``, never ``0.0``.
+prices, except the shipped ``mistral-large-4`` entry, which carries
+launch-sale prices below the published list; genuinely unknown values are
+represented by ``None``, never ``0.0``.
 """
 
 from __future__ import annotations
@@ -35,7 +37,19 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
                     "auto_compact_threshold": 400000,
                 }
             ],
-        }
+        },
+        "mistral-large-4": {
+            "thinking": "high",
+            "deployments": [
+                {
+                    "provider": "mistral",
+                    "name": "mistral-large-4",
+                    "prices": {"input": 0.68, "output": 2.09, "cached_input": 0.07},
+                    "supports_images": True,
+                    "auto_compact_threshold": 400000,
+                }
+            ],
+        },
     },
     "roles": {
         "orchestrator": {
@@ -43,16 +57,16 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
             "model": "glm-5-3",
             "thinking": "high",
         },
-        "large": {
-            "description": "large preset",
-            "model": "glm-5-3",
-            "thinking": "high",
-        },
-        "medium": {
-            "description": "medium preset",
+        "worker": {
+            "description": "worker preset",
             "model": "glm-5-3",
             "thinking": "medium",
         },
-        "small": {"description": "small preset", "model": "glm-5-3", "thinking": "low"},
+        "scout": {"description": "scout preset", "model": "glm-5-3", "thinking": "low"},
+        "heavy": {
+            "description": "heavy preset",
+            "model": "mistral-large-4",
+            "thinking": "high",
+        },
     },
 })

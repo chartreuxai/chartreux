@@ -65,8 +65,8 @@ def test_tools_inventory_intersects_filters_without_changing_other_categories(
 
 
 def test_curated_registry_is_complete_and_validated() -> None:
-    assert len(EDITABLE_SETTINGS) == len(EDITABLE_BY_PATH) == 46
-    assert len(VISIBLE_SETTINGS) == 40
+    assert len(EDITABLE_SETTINGS) == len(EDITABLE_BY_PATH) == 45
+    assert len(VISIBLE_SETTINGS) == 39
     visible = {item.path: item for item in VISIBLE_SETTINGS}
     assert visible["status_line"].control == "status_line"
     assert "status_line" not in EDITABLE_BY_PATH
@@ -184,8 +184,8 @@ async def test_non_user_layer_build_error_falls_back_to_live_config(
         )
         fields = {field.path: field for field in response.fields}
         assert (
-            fields["show_greeting"].effective_value
-            is loop.config_orchestrator.config.show_greeting
+            fields["ask_confirmation_on_exit"].effective_value
+            is loop.config_orchestrator.config.ask_confirmation_on_exit
         )
         assert {field.origin for field in response.fields} == {"live config"}
     finally:
@@ -343,12 +343,16 @@ async def test_snapshot_pairs_force_loaded_revision_with_sparse_leaf_values(
                 session_id=loop.session_id,
                 target="user",
                 expected_revision=updated.user_revision,
-                ops=[ConfigWriteOpWire(op="set", path="/show_greeting", value=False)],
+                ops=[
+                    ConfigWriteOpWire(
+                        op="set", path="/ask_confirmation_on_exit", value=False
+                    )
+                ],
             ),
         )
         assert stale["persistence"] == "not_saved"
         assert stale["failures"] == ["conflict"]
-        assert "show_greeting" not in tomllib.loads(source.read_text())
+        assert "ask_confirmation_on_exit" not in tomllib.loads(source.read_text())
         list_save = await client.request(
             "config/write",
             ConfigWriteParams(

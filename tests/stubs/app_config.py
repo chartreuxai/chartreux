@@ -20,7 +20,6 @@ def build_test_app_config(*, show_thinking_nodes: bool = False) -> ConfigView:
         autocopy_to_clipboard=True,
         file_watcher_for_autocomplete=False,
         ask_confirmation_on_exit=True,
-        show_greeting=True,
         show_thinking_nodes=show_thinking_nodes,
         enable_notifications=True,
         models=[

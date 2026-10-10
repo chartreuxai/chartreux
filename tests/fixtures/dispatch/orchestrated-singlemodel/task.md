@@ -19,14 +19,14 @@ The active table overrides compatibility examples and profile defaults. Pass the
 
 | Slot | Profile | Role | Model | Thinking | Purposes | Implements | Review eligible |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `mechanical` | `worker` | — | `glm-5-3` | low | search, exploration, verification, mechanical-edit | routine | False |
-| `implementor` | `worker` | — | `glm-5-3` | medium | implementation | routine | False |
-| `escalation-implementor` | `worker` | — | `glm-5-3` | medium | implementation-demanding-settled | escalation | False |
-| `advisor` | `advisor` | — | `glm-5-3` | high | design-analysis, planning-analysis | never | False |
-| `reviewer` | `reviewer` | — | `glm-5-3` | medium | review.quick, review.standard | never | True |
-| `analytical-reviewer` | `reviewer` | — | `glm-5-3` | high | review.deep | never | True |
-| `peer-reviewer` | `reviewer` | — | `glm-5-3` | high | review.deep | never | True |
-| `execution-reviewer` | `reviewer` | — | `glm-5-3` | medium | review.deep | never | True |
+| `mechanical` | `worker` | — | `solo-model` | low | search, exploration, verification, mechanical-edit | routine | False |
+| `implementor` | `worker` | — | `solo-model` | medium | implementation | routine | False |
+| `escalation-implementor` | `worker` | — | `solo-model` | high | implementation-demanding-settled | escalation | False |
+| `advisor` | `advisor` | — | `solo-model` | high | design-analysis, planning-analysis | never | False |
+| `reviewer` | `reviewer` | — | `solo-model` | medium | review.quick, review.standard | never | True |
+| `analytical-reviewer` | `reviewer` | — | `solo-model` | high | review.deep | never | True |
+| `peer-reviewer` | `reviewer` | — | `solo-model` | high | review.deep | never | True |
+| `execution-reviewer` | `reviewer` | — | `solo-model` | medium | review.deep | never | True |
 
 ### Purpose meanings
 - `search`: Bounded searches, grep, and symbol or reference lookups.
@@ -50,7 +50,7 @@ For one canonical model, including multiple thinking levels, use fresh-context r
 Select a route afresh for each task. Uncertainty, file count, session length, or wanting a better answer are not escalation criteria. If an implementation attempt fails, diagnose the failure, retry on the `implementor` slot with a different approach, or dispatch the `advisor` slot for read-only analysis; never re-dispatch implementation to the `advisor` slot. Escalate architectural blockers to an advisor and authorization or scope blockers to the user.
 
 ### Contrasts
-Use slot `mechanical` for bounded searches, verification runs, and mechanical single-file edits; use slot `implementor` for substantive implementation. Use slot `escalation-implementor` for demanding execution with a settled approach and state the reason; use slot `advisor` for read-only design and planning analysis, never implementation.
+Use slot `mechanical` for bounded searches, verification runs, and mechanical single-file edits; use slot `implementor` for substantive implementation. Use slot `escalation-implementor` for demanding execution with a settled approach and state the reason; it is a worker-profile route. Use slot `advisor` for read-only design and planning analysis only; the advisor profile never implements.
 
 To supersede busy work, set `replace_run: true` with `agent_id` and `background: true`. Only the owning parent may replace a run. Busy replacement forbids `config` and profile changes; idle reuse still supports launch reconfiguration. The tool stops the old run, joins its cleanup and result publication, then launches in the same conversation, automatically prepending: "This task supersedes the interrupted task." Its existing capacity slot is held through the handoff, so replacement works at capacity. The acknowledgment has `launch_outcome: "launched"` and `metadata.replaced_run_id` / `metadata.replacement_run_id`. Refusals have `launch_outcome: "already_stopping"`, `"already_finishing"`, or `"rejected_reservation"`, not a successful launch status. Retrieve the old run's partial result by its ID; cancellation does not undo side effects. If replacement admission fails after stopping, the old run remains terminal, not resumed. On an idle agent, `replace_run: true` is ordinary reuse with no stop or supersession frame.
 

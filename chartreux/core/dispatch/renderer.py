@@ -207,11 +207,11 @@ _REUSE_SUFFIX = (
 )
 
 _REVIEW_EXAMPLE_MULTI_MODEL = (
-    'For example, launch a deep review with `config: {"model": "@large", '
+    'For example, launch a deep review with `config: {"model": "@heavy", '
     '"instructions": "Review carefully.", "enabled_tools": ["read_file"]}`. '
-    "For a second-round deep review, launch a fresh reviewer with a `@large` "
+    "For a second-round deep review, launch a fresh reviewer with a `@heavy` "
     'model override — `task(agent_type="reviewer", task="Review the retry '
-    'changes.", config={"model": "@large"})` — rather than re-tasking an idle '
+    'changes.", config={"model": "@heavy"})` — rather than re-tasking an idle '
     "implementor: a fresh reviewer must not inherit an implementor's persona "
     "or history."
 )
@@ -226,18 +226,20 @@ _REVIEW_EXAMPLE_SINGLE_MODEL = (
 )
 
 # The isolated orchestrated compatibility block: the legacy task routing
-# paragraph, preserved byte-identically for the multi-model fixture.
+# paragraph for the multi-model fixture, with the `@heavy` doctrine aligned to
+# the escalation-implementor binding.
 _TASK_ROUTING_MULTI_MODEL = (
     "Route by the work, not the profile default: pass the tier explicitly in "
     "`config`. Mechanical delegated work — single-file edits, bounded "
     "searches, verification runs — launches with a model override, for "
     'example `task(agent_type="worker", task="Rename add to plus in utils.py '
-    'and update its call sites.", config={"model": "@small"})`. Substantive '
-    "implementation launches at the `@medium` worker default with no override, "
+    'and update its call sites.", config={"model": "@scout"})`. Substantive '
+    "implementation launches at the `@worker` worker default with no override, "
     'for example `task(agent_type="worker", task="Add a retry helper with '
-    'exponential backoff to utils.py and use it in app.py.")`. `@large` '
-    "launches are for architecture, design, planning, and deep review only — "
-    "never implementation."
+    'exponential backoff to utils.py and use it in app.py.")`. `@heavy` '
+    "launches are for architecture, design, planning, and deep review, plus "
+    "demanding execution with a settled approach through the "
+    "escalation-implementor route — never routine implementation."
 )
 
 
@@ -278,7 +280,7 @@ def _slot_rows(policy: DispatchPolicy) -> list[str]:
         elif all(
             slot.implements == "never" and not slot.review_eligible for slot in slots
         ):
-            clause = "; never implementation"
+            clause = "; the advisor profile never implements"
         rows.append(
             f"{names_text} (profile `{profile}`) {verb} "
             f"{_join_oxford(list(purposes))}{clause}."
@@ -534,7 +536,7 @@ def render_task_regions(policy: DispatchPolicy, shape: RosterShape) -> dict[str,
     else:
         tier = (
             "re-state the tier explicitly on every reuse, so substantive "
-            "work on a previously `@small` agent runs at `@medium`. "
+            "work on a previously `@scout` agent runs at `@worker`. "
         )
     return {
         "reuse": _REUSE_PREFIX + tier + _REUSE_SUFFIX,

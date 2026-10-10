@@ -33,7 +33,13 @@ from chartreux.utils.tool_presentation import ToolEffectKind
 
 class WriteFileArgs(BaseModel):
     file_path: ToolPath = Field(
-        description="The absolute path to the file to write (must be absolute, not relative)"
+        description=(
+            "The absolute path to the file to write (must be absolute, not relative). Paths "
+            "outside the session's authorized roots may still be attempted: in interactive "
+            "sessions the runtime asks the user to grant access and the operation proceeds on "
+            "approval; the tool result states when access is unavailable or was declined, and "
+            "only then is config or manual fallback appropriate."
+        )
     )
     content: str = Field(description="The content to write to the file")
 

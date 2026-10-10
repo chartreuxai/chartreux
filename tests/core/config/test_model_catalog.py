@@ -263,18 +263,19 @@ def test_16_shipped_defaults_validate_and_have_verified_wire_names() -> None:
     # proxies, private pins) belong in the user models.toml overlay.
     assert set(catalog.providers) == {"mistral"}
     assert catalog.providers["mistral"].api_base == "https://api.mistral.ai/v1"
-    assert set(catalog.models) == {"glm-5-3"}
+    assert set(catalog.models) == {"glm-5-3", "mistral-large-4"}
     assert {name: model.thinking for name, model in catalog.models.items()} == {
-        "glm-5-3": "high"
+        "glm-5-3": "high",
+        "mistral-large-4": "high",
     }
     assert catalog.roles["orchestrator"].model == "glm-5-3"
     assert {
         name: (role.model, role.thinking) for name, role in catalog.roles.items()
     } == {
         "orchestrator": ("glm-5-3", "high"),
-        "large": ("glm-5-3", "high"),
-        "medium": ("glm-5-3", "medium"),
-        "small": ("glm-5-3", "low"),
+        "worker": ("glm-5-3", "medium"),
+        "scout": ("glm-5-3", "low"),
+        "heavy": ("mistral-large-4", "high"),
     }
     assert {
         name: (
@@ -286,12 +287,15 @@ def test_16_shipped_defaults_validate_and_have_verified_wire_names() -> None:
             model.deployments[0].auto_compact_threshold,
         )
         for name, model in catalog.models.items()
-    } == {"glm-5-3": ("mistral", "zai-glm-5-3", 1.4, 4.4, 0.14, 400000)}
+    } == {
+        "glm-5-3": ("mistral", "zai-glm-5-3", 1.4, 4.4, 0.14, 400000),
+        "mistral-large-4": ("mistral", "mistral-large-4", 0.68, 2.09, 0.07, 400000),
+    }
     assert {
         deployment.name
         for model in catalog.models.values()
         for deployment in model.deployments
-    } == {"zai-glm-5-3"}
+    } == {"zai-glm-5-3", "mistral-large-4"}
 
 
 def test_shipped_catalog_json_dump_round_trips() -> None:
@@ -305,20 +309,22 @@ def test_shipped_catalog_json_dump_round_trips() -> None:
 
 
 @pytest.mark.parametrize(
-    ("preset", "thinking"),
+    ("preset", "base_model", "thinking"),
     [
-        ("orchestrator", "high"),
-        ("large", "high"),
-        ("medium", "medium"),
-        ("small", "low"),
+        ("orchestrator", "glm-5-3", "high"),
+        ("worker", "glm-5-3", "medium"),
+        ("scout", "glm-5-3", "low"),
+        ("heavy", "mistral-large-4", "high"),
     ],
 )
-def test_shipped_presets_resolve_their_own_thinking(preset: str, thinking: str) -> None:
+def test_shipped_presets_resolve_their_own_thinking(
+    preset: str, base_model: str, thinking: str
+) -> None:
     resolver = ModelResolver(CatalogSnapshot(SHIPPED_CATALOG, "test"))
 
     resolved = resolver.resolve(f"@{preset}")
 
-    assert resolved.base_model == "glm-5-3"
+    assert resolved.base_model == base_model
     assert resolved.thinking == thinking
     assert resolved.materialize(auto_compact_threshold=200000).thinking == thinking
 
@@ -466,7 +472,7 @@ def test_resolver_unknown_explicit_name_is_typed() -> None:
     with pytest.raises(ModelResolutionError) as error:
         resolver.resolve("typo-model")
     assert error.value.code == "unknown_model"
-    assert "Valid canonical models: glm-5-3" in str(error.value)
+    assert "Valid canonical models: glm-5-3, mistral-large-4" in str(error.value)
 
 
 def test_resolver_unknown_role_lists_valid_roles() -> None:
@@ -475,7 +481,7 @@ def test_resolver_unknown_role_lists_valid_roles() -> None:
         resolver.resolve("@not-a-role")
     assert error.value.code == "unknown_role"
     assert "@orchestrator" in str(error.value)
-    assert "@medium" in str(error.value)
+    assert "@worker" in str(error.value)
 
 
 def test_deployment_priority_disabled_skip_and_all_disabled() -> None:
@@ -629,7 +635,7 @@ def test_role_overlay_merges_per_key_and_rejects_legacy_names() -> None:
         catalog.roles["orchestrator"].description
         == SHIPPED_CATALOG.roles["orchestrator"].description
     )
-    assert catalog.roles["large"] == SHIPPED_CATALOG.roles["large"]
+    assert catalog.roles["heavy"] == SHIPPED_CATALOG.roles["heavy"]
     with pytest.raises(ValueError, match=r"migration required.*\[roles\]"):
         merge_catalog_overlay(SHIPPED_CATALOG, {"tags": {}})
     with pytest.raises(ValueError, match="remove aliases"):
@@ -727,10 +733,10 @@ def test_snapshot_default_dispatch_is_the_shipped_default() -> None:
 
 def test_load_catalog_resolves_dispatch_and_revision(tmp_path: Path) -> None:
     plain = tmp_path / "plain.toml"
-    plain.write_text('[roles.small]\nthinking = "low"\n')
+    plain.write_text('[roles.scout]\nthinking = "low"\n')
     dispatched = tmp_path / "dispatched.toml"
     dispatched.write_text(
-        '[roles.small]\nthinking = "low"\n\n[dispatch]\nmode = "orchestrated"\n'
+        '[roles.scout]\nthinking = "low"\n\n[dispatch]\nmode = "orchestrated"\n'
     )
 
     base = load_catalog(plain)
@@ -745,8 +751,8 @@ def test_load_catalog_resolves_dispatch_and_revision(tmp_path: Path) -> None:
 
 
 def test_dispatch_overlay_sparse_merge_inherits_shipped_preset() -> None:
-    policy = merge_dispatch_overlay({"slots": {"implementor": {"role": "@small"}}})
-    assert policy.slots["implementor"].role == "@small"
+    policy = merge_dispatch_overlay({"slots": {"implementor": {"role": "@scout"}}})
+    assert policy.slots["implementor"].role == "@scout"
     assert policy.slots["implementor"].purposes == ("implementation",)
-    assert policy.slots["advisor"].role == "@large"
+    assert policy.slots["advisor"].role == "@heavy"
     assert policy.identity == SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE].identity

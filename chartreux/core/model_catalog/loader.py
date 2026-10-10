@@ -373,6 +373,33 @@ def load_catalog(path: Path | None = None) -> CatalogSnapshot:
     return snapshot
 
 
+def project_catalog_changes(
+    snapshot: CatalogSnapshot, changes: CatalogChanges
+) -> CatalogSnapshot:
+    """Apply a catalog change batch in memory using persistence merge semantics."""
+    overlay: dict[str, Any] = {
+        "providers": {
+            name: definition.model_dump(mode="json")
+            for name, definition in snapshot.catalog.providers.items()
+        },
+        "models": {
+            name: definition.model_dump(mode="json")
+            for name, definition in snapshot.catalog.models.items()
+        },
+        "roles": {
+            name: definition.model_dump(mode="json")
+            for name, definition in snapshot.catalog.roles.items()
+        },
+        "dispatch": snapshot.dispatch.model_dump(mode="json"),
+    }
+    candidate = _apply_catalog_changes(overlay, snapshot.catalog, changes)
+    catalog = merge_catalog_overlay(snapshot.catalog, candidate)
+    dispatch, diagnostics = resolve_dispatch_overlay(
+        candidate, source="<staged catalog>", catalog=catalog
+    )
+    return _snapshot(catalog, snapshot.overlaid_providers, dispatch, diagnostics)
+
+
 class CatalogStore:
     """The only mutable writer for the user catalog overlay."""
 

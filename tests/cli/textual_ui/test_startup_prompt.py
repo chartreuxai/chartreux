@@ -21,7 +21,6 @@ async def test_startup_prompt_waits_for_startup_resume_picker(
     app._show_resume_picker = True
     process_prompt = Mock()
 
-    monkeypatch.setattr(app, "_show_greeting_message", AsyncMock())
     monkeypatch.setattr(app, "_process_initial_prompt", process_prompt)
 
     await app._complete_post_ready_startup()

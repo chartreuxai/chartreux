@@ -60,6 +60,7 @@ from chartreux.app_server.protocol import (
     ProtocolErrorCode,
     RootsReadParams,
     RootsReplaceParams,
+    RootsSaveParams,
     ServerInfo,
     ServerRequest,
     SessionCompactParams,
@@ -145,6 +146,7 @@ _SESSION_BACKEND_METHODS = frozenset({
     "config/policy/replace",
     "policy/roots/read",
     "policy/roots/replace",
+    "policy/roots/save",
     "config/write",
     "session/compact",
     "session/context/inject",
@@ -1018,7 +1020,7 @@ class AppServer:
             runtime_updated=result.runtime_updated,
         )
 
-    async def _dispatch_backend_config(
+    async def _dispatch_backend_config(  # noqa: PLR0911 - explicit route ownership
         self, root: SessionBackend, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult | None:
         if method in {"policy/roots/read", "policy/roots/replace"}:
@@ -1035,6 +1037,14 @@ class AppServer:
                 ) from None
             roots_result = await root.replace_roots(roots_params)
             return DispatchResult(roots_result.response, runtime_updated=True)
+        if method == "policy/roots/save":
+            try:
+                save_params = validate_wire(RootsSaveParams, raw_params)
+            except ValidationError:
+                raise SessionBackendError(
+                    ProtocolErrorCode.INVALID_PARAMS, "Invalid root save parameters"
+                ) from None
+            return DispatchResult(await root.save_roots(save_params))
         if method in {"config/policy/read", "config/policy/replace"}:
             if method == "config/policy/read":
                 return DispatchResult(

@@ -26,15 +26,30 @@ class GraduationState:
 
     def model_saved(
         self,
-        usable_models: frozenset[str],
+        roster_before: frozenset[str],
+        roster_after: frozenset[str],
         saved_models: frozenset[str],
         *,
         succeeded: bool = True,
         linked: bool = False,
     ) -> None:
-        """Names are canonical identities; saved_models includes newly ready models."""
-        if succeeded and not linked and len(usable_models) >= MIN_USABLE_MODELS:
-            self.second_model_saved |= bool(saved_models & usable_models)
+        """Names are canonical identities; saved_models includes newly ready models.
+
+        The latch is a bound-roster transition, not a usable-model count: it
+        sets only when the roster the runtime would select moves from exactly
+        one distinct canonical identity to two or more, and a saved identity
+        is part of the multi-model post-save roster. A save against a roster
+        that already bound several identities, or from an empty roster, does
+        not latch.
+        """
+        if (
+            succeeded
+            and not linked
+            and len(roster_before) == 1
+            and len(roster_after) >= MIN_USABLE_MODELS
+            and bool(saved_models & roster_after)
+        ):
+            self.second_model_saved = True
 
     def compacted(self, *, replayed: bool = False) -> None:
         if not replayed:

@@ -279,7 +279,7 @@ async def test_project_profiles_stay_valid_but_never_carry_dispatch_authority(
 
     # Trusted project profiles remain valid as profile definitions.
     plain_path = agents_dir / "plain.toml"
-    plain_path.write_text('description = "plain profile"\nrole = "medium"\n')
+    plain_path.write_text('description = "plain profile"\nrole = "plain-role"\n')
     plain = AgentProfile.from_toml(plain_path)
     apply_profile_overrides(orch, plain.overrides, role=plain.role)
-    assert orch.config.active_model == "@medium"
+    assert orch.config.active_model == "@plain-role"

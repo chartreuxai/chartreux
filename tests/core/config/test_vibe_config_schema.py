@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import ValidationError
 import pytest
 
 from chartreux.core.config import MissingAPIKeyError
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+from chartreux.core.config.layers.user import UserConfigLayer
 from chartreux.core.prompts import UtilityPrompt
 from tests.conftest import build_test_vibe_config
 
@@ -46,3 +49,16 @@ def test_api_key_readiness_is_separate_from_schema_validation(
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
     with pytest.raises(MissingAPIKeyError):
         build_test_vibe_config().require_active_provider_api_key()
+
+
+@pytest.mark.asyncio
+async def test_removed_show_greeting_key_in_user_toml_loads_cleanly(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "config.toml"
+    source.write_text('show_greeting = false\ntheme = "light"\n')
+    user = UserConfigLayer(path=source)
+    loaded = await user.load()
+    config = ChartreuxConfigSchema.model_validate(loaded.model_dump())
+    assert config.theme == "light"
+    assert not hasattr(config, "show_greeting")

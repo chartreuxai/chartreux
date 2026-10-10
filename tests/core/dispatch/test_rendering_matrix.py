@@ -14,18 +14,17 @@ from chartreux.core.dispatch.renderer import (
     roster_for,
     task_skeleton,
 )
-from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.prompts import SystemPrompt
 from chartreux.core.system_prompt import _interpolate_prompt
-from tests.conftest import multi_model_catalog
+from tests.conftest import multi_model_catalog, single_model_catalog
 
 FIXTURES = SystemPrompt.CLI
-TIERS = ("@small", "@medium", "@large")
+TIERS = ("@scout", "@worker", "@heavy")
 
 
 @pytest.mark.parametrize("mode,policy", SHIPPED_PRESETS.items())
 @pytest.mark.parametrize(
-    "catalog", [SHIPPED_CATALOG, multi_model_catalog()], ids=["single", "multi"]
+    "catalog", [single_model_catalog(), multi_model_catalog()], ids=["single", "multi"]
 )
 def test_policy_roster_rendering_matrix(mode, policy, catalog):
     shape = roster_for(catalog, policy)
@@ -37,5 +36,5 @@ def test_policy_roster_rendering_matrix(mode, policy, catalog):
     if shape.single_model:
         assert all(tier not in cli and tier not in task for tier in TIERS)
     elif policy.mode.value == "orchestrated":
-        assert "@small" in cli and "@medium" in cli
-        assert "@small" in task
+        assert "@scout" in cli and "@worker" in cli
+        assert "@scout" in task

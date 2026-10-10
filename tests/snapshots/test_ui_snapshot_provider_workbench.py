@@ -13,7 +13,7 @@ from chartreux.core.model_catalog.loader import load_catalog
 from chartreux.ui.providers.workbench import ProviderWorkbenchScreen, WorkbenchView
 from tests.snapshots.base_snapshot_test_app import BaseSnapshotTestApp
 from tests.snapshots.snap_compare import SnapCompare
-from tests.ui.providers.test_workbench import setup
+from tests.ui.providers.test_workbench import Services, setup
 
 
 @pytest.fixture(autouse=True)
@@ -258,7 +258,12 @@ def test_preset_editor_actions(snap_compare: SnapCompare) -> None:
 def test_add_models_stage(snap_compare: SnapCompare) -> None:
     async def before(pilot: Pilot) -> None:
         screen = cast(ProviderWorkbenchScreen, pilot.app.screen)
-        screen.snapshot = load_catalog(Path("/nonexistent/chartreux-models.toml"))
+        shipped = load_catalog(Path("/nonexistent/chartreux-models.toml"))
+        screen.snapshot = shipped
+        # The stub writer stands in for the on-disk catalog: keep it in sync
+        # with the screen's snapshot the way the real CatalogStore stays
+        # consistent with the overlay it reads and writes.
+        cast("Services", screen.catalog_writer).catalog = shipped
         screen._refresh_browser()
         browser = screen.query_one("#wb-providers", OptionList)
         browser.highlighted = next(

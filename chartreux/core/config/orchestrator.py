@@ -5,6 +5,7 @@ from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping
 import copy
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -22,6 +23,7 @@ from chartreux.core.config._credential_authority import (
 )
 from chartreux.core.config._restrictions import ConfigCandidate, SourceRestrictions
 from chartreux.core.config._root_authority import ROOTS_FIELD, validate_root_source
+from chartreux.core.config._root_persistence import persist_project_root_grant
 from chartreux.core.config._source_validation import validate_source
 from chartreux.core.config.builder import ConfigBuilder
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
@@ -641,6 +643,29 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
             # notification cannot undo it or turn it into a failed save.
             return replace(result, error="notification")
         return result
+
+    async def save_project_root_grant(
+        self, *, project: Path, root: Path, expected_revision: str
+    ) -> ConfigSaveResult:
+        """Persist one approved root grant to the actual user source only.
+
+        This dedicated path is the only sanctioned writer of
+        ``authorized_roots_by_project``; generic config/write patches keep
+        rejecting the field. The merge reads a force-loaded copy of the user
+        layer, so unrelated projects and settings come from disk, and the
+        expected user revision is checked optimistically before an atomic
+        ``save_checked`` write. Runtime state is never published: live caches,
+        the accepted token, and the workspace stay unchanged (application is
+        "unchanged"); the caller applies the session grant itself.
+        """
+        async with self._mutation_lock:
+            if not self._can_persist or not expected_revision:
+                return ConfigSaveResult(
+                    "user", "not_saved", "unchanged", error="validation"
+                )
+            return await persist_project_root_grant(
+                self, project=project, root=root, expected_revision=expected_revision
+            )
 
     async def set_field(
         self,

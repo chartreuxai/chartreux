@@ -38,7 +38,7 @@ def test_overlay_authority_and_curated_blocks_in_all_renderings(mode, catalog):
     policy = merge_dispatch_overlay({
         "mode": mode,
         "vocabulary": {"audit": {"description": "Inspect widget invariants."}},
-        "slots": {"mechanical": {"role": "@large", "purposes": ["audit"]}},
+        "slots": {"mechanical": {"role": "@heavy", "purposes": ["audit"]}},
         "failure_routing": "widget: use slot `mechanical`.",
         "contrasts": "Use slot `mechanical` for purpose `audit`; use slot `implementor` for implementation.",
     })
@@ -66,9 +66,9 @@ def test_empty_roster_renders_every_unavailable_slot_honestly():
         assert "no slot binding is available" in text.lower()
         for name in policy.slots:
             assert f"Slot `{name}` unavailable:" in text
-        assert "`@small`" not in text
-        assert "`@medium`" not in text
-        assert "`@large`" not in text
+        assert "`@scout`" not in text
+        assert "`@worker`" not in text
+        assert "`@heavy`" not in text
 
 
 @pytest.mark.parametrize(
@@ -152,7 +152,7 @@ def test_resume_removed_secondary_model_retains_orchestration_and_bindings():
     from chartreux.core.subagents import InvalidLaunchModelError
 
     with pytest.raises(InvalidLaunchModelError):
-        _resolved_model(config, "@small")
+        _resolved_model(config, "@scout")
 
 
 def test_fallback_diagnostic_is_projected_to_clients():

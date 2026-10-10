@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
@@ -18,8 +18,9 @@ from chartreux.core.model_catalog.contracts import (
     ModelEdits,
     OptionalEdit,
 )
-from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.model_catalog.loader import CatalogSnapshot, project_catalog_changes
 from chartreux.core.model_catalog.matching import MatchOutcome, match_discovered_model
+from chartreux.core.model_catalog.resolver import ModelResolver, supports_thinking
 from chartreux.core.model_catalog.schema import (
     DeploymentDefinition,
     ModelCatalog,
@@ -31,14 +32,23 @@ type CollisionDecision = Literal["add_existing", "separate"]
 
 
 def usable_canonical_models(
-    snapshot: CatalogSnapshot, credential_resolver: CredentialStatusResolver
+    snapshot: CatalogSnapshot,
+    credential_resolver: CredentialStatusResolver,
+    *,
+    allowed_models: Sequence[str] = (),
+    thinking_overrides: Mapping[str, str] | None = None,
 ) -> frozenset[str]:
     """Project catalog readiness into identities for the core-free graduation state."""
     state = ManagementState.from_snapshot(snapshot, "")
     return frozenset(
         name
         for name in snapshot.catalog.models
-        if state._usable(name, credential_resolver=credential_resolver)
+        if state._usable(
+            name,
+            credential_resolver=credential_resolver,
+            allowed_models=allowed_models,
+            thinking_overrides=thinking_overrides,
+        )
     )
 
 
@@ -457,7 +467,12 @@ class ManagementState:
         )
 
     def validate_preset(
-        self, role: str, credential_resolver: CredentialStatusResolver | None
+        self,
+        role: str,
+        credential_resolver: CredentialStatusResolver | None,
+        *,
+        allowed_models: Sequence[str] = (),
+        thinking_overrides: Mapping[str, str] | None = None,
     ) -> str | None:
         model, thinking = self.preset(role)
         if model not in self.catalog.models and not any(
@@ -466,7 +481,14 @@ class ManagementState:
             for item in pending.values()
         ):
             return f"Preset {role}: configure model {model} or choose another model."
-        reason = self._preset_readiness(model, thinking, credential_resolver)
+        reason = self._preset_readiness(
+            model,
+            thinking,
+            credential_resolver,
+            role=role,
+            allowed_models=tuple(allowed_models),
+            thinking_overrides=thinking_overrides,
+        )
         return (
             f"Preset {role}: {reason}; repair it or choose another model/level."
             if reason
@@ -653,105 +675,77 @@ class ManagementState:
         *,
         after: bool = False,
         credential_resolver: CredentialStatusResolver | None = None,
+        allowed_models: Sequence[str] = (),
+        thinking_overrides: Mapping[str, str] | None = None,
     ) -> bool:
-        definition = self.catalog.models.get(name)
-        if definition is not None and definition.disabled:
+        candidate = self._candidate_snapshot() if after else self.snapshot
+        try:
+            resolved = ModelResolver(candidate).resolve(
+                name,
+                allowed_models=allowed_models,
+                thinking_override=(thinking_overrides or {}).get(name),
+            )
+        except ValueError:
             return False
-
-        def ready(provider_id: str) -> bool:
-            provider = self.catalog.providers[provider_id]
-            connection = self.connections.get(provider_id)
-            env_var = (
-                connection.api_key_env_var
-                if after and connection
-                else provider.api_key_env_var
-            )
-            return not provider.disabled and (
-                not env_var
-                or credential_resolver is None
-                or bool(credential_resolver(env_var))
-            )
-
-        if after and any(
-            item.enabled and item.canonical_name == name and ready(provider_id)
-            for provider_id, pending in self.pending_by_provider.items()
-            for item in pending.values()
-        ):
-            return True
-        return definition is not None and any(
-            ready(dep.provider)
-            and (
-                self.enabled_by_deployment.get((name, dep.provider), not dep.disabled)
-                if after
-                else not dep.disabled
-            )
-            for dep in definition.deployments
+        env_var = resolved.provider.api_key_env_var
+        return (
+            not env_var
+            or credential_resolver is None
+            or bool(credential_resolver(env_var))
         )
+
+    def _candidate_snapshot(self) -> CatalogSnapshot:
+        return project_catalog_changes(self.snapshot, self._build())
 
     def _preset_readiness(
         self,
         model: str,
         thinking: str,
         credential_resolver: CredentialStatusResolver | None,
+        *,
+        role: str | None = None,
+        candidate: CatalogSnapshot | None = None,
+        allowed_models: tuple[str, ...] = (),
+        thinking_overrides: Mapping[str, str] | None = None,
     ) -> str | None:
-        """Check one deployment against credentials and thinking together."""
-        definition = self.catalog.models.get(model)
-        if definition is not None and definition.disabled:
-            return "the canonical model is disabled"
-        deployments: list[tuple[str, str, tuple[str, ...] | None, bool]] = [
-            (
-                deployment.provider,
-                deployment.name,
-                deployment.supported_thinking_levels,
-                self.enabled_by_deployment.get(
-                    (model, deployment.provider), not deployment.disabled
+        """Resolve first using runtime ordering, then inspect only its credential.
+
+        A role expression filters deployments by the staged thinking level, as
+        the runtime does. A bare (model, thinking) pair instead selects the
+        first deployment supporting that level: the deployment a preset staged
+        with the pair would resolve to at runtime.
+        """
+        candidate = candidate or self._candidate_snapshot()
+        effective = (thinking_overrides or {}).get(model, thinking)
+        try:
+            resolved = ModelResolver(candidate).resolve(
+                f"@{role}" if role is not None else model,
+                allowed_models=allowed_models,
+                thinking_override=effective,
+                candidate_filter=(
+                    None
+                    if role is not None
+                    else lambda match: supports_thinking(
+                        match.provider, match.deployment, effective
+                    )
                 ),
             )
-            for deployment in (definition.deployments if definition else ())
-        ]
-        deployments.extend(
-            (provider, item.wire_name, None, item.enabled)
-            for provider, pending in self.pending_by_provider.items()
-            for item in pending.values()
-            if item.canonical_name == model
-        )
-        unavailable_credential: str | None = None
-        unsupported = False
-        for provider_id, wire_name, supported, enabled in deployments:
-            if not enabled:
-                continue
-            provider = self.catalog.providers[provider_id]
-            if provider.disabled:
-                continue
-            connection = self.connections.get(provider_id)
-            env_var = (
-                connection.api_key_env_var if connection else provider.api_key_env_var
-            )
-            if (
-                env_var
-                and credential_resolver is not None
-                and not credential_resolver(env_var)
-            ):
-                unavailable_credential = env_var
-                continue
-            levels = get_thinking_levels(
-                connection.backend if connection else provider.backend,
-                connection.api_style if connection else provider.api_style,
-                wire_name,
-            )
-            if (supported is not None and thinking not in supported) or (
-                levels is not None and thinking not in levels
-            ):
-                unsupported = True
-                continue
-            return None
-        if unavailable_credential:
-            return f"credential {unavailable_credential} is unavailable"
-        if unsupported:
-            return (
-                f"thinking {thinking} is unsupported by enabled deployments of {model}"
-            )
-        return "no enabled deployment is available"
+        except ValueError as exc:
+            if getattr(exc, "code", None) == "thinking_unsupported":
+                # The host override replaces the staged level, as at runtime.
+                return (
+                    f"thinking {effective} is unsupported by enabled "
+                    f"deployments of {model}"
+                )
+            return str(exc)
+        env_var = resolved.provider.api_key_env_var
+        if (
+            env_var
+            and credential_resolver is not None
+            and not credential_resolver(env_var)
+        ):
+            return f"credential {env_var} is unavailable"
+        return None
 
     def _collision_errors(self) -> list[str]:
         errors: list[str] = []
@@ -827,13 +821,15 @@ class ManagementState:
             *(slot.role.removeprefix("@") for slot in self._dispatch.slots.values()),
         }
 
-    def validate(
+    def validate(  # noqa: PLR0912
         self,
         active_expression: str | None = None,
         *,
         mode: Literal["management", "onboarding"] = "management",
         credential_resolver: CredentialStatusResolver | None = None,
         completion: bool = True,
+        allowed_models: Sequence[str] = (),
+        thinking_overrides: Mapping[str, str] | None = None,
     ) -> Validation:
         """Validate structural edits; additionally check preset readiness at Finish."""
         errors: list[str] = []
@@ -851,6 +847,10 @@ class ManagementState:
                         if getattr(item.edits, field_name).state == "cleared":
                             errors.append(f"{field_name} cannot be cleared.")
         changes = self._build()
+        try:
+            candidate = project_catalog_changes(self.snapshot, changes)
+        except (ValueError, TypeError):
+            candidate = self.snapshot
         unresolved: list[str] = []
         unusable: list[str] = []
         if completion:
@@ -870,7 +870,15 @@ class ManagementState:
                         f"Preset {role}: configure model {model} or choose another model."
                     )
                     continue
-                reason = self._preset_readiness(model, thinking, credential_resolver)
+                reason = self._preset_readiness(
+                    model,
+                    thinking,
+                    credential_resolver,
+                    role=role,
+                    candidate=candidate,
+                    allowed_models=tuple(allowed_models),
+                    thinking_overrides=thinking_overrides,
+                )
                 if reason is not None:
                     unusable.append(role)
                     errors.append(

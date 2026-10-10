@@ -117,6 +117,7 @@ SERVER_METHODS: tuple[str, ...] = (
     "config/policy/replace",
     "policy/roots/read",
     "policy/roots/replace",
+    "policy/roots/save",
     "config/schema",
     "config/write",
     "diagnostics/list",
@@ -914,6 +915,9 @@ class RootsReadResponse(ProtocolModel):
     revision: str
     project: str
     roots: list[str]
+    saved_roots: list[str] | None = None
+    user_revision: str | None = None
+    effective_roots: list[str] = Field(default_factory=list)
 
 
 class RootsReplaceParams(ProtocolModel):
@@ -927,6 +931,38 @@ class RootsReplaceParams(ProtocolModel):
 class RootsReplaceResponse(ProtocolModel):
     revision: str
     runtime: RuntimeSnapshot
+
+
+class RootsSaveParams(ProtocolModel):
+    session_id: str
+    root: str
+    expected_revision: str
+    user_initiated: Literal[True]
+
+
+class RootsSaveResponse(ProtocolModel):
+    """Honest persistence outcome of one project root grant save.
+
+    Mirrors the config save result: a stale expected revision is a conflict
+    result, never an RPC error, so callers can keep an already-applied session
+    grant and report the outcome.
+    """
+
+    target: Literal["user", "project"] = "user"
+    persistence: Literal["not_saved", "saved", "durability_uncertain"]
+    application: Literal["unchanged", "applied", "failed"]
+    revision: str | None = None
+    error: (
+        Literal[
+            "validation",
+            "conflict",
+            "write",
+            "application",
+            "cancelled",
+            "notification",
+        ]
+        | None
+    ) = None
 
 
 class PolicyToolReplacement(ProtocolModel):

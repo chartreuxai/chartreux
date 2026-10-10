@@ -29,7 +29,7 @@ class ModelResolutionError(ValueError):
         self.code = code
 
 
-def _supports_thinking(
+def supports_thinking(
     provider: ProviderDefinition, deployment: DeploymentDefinition, thinking: str
 ) -> bool:
     """Check declared deployment limits and known backend wire capabilities."""
@@ -74,7 +74,7 @@ class ResolvedModel:
             if thinking is not None
             else self.thinking or self.definition.thinking
         )
-        if validate_thinking and not _supports_thinking(
+        if validate_thinking and not supports_thinking(
             self.provider, self.deployment, selected_thinking
         ):
             raise ModelResolutionError(
@@ -251,7 +251,7 @@ class ModelResolver:
                 continue
             thinking_compatible = False
             for deployment in allowed:
-                if role is not None and not _supports_thinking(
+                if role is not None and not supports_thinking(
                     self.snapshot.catalog.providers[deployment.provider],
                     deployment,
                     thinking_override
@@ -330,7 +330,7 @@ class ModelResolver:
                 "allowlist_excluded",
                 f"Committed deployment {label!r} is not permitted by allowed_models",
             )
-        if identity.thinking is not None and not _supports_thinking(
+        if identity.thinking is not None and not supports_thinking(
             provider, deployment, identity.thinking
         ):
             raise ModelResolutionError(

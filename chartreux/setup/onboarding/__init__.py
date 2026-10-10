@@ -24,6 +24,11 @@ from chartreux.core.model_catalog.contracts import (
 )
 from chartreux.core.model_catalog.discovery import discover_models
 from chartreux.core.model_catalog.loader import CatalogStore, load_catalog
+from chartreux.core.model_catalog.materialization import (
+    MaterializationError,
+    materialize_default_catalog,
+)
+from chartreux.observability.logging import logger
 from chartreux.setup.auth.api_key_persistence import persist_api_key
 from chartreux.setup.onboarding.base import OnboardingHost
 from chartreux.setup.onboarding.context import OnboardingContext
@@ -146,9 +151,12 @@ class OnboardingApp(App[ProviderWorkbenchResult | OnboardingFailure | None]):
         return self._config_service
 
     def _graduation_models_saved(
-        self, usable: frozenset[str], newly_usable: frozenset[str]
+        self,
+        roster_before: frozenset[str],
+        roster_after: frozenset[str],
+        saved_models: frozenset[str],
     ) -> None:
-        self._graduation.state.model_saved(usable, newly_usable)
+        self._graduation.state.model_saved(roster_before, roster_after, saved_models)
         self._graduation.save()
 
     async def _run_workbench(self) -> None:
@@ -164,6 +172,9 @@ class OnboardingApp(App[ProviderWorkbenchResult | OnboardingFailure | None]):
                 snapshot=load_catalog(),
                 mode="onboarding",
                 initial_view=initial_view,
+                allowed_models=self._config.allowed_models,
+                thinking_overrides=self._config.thinking_overrides,
+                selected_model=self._config.selected_model,
                 on_models_saved=self._graduation_models_saved,
                 tls=TLSConfig(
                     enable_system_trust_store=self._config.enable_system_trust_store
@@ -225,6 +236,19 @@ def run_onboarding(
             "Run `chartreux --setup` to choose a usable model or configure its credential.\n"
         )
         sys.exit(1)
+    # A completed setup that saved no catalog still runs on the shipped
+    # defaults in code; publish the editable template so the user owns the
+    # file. Onboarding is the only caller — it is reachable only after legacy
+    # reconciliation, and publication never overwrites an existing file, so a
+    # migrated or saved roster always wins.
+    try:
+        materialize_default_catalog()
+    except (MaterializationError, OSError) as error:
+        logger.warning(
+            "Default catalog materialization could not be fully completed "
+            "(not published): %s",
+            error,
+        )
     if isinstance(result, ProviderWorkbenchResult):
         rprint('\nSetup complete. Run "chartreux" to start using the Chartreux CLI.\n')
     return resolved_orchestrator

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum, auto
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -28,3 +29,14 @@ class ToolPermission(StrEnum):
 class PermissionContext(BaseModel):
     permission: ToolPermission
     reason: str | None = None
+    denial_kind: (
+        Literal[
+            "out_of_root",
+            "sensitive",
+            "path_rule",
+            "plan_scope",
+            "parent_ceiling",
+            "tool_policy",
+        ]
+        | None
+    ) = None

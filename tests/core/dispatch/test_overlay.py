@@ -21,11 +21,13 @@ from chartreux.core.dispatch import (
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import (
     CatalogLoadError,
+    CatalogSnapshot,
     load_catalog,
     merge_catalog_overlay,
     merge_dispatch_overlay,
     resolve_dispatch_overlay,
 )
+from chartreux.core.model_catalog.resolver import ModelResolver
 from chartreux.utils.paths import get_chartreux_home
 
 
@@ -41,6 +43,50 @@ def test_roles_only_overlay_loads_exactly_as_before(tmp_path: Path) -> None:
     assert snapshot.dispatch == SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE]
     assert snapshot.dispatch.mode == DEFAULT_DISPATCH_MODE
     assert snapshot.dispatch_diagnostics == ()
+
+
+def test_sparse_patch_of_a_removed_role_fails_validation() -> None:
+    # A sparse [roles.small] patch no longer inherits the shipped model and
+    # thinking fields (the tier roles were removed with the roster rename), so
+    # it fails schema validation with a clear error instead of retargeting.
+    with pytest.raises(ValidationError, match="model"):
+        merge_catalog_overlay(
+            SHIPPED_CATALOG, {"roles": {"small": {"thinking": "low"}}}
+        )
+
+
+def test_complete_old_role_definition_remains_a_user_defined_role() -> None:
+    catalog = merge_catalog_overlay(
+        SHIPPED_CATALOG,
+        {
+            "roles": {
+                "small": {
+                    "description": "custom preset",
+                    "model": "glm-5-3",
+                    "thinking": "low",
+                }
+            }
+        },
+    )
+    resolver = ModelResolver(CatalogSnapshot(catalog, "user-role"))
+    assert catalog.roles["small"].model == "glm-5-3"
+    assert resolver.resolve("@small").base_model == "glm-5-3"
+
+
+def test_dispatch_overlay_binding_a_removed_role_fails_with_actionable_lint(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "models.toml"
+    path.write_text('[dispatch.slots.implementor]\nrole = "@small"\n')
+
+    snapshot = load_catalog(path)
+
+    assert snapshot.dispatch == STANDALONE_PRESET
+    assert snapshot.dispatch_diagnostics
+    diagnostic = snapshot.dispatch_diagnostics[0]
+    assert "S1" in diagnostic
+    assert "@small" in diagnostic
+    assert "implementor" in diagnostic
 
 
 def test_missing_models_toml_selects_the_shipped_default_dispatch(
@@ -69,7 +115,7 @@ def test_dispatch_overlay_sparse_semantics_and_list_replacement() -> None:
             "implementor": {"purposes": ["implementation", "search"]},
             "custom": {
                 "profile": "worker",
-                "role": "@small",
+                "role": "@scout",
                 "purposes": ["mechanical-edit"],
                 "implements": "routine",
                 "review_eligible": False,
@@ -82,7 +128,7 @@ def test_dispatch_overlay_sparse_semantics_and_list_replacement() -> None:
 
     # List-valued fields replace; absent slot fields inherit the preset.
     assert policy.slots["implementor"].purposes == ("implementation", "search")
-    assert policy.slots["implementor"].role == "@medium"
+    assert policy.slots["implementor"].role == "@worker"
     assert policy.slots["implementor"].profile == "worker"
     # A new slot carries its own complete definition.
     assert policy.slots["custom"].purposes == ("mechanical-edit",)
@@ -129,15 +175,15 @@ def test_dispatch_overlay_schema_errors_fail_at_load(patch: object) -> None:
 
 def test_dispatch_content_participates_in_revision(tmp_path: Path) -> None:
     plain = tmp_path / "plain.toml"
-    plain.write_text('[roles.small]\nthinking = "low"\n')
+    plain.write_text('[roles.scout]\nthinking = "low"\n')
     selected = tmp_path / "selected.toml"
     selected.write_text(
-        '[roles.small]\nthinking = "low"\n\n[dispatch]\nmode = "orchestrated"\n'
+        '[roles.scout]\nthinking = "low"\n\n[dispatch]\nmode = "orchestrated"\n'
     )
     edited = tmp_path / "edited.toml"
     edited.write_text(
-        '[roles.small]\nthinking = "low"\n\n[dispatch]\nmode = "standalone"\n\n'
-        '[dispatch.slots.implementor]\nrole = "@small"\n'
+        '[roles.scout]\nthinking = "low"\n\n[dispatch]\nmode = "standalone"\n\n'
+        '[dispatch.slots.implementor]\nrole = "@scout"\n'
     )
 
     base = load_catalog(plain)

@@ -14,7 +14,6 @@ if TYPE_CHECKING:
         FALLBACK_THEME,
     )
     from chartreux.core.config.chartreux_schema import (
-        DEFAULT_ACTIVE_MODEL_CONFIG,
         ChartreuxConfigSchema,
         create_default_config,
         load_dotenv_values,
@@ -83,7 +82,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AUTO_THEME",
-    "DEFAULT_ACTIVE_MODEL_CONFIG",
     "DEFAULT_API_RETRY_MAX_ELAPSED_TIME",
     "DEFAULT_API_TIMEOUT",
     "DEFAULT_AUTO_COMPACT_THRESHOLD",
@@ -234,10 +232,6 @@ _MAPPING: dict[str, tuple[str, str]] = {
     "ConfigChangeCallback": ("chartreux.core.config.types", "ConfigChangeCallback"),
     "ConfigChangeEvent": ("chartreux.core.config.types", "ConfigChangeEvent"),
     "LayerConfigSnapshot": ("chartreux.core.config.types", "LayerConfigSnapshot"),
-    "DEFAULT_ACTIVE_MODEL_CONFIG": (
-        "chartreux.core.config.chartreux_schema",
-        "DEFAULT_ACTIVE_MODEL_CONFIG",
-    ),
     "DEFAULT_TRANSCRIBE_MODELS": (
         "chartreux.core.config.chartreux_schema",
         "DEFAULT_TRANSCRIBE_MODELS",

@@ -100,7 +100,9 @@ async def test_authority_guard_counts_pending_but_not_finished_records() -> None
     assert registry is not None
     try:
         pending = loop.background_jobs.reserve(BashStartArgs(command="echo pending"))
-        cosmetic = loop.config.model_copy(update={"show_greeting": False}, deep=True)
+        cosmetic = loop.config.model_copy(
+            update={"ask_confirmation_on_exit": False}, deep=True
+        )
         loop._guard_job_authority_config(cosmetic)
         reduction = loop.config.model_copy(
             update={"disabled_tools": [*loop.config.disabled_tools, "bash"]}, deep=True

@@ -67,6 +67,8 @@ from chartreux.app_server.protocol import (
     RootsReadResponse,
     RootsReplaceParams,
     RootsReplaceResponse,
+    RootsSaveParams,
+    RootsSaveResponse,
     RuntimeUpdatedParams,
     SessionCompactParams,
     SessionCompactResponse,
@@ -105,6 +107,7 @@ from chartreux.app_server.protocol import (
 from chartreux.core.agent_loop._loop import AgentLoopStateError, _PreparedReload
 from chartreux.core.config._mcp_save import MCPApply, MCPPreflight
 from chartreux.core.config._restrictions import ConfigCandidate
+from chartreux.core.config._root_persistence import read_saved_roots
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.git.worktree import ManagedWorktree, PreparedWorktree
@@ -622,6 +625,16 @@ class SessionBackendImpl:
         try:
             source = self.children.root_source(params.session_id)
             project = self.session.agent_loop.cwd
+            loop = self.session.agent_loop
+            saved = await read_saved_roots(loop.config_orchestrator, project=project)
+            effective = {
+                path
+                for entry in source.authorized_roots
+                if entry.project == project
+                for path in entry.roots
+            }
+            effective.update(loop._session_root_grants.roots)
+            effective.discard(project.resolve())
             return RootsReadResponse(
                 revision=self.children.roots_revision(params.session_id),
                 project=str(project),
@@ -631,6 +644,9 @@ class SessionBackendImpl:
                     if entry.project == project
                     for path in entry.roots
                 ],
+                saved_roots=list(saved.roots) if saved.unavailable is None else None,
+                user_revision=saved.user_revision,
+                effective_roots=sorted(str(path) for path in effective),
             )
         except (ValueError, RuntimeError):
             pass
@@ -660,6 +676,36 @@ class SessionBackendImpl:
         # Do not reflect untrusted paths or validation inputs in RPC errors.
         raise SessionBackendError(
             ProtocolErrorCode.CONFLICT, "Root replacement rejected"
+        )
+
+    async def save_roots(self, params: RootsSaveParams) -> RootsSaveResponse:
+        """Persist one user-approved root grant for the calling session.
+
+        The calling session may be a child: the registry routes the save to the
+        root orchestrator keyed by the registered caller's cwd, and child
+        orchestrators never write. Mid-turn safe: no tree-idle reservation is
+        taken; the save internals hold the orchestrator mutation lock and
+        publish nothing. A stale expected revision is a conflict result, not an
+        RPC error, so an already-applied session grant survives it.
+        """
+        self.guard_request()
+        try:
+            result = await self.children.save_root_grant(
+                session_id=params.session_id,
+                root=Path(params.root),
+                expected_revision=params.expected_revision,
+            )
+        except (ValueError, RuntimeError):
+            raise SessionBackendError(
+                ProtocolErrorCode.NOT_FOUND,
+                "Root grant save requires a registered session",
+            ) from None
+        return RootsSaveResponse(
+            target=result.target,
+            persistence=result.persistence,
+            application=result.application,
+            revision=result.revision,
+            error=result.error,
         )
 
     async def read_policy(self, params: PolicyReadParams) -> PolicyReadResponse:

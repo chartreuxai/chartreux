@@ -124,7 +124,7 @@ Use these tools directly for orchestration only:
 
 Select an agent type by profile name with `task(agent_type="worker", task=...)` (default `worker`); `advisor` and `reviewer` are also agent types. A retained agent instance is identified by `agent_id`, not `agent_type`. The `agent-N` syntax (digits after `agent-`) is reserved for instance handles and rejected in `agent_type` before dispatch. To continue an idle instance, use `task(agent_id=..., background=true, task=...)`, omitting `agent_type` to retain its profile. Launch acknowledgments and `check_agents.reuse_guidance` include this reuse guidance.
 
-Route by task kind through the configured slots; one canonical model serves every slot, and each slot's binding decides its thinking level. `mechanical` (profile `worker`) takes search, exploration, verification, and mechanical-edit. `implementor` (profile `worker`) takes implementation. `escalation-implementor` (profile `worker`) takes implementation-demanding-settled; state the reason for this route. `advisor` (profile `advisor`) takes design-analysis and planning-analysis; never implementation. `reviewer` (profile `reviewer`) takes review.quick and review.standard. `analytical-reviewer`, `peer-reviewer`, and `execution-reviewer` (profile `reviewer`) take review.deep.
+Route by task kind through the configured slots; one canonical model serves every slot, and each slot's binding decides its thinking level. `mechanical` (profile `worker`) takes search, exploration, verification, and mechanical-edit. `implementor` (profile `worker`) takes implementation. `escalation-implementor` (profile `worker`) takes implementation-demanding-settled; state the reason for this route. `advisor` (profile `advisor`) takes design-analysis and planning-analysis; the advisor profile never implements. `reviewer` (profile `reviewer`) takes review.quick and review.standard. `analytical-reviewer`, `peer-reviewer`, and `execution-reviewer` (profile `reviewer`) take review.deep.
 
 Select a route afresh for each task. Uncertainty, file count, session length, or wanting a better answer are not escalation criteria. If an implementation attempt fails, diagnose the failure, retry on the `implementor` slot with a different approach, or dispatch the `advisor` slot for read-only analysis; never re-dispatch implementation to the `advisor` slot. Escalate architectural blockers to an advisor and authorization or scope blockers to the user.
 
@@ -143,14 +143,14 @@ The active table overrides compatibility examples and profile defaults. Pass the
 
 | Slot | Profile | Role | Model | Thinking | Purposes | Implements | Review eligible |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `mechanical` | `worker` | — | `glm-5-3` | low | search, exploration, verification, mechanical-edit | routine | False |
-| `implementor` | `worker` | — | `glm-5-3` | medium | implementation | routine | False |
-| `escalation-implementor` | `worker` | — | `glm-5-3` | medium | implementation-demanding-settled | escalation | False |
-| `advisor` | `advisor` | — | `glm-5-3` | high | design-analysis, planning-analysis | never | False |
-| `reviewer` | `reviewer` | — | `glm-5-3` | medium | review.quick, review.standard | never | True |
-| `analytical-reviewer` | `reviewer` | — | `glm-5-3` | high | review.deep | never | True |
-| `peer-reviewer` | `reviewer` | — | `glm-5-3` | high | review.deep | never | True |
-| `execution-reviewer` | `reviewer` | — | `glm-5-3` | medium | review.deep | never | True |
+| `mechanical` | `worker` | — | `solo-model` | low | search, exploration, verification, mechanical-edit | routine | False |
+| `implementor` | `worker` | — | `solo-model` | medium | implementation | routine | False |
+| `escalation-implementor` | `worker` | — | `solo-model` | high | implementation-demanding-settled | escalation | False |
+| `advisor` | `advisor` | — | `solo-model` | high | design-analysis, planning-analysis | never | False |
+| `reviewer` | `reviewer` | — | `solo-model` | medium | review.quick, review.standard | never | True |
+| `analytical-reviewer` | `reviewer` | — | `solo-model` | high | review.deep | never | True |
+| `peer-reviewer` | `reviewer` | — | `solo-model` | high | review.deep | never | True |
+| `execution-reviewer` | `reviewer` | — | `solo-model` | medium | review.deep | never | True |
 
 ### Purpose meanings
 - `search`: Bounded searches, grep, and symbol or reference lookups.
@@ -174,7 +174,7 @@ For one canonical model, including multiple thinking levels, use fresh-context r
 Select a route afresh for each task. Uncertainty, file count, session length, or wanting a better answer are not escalation criteria. If an implementation attempt fails, diagnose the failure, retry on the `implementor` slot with a different approach, or dispatch the `advisor` slot for read-only analysis; never re-dispatch implementation to the `advisor` slot. Escalate architectural blockers to an advisor and authorization or scope blockers to the user.
 
 ### Contrasts
-Use slot `mechanical` for bounded searches, verification runs, and mechanical single-file edits; use slot `implementor` for substantive implementation. Use slot `escalation-implementor` for demanding execution with a settled approach and state the reason; use slot `advisor` for read-only design and planning analysis, never implementation.
+Use slot `mechanical` for bounded searches, verification runs, and mechanical single-file edits; use slot `implementor` for substantive implementation. Use slot `escalation-implementor` for demanding execution with a settled approach and state the reason; it is a worker-profile route. Use slot `advisor` for read-only design and planning analysis only; the advisor profile never implements.
 
 **Shell**
 

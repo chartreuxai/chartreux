@@ -39,7 +39,12 @@ from chartreux.core.tools.builtins.task import (
     TaskToolConfig,
 )
 from chartreux.core.tools.permissions import PermissionContext
-from tests.conftest import ConfigBuilder, OrchestratorLoader, multi_model_catalog
+from tests.conftest import (
+    ConfigBuilder,
+    OrchestratorLoader,
+    multi_model_catalog,
+    single_model_catalog,
+)
 from tests.mock.utils import collect_result
 from tests.stubs.fake_interaction_requests import FakeInteractionRequests
 
@@ -80,7 +85,9 @@ class TestTaskArgs:
         assert "committed base model" in prompt
 
     @pytest.mark.parametrize("policy", [ORCHESTRATED_PRESET, STANDALONE_PRESET])
-    @pytest.mark.parametrize("catalog", [multi_model_catalog(), SHIPPED_CATALOG])
+    @pytest.mark.parametrize(
+        "catalog", [multi_model_catalog(), single_model_catalog(), SHIPPED_CATALOG]
+    )
     def test_task_prompt_documents_single_preset_semantics(
         self, policy: DispatchPolicy, catalog: ModelCatalog
     ) -> None:
@@ -90,10 +97,10 @@ class TestTaskArgs:
 
         if shape.single_model:
             assert "fresh reviewer on a deep-review slot" in prompt
-            assert '"model": "@large"' not in prompt
+            assert '"model": "@heavy"' not in prompt
         else:
-            assert '"model": "@large"' in prompt
-            assert 'config={"model": "@large"}' in prompt
+            assert '"model": "@heavy"' in prompt
+            assert 'config={"model": "@heavy"}' in prompt
         assert '"model": "strong"' not in prompt
         assert "A slot binds a profile, a role, and purposes." in prompt
         assert "A slot's role is one default model and thinking level." in prompt
@@ -105,8 +112,10 @@ class TestTaskArgs:
         ) in prompt
 
     @pytest.mark.parametrize("policy", [ORCHESTRATED_PRESET, STANDALONE_PRESET])
-    @pytest.mark.parametrize("catalog", [multi_model_catalog(), SHIPPED_CATALOG])
-    def test_task_prompt_documents_mechanical_small_override(
+    @pytest.mark.parametrize(
+        "catalog", [multi_model_catalog(), single_model_catalog(), SHIPPED_CATALOG]
+    )
+    def test_task_prompt_documents_mechanical_scout_override(
         self, policy: DispatchPolicy, catalog: ModelCatalog
     ) -> None:
         shape = roster_for(catalog, policy)
@@ -115,7 +124,7 @@ class TestTaskArgs:
 
         if policy == ORCHESTRATED_PRESET and not shape.single_model:
             assert "pass the tier explicitly in `config`" in prompt
-            assert 'config={"model": "@small"}' in prompt
+            assert 'config={"model": "@scout"}' in prompt
             assert (
                 'task="Rename add to plus in utils.py and update its call sites."'
                 in prompt
@@ -124,16 +133,16 @@ class TestTaskArgs:
                 'task="Add a retry helper with exponential backoff to utils.py and use '
                 'it in app.py."' in prompt
             )
-            assert '"model": "@large"' in prompt
+            assert '"model": "@heavy"' in prompt
         else:
             assert "launches on the `mechanical` slot" in prompt
             assert "implementation launches on the `implementor` slot" in prompt
-            assert 'config={"model": "@small"}' not in prompt
+            assert 'config={"model": "@scout"}' not in prompt
         if policy == STANDALONE_PRESET:
             assert "Delegation is optional" in prompt
         if shape.single_model:
             assert "re-state the slot explicitly on every reuse" in prompt
-            assert "previously `@small`" not in prompt
+            assert "previously `@scout`" not in prompt
 
     def test_task_prompt_opener_covers_routine_bounded_delegation(self) -> None:
         prompt = (

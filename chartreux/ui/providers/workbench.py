@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from enum import StrEnum
@@ -30,6 +30,7 @@ from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
 from chartreux.core.dispatch.schema import DispatchMode
+from chartreux.core.dispatch.session import bind_snapshot_policy
 from chartreux.core.model_catalog.contracts import (
     CatalogChanges,
     CatalogValidationError,
@@ -48,7 +49,7 @@ from chartreux.core.model_catalog.contracts import (
     TLSConfig,
 )
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
-from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.model_catalog.loader import CatalogSnapshot, project_catalog_changes
 from chartreux.core.model_catalog.matching import match_discovered_model
 from chartreux.core.model_catalog.presets import (
     FULLY_CUSTOM,
@@ -695,8 +696,14 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         tls: TLSConfig | None = None,
         mode: Literal["management", "onboarding"] = "management",
         initial_view: Literal["providers", "presets"] = "providers",
-        on_models_saved: Callable[[frozenset[str], frozenset[str]], None] | None = None,
+        on_models_saved: Callable[
+            [frozenset[str], frozenset[str], frozenset[str]], None
+        ]
+        | None = None,
         session_only_credential_envs: set[str] | None = None,
+        allowed_models: Sequence[str] = (),
+        thinking_overrides: Mapping[str, str] | None = None,
+        selected_model: str | None = None,
     ) -> None:
         super().__init__()
         self.on_models_saved = on_models_saved
@@ -705,6 +712,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self.catalog_writer = catalog_writer
         self.credentials = credentials
         self.config = config
+        self.allowed_models = tuple(allowed_models)
+        self.thinking_overrides = dict(thinking_overrides or {})
+        self.selected_model = selected_model
         self.credential_resolver = credential_resolver
         self.tls = tls or TLSConfig()
         self.mode: Literal["management", "onboarding"] = mode
@@ -1991,6 +2001,8 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             self._update_help()
         elif key.startswith("model:"):
             name = key.removeprefix("model:")
+            if self.mode == "onboarding":
+                self.selected_model = name
             self._detail_cursor = name
             providers = self._catalog_model_owners(name)
             provider = providers[0] if len(providers) == 1 else None
@@ -2068,6 +2080,11 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self._onboarding_presets_seeded = False
         if state is None:
             return
+        changes = state._build()
+        try:
+            candidate = project_catalog_changes(state.snapshot, changes)
+        except (ValueError, TypeError):
+            candidate = state.snapshot
         configured = {
             provider_id
             for provider_id, provider in state.catalog.providers.items()
@@ -2081,26 +2098,61 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         candidates = [
             (name, thinking)
             for name, definition in sorted(state.catalog.models.items())
-            if not definition.disabled
+            if (self.selected_model is None or name == self.selected_model)
+            and not definition.disabled
             and any(
                 deployment.provider in configured
                 and not state.catalog.providers[deployment.provider].disabled
                 for deployment in definition.deployments
             )
             for thinking in state.preset_thinking_levels(name)
-            if state._preset_readiness(name, thinking, self._credential_value) is None
+            if state._preset_readiness(
+                name,
+                thinking,
+                self._credential_value,
+                candidate=candidate,
+                allowed_models=self.allowed_models,
+                thinking_overrides=self.thinking_overrides,
+            )
+            is None
         ]
         if not candidates:
+            reason = None
+            if self.selected_model is not None:
+                reason = state._preset_readiness(
+                    self.selected_model,
+                    state.preset_thinking_levels(self.selected_model)[0]
+                    if self.selected_model in state.catalog.models
+                    and state.preset_thinking_levels(self.selected_model)
+                    else "medium",
+                    self._credential_value,
+                    candidate=candidate,
+                    allowed_models=self.allowed_models,
+                    thinking_overrides=self.thinking_overrides,
+                )
             self._set_feedback(
                 "preset",
-                "No configured, enabled model is ready. Connect a provider, enable a model, and provide its credential.",
+                f"Selected model {self.selected_model!r} is not ready: {reason}"
+                if reason
+                else "No configured, enabled model is ready. Connect a provider, enable a model, and provide its credential.",
                 "warning",
             )
             return
         self._onboarding_presets_seeded = True
         for role in state.catalog.roles:
             model, thinking = state.preset(role)
-            if state._preset_readiness(model, thinking, self._credential_value) is None:
+            if (
+                state._preset_readiness(
+                    model,
+                    thinking,
+                    self._credential_value,
+                    role=role,
+                    candidate=candidate,
+                    allowed_models=self.allowed_models,
+                    thinking_overrides=self.thinking_overrides,
+                )
+                is None
+            ):
                 continue
             replacement = next(
                 (candidate for candidate in candidates if candidate[1] == thinking),
@@ -2158,7 +2210,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         )
         ordered_roles = [
             role
-            for role in ("orchestrator", "large", "medium", "small")
+            for role in ("orchestrator", "worker", "scout", "heavy")
             if role in state.catalog.roles
         ]
         ordered_roles.extend(sorted(set(state.catalog.roles) - set(ordered_roles)))
@@ -2166,9 +2218,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             model, thinking = state.preset(role)
             title = {
                 "orchestrator": "Main assistant (@orchestrator)",
-                "large": "Large (@large)",
-                "medium": "Medium (@medium)",
-                "small": "Small (@small)",
+                "worker": "Worker (@worker)",
+                "scout": "Scout (@scout)",
+                "heavy": "Heavy (@heavy)",
             }.get(role, f"@{role}")
             rows.add_option(
                 Option(
@@ -2223,7 +2275,10 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         if key == "finish":
             if self.mode == "onboarding":
                 validation = state.validate(
-                    mode="onboarding", credential_resolver=self._credential_value
+                    mode="onboarding",
+                    credential_resolver=self._credential_value,
+                    allowed_models=self.allowed_models,
+                    thinking_overrides=self.thinking_overrides,
                 )
                 if validation.errors:
                     self._customize_presets = True
@@ -2238,7 +2293,12 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                     definition = state.catalog.roles[role]
                     if pair == (definition.model, definition.thinking):
                         continue
-                    error = state.validate_preset(role, self._credential_value)
+                    error = state.validate_preset(
+                        role,
+                        self._credential_value,
+                        allowed_models=self.allowed_models,
+                        thinking_overrides=self.thinking_overrides,
+                    )
                     if error:
                         self._set_feedback("preset", error, "error")
                         self._refresh_presets(highlight=f"preset:{role}")
@@ -3422,6 +3482,9 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             )
             state.discovery = DiscoveryResult((*previous, DiscoveryItem(wire)))
         state.select(wire)
+        if self.mode == "onboarding":
+            item = state.pending.get(wire)
+            self.selected_model = item.canonical_name if item else wire
         self._set_feedback("field", "", "info")
         self._editing = None
         editor.value = ""
@@ -3527,17 +3590,36 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             return None
         return self._credential_value(env_var)
 
-    def _notify_models_saved(self, previously_usable: frozenset[str]) -> None:
+    def _bound_roster_identities(self, snapshot: CatalogSnapshot) -> frozenset[str]:
+        """Distinct canonical identities the snapshot's slots would bind."""
+        return bind_snapshot_policy(
+            snapshot, allowed_models=self.allowed_models
+        ).bound_canonical_identities
+
+    def _notify_models_saved(
+        self, previously_usable: frozenset[str], roster_before: frozenset[str]
+    ) -> None:
         if self.on_models_saved is not None:
             usable = usable_canonical_models(
-                self.snapshot, self._persisted_credential_value
+                self.snapshot,
+                self._persisted_credential_value,
+                allowed_models=self.allowed_models,
+                thinking_overrides=self.thinking_overrides,
             )
-            self.on_models_saved(usable, usable - previously_usable)
+            self.on_models_saved(
+                roster_before,
+                self._bound_roster_identities(self.snapshot),
+                usable - previously_usable,
+            )
 
     def _save_key(self, value: str) -> None:
         previously_usable = usable_canonical_models(
-            self.snapshot, self._persisted_credential_value
+            self.snapshot,
+            self._persisted_credential_value,
+            allowed_models=self.allowed_models,
+            thinking_overrides=self.thinking_overrides,
         )
+        roster_before = self._bound_roster_identities(self.snapshot)
         state = self.state
         env = (
             self._add.api_key_env_var
@@ -3555,7 +3637,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
             self._session_only_credential_envs.add(env)
         if result.status == "saved":
             self._session_only_credential_envs.discard(env)
-            self._notify_models_saved(previously_usable)
+            self._notify_models_saved(previously_usable, roster_before)
         self._unresolved.pop("field", None)
         self._confirm = None
         self._editing = None
@@ -3758,6 +3840,12 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
     ) -> None:
         self._update_help()
 
+    def _remember_onboarding_model_selection(
+        self, name: str, selected: set[str]
+    ) -> None:
+        if self.mode == "onboarding" and name in selected:
+            self.selected_model = name
+
     def on_selection_list_selected_changed(
         self, event: SelectionList.SelectedChanged
     ) -> None:
@@ -3790,6 +3878,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         for name, wire, enabled, _found in rows:
             if (name in selected) == enabled:
                 continue
+            self._remember_onboarding_model_selection(name, selected)
             if name in state.configured():
                 state.toggle(name, name in selected)
             elif wire in state.pending:
@@ -4382,11 +4471,11 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 )
                 if provider is not None and not is_mistral_preset:
                     raise ValueError("Provider already exists; choose another name.")
+                connection_changed = provider is not None and (
+                    state.connection != ConnectionDraft.from_definition(provider)
+                )
                 if is_mistral_preset and provider is not None:
                     customized = state.provider_id in self.snapshot.overlaid_providers
-                    connection_changed = (
-                        state.connection != ConnectionDraft.from_definition(provider)
-                    )
                     if (
                         customized
                         and connection_changed
@@ -4395,13 +4484,21 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                         self._confirm = "overwrite-mistral"
                         self._update_help()
                         return
-                changes = replace(
-                    changes,
-                    provider={
-                        **state.catalog.providers[state.provider_id].model_dump(),
-                        **changes.provider_patches.get(state.provider_id, {}),
-                    },
-                )
+                if provider is None or connection_changed:
+                    # A new provider persists its full staged definition, and a
+                    # changed preset overrides the shipped one. An unchanged
+                    # preset over an existing definition persists nothing: the
+                    # provider already lives in the base catalog, and writing
+                    # its table into the overlay would flip overlaid_providers
+                    # provenance and block first-run materialization of the
+                    # default template.
+                    changes = replace(
+                        changes,
+                        provider={
+                            **state.catalog.providers[state.provider_id].model_dump(),
+                            **changes.provider_patches.get(state.provider_id, {}),
+                        },
+                    )
             elif not state.dirty:
                 self._feedback_kind = "info"
                 self._message = "No catalog changes to apply."
@@ -4444,8 +4541,12 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
         self, changes: CatalogChanges, state: ManagementState, *, create: bool
     ) -> None:
         previously_usable = usable_canonical_models(
-            self.snapshot, self._persisted_credential_value
+            self.snapshot,
+            self._persisted_credential_value,
+            allowed_models=self.allowed_models,
+            thinking_overrides=self.thinking_overrides,
         )
+        roster_before = self._bound_roster_identities(self.snapshot)
         write = asyncio.create_task(
             asyncio.to_thread(self.catalog_writer.apply_changes, changes)
         )
@@ -4476,7 +4577,7 @@ class ProviderWorkbenchScreen(ModalScreen[ProviderWorkbenchResult]):
                 result.snapshot, state.provider_id
             )
             if result.changed:
-                self._notify_models_saved(previously_usable)
+                self._notify_models_saved(previously_usable, roster_before)
             if create:
                 self._stage = None
                 self._add = None

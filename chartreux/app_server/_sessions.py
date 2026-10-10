@@ -31,7 +31,11 @@ from chartreux.app_server._projection import (
     project_session_log,
 )
 from chartreux.app_server._root_session import SessionHandoff, rebind_history
-from chartreux.app_server._runtime import AgentRuntimeFactory, close_agent_loop
+from chartreux.app_server._runtime import (
+    AgentRuntimeFactory,
+    SessionRootGrantPort,
+    close_agent_loop,
+)
 from chartreux.app_server._session_history import SessionHistory
 from chartreux.app_server._state import build_public_state
 from chartreux.app_server._streaming import BoundedEventQueue, stream_until_complete
@@ -70,6 +74,7 @@ from chartreux.core.config._restrictions import (
     partition_policy_sources,
 )
 from chartreux.core.config.layers.user import UserConfigLayer
+from chartreux.core.config.types import ConfigSaveResult
 from chartreux.core.events import BaseEvent, ToolStreamEvent
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session.saved_sessions import delete_saved_session
@@ -501,6 +506,34 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         )
         return self.roots_revision(session_id)
 
+    async def save_root_grant(
+        self, *, session_id: str, root: Path, expected_revision: str
+    ) -> ConfigSaveResult:
+        """Persist one approved root grant through the root orchestrator only.
+
+        The calling session (root or child) is resolved through the registry,
+        and the save is keyed by that registered session's cwd; a caller-supplied
+        project path is never trusted. Child orchestrators never write: the save
+        always targets the root orchestrator. Mid-turn safe: the orchestrator
+        mutation lock is the only reservation, and nothing is published.
+        """
+        caller = self._resolve_session_loop(session_id)
+        root_runtime = self._root
+        if caller is None or root_runtime is None:
+            raise ValueError("Root grant save requires a registered session and root")
+        return (
+            await root_runtime.agent_loop.config_orchestrator.save_project_root_grant(
+                project=caller.cwd, root=root, expected_revision=expected_revision
+            )
+        )
+
+    def _root_grant_save(
+        self, session_id: str, root: Path, expected_revision: str
+    ) -> Awaitable[ConfigSaveResult]:
+        return self.save_root_grant(
+            session_id=session_id, root=root, expected_revision=expected_revision
+        )
+
     async def replace_policy(
         self,
         *,
@@ -676,6 +709,18 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             raise RuntimeError("A root session runtime is already registered")
         self._root = runtime
         self.begin_root_generation()
+        runtime.agent_loop.bind_root_grant_port(
+            SessionRootGrantPort(self._resolve_session_loop, self._root_grant_save)
+        )
+
+    def _resolve_session_loop(self, session_id: str) -> AgentLoop | None:
+        root = self._root
+        if root is not None and root.agent_loop.session_id == session_id:
+            return root.agent_loop
+        child = self._children.get(session_id) or self._readable_children.get(
+            session_id
+        )
+        return child.agent_loop if child is not None else None
 
     def begin_root_generation(self) -> None:
         root = self._root
@@ -3661,6 +3706,13 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         base_history: list[PublicHistoryEntry] | None = None,
         event_sink: Callable[[BaseEvent], Awaitable[None]] | None = None,
     ) -> SessionRuntime:
+        # The runtime-owned port resolves the calling session, so a child's
+        # approved grant lands in that child's store only, never the parent's.
+        # Its save routes through the root orchestrator keyed by the registered
+        # caller's cwd; child orchestrators never write.
+        child.bind_root_grant_port(
+            SessionRootGrantPort(self._resolve_session_loop, self._root_grant_save)
+        )
         execution = SessionExecution()
         history = SessionHistory(base_history or [])
         runtime: SessionRuntime | None = None

@@ -186,7 +186,11 @@ def test_implicit_start_without_tty_does_not_run_onboarding(
 
     assert exc_info.value.code == 1
     assert onboarding_called is False
-    assert "run `chartreux --setup` once interactively" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "Missing MISTRAL_API_KEY environment variable for mistral provider" in error
+    assert "Run `chartreux --setup`" in error
+    assert "Settings > Providers (/providers)" in error
+    assert "Credentials do not change provider routing" in error
 
 
 def test_setup_without_tty_does_not_run_onboarding(

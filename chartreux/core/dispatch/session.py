@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
 
+from chartreux.core.config._defaults import DEFAULT_AUTO_COMPACT_THRESHOLD
 from chartreux.core.dispatch.lint import RosterShape
 from chartreux.core.dispatch.schema import DispatchMode, DispatchPolicy
 from chartreux.core.session_types import CommittedModelIdentity
@@ -15,6 +16,7 @@ from chartreux.observability.logging import logger
 
 if TYPE_CHECKING:
     from chartreux.core.config import ChartreuxConfigSchema
+    from chartreux.core.model_catalog.loader import CatalogSnapshot
 
 
 class SessionPolicyError(ValueError):
@@ -82,33 +84,42 @@ class BoundDispatchPolicy(BaseModel):
         ]
         return matches[0] if matches else None
 
+    @property
+    def bound_canonical_identities(self) -> frozenset[str]:
+        """Distinct canonical identities bound across slots.
 
-def bind_policy(
-    config: ChartreuxConfigSchema, *, legacy: bool = False
+        Bindings are already canonical, so an alias or wire name of the same
+        model counts once; slots that failed to bind are absent, exactly as
+        :meth:`identity_for` skips them.
+        """
+        return frozenset(identity.base_model for identity in self.bindings.values())
+
+
+def bind_snapshot_policy(
+    snapshot: CatalogSnapshot,
+    *,
+    allowed_models: Sequence[str] = (),
+    auto_compact_threshold: int = DEFAULT_AUTO_COMPACT_THRESHOLD,
 ) -> BoundDispatchPolicy:
-    from chartreux.core.dispatch.presets import DEFAULT_DISPATCH_MODE, SHIPPED_PRESETS
-    from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
-    from chartreux.core.model_catalog.loader import CatalogSnapshot
+    """Bind one catalog snapshot's dispatch slots without a full config.
+
+    Pre-session callers resolve exactly the roster the runtime selects at
+    startup from the same snapshot: its own dispatch policy and slot roles,
+    with slots that fail to resolve left unbound.
+    """
     from chartreux.core.model_catalog.resolver import (
         ModelResolutionError,
         ModelResolver,
     )
 
-    snapshot = config.catalog_snapshot or CatalogSnapshot(SHIPPED_CATALOG, "session")
-    policy = (
-        snapshot.dispatch
-        if config.catalog_snapshot
-        else SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE]
-    )
+    policy = snapshot.dispatch
     diagnostics = list(snapshot.dispatch_diagnostics)
     bindings = {}
     resolver = ModelResolver(snapshot)
     for name, slot in policy.slots.items():
         try:
-            resolved = resolver.resolve(slot.role, allowed_models=config.allowed_models)
-            model = resolved.materialize(
-                auto_compact_threshold=config.auto_compact_threshold
-            )
+            resolved = resolver.resolve(slot.role, allowed_models=allowed_models)
+            model = resolved.materialize(auto_compact_threshold=auto_compact_threshold)
             bindings[name] = resolved.identity.model_copy(
                 update={"thinking": model.thinking}
             )
@@ -116,15 +127,31 @@ def bind_policy(
             diagnostics.append(
                 f"Dispatch slot {name!r}: {slot.role} unavailable: {exc}; launches fail closed."
             )
+    return BoundDispatchPolicy(
+        policy=policy, bindings=bindings, diagnostics=tuple(diagnostics)
+    )
+
+
+def bind_policy(
+    config: ChartreuxConfigSchema, *, legacy: bool = False
+) -> BoundDispatchPolicy:
+    from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
+    from chartreux.core.model_catalog.loader import CatalogSnapshot
+
+    snapshot = config.catalog_snapshot or CatalogSnapshot(SHIPPED_CATALOG, "session")
+    bound = bind_snapshot_policy(
+        snapshot,
+        allowed_models=config.allowed_models,
+        auto_compact_threshold=config.auto_compact_threshold,
+    )
+    diagnostics = list(bound.diagnostics)
     if legacy:
         diagnostics.append(
             "Legacy session has no dispatch policy snapshot; resolved live policy on resume."
         )
     for note in diagnostics:
         logger.warning("%s", note)
-    return BoundDispatchPolicy(
-        policy=policy, bindings=bindings, diagnostics=tuple(diagnostics)
-    )
+    return bound.model_copy(update={"diagnostics": tuple(diagnostics)})
 
 
 def resume_policy(

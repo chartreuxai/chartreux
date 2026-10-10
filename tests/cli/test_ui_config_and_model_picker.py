@@ -259,6 +259,7 @@ async def test_model_picker_shows_all_models() -> None:
         picker = app.query_one(ModelPickerApp)
         assert [model.alias for model in picker._models] == [
             "glm-5-3",
+            "mistral-large-4",
             "alpha",
             "beta",
             "gamma",
@@ -286,14 +287,15 @@ async def test_model_picker_shows_display_name_but_persists_alias() -> None:
         picker = app.query_one(ModelPickerApp)
         assert [model.display_name for model in picker._models] == [
             "mistral/zai-glm-5-3",
+            "mistral/mistral-large-4",
             "mistral/model-a",
             "mistral/custom-model",
         ]
         option_list = picker.query_one(OptionList)
-        assert "mistral/custom-model" in str(option_list.get_option_at_index(3).prompt)
+        assert "mistral/custom-model" in str(option_list.get_option_at_index(4).prompt)
 
         # Selecting it still persists the alias, not the label.
-        await pilot.press("home", "down", "down", "down", "enter")
+        await pilot.press("home", "down", "down", "down", "down", "enter")
         await wait_until(pilot, lambda: app.config.active_model.alias == "custom")
 
         assert app.config.active_model.alias == "custom"
@@ -336,8 +338,8 @@ async def test_model_picker_select_model() -> None:
         await pilot.pause(0.1)
         await _open_model_picker(pilot, app)
 
-        # Default, shipped model, and alpha precede beta.
-        await pilot.press("down", "down", "down")
+        # Default, the two shipped models, and alpha precede beta.
+        await pilot.press("down", "down", "down", "down")
         await pilot.press("enter")
         await wait_until(pilot, lambda: app.config.active_model.alias == "beta")
 
@@ -354,7 +356,7 @@ async def test_model_picker_select_current_model() -> None:
         await pilot.pause(0.1)
         await _open_model_picker(pilot, app)
 
-        await pilot.press("down", "down")
+        await pilot.press("down", "down", "down")
         await pilot.press("enter")
         await pilot.pause(0.2)
 
@@ -407,8 +409,8 @@ async def test_model_picker_offers_default_row() -> None:
 
         picker = app.query_one(ModelPickerApp)
         option_list = picker.query_one(OptionList)
-        # Default + one shipped and three explicitly configured models.
-        assert option_list.option_count == 5
+        # Default + two shipped and three explicitly configured models.
+        assert option_list.option_count == 6
         # The fixture has no session override, so Default is current.
         assert picker._is_pinned is False
         assert option_list.highlighted == 0
@@ -490,8 +492,9 @@ async def test_model_switch_updates_context_window_status_bar() -> None:
         assert app.query_one(SessionStatusLine).state.auto_compact_threshold == 200_000
 
         await _open_model_picker(pilot, app)
-        # Highlight starts on Default; beta follows the shipped model and alpha.
-        await pilot.press("down", "down", "down")
+        # Highlight starts on Default; beta follows the two shipped models
+        # and alpha.
+        await pilot.press("down", "down", "down", "down")
         await pilot.press("enter")
         await wait_until(pilot, lambda: app.config.active_model.alias == "beta")
 

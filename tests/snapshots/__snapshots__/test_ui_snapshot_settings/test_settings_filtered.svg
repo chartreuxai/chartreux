@@ -34,8 +34,8 @@
 
     .terminal-r1 { fill: #c5c8c6 }
 .terminal-r2 { fill: #c5c8c6;font-weight: bold }
-.terminal-r3 { fill: #292929;font-weight: bold }
-.terminal-r4 { fill: #608ab1;font-weight: bold }
+.terminal-r3 { fill: #608ab1;font-weight: bold }
+.terminal-r4 { fill: #292929;font-weight: bold }
     </style>
 
     <defs>
@@ -121,15 +121,15 @@
             </g>
 
     <g transform="translate(9, 41)" clip-path="url(#terminal-clip-terminal)">
-    <rect fill="#c5c8c6" x="24.4" y="50.3" width="927.2" height="24.65" shape-rendering="crispEdges"/>
+    <rect fill="#c5c8c6" x="24.4" y="147.9" width="927.2" height="24.65" shape-rendering="crispEdges"/>
     <g class="terminal-matrix">
     <text class="terminal-r2" x="12.2" y="20" textLength="97.6" clip-path="url(#terminal-line-0)">Settings</text><text class="terminal-r1" x="976" y="20" textLength="12.2" clip-path="url(#terminal-line-0)">
 </text><text class="terminal-r1" x="12.2" y="44.4" textLength="183" clip-path="url(#terminal-line-1)">Filter:&#160;timeout</text><text class="terminal-r1" x="976" y="44.4" textLength="12.2" clip-path="url(#terminal-line-1)">
-</text><text class="terminal-r3" x="24.4" y="68.8" textLength="927.2" clip-path="url(#terminal-line-2)">▸&#160;project_context.timeout_seconds&#160;&#160;&#160;&#160;2&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;</text><text class="terminal-r1" x="976" y="68.8" textLength="12.2" clip-path="url(#terminal-line-2)">
+</text><text class="terminal-r1" x="48.8" y="68.8" textLength="427" clip-path="url(#terminal-line-2)">project_context.timeout_seconds&#160;&#160;&#160;&#160;</text><text class="terminal-r1" x="475.8" y="68.8" textLength="12.2" clip-path="url(#terminal-line-2)">2</text><text class="terminal-r1" x="976" y="68.8" textLength="12.2" clip-path="url(#terminal-line-2)">
 </text><text class="terminal-r1" x="48.8" y="93.2" textLength="183" clip-path="url(#terminal-line-3)">api_timeout&#160;&#160;&#160;&#160;</text><text class="terminal-r1" x="231.8" y="93.2" textLength="12.2" clip-path="url(#terminal-line-3)">2</text><text class="terminal-r1" x="976" y="93.2" textLength="12.2" clip-path="url(#terminal-line-3)">
 </text><text class="terminal-r1" x="48.8" y="117.6" textLength="280.6" clip-path="url(#terminal-line-4)">api_connect_timeout&#160;&#160;&#160;&#160;</text><text class="terminal-r1" x="329.4" y="117.6" textLength="12.2" clip-path="url(#terminal-line-4)">2</text><text class="terminal-r1" x="976" y="117.6" textLength="12.2" clip-path="url(#terminal-line-4)">
 </text><text class="terminal-r1" x="48.8" y="142" textLength="256.2" clip-path="url(#terminal-line-5)">api_write_timeout&#160;&#160;&#160;&#160;</text><text class="terminal-r1" x="305" y="142" textLength="12.2" clip-path="url(#terminal-line-5)">2</text><text class="terminal-r1" x="976" y="142" textLength="12.2" clip-path="url(#terminal-line-5)">
-</text><text class="terminal-r1" x="48.8" y="166.4" textLength="244" clip-path="url(#terminal-line-6)">api_pool_timeout&#160;&#160;&#160;&#160;</text><text class="terminal-r1" x="292.8" y="166.4" textLength="12.2" clip-path="url(#terminal-line-6)">2</text><text class="terminal-r1" x="976" y="166.4" textLength="12.2" clip-path="url(#terminal-line-6)">
+</text><text class="terminal-r4" x="24.4" y="166.4" textLength="927.2" clip-path="url(#terminal-line-6)">▸&#160;api_pool_timeout&#160;&#160;&#160;&#160;2&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;</text><text class="terminal-r1" x="976" y="166.4" textLength="12.2" clip-path="url(#terminal-line-6)">
 </text><text class="terminal-r1" x="976" y="190.8" textLength="12.2" clip-path="url(#terminal-line-7)">
 </text><text class="terminal-r1" x="976" y="215.2" textLength="12.2" clip-path="url(#terminal-line-8)">
 </text><text class="terminal-r1" x="976" y="239.6" textLength="12.2" clip-path="url(#terminal-line-9)">
@@ -143,10 +143,10 @@
 </text><text class="terminal-r1" x="976" y="434.8" textLength="12.2" clip-path="url(#terminal-line-17)">
 </text><text class="terminal-r1" x="976" y="459.2" textLength="12.2" clip-path="url(#terminal-line-18)">
 </text><text class="terminal-r1" x="12.2" y="483.6" textLength="951.6" clip-path="url(#terminal-line-19)">──────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="976" y="483.6" textLength="12.2" clip-path="url(#terminal-line-19)">
-</text><text class="terminal-r1" x="12.2" y="508" textLength="939.4" clip-path="url(#terminal-line-20)">Maximum&#160;seconds&#160;to&#160;gather&#160;project&#160;context&#160;(capped&#160;at&#160;10&#160;seconds);&#160;0&#160;allows&#160;no</text><text class="terminal-r1" x="976" y="508" textLength="12.2" clip-path="url(#terminal-line-20)">
-</text><text class="terminal-r1" x="12.2" y="532.4" textLength="231.8" clip-path="url(#terminal-line-21)">time&#160;for&#160;gathering.</text><text class="terminal-r1" x="976" y="532.4" textLength="12.2" clip-path="url(#terminal-line-21)">
-</text><text class="terminal-r1" x="12.2" y="556.8" textLength="695.4" clip-path="url(#terminal-line-22)">Submitting&#160;the&#160;editor&#160;saves&#160;to&#160;user&#160;settings&#160;immediately.</text><text class="terminal-r1" x="976" y="556.8" textLength="12.2" clip-path="url(#terminal-line-22)">
-</text><text class="terminal-r4" x="12.2" y="581.2" textLength="61" clip-path="url(#terminal-line-23)">Enter</text><text class="terminal-r1" x="73.2" y="581.2" textLength="85.4" clip-path="url(#terminal-line-23)">&#160;Open&#160;&#160;</text><text class="terminal-r4" x="158.6" y="581.2" textLength="36.6" clip-path="url(#terminal-line-23)">Esc</text><text class="terminal-r1" x="195.2" y="581.2" textLength="61" clip-path="url(#terminal-line-23)">&#160;Back</text>
+</text><text class="terminal-r1" x="12.2" y="508" textLength="427" clip-path="url(#terminal-line-20)">Connection-pool&#160;timeout&#160;in&#160;seconds.</text><text class="terminal-r1" x="976" y="508" textLength="12.2" clip-path="url(#terminal-line-20)">
+</text><text class="terminal-r1" x="12.2" y="532.4" textLength="695.4" clip-path="url(#terminal-line-21)">Submitting&#160;the&#160;editor&#160;saves&#160;to&#160;user&#160;settings&#160;immediately.</text><text class="terminal-r1" x="976" y="532.4" textLength="12.2" clip-path="url(#terminal-line-21)">
+</text><text class="terminal-r1" x="12.2" y="556.8" textLength="597.8" clip-path="url(#terminal-line-22)">Saved&#160;user&#160;value:&#160;Not&#160;Set&#160;&#160;Effective:&#160;2&#160;(default)</text><text class="terminal-r1" x="976" y="556.8" textLength="12.2" clip-path="url(#terminal-line-22)">
+</text><text class="terminal-r3" x="12.2" y="581.2" textLength="61" clip-path="url(#terminal-line-23)">Enter</text><text class="terminal-r1" x="73.2" y="581.2" textLength="85.4" clip-path="url(#terminal-line-23)">&#160;Open&#160;&#160;</text><text class="terminal-r3" x="158.6" y="581.2" textLength="36.6" clip-path="url(#terminal-line-23)">Esc</text><text class="terminal-r1" x="195.2" y="581.2" textLength="61" clip-path="url(#terminal-line-23)">&#160;Back</text>
     </g>
     </g>
 </svg>

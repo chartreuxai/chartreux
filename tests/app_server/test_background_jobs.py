@@ -140,12 +140,16 @@ async def test_config_publication_blocks_authority_not_cosmetic_changes(
             "config/write",
             ConfigWriteParams(
                 session_id=root.session_id,
-                ops=[ConfigWriteOpWire(op="set", path="/show_greeting", value=False)],
+                ops=[
+                    ConfigWriteOpWire(
+                        op="set", path="/ask_confirmation_on_exit", value=False
+                    )
+                ],
             ),
         )
         cosmetic = ConfigWriteResponse.model_validate(cosmetic)
         assert not cosmetic.failures
-        assert not root.config.show_greeting
+        assert not root.config.ask_confirmation_on_exit
         assert root.background_jobs.active_count == 1
         await root.background_jobs.stop(BashStopArgs(job_id=started.job.job_id))
         response = await client.request(

@@ -106,7 +106,13 @@ class GrepArgs(BaseModel):
     pattern: str = Field(description="The regex pattern to search for in file contents")
     path: ToolPath = Field(
         default=".",
-        description="The file or directory to search in. Defaults to the current working directory.",
+        description=(
+            "The file or directory to search in. Defaults to the current working directory. "
+            "Paths outside the session's authorized roots may still be attempted: in interactive "
+            "sessions the runtime asks the user to grant access and the operation proceeds on "
+            "approval; the tool result states when access is unavailable or was declined, and "
+            "only then is config or manual fallback appropriate."
+        ),
     )
     max_matches: int | None = Field(
         default=None, description="Override the default maximum number of matches."

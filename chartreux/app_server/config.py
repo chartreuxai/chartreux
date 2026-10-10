@@ -41,7 +41,6 @@ class ConfigView(ProtocolModel):
     theme: str
     log_level: str | None
     disable_welcome_banner_animation: bool
-    show_greeting: bool
     autocopy_to_clipboard: bool
     file_watcher_for_autocomplete: bool
     ask_confirmation_on_exit: bool
@@ -52,6 +51,11 @@ class ConfigView(ProtocolModel):
     enable_notifications: bool
     enable_system_trust_store: bool = False
     dispatch_mode: Literal["standalone", "orchestrated"] | None = None
+    # Distinct canonical identities bound by the session's dispatch policy.
+    # None when no policy is attached (for example before a session starts);
+    # an attached policy that bound no slots projects an empty list, which is
+    # a live empty roster and must not be confused with "no policy".
+    bound_roster: list[str] | None = None
     models: list[ModelConfigView]
     validation_warnings: list[str]
 

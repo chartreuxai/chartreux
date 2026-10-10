@@ -72,7 +72,7 @@ def test_s1_unknown_and_unavailable_active_roles() -> None:
     )
 
 
-def test_missing_tier_roles_recover_without_seeding_or_repair() -> None:
+def test_missing_roles_recover_without_seeding_or_repair() -> None:
     catalog = SHIPPED_CATALOG.model_copy(update={"roles": {}})
     policy, diagnostics = resolve_dispatch_overlay({}, catalog=catalog)
     assert policy is STANDALONE_PRESET
@@ -315,18 +315,18 @@ def test_reference_parser_preserves_duplicate_seats_and_substitutions() -> None:
 
 def test_roster_shape_preserves_thinking_not_provider_diversity() -> None:
     resolver = ModelResolver(CatalogSnapshot(SHIPPED_CATALOG, "test"))
-    small = resolver.resolve("@small")
-    large = resolver.resolve("@large")
-    shape = roster_shape([small, large, small])
+    scout = resolver.resolve("@scout")
+    worker = resolver.resolve("@worker")
+    shape = roster_shape([scout, worker, scout])
     assert shape.single_model
     assert len(shape.bindings) == 2
     other_provider = replace(
-        small, deployment=small.deployment.model_copy(update={"provider": "elsewhere"})
+        scout, deployment=scout.deployment.model_copy(update={"provider": "elsewhere"})
     )
-    assert roster_shape([small, other_provider]).single_model
-    assert len(roster_shape([small, other_provider]).bindings) == 1
+    assert roster_shape([scout, other_provider]).single_model
+    assert len(roster_shape([scout, other_provider]).bindings) == 1
     assert not roster_shape([
-        small,
-        replace(large, base_model="different"),
+        scout,
+        replace(worker, base_model="different"),
     ]).single_model
     assert not roster_shape([]).single_model

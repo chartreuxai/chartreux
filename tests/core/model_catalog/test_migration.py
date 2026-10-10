@@ -360,6 +360,66 @@ def test_migration_reconciles_shipped_wire_name_and_preserves_overrides(
     ]
 
 
+def test_migration_reconciles_deployment_wire_name_and_keeps_one_row_per_model(
+    tmp_path: Path,
+) -> None:
+    # Maintainer's legacy Vibe fixture (2026-10-09): the GLM entry is named for
+    # the shipped glm-5-3 deployment wire name, so it must reconcile onto the
+    # shipped canonical glm-5-3 — one row with the user's overrides preserved —
+    # not fork a duplicate `zai-glm-5-3` canonical model. The ML4 entry emits
+    # its own canonical row (it was unshipped when the fixture was captured;
+    # since R1 it reconciles onto the shipped ML4 entry the same way). The
+    # workbench-facing catalog has exactly one row per canonical model.
+    config, catalog = _paths(tmp_path)
+    config.write_text(
+        "[[providers]]\n"
+        'name = "mistral"\n'
+        'api_base = "https://api.mistral.ai/v1"\n'
+        "[[models]]\n"
+        'name = "mistral-large-4"\n'
+        'provider = "mistral"\n'
+        "temperature = 1.0\n"
+        "input_price = 0.68\n"
+        "output_price = 2.09\n"
+        "cached_input_price = 0.07\n"
+        'thinking = "high"\n'
+        "supports_images = true\n"
+        "auto_compact_threshold = 400000\n"
+        'alias = "mistral-large-4"\n'
+        "[[models]]\n"
+        'name = "zai-glm-5-3"\n'
+        'provider = "mistral"\n'
+        "temperature = 1.0\n"
+        "input_price = 1.4\n"
+        "output_price = 4.4\n"
+        "cached_input_price = 0.14\n"
+        'thinking = "high"\n'
+        "supports_images = false\n"
+        "auto_compact_threshold = 400000\n"
+        'alias = "zai-glm-5-3"\n'
+    )
+
+    apply_migration(plan_migration(config, catalog))
+
+    effective = load_catalog(catalog).catalog
+    assert "glm-5-3" in effective.models
+    assert "zai-glm-5-3" not in effective.models
+    assert "mistral-large-4" in effective.models
+    assert len(effective.models) == 2  # exactly one GLM row plus ML4
+    glm = effective.models["glm-5-3"]
+    deployment = next(d for d in glm.deployments if d.provider == "mistral")
+    assert deployment.name == "zai-glm-5-3"
+    assert (
+        deployment.prices.input,
+        deployment.prices.output,
+        deployment.prices.cached_input,
+    ) == (1.4, 4.4, 0.14)
+    assert glm.temperature == 1.0
+    assert glm.thinking == "high"
+    ml4 = effective.models["mistral-large-4"]
+    assert ml4.temperature == 1.0 and ml4.thinking == "high"
+
+
 def test_models_migrate_help_has_no_duplicate_migrate_path(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

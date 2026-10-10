@@ -579,16 +579,6 @@ class WhatsNewMessage(Static):
         yield Markdown(self._content)
 
 
-class GreetingMessage(Static):
-    def __init__(self, username: str) -> None:
-        super().__init__()
-        self.add_class("greeting-message")
-        self._username = username
-
-    def compose(self) -> ComposeResult:
-        yield NoMarkupStatic(f"Hello {self._username}, how can I help you?")
-
-
 class CustomToolsDeprecationMessage(Static):
     def __init__(self, tool_names: list[str]) -> None:
         super().__init__()

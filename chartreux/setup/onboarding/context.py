@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 
 from chartreux.core.config import (
@@ -8,6 +8,7 @@ from chartreux.core.config import (
     ChartreuxConfigSchema,
     ModelConfig,
     ProviderConfig,
+    ThinkingLevel,
 )
 from chartreux.core.config.default_orchestrator import build_default_orchestrator
 from chartreux.core.config.harness_files import (
@@ -26,6 +27,9 @@ class OnboardingContext:
     has_provider_credentials: bool = False
     enable_system_trust_store: bool = False
     repair_default_preset: bool = False
+    allowed_models: list[str] = field(default_factory=list)
+    thinking_overrides: dict[str, ThinkingLevel] = field(default_factory=dict)
+    selected_model: str | None = None
 
     @staticmethod
     def _fallback_provider(config: ChartreuxConfigSchema) -> ProviderConfig:
@@ -62,6 +66,33 @@ class OnboardingContext:
         except ValueError:
             provider = cls._fallback_provider(config)
             repair_default_preset = cls._has_usable_model(config)
+        try:
+            active_model = config.get_active_model()
+            selected_model = active_model.alias or active_model.name
+            snapshot = config.catalog_snapshot
+            if snapshot is not None:
+                # A known canonical alias wins; wire-name matching is only a
+                # fallback for selections that are not canonical names.
+                selected_model = next(
+                    (
+                        model_name
+                        for model_name in snapshot.catalog.models
+                        if model_name == selected_model
+                    ),
+                    next(
+                        (
+                            model_name
+                            for model_name, definition in snapshot.catalog.models.items()
+                            if any(
+                                deployment.name == active_model.name
+                                for deployment in definition.deployments
+                            )
+                        ),
+                        selected_model,
+                    ),
+                )
+        except ValueError:
+            selected_model = None
         return cls(
             provider=provider,
             theme=config.theme,
@@ -69,6 +100,9 @@ class OnboardingContext:
             or bool(os.environ.get(provider.api_key_env_var)),
             enable_system_trust_store=config.enable_system_trust_store,
             repair_default_preset=repair_default_preset,
+            allowed_models=list(config.allowed_models),
+            thinking_overrides=dict(config.thinking_overrides),
+            selected_model=selected_model,
         )
 
     @classmethod

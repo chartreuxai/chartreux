@@ -43,7 +43,33 @@ def test_from_config_keeps_only_initial_provider_input() -> None:
     context = OnboardingContext.from_config(build_test_vibe_config())
     assert context.provider is not None
     assert context.provider.name == "mistral"
+    assert context.selected_model == build_test_vibe_config().get_active_model().alias
     assert not hasattr(context, "models")
+
+
+def test_custom_alias_over_a_shipped_wire_name_wins_selection() -> None:
+    """A canonical alias must beat wire-name matching during onboarding."""
+    config = build_test_vibe_config(
+        active_model="custom-glm",
+        models=[
+            ModelConfig(
+                name="zai-glm-5-3",
+                provider="mistral",
+                alias="custom-glm",
+                thinking="low",
+            )
+        ],
+    )
+    active = config.get_active_model()
+    assert (active.alias, active.name) == ("custom-glm", "zai-glm-5-3")
+    # The shipped glm-5-3 canonical model serves the same wire name and is
+    # catalogued before the custom alias.
+    snapshot = config.catalog_snapshot
+    assert snapshot is not None and "glm-5-3" in snapshot.catalog.models
+
+    context = OnboardingContext.from_config(config)
+
+    assert context.selected_model == "custom-glm"
 
 
 @pytest.mark.parametrize("theme", ["auto", "light", "dark"])

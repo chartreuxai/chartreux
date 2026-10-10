@@ -213,7 +213,7 @@ async def test_selected_model_survives_exit_and_fresh_resume_without_new_turn(
         await wait_until(pilot, lambda: bool(app.query(ModelPickerApp)))
         picker = app.query_one(ModelPickerApp)
         await wait_until(pilot, lambda: picker.query_one(OptionList).has_focus)
-        await pilot.press("down", "down", "down", "enter")
+        await pilot.press("down", "down", "down", "down", "enter")
         assert await wait_until(pilot, lambda: app.config.active_model.alias == "beta")
         assert await wait_until(
             pilot,

@@ -51,9 +51,9 @@ The built-in profiles are presets for common delegated work:
 
 | Profile | Model role | Prompt ID | Use it for |
 | --- | --- | --- | --- |
-| `worker` | `medium` | `worker` | General-purpose bounded implementation. |
-| `advisor` | `large` | `advisor` | Independent architectural guidance, second opinions, and risk analysis. |
-| `reviewer` | `medium` | `reviewer` | Independent read-only reviews of code, documentation, specifications, and plans. |
+| `worker` | `worker` | `worker` | General-purpose bounded implementation. |
+| `advisor` | `heavy` | `advisor` | Independent architectural guidance, second opinions, and risk analysis. |
+| `reviewer` | `worker` | `reviewer` | Independent read-only reviews of code, documentation, specifications, and plans. |
 
 `advisor` is restricted to the read-only tools `read_file`, `grep`,
 `web_search`, `web_fetch`, and `skill`. It is configured with no idle-TTL eviction so it

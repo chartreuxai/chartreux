@@ -55,6 +55,8 @@ from chartreux.app_server.protocol import (
     RootsReadResponse,
     RootsReplaceParams,
     RootsReplaceResponse,
+    RootsSaveParams,
+    RootsSaveResponse,
     RuntimeReadParams,
     RuntimeReadResponse,
     RuntimeSnapshot,
@@ -266,6 +268,26 @@ class ConfigResource:
         )
         self._apply_runtime(response.runtime)
         return response
+
+    async def save_root(
+        self, *, root: str, expected_revision: str, user_initiated: bool
+    ) -> RootsSaveResponse:
+        """Explicit user action only; persists one approved root grant."""
+        if user_initiated is not True:
+            raise ValueError("Root grant saving requires an explicit user action")
+        client = await self._connection.connect()
+        return validate_wire(
+            RootsSaveResponse,
+            await client.request(
+                "policy/roots/save",
+                RootsSaveParams(
+                    session_id=self._state.session_id,
+                    root=root,
+                    expected_revision=expected_revision,
+                    user_initiated=True,
+                ),
+            ),
+        )
 
     async def read_policy(self) -> PolicyReadResponse:
         client = await self._connection.connect()
