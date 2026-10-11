@@ -17,6 +17,7 @@ from pydantic_core import InitErrorDetails, PydanticCustomError
 from pydantic_settings.sources import EnvSettingsSource
 
 from chartreux.core.config._catalog import DISPATCH_AUTHORITY_MESSAGE
+from chartreux.core.config._dangerous_command_authority import GRANTS_FIELD
 from chartreux.core.config._root_authority import ROOTS_FIELD
 from chartreux.core.config.chartreux_schema import _expand_paths, _non_empty
 from chartreux.core.config.models import SessionLoggingConfig
@@ -163,6 +164,9 @@ def validate_environment_names(
         if top_level == ROOTS_FIELD:
             errors.append(_source_error("environment", ROOTS_FIELD))
             continue
+        if top_level == GRANTS_FIELD:
+            errors.append(_source_error("environment", GRANTS_FIELD))
+            continue
         if top_level not in fields:
             errors.append(_source_error(source, field_label, kind="extra_forbidden"))
             continue
@@ -234,6 +238,9 @@ def validate_source(
         except ValidationError as exc:
             if key == ROOTS_FIELD:
                 errors.append(_source_error("root-source", ROOTS_FIELD))
+                continue
+            if key == GRANTS_FIELD:
+                errors.append(_source_error("grant-source", GRANTS_FIELD))
                 continue
             for error in exc.errors(include_input=False, include_context=False):
                 if (

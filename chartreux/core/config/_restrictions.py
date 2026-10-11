@@ -8,6 +8,11 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from chartreux.core.config._dangerous_command_authority import (
+    GRANTS_FIELD,
+    ProjectDangerousCommandGrant,
+    validate_grant_source,
+)
 from chartreux.core.config._root_authority import (
     ROOTS_FIELD,
     ProjectRootAuthority,
@@ -71,6 +76,7 @@ class SourceRestrictions:
     tools: tuple[ToolRestriction, ...]
     identity: PolicySourceIdentity | None = None
     authorized_roots: tuple[ProjectRootAuthority, ...] = ()
+    dangerous_command_grants: tuple[ProjectDangerousCommandGrant, ...] = ()
     # An empty explicit overlay revokes persisted roots; a tool-only projection
     # must leave the backing source's roots alone.
     replaces_roots: bool = False
@@ -80,6 +86,13 @@ class SourceRestrictions:
         return {
             str(item.project): [str(root) for root in item.roots]
             for item in self.authorized_roots
+        }
+
+    def project_grants(self) -> dict[str, list[str]]:
+        """Return an independent canonical grant map for private runtime staging."""
+        return {
+            str(item.project): list(item.operations)
+            for item in self.dangerous_command_grants
         }
 
     def replace_in(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -106,6 +119,8 @@ class SourceRestrictions:
     def preserves(self, previous: SourceRestrictions) -> bool:
         """Conservative syntactic check; generic patches cannot revoke authority."""
         if self.authorized_roots != previous.authorized_roots:
+            return False
+        if self.dangerous_command_grants != previous.dangerous_command_grants:
             return False
         tools = {tool.tool_name: tool for tool in self.tools}
         for old in previous.tools:
@@ -139,9 +154,16 @@ class SourceRestrictions:
                     "Authorized root source provenance unavailable: "
                     "authorized_roots_by_project (source: unknown)"
                 )
+            if GRANTS_FIELD in data:
+                raise ValueError(
+                    "Dangerous command grant source provenance unavailable: "
+                    "dangerous_command_grants_by_project (source: unknown)"
+                )
             authorized_roots = ()
+            dangerous_command_grants = ()
         else:
             authorized_roots = validate_root_source(data, layer=root_layer)
+            dangerous_command_grants = validate_grant_source(data, layer=root_layer)
         try:
             if replacement:
                 _ReplacementInput.model_validate(data)
@@ -159,6 +181,7 @@ class SourceRestrictions:
             layer_name=layer_name,
             identity=identity,
             authorized_roots=authorized_roots,
+            dangerous_command_grants=dangerous_command_grants,
             replaces_roots=replaces_roots,
             locator=locator,
             kind=kind,

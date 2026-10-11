@@ -66,10 +66,13 @@ def test_tools_inventory_intersects_filters_without_changing_other_categories(
 
 def test_curated_registry_is_complete_and_validated() -> None:
     assert len(EDITABLE_SETTINGS) == len(EDITABLE_BY_PATH) == 45
-    assert len(VISIBLE_SETTINGS) == 39
+    assert len(VISIBLE_SETTINGS) == 40
     visible = {item.path: item for item in VISIBLE_SETTINGS}
     assert visible["status_line"].control == "status_line"
     assert "status_line" not in EDITABLE_BY_PATH
+    assert visible["shell_permissions"].control == "shell_permissions"
+    assert "shell_permissions" not in EDITABLE_BY_PATH
+    assert "dangerous_command_grants_by_project" in EXCLUDED_SETTINGS
     assert "show_message_timestamps" in visible
     assert all(
         path not in visible

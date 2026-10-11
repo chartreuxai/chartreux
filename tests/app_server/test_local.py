@@ -118,7 +118,11 @@ from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
 from tests.stubs.fake_mcp_registry import FakeMCPRegistry
 
 _CATALOG_FIELDS = {"models", "providers"}
-_ORDINARY_OVERRIDE_EXCLUDED_FIELDS = {*_CATALOG_FIELDS, "authorized_roots_by_project"}
+_ORDINARY_OVERRIDE_EXCLUDED_FIELDS = {
+    *_CATALOG_FIELDS,
+    "authorized_roots_by_project",
+    "dangerous_command_grants_by_project",
+}
 
 
 class _FakeSessionBackendServices:

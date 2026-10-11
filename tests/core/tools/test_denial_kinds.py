@@ -4,7 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from chartreux.core.tools.base import ToolPermission
+from chartreux.core.dangerous_commands import DangerousCommandProposal, RepositoryScope
+from chartreux.core.tools.base import BaseToolState, ToolPermission
+from chartreux.core.tools.builtins.bash import Bash, BashArgs, BashToolConfig
+from chartreux.core.tools.models import PermissionContext
 from chartreux.core.tools.utils import (
     PathAccess,
     PathAuthority,
@@ -109,3 +112,91 @@ def test_sensitive_and_path_rule_precede_out_of_root(tmp_path: Path) -> None:
         )
         assert decision is not None
         assert decision.denial_kind == expected
+
+
+def _proposal() -> DangerousCommandProposal:
+    return DangerousCommandProposal(
+        command=("git", "push"),
+        project=Path("/project"),
+        scope=RepositoryScope(
+            git_dir=Path("/project/.git"), work_tree=Path("/project")
+        ),
+        operations=("git.push",),
+        consequence="Publish local commits to the remote.",
+    )
+
+
+def test_dangerous_command_kind_requires_a_grantable_proposal() -> None:
+    # The taxonomy admits exactly one grantable kind, and it always carries
+    # the typed whole-call proposal.
+    context = PermissionContext(
+        permission=ToolPermission.NEVER,
+        reason="denied",
+        denial_kind="dangerous_command",
+        dangerous_command_proposal=_proposal(),
+    )
+    assert context.dangerous_command_proposal is not None
+    with pytest.raises(ValueError, match="requires a grantable proposal"):
+        PermissionContext(
+            permission=ToolPermission.NEVER,
+            reason="denied",
+            denial_kind="dangerous_command",
+        )
+
+
+@pytest.mark.parametrize(
+    "denial_kind",
+    [
+        "out_of_root",
+        "sensitive",
+        "path_rule",
+        "plan_scope",
+        "parent_ceiling",
+        "tool_policy",
+    ],
+)
+def test_other_denial_kinds_never_carry_a_proposal(denial_kind: str) -> None:
+    with pytest.raises(ValueError, match="dangerous_command_proposal requires"):
+        PermissionContext(
+            permission=ToolPermission.NEVER,
+            reason="denied",
+            denial_kind=denial_kind,  # type: ignore[arg-type]
+            dangerous_command_proposal=_proposal(),
+        )
+
+
+def test_shell_dangerous_git_denial_is_the_grantable_kind(tmp_path: Path) -> None:
+    # Without any dangerous-command authority, the shell resolver classifies
+    # the missing authority as the grantable dangerous_command kind.
+    tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=tmp_path
+    )
+    context = tool.resolve_permission(BashArgs(command="git push"))
+    assert context is not None
+    assert context.permission is ToolPermission.NEVER
+    assert context.denial_kind == "dangerous_command"
+    assert context.dangerous_command_proposal is not None
+    assert context.dangerous_command_proposal.operations == ("git.push",)
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_kind"),
+    [
+        # Absolute denylist veto: never the grantable kind, never a proposal.
+        ("vim file.txt", None),
+        # Hard guards: never the grantable kind, never a proposal.
+        ("git reset --hard HEAD", None),
+        ("git push --bogus origin main", None),
+    ],
+)
+def test_shell_veto_and_hard_denials_never_use_dangerous_command(
+    tmp_path: Path, command: str, expected_kind: str | None
+) -> None:
+    tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=tmp_path
+    )
+    context = tool.resolve_permission(BashArgs(command=command))
+    assert context is not None
+    assert context.permission is ToolPermission.NEVER
+    assert context.denial_kind == expected_kind
+    assert context.dangerous_command_proposal is None

@@ -59,6 +59,24 @@ those recovery tools. Shell allowlists are not restored by the job API. Live job
 or pending admissions can block execution-authority reductions, not cosmetic
 status-line changes. See [managed shell jobs](../guides/tools-safety.md#managed-shell-jobs).
 
+The shipped `[tools.bash]` `denylist` defaults no longer contain the recognized
+dangerous git operations (`git push`, `git checkout`, `git restore`,
+`git stash drop`, `git stash clear`, `git switch --discard-changes`,
+`git switch -f`, `git reflog expire`, `git reflog delete`): those are governed by
+the typed dangerous-command policy and its runtime approval flow instead. Explicit
+`denylist` entries remain an absolute veto checked before any grant; setting
+`denylist = []` no longer implicitly authorizes dangerous git commands — they need
+a runtime grant. See [dangerous git commands](../guides/tools-safety.md#dangerous-git-commands).
+
+`dangerous_command_grants_by_project` is a protected user-layer field (a map of
+project key to granted operation IDs) that persists "Always for this project"
+dangerous-command grants. Only the `git.push` operation is persistable, and only
+the runtime approval flow or the Settings > Shell Permissions panel manages it:
+programmatic or generic config writes to the field are rejected, and it is
+accepted only from an installed user source. Revocation reports live and on-disk
+outcomes separately through the app-server `policy/dangerous_commands/revoke`
+method.
+
 The built-in read/edit/write/image/grep configurations include sensitive patterns for `.env`-style files. Do not remove those protections casually.
 
 ### Agents and skills

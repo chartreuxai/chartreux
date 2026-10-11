@@ -2,6 +2,63 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.5.2 (2026-10-11)
+
+### Added
+
+- Dangerous-command runtime approvals for git operations: a typed classifier
+  resolves dangerous git commands with resolver-side authority binding and
+  configured-remote verification; approvals grant per operation and repository
+  scope with Allow This Session / Once / Always choices. Only `git.push`
+  persists, through a protected user-layer map; app-server endpoints expose
+  read and revoke (no public grant), the TUI question renders safely with a
+  redaction notice, and a Shell Permissions panel lists grants. Grants survive
+  compaction and reload, are cleared by in-place session resets, and are never
+  restored on resume (ADR 0019).
+- `.git` metadata hardening: every write/mutate path operand is resolved
+  against tracked working-directory sets (including git `-C` relocations) and
+  denied on metadata containment, fail closed; hard links are contained at
+  creation and write time via inode comparison; program-selection config keys
+  (`core.hooksPath`, `core.editor`, `sequence.editor`, `filter.*` clean and
+  process, `merge.*.driver`, `diff.*` drivers, `core.fsmonitor`, `man.*.path`,
+  `interactive.diffFilter`) are hard-guarded in every write scope including
+  section renames; `git apply --unsafe-paths` is a hard guard; work-tree
+  relocations into metadata are denied for tree-writing subcommands; write
+  operands of archive, extraction, binary, and compression tools are inspected
+  in attached and separate option forms. The enumeration stop rule and the
+  accepted residual boundary are recorded in ADR 0019.
+- Shell redirect analysis v0.2 (ADR 0021): the order-blind cd+redirect veto is
+  replaced by occurrence-local redirect modeling on the existing resolver
+  cd-chain tracker; fd duplication and device sinks are structurally exempt;
+  compound chains (semicolons, pipelines, nested sources) resolve; absolute
+  redirect targets inside the session scratchpad are authorized at the
+  resolver layer after the metadata check, with component-wise root matching.
+
+### Changed
+
+- Subagent operational discipline is rewritten for ML4 (ADR 0020): the
+  never-firing denial stop rule is replaced by a strategy-switch rule;
+  permission-refusal language is hardened, including the
+  same-effect-other-tool retry pattern; an efficiency rule is added; the
+  destinations rule takes precedence over assignment text; reviewer and
+  advisor report formats gain a Denials encountered slot. The failure-retries
+  rule is dropped and recorded as an accepted risk with validation baselines.
+- Denylist break: an empty `bash` denylist no longer implicitly authorizes
+  dangerous commands; entries must be removed explicitly to permit them.
+- The bash tool prompt documents scratchpad-absolute redirect targets.
+
+### Security
+
+- Push integrity: granted pushes are verified against configured remotes;
+  push destinations, remote redefinition, and redirecting configuration
+  writes (remote URLs, `url.*.insteadOf` rewrites, credential and include
+  sections, `core.sshCommand` and exec-program keys) are hard-guarded so an
+  approval cannot land at an attacker-chosen repository.
+- Closes pre-existing redirect-target bypasses: concatenated literal targets
+  (`> "sub"/../.git/config`, `> "sub"/../../outside.log`) were never
+  path-checked before and now are, and `source`/`.` operands are
+  authority-checked.
+
 ## 0.5.1 (2026-10-10)
 
 ### Added

@@ -317,7 +317,25 @@ user turn instead of sending them in the Responses function output.
 The built-in shell surface exposes the POSIX `bash` tool. It reads permissions
 and denylists from `[tools.bash]`; its resolver's hard guards determine shell
 policy. The historical `[tools.bash].allowlist` key is rejected in v0.1; remove
-it from configuration files. Each model-facing call is finite: it
+it from configuration files. Recognized dangerous git commands carry typed
+policy: `git push` (publication) and the consequential operations (forced,
+deleting, or mirrored pushes, `git checkout`, `git restore`,
+`git switch --discard-changes`/`-f`, `git stash drop`/`clear`,
+`git reflog expire`/`delete`) are denied pending authority — interactive
+sessions prompt the user (Deny default; publication grantable once, per session,
+or always for the project; consequential once or per session, never always),
+and noninteractive sessions deny with remediation naming the actual path:
+publication operations point to `dangerous_command_grants_by_project` for
+this project in the user config.toml, consequential operations cannot be
+pre-authorized and require approval in an interactive session, and a mixed
+call covers only the persistable subset. The denial carries the resolver's
+reason. A refusal means the user declined: do not retry that
+exact command. Hard guards (`git reset --hard`, forced non-dry-run `git clean`,
+recursive `rm`) are never grantable — the user runs them. An explicit
+`denylist` entry is an absolute veto no grant overrides. Approval is permission
+authority, not standing intent to publish. Inspect and revoke dangerous-command
+authority in Settings > Shell Permissions; there is no public grant endpoint. Each
+model-facing call is finite: it
 starts a fresh shell, closes stdin so the command receives EOF, enforces a timeout,
 and returns separate stdout and stderr for local execution. Shell state and process
 handles do not persist across calls. Managed background sessions, polling, continued

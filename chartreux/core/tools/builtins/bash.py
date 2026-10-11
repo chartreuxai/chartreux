@@ -22,7 +22,6 @@ from chartreux.core.tools.builtins._shell_permission_resolver import (
     _denied as _denied,
     _expand_guardrail_commands as _expand_guardrail_commands,
     _expand_guardrail_parts as _expand_guardrail_parts,
-    _extract_redirect_paths as _extract_redirect_paths,
     _get_default_denylist as _get_default_denylist,
     _get_default_denylist_standalone as _get_default_denylist_standalone,
     _get_parser as _get_parser,
@@ -180,7 +179,11 @@ class Bash(
 
     def resolve_permission(self, args: BashArgs) -> PermissionContext | None:
         return ShellPermissionResolver(
-            self.config, self.cwd, self.workspace, self.path_authority
+            self.config,
+            self.cwd,
+            self.workspace,
+            self.path_authority,
+            self.dangerous_command_authorities_getter,
         ).resolve_permission(args)
 
     @final

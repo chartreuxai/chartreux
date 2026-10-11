@@ -1443,3 +1443,193 @@ async def test_escape_dismisses_stop_confirmation_before_browser_and_parent(
         interrupt.assert_not_called()
         await pilot.press("escape")
         interrupt.assert_called_once()
+
+
+def _authority_callback(request) -> PublicCallbackEntry:
+    return _callback(UserInputCallbackDetail(request=request))
+
+
+@pytest.mark.asyncio
+async def test_shell_permissions_panel_opens_from_settings_over_app_server(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Settings → Shell Permissions inspects and revokes over the real endpoints."""
+    from types import SimpleNamespace
+
+    from textual.widgets import OptionList
+
+    from chartreux.cli.textual_ui.widgets.shell_permissions_app import (
+        ShellPermissionsApp,
+    )
+    from chartreux.core.tools.builtins._shell_command_policy import (
+        GitRepositoryRelocation,
+        resolve_repository_scope,
+    )
+    from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
+    from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
+
+    async def preview_candidate(self: FakeConfigOrchestrator):
+        return SimpleNamespace(config=self.config)
+
+    monkeypatch.setattr(FakeConfigOrchestrator, "preview_candidate", preview_candidate)
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    scope = resolve_repository_scope(project, GitRepositoryRelocation())
+    assert scope is not None
+    loop = build_test_agent_loop(cwd=project)
+    loop._dangerous_command_grants.grant_session({("git.push", scope)})
+    app = build_test_chartreux_app(agent_loop=loop)
+    async with app.run_test(size=(100, 32)) as pilot:
+        await app._session_ready.wait()
+        await app._show_settings()
+        await _wait_until(pilot, lambda: isinstance(app.screen, SettingsScreen))
+        await pilot.press(*"shell")
+        await pilot.pause()
+        await pilot.press("enter")
+        await _wait_until(pilot, lambda: isinstance(app.screen, ShellPermissionsApp))
+        panel = app.screen
+        assert isinstance(panel, ShellPermissionsApp)
+        await _wait_until(pilot, lambda: panel._inspection is not None)
+        grants = panel.query_one("#shell-permissions-grants", OptionList)
+        row_ids = [str(row.id) for row in grants.options if row.id is not None]
+        assert "live:git.push" in row_ids
+        project_line = str(
+            panel.query_one("#shell-permissions-project", NoMarkupStatic).content
+        )
+        assert str(project) in project_line
+        # Revoke the live grant through the real endpoint.
+        await pilot.press("enter")
+        await _wait_until(
+            pilot,
+            lambda: (
+                "live session authority removed"
+                in str(
+                    panel.query_one(
+                        "#shell-permissions-feedback", NoMarkupStatic
+                    ).content
+                )
+            ),
+        )
+        feedback = str(
+            panel.query_one("#shell-permissions-feedback", NoMarkupStatic).content
+        )
+        assert "no saved removal attempted" in feedback
+        # The session store no longer carries the authority.
+        assert loop._dangerous_command_grants.dangerous_command_authorities() == ()
+        # The refreshed list reconciles: the live row is gone.
+        await _wait_until(
+            pilot,
+            lambda: (
+                "live:git.push"
+                not in [str(row.id) for row in grants.options if row.id is not None]
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_shell_permissions_panel_defers_incoming_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A question arriving while the panel is open defers, then presents."""
+    from types import SimpleNamespace
+
+    from chartreux.cli.textual_ui.widgets.shell_permissions_app import (
+        ShellPermissionsApp,
+    )
+    from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
+
+    async def preview_candidate(self: FakeConfigOrchestrator):
+        return SimpleNamespace(config=self.config)
+
+    monkeypatch.setattr(FakeConfigOrchestrator, "preview_candidate", preview_candidate)
+    app = build_test_chartreux_app()
+    callback = _question_callback("callback-shell-permissions")
+    async with app.run_test(size=(100, 32)) as pilot:
+        await app._session_ready.wait()
+        await app._show_settings()
+        await _wait_until(pilot, lambda: isinstance(app.screen, SettingsScreen))
+        await pilot.press(*"shell")
+        await pilot.pause()
+        await pilot.press("enter")
+        await _wait_until(pilot, lambda: isinstance(app.screen, ShellPermissionsApp))
+        panel = app.screen
+        await app._handle_turn_event(CallbackRequested(callback))
+        await pilot.pause()
+        # The panel stays open and shows the pending-action notice; no question.
+        assert app.screen is panel
+        assert panel.query_one("#shell-permissions-pending-action").display
+        assert not app.query(QuestionApp)
+        # Escape the panel, then Settings (the first Escape clears the filter,
+        # the second dismisses); the deferred question presents.
+        await pilot.press("escape")
+        await pilot.pause()
+        assert isinstance(app.screen, SettingsScreen)
+        await pilot.press("escape", "escape")
+        await _wait_until(pilot, lambda: app._active_callback is callback)
+        assert app.query(QuestionApp)
+
+
+@pytest.mark.asyncio
+async def test_dangerous_command_question_presents_safely_via_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The P4 dangerous-command question renders safely through the callback."""
+    from pathlib import Path
+    import shlex
+
+    from chartreux.core.agent_loop._dangerous_command_grants import (
+        DANGEROUS_COMMAND_DENY_LABEL,
+        DANGEROUS_COMMAND_ONCE_LABEL,
+        DANGEROUS_COMMAND_PROJECT_LABEL,
+        DANGEROUS_COMMAND_SESSION_LABEL,
+        dangerous_command_request,
+    )
+    from chartreux.core.dangerous_commands import (
+        DangerousCommandProposal,
+        RepositoryScope,
+    )
+    from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
+
+    project = Path("/home/example/projects/shop")
+    command = ("git", "push", "origin", "[red]main[/red]")
+    proposal = DangerousCommandProposal(
+        command=command,
+        project=project,
+        scope=RepositoryScope(git_dir=project / ".git", work_tree=project),
+        operations=("git.push",),
+        consequence="Publish local commits to the remote.",
+    )
+    request = dangerous_command_request(proposal)
+    app = build_test_chartreux_app()
+    callback = _authority_callback(request)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app._session_ready.wait()
+        await app._handle_turn_event(CallbackRequested(callback))
+        await _wait_until(pilot, lambda: bool(app.query(QuestionApp)))
+        question = app.query_one(QuestionApp)
+        title = question.query_one(".question-title", NoMarkupStatic)
+        # The literal command — including markup-looking text — is displayed.
+        assert str(title.content) == request.questions[0].question
+        assert shlex.join(command) in str(title.content)
+        assert "[red]main[/red]" in str(title.content)
+        assert "not a standing intent to publish" in str(title.content)
+        labels = [
+            str(widget.content) for widget in question.option_widgets if widget.display
+        ]
+        assert len(labels) == 4
+        assert DANGEROUS_COMMAND_DENY_LABEL in labels[0]
+        assert DANGEROUS_COMMAND_ONCE_LABEL in labels[1]
+        assert DANGEROUS_COMMAND_SESSION_LABEL in labels[2]
+        assert DANGEROUS_COMMAND_PROJECT_LABEL in labels[3]
+        # Deny is default-selected; answering it denies the command.
+        assert question.selected_option == 0
+        response = AsyncMock()
+        monkeypatch.setattr(app.app_server, "respond_to_callback", response)
+        question._mount_time = 0.0
+        await pilot.press("enter")
+        await _wait_until(pilot, lambda: response.await_count == 1)
+        assert response.await_args is not None
+        output = response.await_args.args[1]
+        assert output.result.cancelled is False
+        assert output.result.answers[0].answer == DANGEROUS_COMMAND_DENY_LABEL
+        assert output.result.answers[0].question == request.questions[0].question

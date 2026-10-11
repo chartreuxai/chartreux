@@ -43,6 +43,7 @@ from chartreux.core.config.models import (
     SubagentsConfig,
     ThinkingLevel,
     normalize_authorized_roots,
+    normalize_dangerous_command_grants,
 )
 
 if TYPE_CHECKING:
@@ -316,6 +317,18 @@ class ChartreuxConfigSchema(ConfigSchema):
     ] = Field(
         default_factory=dict,
         description="User-source-only additional filesystem roots by canonical project.",
+    )
+    # Projection only, as above: accepted saved grants live on the immutable
+    # source restrictions, and only the dedicated persistence path may write them.
+    dangerous_command_grants_by_project: Annotated[
+        dict[str, list[str]],
+        WithReplaceMerge(),
+        AfterValidator(normalize_dangerous_command_grants),
+    ] = Field(
+        default_factory=dict,
+        description=(
+            "User-source-only saved dangerous-command grants by canonical project."
+        ),
     )
 
     # Tools

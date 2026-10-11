@@ -440,21 +440,158 @@ def test_redirect_only_statement_is_denied() -> None:
     assert "redirect-only statements are not permitted" in analysis.approval_reasons
 
 
-@pytest.mark.parametrize("command", ["cd /tmp > log", "cd /tmp && echo hi > log"])
-def test_redirect_in_cd_chain_is_denied(command: str) -> None:
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd /tmp > log",
+        "cd /tmp && echo hi > log",
+        "cd sub && echo hi > log",
+        "echo hi > log && cd sub",
+        "cd sub && echo hi 2>&1 | head",
+        "cd sub && echo hi > /dev/null",
+    ],
+)
+def test_redirect_in_cd_chain_is_not_vetoed(command: str) -> None:
+    # The order-blind cd+redirect veto is gone (ADR 0021): the analysis no
+    # longer denies a chain merely because a cd and a redirect coexist. The
+    # redirect target is attributed to its occurrence position instead, and
+    # the resolver resolves it against the tracked working directory there.
     analysis = analyze_shell_command(command)
 
-    assert analysis.requires_approval
-    assert "redirection in a command chain containing cd" in analysis.approval_reasons
+    assert not analysis.requires_approval
+    assert not any(
+        "redirection in a command chain" in reason
+        for reason in analysis.approval_reasons
+    )
+
+
+@pytest.mark.parametrize(
+    "command,expected_parts,expected_operands",
+    [
+        # A redirect attached to the cd command resolves against the pre-cd
+        # working directory, so its operand precedes the cd part.
+        ("cd sub > log", ("cd sub <redirect>",), (("log",), ())),
+        # A redirect after the cd belongs to the later command.
+        ("cd sub && echo hi > log", ("cd sub", "echo hi"), ((), ("log",), ())),
+        # A redirect before the cd belongs to the earlier command.
+        (
+            "echo hi > log && cd sub",
+            ("echo hi <redirect>", "cd sub"),
+            (("log",), (), ()),
+        ),
+        # A redirect-only statement anchors to the next command.
+        ("> log; echo hi", ("echo hi",), (("log",), ())),
+        # A redirect-only statement after the last command anchors to the end.
+        ("echo hi; > log", ("echo hi",), ((), ("log",))),
+        # fd duplication and device sinks are not filesystem targets.
+        ("echo hi 2>&1", ("echo hi <redirect>",), ((), ())),
+        ("echo hi > /dev/null", ("echo hi <redirect>",), (("/dev/null",), ())),
+    ],
+)
+def test_redirect_operands_are_attributed_to_occurrence_position(
+    command: str,
+    expected_parts: tuple[str, ...],
+    expected_operands: tuple[tuple[str, ...], ...],
+) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert analysis.command_parts == expected_parts
+    assert analysis.redirect_operands == expected_operands
+    assert len(analysis.redirect_operands) == len(expected_parts) + 1
 
 
 @pytest.mark.parametrize("directory_command", ["pushd ..", "popd", "popd +1"])
-def test_redirect_in_directory_stack_chain_is_denied(directory_command: str) -> None:
+def test_redirect_in_directory_stack_chain_is_not_vetoed(
+    directory_command: str,
+) -> None:
+    # The stack-chain veto is gone with the cd-chain veto (ADR 0021); the
+    # resolver's tracked-cwd machinery governs the redirect target instead.
     analysis = analyze_shell_command(f"{directory_command}; printf hi > file")
-    assert (
-        "redirection in a command chain changing the working directory"
-        in analysis.approval_reasons
+
+    assert not any(
+        "redirection in a command chain" in reason
+        for reason in analysis.approval_reasons
     )
+    assert analysis.command_parts == (directory_command, "printf hi <redirect>")
+    assert analysis.redirect_operands == ((), ("file",), ())
+
+
+@pytest.mark.parametrize("target", ["/dev/null", "/dev/stdout", "/dev/stderr"])
+def test_device_sink_redirects_are_not_file_redirects(target: str) -> None:
+    # Device sinks never open a file, so they are exempt from the absolute
+    # redirect-target rule without any string rewrite (ADR 0021).
+    analysis = analyze_shell_command(f"echo hi > {target}")
+
+    assert not analysis.requires_approval
+    assert analysis.command_parts == ("echo hi <redirect>",)
+
+
+def test_absolute_redirect_target_inside_scratchpad_root_is_allowed(tmp_path) -> None:
+    scratchpad = tmp_path / "scratch"
+    scratchpad.mkdir()
+    roots = frozenset({scratchpad.resolve()})
+
+    analysis = analyze_shell_command(
+        f"echo hi > {scratchpad}/log.txt", scratchpad_roots=roots
+    )
+
+    assert not analysis.requires_approval
+    assert analysis.command_parts == ("echo hi <redirect>",)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        # A sibling directory that merely spells like the scratchpad root.
+        "scratch-sibling/log.txt",
+        # A path that escapes the root through a parent component.
+        "scratch/../outside.log",
+        # A symlink inside the root that points outside it.
+        "scratch/escape/log.txt",
+    ],
+)
+def test_absolute_redirect_target_outside_scratchpad_roots_is_denied(
+    tmp_path, relative: str
+) -> None:
+    scratchpad = tmp_path / "scratch"
+    scratchpad.mkdir()
+    (scratchpad / "escape").symlink_to(tmp_path, target_is_directory=True)
+    (tmp_path / "scratch-sibling").mkdir()
+    roots = frozenset({scratchpad.resolve()})
+
+    analysis = analyze_shell_command(
+        f"echo hi > {tmp_path / relative}", scratchpad_roots=roots
+    )
+
+    assert analysis.requires_approval
+    assert "an absolute redirection target" in analysis.approval_reasons
+
+
+def test_absolute_redirect_target_outside_workspace_is_denied(tmp_path) -> None:
+    scratchpad = tmp_path / "scratch"
+    scratchpad.mkdir()
+    roots = frozenset({scratchpad.resolve()})
+
+    analysis = analyze_shell_command("echo hi > /etc/passwd", scratchpad_roots=roots)
+
+    assert analysis.requires_approval
+    assert "an absolute redirection target" in analysis.approval_reasons
+
+
+def test_absolute_redirect_target_needs_canonical_roots(tmp_path) -> None:
+    # A root that is itself a symlink is not canonical, so nothing under the
+    # spelled path is authorized (the path layer re-checks with realpaths).
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+
+    analysis = analyze_shell_command(
+        f"echo hi > {link}/log.txt", scratchpad_roots=frozenset({link})
+    )
+
+    assert analysis.requires_approval
+    assert "an absolute redirection target" in analysis.approval_reasons
 
 
 @pytest.mark.parametrize(
@@ -536,3 +673,50 @@ def test_approval_label_names_the_reasons() -> None:
 
     assert label.startswith("unsupported shell syntax: ")
     assert "command substitution" in label
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_target"),
+    [
+        # A concatenation destination is a literal target: it is attributed
+        # to its occurrence position like any other literal target (the
+        # broadened _literal_redirect_target; ADR 0021 fix round).
+        ('echo x > "sub"/../../outside.log', "sub/../../outside.log"),
+        ('echo x > .gi"t"/config', ".git/config"),
+        # A glob-looking destination is still a literal filename: the
+        # analysis attributes it without a glob denial (the resolver's
+        # path-glob heuristic does not fire for redirect destinations,
+        # because bash never pathname-expands them).
+        ("echo x > f[0]", "f[0]"),
+        ('echo x > f"*"', "f*"),
+        ("echo x > out[1].log", "out[1].log"),
+    ],
+)
+def test_literal_redirect_targets_include_concatenations_and_glob_lookalikes(
+    command: str, expected_target: str
+) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert not analysis.requires_approval
+    assert analysis.command_parts == ("echo x <redirect>",)
+    assert analysis.redirect_operands == ((expected_target,), ())
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_part"),
+    [
+        # Script-loading builtins are ordinary commands to the analysis;
+        # their operands are path-inspected by the resolver (ADR 0021 fix
+        # round).
+        ("source sub/setup.sh", "source sub/setup.sh"),
+        (". ./lib.sh", ". ./lib.sh"),
+        ("source sub/setup.sh > out", "source sub/setup.sh <redirect>"),
+    ],
+)
+def test_source_commands_are_extracted_as_parts(
+    command: str, expected_part: str
+) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert not analysis.requires_approval
+    assert analysis.command_parts == (expected_part,)

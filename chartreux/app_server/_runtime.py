@@ -962,6 +962,34 @@ class SessionRootGrantPort:
         return await self._save_grant(session_id, root, expected_revision)
 
 
+class SessionDangerousCommandGrantPort:
+    """Runtime-owned port persisting approved dangerous-command grants.
+
+    Saving is the dedicated user-layer persistence path: the registry routes
+    the save to the root orchestrator keyed by the registered caller's cwd,
+    so child orchestrators never write. The loop's proposal project argument
+    is not trusted as a key: the registry always re-derives the project from
+    the registered session, exactly like the roots grant port. The port
+    reports the persistence outcome honestly and separately from the live
+    session grant, which the loop applies itself regardless of the outcome.
+    """
+
+    def __init__(
+        self,
+        resolve_session: Callable[[str], AgentLoop | None],
+        save_grant: Callable[[str, Path, str, str], Awaitable[ConfigSaveResult]],
+    ) -> None:
+        self._resolve_session = resolve_session
+        self._save_grant = save_grant
+
+    async def save_dangerous_command_grant(
+        self, session_id: str, project: Path, operation_id: str, expected_revision: str
+    ) -> ConfigSaveResult:
+        return await self._save_grant(
+            session_id, project, operation_id, expected_revision
+        )
+
+
 class HarnessProcess:
     def __init__(self, harness_files: HarnessFilesManager | None = None) -> None:
         from chartreux.app_server._mcp_auth import MCPAuthenticationService

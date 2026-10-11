@@ -248,6 +248,19 @@ def is_canonical_scratch_path(file_path: Path, root: Path | None) -> bool:
         return False
 
 
+def effective_scratchpad_roots(authority: PathAuthority) -> frozenset[Path]:
+    """The authority's own scratchpad roots: the pinned roots plus the owned dir.
+
+    Request-time ceilings are deliberately excluded: they are runtime context,
+    not part of the authority snapshot, and the path layer re-checks every
+    operand against them independently.
+    """
+    roots = frozenset(authority.scratchpad_roots)
+    if authority.scratchpad is not None:
+        roots |= {authority.scratchpad.absolute()}
+    return roots
+
+
 class PathAccess(StrEnum):
     READ = "read"
     WRITE = "write"

@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from chartreux.core.background_jobs import BackgroundJobsPort
     from chartreux.core.callbacks import ClearContextCallback
     from chartreux.core.config import ChartreuxConfigSchema
+    from chartreux.core.dangerous_commands import DangerousCommandAuthority
     from chartreux.core.hooks.models import HookConfigResult
     from chartreux.core.skills.manager import SkillManager
     from chartreux.core.subagents import (
@@ -56,6 +57,10 @@ if TYPE_CHECKING:
     from chartreux.core.tools.utils import PathAuthority
 
 ARGS_COUNT = 4
+
+
+def _no_dangerous_command_authorities() -> tuple[DangerousCommandAuthority, ...]:
+    return ()
 
 
 class InteractionRequestPort(Protocol):
@@ -189,6 +194,12 @@ class BaseTool[
         self.instruction_read_files_getter: Callable[[], frozenset[Path]] = frozenset
         self.plan_file_write_scope_getter: Callable[[], Path | None] = lambda: None
         self.path_authority_getter: Callable[[], PathAuthority] | None = None
+        # Installed by the runtime alongside the other live getters; the shell
+        # resolver reads it per invocation so authority changes invalidate
+        # cached permission decisions.
+        self.dangerous_command_authorities_getter: Callable[
+            [], tuple[DangerousCommandAuthority, ...]
+        ] = _no_dangerous_command_authorities
         self.inherited_plan_write_scopes: tuple[tuple[Path, Path | None], ...] = ()
 
     @classmethod

@@ -33,6 +33,7 @@ from chartreux.app_server._projection import (
 from chartreux.app_server._root_session import SessionHandoff, rebind_history
 from chartreux.app_server._runtime import (
     AgentRuntimeFactory,
+    SessionDangerousCommandGrantPort,
     SessionRootGrantPort,
     close_agent_loop,
 )
@@ -57,6 +58,12 @@ from chartreux.app_server.models import (
 from chartreux.app_server.protocol import (
     AgentSummaryModel,
     CallbackResultError,
+    DangerousCommandAuthorityReadResponse,
+    DangerousCommandDenylistBlockWire,
+    DangerousCommandGrantScopeWire,
+    DangerousCommandGrantWire,
+    DangerousCommandRevocationOutcome,
+    DangerousCommandRevokeResponse,
     HistoryEntryAddedParams,
     HistoryEntryUpdatedParams,
     RunStopReason as PublicRunStopReason,
@@ -69,12 +76,20 @@ from chartreux.app_server.protocol import (
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._loop import _PreparedPolicyReplacement
 from chartreux.core.agents.launch import FrozenPersona, LaunchCandidate, resolve_launch
+from chartreux.core.config._dangerous_command_persistence import (
+    read_saved_dangerous_command_grants,
+)
 from chartreux.core.config._restrictions import (
     SourceRestrictions,
     partition_policy_sources,
 )
 from chartreux.core.config.layers.user import UserConfigLayer
 from chartreux.core.config.types import ConfigSaveResult
+from chartreux.core.dangerous_commands import (
+    OPERATION_REGISTRY,
+    DangerousCommandAuthority,
+    RepositoryScope,
+)
 from chartreux.core.events import BaseEvent, ToolStreamEvent
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session.saved_sessions import delete_saved_session
@@ -104,6 +119,16 @@ from chartreux.core.subagents import (
     prepare_subagent_prompt,
 )
 from chartreux.core.tools.base import InvokeContext
+from chartreux.core.tools.builtins._shell_command_policy import (
+    GitRepositoryRelocation,
+    canonical_git_command,
+    classify_dangerous_git_command,
+    matches_command_prefix,
+    resolve_repository_scope,
+)
+from chartreux.core.tools.builtins._shell_permission_resolver import (
+    _split_command_tokens,
+)
 from chartreux.core.tools.io_port import ToolIOPort
 from chartreux.core.tools.manager import ToolManager
 from chartreux.core.tools.models import ToolPermission, ToolPermissionError
@@ -335,6 +360,172 @@ class StoredChildSession:
     link: ChildSessionLink
 
 
+@dataclass(frozen=True, slots=True)
+class DangerousCommandGrantEntry:
+    """One (operation, repository scope) authority entry of an inspection."""
+
+    operation_id: str
+    scope: RepositoryScope
+
+
+@dataclass(frozen=True, slots=True)
+class DangerousCommandDenylistBlock:
+    """An explicit denylist pattern and the registry operations it vetoes."""
+
+    pattern: str
+    operations: tuple[str, ...]
+
+
+def _grant_entry_sort_key(entry: DangerousCommandGrantEntry) -> tuple[str, str, str]:
+    scope = entry.scope
+    return (entry.operation_id, str(scope.git_dir), str(scope.work_tree))
+
+
+def _grant_entries(
+    authorities: tuple[DangerousCommandAuthority, ...],
+) -> tuple[DangerousCommandGrantEntry, ...]:
+    """Flatten authority snapshots into sorted (operation, scope) entries."""
+    entries = {
+        DangerousCommandGrantEntry(operation_id, authority.scope)
+        for authority in authorities
+        for operation_id in authority.operations
+    }
+    return tuple(sorted(entries, key=_grant_entry_sort_key))
+
+
+def _grant_wire(entry: DangerousCommandGrantEntry) -> DangerousCommandGrantWire:
+    scope = entry.scope
+    return DangerousCommandGrantWire(
+        operation_id=entry.operation_id,
+        scope=DangerousCommandGrantScopeWire(
+            git_dir=str(scope.git_dir),
+            work_tree=str(scope.work_tree) if scope.work_tree is not None else None,
+        ),
+    )
+
+
+def _accepted_saved_grants(
+    loop: AgentLoop, project: Path
+) -> tuple[DangerousCommandGrantEntry, ...]:
+    """Saved user-config authority the session's accepted sources contribute.
+
+    The union covers the session's inherited restrictions (a child accepts its
+    parent's sources) and its own accepted restrictions; the same source can
+    appear in both, so entries dedupe by project and operations. Only the
+    registered project's grants are relevant to its inspection.
+    """
+    sources = (
+        *loop.runtime_policy.inherited_restrictions,
+        *loop.config_orchestrator.restrictions,
+    )
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    entries: set[DangerousCommandGrantEntry] = set()
+    for source in sources:
+        for grant in source.dangerous_command_grants:
+            key = (str(grant.project), grant.operations)
+            if key in seen:
+                continue
+            seen.add(key)
+            if str(grant.project) != str(project):
+                continue
+            scope = resolve_repository_scope(grant.project, GitRepositoryRelocation())
+            if scope is None:
+                continue
+            entries.update(
+                DangerousCommandGrantEntry(operation_id, scope)
+                for operation_id in grant.operations
+            )
+    return tuple(sorted(entries, key=_grant_entry_sort_key))
+
+
+# One canonical probe form per registry operation. The denylist is matched
+# with the resolver's own prefix/canonical-git matching, so a probe doubles as
+# the operation's representative command; tests pin each probe to exactly its
+# operation through the frozen classifier.
+_DANGEROUS_COMMAND_DENYLIST_PROBES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("git.push", ("git", "push")),
+    ("git.push.force", ("git", "push", "--force")),
+    ("git.push.delete", ("git", "push", "--delete")),
+    ("git.push.mirror", ("git", "push", "--mirror")),
+    ("git.checkout", ("git", "checkout")),
+    ("git.restore", ("git", "restore")),
+    ("git.switch.discard", ("git", "switch", "--discard-changes")),
+    ("git.stash.drop", ("git", "stash", "drop")),
+    ("git.stash.clear", ("git", "stash", "clear")),
+    ("git.reflog.expire", ("git", "reflog", "expire")),
+    ("git.reflog.delete", ("git", "reflog", "delete")),
+)
+
+
+def _explicit_shell_denylist(loop: AgentLoop) -> tuple[str, ...]:
+    """Configured bash denylist entries, without the shipped defaults.
+
+    Mirrors the tool manager's restriction assembly (inherited plus accepted
+    sources); the merged tool config also carries built-in defaults, which are
+    not explicit contributions and never mention dangerous git operations.
+    """
+    sources = (
+        *loop.runtime_policy.inherited_restrictions,
+        *loop.config_orchestrator.restrictions,
+    )
+    patterns: list[str] = []
+    for source in sources:
+        for restriction in source.tools:
+            if restriction.tool_name != "bash":
+                continue
+            for pattern in restriction.denylist:
+                if pattern not in patterns:
+                    patterns.append(pattern)
+    return tuple(patterns)
+
+
+def _denylist_blocked_operations(pattern: str) -> tuple[str, ...]:
+    """Registry operations one explicit denylist pattern absolutely vetoes.
+
+    A pattern vetoes an operation when it prefix-matches one of the
+    operation's representative probe forms (the resolver's own prefix and
+    canonical-git matching), or when the pattern is itself a complete
+    grantable form of the operation (``git push origin --delete``). Patterns
+    that only block through an unclassifiable extension (an end-of-options
+    marker, say) are not reported; the surface is informational and never
+    suggests a grant overrides a veto.
+    """
+    pattern_tokens = _split_command_tokens(pattern)
+    if not pattern_tokens:
+        return ()
+    direct = classify_dangerous_git_command(pattern_tokens)
+    direct_operations = (
+        direct.grantable.operation_ids if direct.grantable is not None else ()
+    )
+    blocked: list[str] = []
+    for operation_id, probe in _DANGEROUS_COMMAND_DENYLIST_PROBES:
+        if operation_id in direct_operations:
+            blocked.append(operation_id)
+            continue
+        tokens = list(probe)
+        canonical = canonical_git_command(tokens)
+        if matches_command_prefix(tokens, pattern_tokens) or (
+            canonical is not None and matches_command_prefix(canonical, pattern_tokens)
+        ):
+            blocked.append(operation_id)
+    return tuple(blocked)
+
+
+def _blocking_denylist(loop: AgentLoop) -> tuple[DangerousCommandDenylistBlock, ...]:
+    """Explicit denylist entries blocking dangerous git operations.
+
+    The denylist is an absolute veto checked before grantability, so these
+    entries are reported apart from grant authority: no live or saved grant
+    overrides them.
+    """
+    blocks: list[DangerousCommandDenylistBlock] = []
+    for pattern in _explicit_shell_denylist(loop):
+        operations = _denylist_blocked_operations(pattern)
+        if operations:
+            blocks.append(DangerousCommandDenylistBlock(pattern, operations))
+    return tuple(blocks)
+
+
 class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
     def __init__(
         self,
@@ -534,6 +725,216 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             session_id=session_id, root=root, expected_revision=expected_revision
         )
 
+    async def save_dangerous_command_grant(
+        self, *, session_id: str, operation_id: str, expected_revision: str
+    ) -> ConfigSaveResult:
+        """Persist one approved dangerous-command grant through the root orchestrator only.
+
+        The calling session (root or child) is resolved through the registry,
+        and the save is keyed by that registered session's cwd; a caller-supplied
+        project path is never trusted. Child orchestrators never write: the save
+        always targets the root orchestrator. Mid-turn safe: the orchestrator
+        mutation lock is the only reservation, and nothing is published.
+        """
+        caller = self._resolve_session_loop(session_id)
+        root_runtime = self._root
+        if caller is None or root_runtime is None:
+            raise ValueError(
+                "Dangerous-command grant save requires a registered session and root"
+            )
+        return await root_runtime.agent_loop.config_orchestrator.save_dangerous_command_grant(
+            project=caller.cwd,
+            operation_id=operation_id,
+            expected_revision=expected_revision,
+        )
+
+    def _dangerous_command_grant_save(
+        self, session_id: str, project: Path, operation_id: str, expected_revision: str
+    ) -> Awaitable[ConfigSaveResult]:
+        # The loop's proposal project is not a trusted key: the save is keyed
+        # by the registered caller session's cwd, exactly like the roots save.
+        del project
+        return self.save_dangerous_command_grant(
+            session_id=session_id,
+            operation_id=operation_id,
+            expected_revision=expected_revision,
+        )
+
+    def resolve_live_session(self, session_id: str) -> SessionRuntime | None:
+        """The registered root or an active child runtime, never a stale one."""
+        root = self._root
+        if (
+            root is not None
+            and not root._closed
+            and root.agent_loop.session_id == session_id
+        ):
+            return root
+        child = self._children.get(session_id)
+        if child is not None and not child._closed:
+            return child
+        return None
+
+    def _require_live_session(self, session_id: str) -> SessionRuntime:
+        runtime = self.resolve_live_session(session_id)
+        if runtime is None:
+            raise ValueError(
+                "Dangerous-command authority requires a live registered session"
+            )
+        return runtime
+
+    async def read_dangerous_command_authority(
+        self, session_id: str
+    ) -> DangerousCommandAuthorityReadResponse:
+        """Inspect one registered session's dangerous-command authority.
+
+        The project is always the registered session's own cwd; no
+        caller-supplied project key is accepted. Live grants come from the
+        session's own store, accepted saved grants from the restrictions the
+        session enforces, and the disk read is the fresh P2 projection with
+        its revision. Blocking denylist entries are reported apart from grant
+        authority because no grant overrides an explicit denylist veto.
+        """
+        runtime = self._require_live_session(session_id)
+        loop = runtime.agent_loop
+        store = loop._dangerous_command_grants
+        project = loop.cwd
+        root = self._root
+        if root is None:
+            raise ValueError("Dangerous-command authority requires a registered root")
+        saved = await read_saved_dangerous_command_grants(
+            root.agent_loop.config_orchestrator, project=project
+        )
+        return DangerousCommandAuthorityReadResponse(
+            project=str(project),
+            live_authority_generation=store.authority_generation,
+            live_grants=[
+                _grant_wire(entry)
+                for entry in _grant_entries(store.dangerous_command_authorities())
+            ],
+            accepted_saved_grants=[
+                _grant_wire(entry) for entry in _accepted_saved_grants(loop, project)
+            ],
+            saved_operations=(
+                list(saved.operations) if saved.unavailable is None else None
+            ),
+            disk_revision=saved.user_revision,
+            blocking_denylist=[
+                DangerousCommandDenylistBlockWire(
+                    pattern=block.pattern, operations=list(block.operations)
+                )
+                for block in _blocking_denylist(loop)
+            ],
+        )
+
+    async def revoke_dangerous_command_grant(
+        self,
+        *,
+        session_id: str,
+        operation_id: str,
+        expected_live_generation: int,
+        expected_disk_revision: str | None,
+    ) -> DangerousCommandRevokeResponse:
+        """Revoke one operation's live and saved authority for a session.
+
+        Live removal is guarded by the session store's monotonic generation:
+        a stale expected generation aborts the whole revocation (the saved
+        side is untouched) and reports the current generation to re-read. A
+        matching generation removes the operation's session grants at every
+        scope and invalidates installed pending once permits immediately;
+        cached authority is dropped. A question already awaiting an answer is
+        not cancelled: answering it after the revocation still grants fresh
+        authority for the decided scope. Saved removal is the dedicated
+        revision-checked user-layer remove routed through the root
+        orchestrator and keyed by the registered session's cwd. The two
+        outcomes are reported separately, and a failed saved removal warns
+        that the authority can return on the next reload or start. When the
+        session's accepted saved restrictions still authorize the revoked
+        operation — whether or not the runtime store ever held it — the
+        removal warns that the session keeps that authority until the next
+        reload or start. The reported generation is read after the saved-side
+        attempt, so a concurrent approval during the disk write is
+        reflected.
+        """
+        runtime = self._require_live_session(session_id)
+        loop = runtime.agent_loop
+        store = loop._dangerous_command_grants
+        if store.authority_generation != expected_live_generation:
+            return DangerousCommandRevokeResponse(
+                live=DangerousCommandRevocationOutcome(
+                    status="conflict", generation=store.authority_generation
+                ),
+                saved=DangerousCommandRevocationOutcome(status="skipped"),
+                live_authority_generation=store.authority_generation,
+            )
+        requirements = {
+            (operation_id, authority.scope)
+            for authority in store.dangerous_command_authorities()
+            if operation_id in authority.operations
+        }
+        store.revoke_session(requirements)
+        store.invalidate_pending(requirements)
+        loop.tool_manager._invalidate_dangerous_command_authority()
+        operation = OPERATION_REGISTRY[operation_id]
+        warnings: list[str] = []
+        if any(
+            entry.operation_id == operation_id
+            for entry in _accepted_saved_grants(loop, loop.cwd)
+        ):
+            # The runtime store no longer carries the operation — it may
+            # never have — but the session's accepted restrictions still
+            # authorize it, so the session's live authority persists until a
+            # reload or restart.
+            warnings.append(
+                f"The live {operation_id} grant is removed, but this session "
+                f"keeps {operation_id} authority from accepted config until "
+                "the next config reload or session start."
+            )
+        if not operation.persistable:
+            # Consequential operations are never saved, so no saved authority
+            # can exist to remove.
+            saved_outcome = DangerousCommandRevocationOutcome(status="not_applicable")
+        elif expected_disk_revision is None:
+            saved_outcome = DangerousCommandRevocationOutcome(status="skipped")
+        else:
+            root = self._root
+            if root is None:
+                raise ValueError(
+                    "Dangerous-command revocation requires a registered root"
+                )
+            result = await root.agent_loop.config_orchestrator.remove_dangerous_command_grant(
+                project=loop.cwd,
+                operation_id=operation_id,
+                expected_revision=expected_disk_revision,
+            )
+            if result.error == "conflict":
+                saved_outcome = DangerousCommandRevocationOutcome(status="conflict")
+            elif result.persistence == "saved" and result.error is None:
+                saved_outcome = DangerousCommandRevocationOutcome(
+                    status="removed", revision=result.revision
+                )
+            else:
+                saved_outcome = DangerousCommandRevocationOutcome(
+                    status="failed", revision=result.revision
+                )
+            if saved_outcome.status != "removed":
+                warnings.append(
+                    f"Removing the saved {operation_id} grant for {loop.cwd} did "
+                    "not succeed, so the authority can return on the next config "
+                    "reload or session start."
+                )
+        # Read the generation after the saved-side attempt: a concurrent
+        # approval during the disk write bumps it, and the response reports
+        # the post-operation value.
+        generation = store.authority_generation
+        return DangerousCommandRevokeResponse(
+            live=DangerousCommandRevocationOutcome(
+                status="removed", generation=generation
+            ),
+            saved=saved_outcome,
+            live_authority_generation=generation,
+            warning=" ".join(warnings) if warnings else None,
+        )
+
     async def replace_policy(
         self,
         *,
@@ -711,6 +1112,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self.begin_root_generation()
         runtime.agent_loop.bind_root_grant_port(
             SessionRootGrantPort(self._resolve_session_loop, self._root_grant_save)
+        )
+        runtime.agent_loop.bind_dangerous_command_grant_port(
+            SessionDangerousCommandGrantPort(
+                self._resolve_session_loop, self._dangerous_command_grant_save
+            )
         )
 
     def _resolve_session_loop(self, session_id: str) -> AgentLoop | None:
@@ -3712,6 +4118,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         # caller's cwd; child orchestrators never write.
         child.bind_root_grant_port(
             SessionRootGrantPort(self._resolve_session_loop, self._root_grant_save)
+        )
+        child.bind_dangerous_command_grant_port(
+            SessionDangerousCommandGrantPort(
+                self._resolve_session_loop, self._dangerous_command_grant_save
+            )
         )
         execution = SessionExecution()
         history = SessionHistory(base_history or [])

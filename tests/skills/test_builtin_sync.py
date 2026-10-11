@@ -67,17 +67,32 @@ class TestBuiltinSkills:
         )
         assert "cannot yet be reused" in prompt
 
-    def test_bash_prompt_documents_runtime_denial_not_lifted_by_approval(self) -> None:
+    def test_bash_prompt_documents_dangerous_command_approval_flow(self) -> None:
         prompt = (
             Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/bash.md"
         ).read_text()
 
-        assert "not lifted by conversational approval" in prompt
-        assert "user-removable" in prompt
+        assert "`dangerous_command` denial" in prompt
+        assert (
+            "the runtime will prompt the user when the session is interactive" in prompt
+        )
+        assert (
+            "A refusal means the user declined: do not retry that exact command"
+            in prompt
+        )
+        assert (
+            "Conversational approval does not grant dangerous-command authority"
+            in prompt
+        )
+        assert "hard guards" in prompt
         assert "git reset --hard" in prompt
         assert "--config-env" in prompt
+        assert "absolute veto" in prompt
+        assert "permission authority, not standing intent" in prompt
 
-    def test_git_workflow_skill_recommends_switch_and_handoff_only_push(self) -> None:
+    def test_git_workflow_skill_recommends_switch_and_runtime_approval_push(
+        self,
+    ) -> None:
         skill = (
             Path(__file__).parents[2] / "chartreux/skills/main-git-workflow/SKILL.md"
         ).read_text()
@@ -86,7 +101,8 @@ class TestBuiltinSkills:
         assert "`git switch <branch>`" in skill
         assert "git checkout -b" not in skill
         assert "switching branches is fine" not in skill
-        assert "runtime-denied by default" in skill
+        assert "dangerous-command approval flow" in skill
+        assert "An explicit `[tools.bash]` denylist entry is an absolute veto" in skill
         assert "`git stash apply" in skill
 
     def test_design_and_plan_skills_gate_on_explicit_acceptance(self) -> None:
@@ -138,6 +154,19 @@ class TestBuiltinSkills:
         assert prompt.count("Reuse an `idle` agent") == 1
         assert prompt.count("Persona is immutable") == 1
         assert prompt.count("A `running` agent is busy") == 1
+
+    def test_chartreux_skill_documents_dangerous_command_approval(self) -> None:
+        prompt = BUILTIN_SKILLS["chartreux"].prompt
+        for documented in (
+            "dangerous git commands",
+            "Deny default",
+            "never always",
+            "absolute veto",
+            "not standing intent to publish",
+            "Settings > Shell Permissions",
+            "no public grant endpoint",
+        ):
+            assert documented in prompt, documented
 
     def test_chartreux_skill_does_not_advertise_plugins(self) -> None:
         skill = BUILTIN_SKILLS["chartreux"]

@@ -3149,6 +3149,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     "settings-screen",
                     "usage-screen",
                     "status-line-settings-screen",
+                    "shell-permissions-screen",
                     "websearch-screen",
                 }
                 or screen.__class__.__name__ == "ProviderWorkbenchScreen"
@@ -3161,6 +3162,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         for indication in (
             "#settings-pending-action",
             "#status-line-settings-pending-action",
+            "#shell-permissions-pending-action",
             "#wb-pending-action",
             "#agent-transcript-pending-action",
         ):
@@ -5547,13 +5549,17 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     async def _wait_for_settings(self) -> None:
         from chartreux.ui.settings_service import SettingsService
+        from chartreux.ui.shell_permissions import ShellPermissionsService
 
         service = SettingsService(
             self.app_server.resources.config, apply_ui=self._apply_config_to_ui
         )
+        shell_permissions = ShellPermissionsService(self.app_server.resources.config)
         try:
             snapshot = await service.read()
-            screen = _get_settings_screen_class()(service, snapshot)
+            screen = _get_settings_screen_class()(
+                service, snapshot, shell_permissions=shell_permissions
+            )
             screen.return_state = self._settings_return_state
             self._settings_return_state = None
             command_name = await self.push_screen_wait(screen)
@@ -6110,6 +6116,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 "usage-screen",
                 "websearch-screen",
                 "status-line-settings-screen",
+                "shell-permissions-screen",
             }
             or self.screen.__class__.__name__ == "ProviderWorkbenchScreen"
         ):

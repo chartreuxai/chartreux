@@ -40,10 +40,10 @@ Activates when user requests git assistance:
 ## Core Principles
 
 ### 1. Safety First
-- **Handoff-only history rewriting**: The agent never executes history-rewriting operations — rebase, squash via reset, amend, any reset that moves existing commits, force push — even with explicit user confirmation. The agent explains the operation, prepares exact commands, and the user runs them in their own terminal.
+- **Handoff-only history rewriting**: The agent never executes local history-rewriting operations — rebase, squash via reset, amend, any reset that moves existing commits — even with explicit user confirmation. The agent explains the operation, prepares exact commands, and the user runs them in their own terminal. Force push (`git push --force*`) is a consequential dangerous command instead: it runs only through the runtime approval flow (once or for the session, never always); on a denial or refusal it is handoff-only for the user.
 - **Warning**: Alert user before any history-rewriting operation
 - **Detection**: Check if current branch is shared/protected before advising on dangerous operations
-- **Shared safety ban**: The shared AGENTS rules prohibit destructive checkout, reset, clean, and history-rewrite operations by the agent. This skill never loosens that ban, and user confirmation does not lift it. Operations the agent must not run itself (`git rebase`, `git reset` that moves history, `git commit --amend`, `git push --force*`, `git reset --hard`, `git clean`, discarding changes) are handled handoff-only: prepare exact commands and guidance, and the user runs them in their own terminal.
+- **Shared safety ban**: The shared AGENTS rules prohibit destructive checkout, reset, clean, and history-rewrite operations by the agent. This skill never loosens that ban, and user confirmation does not lift it. History-rewriting operations (`git rebase`, `git reset` that moves history, `git commit --amend`, squash via reset) and hard-guard operations (`git reset --hard`, `git clean`, `rm -rf`) are handoff-only: prepare exact commands and guidance, and the user runs them in their own terminal. `git push` and the consequential git operations (forced/deleting/mirroring pushes, `git checkout`, `git restore`, `git switch --discard-changes`/`-f`, `git stash drop`/`clear`, `git reflog expire`/`delete`) are governed by the runtime dangerous-command approval flow: attempt the command only when the user asked for it, let the runtime prompt the user, and honor a refusal (do not retry a denied command). An explicit `[tools.bash]` denylist entry is an absolute veto: hand the command to the user instead.
 
 ### 2. Conventional Commits Standard
 All commit messages follow the [Conventional Commits](https://www.conventionalcommits.org/) specification:
@@ -146,7 +146,7 @@ done
 
 ## Step 3: Execute Operation
 
-Safe operations (commit, branch, stash) are executed by the agent with user approval. Push is runtime-denied by default — handoff-only: the user runs it or intentionally removes the denylist entry. History-rewriting operations (rebase, squash, amend, any history-moving reset, force push) are NEVER executed here — they follow the handoff-only protocol in their sections and in Step 4.
+Safe operations (commit, branch, stash) are executed by the agent with user approval. Push triggers the runtime dangerous-command approval flow: the runtime prompts the user and the push runs only on a grant; if it is denied or refused, hand the exact command to the user instead of retrying. History-rewriting operations (rebase, squash, amend, any history-moving reset, force push via history rewrite) are NEVER executed here — they follow the handoff-only protocol in their sections and in Step 4.
 
 ### Operation: Commit Message Generation (`/main-git-workflow commit` or "generate commit message")
 
@@ -269,7 +269,7 @@ git merge-base HEAD origin/<target-branch>
 
 5. After the user completes the rebase, explain force-push implications (with warning):
    - Only suggest `git push --force-with-lease` (safer than `--force`)
-   - Force push rewrites remote history — handoff-only: provide the command; the user runs it themselves
+   - Force push rewrites remote history — consequential: it runs only through the runtime approval flow (once/session); on a denial or refusal, provide the command and the user runs it themselves
 
 **Example Output:**
 ```
@@ -288,7 +288,8 @@ If conflicts occur, tell me and I'll help you resolve them:
 3. Continue rebase: git rebase --continue
 
 After the rebase, pushing requires --force-with-lease (rewrites remote history) —
-I'll give you the exact command to run yourself.
+the runtime will ask for approval (once/session); if denied, I'll give you the
+exact command to run yourself.
 ```
 
 ---
@@ -318,7 +319,7 @@ I'll give you the exact command to run yourself.
      - Note for the user: `git reset --soft` is non-destructive (all changes remain staged; recover via `git reflog` if needed), but it still moves existing history, so it is handoff-only under the shared AGENTS ban — the user runs it themselves
    - **Selective squash or reordering** (keeping some commits, squashing others): also hand off:
      "Selective squashing needs an interactive rebase. Run this yourself in a terminal: `git rebase -i HEAD~N`, mark commits to combine as `squash`, save and close. Tell me when done and I'll verify the result."
-5. After the user completes the squash, explain force-push implications (with warning) — force push is handoff-only too
+5. After the user completes the squash, explain force-push implications (with warning) — force push is consequential: runtime approval, handoff on denial
 
 **Example Output:**
 ```
@@ -447,15 +448,15 @@ Select option: [1-5]
 2. Check if branch has upstream: `git rev-parse --abbrev-ref @{u} 2>/dev/null`
 3. If no upstream:
    - Prompt: "No upstream set. Set upstream to origin/<branch>? (y/n)"
-   - If yes: handoff-only — `git push --set-upstream origin <branch>` is runtime-denied by default; give the user the exact command to run themselves (or point to the `[tools.bash]` denylist entry)
+   - If yes: run `git push --set-upstream origin <branch>` — the runtime dangerous-command approval flow prompts the user; if denied or refused, give the user the exact command to run themselves
 4. If upstream exists:
    - Check if branch is behind/ahead: `git log --oneline @{u}..HEAD` and `git log --oneline HEAD..@{u}`
    - If behind: "Your branch is behind remote. Pull first? (y/n)"
    - If diverged: Warn about force push requirement
 5. If shared branch and diverged:
-   - **BLOCK**: Explain that force push overwrites remote history — handoff-only: provide the `git push --force-with-lease` command; the user runs it themselves
+   - **BLOCK**: Explain that force push overwrites remote history — it is a consequential operation in the runtime approval flow (grantable once or for the session, never always): attempt `git push --force-with-lease` only with the user's clear request, let the runtime prompt, and on a denial hand the user the exact command to run themselves
    - Suggest `--force-with-lease` instead of `--force`
-6. Push is handoff-only: `git push` is runtime-denied by default — give the user the exact command to run themselves (or point to the `[tools.bash]` denylist entry). Force pushes are never executed by the agent — handoff-only.
+6. Push runs through the runtime dangerous-command approval flow: the runtime prompts the user and the push runs only on a grant (publication may be allowed once, for the session, or always for this project). If denied or refused, hand the user the exact command to run themselves; do not retry it. An explicit `[tools.bash]` denylist entry vetoing the push is absolute: hand off instead.
 
 **Example Output:**
 ```
@@ -465,8 +466,8 @@ Status: 2 commits ahead, 1 commit behind
 
 Your branch has diverged from remote. Options:
 1. Pull and merge (recommended)
-2. Rebase onto remote and force push (handoff-only: I provide the commands, you run them)
-3. Force push (overwrites remote) - DANGEROUS, handoff-only: I provide the command, you run it
+2. Rebase onto remote and force push (consequential: runtime approval once/session; on denial, you run the commands yourself)
+3. Force push (overwrites remote) - DANGEROUS, consequential: runtime approval once/session; on denial or refusal, handoff — I provide the command, you run it
 
 Select option: [1-3]
 ```
@@ -497,7 +498,7 @@ Suggested Actions:
 1. Review changes: git diff
 2. Stage changes: git add -p (interactive) or git add .
 3. Commit: /main-git-workflow commit
-4. Push: `git push` (handoff-only; you run it — runtime-denied by default)
+4. Push: `git push` (runtime approval; you or the user confirm — denied means handoff)
 5. Rebase onto main: /main-git-workflow rebase (guidance + handoff; you run the rebase)
 
 What would you like to do?
@@ -511,10 +512,6 @@ What would you like to do?
 These operations rewrite history. The agent explains them, prepares exact commands, and the user runs them in their own terminal:
 
 ```bash
-# Force push (overwrites remote history)
-git push --force
-git push --force-with-lease  # Still dangerous, just safer
-
 # Any reset that moves existing history (soft, mixed, or hard)
 git reset --soft HEAD~N
 git reset HEAD~N
@@ -532,6 +529,8 @@ git merge --squash
 # Discard untracked files
 git clean
 ```
+
+Force pushes (`git push --force`, `git push --force-with-lease`) are NOT in this handoff-only list: they are consequential dangerous commands that run only through the runtime approval flow (grantable once or for the session, never always). On a denial, refusal, or explicit `[tools.bash]` denylist veto, they revert to handoff: provide the command and the user runs it.
 
 **Handoff Protocol:**
 1. Detect that the requested operation rewrites history
@@ -551,7 +550,7 @@ These can be executed directly (read-only or additive, no history rewrite):
 - `git pull` (without rebase)
 - `git fetch`
 
-`git checkout` and `git restore` are runtime-denied by default — handoff-only: the user runs them or intentionally removes the denylist entry; use `git switch` for branch creation (`git switch -c <branch>`) and plain branch switching (`git switch <branch>`). Plain `git switch <branch>` and `git switch -c` are safe; `git switch --discard-changes`, `git switch -f`, and branch-resetting `git switch -C` discard working-tree changes or reset a branch — treat them as destructive operations under the handoff guidance (and note `git switch --discard-changes` and `git switch -f` are runtime-denied by the default denylist). `git push` is runtime-denied by default — handoff-only: the user runs it or intentionally removes the denylist entry. `git stash drop` and `git stash clear` permanently discard stashed work — runtime-denied by default; the user runs them or intentionally removes the denylist entry.
+`git checkout` and `git restore` are consequential dangerous commands: the runtime prompts the user before they run (grantable once or for the session, never always); on a refusal or noninteractive denial the user runs them. Use `git switch` for branch creation (`git switch -c <branch>`) and plain branch switching (`git switch <branch>`). Plain `git switch <branch>` and `git switch -c` are safe; `git switch --discard-changes`, `git switch -f`, and branch-resetting `git switch -C` discard working-tree changes or reset a branch — treat them as destructive operations (`git switch --discard-changes` and `git switch -f` are consequential dangerous commands requiring runtime approval). `git push` runs through the runtime approval flow (publication: once, session, or project); if denied or refused, the user runs it. `git stash drop` and `git stash clear` permanently discard stashed work — consequential dangerous commands requiring runtime approval; on a refusal the user runs them. An explicit `[tools.bash]` denylist entry vetoing any of these is absolute: hand the command to the user instead.
 
 ---
 
@@ -579,7 +578,7 @@ When merge or rebase conflicts occur, guide user through resolution:
 **3. Abort Operation:**
 - For rebase: `git rebase --abort` — HANDOFF-ONLY: the user executes this to abort a rebase the USER started; the agent never runs it or starts a rebase
 - For merge: `git merge --abort`
-- For stash: `git stash drop stash@{n}` permanently discards that stash — runtime-denied by default; the user runs it or intentionally removes the denylist entry
+- For stash: `git stash drop stash@{n}` permanently discards that stash — a consequential dangerous command: the runtime prompts the user; on a refusal the user runs it
 
 **4. Common Resolution Patterns:**
 - **Keep ours**: Keep current branch changes, discard incoming
@@ -658,7 +657,7 @@ Test with:
 - [ ] `/main-git-workflow undo` to undo last commit (should hand off reset commands to user, not execute)
 - [ ] `/main-git-workflow undo` with discard option (should hand off to user, not run `git reset --hard`)
 - [ ] `/main-git-workflow push` with no upstream (should offer to set)
-- [ ] `/main-git-workflow push` with diverged branch (should warn and hand off force-push command, not execute it)
+- [ ] `/main-git-workflow push` with diverged branch (should warn; force push is consequential — runtime approval, hand off on denial)
 - [ ] `/main-git-workflow` for general status and suggestions
 - [ ] Natural language: "create a branch for fixing the login bug"
 - [ ] Natural language: "generate a commit message for my changes"

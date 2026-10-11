@@ -54,6 +54,10 @@ from chartreux.app_server.protocol import (
     ConfigWriteResponse,
     ContextInjectParams,
     ContextInjectResponse,
+    DangerousCommandAuthorityReadParams,
+    DangerousCommandAuthorityReadResponse,
+    DangerousCommandRevokeParams,
+    DangerousCommandRevokeResponse,
     EmptyResponse,
     EventNotificationParams,
     MCPAuthRequiredParams,
@@ -110,6 +114,7 @@ from chartreux.core.config._restrictions import ConfigCandidate
 from chartreux.core.config._root_persistence import read_saved_roots
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.orchestrator import ConfigOrchestrator
+from chartreux.core.dangerous_commands import OPERATION_REGISTRY
 from chartreux.core.git.worktree import ManagedWorktree, PreparedWorktree
 from chartreux.core.git.worktree.record import OwnershipToken, release_holder
 from chartreux.core.session.session_lease import SessionBusyError
@@ -707,6 +712,54 @@ class SessionBackendImpl:
             revision=result.revision,
             error=result.error,
         )
+
+    async def read_dangerous_command_authority(
+        self, params: DangerousCommandAuthorityReadParams
+    ) -> DangerousCommandAuthorityReadResponse:
+        """Inspect one registered session's dangerous-command authority.
+
+        The project is always the registered session's own cwd: no
+        caller-supplied project key is accepted. Unregistered or stale
+        sessions are rejected.
+        """
+        self.guard_request()
+        try:
+            return await self.children.read_dangerous_command_authority(
+                params.session_id
+            )
+        except (ValueError, RuntimeError):
+            raise SessionBackendError(
+                ProtocolErrorCode.NOT_FOUND,
+                "Dangerous-command authority requires a live registered session",
+            ) from None
+
+    async def revoke_dangerous_command_grant(
+        self, params: DangerousCommandRevokeParams
+    ) -> DangerousCommandRevokeResponse:
+        """Revoke one operation's live and saved authority (user-initiated).
+
+        Live session authority and saved authority are removed with separate
+        outcomes; the expected live generation and disk revision are checked
+        optimistically, so a conflict is a reported outcome, never an RPC
+        error. Unregistered or stale sessions are rejected.
+        """
+        self.guard_request()
+        if params.operation_id not in OPERATION_REGISTRY:
+            raise SessionBackendError(
+                ProtocolErrorCode.INVALID_PARAMS, "Unknown dangerous operation"
+            )
+        try:
+            return await self.children.revoke_dangerous_command_grant(
+                session_id=params.session_id,
+                operation_id=params.operation_id,
+                expected_live_generation=params.expected_live_generation,
+                expected_disk_revision=params.expected_disk_revision,
+            )
+        except (ValueError, RuntimeError):
+            raise SessionBackendError(
+                ProtocolErrorCode.NOT_FOUND,
+                "Dangerous-command revocation requires a live registered session",
+            ) from None
 
     async def read_policy(self, params: PolicyReadParams) -> PolicyReadResponse:
         self.guard_request()

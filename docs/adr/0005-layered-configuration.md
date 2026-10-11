@@ -172,3 +172,16 @@ becoming competing sources of truth.
 - A client needs a private config object, TOML path, secret, or orchestrator.
 - A new config path would make startup slower for users who do not use the
   feature.
+
+## Amendments
+
+### Protected field: `dangerous_command_grants_by_project` (2026-10-10)
+
+- The user layer gained a second protected field alongside
+  `authorized_roots_by_project`: `dangerous_command_grants_by_project`, a map of
+  project key to granted dangerous-command operation IDs (only the persistable
+  `git.push` operation is accepted). It is accepted only from an installed user
+  source, programmatic and generic config patches to it are rejected, and it is
+  managed only through the runtime approval flow or the Shell Permissions
+  settings panel via dedicated revision-checked save/remove operations (see
+  [ADR 0019](0019-dangerous-git-permissions.md)).

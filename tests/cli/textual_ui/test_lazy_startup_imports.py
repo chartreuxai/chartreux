@@ -176,6 +176,7 @@ class _Orchestrator:
                         "models",
                         "providers",
                         "authorized_roots_by_project",
+                        "dangerous_command_grants_by_project",
                     },
                 ),
                 name="fake-base",

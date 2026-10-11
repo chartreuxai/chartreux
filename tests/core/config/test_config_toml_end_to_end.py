@@ -122,11 +122,12 @@ async def test_toml_subagent_cap_rejects_invalid_values(
 @pytest.mark.parametrize(
     ("denylist", "curl_denied"), [([], False), (["curl", "wget"], True)]
 )
-async def test_toml_bash_denylist_removes_shipped_git_defaults(
+async def test_toml_bash_denylist_still_requires_dangerous_command_authority(
     tmp_path: Path, denylist: list[str], curl_denied: bool
 ) -> None:
-    # A configured [tools.bash] denylist replaces the shipped defaults, so a
-    # list omitting the git entries permits those forms end to end.
+    # A configured [tools.bash] denylist replaces the shipped defaults, but a
+    # list omitting the git entries no longer permits those forms: they are
+    # denied pending dangerous-command authority end to end.
     from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
     from chartreux.core.config.layers.user import UserConfigLayer
     from chartreux.core.config.orchestrator import ConfigOrchestrator
@@ -167,11 +168,15 @@ async def test_toml_bash_denylist_removes_shipped_git_defaults(
         "git reflog delete main",
     ):
         result = tool.resolve_permission(BashArgs(command=command))
-        assert result is not None and result.permission is ToolPermission.ALWAYS
+        assert result is not None and result.permission is ToolPermission.NEVER
+        assert result.denial_kind == "dangerous_command"
+        assert result.dangerous_command_proposal is not None
     # The policy layer's hard guards survive the configured removal.
     for command in ("git reset --hard HEAD", "git clean -fd"):
         result = tool.resolve_permission(BashArgs(command=command))
         assert result is not None and result.permission is ToolPermission.NEVER
+        assert result.denial_kind is None
+        assert result.dangerous_command_proposal is None
     result = tool.resolve_permission(BashArgs(command="curl example.org"))
     assert result is not None
     assert (result.permission is ToolPermission.NEVER) is curl_denied

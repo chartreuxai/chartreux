@@ -1395,6 +1395,11 @@ StatusMessage {
     margin-bottom: 1;
 }
 
+.question-redaction-notice {
+    height: auto;
+    color: $warning;
+}
+
 .question-title {
     height: auto;
     text-style: bold;

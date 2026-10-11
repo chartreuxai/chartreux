@@ -1,0 +1,59 @@
+#shell-permissions-screen { align: center middle; }
+#shell-permissions-content {
+    width: 92;
+    height: 100%;
+    background: $surface;
+    border: solid $foreground-muted;
+    border-title-color: $foreground;
+    border-title-style: bold;
+    padding: 0 1;
+}
+#shell-permissions-content.fullscreen {
+    width: 100%;
+    height: 100%;
+    background: $background;
+    border: none;
+}
+#shell-permissions-title { display: none; height: 1; text-style: bold; }
+#shell-permissions-content.fullscreen #shell-permissions-title { display: block; }
+#shell-permissions-pending-action { height: 1; color: $warning; text-overflow: ellipsis; }
+#shell-permissions-project { height: 1; color: $text-muted; text-overflow: ellipsis; }
+#shell-permissions-grants {
+    height: 1fr;
+    width: 100%;
+    border: none;
+    padding: 0;
+    text-wrap: nowrap;
+}
+#shell-permissions-actions { height: 2; width: 100%; border: none; padding: 0; text-wrap: nowrap; }
+#shell-permissions-feedback { height: auto; max-height: 3; color: $text-muted; }
+#shell-permissions-feedback.warning { color: $warning; }
+#shell-permissions-feedback.error { color: $error; }
+#shell-permissions-feedback.success { color: $success; }
+#shell-permissions-hint { height: 1; color: $text-muted; text-overflow: ellipsis; }
+/* Use a block cursor, not reverse video over Textual's inverted cursor colors. */
+#shell-permissions-grants > .option-list--option-highlighted,
+#shell-permissions-actions > .option-list--option-highlighted {
+    color: $foreground;
+    background: transparent;
+    text-style: none;
+}
+#shell-permissions-grants:focus > .option-list--option-highlighted,
+#shell-permissions-actions:focus > .option-list--option-highlighted {
+    color: $surface;
+    background: $foreground;
+    text-style: bold;
+}
+#shell-permissions-content.fullscreen #shell-permissions-grants:focus > .option-list--option-highlighted,
+#shell-permissions-content.fullscreen #shell-permissions-actions:focus > .option-list--option-highlighted {
+    color: $background;
+}
+#shell-permissions-grants:ansi:focus > .option-list--option-highlighted,
+#shell-permissions-content.fullscreen #shell-permissions-grants:ansi:focus > .option-list--option-highlighted,
+#shell-permissions-actions:ansi:focus > .option-list--option-highlighted,
+#shell-permissions-content.fullscreen #shell-permissions-actions:ansi:focus > .option-list--option-highlighted {
+    color: $ansi-background;
+    background: $ansi-foreground;
+}
+#shell-permissions-grants > .option-list--option-hover,
+#shell-permissions-actions > .option-list--option-hover { background: transparent; }

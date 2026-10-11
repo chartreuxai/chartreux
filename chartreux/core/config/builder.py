@@ -13,12 +13,19 @@ from pydantic.fields import FieldInfo
 
 from chartreux.core.config._catalog import validate_catalog_scope
 from chartreux.core.config._credential_authority import validate_credential_env_source
+from chartreux.core.config._dangerous_command_authority import (
+    ProjectDangerousCommandGrant,
+    validate_grant_source,
+)
 from chartreux.core.config._restrictions import (
     ConfigCandidate,
     PolicySourceIdentity,
     SourceRestrictions,
 )
-from chartreux.core.config._root_authority import validate_root_source
+from chartreux.core.config._root_authority import (
+    ProjectRootAuthority,
+    validate_root_source,
+)
 from chartreux.core.config._source_validation import validate_source
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.layer import (
@@ -197,8 +204,7 @@ class ConfigBuilder[S: ConfigSchema]:
                 except (UntrustedLayerError, EmptyLayerError):
                     continue
                 self._reject_persisted_model_overrides(layer, loaded.model_dump())
-                validate_credential_env_source(loaded.model_dump(), layer=layer)
-                validate_root_source(loaded.model_dump(), layer=layer)
+                self._validate_layer_source(layer, loaded.model_dump())
                 validate_catalog_scope(
                     self._schema,
                     loaded.model_dump(),
@@ -208,8 +214,7 @@ class ConfigBuilder[S: ConfigSchema]:
                 data = overrides.get(layer.name, loaded)
                 raw = data.model_dump()
                 self._reject_persisted_model_overrides(layer, raw)
-                validate_credential_env_source(raw, layer=layer)
-                validate_root_source(raw, layer=layer)
+                self._validate_layer_source(layer, raw)
                 validate_catalog_scope(
                     self._schema,
                     raw,
@@ -239,17 +244,14 @@ class ConfigBuilder[S: ConfigSchema]:
                         raise ValueError("Root replacement source identity changed")
                     raw = replacement.replace_in(raw)
                 roots = validate_root_source(raw, layer=layer)
-                # Compare the effective source projection, not shadowed disk roots.
-                # Canonical overlay paths must still resist symlink reinterpretation.
-                if not force_load or (replacement and replacement.replaces_roots):
-                    for accepted in self.accepted_root_sources:
-                        if (
-                            accepted.layer_name == layer.name
-                            and roots != accepted.authorized_roots
-                        ):
-                            raise ValueError(
-                                "Authorized root interpretation changed; explicit reload required"
-                            )
+                grants = validate_grant_source(raw, layer=layer)
+                self._check_accepted_interpretation(
+                    layer=layer,
+                    roots=roots,
+                    grants=grants,
+                    force_load=force_load,
+                    replacement=replacement,
+                )
                 if not isinstance(layer, LaunchOverridesLayer):
                     restrictions.append(
                         SourceRestrictions.from_raw(
@@ -308,6 +310,45 @@ class ConfigBuilder[S: ConfigSchema]:
                 "'thinking_overrides'; set each role's model and thinking in "
                 "models.toml, or use /thinking for this session"
             )
+
+    @staticmethod
+    def _validate_layer_source(
+        layer: ConfigLayer[RawConfig], raw: dict[str, Any]
+    ) -> None:
+        """Reject protected-field contributions from non-user sources."""
+        validate_credential_env_source(raw, layer=layer)
+        validate_root_source(raw, layer=layer)
+        validate_grant_source(raw, layer=layer)
+
+    def _check_accepted_interpretation(
+        self,
+        *,
+        layer: ConfigLayer[RawConfig],
+        roots: tuple[ProjectRootAuthority, ...],
+        grants: tuple[ProjectDangerousCommandGrant, ...],
+        force_load: bool,
+        replacement: SourceRestrictions | None,
+    ) -> None:
+        """Compare the effective source projection, not shadowed disk roots or grants.
+
+        Canonical overlay paths must still resist symlink reinterpretation, and
+        explicit reload is the only sanctioned way to adopt a changed
+        interpretation.
+        """
+        if force_load and not (replacement and replacement.replaces_roots):
+            return
+        for accepted in self.accepted_root_sources:
+            if accepted.layer_name != layer.name:
+                continue
+            if roots != accepted.authorized_roots:
+                raise ValueError(
+                    "Authorized root interpretation changed; explicit reload required"
+                )
+            if grants != accepted.dangerous_command_grants:
+                raise ValueError(
+                    "Dangerous command grant interpretation changed; "
+                    "explicit reload required"
+                )
 
     @staticmethod
     def _restriction_projection(

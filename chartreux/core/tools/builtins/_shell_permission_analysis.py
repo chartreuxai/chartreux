@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 import re
 
 from tree_sitter import Language, Node, Parser
@@ -13,6 +14,7 @@ from chartreux.core.tools.builtins._shell_command_policy import (
     package_argument_indexes,
 )
 from chartreux.core.tools.builtins._shell_diagnostics import Diagnostic
+from chartreux.core.tools.utils import is_canonical_scratch_path, resolve_tool_path
 
 _SUPPORTED_COMMAND_PARTS = {
     "command_name",
@@ -24,6 +26,10 @@ _SUPPORTED_COMMAND_PARTS = {
 }
 
 _REDIRECTION_NODES = {"heredoc_redirect", "herestring_redirect"}
+
+# Standard-device sinks are not filesystem targets: a redirect to one never
+# opens a file, so it never counts as a file redirect for policy purposes.
+_REDIRECTION_DEVICES = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
 
 # Assignment names that can alter command lookup, loading, startup, or runtime
 # behavior. Prefix families are checked separately below.
@@ -294,7 +300,25 @@ def _assignment_reason(node: Node) -> str | None:  # noqa: PLR0911
     return None
 
 
-def _redirect_reason(node: Node) -> str | None:
+def _is_scratchpad_target(destination: str, roots: frozenset[Path]) -> bool:
+    """Whether an absolute redirect target resolves inside a scratchpad root.
+
+    The match is component-wise against the pinned roots over the full
+    realpath — never a string prefix — so a sibling directory that merely
+    spells like a scratchpad root, or a symlink escaping one, stays denied.
+    """
+    if not roots:
+        return False
+    try:
+        resolved = resolve_tool_path(destination, Path.cwd())
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return any(is_canonical_scratch_path(resolved, root) for root in roots)
+
+
+def _redirect_reason(  # noqa: PLR0911
+    node: Node, *, scratchpad_roots: frozenset[Path] = frozenset()
+) -> str | None:
     descriptor = node.child_by_field_name("descriptor")
     destination = node.child_by_field_name("destination")
     operators = [
@@ -314,11 +338,73 @@ def _redirect_reason(node: Node) -> str | None:
         return "a non-literal redirection target"
     if destination_text.startswith("-") or destination_text.isdigit():
         return "an invalid redirection path target"
+    if destination_text in _REDIRECTION_DEVICES:
+        # Device sinks are not filesystem targets (ADR 0021).
+        return None
     from pathlib import PurePosixPath
 
     if PurePosixPath(destination_text).is_absolute():
+        # Absolute targets are authorized only inside the session scratchpad
+        # roots. The resolver's path layer independently gates every literal
+        # redirect target as a WRITE, so this exemption is friction relief,
+        # never an authorization beyond workspace+scratchpad.
+        if _is_scratchpad_target(destination_text, scratchpad_roots):
+            return None
         return "an absolute redirection target"
     return None
+
+
+def _literal_redirect_target(node: Node) -> str | None:
+    """The literal filesystem target of a file_redirect, or None.
+
+    fd duplication (2>&1) and non-literal destinations are not filesystem
+    targets; device sinks are targets (the resolver filters them from
+    synthetic operands).
+    """
+    destination = node.child_by_field_name("destination")
+    if destination is None:
+        return None
+    target = _literal_token(destination)
+    if target is None:
+        return None
+    duplication = any(child.type in {">&", "<&"} for child in node.children)
+    if duplication and (target.isdigit() or target == "-"):
+        return None  # Descriptor duplication is not filesystem access.
+    return target
+
+
+def _redirect_anchor(node: Node) -> Node | None:
+    """The command a redirect applies to, for occurrence-local resolution.
+
+    A trailing redirect on a list or pipeline applies to its last command
+    (``cd sub && make > out.log`` redirects make's output); a redirect-only
+    statement anchors to nothing and resolves against the next command.
+    """
+    parent = node.parent
+    if parent is None:
+        return None
+    if parent.type == "command":
+        # Redirect-first and assignment forms keep the redirect inside the
+        # command node; the analysis denies those shapes, but the target is
+        # still attributed so it stays checked.
+        return parent
+    if parent.type != "redirected_statement":
+        return None
+    statement = next(
+        (
+            child
+            for child in parent.children
+            if child.type
+            not in {"file_redirect", "heredoc_redirect", "herestring_redirect"}
+        ),
+        None,
+    )
+    if statement is None:
+        return None  # Redirect-only statement: no command to anchor to.
+    if statement.type == "command":
+        return statement
+    anchored = [child for child in _descendants(statement) if child.type == "command"]
+    return anchored[-1] if anchored else None
 
 
 def _executable_parts(node: Node) -> list[str]:
@@ -502,6 +588,13 @@ class ShellPermissionAnalysis:
     command_parts: tuple[str, ...]
     approval_reasons: tuple[str, ...]
     diagnostics: tuple[Diagnostic, ...] = ()
+    # Literal redirect targets grouped by occurrence position: group i holds
+    # the targets whose synthetic WRITE operands resolve against the working
+    # directory in force before command part i runs, and the final group
+    # holds targets that follow the last part. Redirections are set up before
+    # their command executes, so a redirect attached to a cd resolves against
+    # the pre-cd working directory.
+    redirect_operands: tuple[tuple[str, ...], ...] = ()
 
     @property
     def approval_diagnostic(self) -> Diagnostic:
@@ -530,7 +623,10 @@ def _get_parser() -> Parser:
 
 
 def _analyze_shell_command(  # noqa: PLR0915
-    command: str, *, nested_source: bool = False
+    command: str,
+    *,
+    nested_source: bool = False,
+    scratchpad_roots: frozenset[Path] = frozenset(),
 ) -> ShellPermissionAnalysis:
     """Extract commands and fail closed on syntax the policy cannot model."""
     if "\0" in command:
@@ -538,6 +634,12 @@ def _analyze_shell_command(  # noqa: PLR0915
     command = re.sub(r"(?<!\\)\\\n", "", command)
     tree = _get_parser().parse(command.encode("utf-8"))
     commands: list[str] = []
+    # Literal redirect targets grouped by the command part they precede; the
+    # trailing group collects targets that follow the last part (redirect-only
+    # statements anchor to the next command, or to the end of the chain).
+    redirect_groups: list[list[str]] = []
+    pending_targets: list[str] = []
+    part_index_by_command: dict[tuple[int, int, str], int] = {}
     approval_reasons: set[str] = set()
     diagnostics: dict[str, Diagnostic] = {}
 
@@ -547,9 +649,6 @@ def _analyze_shell_command(  # noqa: PLR0915
     all_nodes = (tree.root_node, *tuple(_descendants(tree.root_node)))
     has_file_redirect = any(node.type == "file_redirect" for node in all_nodes)
     has_command = any(_command_name(node) is not None for node in all_nodes)
-    has_cwd_change = any(
-        _command_name(node) in {"cd", "pushd", "popd"} for node in all_nodes
-    )
     if has_file_redirect and not has_command:
         approval_reasons.add("redirect-only statements are not permitted")
     if (
@@ -557,12 +656,6 @@ def _analyze_shell_command(  # noqa: PLR0915
         and not has_command
     ):
         approval_reasons.add("assignment-only statements are not permitted")
-    if has_file_redirect and has_cwd_change:
-        approval_reasons.add(
-            "redirection in a command chain containing cd"
-            if any(_command_name(node) == "cd" for node in all_nodes)
-            else "redirection in a command chain changing the working directory"
-        )
 
     def find_commands(node: Node) -> None:  # noqa: PLR0912
         previous_reasons = approval_reasons.copy()
@@ -570,8 +663,26 @@ def _analyze_shell_command(  # noqa: PLR0915
             if reason := _assignment_reason(node):
                 approval_reasons.add(reason)
         elif node.type == "file_redirect":
-            if reason := _redirect_reason(node):
+            if reason := _redirect_reason(node, scratchpad_roots=scratchpad_roots):
                 approval_reasons.add(reason)
+            if target := _literal_redirect_target(node):
+                anchor = _redirect_anchor(node)
+                index = (
+                    part_index_by_command.get((
+                        anchor.start_byte,
+                        anchor.end_byte,
+                        anchor.type,
+                    ))
+                    if anchor is not None
+                    else None
+                )
+                if index is None:
+                    # No emitted part precedes this redirect yet (a
+                    # redirect-only statement, or an anchor that produced no
+                    # command part): it resolves against the next part.
+                    pending_targets.append(target)
+                else:
+                    redirect_groups[index].append(target)
         elif reason := _node_approval_reason(node):
             approval_reasons.add(reason)
 
@@ -609,7 +720,15 @@ def _analyze_shell_command(  # noqa: PLR0915
             if parts and node.parent and node.parent.type == "redirected_statement":
                 parts.append("<redirect>")
             if parts:
+                part_index_by_command[(node.start_byte, node.end_byte, node.type)] = (
+                    len(commands)
+                )
                 commands.append(" ".join(parts))
+                # Redirects that precede this part (redirect-only statements,
+                # or anchors that emitted no part) resolve against the
+                # working directory in force before this part runs.
+                redirect_groups.append(list(pending_targets))
+                pending_targets.clear()
 
         for reason in approval_reasons - previous_reasons:
             original = (node.text or b"").decode("utf-8")
@@ -635,15 +754,22 @@ def _analyze_shell_command(  # noqa: PLR0915
             )
             for reason in sorted(approval_reasons)
         ),
+        redirect_operands=tuple(tuple(group) for group in redirect_groups)
+        + (tuple(pending_targets),),
     )
 
 
 def analyze_shell_command(
-    command: str, *, nested_source: bool = False
+    command: str,
+    *,
+    nested_source: bool = False,
+    scratchpad_roots: frozenset[Path] = frozenset(),
 ) -> ShellPermissionAnalysis:
     """Analyze a command, denying safely when parsing or traversal fails."""
     try:
-        return _analyze_shell_command(command, nested_source=nested_source)
+        return _analyze_shell_command(
+            command, nested_source=nested_source, scratchpad_roots=scratchpad_roots
+        )
     except Exception:
         return ShellPermissionAnalysis(
             command_parts=(), approval_reasons=("shell analysis failed",)

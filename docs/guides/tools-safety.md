@@ -69,7 +69,32 @@ Trust can apply to the current folder, the repository root when offered, or the 
 
 `bash` runs a finite command in a fresh POSIX shell. Standard input is closed, a timeout is enforced, and stdout and stderr are returned separately. Shell state, process handles, continued stdin, polling, and cursor-based output do not persist between calls. Configure its `permission`, `max_output_bytes`, `default_timeout`, `denylist`, `denylist_standalone`, and `sensitive_patterns` under `[tools.bash]`; runtime path and sensitive-file protections still apply.
 
-The default `denylist` denies `git push`, `git checkout`, `git stash drop`, `git stash clear`, `git restore`, `git switch --discard-changes`, `git switch -f`, `git reflog expire`, and `git reflog delete`. These entries are user-removable: clear or replace `denylist` under `[tools.bash]` to let the agent run them. Hard guards are separate and non-overridable: `git reset --hard` and forced non-dry-run `git clean` stay denied regardless of `denylist` or `permission` settings, and `git -c ...`/`--config-env` spellings are denied by the policy layer even with the denylist cleared. The denylist covers direct command spellings and modeled wrappers (for example `git -C . push`); it does not cover arbitrary unmodeled executors such as make targets, scripts, or inline interpreter code.
+The default `denylist` no longer contains the recognized dangerous git operations (`git push`, `git checkout`, `git restore`, `git stash drop`, `git stash clear`, `git switch --discard-changes`, `git switch -f`, `git reflog expire`, `git reflog delete`): they are classified by the [dangerous-command policy](#dangerous-git-commands) and denied pending typed authority. Explicit `denylist` entries remain an absolute veto: a matching entry denies the command before any grant is even considered, and only the user removing the entry lifts it. Hard guards are separate and non-overridable: recursive `rm`, `git reset --hard`, and forced non-dry-run `git clean` stay denied regardless of `denylist`, `permission`, or approval settings, and `git -c ...`/`--config-env` spellings are denied by the policy layer even with the denylist cleared. The denylist covers direct command spellings and modeled wrappers (for example `git -C . push`); it does not cover arbitrary unmodeled executors such as make targets, scripts, or inline interpreter code.
+
+## Dangerous git commands
+
+Recognized dangerous git operations have first-class typed policy instead of denylist membership. A pure classifier assigns each whole shell call an operation set from a frozen registry, and execution is denied unless authority exists for every required operation in the command's exact repository scope (`git_dir`/`work_tree`; sibling worktrees are isolated).
+
+There are three policy classes:
+
+- **Publication** (`git.push`, ordinary `git push` only) — grantable in an interactive session with the choices Deny (default), Allow once, Allow this session, or Always for this project.
+- **Consequential** (`git.push.force`, `git.push.delete`, `git.push.mirror`, `git.checkout`, `git.restore`, `git.switch.discard`, `git.stash.drop`, `git.stash.clear`, `git.reflog.expire`, `git.reflog.delete`) — grantable with Deny (default), Allow once, or Allow this session. **Never** "Always": a push combining consequential mechanisms requires all classified consequential operations, and `git.push` authority never covers them.
+- **Hard guards** (recursive `rm`, `git reset --hard`, forced non-dry-run `git clean`, unmodeled or ambiguous forms) — no operation ID and no grant path: the user runs the command themselves.
+
+Grant and denial semantics:
+
+- A dangerous command denied for lack of authority triggers a runtime approval question in interactive sessions. Approval is **permission authority, not standing intent to publish**: a grant lets the tool call run; it is not a standing instruction that the project should be published or that further dangerous commands are pre-approved.
+- **Allow once** authorizes exactly one invocation of the original call, including every listed occurrence of the command; it is never shared across concurrent identical calls.
+- **Allow this session** installs session authority keyed by operation and repository scope; it survives compaction and `/reload` and expires with the session, a new conversation or branch, or resume (session grants are not auto-restored).
+- **Always for this project** persists the grant to the protected user-layer `dangerous_command_grants_by_project` field (only `git.push` is persistable). The saved grant keys to the session's project (`cwd`), matching the authorized-roots flow; for a cross-project command targeting an authorized root, the saved grant still keys to the session's own project.
+- **Refusal memory**: a denial records the decided call's repository-bound canonical identity, so the exact decided call returns an honest denial instead of re-prompting. Whitespace and quoting variants that tokenize identically match; a reformulated command re-prompts. It is per decided call, not a blanket block.
+- **Recheck is the final gate**: an approval installs runtime authority and then the full permission pipeline rechecks (tool disablement, denylist, sensitivity, path and parent-ceiling restrictions, repository identity). On a recheck failure nothing executes and an unused once authority is destroyed. Child approval never lifts a missing parent dangerous-command authority.
+- **Noninteractive sessions** deny dangerous commands promptly with remediation naming the actual path: publication operations point to the persistent knob (`Add git.push to dangerous_command_grants_by_project for this project in your user config.toml`); consequential operations state they cannot be pre-authorized and require approval in an interactive session; a mixed call's remediation covers only the persistable subset, naming the operations that still need interactive approval. The denial carries the resolver's reason.
+- Revocation and inspection: the app server exposes `policy/dangerous_commands/read` and `policy/dangerous_commands/revoke` (see [App server](../integrations/app-server.md)); there is deliberately no public "grant an arbitrary operation" endpoint — grants come only from the runtime approval flow. The Textual settings panel **Settings > Shell Permissions** (in the Advanced & Tools group) shows live and saved dangerous-command authority and lets the user revoke it.
+
+### Breaking change
+
+Recognized git operations left the shipped denylist, and `denylist = []` no longer implicitly authorizes them: an empty explicit denylist used to leave the agent free to push; now publication needs a runtime grant (or a saved project grant) exactly as before. Explicit denylist entries remain an absolute veto, so an explicit `denylist = ["git push"]` still blocks pushes outright.
 
 ## Managed shell jobs
 
@@ -133,14 +158,14 @@ seconds for SIGTERM before SIGKILL; stopping does not undo file or remote effect
 A late stop preserves natural completion.
 
 `bash_start` uses the canonical `[tools.bash]` permission, denylist, sensitive-path,
-workspace, and inherited-parent restrictions. The default denylist applies at
-launch as well: `git push`, `git checkout`, `git stash drop`, `git stash clear`,
-`git restore`, `git switch --discard-changes`, `git switch -f`,
-`git reflog expire`, and `git reflog delete` are denied by default, and a
-denied launch creates no active job. Those entries are user-removable under
-`[tools.bash]`; the hard guards
-(`git reset --hard`, forced non-dry-run `git clean`) are not. There is no separate
-`[tools.bash_start]` permission key and no interactive launch approval. Ordinary
+workspace, and inherited-parent restrictions. It also applies the same
+dangerous-command policy as `bash`: `bash` and `bash_start` behave identically, a
+dangerous launch prompts the user for approval in interactive sessions (and is
+denied with remediation otherwise), and a denied launch creates no active job.
+The hard guards (recursive `rm`, `git reset --hard`, forced non-dry-run
+`git clean`) are not grantable. There is no separate
+`[tools.bash_start]` permission key and no separate interactive launch approval
+beyond the dangerous-command flow. Ordinary
 tool filtering still controls availability; read, stop, and list have their own
 ordinary tool permissions and ownership checks. Disabling launch does not itself
 disable recovery tools. Live jobs or pending launches restrict execution-authority

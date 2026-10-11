@@ -42,6 +42,8 @@ from chartreux.app_server.protocol import (
     ConfigReloadParams,
     ConfigWriteParams,
     ContextInjectParams,
+    DangerousCommandAuthorityReadParams,
+    DangerousCommandRevokeParams,
     EventBatch,
     EventNotificationParams,
     EventsReadParams,
@@ -144,6 +146,8 @@ _SESSION_BACKEND_METHODS = frozenset({
     "config/reload",
     "config/policy/read",
     "config/policy/replace",
+    "policy/dangerous_commands/read",
+    "policy/dangerous_commands/revoke",
     "policy/roots/read",
     "policy/roots/replace",
     "policy/roots/save",
@@ -1020,7 +1024,7 @@ class AppServer:
             runtime_updated=result.runtime_updated,
         )
 
-    async def _dispatch_backend_config(  # noqa: PLR0911 - explicit route ownership
+    async def _dispatch_backend_config(  # noqa: PLR0911, PLR0912 - explicit route ownership
         self, root: SessionBackend, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult | None:
         if method in {"policy/roots/read", "policy/roots/replace"}:
@@ -1045,6 +1049,23 @@ class AppServer:
                     ProtocolErrorCode.INVALID_PARAMS, "Invalid root save parameters"
                 ) from None
             return DispatchResult(await root.save_roots(save_params))
+        if method == "policy/dangerous_commands/read":
+            return DispatchResult(
+                await root.read_dangerous_command_authority(
+                    validate_wire(DangerousCommandAuthorityReadParams, raw_params)
+                )
+            )
+        if method == "policy/dangerous_commands/revoke":
+            try:
+                revoke_params = validate_wire(DangerousCommandRevokeParams, raw_params)
+            except ValidationError:
+                raise SessionBackendError(
+                    ProtocolErrorCode.INVALID_PARAMS,
+                    "Invalid dangerous-command revocation parameters",
+                ) from None
+            return DispatchResult(
+                await root.revoke_dangerous_command_grant(revoke_params)
+            )
         if method in {"config/policy/read", "config/policy/replace"}:
             if method == "config/policy/read":
                 return DispatchResult(

@@ -13,6 +13,7 @@ from chartreux.app_server.models import (
     UserQuestionRequest,
 )
 from chartreux.cli.textual_ui.widgets.question_app import QuestionApp
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
 
 @pytest.fixture
@@ -1104,3 +1105,101 @@ class TestQuestionAppClicks:
 
             assert qapp.selected_option == qapp._other_option_idx
             assert qapp._other_option_idx in qapp.multi_selections[0]
+
+
+class TestQuestionDisplaySafety:
+    """Render-time display safety pins for the generic question widget.
+
+    Ordinary questions (roots prompts, ask_user_question) keep their exact
+    behavior: no redaction notice without secrets, markup-looking text renders
+    literally, answers carry the original question identity, and the question
+    text scrolls inside the body so long text never hides the choices.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ordinary_question_shows_no_redaction_notice(
+        self, single_question_args
+    ):
+        app = _HostApp(single_question_args)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            qapp = app.query_one(QuestionApp)
+            notice = qapp.query_one(".question-redaction-notice", NoMarkupStatic)
+            assert not notice.display
+            title = qapp.query_one(".question-title", NoMarkupStatic)
+            assert str(title.content) == single_question_args.questions[0].question
+
+    @pytest.mark.asyncio
+    async def test_markup_looking_question_text_renders_literally(self):
+        args = UserQuestionRequest(
+            questions=[
+                UserQuestion(
+                    question=(
+                        "Deploy to [red]production[/red]? "
+                        "See [bold]docs[/bold] and [/] odd tags."
+                    ),
+                    options=[QuestionChoice(label="Yes"), QuestionChoice(label="No")],
+                )
+            ]
+        )
+        app = _HostApp(args)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            qapp = app.query_one(QuestionApp)
+            title = qapp.query_one(".question-title", NoMarkupStatic)
+            assert str(title.content) == args.questions[0].question
+            assert "[red]production[/red]" in str(title.render())
+            assert "[/]" in str(title.render())
+
+    @pytest.mark.asyncio
+    async def test_redacted_display_keeps_the_answered_identity_exact(self):
+        from chartreux.core.tools import secret_redaction
+
+        secret = "sk-SyntheticQuestionSecret12345"
+        args = UserQuestionRequest(
+            questions=[
+                UserQuestion(
+                    question=f"Ship with token {secret}?",
+                    options=[QuestionChoice(label="Yes"), QuestionChoice(label="No")],
+                )
+            ]
+        )
+        app = _HostApp(args)
+        policy = secret_redaction.ScrubPolicy(
+            redaction_credentials=(("TEST_TOKEN", secret),)
+        )
+        with secret_redaction.bind_policy(policy):
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause()
+                qapp = app.query_one(QuestionApp)
+                title = qapp.query_one(".question-title", NoMarkupStatic)
+                notice = qapp.query_one(".question-redaction-notice", NoMarkupStatic)
+                # The display is redacted with a visible notice...
+                assert secret not in str(title.content)
+                assert notice.display
+                # ...while the answered identity stays exact.
+                qapp._mount_time = 0.0
+                with patch.object(
+                    qapp, "post_message", wraps=qapp.post_message
+                ) as delivery:
+                    await pilot.press("enter")
+                    answered = next(
+                        call.args[0]
+                        for call in delivery.call_args_list
+                        if isinstance(call.args[0], QuestionApp.Answered)
+                    )
+                assert answered.answers[0].question == args.questions[0].question
+                assert secret in answered.answers[0].question
+                assert answered.answers[0].answer == "Yes"
+
+    @pytest.mark.asyncio
+    async def test_question_text_scrolls_inside_the_body(self, single_question_args):
+        app = _HostApp(single_question_args)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            qapp = app.query_one(QuestionApp)
+            body = qapp.query_one("#question-body")
+            # The title lives inside the scrollable body so long question text
+            # stays fully inspectable without hiding the choices.
+            assert qapp.title_widget is not None
+            assert qapp.title_widget.parent is body

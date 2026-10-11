@@ -213,6 +213,31 @@ class TestBashGranularPermissions:
         assert result.permission is ToolPermission.NEVER
         assert result.reason
 
+    @pytest.mark.parametrize(
+        ("command", "operation_ids"),
+        [
+            ("git push", ("git.push",)),
+            ("git push --force origin main", ("git.push.force",)),
+            ("git checkout main", ("git.checkout",)),
+            ("git stash drop", ("git.stash.drop",)),
+        ],
+    )
+    def test_dangerous_git_commands_require_dangerous_command_authority(
+        self, command, operation_ids
+    ):
+        # The recognized git forms are denied pending typed dangerous-command
+        # authority: a grantable denial carrying the whole-call proposal, never
+        # a hard guard and never an implicit allow.
+        bash = self._bash()
+        result = bash.resolve_permission(BashArgs(command=command))
+        assert isinstance(result, PermissionContext)
+        assert result.permission is ToolPermission.NEVER
+        assert result.denial_kind == "dangerous_command"
+        assert result.reason
+        proposal = result.dangerous_command_proposal
+        assert proposal is not None
+        assert proposal.operations == operation_ids
+
     def test_rmdir_in_workdir_executes_automatically(self):
         bash = self._bash()
         result = bash.resolve_permission(BashArgs(command="rmdir foo"))

@@ -31,7 +31,10 @@ class SettingDescriptor:
     group: str
     choices: tuple[str, ...] = ()
     item_kind: Literal["path", "pattern"] | None = None
-    control: Literal["checklist", "toggle_inventory", "status_line"] | None = None
+    control: (
+        Literal["checklist", "toggle_inventory", "status_line", "shell_permissions"]
+        | None
+    ) = None
     inventory: Literal["tools", "skills", "agents"] | None = None
     minimum: int | float | None = None
     exclusive_minimum: bool = False
@@ -469,6 +472,21 @@ STATUS_LINE_SETTING = SettingDescriptor(
     control="status_line",
 )
 
+# Inspection/revocation hook for dangerous-command permission authority. This
+# is deliberately not an editable setting: grants are approved per command in
+# the runtime flow and are never set through config writes, so the protected
+# dangerous_command_grants_by_project field stays excluded from the catalog.
+SHELL_PERMISSIONS_SETTING = SettingDescriptor(
+    "shell_permissions",
+    "Shell Permissions",
+    "Inspect and revoke dangerous-command permission authority (for example "
+    "git push) for this session and project. Authority is approved per "
+    "command when it is needed; it is not set here.",
+    "deferred",
+    "Advanced & Tools",
+    control="shell_permissions",
+)
+
 VISIBLE_SETTINGS: tuple[SettingDescriptor, ...] = (
     *(
         STATUS_LINE_SETTING if item.path == "status_line.segments" else item
@@ -494,6 +512,7 @@ VISIBLE_SETTINGS: tuple[SettingDescriptor, ...] = (
         )
         for category in ("agents", "skills", "tools")
     ),
+    SHELL_PERMISSIONS_SETTING,
 )
 
 DEFERRED_SETTINGS: tuple[SettingDescriptor, ...] = ()
@@ -520,6 +539,7 @@ LINK_SETTINGS: tuple[SettingDescriptor, ...] = tuple(
 EXCLUDED_SETTINGS = frozenset({
     "authorized_roots_by_project",
     "credential_env_passthrough",
+    "dangerous_command_grants_by_project",
     "session_logging.permission_repair_dir",
     "tools.<name>.allowlist",
     "tools.<name>.denylist",

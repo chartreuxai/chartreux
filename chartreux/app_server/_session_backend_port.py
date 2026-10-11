@@ -22,6 +22,10 @@ from chartreux.app_server.protocol import (
     ConfigWriteResponse,
     ContextInjectParams,
     ContextInjectResponse,
+    DangerousCommandAuthorityReadParams,
+    DangerousCommandAuthorityReadResponse,
+    DangerousCommandRevokeParams,
+    DangerousCommandRevokeResponse,
     EmptyResponse,
     PolicyReadParams,
     PolicyReadResponse,
@@ -260,6 +264,14 @@ class SessionBackend(Protocol):  # noqa: PLR0904 - unified backend contract
     ) -> SessionBackendResult[RootsReplaceResponse]: ...
 
     async def save_roots(self, params: RootsSaveParams) -> RootsSaveResponse: ...
+
+    async def read_dangerous_command_authority(
+        self, params: DangerousCommandAuthorityReadParams
+    ) -> DangerousCommandAuthorityReadResponse: ...
+
+    async def revoke_dangerous_command_grant(
+        self, params: DangerousCommandRevokeParams
+    ) -> DangerousCommandRevokeResponse: ...
 
     async def read_mcp(self) -> SessionMCPState: ...
 

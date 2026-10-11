@@ -5,6 +5,7 @@ from pathlib import Path
 import stat
 import threading
 import tomllib
+from typing import IO
 
 import pytest
 
@@ -139,6 +140,47 @@ async def test_stale_expected_revision_fails_cleanly(tmp_path: Path) -> None:
         assert result.revision is None
 
     assert path.read_text() == external
+    assert live_state(orchestrator) == before
+
+
+@pytest.mark.asyncio
+async def test_intervening_write_between_revision_read_and_replace_conflicts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('theme = "dark"\n')
+    orchestrator = await make_orchestrator(path)
+    layer = orchestrator.get_layer("user-toml")
+    expected = layer.fingerprint
+    assert expected is not None
+    before = live_state(orchestrator)
+    external = 'theme = "light"\n# written between the revision reads\n'
+    original = _base.create_file_fingerprint
+    target_reads = 0
+
+    def intervening(file: IO[bytes]) -> str:
+        nonlocal target_reads
+        if Path(file.name) == path:
+            target_reads += 1
+            if target_reads == 2:
+                # A non-cooperating writer replaces the store after the first
+                # under-lock revision read and before the replacement.
+                path.write_text(external)
+        return original(file)
+
+    monkeypatch.setattr(_base, "create_file_fingerprint", intervening)
+
+    result = await orchestrator.save_project_root_grant(
+        project=tmp_path, root=tmp_path / "extra", expected_revision=expected
+    )
+
+    assert result.persistence == "not_saved"
+    assert result.application == "unchanged"
+    assert result.error == "conflict"
+    assert result.revision is None
+    # The intervening writer's content survives byte-for-byte.
+    assert path.read_text() == external
+    assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
     assert live_state(orchestrator) == before
 
 

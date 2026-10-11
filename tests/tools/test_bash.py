@@ -444,73 +444,109 @@ def test_network_clients_are_denied_by_default(command):
 
 
 @pytest.mark.parametrize(
-    ("command", "pattern"),
+    ("command", "operation_ids"),
     [
-        ("git push", "git push"),
-        ("git push --force origin main", "git push"),
-        ("git checkout main", "git checkout"),
-        ("git checkout -b feature", "git checkout"),
-        ("git checkout -- file.txt", "git checkout"),
-        ("git checkout HEAD -- file.txt", "git checkout"),
-        ("git stash drop", "git stash drop"),
-        ("git stash drop stash@{1}", "git stash drop"),
-        ("git stash clear", "git stash clear"),
-        ("git restore file.txt", "git restore"),
-        ("git restore .", "git restore"),
-        ("git restore --source HEAD file.txt", "git restore"),
-        ("git restore --staged file.txt", "git restore"),
-        ("git switch --discard-changes", "git switch --discard-changes"),
-        ("git switch --discard-changes main", "git switch --discard-changes"),
-        ("git switch -f", "git switch -f"),
-        ("git switch -f main", "git switch -f"),
-        ("git reflog expire", "git reflog expire"),
-        ("git reflog expire --expire=now --all", "git reflog expire"),
-        ("git reflog delete", "git reflog delete"),
-        ("git reflog delete main", "git reflog delete"),
-        # Recognized git global options are normalized before prefix matching.
-        ("git -C . push", "git push"),
-        ("git --no-pager checkout main", "git checkout"),
-        ("git -C . switch --discard-changes", "git switch --discard-changes"),
-        ("git --no-pager switch -f main", "git switch -f"),
-        ("git -C . reflog expire --all", "git reflog expire"),
-        ("git -C . reflog delete main", "git reflog delete"),
+        ("git push", ("git.push",)),
+        ("git push --force origin main", ("git.push.force",)),
+        ("git checkout main", ("git.checkout",)),
+        ("git checkout -b feature", ("git.checkout",)),
+        ("git stash drop", ("git.stash.drop",)),
+        ("git stash clear", ("git.stash.clear",)),
+        ("git restore file.txt", ("git.restore",)),
+        ("git restore .", ("git.restore",)),
+        ("git restore --source HEAD file.txt", ("git.restore",)),
+        ("git restore --staged file.txt", ("git.restore",)),
+        ("git switch --discard-changes", ("git.switch.discard",)),
+        ("git switch --discard-changes main", ("git.switch.discard",)),
+        ("git switch -f", ("git.switch.discard",)),
+        ("git switch -f main", ("git.switch.discard",)),
+        ("git reflog expire", ("git.reflog.expire",)),
+        ("git reflog expire --expire=now --all", ("git.reflog.expire",)),
+        ("git reflog delete", ("git.reflog.delete",)),
+        ("git reflog delete main", ("git.reflog.delete",)),
+        # Recognized git global options relocate the repository scope.
+        ("git -C . push", ("git.push",)),
+        ("git --no-pager checkout main", ("git.checkout",)),
+        ("git -C . switch --discard-changes", ("git.switch.discard",)),
+        ("git --no-pager switch -f main", ("git.switch.discard",)),
+        ("git -C . reflog expire --all", ("git.reflog.expire",)),
+        ("git -C . reflog delete main", ("git.reflog.delete",)),
     ],
 )
-def test_destructive_git_forms_are_denied_by_default(command, pattern):
+def test_dangerous_git_forms_require_dangerous_command_approval_by_default(
+    command, operation_ids
+):
+    # The recognized git forms left the shipped denylist: they are denied
+    # pending typed dangerous-command authority, with a whole-call proposal.
     bash_tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
 
     permission = bash_tool.resolve_permission(BashArgs(command=command))
 
     assert isinstance(permission, PermissionContext)
     assert permission.permission is ToolPermission.NEVER
-    assert f"matches denylist pattern '{pattern}'" in (permission.reason or "")
-
-
-@pytest.mark.parametrize(
-    ("command", "pattern"),
-    [
-        # End-of-options marker: canonicalizes to the plain subcommand form.
-        ("git -- push", "git push"),
-        # Environment-assignment prefixes do not smuggle a denied command.
-        ("FOO=1 git push", "git push"),
-        # Nested shell source is analyzed and matched too.
-        ("sh -c 'git -C . push'", "git push"),
-    ],
-)
-def test_denylist_git_spelling_variants_are_denied(command, pattern):
-    bash_tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
-
-    permission = bash_tool.resolve_permission(BashArgs(command=command))
-
-    assert isinstance(permission, PermissionContext)
-    assert permission.permission is ToolPermission.NEVER
-    assert f"matches denylist pattern '{pattern}'" in (permission.reason or "")
+    assert permission.denial_kind == "dangerous_command"
+    assert "requires approval for a dangerous git operation" in (
+        permission.reason or ""
+    )
+    proposal = permission.dangerous_command_proposal
+    assert proposal is not None
+    assert proposal.operations == operation_ids
+    assert proposal.command == tuple(shlex.split(command))
+    assert proposal.consequence
 
 
 @pytest.mark.parametrize(
     "command",
     [
-        # Non-destructive git forms stay permitted by the default denylist.
+        # End-of-options markers are never a modeled grantable form.
+        "git checkout -- file.txt",
+        "git checkout HEAD -- file.txt",
+        "git -- push",
+        # Unmodeled options of dangerous forms fail closed.
+        "git push --bogus origin main",
+        "git switch --bogus main",
+    ],
+)
+def test_unmodeled_git_forms_are_hard_denied_by_default(command):
+    bash_tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    assert permission.denial_kind is None
+    assert permission.dangerous_command_proposal is None
+    assert permission.reason
+
+
+@pytest.mark.parametrize(
+    ("command", "operation_ids"),
+    [
+        # Environment-assignment prefixes do not smuggle a denied command.
+        ("FOO=1 git push", ("git.push",)),
+        # Nested shell source is analyzed and classified too.
+        ("sh -c 'git -C . push'", ("git.push",)),
+    ],
+)
+def test_dangerous_git_spelling_variants_require_dangerous_command_approval(
+    command, operation_ids
+):
+    bash_tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    assert permission.denial_kind == "dangerous_command"
+    assert permission.dangerous_command_proposal is not None
+    assert permission.dangerous_command_proposal.operations == operation_ids
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Non-destructive git forms stay permitted: the classifier marks them
+        # routine, so no dangerous-command authority is involved.
         "git switch main",
         "git switch -c feature",
         "git stash pop",
@@ -518,7 +554,13 @@ def test_denylist_git_spelling_variants_are_denied(command, pattern):
         "git tag -d v1",
         "git reflog",
         "git reflog show",
-        # Dangling global options canonicalize to bare git and match no entry.
+        # Readers that are unmodeled builtins stay governed by the policy
+        # layer, unchanged.
+        "git describe --tags",
+        "git shortlog",
+        "git count-objects",
+        # Dangling global options without a subcommand carry no dangerous
+        # operation; the policy layer's treatment is unchanged.
         "git -C",
         "git --git-dir",
     ],
@@ -1690,17 +1732,33 @@ def test_shell_dash_dash_c_is_denied(command: str, tmp_path: Path):
     assert "unsupported shell -- -c" in (result.reason or "")
 
 
-@pytest.mark.parametrize("directory_command", ["pushd ..", "popd", "popd +1"])
-def test_nested_redirect_after_directory_change_is_denied(
-    directory_command: str, tmp_path: Path
+@pytest.mark.parametrize(
+    ("directory_command", "expected", "reason"),
+    [
+        # pushd .. leaves the workspace, so the nested redirect target
+        # resolves against a directory outside it (occurrence-local: the
+        # redirect belongs to printf, which runs after the pushd).
+        ("pushd ..", ToolPermission.NEVER, "outside the authorized workspace"),
+        # A named/option-bearing popd cannot be statically resolved: the
+        # relative redirect target fails closed on the unknown cwd.
+        ("popd +1", ToolPermission.NEVER, "not statically known"),
+        # A plain popd on an empty stack is a no-op, so the nested redirect
+        # target stays in the workspace and the chain is allowed.
+        ("popd", ToolPermission.ALWAYS, None),
+    ],
+)
+def test_nested_redirect_after_directory_change_resolution(
+    directory_command: str, expected: ToolPermission, reason: str | None, tmp_path: Path
 ):
+    # The order-blind cd+redirect veto is gone (ADR 0021): a nested redirect
+    # after a directory change is governed by the tracked working directory
+    # at the redirect's occurrence position.
     result = _w11_permission(
         f"bash -c '{directory_command}; printf hi > file'", tmp_path
     )
-    assert result.permission is ToolPermission.NEVER
-    assert "redirection in a command chain changing the working directory" in (
-        result.reason or ""
-    )
+    assert result.permission is expected
+    if reason is not None:
+        assert reason in (result.reason or "")
 
 
 @pytest.mark.parametrize(
@@ -1821,7 +1879,27 @@ def test_busybox_unrecognized_applets_fail_closed(applet: str, tmp_path: Path) -
     assert "unsupported busybox applet" in (result.reason or "")
 
 
-@pytest.mark.parametrize("launcher", ["toybox", "unknown-applet"])
+@pytest.mark.parametrize("shell", ["sh", "ash"])
+def test_toybox_shell_source_is_inspected(shell: str, tmp_path: Path) -> None:
+    assert (
+        _w11_permission(f"toybox {shell} -c 'printf hi'", tmp_path).permission
+        is ToolPermission.ALWAYS
+    )
+    result = _w11_permission(
+        f"toybox {shell} -c 'curl https://example.test/'", tmp_path
+    )
+    assert result.permission is ToolPermission.NEVER
+    assert "curl" in (result.reason or "")
+
+
+@pytest.mark.parametrize("applet", ["cp", "ls", "bash", "dash", "not-a-shell"])
+def test_toybox_unrecognized_applets_fail_closed(applet: str, tmp_path: Path) -> None:
+    result = _w11_permission(f"toybox {applet} -c 'printf hi'", tmp_path)
+    assert result.permission is ToolPermission.NEVER
+    assert "unsupported toybox applet" in (result.reason or "")
+
+
+@pytest.mark.parametrize("launcher", ["unknown-applet"])
 @pytest.mark.parametrize("shell", ["sh", "ash", "bash", "dash"])
 def test_unmodeled_applet_shell_source_fails_closed(
     launcher: str, shell: str, tmp_path: Path
@@ -2311,9 +2389,16 @@ def test_executor_argv_is_not_reparsed_as_shell(tmp_path: Path, monkeypatch) -> 
     calls: list[str] = []
     original = resolver._analyze_guardrail_source
 
-    def record(source: str, *, nested_source: bool = False):
+    def record(
+        source: str,
+        *,
+        nested_source: bool = False,
+        scratchpad_roots: frozenset = frozenset(),
+    ):
         calls.append(source)
-        return original(source, nested_source=nested_source)
+        return original(
+            source, nested_source=nested_source, scratchpad_roots=scratchpad_roots
+        )
 
     monkeypatch.setattr(resolver, "_analyze_guardrail_source", record)
     command = "uv run echo 'x; rm -r build' 'a b' 'print(1 * 2)'"

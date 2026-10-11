@@ -68,3 +68,16 @@ Tools are the highest-risk extension point. Typed contracts make LLM calls, vali
 - UI or ACP behavior would require changing the core tool contract in a surface-specific way.
 - A new tool requires app-server registration only to make its ordinary call or
   result visible.
+
+## Amendments
+
+### New denial kind: `dangerous_command` (2026-10-10)
+
+- Permission resolution gained a third denial kind alongside tool denial and
+  ordinary shell policy: `dangerous_command`, with an optional
+  `dangerous_command_proposal` payload. It denotes a grantable dangerous git
+  command lacking typed authority — in interactive sessions the runtime approval
+  question decides it, and refusal memory and the post-approval recheck
+  (see [ADR 0019](0019-dangerous-git-permissions.md)) keep it inside the same
+  authoritative permission pipeline. Hard guards remain ordinary fail-closed
+  policy denials with no grant path.

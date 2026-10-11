@@ -24,6 +24,9 @@ _STATIC_MESSAGES = {
     "path_outside": "Shell path is outside the authorized workspace; only an explicit user scope change can authorize it",
     "metadata_unlocated": "Command denied: protected Git metadata cannot be located",
     "metadata_redirect": "Command denied: redirection to protected Git metadata",
+    "metadata_operand": "Command denied: file operand reaches protected Git metadata",
+    "metadata_hardlink": "Command denied: file operand is a hard link to protected Git metadata",
+    "metadata_worktree": "Command denied: the git work tree resolves inside protected Git metadata",
     "byte_budget": "Command denied: shell analysis budget exceeded (bytes)",
     "eval_exec": "Command denied: eval and exec cannot be safely inspected",
 }
@@ -96,6 +99,13 @@ def render_diagnostic(diagnostic: Diagnostic) -> str:
             )
         case "denylist":
             message = f"Command denied: '{part}' matches denylist pattern '{token}'. Do not attempt to run this command."
+        case "dangerous_command":
+            message = (
+                f"Command denied: '{part}' requires approval for a dangerous git "
+                f"operation ({token}): {detail}"
+            )
+        case "dangerous_guard":
+            message = f"Command denied: {detail}"
         case "standalone":
             message = f"Command denied: '{part}' is not allowed as a standalone command. Do not attempt to run this command."
         case "policy":

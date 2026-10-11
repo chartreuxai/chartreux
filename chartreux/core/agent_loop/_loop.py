@@ -19,6 +19,15 @@ from uuid import uuid4
 
 from pydantic import BaseModel, JsonValue
 
+from chartreux.core.agent_loop._dangerous_command_grants import (
+    DANGEROUS_COMMAND_DECLINED_FEEDBACK,
+    DangerousCommandCallIdentity,
+    DangerousCommandGrantStore,
+    dangerous_command_grant_save_note,
+    dangerous_command_request,
+    derive_call_requirements,
+    parse_dangerous_command_result,
+)
 from chartreux.core.agent_loop._request_broker import InteractionRequestBroker
 from chartreux.core.agent_loop._root_grants import (
     ROOT_GRANT_DECLINED_FEEDBACK,
@@ -71,6 +80,9 @@ from chartreux.core.compaction import (
 )
 from chartreux.core.compaction.context import select_model_context
 from chartreux.core.config import ChartreuxConfigSchema, ModelConfig, ProviderConfig
+from chartreux.core.config._dangerous_command_persistence import (
+    read_saved_dangerous_command_grants,
+)
 from chartreux.core.config._restrictions import SourceRestrictions
 from chartreux.core.config._root_persistence import read_saved_roots
 from chartreux.core.config.harness_files import (
@@ -79,6 +91,14 @@ from chartreux.core.config.harness_files import (
 )
 from chartreux.core.config.layers.project import ProjectConfigLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
+from chartreux.core.config.types import ConfigSaveResult
+from chartreux.core.dangerous_command_grants import DangerousCommandGrantPersistencePort
+from chartreux.core.dangerous_commands import (
+    OPERATION_REGISTRY,
+    DangerousCommandProposal,
+    GrantChoice,
+    RepositoryScope,
+)
 from chartreux.core.dispatch.renderer import task_description_for_config
 from chartreux.core.dispatch.session import (
     BoundDispatchPolicy,
@@ -234,6 +254,59 @@ def _declined_root_decision() -> ToolDecision:
         verdict=ToolExecutionResponse.SKIP,
         approval_type=ToolPermission.NEVER,
         feedback=ROOT_GRANT_DECLINED_FEEDBACK,
+    )
+
+
+def _dangerous_command_denial(
+    ctx: PermissionContext, tool_name: str, proposal: DangerousCommandProposal
+) -> ToolDecision:
+    """Denial decision naming the persistent config knob for the operation."""
+    reason = ctx.reason or f"Tool '{tool_name}' is disabled by policy"
+    persistable = tuple(
+        operation_id
+        for operation_id in proposal.operations
+        if (operation := OPERATION_REGISTRY.get(operation_id)) is not None
+        and operation.persistable
+    )
+    blocked = tuple(
+        operation_id
+        for operation_id in proposal.operations
+        if (operation := OPERATION_REGISTRY.get(operation_id)) is None
+        or not operation.persistable
+    )
+    if persistable and not blocked:
+        remediation = (
+            f"Add {', '.join(persistable)} to "
+            "dangerous_command_grants_by_project for this project in your "
+            "user config.toml to authorize it."
+        )
+    elif persistable:
+        # A mixed call: the saved grant covers only the persistable subset,
+        # so the message must not claim the config edit authorizes the call.
+        remediation = (
+            f"Add {', '.join(persistable)} to "
+            "dangerous_command_grants_by_project for this project in your "
+            "user config.toml to pre-authorize only part of this call; the "
+            f"remaining operations ({', '.join(blocked)}) cannot be "
+            "pre-authorized and require approval in an interactive session."
+        )
+    else:
+        remediation = (
+            "This operation cannot be pre-authorized; it requires approval in "
+            "an interactive session."
+        )
+    return ToolDecision(
+        verdict=ToolExecutionResponse.SKIP,
+        approval_type=ToolPermission.NEVER,
+        feedback=f"{reason} {remediation}",
+    )
+
+
+def _declined_dangerous_command_decision() -> ToolDecision:
+    return ToolDecision(
+        verdict=ToolExecutionResponse.SKIP,
+        approval_type=ToolPermission.NEVER,
+        feedback=DANGEROUS_COMMAND_DECLINED_FEEDBACK,
     )
 
 
@@ -496,6 +569,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         background_jobs: BackgroundJobsPort | None = None,
         bound_dispatch_policy: BoundDispatchPolicy | None = None,
         root_grant_port: RootGrantPort | None = None,
+        dangerous_command_grant_port: DangerousCommandGrantPersistencePort
+        | None = None,
     ) -> None:
         self._background_job_registry = None if is_subagent else BackgroundJobRegistry()
         self.background_jobs = (
@@ -533,6 +608,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             self._session_root_grants.grant(inherited_root)
         self._root_grant_port = root_grant_port
         self._root_grant_askers: set[asyncio.Task[None]] = set()
+        # Runtime-owned dangerous-command grants (session/once/refusal); the
+        # store is the provider port every tool manager of this loop consumes.
+        self._dangerous_command_grants = DangerousCommandGrantStore()
+        self._dangerous_command_grant_port = dangerous_command_grant_port
         self.harness_files = replace(
             harness_files or get_harness_files_manager(), cwd=self.cwd
         )
@@ -625,6 +704,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             scratchpad_dir=self.scratchpad_dir,
             task_description=task_description_for_config(config),
             session_root_grants=self._session_root_grants,
+            dangerous_command_authority_provider=self._dangerous_command_grants,
         )
         self.skill_manager = SkillManager(
             lambda: self.config, harness_files=self.harness_files
@@ -1029,6 +1109,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         """Bind the runtime-owned port that applies approved session root grants."""
         self._root_grant_port = port
 
+    def bind_dangerous_command_grant_port(
+        self, port: DangerousCommandGrantPersistencePort
+    ) -> None:
+        """Bind the runtime-owned persistence port for approved project grants."""
+        self._dangerous_command_grant_port = port
+
     def apply_root_grant(self, root: Path) -> bool:
         """Apply a user-approved root grant to this session's live authority."""
         granted = self._session_root_grants.grant(root)
@@ -1377,6 +1463,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 scratchpad_dir=self.scratchpad_dir,
                 task_description=task_description_for_config(target_config),
                 session_root_grants=self._session_root_grants,
+                dangerous_command_authority_provider=self._dangerous_command_grants,
             )
         system_prompt = self._render_system_prompt(
             self.skill_manager, target_config, tool_manager, self.agent_manager
@@ -3108,6 +3195,17 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 )
                 if decision is not None:
                     return decision
+            if (
+                ctx is not None
+                and ctx.denial_kind == "dangerous_command"
+                and ctx.dangerous_command_proposal is not None
+                and config_perm != ToolPermission.NEVER
+            ):
+                decision = await self._resolve_dangerous_command_grant(
+                    tool, args, ctx, tool_name, tool_call_id
+                )
+                if decision is not None:
+                    return decision
             return ToolDecision(
                 verdict=ToolExecutionResponse.SKIP,
                 approval_type=ToolPermission.NEVER,
@@ -3231,6 +3329,226 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 "to your user config failed."
             )
         return root_grant_save_note(root, self.cwd, result)
+
+    async def _resolve_dangerous_command_grant(
+        self,
+        tool: BaseTool,
+        args: BaseModel,
+        ctx: PermissionContext,
+        tool_name: str,
+        tool_call_id: str | None,
+    ) -> ToolDecision | None:
+        """Resolve a grantable dangerous-command denial, prompting when allowed.
+
+        Returns None when the denial must keep the existing behavior: no typed
+        proposal, or a call that can no longer be re-derived, or a bare loop
+        without user input keeps the plain resolver denial. A runtime-managed
+        session that cannot prompt denies promptly with the remediation
+        instead of waiting. A decided call identity is never re-prompted: it
+        returns the honest refusal.
+        """
+        proposal = ctx.dangerous_command_proposal
+        command = getattr(args, "command", None)
+        # Derive the approval's coverage in the same synchronous window as the
+        # denial, so a world change before the answer fails the recheck instead
+        # of silently re-scoping the approval to a different repository.
+        requirements = (
+            derive_call_requirements(command, proposal.project, proposal.operations)
+            if proposal is not None and isinstance(command, str)
+            else None
+        )
+        if proposal is None or requirements is None:
+            # No typed proposal, or the call can no longer be re-derived:
+            # keep the plain denial.
+            return None
+        if not self._user_input_capability or (
+            self._is_subagent and self._dangerous_command_grant_port is None
+        ):
+            # A runtime-managed session that cannot prompt names the
+            # persistent config knob (publication only); a bare loop keeps the
+            # existing denial text unchanged.
+            return (
+                _dangerous_command_denial(ctx, tool_name, proposal)
+                if self._dangerous_command_grant_port is not None
+                else None
+            )
+        store = self._dangerous_command_grants
+        identity = DangerousCommandCallIdentity(
+            scope=proposal.scope, command=proposal.command
+        )
+        if store.is_refused(identity):
+            return _declined_dangerous_command_decision()
+        choice = await self._prompt_dangerous_command_grant(proposal, tool_call_id)
+        if choice is None:
+            return _dangerous_command_denial(ctx, tool_name, proposal)
+        if choice == "deny":
+            store.record_refusal(identity)
+            return _declined_dangerous_command_decision()
+        return await self._resume_after_dangerous_command_grant(
+            tool, args, tool_name, proposal, choice, requirements
+        )
+
+    async def _prompt_dangerous_command_grant(
+        self, proposal: DangerousCommandProposal, tool_call_id: str | None
+    ) -> GrantChoice | None:
+        """Ask the user to approve *proposal*; None when the prompt fails.
+
+        A failed prompt is never a user decision: it denies without recording
+        a refusal, so a retry can prompt again.
+        """
+        try:
+            answer = await self._request_broker.request_user_input(
+                dangerous_command_request(proposal), tool_call_id or ""
+            )
+            return parse_dangerous_command_result(answer, proposal.operations)
+        except Exception:
+            logger.warning(
+                "Dangerous-command prompt failed; keeping the denial", exc_info=True
+            )
+            return None
+
+    async def _resume_after_dangerous_command_grant(
+        self,
+        tool: BaseTool,
+        args: BaseModel,
+        tool_name: str,
+        proposal: DangerousCommandProposal,
+        choice: GrantChoice,
+        requirements: frozenset[tuple[str, RepositoryScope]],
+    ) -> ToolDecision:
+        """Apply an approved grant, fully re-resolve, and resume the call.
+
+        The approval installs runtime authority first — a once permit bound to
+        exactly this invocation, or a session grant keyed by operation and
+        repository scope — then the original call is FULLY re-resolved
+        (disablement, denylist, sensitivity, paths, parent ceilings, repository
+        identity, retired manager). A failed recheck executes nothing and
+        destroys any unused once authority; a passed recheck consumes the
+        permit before the call resumes, leaving no reusable authority. A
+        project grant then awaits persistence, and that await is itself a
+        world-change window: the full resolution runs again after it, so the
+        last recheck is the final admission gate exactly as the roots flow
+        rechecks last.
+        """
+        store = self._dangerous_command_grants
+        permit = None
+        if choice == "allow_once":
+            if requirements:
+                permit = store.install_once(requirements)
+                self.tool_manager._invalidate_dangerous_command_authority()
+        elif store.grant_session(requirements):
+            self.tool_manager._invalidate_dangerous_command_authority()
+        # Full recheck of the original call under the approved authority. A
+        # failed recheck executes nothing, destroys any unused once
+        # authority, and never persists.
+        resolved = tool.resolve_permission(args)
+        if resolved is not None and resolved.permission == ToolPermission.NEVER:
+            if permit is not None:
+                store.destroy_once(permit)
+                self.tool_manager._invalidate_dangerous_command_authority()
+            return ToolDecision(
+                verdict=ToolExecutionResponse.SKIP,
+                approval_type=ToolPermission.NEVER,
+                feedback=(
+                    resolved.reason or f"Tool '{tool_name}' is disabled by policy"
+                ),
+            )
+        if permit is not None:
+            # The permit authorized exactly this invocation; it is consumed
+            # before the call resumes, so no authority outlives the approval.
+            store.destroy_once(permit)
+            self.tool_manager._invalidate_dangerous_command_authority()
+        result_note = None
+        if choice == "allow_project":
+            result_note = await self._persist_project_dangerous_command_grant(proposal)
+            # The persist await sits between the recheck above and execution,
+            # so that recheck is not yet the final admission gate: the world
+            # may have changed while it ran. Invalidate cached authority —
+            # an in-place config change does not move the manager's authority
+            # token — and re-run the full resolution, exactly as the roots
+            # flow rechecks last. A mid-await change (denylist, disablement,
+            # a retired manager) skips the call cleanly instead of executing
+            # it or failing at invoke time.
+            self.tool_manager._invalidate_dangerous_command_authority()
+            resolved = tool.resolve_permission(args)
+            if resolved is not None and resolved.permission == ToolPermission.NEVER:
+                return ToolDecision(
+                    verdict=ToolExecutionResponse.SKIP,
+                    approval_type=ToolPermission.NEVER,
+                    feedback=(
+                        resolved.reason or f"Tool '{tool_name}' is disabled by policy"
+                    ),
+                )
+        return ToolDecision(
+            verdict=ToolExecutionResponse.EXECUTE,
+            approval_type=ToolPermission.ALWAYS,
+            result_note=result_note,
+        )
+
+    async def _persist_project_dangerous_command_grant(
+        self, proposal: DangerousCommandProposal
+    ) -> str:
+        """Attempt to persist an approved grant; report grant and save apart.
+
+        The user revision is fetched from the saved-grants read surface at
+        decision time and never cached across turns. A failed or uncertain
+        save never blocks the already-applied session grant; cancellation
+        propagates so the tool cannot resume without the session grant.
+        """
+        repository = proposal.scope.work_tree or proposal.scope.git_dir
+        operations = ", ".join(proposal.operations)
+        port = self._dangerous_command_grant_port
+        if port is None:
+            return (
+                f"Dangerous-command grant for {operations} in {repository} "
+                "applies to this session; this session cannot save "
+                "dangerous-command grants to your user config."
+            )
+        try:
+            saved = await read_saved_dangerous_command_grants(
+                self.config_orchestrator, project=proposal.project
+            )
+        except Exception:
+            logger.warning(
+                "Saved dangerous-command grants read failed for %s",
+                proposal.project,
+                exc_info=True,
+            )
+            saved = None
+        if saved is None or saved.unavailable is not None or not saved.user_revision:
+            return (
+                f"Dangerous-command grant for {operations} in {repository} "
+                "applies to this session only; your saved grants could not be "
+                "read, so it was not saved to your config."
+            )
+        outcomes: list[tuple[str, ConfigSaveResult | None]] = []
+        for operation_id in proposal.operations:
+            operation = OPERATION_REGISTRY.get(operation_id)
+            if operation is None or not operation.persistable:
+                continue  # Only publication grants are persistable.
+            try:
+                result = await port.save_dangerous_command_grant(
+                    self.session_id, proposal.project, operation_id, saved.user_revision
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Project dangerous-command grant save failed for %s",
+                    operation_id,
+                    exc_info=True,
+                )
+                result = None
+            outcomes.append((operation_id, result))
+        if not outcomes:
+            return (
+                f"Dangerous-command grant for {operations} in {repository} "
+                "applies to this session; no persistable operation was saved "
+                "to your user config."
+            )
+        return dangerous_command_grant_save_note(
+            proposal.project, proposal.scope, tuple(outcomes)
+        )
 
     def _close_tool_batch(self, queue: asyncio.Queue[BaseEvent | None]) -> None:
         self._request_broker.unbind(queue)
@@ -4051,6 +4369,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._publish_system_prompt(new_prompt)
         self.replace_session_lease(lease)
         self._reset_title_state()
+        # The reset starts a new session in place (a history clear or a
+        # rewind fork): session grants, once permits, and refusal memory
+        # expire with the old session and are never auto-restored across
+        # the boundary, so drop them and the cached authority they fed.
+        self._dangerous_command_grants.clear_session_state()
+        self.tool_manager._invalidate_dangerous_command_authority()
 
     def replace_session_lease(self, lease: SessionLease | None) -> None:
         previous = self._session_lease
@@ -4221,6 +4545,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._is_user_prompt_call = False
         self._reactive_recovery_used = False
         self._reset_title_state()
+        # A resume rebinds the loop in place: session grants, once permits,
+        # and refusal memory expire with the previous session and are never
+        # auto-restored across the boundary, so drop them and the cached
+        # authority they fed.
+        self._dangerous_command_grants.clear_session_state()
+        self.tool_manager._invalidate_dangerous_command_authority()
 
     @requires_init
     async def clear_history(self) -> None:
@@ -4603,6 +4933,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             scratchpad_dir=self.scratchpad_dir,
             task_description=task_description_for_config(authority().config),
             session_root_grants=self._session_root_grants,
+            dangerous_command_authority_provider=self._dangerous_command_grants,
         )
         manager.set_instruction_read_files(previous_manager._instruction_read_files)
         for name in manager.registered_tools:
@@ -4772,6 +5103,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             scratchpad_dir=self.scratchpad_dir,
             task_description=task_description_for_config(target_config),
             session_root_grants=self._session_root_grants,
+            dangerous_command_authority_provider=self._dangerous_command_grants,
         )
         skill_manager = SkillManager(
             config_source.get, harness_files=self.harness_files

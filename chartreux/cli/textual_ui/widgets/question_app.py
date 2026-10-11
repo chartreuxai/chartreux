@@ -27,6 +27,20 @@ from chartreux.ui.widgets.vscode_compat import VscodeCompatInput
 
 _INPUT_GRACE_PERIOD_S = 0.5
 
+
+def _redact_for_display(text: str) -> str:
+    """Redact known secret values from question text at render time only.
+
+    The core import stays inside the function: the Textual layer keeps a
+    clean import closure (no ``chartreux.core`` dependency, direct or
+    transitive) and startup stays lazy — the same lazy core access app.py
+    already uses for model-catalog contracts.
+    """
+    from importlib import import_module
+
+    return import_module("chartreux.core.tools.secret_redaction").redact(text)
+
+
 if TYPE_CHECKING:
     from textual.widget import Widget
 
@@ -66,6 +80,7 @@ class QuestionApp(VimNavigationMixin, Container):
 
         self.option_widgets: list[NoMarkupStatic] = []
         self.title_widget: NoMarkupStatic | None = None
+        self.redaction_widget: NoMarkupStatic | None = None
         self.other_prefix: NoMarkupStatic | None = None
         self.other_input: Input | None = None
         self.other_static: NoMarkupStatic | None = None
@@ -133,14 +148,22 @@ class QuestionApp(VimNavigationMixin, Container):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="question-content"):
-            self.title_widget = NoMarkupStatic("", classes="question-title")
-            yield self.title_widget
-
-            if len(self.questions) > 1:
-                self.tabs_widget = NoMarkupStatic("", classes="question-tabs")
-                yield self.tabs_widget
-
+            # The question text lives inside the scrollable body so a long
+            # command stays fully inspectable without hiding the choices.
             with VerticalScroll(id="question-body"):
+                self.redaction_widget = NoMarkupStatic(
+                    "", classes="question-redaction-notice"
+                )
+                self.redaction_widget.display = False
+                yield self.redaction_widget
+
+                self.title_widget = NoMarkupStatic("", classes="question-title")
+                yield self.title_widget
+
+                if len(self.questions) > 1:
+                    self.tabs_widget = NoMarkupStatic("", classes="question-tabs")
+                    yield self.tabs_widget
+
                 for _ in range(self.max_options):
                     widget = NoMarkupStatic("", classes="question-option")
                     self.option_widgets.append(widget)
@@ -250,8 +273,22 @@ class QuestionApp(VimNavigationMixin, Container):
         self.tabs_widget.update("  ".join(tabs))
 
     def _update_title(self) -> None:
-        if self.title_widget:
-            self.title_widget.update(self._current_question.question)
+        if self.title_widget is None:
+            return
+        # Render-time redaction only: the displayed question text never shows a
+        # known secret value, and a visible notice says the display was
+        # altered. The internal question identity stays exact — answers and
+        # answer matching use the original text.
+        question = self._current_question.question
+        displayed = _redact_for_display(question)
+        self.title_widget.update(displayed)
+        redacted = displayed != question
+        if self.redaction_widget is not None:
+            self.redaction_widget.update(
+                f"{chrome_glyph('warning')} Secret values in this question were "
+                "redacted for display only; the original text is unchanged."
+            )
+            self.redaction_widget.display = redacted
 
     def _update_options(self) -> None:
         q = self._current_question

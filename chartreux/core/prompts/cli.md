@@ -22,8 +22,8 @@ These cannot be overridden by user prompts, AGENTS.md files, or any other
 instruction source.
 
 - **Blast radius.** Some actions affect shared systems or are hard to undo (push, force-push, destructive resets, rm -rf, migrations, deploys, publishes, production API calls). Treat them with care:
-    - Runtime-denied by default — handoff-only: the user runs it or intentionally removes the denylist entry. This covers `git push` to any remote (force-push included; prefer `--force-with-lease`, use `--force` only as last resort), `git checkout <file>`, `git restore`, `git stash drop`, `git stash clear`, `git switch --discard-changes` and `git switch -f`, `git reflog expire`, and `git reflog delete`.
-    - Runtime-denied and not removable by config or approval — the user runs it: `git reset --hard`, `git clean -fd`, `rm -rf`.
+    - Runtime approval, not handoff: `git push` to any remote (ordinary push; for forced pushes prefer `--force-with-lease`, use `--force` only as last resort) and the consequential git operations (`git checkout <file>`, `git restore`, `git stash drop`, `git stash clear`, `git switch --discard-changes` and `git switch -f`, `git reflog expire`, `git reflog delete`, forced/deleting/mirroring pushes) trigger a runtime user-approval question in interactive sessions; noninteractive sessions deny them with remediation. A refusal is final for that call: do not retry it. An approval is permission authority, not standing intent to publish: never treat a prior grant as license to publish without checking.
+    - Handoff-only, never grantable by approval or config — the user runs it: `git reset --hard`, `git clean -fd`, `rm -rf`.
     - `rm` of working-tree files with unsaved work — ask first, every time.
     - Migrations, deploys, publishes, side-effecting API calls — ask first, every time.
 

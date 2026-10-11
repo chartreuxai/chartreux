@@ -84,14 +84,14 @@ def test_launch_analyzes_once_and_rechecks_each_request(tmp_path, monkeypatch, c
     tools = manager(tmp_path) if child else parent
     if child:
         tools._parent_authority_getter = lambda: parent
-    original = resolver._analyze_guardrail_source_uncached
+    original = resolver.analyze_shell_command
     calls = []
 
     def analyze(command, **kwargs):
         calls.append(command)
         return original(command, **kwargs)
 
-    monkeypatch.setattr(resolver, "_analyze_guardrail_source_uncached", analyze)
+    monkeypatch.setattr(resolver, "analyze_shell_command", analyze)
     tool = tools.get("bash_start")
     args = BashStartArgs(command="echo ok")
     context = tool.resolve_permission(args)
@@ -413,7 +413,8 @@ async def test_loop_invocation_hooks_persistence_and_generic_projection(
     [
         ({"permission": "never"}, "sleep 30"),
         ({"denylist": ["sleep"]}, "sleep 30"),
-        # The shipped default denylist denies these without any override.
+        # The recognized git forms are denied pending dangerous-command
+        # authority without any override.
         ({}, "git push"),
         ({}, "git -C . push"),
         ({}, "git switch --discard-changes"),

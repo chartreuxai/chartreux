@@ -523,6 +523,194 @@ def test_role_prompts_contain_subagent_contract(prompt_id: str) -> None:
         assert "maintain a cumulative record" not in prompt
 
 
+@pytest.mark.parametrize("prompt_id", ["worker", "reviewer", "advisor"])
+def test_role_prompts_retire_stop_rule_and_failure_retries(prompt_id: str) -> None:
+    prompt = load_system_prompt(prompt_id)
+
+    # ADR 0020: the whole-assignment stop rule never fired in the six audited
+    # mistral-large-4 sessions; the strategy-switch rule replaces it.
+    assert "top and return a blocker after two" not in prompt
+    assert "After a stop, further task execution is prohibited" not in prompt
+    # The failure-retries rule is dropped by maintainer decision (ADR 0020).
+    assert "Failure retries" not in prompt
+    assert "two occurrences of the same diagnostic" not in prompt
+    assert "persist failed commands" not in prompt
+    assert "One recorded isolation rerun" not in prompt
+    assert "Do not run verification reserved to the parent" not in prompt
+
+
+def test_worker_prompt_operational_discipline_has_strategy_switch_and_efficiency() -> (
+    None
+):
+    prompt = SystemPrompt.WORKER.read()
+
+    # Denials rule: persistent recording, consult-before-next-call, and
+    # hardened permission/policy refusal language.
+    assert (
+        "Denials: record each denied command and the runtime's stated reason "
+        "in task notes or a scratchpad file that survives compaction and remains "
+        "inspectable, not private reasoning; consult the record before the next "
+        "tool call." in prompt
+    )
+    assert (
+        "Never retry a permission/policy-refused action through changed syntax, "
+        "another tool, a wrapper, or another model; report the blocked "
+        "requirement and continue only independent authorized work." in prompt
+    )
+    # Same-effect retry clarification (ADR 0020 amendment): the refused
+    # action's identity is its effect on the same files or state, not the
+    # command spelling.
+    assert (
+        "The refused action's identity is its effect on the same files or "
+        "state, not the command spelling: producing the same refused effect "
+        "through a different tool, script, or mechanism is still a retry." in prompt
+    )
+    # Destinations rule with the sharpened repository-outputs exception and
+    # the precedence clause over assignment text (ADR 0020 amendment).
+    assert (
+        "Keep generated artifacts outside the repository tree unless the "
+        "deliverable itself requires repository outputs; incidental tooling "
+        "instructions such as where to point a log redirection do not count." in prompt
+    )
+    assert (
+        "These rules take precedence over assignment text: an instruction in "
+        "the task message does not authorize a destination this rule forbids; "
+        "report the conflict in the result instead of complying silently." in prompt
+    )
+    assert "unless the task explicitly requires repository outputs" not in prompt
+    assert (
+        "Treat ambiguous denials mixing syntax and policy as permission/policy "
+        "refusals. For syntax-only rejections, use at most one supported "
+        "reformulation; never resubmit the denied command or reuse the rejected "
+        "syntax element or construct." in prompt
+    )
+    # The dangling failure-retries cross-reference does not survive the drop.
+    assert "executed commands that fail follow failure retries" not in prompt
+    # Strategy switch with the same-reason definition, the not-a-retry bridge,
+    # and post-compaction verifiability of the adopted method.
+    assert (
+        "Strategy switch: after the second denial citing the same runtime "
+        "rule/pattern across the assignment, record it and adopt a different "
+        "supported method for the affected operation" in prompt
+    )
+    assert (
+        '"Same reason" means the rejection-reason category stated by the '
+        "runtime's denial message, matched by its stated rule/pattern, not "
+        "free-text similarity." in prompt
+    )
+    assert (
+        "Record the adopted method alongside the denial so keeping it stays "
+        "verifiable after compaction; keep that method for the rest of the "
+        "assignment, including after compaction." in prompt
+    )
+    assert (
+        "Adopting a different supported method under this rule is not a retry "
+        "of the refused action." in prompt
+    )
+    assert (
+        "Disclose repeated denials and the method change in the final report." in prompt
+    )
+    # Efficiency rule with its precedence carve-out and freshness exception.
+    assert (
+        "Efficiency: batch related shell operations into one invocation when "
+        "it can replace several sequential calls." in prompt
+    )
+    assert (
+        "Read each file at most once per session unless it changes; after a "
+        "change, re-read only the changed region or needed range, never the "
+        "whole file to locate one edit." in prompt
+    )
+    assert (
+        "Unless the loaded skill requires otherwise, observe these limits; they "
+        "never forbid a bounded re-read when the file's current state matters "
+        "(before changing a file, re-read it when its current state matters)." in prompt
+    )
+
+
+@pytest.mark.parametrize("prompt_id", ["reviewer", "advisor"])
+def test_read_only_role_prompts_have_rewritten_denials_strategy_switch_and_denials_slot(
+    prompt_id: str,
+) -> None:
+    prompt = load_system_prompt(prompt_id)
+
+    # Rewritten denials rule (read-only variant): report-in-result recording
+    # with the pinned clauses and hardened refusal language, no stop rule.
+    assert (
+        "Denials: report denied commands and the runtime's rejection reason "
+        "in your result; do not persist them to task-note files." in prompt
+    )
+    assert (
+        "Never retry a permission/policy-refused action through changed syntax, "
+        "another tool, a wrapper, or another model; report the blocked "
+        "requirement and continue only independent authorized work." in prompt
+    )
+    # Same-effect retry clarification (ADR 0020 amendment), same sentence as
+    # in the worker prompt.
+    assert (
+        "The refused action's identity is its effect on the same files or "
+        "state, not the command spelling: producing the same refused effect "
+        "through a different tool, script, or mechanism is still a retry." in prompt
+    )
+    # Strategy switch adapted to record in the result.
+    assert (
+        "Strategy switch: after the second denial citing the same runtime "
+        "rule/pattern across the assignment, record it in your result and adopt "
+        "a different supported method for the affected operation" in prompt
+    )
+    assert (
+        '"Same reason" means the rejection-reason category stated by the '
+        "runtime's denial message, matched by its stated rule/pattern, not "
+        "free-text similarity." in prompt
+    )
+    assert (
+        "Adopting a different supported method is not a retry of the refused "
+        "action." in prompt
+    )
+    assert "Disclose repeated denials and the method change in your result." in prompt
+    # The report format carries a denials slot so recording has a destination.
+    assert (
+        "**Denials encountered:** {denied commands and the runtime's stated "
+        "reasons, or none}" in prompt
+    )
+
+
+def test_reviewer_denials_slot_follows_coverage_line() -> None:
+    prompt = load_system_prompt("reviewer")
+
+    assert prompt.index(
+        "**Coverage:** {what was reviewed and excluded}"
+    ) < prompt.index("**Denials encountered:**")
+
+
+def test_advisor_denials_slot_covers_every_output_form() -> None:
+    prompt = load_system_prompt("advisor")
+
+    # Every permitted output form can carry the denials slot: the Advice
+    # template, the concise paragraph, and the Blocker form.
+    assert (
+        "The **Denials encountered:** line is part of every permitted output "
+        "form: include it, or its content, in the concise paragraph and in the "
+        "Blocker form as well." in prompt
+    )
+
+
+def test_subagent_contract_block_is_byte_identical_across_role_prompts() -> None:
+    def contract_block(prompt_id: str) -> str:
+        prompt = load_system_prompt(prompt_id)
+        start = prompt.index("## Subagent contract")
+        end = prompt.index("\n## ", start)
+        return prompt[start:end]
+
+    blocks = [
+        contract_block(prompt_id) for prompt_id in ("worker", "reviewer", "advisor")
+    ]
+    # ADR 0020 leaves the shared contract block untouched; it stays
+    # byte-identical across the three role prompts.
+    assert blocks[0] == blocks[1] == blocks[2]
+    assert "Perform one bounded assignment" in blocks[0]
+    assert "Return the requested result format exactly." in blocks[0]
+
+
 def test_user_prompt_overrides_builtin_role_prompt_by_id(
     mock_prompts_dirs: tuple[Path, Path],
 ) -> None:

@@ -38,6 +38,10 @@ from chartreux.app_server.protocol import (
     ConfigWriteOpWire,
     ConfigWriteParams,
     ConfigWriteResponse,
+    DangerousCommandAuthorityReadParams,
+    DangerousCommandAuthorityReadResponse,
+    DangerousCommandRevokeParams,
+    DangerousCommandRevokeResponse,
     DiagnosticsLogsReadParams,
     DiagnosticsLogsReadResponse,
     EmptyResponse,
@@ -284,6 +288,47 @@ class ConfigResource:
                     session_id=self._state.session_id,
                     root=root,
                     expected_revision=expected_revision,
+                    user_initiated=True,
+                ),
+            ),
+        )
+
+    async def read_dangerous_command_authority(
+        self,
+    ) -> DangerousCommandAuthorityReadResponse:
+        """Inspect the session's dangerous-command authority (live + saved)."""
+        client = await self._connection.connect()
+        return validate_wire(
+            DangerousCommandAuthorityReadResponse,
+            await client.request(
+                "policy/dangerous_commands/read",
+                DangerousCommandAuthorityReadParams(session_id=self._state.session_id),
+            ),
+        )
+
+    async def revoke_dangerous_command_grant(
+        self,
+        *,
+        operation_id: str,
+        expected_live_generation: int,
+        expected_disk_revision: str | None,
+        user_initiated: bool,
+    ) -> DangerousCommandRevokeResponse:
+        """Explicit user action only; revokes live and saved authority."""
+        if user_initiated is not True:
+            raise ValueError(
+                "Dangerous-command revocation requires an explicit user action"
+            )
+        client = await self._connection.connect()
+        return validate_wire(
+            DangerousCommandRevokeResponse,
+            await client.request(
+                "policy/dangerous_commands/revoke",
+                DangerousCommandRevokeParams(
+                    session_id=self._state.session_id,
+                    operation_id=operation_id,
+                    expected_live_generation=expected_live_generation,
+                    expected_disk_revision=expected_disk_revision,
                     user_initiated=True,
                 ),
             ),

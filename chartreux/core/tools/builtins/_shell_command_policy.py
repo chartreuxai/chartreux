@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -7,7 +8,16 @@ import stat
 from typing import Literal
 from urllib.parse import unquote, urlsplit
 
+from chartreux.core.dangerous_commands import (
+    DangerousCommandClassification,
+    GitRepositoryRelocation,
+    GrantableGitCall,
+    ModeledGitCall,
+    RepositoryScope,
+    operations_for_ids,
+)
 from chartreux.core.tools.builtins._shell_diagnostics import Diagnostic
+from chartreux.core.tools.utils import resolve_tool_path
 
 # Length of a single-character short option ("-i") and the minimum length of
 # an unambiguous combined short-option cluster ("-ic").
@@ -47,6 +57,13 @@ class ShellCommandPolicy:
     # code; the permission resolver inspects that config before permitting it.
     inspect_git_repository: bool = False
     option_path_values: tuple[str, ...] = ()
+    # Path operands that name files the command WRITES itself (git archive
+    # --output, a writing git config --file, git apply --directory, an
+    # init/worktree-add/move or submodule-add destination). Unlike
+    # option_path_values, these stay checked against protected Git metadata
+    # even when the command is git: git's -C/--git-dir/--work-tree
+    # selectors locate the repository, but these operands write it.
+    write_path_values: tuple[str, ...] = ()
     positional_values: tuple[str, ...] | None = None
 
 
@@ -515,6 +532,14 @@ EXECUTOR_REGISTRY: dict[str, ExecutorGrammar] = {
         boundary_kind="argv_positional",
         admitted_applets=frozenset({"sh", "ash", "bash", "dash", "hush"}),
     ),
+    # toybox is busybox's multi-call twin: every applet runs through the
+    # same launcher, so the same admission rule applies — the shell applets
+    # are analyzed as shell sources, and every other applet fails closed
+    # (an unmodeled `toybox cp` must never reach the operand guard as an
+    # unknown command). toybox ships the sh/ash shells.
+    "toybox": ExecutorGrammar(
+        boundary_kind="argv_positional", admitted_applets=frozenset({"sh", "ash"})
+    ),
 }
 
 for _name, (_values, _flags, _operands) in {
@@ -701,7 +726,7 @@ def executor_boundary(  # noqa: PLR0911, PLR0912, PLR0914, PLR0915
         and grammar.admitted_applets is not None
         and (not tokens[1:] or tokens[1] not in grammar.admitted_applets)
     ):
-        raise ValueError("unsupported busybox applet")
+        raise ValueError(f"unsupported {name} applet")
     index = 1
     keyword_seen = grammar.keyword is None
     cwd: list[str] = []
@@ -1602,6 +1627,47 @@ def _rm_policy(args: list[str]) -> ShellCommandPolicy:
     return ShellCommandPolicy()
 
 
+def _effective_clean_flags(options: tuple[str, ...]) -> tuple[bool, bool]:
+    """Effective (force, dry-run) state of git clean under last-wins semantics.
+
+    git's parse-options resolves repeated boolean options in order and
+    accepts a ``--no-`` spelling of every boolean, so the final spelling
+    decides: ``--dry-run --no-dry-run`` leaves the clean destructive, and
+    ``--force --no-force`` leaves it inert. Presence alone would misread
+    both. ``options`` holds resolved option tokens — long options by
+    canonical name, short options one character each, so a ``-fdn`` cluster
+    contributes ``-f``, ``-d``, and ``-n`` in order.
+    """
+    force = False
+    dry_run = False
+    for option in options:
+        if option in {"--force", "-f"}:
+            force = True
+        elif option == "--no-force":
+            force = False
+        if option in {"--dry-run", "-n"}:
+            dry_run = True
+        elif option == "--no-dry-run":
+            dry_run = False
+    return force, dry_run
+
+
+def _legacy_clean_flags(effective_options: list[str]) -> tuple[bool, bool]:
+    """Resolve raw git clean option tokens into effective (force, dry-run).
+
+    The runtime policy layer scans raw tokens, not the classifier's
+    resolved options: long spellings map directly, and a short cluster
+    contributes its ``f``/``n`` characters in order.
+    """
+    options: list[str] = []
+    for token in effective_options:
+        if token in {"--dry-run", "--no-dry-run", "--force", "--no-force"}:
+            options.append(token)
+        elif token.startswith("-") and not token.startswith("--"):
+            options.extend(f"-{short}" for short in token[1:] if short in {"f", "n"})
+    return _effective_clean_flags(tuple(options))
+
+
 def _git_destructive_policy(args: list[str]) -> bool:
     index = 0
     while index < len(args) and args[index].startswith("-"):
@@ -1642,24 +1708,11 @@ def _git_destructive_policy(args: list[str]) -> bool:
                 option_index += 2
             else:
                 option_index += 1
-        dry_run = any(
-            token == "--dry-run"
-            or (
-                token.startswith("-")
-                and not token.startswith("--")
-                and "n" in token[1:]
-            )
-            for token in effective_options
-        )
-        force = any(
-            token == "--force"
-            or (
-                token.startswith("-")
-                and not token.startswith("--")
-                and "f" in token[1:]
-            )
-            for token in effective_options
-        )
+        # git resolves repeated boolean options in order and accepts --no-
+        # spellings of them, so the last dry-run/force spelling decides:
+        # --dry-run --no-dry-run is a destructive clean, --force --no-force
+        # is not. Presence alone would misread both.
+        force, dry_run = _legacy_clean_flags(effective_options)
         return force and not dry_run
     return False
 
@@ -1902,6 +1955,149 @@ def canonical_git_command(tokens: list[str]) -> list[str] | None:
     return [tokens[0], *tokens[1 + index :]]
 
 
+# git archive's --output/-o operand names the written archive: a raw
+# file-write operand of an otherwise exempted subcommand, governed like any
+# other write operand.
+_GIT_ARCHIVE_OUTPUT_TABLE = _OptionTable(
+    long_values=frozenset({"--output"}), short_values=frozenset({"o"})
+)
+
+
+def _git_archive_output_values(args: list[str]) -> tuple[str, ...]:
+    """The --output/-o targets of one git archive call, in every spelling."""
+    parsed = _scan_options(args, _GIT_ARCHIVE_OUTPUT_TABLE)
+    return parsed.values_for("--output", "-o")
+
+
+# git apply's --directory relocates the patch's write root: every patched
+# path (after -p stripping) lands beneath it, so the value is a raw write
+# operand of an otherwise exempted subcommand, governed like any other.
+_GIT_APPLY_TABLE = _OptionTable(
+    long_values=frozenset({"--directory"}), boolean_long=frozenset({"--unsafe-paths"})
+)
+# --unsafe-paths disables the path refusal git itself applies outside the
+# work tree — including paths inside .git metadata, which git otherwise
+# rejects as "invalid path" — and no legitimate agent workflow needs it.
+_GIT_APPLY_UNSAFE_PATHS_REASON = (
+    "git apply --unsafe-paths disables the path refusal git itself "
+    "applies outside the work tree, including paths inside protected "
+    "Git metadata: no legitimate agent workflow needs it, and no "
+    "permission setting can authorize it"
+)
+
+# git init's positional operand is the directory the call creates, and
+# --separate-git-dir names the git dir it creates; both are write operands.
+# --shared takes an optional attached value only, so it never consumes the
+# positional directory.
+_GIT_INIT_TABLE = _OptionTable(
+    long_values=frozenset({
+        "--initial-branch",
+        "--object-format",
+        "--ref-format",
+        "--separate-git-dir",
+        "--template",
+    }),
+    short_values=frozenset({"b"}),
+    optional_long_values=frozenset({"--shared"}),
+    boolean_long=frozenset({"--bare", "--quiet"}),
+)
+
+# git worktree add's first positional operand is the new work tree's path;
+# -b/-B and --reason take values, every other option is a boolean (--orphan
+# included: it selects an unborn branch and takes no value).
+_GIT_WORKTREE_ADD_TABLE = _OptionTable(
+    long_values=frozenset({"--reason"}),
+    short_values=frozenset({"b", "B"}),
+    boolean_long=frozenset({
+        "--checkout",
+        "--detach",
+        "--force",
+        "--guess-remote",
+        "--lock",
+        "--orphan",
+        "--quiet",
+        "--relative-paths",
+        "--track",
+    }),
+)
+
+# git worktree move's grammar is `git worktree move [-f] <worktree>
+# <new-path>`: -f/--force is the only option, and the SECOND positional
+# names the directory the call relocates the work tree to.
+_GIT_WORKTREE_MOVE_TABLE = _OptionTable(boolean_long=frozenset({"--force"}))
+
+# git submodule add's grammar is `git submodule add [options] <repository>
+# [<path>]`: the SECOND positional names the directory the call creates
+# the submodule work tree at, and --separate-git-dir names the git dir it
+# creates for it (the init twin). -b/--branch, --name, --depth,
+# --reference, and --separate-git-dir take values; every other option is a
+# boolean.
+_GIT_SUBMODULE_ADD_TABLE = _OptionTable(
+    long_values=frozenset({
+        "--branch",
+        "--depth",
+        "--name",
+        "--reference",
+        "--separate-git-dir",
+    }),
+    short_values=frozenset({"b"}),
+    boolean_long=frozenset({"--dissociate", "--force", "--progress", "--quiet"}),
+)
+
+
+def _git_destination_operands(  # noqa: PLR0911
+    subcommand: str, args: list[str], index: int
+) -> tuple[list[str], str | None]:
+    """The write operands a git subcommand creates or relocates its writes to.
+
+    ``git apply --directory`` names the patch's write root (every patched
+    path lands beneath it after ``-p`` stripping), ``git init``'s positional
+    operand and ``--separate-git-dir`` name directories the call creates,
+    ``git worktree add``'s first positional names the new work tree,
+    ``git worktree move``'s second positional names the directory the call
+    relocates the work tree to, and ``git submodule add``'s second
+    positional (plus its ``--separate-git-dir`` git dir) names the
+    directories the call creates. Returns the write operands and, for
+    ``git apply --unsafe-paths``, the hard-guard reason: the flag disables
+    the path refusal git itself applies outside the work tree, including
+    inside protected metadata.
+    """
+    rest = args[index + 1 :]
+    if subcommand == "apply":
+        apply_parsed = _scan_options(rest, _GIT_APPLY_TABLE)
+        write_paths = list(apply_parsed.values_for("--directory"))
+        if _has_long(apply_parsed, "--unsafe-paths"):
+            return write_paths, _GIT_APPLY_UNSAFE_PATHS_REASON
+        return write_paths, None
+    if subcommand == "init":
+        init_parsed = _scan_options(rest, _GIT_INIT_TABLE)
+        write_paths = [init_parsed.positionals[0]] if init_parsed.positionals else []
+        write_paths.extend(init_parsed.values_for("--separate-git-dir"))
+        return write_paths, None
+    if subcommand == "worktree" and args[index + 1 : index + 2] == ["add"]:
+        add_parsed = _scan_options(args[index + 2 :], _GIT_WORKTREE_ADD_TABLE)
+        write_paths = [add_parsed.positionals[0]] if add_parsed.positionals else []
+        return write_paths, None
+    if subcommand == "worktree" and args[index + 1 : index + 2] == ["move"]:
+        move_parsed = _scan_options(args[index + 2 :], _GIT_WORKTREE_MOVE_TABLE)
+        # The first positional selects the work tree to move; the second
+        # names its new location.
+        write_paths = (
+            [move_parsed.positionals[1]] if len(move_parsed.positionals) > 1 else []
+        )
+        return write_paths, None
+    if subcommand == "submodule" and args[index + 1 : index + 2] == ["add"]:
+        add_parsed = _scan_options(args[index + 2 :], _GIT_SUBMODULE_ADD_TABLE)
+        # The first positional is the source repository (a read); the
+        # second names the destination the call creates.
+        write_paths = (
+            [add_parsed.positionals[1]] if len(add_parsed.positionals) > 1 else []
+        )
+        write_paths.extend(add_parsed.values_for("--separate-git-dir"))
+        return write_paths, None
+    return [], None
+
+
 def _git_policy(args: list[str]) -> ShellCommandPolicy:
     if _git_destructive_policy(args):
         return ShellCommandPolicy(requires_approval=True)
@@ -1913,14 +2109,55 @@ def _git_policy(args: list[str]) -> ShellCommandPolicy:
         return ShellCommandPolicy(option_path_values=tuple(paths))
     subcommand = args[index]
     if subcommand not in _GIT_READER_SUBCOMMANDS:
+        option_paths = list(paths)
+        write_paths: list[str] = []
+        hard_guard_reason: str | None = None
+        if subcommand == "archive":
+            # git archive --output/-o writes the named file directly.
+            write_paths.extend(_git_archive_output_values(args[index + 1 :]))
+        elif subcommand == "config":
+            # A writing git config --file/-f names the written file, so it
+            # is a write-classified operand; a read names a file git only
+            # reads, which stays authority-scoped like a selector. An
+            # unscannable form fails closed as a write.
+            call = _scan_git_config_call(args[index + 1 :])
+            file_values = [
+                value for option, value in call.values if option in {"--file", "-f"}
+            ]
+            if call.error is not None or call.mutates or call.edits:
+                write_paths.extend(file_values)
+            else:
+                option_paths.extend(file_values)
+        elif (
+            subcommand in {"apply", "init"}
+            or (
+                subcommand == "worktree"
+                and args[index + 1 : index + 2] in (["add"], ["move"])
+            )
+            or (subcommand == "submodule" and args[index + 1 : index + 2] == ["add"])
+        ):
+            # Destinations the call creates or relocates its writes to
+            # (apply --directory, init/worktree-add/move/submodule-add
+            # destinations); the helper also reports the --unsafe-paths
+            # hard guard.
+            write_paths, hard_guard_reason = _git_destination_operands(
+                subcommand, args, index
+            )
+        denial_reason = (
+            f"unmodeled git builtin {subcommand!r}; denied conservatively; permission settings cannot override this guard"
+            if subcommand in _GIT_UNMODELED_BUILTINS
+            else f"unrecognized git subcommand {subcommand!r}; aliases and external helpers cannot be inspected"
+        )
+        if hard_guard_reason is not None:
+            denial_reason = hard_guard_reason
         return ShellCommandPolicy(
-            requires_approval=subcommand not in _GIT_NONREADER_SUBCOMMANDS,
-            denial_reason=(
-                f"unmodeled git builtin {subcommand!r}; denied conservatively; permission settings cannot override this guard"
-                if subcommand in _GIT_UNMODELED_BUILTINS
-                else f"unrecognized git subcommand {subcommand!r}; aliases and external helpers cannot be inspected"
+            requires_approval=(
+                subcommand not in _GIT_NONREADER_SUBCOMMANDS
+                or hard_guard_reason is not None
             ),
-            option_path_values=tuple(paths),
+            denial_reason=denial_reason,
+            option_path_values=tuple(option_paths),
+            write_path_values=tuple(write_paths),
         )
     parsed = _scan_options(args[index + 1 :], _GIT_SUBCOMMAND_TABLE)
     # --remerge-diff and --diff-merges=remerge re-run repository-configured
@@ -1959,6 +2196,1618 @@ def _git_policy(args: list[str]) -> ShellCommandPolicy:
     )
 
 
+# --- Dangerous-git classifier (dangerous-command permissions) ---
+#
+# The pure, typed classifier behind the dangerous-command permission flow:
+# one whole expanded call is routine, hard-denied, or grantable. It never
+# mutates grants, persists nothing, and executes nothing; the runtime
+# enforcement above is unchanged. Ambiguous or unmodeled forms fail closed:
+# never grantable, and never an ordinary git.push.
+
+_GIT_PUSH_TABLE = _OptionTable(
+    frozenset({"--push-option", "--repo"}),
+    frozenset("o"),
+    frozenset({"--force-with-lease", "--signed"}),
+    boolean_long=frozenset({
+        "--all",
+        "--atomic",
+        "--delete",
+        "--dry-run",
+        "--follow-tags",
+        "--force",
+        "--force-if-includes",
+        "--ipv4",
+        "--ipv6",
+        "--mirror",
+        "--no-atomic",
+        "--no-dry-run",
+        "--no-force",
+        "--no-progress",
+        "--no-quiet",
+        "--no-set-upstream",
+        "--no-thin",
+        "--no-verbose",
+        "--no-verify",
+        "--porcelain",
+        "--progress",
+        "--prune",
+        "--quiet",
+        "--set-upstream",
+        "--tags",
+        "--thin",
+        "--verbose",
+        "--verify",
+    }),
+)
+_GIT_PUSH_BOOLEAN_SHORTS = frozenset("46fnquv")
+_GIT_PUSH_FORCE_OPTIONS = frozenset({
+    "--force",
+    "--force-if-includes",
+    "--force-with-lease",
+    "-f",
+})
+# --receive-pack/--exec select the program git runs for a local remote, so a
+# push carrying either is never grantable.
+_GIT_PUSH_HARD_GUARD_LONGS = frozenset({"--exec", "--receive-pack"})
+# A URL scheme prefix (https://, ssh://, git://, ...) names a destination
+# directly, exactly like a path operand does.
+_PUSH_URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+
+
+def _push_destination_is_explicit(destination: str) -> bool:
+    """Whether a push destination operand is a path or URL, not a remote name.
+
+    A bare name (``origin``, ``upstream``) resolves through the repository's
+    configured remotes, which the grant covers; a path or URL names its
+    destination directly, outside the source repository the grant scopes.
+    A remote name can never contain ``:`` (git's refname validation rejects
+    it), so an scp-like ``host:repo.git`` operand is a URL destination, not
+    a remote name.
+    """
+    if "/" in destination or ":" in destination or destination.startswith((".", "~")):
+        return True
+    return _PUSH_URL_SCHEME.match(destination) is not None
+
+
+def push_destination_operands(call: ModeledGitCall) -> tuple[str, ...]:
+    """The destination operands of a modeled push call.
+
+    The first positional is always the repository, never a refspec, and
+    ``--repo`` overrides it, so both name the destination a push runs
+    receive-pack and hooks on.
+    """
+    destinations = list(call.operands[:1])
+    destinations.extend(
+        value for option, value in call.option_values if option == "--repo"
+    )
+    return tuple(destinations)
+
+
+def _push_destination_fail_closed_reason(call: ModeledGitCall) -> str | None:
+    """Why a push destination is not a grantable remote name, or None.
+
+    The destination operands name the destination a push runs receive-pack
+    and hooks on, so an explicit path or URL destination is never
+    grantable. A bare name is only name-shaped: the classifier stays pure
+    and cannot inspect the repository, so the resolver verifies the name
+    against the repository's configured remotes — git resolves any
+    destination that is not a configured remote name as a URL.
+    """
+    for destination in push_destination_operands(call):
+        if _push_destination_is_explicit(destination):
+            return (
+                f"destination {destination!r} is a path or URL, not a remote "
+                "name: a push to it runs the destination's receive-pack and "
+                "hooks, outside the repository the grant covers"
+            )
+    return None
+
+
+_GIT_SWITCH_TABLE = _OptionTable(
+    frozenset({"--create", "--force-create", "--orphan"}),
+    frozenset("cC"),
+    frozenset({"--recurse-submodules"}),
+    boolean_long=frozenset({
+        "--detach",
+        "--discard-changes",
+        "--force",
+        "--guess",
+        "--merge",
+        "--no-create",
+        "--no-guess",
+        "--no-track",
+        "--quiet",
+        "--track",
+    }),
+)
+_GIT_SWITCH_BOOLEAN_SHORTS = frozenset("dfgmq")
+_GIT_SWITCH_DISCARD_OPTIONS = frozenset({"--discard-changes", "--force", "-f"})
+
+# checkout/restore are scanned leniently: every form is consequential and git
+# itself rejects unmodeled options, so unknown options are recorded without
+# failing the classification. Only their value-taking options matter, to keep
+# consumed operands out of the positional operands.
+_GIT_CHECKOUT_TABLE = _OptionTable(
+    frozenset({"--conflict", "--orphan", "--pathspec-from-file"}),
+    frozenset("bB"),
+    frozenset({"--recurse-submodules"}),
+)
+_GIT_RESTORE_TABLE = _OptionTable(
+    frozenset({"--pathspec-from-file", "--source"}), frozenset("s")
+)
+_GIT_WORKTREE_TABLES = {"checkout": _GIT_CHECKOUT_TABLE, "restore": _GIT_RESTORE_TABLE}
+
+# stash's value-taking options must consume before the sub-subcommand is
+# read: `git stash -m drop` is a stash push with message "drop", not a drop.
+_GIT_STASH_TABLE = _OptionTable(
+    frozenset({"--message", "--pathspec-from-file"}), frozenset("m")
+)
+_GIT_REFLOG_TABLE = _OptionTable()
+_STASH_REFLOG_OPERATION_IDS = {
+    ("stash", "drop"): "git.stash.drop",
+    ("stash", "clear"): "git.stash.clear",
+    ("reflog", "expire"): "git.reflog.expire",
+    ("reflog", "delete"): "git.reflog.delete",
+}
+
+# reset/clean are scanned strictly: their hard-guard flags accept unambiguous
+# abbreviations (`git reset --ha` really hard-resets), so an unrecognized
+# option could hide one and must fail closed.
+_GIT_RESET_TABLE = _OptionTable(
+    frozenset({"--pathspec-from-file"}),
+    boolean_long=frozenset({
+        "--hard",
+        "--keep",
+        "--merge",
+        "--mixed",
+        "--quiet",
+        "--soft",
+    }),
+)
+_GIT_RESET_BOOLEAN_SHORTS = frozenset("q")
+_GIT_CLEAN_TABLE = _OptionTable(
+    frozenset({"--exclude"}),
+    frozenset("e"),
+    boolean_long=frozenset({
+        "--dry-run",
+        "--force",
+        "--interactive",
+        "--no-dry-run",
+        "--no-force",
+        "--no-interactive",
+        "--no-quiet",
+        "--quiet",
+    }),
+)
+_GIT_CLEAN_BOOLEAN_SHORTS = frozenset("dfnqxXi")
+
+# git config is a permitted routine command, so the classifier scans it
+# leniently: git itself rejects unmodeled options, and the key check below
+# looks at every operand, so a misread option consumption can only
+# over-block, never miss a write. Value options consume their operand
+# exactly as git's parser does (-f/--file, -t/--type, --blob, --default,
+# --comment); every other documented option is a boolean.
+_GIT_CONFIG_TABLE = _OptionTable(
+    frozenset({"--blob", "--comment", "--default", "--file", "--type"}),
+    frozenset({"f", "t"}),
+    boolean_long=frozenset({
+        "--add",
+        "--all",
+        "--edit",
+        "--fixed-value",
+        "--get",
+        "--get-all",
+        "--get-color",
+        "--get-colorbool",
+        "--get-regexp",
+        "--get-urlmatch",
+        "--global",
+        "--includes",
+        "--list",
+        "--local",
+        "--name-only",
+        "--null",
+        "--replace-all",
+        "--show-names",
+        "--show-origin",
+        "--show-scope",
+        "--system",
+        "--unset",
+        "--unset-all",
+        "--worktree",
+    }),
+)
+_GIT_CONFIG_BOOLEAN_SHORTS = frozenset("elz")
+# Read actions report configuration; they never write it.
+_GIT_CONFIG_READ_OPTIONS = frozenset({
+    "--get",
+    "--get-all",
+    "--get-color",
+    "--get-colorbool",
+    "--get-regexp",
+    "--get-urlmatch",
+    "--list",
+    "-l",
+})
+# Write actions record a value.
+_GIT_CONFIG_WRITE_LONGS = frozenset({"--add", "--replace-all"})
+# Removal actions only ever remove configuration.
+_GIT_CONFIG_UNSET_LONGS = frozenset({"--unset", "--unset-all"})
+# Section operations act on section names, not keys.
+_GIT_CONFIG_SECTION_LONGS = frozenset({"--rename-section", "--remove-section"})
+# The newer subcommand spellings (git config set/get/list/...): the first
+# operand is the action word, not a key.
+_GIT_CONFIG_SUBCOMMANDS = frozenset({
+    "edit",
+    "get",
+    "list",
+    "remove-section",
+    "rename-section",
+    "set",
+    "unset",
+})
+_GIT_CONFIG_READ_SUBCOMMANDS = frozenset({"get", "list"})
+_GIT_CONFIG_MUTATION_SUBCOMMANDS = frozenset({
+    "remove-section",
+    "rename-section",
+    "set",
+    "unset",
+})
+
+# git remote is scanned leniently: only the sub-subcommand decides the
+# classification, and git itself rejects unmodeled options. The global
+# grammar is the single boolean -v/--verbose; every other option belongs to
+# the sub-subcommand, whose own operands never matter once the form is a
+# hard guard.
+_GIT_REMOTE_TABLE = _OptionTable(boolean_long=frozenset({"--verbose"}))
+_GIT_REMOTE_BOOLEAN_SHORTS = frozenset("v")
+# git remote mutations redefine where a granted push lands: add/set-url
+# point a bare destination name at an arbitrary URL or path, rename
+# retargets an existing remote, and remove (rm) turns a configured bare
+# name back into a URL git resolves as a path.
+_GIT_REMOTE_MUTATION_SUBCOMMANDS = frozenset({
+    "add",
+    "set-url",
+    "rename",
+    "remove",
+    "rm",
+})
+
+_ROUTINE = DangerousCommandClassification(kind="routine")
+
+
+@dataclass(frozen=True)
+class _OptionTokenScan:
+    """Scan result for one classified option token."""
+
+    options: tuple[str, ...] = ()
+    values: tuple[tuple[str, str], ...] = ()
+    consumed: int = 1
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class _StrictGitOptions:
+    """Strictly scanned options of one classified git subcommand."""
+
+    options: tuple[str, ...]
+    values: tuple[tuple[str, str], ...]
+    operands: tuple[str, ...]
+    end_of_options: bool
+    error: str | None
+
+
+@dataclass(frozen=True)
+class _GitGlobalScan:
+    """Structured walk of git's global options for classification."""
+
+    index: int
+    relocation: GitRepositoryRelocation
+    end_of_options: bool
+    error: str | None
+
+
+def _scan_required_long_value(
+    option: str, token: str, args: list[str], index: int
+) -> _OptionTokenScan:
+    """Consume one required-value long option, in = or separated form."""
+    _, separator, attached = token.partition("=")
+    if separator:
+        if not attached:
+            return _OptionTokenScan(
+                error=f"option {option!r} requires a non-empty value"
+            )
+        return _OptionTokenScan(options=(option,), values=((option, attached),))
+    if index + 1 >= len(args):
+        return _OptionTokenScan(error=f"option {option!r} requires a value")
+    return _OptionTokenScan(
+        options=(option,), values=((option, args[index + 1]),), consumed=2
+    )
+
+
+def _scan_long_option_token(
+    token: str,
+    args: list[str],
+    index: int,
+    table: _OptionTable,
+    *,
+    strict: bool,
+    hard_guard_longs: frozenset[str],
+) -> _OptionTokenScan:
+    """Resolve one long option token against a classified subcommand's grammar."""
+    name = token.partition("=")[0]
+    if hard_guard_longs and _match_long(token, hard_guard_longs) is not None:
+        return _OptionTokenScan(error=f"option {name!r} selects the program git runs")
+    all_long = table.long_values | table.optional_long_values | table.boolean_long
+    option = _match_long(token, all_long)
+    if option is None:
+        if strict:
+            return _OptionTokenScan(error=f"unknown or ambiguous option {name!r}")
+        return _OptionTokenScan(options=(name,))
+    if option in table.boolean_long and "=" in token and strict:
+        return _OptionTokenScan(error=f"option {option!r} takes no value")
+    if option in table.long_values:
+        return _scan_required_long_value(option, token, args, index)
+    # Optional values attach only in = form; an empty attached value is valid
+    # (e.g. --force-with-lease=). A boolean option given a value in lenient
+    # mode lands here too and is recorded, not consumed.
+    values = ((option, token.partition("=")[2]),) if "=" in token else ()
+    return _OptionTokenScan(options=(option,), values=values)
+
+
+def _scan_short_option_token(
+    token: str,
+    args: list[str],
+    index: int,
+    table: _OptionTable,
+    *,
+    boolean_shorts: frozenset[str],
+    strict: bool,
+) -> _OptionTokenScan:
+    """Resolve one short-option token (a cluster) against the grammar."""
+    options: list[str] = []
+    values: list[tuple[str, str]] = []
+    error: str | None = None
+    consumed = 1
+    chars = token[1:]
+    for offset, short in enumerate(chars):
+        name = f"-{short}"
+        if short in table.short_values:
+            attached = chars[offset + 1 :]
+            options.append(name)
+            if attached:
+                values.append((name, attached))
+            elif index + 1 < len(args):
+                values.append((name, args[index + 1]))
+                consumed = 2
+            else:
+                error = f"option {name!r} requires a value"
+            break
+        if short in table.optional_short_values:
+            attached = chars[offset + 1 :]
+            options.append(name)
+            if attached:
+                values.append((name, attached))
+            break
+        if short in boolean_shorts:
+            options.append(name)
+            continue
+        if strict:
+            error = f"unknown or ambiguous option {name!r}"
+            break
+        options.append(name)
+    return _OptionTokenScan(tuple(options), tuple(values), consumed, error)
+
+
+def _scan_classified_git_options(
+    args: list[str],
+    table: _OptionTable,
+    *,
+    boolean_shorts: frozenset[str] = frozenset(),
+    hard_guard_longs: frozenset[str] = frozenset(),
+    strict: bool = True,
+) -> _StrictGitOptions:
+    """Scan one classified git subcommand's arguments.
+
+    Unlike _scan_options, classification must never misread a consumed
+    operand as a flag, so every option is resolved against the subcommand's
+    modeled grammar. Strict mode (push, switch, reset, clean) fails closed on
+    any unknown option, ambiguous abbreviation, value given to a boolean
+    option, empty required value, or dangling required value. Lenient mode
+    (checkout, restore, stash, reflog) records unknown options without
+    consuming them: git itself rejects unmodeled options, and the consequence
+    of those subcommands does not depend on their options.
+    """
+    options: list[str] = []
+    values: list[tuple[str, str]] = []
+    operands: list[str] = []
+    end_of_options = False
+    error: str | None = None
+    index = 0
+    while index < len(args) and error is None:
+        token = args[index]
+        if end_of_options:
+            operands.append(token)
+            index += 1
+        elif token == "--":
+            end_of_options = True
+            index += 1
+        elif token.startswith("--"):
+            step = _scan_long_option_token(
+                token,
+                args,
+                index,
+                table,
+                strict=strict,
+                hard_guard_longs=hard_guard_longs,
+            )
+            error = step.error
+            options.extend(step.options)
+            values.extend(step.values)
+            index += step.consumed
+        elif token.startswith("-") and token != "-":
+            step = _scan_short_option_token(
+                token, args, index, table, boolean_shorts=boolean_shorts, strict=strict
+            )
+            error = step.error
+            options.extend(step.options)
+            values.extend(step.values)
+            index += step.consumed
+        else:
+            operands.append(token)
+            index += 1
+    return _StrictGitOptions(
+        tuple(options), tuple(values), tuple(operands), end_of_options, error
+    )
+
+
+def _scan_git_globals(args: list[str]) -> _GitGlobalScan:
+    """Walk git's global options, recording repository relocation operands.
+
+    The recognized grammar mirrors _git_global_options exactly, so the
+    classifier agrees with runtime enforcement on which spellings are known.
+    Unlike the runtime walker, classification also fails closed on a dangling
+    or empty required value and keeps -C/--git-dir/--work-tree operands
+    structured.
+    """
+    index = 0
+    cwd_paths: list[str] = []
+    git_dir: str | None = None
+    work_tree: str | None = None
+    end_of_options = False
+    error: str | None = None
+    while index < len(args) and args[index].startswith("-"):
+        token = args[index]
+        name = token.partition("=")[0]
+        if token in {"-h", "-p", "-P", "-v"} or name in _GIT_BOOLEAN_GLOBALS:
+            index += 1
+            continue
+        if token == "--":
+            end_of_options = True
+            index += 1
+            continue
+        parsed = _scan_options(args[index:], _GIT_GLOBAL_TABLE)
+        known = (
+            _match_long(
+                token,
+                _GIT_GLOBAL_TABLE.long_values | _GIT_GLOBAL_TABLE.optional_long_values,
+            )
+            if token.startswith("--")
+            else token[:2] in {"-C", "-c"}
+        )
+        if not known:
+            error = f"unknown or ambiguous global option {name!r}"
+            break
+        if name == "--config-env" or token.startswith("-c"):
+            error = f"global option {name!r} overrides git configuration"
+            break
+        value_pairs = parsed.values[:1]
+        if value_pairs and not value_pairs[0][1]:
+            error = f"global option {value_pairs[0][0]!r} requires a non-empty value"
+            break
+        if not value_pairs:
+            # A required-value global at the end of the invocation has no operand.
+            required = (
+                _match_long(token, _GIT_GLOBAL_TABLE.long_values)
+                if token.startswith("--")
+                else token[:2] == "-C"
+            )
+            if required is not None:
+                error = f"global option {name!r} requires a value"
+                break
+        elif value_pairs[0][0] == "-C":
+            cwd_paths.append(value_pairs[0][1])
+        elif value_pairs[0][0] == "--git-dir":
+            git_dir = value_pairs[0][1]
+        elif value_pairs[0][0] == "--work-tree":
+            work_tree = value_pairs[0][1]
+        consumed_value = bool(value_pairs) and (
+            (
+                token.startswith("--")
+                and "=" not in token
+                and not token.startswith("--exec-path")
+            )
+            or token in {"-C", "-c"}
+        )
+        index += 2 if consumed_value else 1
+    relocation = GitRepositoryRelocation(
+        cwd_paths=tuple(cwd_paths), git_dir=git_dir, work_tree=work_tree
+    )
+    return _GitGlobalScan(index, relocation, end_of_options, error)
+
+
+def _hard_denied(reason: str) -> DangerousCommandClassification:
+    return DangerousCommandClassification(kind="hard_denied", reason=reason)
+
+
+def _grantable_classification(
+    operation_ids: tuple[str, ...],
+    call: ModeledGitCall,
+    relocation: GitRepositoryRelocation,
+) -> DangerousCommandClassification:
+    operations = operations_for_ids(operation_ids)
+    consequence = "; ".join(operation.consequence for operation in operations)
+    return DangerousCommandClassification(
+        kind="grantable",
+        grantable=GrantableGitCall(operations, consequence, call, relocation),
+    )
+
+
+def _fail_closed_on_end_of_options(
+    classification: DangerousCommandClassification, *, end_of_options: bool
+) -> DangerousCommandClassification:
+    """An end-of-options marker is never a modeled form of a grantable call."""
+    if classification.kind == "grantable" and end_of_options:
+        return _hard_denied("end-of-options marker is not a modeled form")
+    return classification
+
+
+def _refspec_fail_closed_reason(refspec: str) -> str | None:
+    """Why a push refspec is not a modeled form, or None when it is."""
+    if not refspec:
+        return "empty refspec"
+    if any(char in refspec for char in "*?["):
+        return f"glob refspec {refspec!r} is not a modeled form"
+    if refspec.count(":") > 1:
+        return f"refspec {refspec!r} is not a valid src:dst form"
+    _, separator, dst = refspec.partition(":")
+    if separator and not dst:
+        return f"refspec {refspec!r} has an empty destination"
+    body = refspec.removeprefix("+")
+    if not body:
+        return f"refspec {refspec!r} is not a valid form"
+    return None
+
+
+def _push_operation_ids(*, force: bool, delete: bool, mirror: bool) -> tuple[str, ...]:
+    """Operation IDs a push requires; a compound push never inherits git.push."""
+    ids = []
+    if force:
+        ids.append("git.push.force")
+    if delete:
+        ids.append("git.push.delete")
+    if mirror:
+        ids.append("git.push.mirror")
+    return tuple(ids) if ids else ("git.push",)
+
+
+def _classify_git_push(
+    args: list[str], globals_scan: _GitGlobalScan
+) -> DangerousCommandClassification:
+    scan = _scan_classified_git_options(
+        args,
+        _GIT_PUSH_TABLE,
+        boolean_shorts=_GIT_PUSH_BOOLEAN_SHORTS,
+        hard_guard_longs=_GIT_PUSH_HARD_GUARD_LONGS,
+    )
+    if scan.error is not None:
+        return _hard_denied(f"git push: {scan.error}")
+    options = set(scan.options)
+    force = bool(options & _GIT_PUSH_FORCE_OPTIONS)
+    # --prune removes remote refs without a local counterpart, so it is a
+    # deletion mechanism like --delete, never ordinary publication.
+    delete = "--delete" in options or "--prune" in options
+    mirror = "--mirror" in options
+    call = ModeledGitCall("push", scan.options, scan.values, scan.operands)
+    # A push to an explicit path or URL destination is never grantable: the
+    # grant scopes the source repository, and the push runs the destination's
+    # receive-pack and hooks.
+    destination_reason = _push_destination_fail_closed_reason(call)
+    if destination_reason is not None:
+        return _hard_denied(f"git push: {destination_reason}")
+    # The first positional is always the repository, never a refspec.
+    for refspec in scan.operands[1:]:
+        reason = _refspec_fail_closed_reason(refspec)
+        if reason is not None:
+            return _hard_denied(f"git push: {reason}")
+        if refspec.startswith("+"):
+            force = True
+        if refspec.removeprefix("+").startswith(":"):
+            delete = True
+    result = _grantable_classification(
+        _push_operation_ids(force=force, delete=delete, mirror=mirror),
+        call,
+        globals_scan.relocation,
+    )
+    return _fail_closed_on_end_of_options(
+        result, end_of_options=globals_scan.end_of_options or scan.end_of_options
+    )
+
+
+def _classify_git_worktree_subcommand(
+    subcommand: str,
+    operation_id: str,
+    table: _OptionTable,
+    args: list[str],
+    globals_scan: _GitGlobalScan,
+) -> DangerousCommandClassification:
+    """checkout/restore: every form is consequential, so all forms are grantable."""
+    scan = _scan_classified_git_options(args, table, strict=False)
+    if scan.error is not None:
+        return _hard_denied(f"git {subcommand}: {scan.error}")
+    call = ModeledGitCall(subcommand, scan.options, scan.values, scan.operands)
+    result = _grantable_classification((operation_id,), call, globals_scan.relocation)
+    return _fail_closed_on_end_of_options(
+        result, end_of_options=globals_scan.end_of_options or scan.end_of_options
+    )
+
+
+def _classify_git_switch(
+    args: list[str], globals_scan: _GitGlobalScan
+) -> DangerousCommandClassification:
+    scan = _scan_classified_git_options(
+        args, _GIT_SWITCH_TABLE, boolean_shorts=_GIT_SWITCH_BOOLEAN_SHORTS
+    )
+    if scan.error is not None:
+        return _hard_denied(f"git switch: {scan.error}")
+    if not set(scan.options) & _GIT_SWITCH_DISCARD_OPTIONS:
+        return _ROUTINE
+    call = ModeledGitCall("switch", scan.options, scan.values, scan.operands)
+    result = _grantable_classification(
+        ("git.switch.discard",), call, globals_scan.relocation
+    )
+    return _fail_closed_on_end_of_options(
+        result, end_of_options=globals_scan.end_of_options or scan.end_of_options
+    )
+
+
+def _classify_git_stash_or_reflog(
+    subcommand: str, args: list[str], globals_scan: _GitGlobalScan
+) -> DangerousCommandClassification:
+    """stash drop/clear and reflog expire/delete are grantable; other forms are not."""
+    table = _GIT_STASH_TABLE if subcommand == "stash" else _GIT_REFLOG_TABLE
+    scan = _scan_classified_git_options(args, table, strict=False)
+    if scan.error is not None:
+        return _hard_denied(f"git {subcommand}: {scan.error}")
+    operation_id = _STASH_REFLOG_OPERATION_IDS.get((
+        subcommand,
+        scan.operands[0] if scan.operands else "",
+    ))
+    if operation_id is None:
+        return _ROUTINE
+    call = ModeledGitCall(subcommand, scan.options, scan.values, scan.operands)
+    result = _grantable_classification((operation_id,), call, globals_scan.relocation)
+    return _fail_closed_on_end_of_options(
+        result, end_of_options=globals_scan.end_of_options or scan.end_of_options
+    )
+
+
+def _classify_git_hard_guard_subcommand(
+    subcommand: str, args: list[str]
+) -> DangerousCommandClassification:
+    """reset/clean: destructive forms are hard guards no grant can lift."""
+    if subcommand == "reset":
+        scan = _scan_classified_git_options(
+            args, _GIT_RESET_TABLE, boolean_shorts=_GIT_RESET_BOOLEAN_SHORTS
+        )
+        dangerous = "--hard" in scan.options
+        guard = "git reset --hard"
+    else:
+        scan = _scan_classified_git_options(
+            args, _GIT_CLEAN_TABLE, boolean_shorts=_GIT_CLEAN_BOOLEAN_SHORTS
+        )
+        force, dry_run = _effective_clean_flags(scan.options)
+        dangerous = force and not dry_run
+        guard = "forced non-dry-run git clean"
+    if scan.error is not None:
+        return _hard_denied(f"git {subcommand}: {scan.error}")
+    if dangerous:
+        return _hard_denied(f"{guard} is a hard guard; no grant can authorize it")
+    return _ROUTINE
+
+
+def _classify_git_remaining(subcommand: str) -> DangerousCommandClassification:
+    """Readers and unclassified nonreaders stay routine; the rest are hard guards."""
+    if subcommand in _GIT_UNMODELED_BUILTINS:
+        return _hard_denied(
+            f"unmodeled git builtin {subcommand!r}; denied conservatively"
+        )
+    if (
+        subcommand not in _GIT_READER_SUBCOMMANDS
+        and subcommand not in _GIT_NONREADER_SUBCOMMANDS
+    ):
+        return _hard_denied(
+            f"unrecognized git subcommand {subcommand!r}; "
+            "aliases and external helpers cannot be inspected"
+        )
+    return _ROUTINE
+
+
+# remote.<name> keys whose write redefines where a granted push lands or
+# the program a push runs. url.<base>.insteadOf is guarded alongside
+# pushInsteadOf because git applies it to the URL of a configured remote
+# when pushing, not only when fetching.
+_GIT_CONFIG_REMOTE_PUSH_EFFECTING_KEYS = frozenset({
+    "mirror",
+    "push",
+    "url",
+    "pushurl",
+    "receivepack",
+    "uploadpack",
+    "proxy",
+    "vcs",
+})
+# branch.<name> keys that select the destination of a bare push.
+_GIT_CONFIG_BRANCH_PUSH_EFFECTING_KEYS = frozenset({"remote", "pushremote"})
+# url.<base> keys that rewrite the URL a push uses.
+_GIT_CONFIG_URL_PUSH_EFFECTING_KEYS = frozenset({"insteadof", "pushinsteadof"})
+# include.path and includeIf.<condition>.path author a file git folds into
+# configuration resolution, which can set any push-effecting key for a remote
+# the resolver verified.
+_GIT_CONFIG_INCLUDE_SECTIONS = frozenset({"include", "includeif"})
+# core keys that select a program a push runs: the ssh command (even a
+# --dry-run), the git:// proxy, and the ask-pass program.
+_GIT_CONFIG_CORE_PROGRAM_KEYS = frozenset({"sshcommand", "gitproxy", "askpass"})
+# core/sequence keys that select a program git runs on routine subcommands,
+# not only on a push: core.hooksPath selects the directory git takes hooks
+# from, core.editor the editor git runs for commit/tag/rebase without -m,
+# sequence.editor the editor an interactive rebase runs, and core.fsmonitor
+# the filesystem-monitor daemon git runs for status-bearing subcommands
+# such as add and commit.
+_GIT_CONFIG_CORE_PROGRAM_SELECTION_KEYS = frozenset({
+    "editor",
+    "fsmonitor",
+    "hookspath",
+})
+_GIT_CONFIG_SEQUENCE_PROGRAM_SELECTION_KEYS = frozenset({"editor"})
+# The man section selects the program `git help` runs: man.<tool>.path names
+# the man viewer's executable for the tool man.viewer selects (git 2.53
+# rejects an arbitrary man.viewer command string, so the path key is the
+# live vector), and interactive.diffFilter names the pager-style filter
+# git runs for `git add -p` diffs.
+_GIT_CONFIG_MAN_PROGRAM_SELECTION_KEYS = frozenset({"path", "viewer"})
+_GIT_CONFIG_INTERACTIVE_PROGRAM_SELECTION_KEYS = frozenset({"difffilter"})
+# The driver sections select programs the same way on routine subcommands:
+# filter.<name>.clean and filter.<name>.process run for files with that
+# filter (git add, git checkout), merge.<name>.driver runs for files with
+# that merge driver (git merge), and diff.<name>.command,
+# diff.<name>.textconv, and diff.<name>.external run for diffs with that
+# driver (git diff, git log -p).
+_GIT_CONFIG_FILTER_PROGRAM_SELECTION_KEYS = frozenset({"clean", "process"})
+_GIT_CONFIG_MERGE_PROGRAM_SELECTION_KEYS = frozenset({"driver"})
+_GIT_CONFIG_DIFF_PROGRAM_SELECTION_KEYS = frozenset({"command", "external", "textconv"})
+
+
+def _git_config_key_is_push_effecting(key: str) -> bool:  # noqa: PLR0911
+    """Whether one git config key changes where a granted push lands.
+
+    The guarded surface is every key whose write redefines the push
+    destination or the program a push runs: ``remote.<name>.url`` and
+    ``remote.<name>.pushurl`` define where a push to that remote lands,
+    ``remote.<name>.receivepack`` and ``remote.<name>.uploadpack`` select
+    the program git runs for the remote (receivepack is the config twin of
+    the hard-guarded ``--receive-pack`` option; uploadpack is its
+    fetch-side twin, guarded for symmetry), ``remote.<name>.proxy`` selects
+    the proxy program git runs, ``remote.<name>.vcs`` selects the
+    ``git-remote-<vcs>`` helper that ``git remote update`` executes,
+    ``url.<base>.insteadOf`` and ``url.<base>.pushInsteadOf`` rewrite the
+    URL a push uses, ``branch.<name>.remote`` and ``branch.<name>.pushremote``
+    select the destination of a bare push (path-capable),
+    ``remote.<name>.mirror`` mirrors every push to that remote,
+    ``remote.<name>.push`` installs the refspecs a refspec-less push uses
+    (forced or deleting ones included), and ``remote.pushDefault`` (also
+    spelled ``remote.<name>.pushDefault``) selects the remote a bare push
+    targets. The program-execution family is guarded the same way:
+    ``core.sshCommand`` selects the program git runs for an ssh push (even
+    a ``--dry-run``), ``core.gitProxy`` the program it runs for a
+    ``git://`` push, ``core.askPass`` the program it runs to ask for a
+    credential, and the whole ``credential`` section installs the
+    credential-lookup program a push runs (``credential.helper`` and
+    ``credential.<url>.helper``). Finally, ``include.path`` and
+    ``includeIf.<condition>.path`` author a file git folds into
+    configuration resolution, which can set any of these keys for a remote
+    the resolver verified. Git folds section and key names
+    case-insensitively, so the guard does too; remote, branch, and url-base
+    names are case-sensitive, but the guard fails closed on any spelling.
+    """
+    *sections, name = key.split(".")
+    if not sections:
+        return False
+    folded = name.casefold()
+    section = sections[0].casefold()
+    if section == "remote":
+        if folded in _GIT_CONFIG_REMOTE_PUSH_EFFECTING_KEYS:
+            # The name-bearing keys carry the remote name.
+            return bool(sections[1:])
+        return folded == "pushdefault"
+    if section == "branch":
+        return folded in _GIT_CONFIG_BRANCH_PUSH_EFFECTING_KEYS and bool(sections[1:])
+    if section == "url":
+        return folded in _GIT_CONFIG_URL_PUSH_EFFECTING_KEYS and bool(sections[1:])
+    if section in _GIT_CONFIG_INCLUDE_SECTIONS:
+        # include.path and includeIf.<condition>.path are the only include
+        # keys; the whole section is guarded so no spelling slips through.
+        return True
+    if section == "credential":
+        # credential.helper and credential.<url>.helper install a
+        # credential-lookup program; the whole section is guarded so no
+        # helper spelling slips through.
+        return True
+    if section == "core":
+        return folded in _GIT_CONFIG_CORE_PROGRAM_KEYS
+    return False
+
+
+def _git_config_section_is_push_effecting(section: str) -> bool:
+    """Whether one section operand of a section operation is push-effecting.
+
+    A section rename or removal relocates or deletes whole sections, so it
+    can set or relocate any key the guarded surface covers: the remote
+    definitions, the url rewrites, the branch push destinations, the
+    program-execution keys, the credential section, and the include
+    directives.
+    """
+    folded = section.casefold()
+    return folded in {
+        "remote",
+        "url",
+        "branch",
+        "credential",
+        "include",
+        "includeif",
+    } or folded.startswith((
+        "remote.",
+        "url.",
+        "branch.",
+        "credential.",
+        "include.",
+        "includeif.",
+    ))
+
+
+def _git_config_key_is_program_selection(key: str) -> bool:  # noqa: PLR0911
+    """Whether one git config key selects a program git runs on routine subcommands.
+
+    ``core.hooksPath`` selects the directory git runs hooks from, so a granted
+    push — or any hook-running subcommand, including readers that refresh the
+    index — executes the hooks there; ``core.editor`` selects the program
+    ``git commit`` (without ``-m``), ``git tag -a``, and ``git rebase`` run;
+    ``sequence.editor`` selects the program an interactive rebase runs; and
+    ``core.fsmonitor`` selects the daemon git runs for status-bearing
+    subcommands (``git add``, ``git commit``). The driver sections select
+    programs the same way on routine subcommands:
+    ``filter.<name>.clean`` and ``filter.<name>.process`` run for files with
+    that filter (``git add``, ``git checkout``), ``merge.<name>.driver`` runs
+    for files with that merge driver (``git merge``), and
+    ``diff.<name>.command``, ``diff.<name>.textconv``, and
+    ``diff.<name>.external`` run for diffs with that driver (``git diff``,
+    ``git log -p``). The ``man`` section selects the program ``git help``
+    runs: ``man.<tool>.path`` names the man viewer's executable for the tool
+    ``man.viewer`` selects, and ``interactive.diffFilter`` names the filter
+    git runs for ``git add -p`` diffs. Git folds section and key names
+    case-insensitively, so the guard does too.
+    """
+    *sections, name = key.split(".")
+    if not sections:
+        return False
+    folded = name.casefold()
+    section = sections[0].casefold()
+    if section in {"core", "sequence"}:
+        keys = (
+            _GIT_CONFIG_CORE_PROGRAM_SELECTION_KEYS
+            if section == "core"
+            else _GIT_CONFIG_SEQUENCE_PROGRAM_SELECTION_KEYS
+        )
+        return folded in keys
+    if section == "filter":
+        return folded in _GIT_CONFIG_FILTER_PROGRAM_SELECTION_KEYS and bool(
+            sections[1:]
+        )
+    if section == "merge":
+        return folded in _GIT_CONFIG_MERGE_PROGRAM_SELECTION_KEYS and bool(sections[1:])
+    if section == "diff":
+        return folded in _GIT_CONFIG_DIFF_PROGRAM_SELECTION_KEYS and bool(sections[1:])
+    if section == "man":
+        # man.viewer selects the viewer tool and man.<tool>.path names its
+        # executable; both keys are guarded (a bare man.path or a
+        # man.<tool>.viewer spelling is not a real git key, but guarding it
+        # fails closed).
+        return folded in _GIT_CONFIG_MAN_PROGRAM_SELECTION_KEYS
+    if section == "interactive":
+        return folded in _GIT_CONFIG_INTERACTIVE_PROGRAM_SELECTION_KEYS
+    return False
+
+
+def _git_config_section_is_program_selection(section: str) -> bool:
+    """Whether one section operand of a rename reaches a program-selection section.
+
+    Renaming a section to (or from) ``core``, ``sequence``, ``filter``,
+    ``merge``, ``diff``, ``man``, or ``interactive`` moves its keys into or
+    out of the sections whose ``hooksPath``/``editor``/``fsmonitor``/driver/
+    ``man``/``diffFilter`` keys select the programs git runs, so an
+    agent-authored key lands exactly where the key guard blocks writing it:
+    guarding the key set alone is bypassable.
+    """
+    folded = section.casefold()
+    return folded in {
+        "core",
+        "sequence",
+        "filter",
+        "merge",
+        "diff",
+        "man",
+        "interactive",
+    } or folded.startswith((
+        "core.",
+        "sequence.",
+        "filter.",
+        "merge.",
+        "diff.",
+        "man.",
+        "interactive.",
+    ))
+
+
+def _git_config_push_effecting_reason(target: str) -> str:
+    """Why a push-effecting config write is a hard guard."""
+    return (
+        f"git config writes {target!r}, push-effecting configuration: "
+        "remote.<name>.url and remote.<name>.pushurl define where a push "
+        "to that remote lands, remote.<name>.receivepack and "
+        "remote.<name>.uploadpack select the program git runs for the "
+        "remote (receivepack is the config twin of the hard-guarded "
+        "--receive-pack option; uploadpack is its fetch-side twin, guarded "
+        "for symmetry), remote.<name>.proxy selects the proxy program git "
+        "runs, and remote.<name>.vcs selects the git-remote-<vcs> helper "
+        "that git remote update executes (git remote update and prune stay "
+        "routine: with vcs and sshCommand writes barred, the programs they "
+        "run are user-configured), url.<base>.insteadOf and "
+        "url.<base>.pushInsteadOf rewrite the URL a push uses, "
+        "branch.<name>.remote and branch.<name>.pushremote select the "
+        "destination of a bare push, remote.<name>.mirror mirrors every "
+        "push to that remote, remote.<name>.push installs the refspecs a "
+        "refspec-less push uses, and remote.pushDefault selects the remote "
+        "a bare push targets; core.sshCommand selects the program git runs "
+        "for an ssh push (even a --dry-run), core.gitProxy the program it "
+        "runs for a git:// push, core.askPass the program it runs to ask "
+        "for a credential, and credential.helper and credential.<url>.helper "
+        "install the credential-lookup program a push runs; include.path "
+        "and includeIf.<condition>.path author a file git folds into "
+        "configuration, which can set any of these keys for a remote the "
+        "resolver verified, so an approved push would run what the write "
+        "selects; no grant can authorize the write. A push to a remote "
+        "whose configuration you set yourself is ordinary publication — "
+        "your own config and any file it includes define what push means "
+        "there — so run this command manually if you intend it."
+    )
+
+
+def _git_config_program_selection_reason(target: str) -> str:
+    """Why a program-selection config write is a hard guard."""
+    return (
+        f"git config writes {target!r}, program-selection configuration: "
+        "core.hooksPath selects the directory git runs hooks from, so a "
+        "granted push — or any hook-running git command, including readers "
+        "that refresh the index — would execute the hooks there, "
+        "core.editor selects the program git runs for commit, tag, and "
+        "rebase without -m, sequence.editor selects the program an "
+        "interactive rebase runs, core.fsmonitor selects the daemon git "
+        "runs for status-bearing subcommands (git add, git commit), "
+        "filter.<name>.clean and filter.<name>.process select the programs "
+        "git runs for files with that filter (git add, git checkout), "
+        "merge.<name>.driver selects the program git runs for files with "
+        "that merge driver (git merge), and diff.<name>.command, "
+        "diff.<name>.textconv, and diff.<name>.external select the "
+        "programs git runs for diffs with that driver (git diff, git log "
+        "-p); man.<tool>.path selects the man viewer git runs for "
+        "git help once man.viewer selects its tool, and "
+        "interactive.diffFilter selects the filter git runs for git add -p "
+        "diffs; no grant can authorize the write. A repository whose hooks, "
+        "editor, fsmonitor daemon, filters, merge drivers, diff drivers, "
+        "man viewer, or interactive diff filter you point at a program of "
+        "your choosing is not covered by any git approval — run this "
+        "command manually if you intend it"
+    )
+
+
+def _git_config_program_section_reason(target: str, *, destination: bool) -> str:
+    """Why a section rename reaching a program-selection section is a hard guard.
+
+    The denial names the destination section when the rename's destination
+    operand reaches one, and otherwise the matched operand itself, so the
+    reason always names the section the rename actually moves keys into or
+    out of.
+    """
+    if destination:
+        return (
+            f"git config renames a section to {target!r}, a "
+            "program-selection section: the rename moves the keys of "
+            f"that section into {target}, whose hooksPath/editor/fsmonitor/"
+            "filter/merge/diff/man/interactive keys select the programs "
+            "git runs on routine subcommands, so an agent-authored key "
+            "lands exactly where the key guard blocks writing it; no grant "
+            "can authorize the write. Run this command manually if you "
+            "intend it"
+        )
+    return (
+        f"git config renames the program-selection section {target!r}: the "
+        "rename moves the keys of that section out of the section whose "
+        "program-selection keys the key guard blocks, and an agent-authored "
+        "key could take their place; no grant can authorize the write. Run "
+        "this command manually if you intend it"
+    )
+
+
+def _git_config_rename_guard_reason(operands: list[str]) -> str | None:
+    """Why a section rename is a hard guard, naming the section it lands in.
+
+    A rename to (or from) a program-selection section relocates keys into
+    or out of the sections whose program-selection keys the key guard
+    blocks, so an agent-authored hooksPath/editor or driver key would take
+    effect. The destination operand is named when it reaches a guarded
+    section; otherwise the matched operand is named.
+    """
+    rename_operands = list(operands)
+    destination = rename_operands[-1] if rename_operands[1:] else None
+    if destination is not None and _git_config_section_is_program_selection(
+        destination
+    ):
+        return _git_config_program_section_reason(destination, destination=True)
+    target = next(
+        (
+            operand
+            for operand in rename_operands
+            if _git_config_section_is_program_selection(operand)
+        ),
+        None,
+    )
+    if target is not None:
+        return _git_config_program_section_reason(target, destination=False)
+    return None
+
+
+def _git_config_section_operation_guard_reason(
+    operands: list[str], *, rename: bool
+) -> str | None:
+    """Why a section operation (rename or removal) is a hard guard, or None."""
+    target = next(
+        (
+            operand
+            for operand in operands
+            if _git_config_section_is_push_effecting(operand)
+        ),
+        None,
+    )
+    if target is not None:
+        return _git_config_push_effecting_reason(target)
+    if rename:
+        # Only renames are checked here: a removal cannot move a key into
+        # a guarded section.
+        return _git_config_rename_guard_reason(operands)
+    return None
+
+
+def _git_config_write_guard_reason(
+    operands: list[str], *, section_operation: bool, rename: bool
+) -> str | None:
+    """Why a mutating ``git config`` call is a hard guard, or None when routine.
+
+    The scan already established that the call mutates; this selects the first
+    operand that reaches the guarded surface. Section operations check the
+    push-effecting sections first and, for renames, the program-selection
+    sections (either operand, so a destination section name is covered); key
+    writes check the push-effecting keys and then the program-selection keys.
+    """
+    if section_operation:
+        return _git_config_section_operation_guard_reason(operands, rename=rename)
+    target = next(
+        (operand for operand in operands if _git_config_key_is_push_effecting(operand)),
+        None,
+    )
+    if target is not None:
+        return _git_config_push_effecting_reason(target)
+    target = next(
+        (
+            operand
+            for operand in operands
+            if _git_config_key_is_program_selection(operand)
+        ),
+        None,
+    )
+    if target is not None:
+        return _git_config_program_selection_reason(target)
+    return None
+
+
+@dataclass(frozen=True)
+class _GitConfigCall:
+    """One scanned ``git config`` call, shared by classifier and runtime policy.
+
+    Both layers must agree on which calls write: the classifier guards the
+    push-effecting and program-selection keys, and the runtime policy governs
+    the ``--file`` destination of a writing call. ``operands`` holds the
+    positional operands with the subcommand word removed.
+    """
+
+    options: frozenset[str]
+    operands: tuple[str, ...]
+    subcommand: str | None
+    values: tuple[tuple[str, str], ...]
+    error: str | None
+    reads: bool
+    edits: bool
+    mutates: bool
+    section_operation: bool
+    renames: bool
+
+
+def _scan_git_config_call(args: list[str]) -> _GitConfigCall:
+    """Scan one git config call into its write-relevant shape.
+
+    The scan is lenient — git itself rejects unmodeled options — and the
+    key check looks at every operand, not only the first, so an option
+    whose value consumption is misread can only over-block, never miss a
+    write. The only scan errors are a dangling or empty required value at
+    the end of the invocation, which leaves every earlier --file value
+    already extracted.
+    """
+    scan = _scan_classified_git_options(
+        args, _GIT_CONFIG_TABLE, boolean_shorts=_GIT_CONFIG_BOOLEAN_SHORTS, strict=False
+    )
+    options = set(scan.options)
+    operands = list(scan.operands)
+    subcommand: str | None = None
+    if operands and operands[0] in _GIT_CONFIG_SUBCOMMANDS:
+        subcommand = operands.pop(0)
+    reads = bool(options & _GIT_CONFIG_READ_OPTIONS) or (
+        subcommand in _GIT_CONFIG_READ_SUBCOMMANDS
+    )
+    edits = bool(options & {"--edit", "-e"}) or subcommand == "edit"
+    section_operation = bool(options & _GIT_CONFIG_SECTION_LONGS) or (
+        subcommand in {"rename-section", "remove-section"}
+    )
+    mutates = (
+        len(operands) > 1
+        or bool(options & _GIT_CONFIG_WRITE_LONGS)
+        or bool(options & _GIT_CONFIG_UNSET_LONGS)
+        or bool(options & _GIT_CONFIG_SECTION_LONGS)
+        or subcommand in _GIT_CONFIG_MUTATION_SUBCOMMANDS
+    )
+    return _GitConfigCall(
+        options=frozenset(options),
+        operands=tuple(operands),
+        subcommand=subcommand,
+        values=scan.values,
+        error=scan.error,
+        reads=reads,
+        edits=edits,
+        mutates=mutates,
+        section_operation=section_operation,
+        renames=subcommand == "rename-section" or "--rename-section" in options,
+    )
+
+
+def _classify_git_config(args: list[str]) -> DangerousCommandClassification:
+    """git config: writes to push-effecting or program-selection keys are hard guards.
+
+    ``git config`` is otherwise a permitted routine command, so reads stay
+    routine — ``--get``/``--list``/``--get-urlmatch``/... and the ``get`` and
+    ``list`` subcommands, including a bare key, which git reads — and so do
+    writes to unrelated keys, which cannot change where a granted push
+    lands or what program git runs. What must never classify routine is the
+    agent redefining the push-effecting surface: a configured
+    ``remote.<name>.url``, ``remote.<name>.pushurl``, ``url.<base>.insteadOf``,
+    or ``branch.<name>.remote`` points a granted push at a destination of the
+    agent's choosing, ``remote.<name>.receivepack`` selects the program the
+    push runs, ``remote.<name>.vcs`` selects the helper ``git remote
+    update`` executes, ``core.sshCommand``, ``core.gitProxy``,
+    ``core.askPass``, and the ``credential`` section select the other
+    programs a push runs (the ssh command, the git:// proxy, the ask-pass
+    program, and the credential lookup), and ``include.path`` or
+    ``includeIf.<condition>.path`` authors a file git folds into
+    configuration, which can set any of those keys for a remote the
+    resolver verified, while a configured ``remote.<name>.mirror``,
+    ``remote.<name>.push`` refspec, or ``remote.pushDefault`` makes an
+    ordinary ``git.push`` approval authorize configured forced, deleted, or
+    mirrored updates. The program-selection surface is guarded the same way
+    in every write scope (local, ``--global``, ``--file``, ``--worktree``,
+    and ``-C``/``--git-dir`` relocation): ``core.hooksPath`` selects the
+    directory git runs hooks from, ``core.editor`` the program git runs for
+    commit/tag/rebase without ``-m``, ``sequence.editor`` the program an
+    interactive rebase runs, ``core.fsmonitor`` the daemon git runs for
+    status-bearing subcommands (``git add``, ``git commit``),
+    ``filter.<name>.clean`` and
+    ``filter.<name>.process`` the programs git runs for files with that
+    filter (``git add``, ``git checkout``), ``merge.<name>.driver`` the
+    program git runs for files with that merge driver (``git merge``), and
+    ``diff.<name>.command``, ``diff.<name>.textconv``, and
+    ``diff.<name>.external`` the programs git runs for diffs with that
+    driver (``git diff``, ``git log -p``), ``man.<tool>.path`` the man
+    viewer git runs for ``git help`` once ``man.viewer`` selects its tool,
+    and ``interactive.diffFilter`` the filter git runs for ``git add -p``
+    diffs — each executes on routine
+    subcommands, so every mutation of those keys — set, add, replace-all,
+    unset, the ``set``/``unset`` subcommands — is a hard guard with no
+    grantable operation. A section rename reaching ``core``, ``sequence``,
+    ``filter``, ``merge``, ``diff``, ``man``, or ``interactive`` (either
+    operand, so a destination section name is covered) relocates keys into
+    the section whose program-selection keys the key guard blocks, and is a
+    hard guard too; section removals stay routine for those sections
+    because a removal cannot move a key into a guarded section. Editor
+    writes (``--edit``/``-e``) are hard guards as well: an editor can set
+    any key, so it is never classifiable by key. The boundary is deliberate: a push
+    to a remote whose configuration the USER set is ordinary publication,
+    because the user's own config — includes included — defines what push
+    means there; only the agent's writes are barred.
+    """
+    call = _scan_git_config_call(args)
+    if call.error is not None:
+        return _hard_denied(f"git config: {call.error}")
+    if call.reads:
+        # A read never writes configuration.
+        return _ROUTINE
+    if call.edits:
+        # An editor write can set any key, so it is never classifiable.
+        return _hard_denied(
+            "git config --edit opens an editor on the config file, which "
+            "can set push-effecting configuration (remote.<name>.url, "
+            "remote.<name>.pushurl, remote.<name>.receivepack, "
+            "remote.<name>.uploadpack, remote.<name>.proxy, "
+            "remote.<name>.vcs, url.<base>.insteadOf, "
+            "url.<base>.pushInsteadOf, branch.<name>.remote, "
+            "branch.<name>.pushremote, remote.<name>.mirror, "
+            "remote.<name>.push, remote.pushDefault, core.sshCommand, "
+            "core.gitProxy, core.askPass, credential.helper, "
+            "credential.<url>.helper, include.path, "
+            "includeIf.<condition>.path) or program-selection configuration "
+            "(core.hooksPath, core.editor, sequence.editor, "
+            "core.fsmonitor, filter.<name>.clean, filter.<name>.process, "
+            "merge.<name>.driver, diff.<name>.command, "
+            "diff.<name>.textconv, diff.<name>.external, "
+            "man.<tool>.path, man.viewer, interactive.diffFilter) that no "
+            "grant can authorize; run it manually if you intend it"
+        )
+    if not call.mutates:
+        # A bare key with no action is git's read form; nothing is written.
+        return _ROUTINE
+    if reason := _git_config_write_guard_reason(
+        list(call.operands),
+        section_operation=call.section_operation,
+        rename=call.renames,
+    ):
+        return _hard_denied(reason)
+    return _ROUTINE
+
+
+def _classify_git_remote(args: list[str]) -> DangerousCommandClassification:
+    """git remote: mutations of the remote definitions are hard guards.
+
+    ``git remote add``/``set-url`` point a bare destination name at an
+    arbitrary URL or path, ``rename`` retargets an existing remote, and
+    ``remove`` (``rm``) turns a configured bare name back into a URL git
+    resolves as a path — each redefines where a granted push lands, so no
+    grant can authorize it. Reads (``-v``, ``show``, ``get-url``) and the
+    other non-mutating forms stay routine, including ``update`` and
+    ``prune``: with ``remote.<name>.vcs`` and ``core.sshCommand`` writes
+    barred, the helper and ssh program those forms run are
+    user-configured, so they stay in-contract.
+    """
+    scan = _scan_classified_git_options(
+        args, _GIT_REMOTE_TABLE, boolean_shorts=_GIT_REMOTE_BOOLEAN_SHORTS, strict=False
+    )
+    if scan.error is not None:
+        return _hard_denied(f"git remote: {scan.error}")
+    if scan.operands and scan.operands[0] in _GIT_REMOTE_MUTATION_SUBCOMMANDS:
+        return _hard_denied(
+            f"git remote {scan.operands[0]} redefines where a granted push "
+            "lands: it defines, repoints, renames, or removes the remote a "
+            "push destination resolves through, and a removed remote turns "
+            "the bare name into a URL git resolves as a path; no grant can "
+            "authorize it — run it manually if you intend it"
+        )
+    return _ROUTINE
+
+
+def _dispatch_git_subcommand(
+    subcommand: str, args: list[str], globals_scan: _GitGlobalScan
+) -> DangerousCommandClassification:
+    classification: DangerousCommandClassification
+    if subcommand == "push":
+        classification = _classify_git_push(args, globals_scan)
+    elif subcommand in _GIT_WORKTREE_TABLES:
+        classification = _classify_git_worktree_subcommand(
+            subcommand,
+            f"git.{subcommand}",
+            _GIT_WORKTREE_TABLES[subcommand],
+            args,
+            globals_scan,
+        )
+    elif subcommand == "switch":
+        classification = _classify_git_switch(args, globals_scan)
+    elif subcommand in {"stash", "reflog"}:
+        classification = _classify_git_stash_or_reflog(subcommand, args, globals_scan)
+    elif subcommand in {"reset", "clean"}:
+        classification = _classify_git_hard_guard_subcommand(subcommand, args)
+    elif subcommand == "config":
+        classification = _classify_git_config(args)
+    elif subcommand == "remote":
+        classification = _classify_git_remote(args)
+    else:
+        classification = _classify_git_remaining(subcommand)
+    return classification
+
+
+def classify_dangerous_git_command(tokens: list[str]) -> DangerousCommandClassification:
+    """Classify one whole expanded call for the dangerous-command flow.
+
+    Pure and typed: the call is ``routine`` (no dangerous-command
+    involvement), ``hard_denied`` (denied with no grantable operation), or
+    ``grantable`` (denied pending per-operation grants; the classification
+    carries the required operations, consequence, modeled operands, and
+    repository relocation). Only git invocations are classified; every other
+    command is routine and stays governed by the existing policy layer, whose
+    enforcement is unchanged. Ambiguous or unmodeled forms fail closed: never
+    grantable, never an ordinary git.push. ``git config`` and ``git remote``
+    are the routed subcommands that mostly stay routine — they are permitted
+    commands — so only writes to push-effecting configuration (remote
+    definitions and url rewrites, branch push destinations, mirror/push
+    refspecs, push defaults, the programs a push runs, the credential
+    section, and the include directives), writes to program-selection
+    configuration (``core.hooksPath``, ``core.editor``, ``sequence.editor``,
+    ``filter.<name>.clean``, ``filter.<name>.process``,
+    ``merge.<name>.driver``, ``diff.<name>.command``,
+    ``diff.<name>.textconv``, ``diff.<name>.external``, in every write
+    scope, plus section renames reaching ``core``, ``sequence``,
+    ``filter``, ``merge``, or ``diff``), and ``git remote`` mutations (add,
+    set-url, rename, remove) are hard guards: a push to a remote whose
+    configuration the user set is ordinary publication, because the user's
+    own config — includes included — defines what push means there, and
+    only the agent's writes and remote mutations are barred.
+    """
+    if not tokens or _command_name(tokens[0]) != "git":
+        return _ROUTINE
+    globals_scan = _scan_git_globals(tokens[1:])
+    if globals_scan.error is not None:
+        return _hard_denied(globals_scan.error)
+    args = tokens[1:]
+    if globals_scan.index >= len(args):
+        # No subcommand: bare git prints usage/version and carries nothing to
+        # classify.
+        return _ROUTINE
+    subcommand = args[globals_scan.index]
+    return _dispatch_git_subcommand(
+        subcommand, args[globals_scan.index + 1 :], globals_scan
+    )
+
+
+# Subcommands the dangerous-command flow routes: malformed or unmodeled forms
+# of these fail closed (git config and git remote excepted: they are
+# permitted routine commands, so they stay routine unless they mutate the
+# push-effecting surface). Every other git invocation — readers, unmodeled
+# builtins, unrecognized subcommands, dangling globals without a subcommand —
+# carries no dangerous operation and stays governed by the existing policy
+# layer, whose enforcement is unchanged.
+_DANGEROUS_GIT_SUBCOMMANDS = frozenset({
+    "push",
+    "checkout",
+    "restore",
+    "switch",
+    "stash",
+    "reflog",
+    "reset",
+    "clean",
+    "config",
+    "remote",
+})
+
+
+def is_dangerous_git_subcommand(tokens: list[str]) -> bool:
+    """Whether one git invocation routes through the dangerous-command flow."""
+    canonical = canonical_git_command(tokens)
+    return (
+        canonical is not None
+        and len(canonical) > 1
+        and canonical[1] in _DANGEROUS_GIT_SUBCOMMANDS
+    )
+
+
+def resolve_repository_scope(
+    cwd: Path, relocation: GitRepositoryRelocation
+) -> RepositoryScope | None:
+    """Resolve the repository/worktree identity one git invocation operates on.
+
+    Pure filesystem inspection; git is never invoked. ``cwd`` is the statically
+    tracked working directory of the invocation and ``relocation`` carries
+    git's global -C/--git-dir/--work-tree operands (each -C applies in turn,
+    before the override paths are resolved, exactly as git applies them).
+    Returns None when a repository marker is present but its identity cannot
+    be determined, so callers fail closed. A directory governed by no
+    repository yields that directory's nominal scope: git itself refuses such
+    a call, so the nominal identity only ever matters for grant scoping.
+    """
+    current = (cwd if cwd.is_absolute() else Path.cwd() / cwd).resolve()
+    for value in relocation.cwd_paths:
+        current = resolve_tool_path(value, current)
+    work_tree: Path | None = None
+    if relocation.work_tree is not None:
+        work_tree = resolve_tool_path(relocation.work_tree, current)
+    if relocation.git_dir is not None:
+        return RepositoryScope(
+            git_dir=resolve_tool_path(relocation.git_dir, current), work_tree=work_tree
+        )
+    scope: RepositoryScope | None = None
+    for directory in (current, *current.parents):
+        marker = directory / ".git"
+        if marker.is_dir():
+            scope = RepositoryScope(
+                git_dir=marker.resolve(), work_tree=work_tree or directory
+            )
+            break
+        if (
+            (directory / "HEAD").is_file()
+            and (directory / "config").is_file()
+            and (directory / "objects").is_dir()
+            and (directory / "refs").is_dir()
+        ):
+            # A bare repository (or a git dir used directly) has no work tree.
+            scope = RepositoryScope(git_dir=directory.resolve(), work_tree=work_tree)
+            break
+        if not marker.is_file():
+            continue
+        try:
+            marker_value = marker.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            return None
+        prefix, separator, value = marker_value.partition(":")
+        if not separator or prefix.casefold() != "gitdir":
+            # Not a usable repository pointer; git itself would refuse it, so
+            # the repository identity cannot be determined.
+            return None
+        git_dir = Path(value.strip()).expanduser()
+        if not git_dir.is_absolute():
+            git_dir = directory / git_dir
+        # A linked worktree's own git dir is its identity: sibling worktrees
+        # of one repository never share a scope.
+        scope = RepositoryScope(
+            git_dir=git_dir.resolve(), work_tree=work_tree or directory
+        )
+        break
+    if scope is None:
+        scope = RepositoryScope(
+            git_dir=(current / ".git").resolve(), work_tree=work_tree or current
+        )
+    return scope
+
+
+# Routine git subcommands that write work-tree files: tracked paths under the
+# work tree (checkout/switch/restore/merge/cherry-pick/revert/rebase/am and
+# the whole stash subcommand, whose push/pop/apply forms all touch the work
+# tree) or patch paths (apply), plus pull, whose merge step writes the work
+# tree. A relocation that resolves the work tree inside the git metadata dir
+# turns each of them into a metadata writer, so the resolver denies them
+# there. fetch never writes the work tree and stays out; reset --keep/--merge,
+# git rm/mv, bisect, and submodule stay routine under such a relocation (a
+# documented residual).
+_GIT_TREE_WRITING_SUBCOMMANDS = frozenset({
+    "am",
+    "apply",
+    "cherry-pick",
+    "checkout",
+    "merge",
+    "pull",
+    "rebase",
+    "restore",
+    "revert",
+    "stash",
+    "switch",
+})
+
+# Position of the subcommand token in a canonical git command.
+_GIT_SUBCOMMAND_INDEX = 1
+
+
+def git_work_tree_writing_subcommand(tokens: list[str]) -> str | None:
+    """The subcommand when one git invocation writes work-tree files.
+
+    Returns the subcommand name for the routine tree-writing subcommands, or
+    None for every other invocation — readers, unmodeled or unrecognized
+    forms (already denied or governed elsewhere), and non-git commands.
+    """
+    canonical = canonical_git_command(tokens)
+    if canonical is None or len(canonical) <= _GIT_SUBCOMMAND_INDEX:
+        return None
+    subcommand = canonical[1]
+    return subcommand if subcommand in _GIT_TREE_WRITING_SUBCOMMANDS else None
+
+
+def resolve_git_work_tree(tokens: list[str], cwd: Path) -> Path | None:
+    """Resolve the work tree one git invocation writes, without invoking git.
+
+    Mirrors git's own resolution order: the ``-C`` paths apply in turn, then
+    ``--work-tree``, then ``core.worktree`` from the repository's own config
+    (relative values resolve against the git dir, as git resolves them), then
+    discovery — the directory holding the ``.git`` marker, or the current
+    directory itself when it is a git dir (git then uses the cwd as the work
+    tree). Returns None when the work tree cannot be determined, so callers
+    fail closed.
+    """
+    globals_scan = _scan_git_globals(tokens[1:])
+    if globals_scan.error is not None:
+        return None
+    relocation = globals_scan.relocation
+    current = (cwd if cwd.is_absolute() else Path.cwd() / cwd).resolve()
+    for value in relocation.cwd_paths:
+        current = resolve_tool_path(value, current)
+    if relocation.work_tree is not None:
+        # GIT_WORK_TREE wins over core.worktree and discovery.
+        return resolve_tool_path(relocation.work_tree, current)
+    scope = resolve_repository_scope(
+        current, GitRepositoryRelocation(git_dir=relocation.git_dir)
+    )
+    if scope is None:
+        return None
+    # An explicit git dir without --work-tree, or a git dir discovered as the
+    # cwd itself, leaves git using the cwd as the work tree.
+    work_tree = scope.work_tree if scope.work_tree is not None else current
+    config_paths = _git_dir_config_paths(scope.git_dir)
+    entries = (
+        _parse_git_config_entries(config_paths) if config_paths is not None else None
+    )
+    if entries is None:
+        # An unreadable commondir pointer or an unparsable config: the work
+        # tree cannot be verified, so fail closed.
+        return None
+    configured = next(
+        (
+            value
+            for section, key, value in entries
+            if section == "core" and key == "worktree"
+        ),
+        None,
+    )
+    if configured is None:
+        return work_tree
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        path = scope.git_dir / path
+    return path.resolve()
+
+
+def git_cwd_relocations(tokens: list[str], cwds: set[Path]) -> set[Path] | None:
+    """The directories git's own -C sequence relocates each candidate cwd to.
+
+    Git applies its -C operands in turn — each relative to the directory the
+    previous one produced — before the subcommand runs, so every relative
+    operand of the subcommand, raw write operands included, resolves against
+    the final directory (mirroring how ``resolve_git_work_tree`` models the
+    same sequence). Returns None when the invocation carries no -C, so those
+    operands resolve against the tracked cwds unchanged. An unscannable global
+    sequence never reaches operand resolution — the policy layer denies it
+    before the operand guard runs — and an empty -C value is a no-op
+    relocation git itself accepts, so the tracked cwds stay correct there too.
+    """
+    globals_scan = _scan_git_globals(tokens[1:])
+    if globals_scan.error is not None or not globals_scan.relocation.cwd_paths:
+        return None
+    relocated: set[Path] = set()
+    for cwd in cwds:
+        current = (cwd if cwd.is_absolute() else Path.cwd() / cwd).resolve()
+        for value in globals_scan.relocation.cwd_paths:
+            current = resolve_tool_path(value, current)
+        relocated.add(current)
+    return relocated
+
+
 _GIT_CONFIG_ENTRY = re.compile(
     r"^(?P<key>[A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*(?P<value>.*))?$"
 )
@@ -1966,7 +3815,6 @@ _FALSE_GIT_CONFIG_VALUES = frozenset({"", "0", "false", "no", "off"})
 # The section name is casefolded on parse; the remediation text restores the
 # spelling git documents for the directive.
 _INCLUDE_DIRECTIVE_NAMES = {"include": "include", "includeif": "includeIf"}
-_GIT_SUBCOMMAND_INDEX = 1
 
 
 def _git_config_paths(cwd: Path) -> tuple[Path, ...] | None:  # noqa: PLR0911
@@ -2080,15 +3928,14 @@ def git_metadata_paths(tokens: list[str], *, cwd: Path) -> tuple[Path, ...] | No
     return tuple(metadata)
 
 
-def _git_config_entries(cwd: Path) -> tuple[tuple[str, str, str], ...] | None:
-    """Parse repository-owned config entries without invoking Git.
+def _parse_git_config_entries(
+    config_paths: tuple[Path, ...],
+) -> tuple[tuple[str, str, str], ...] | None:
+    """Parse config file entries without invoking Git.
 
-    None means a repository governs ``cwd`` but its config could not be read;
+    None means one of the files exists but could not be read or parsed;
     callers fail closed on that result.
     """
-    config_paths = _git_config_paths(cwd)
-    if config_paths is None:
-        return None
     entries: list[tuple[str, str, str]] = []
     for config_path in config_paths:
         if not config_path.exists():
@@ -2125,6 +3972,171 @@ def _git_config_entries(cwd: Path) -> tuple[tuple[str, str, str], ...] | None:
                 # Continuations and unknown syntax can conceal executable keys.
                 return None
     return tuple(entries)
+
+
+def _git_config_entries(cwd: Path) -> tuple[tuple[str, str, str], ...] | None:
+    """Parse repository-owned config entries without invoking Git.
+
+    None means a repository governs ``cwd`` but its config could not be read;
+    callers fail closed on that result.
+    """
+    config_paths = _git_config_paths(cwd)
+    if config_paths is None:
+        return None
+    return _parse_git_config_entries(config_paths)
+
+
+# One [section] / [section "sub"] / [section.sub] header with the
+# subsection captured: remote names live in the subsection, which the entry
+# parser's top-level section fold drops.
+_GIT_CONFIG_SECTION_HEADER = re.compile(
+    r"\[\s*(?P<section>[A-Za-z][A-Za-z0-9-]*)"
+    r"(?:\s+\"(?P<quoted>[^\"]*)\"|\.(?P<dotted>[^\]\s]+))?"
+    r"\s*\]"
+)
+
+
+def _git_dir_config_paths(git_dir: Path) -> tuple[Path, ...] | None:
+    """Locate the config files one git dir reads, without invoking Git.
+
+    A linked worktree's git dir shares the common repository's config
+    through ``commondir`` and adds its own ``config.worktree``; every other
+    git dir reads its own ``config`` (plus ``config.worktree`` when the
+    worktree-config extension is in use). Returns None when a commondir
+    pointer exists but cannot be read, so callers fail closed.
+    """
+    try:
+        common_value = (git_dir / "commondir").read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return git_dir / "config", git_dir / "config.worktree"
+    except (OSError, UnicodeError):
+        # An unreadable commondir would fall back to the worktree gitdir's
+        # own config, which does not exist in a linked worktree; fail closed
+        # like the config reads.
+        return None
+    common_dir = Path(common_value)
+    if not common_dir.is_absolute():
+        common_dir = git_dir / common_dir
+    return common_dir / "config", git_dir / "config.worktree"
+
+
+def _git_config_remote_url_names(
+    config_paths: tuple[Path, ...],
+) -> frozenset[str] | None:
+    """Remote names carrying a configured ``remote.<name>.url``, or None.
+
+    Parses the same repository-owned config grammar as
+    ``_git_config_entries``, keeping the section subsection the top-level
+    fold drops. A remote name resolves only when its ``url`` key is
+    present, because git resolves any destination that is not a configured
+    remote name as a URL. None means a config could not be read or parsed,
+    so callers fail closed.
+    """
+    names: set[str] = set()
+    for config_path in config_paths:
+        if not config_path.exists():
+            continue
+        try:
+            lines = config_path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            return None
+        remote_name: str | None = None
+        for raw_line in lines:
+            line = raw_line.strip().lstrip("\ufeff")
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("["):
+                header, separator, line = line.partition("]")
+                if not separator:
+                    return None
+                match = _GIT_CONFIG_SECTION_HEADER.fullmatch(f"{header}]")
+                if match is None:
+                    # Unknown header syntax can conceal a remote definition.
+                    return None
+                section = match.group("section").casefold()
+                subsection = match.group("quoted")
+                if subsection is None:
+                    subsection = match.group("dotted")
+                remote_name = subsection if section == "remote" else None
+                line = line.strip()
+                if not line or line.startswith(("#", ";")):
+                    continue
+            if match := _GIT_CONFIG_ENTRY.fullmatch(line):
+                if remote_name is not None and match.group("key").casefold() == "url":
+                    names.add(remote_name)
+            else:
+                # Continuations and unknown syntax can conceal a url key.
+                return None
+    return frozenset(names)
+
+
+def git_configured_remote_names(scope: RepositoryScope) -> frozenset[str] | None:
+    """Remote names one repository scope resolves from its own config.
+
+    Pure filesystem inspection; git is never invoked. A push destination
+    operand resolves to a remote only when the repository's config carries
+    ``remote.<name>.url`` for it: git resolves any destination that is not
+    a configured remote name as a URL — a path, for a bare name — so a
+    remote with only ``remote.<name>.mirror`` or ``remote.<name>.push``
+    config is NOT resolvable. None means the repository's config could not
+    be read, so callers fail closed. The scope's git dir is the config
+    source: global and system config are not consulted, because the grant
+    scopes the repository whose own config defines its remotes.
+    """
+    config_paths = _git_dir_config_paths(scope.git_dir)
+    if config_paths is None:
+        return None
+    return _git_config_remote_url_names(config_paths)
+
+
+def git_push_destination_risk(
+    call: ModeledGitCall, scope: RepositoryScope
+) -> str | None:
+    """The unconfigured-destination vector of one push call in one scope.
+
+    A push destination operand that is a bare name resolves only through the
+    repository's configured remotes: git resolves any destination that is
+    not a configured remote name as a URL — a path, for a bare name — so a
+    push to an unconfigured name runs the destination's receive-pack and
+    hooks, outside the repository the grant covers. The first positional is
+    always the repository and ``--repo`` overrides it, so both operands are
+    verified.
+
+    Returns None when the call is not a push, carries no destination
+    operand (git then resolves the destination from configuration the
+    agent cannot write), or every destination resolves to a configured
+    remote of the scope. A scope whose git dir does not exist governs no
+    repository — git itself refuses the push there — so it is not verified.
+    """
+    if call.subcommand != "push":
+        return None
+    destinations = push_destination_operands(call)
+    if not destinations:
+        return None
+    if not scope.git_dir.is_dir():
+        # No repository governs this scope: git itself refuses the push
+        # from such a directory, so no destination can run there.
+        return None
+    remotes = git_configured_remote_names(scope)
+    if remotes is None:
+        repository = scope.work_tree or scope.git_dir
+        return (
+            f"the configuration of the repository at {repository} could not "
+            "be read, so the push destination cannot be verified as a "
+            "configured remote; failing closed"
+        )
+    for destination in destinations:
+        if destination not in remotes:
+            repository = scope.work_tree or scope.git_dir
+            return (
+                f"destination {destination!r} is not a configured remote of "
+                f"the repository at {repository}: git resolves a push "
+                "destination that is not a configured remote name as a URL, "
+                "so a push to it runs the destination's receive-pack and "
+                "hooks, outside the repository the grant covers; no grant "
+                "can authorize an unconfigured destination"
+            )
+    return None
 
 
 def _git_value_is_active(value: str) -> bool:
@@ -2514,6 +4526,448 @@ def _package_policy(args: list[str], *, pip: bool = False) -> ShellCommandPolicy
     )
 
 
+# Compilers and linkers whose -o/--output operand is the written program: the
+# output file is a write-classified path operand, so it is workspace-scoped and
+# checked against protected Git metadata like every other write operand. The
+# assembler (as) writes its object through -o as well; it spells no long form
+# (--output would abbreviate --output-target), so the modeled long form is
+# inert for it.
+_COMPILER_OUTPUT_COMMANDS = frozenset({
+    "gcc",
+    "cc",
+    "clang",
+    "g++",
+    "c++",
+    "clang++",
+    "rustc",
+    "ld",
+    "as",
+})
+_COMPILER_OUTPUT_TABLE = _OptionTable(
+    long_values=frozenset({"--output"}), short_values=frozenset("o")
+)
+
+
+def _compiler_output_policy(args: list[str]) -> ShellCommandPolicy:
+    parsed = _scan_options(args, _COMPILER_OUTPUT_TABLE)
+    return ShellCommandPolicy(option_path_values=parsed.values_for("--output", "-o"))
+
+
+# Write-operand options of the commands whose positional operands are already
+# write-classified (the mutating path commands and the file-content commands).
+# Every modeled option names a file or directory the command writes, so each
+# extracted value is a write-classified path operand — in the separate form
+# (-C .git), the attached short form (-C.git), and the attached long form
+# (--output=.git/config) alike. Options that name read targets (tar -T,
+# patch -i, rsync --exclude-from) are deliberately absent: only write
+# operands are extracted here.
+_WRITE_OPERAND_TABLES: dict[str, _OptionTable] = {
+    # cp/mv/install/ln -t/--target-directory names the destination directory.
+    "cp": _OptionTable(
+        long_values=frozenset({"--target-directory"}), short_values=frozenset({"t"})
+    ),
+    "mv": _OptionTable(
+        long_values=frozenset({"--target-directory"}), short_values=frozenset({"t"})
+    ),
+    "install": _OptionTable(
+        long_values=frozenset({"--target-directory"}), short_values=frozenset({"t"})
+    ),
+    "ln": _OptionTable(
+        long_values=frozenset({"--target-directory"}), short_values=frozenset({"t"})
+    ),
+    # tee --output-error[=MODE] carries the write-error mode; GNU's modes
+    # (warn, exit, ...) are not paths, so extracting the attached value is
+    # conservative over-blocking, never a missed write operand.
+    "tee": _OptionTable(optional_long_values=frozenset({"--output-error"})),
+    # patch writes the patched result (-o/--output), the rejects
+    # (-r/--reject-file), and runs under a relocated directory
+    # (-d/--directory); backup names are prefixed with -B/--prefix and
+    # -Y/--basename-prefix.
+    "patch": _OptionTable(
+        long_values=frozenset({
+            "--basename-prefix",
+            "--directory",
+            "--output",
+            "--prefix",
+            "--reject-file",
+        }),
+        short_values=frozenset({"B", "Y", "d", "o", "r"}),
+    ),
+    # tar -f/--file names the archive (written when creating, read when
+    # extracting — the operand is write-classified either way, matching the
+    # positional scan), -C/--directory the extraction destination, and
+    # --add-file a member added to the archive.
+    "tar": _OptionTable(
+        long_values=frozenset({"--add-file", "--directory", "--file"}),
+        short_values=frozenset({"C", "f"}),
+    ),
+    # unzip -d names the extraction destination.
+    "unzip": _OptionTable(short_values=frozenset({"d"})),
+    # iconv -o/--output names the written conversion result.
+    "iconv": _OptionTable(
+        long_values=frozenset({"--output"}), short_values=frozenset({"o"})
+    ),
+    # gpg's -o/--output names the written output file (the decrypted or
+    # signed result): every spelling is real, including the attached short
+    # form (-oFILE) and --output=FILE.
+    "gpg": _OptionTable(
+        long_values=frozenset({"--output"}), short_values=frozenset({"o"})
+    ),
+    # xmllint's -o/--output names the written XML result. The attached
+    # spellings (-oFILE, --output=FILE) are rejected by xmllint itself, so
+    # extracting them is a conservative superset, never a missed operand.
+    "xmllint": _OptionTable(
+        long_values=frozenset({"--output"}), short_values=frozenset({"o"})
+    ),
+    # rsync's directory/file options name where transferred, partial,
+    # backup, and compared files and the log are written.
+    "rsync": _OptionTable(
+        long_values=frozenset({
+            "--backup-dir",
+            "--compare-dest",
+            "--copy-dest",
+            "--link-dest",
+            "--log-file",
+            "--partial-dir",
+            "--temp-dir",
+        }),
+        short_values=frozenset({"T"}),
+    ),
+    # bsdtar is tar-compatible: -f/--file names the archive (written when
+    # creating, read when extracting — write-classified either way, matching
+    # tar) and -C/--directory the extraction destination.
+    "bsdtar": _OptionTable(
+        long_values=frozenset({"--directory", "--file"}),
+        short_values=frozenset({"C", "f"}),
+    ),
+    # pax -f names the archive, written in write mode (-w) and read in read
+    # mode (-r); write-classified either way, matching tar.
+    "pax": _OptionTable(short_values=frozenset({"f"})),
+    # ar's positional archive operand is created or replaced by the mutating
+    # operations (inspected positionally, like tar's), and --output names
+    # the extraction destination directory.
+    "ar": _OptionTable(long_values=frozenset({"--output"})),
+}
+
+
+def _write_operand_policy(
+    table: _OptionTable,
+) -> Callable[[list[str]], ShellCommandPolicy]:
+    """One command's write-operand extraction over its modeled option table.
+
+    The table carries only write-operand options, so every value the scan
+    consumes is a write-classified path operand. Unknown options never
+    consume a following token, so a misread option consumption can only
+    leave an extra candidate, never hide a write operand.
+    """
+
+    def policy(args: list[str]) -> ShellCommandPolicy:
+        parsed = _scan_options(args, table)
+        return ShellCommandPolicy(
+            option_path_values=tuple(value for _, value in parsed.values)
+        )
+
+    return policy
+
+
+def _openssl_output_policy(args: list[str]) -> ShellCommandPolicy:
+    """openssl's -out/--out operand names the written output file.
+
+    OpenSSL spells its output option with one or two dashes and accepts the
+    value separately or attached with ``=`` (``-out FILE``, ``-out=FILE``,
+    ``--out FILE``, ``--out=FILE``), which the short-cluster scanner cannot
+    model; extract every spelling directly. Only the exact ``-out``/``--out``
+    prefixes match, so longer options (``-outform``) never do.
+    """
+    values: list[str] = []
+    for index, token in enumerate(args):
+        if token in {"-out", "--out"} and index + 1 < len(args):
+            values.append(args[index + 1])
+        elif token.startswith(("-out=", "--out=")):
+            values.append(token.partition("=")[2])
+    return ShellCommandPolicy(option_path_values=tuple(values))
+
+
+# split's value-taking options keep their operands (a SIZE, a SEPARATOR) out
+# of the positional scan: only the trailing PREFIX operand names the written
+# output files (PREFIXaa, PREFIXab, ...).
+_SPLIT_TABLE = _OptionTable(
+    long_values=frozenset({
+        "--additional-suffix",
+        "--bytes",
+        "--filter",
+        "--line-bytes",
+        "--lines",
+        "--number",
+        "--separator",
+        "--suffix-length",
+    }),
+    short_values=frozenset({"C", "a", "b", "l", "n", "t"}),
+    optional_long_values=frozenset({"--hex-suffixes", "--numeric-suffixes"}),
+)
+
+
+def _split_output_policy(args: list[str]) -> ShellCommandPolicy:
+    """split's PREFIX operand names the written output files.
+
+    ``split [OPTION]... [INPUT [PREFIX]]`` writes PREFIXaa, PREFIXab, ...;
+    with a single positional the input is read and the prefix defaults to
+    ``x`` in the working directory, so only a second positional is a write
+    target. The input operand is a read and stays governed by the workspace
+    authority alone, exactly like every other reader operand.
+    """
+    parsed = _scan_options(args, _SPLIT_TABLE)
+    positionals = parsed.positionals
+    prefix = (positionals[-1],) if len(positionals) > 1 else ()
+    return ShellCommandPolicy(inspect_positional_paths=True, positional_values=prefix)
+
+
+# csplit's --prefix/-f operand names the written output files (PREFIX00,
+# PREFIX01, ...); the positional operands are the input file and match
+# patterns, not write targets.
+_CSPLIT_TABLE = _OptionTable(
+    long_values=frozenset({"--prefix"}), short_values=frozenset({"f"})
+)
+
+
+def _csplit_output_policy(args: list[str]) -> ShellCommandPolicy:
+    parsed = _scan_options(args, _CSPLIT_TABLE)
+    return ShellCommandPolicy(option_path_values=parsed.values_for("--prefix", "-f"))
+
+
+# cpio's write operands: the -D/--directory directory the copy-in and
+# pass-through modes change into before writing (the extraction/copy
+# destination root), the -F/--file and -O archive files of copy-out mode,
+# and the pass-through destination positional (modeled by _cpio_policy).
+# Member names inside an archive stay uninspected (the documented member
+# residual, same as tar). Options that name read targets (-I's archive, -E's
+# pattern file) and non-path values (-H's format, -M's message, -W's flag,
+# -C's io size, --block-size) are consumed but never extracted; cpio's
+# optional-value -R/--owner is deliberately unmodeled, so its value stays a
+# positional candidate — an unmodeled option can only over-block, never
+# hide a write operand.
+_CPIO_TABLE = _OptionTable(
+    long_values=frozenset({
+        "--block-size",
+        "--directory",
+        "--file",
+        "--format",
+        "--io-size",
+        "--message",
+        "--pattern-file",
+        "--warning",
+    }),
+    short_values=frozenset({"C", "D", "E", "F", "H", "I", "M", "O", "W"}),
+    boolean_long=frozenset({
+        "--absolute-filenames",
+        "--append",
+        "--dereference",
+        "--device-independent",
+        "--dot",
+        "--extract",
+        "--force-local",
+        "--ignore-devno",
+        "--ignore-dirnlink",
+        "--link",
+        "--list",
+        "--make-directories",
+        "--no-absolute-filenames",
+        "--no-preserve-owner",
+        "--null",
+        "--numeric-uid-gid",
+        "--only-verify-crc",
+        "--pass-through",
+        "--preserve-modification-time",
+        "--quiet",
+        "--renumber-inodes",
+        "--reproducible",
+        "--reset-access-time",
+        "--swap-bytes",
+        "--swap-halfwords",
+        "--to-stdout",
+        "--unconditional",
+        "--verbose",
+    }),
+)
+
+
+def _cpio_policy(args: list[str]) -> ShellCommandPolicy:
+    """cpio's write operands: pass-through destinations and archive files.
+
+    Copy-pass mode (-p/--pass-through, -l/--link) copies the files named on
+    standard input into its positional destination directory, so every
+    positional is a write operand. Copy-in mode (-i) extracts archive members
+    into the -D/--directory directory (or the cwd without it — the member
+    residual), and copy-out mode (-o) writes the archive to -F/--file or -O.
+    """
+    parsed = _scan_options(args, _CPIO_TABLE)
+    write_values = list(parsed.values_for("--directory", "-D", "--file", "-F", "-O"))
+    passthrough = _has_long(parsed, "--pass-through", "--link") or _has_short(
+        parsed, frozenset({"p", "l"}), _CPIO_TABLE
+    )
+    if passthrough:
+        # Copy-pass mode's positional operand is the destination directory.
+        return ShellCommandPolicy(
+            inspect_positional_paths=True,
+            option_path_values=tuple(write_values),
+            positional_values=parsed.positionals,
+        )
+    return ShellCommandPolicy(
+        option_path_values=tuple(write_values), positional_values=()
+    )
+
+
+# strip writes its result to -o when given and mutates every positional
+# operand in place otherwise, so both are write operands: strip preserves
+# the executable bit, so `strip -o .git/hooks/pre-commit evil` plants a
+# hook exactly like the modeled `ld -o`. strip spells no long --output
+# (--output abbreviates --output-target, which the table models so the
+# abbreviation consumes its operand like strip itself), and its other
+# value-taking options name formats, sections, and symbols — never files
+# the command writes — so they are consumed but never extracted.
+_STRIP_TABLE = _OptionTable(
+    long_values=frozenset({
+        "--input-target",
+        "--keep-section",
+        "--keep-symbol",
+        "--output-target",
+        "--remove-relocations",
+        "--remove-section",
+        "--strip-symbol",
+        "--target",
+    }),
+    short_values=frozenset({"F", "I", "K", "N", "O", "R", "o"}),
+)
+
+
+def _strip_policy(args: list[str]) -> ShellCommandPolicy:
+    parsed = _scan_options(args, _STRIP_TABLE)
+    return ShellCommandPolicy(
+        inspect_positional_paths=True,
+        option_path_values=parsed.values_for("-o"),
+        positional_values=parsed.positionals,
+    )
+
+
+# scp's grammar is `scp [options] source... destination`, where an operand
+# carrying a colon before any slash is a REMOTE spec (outside this guard:
+# it writes a remote host, never local metadata). A local-to-local copy is
+# a mutating path command like ln: BOTH operands are write-classified and
+# inspected, so a destination resolving into metadata is denied on
+# containment and a source resolving into metadata is denied the same way
+# (the ln rule). The value-taking options are modeled so their operands
+# (ports, identity files, ssh options) never surface as positional
+# candidates.
+_SCP_TABLE = _OptionTable(
+    short_values=frozenset({"c", "D", "F", "i", "J", "l", "o", "P", "S"})
+)
+
+
+def _scp_policy(args: list[str]) -> ShellCommandPolicy:
+    parsed = _scan_options(args, _SCP_TABLE)
+    return ShellCommandPolicy(
+        inspect_positional_paths=True, positional_values=parsed.positionals
+    )
+
+
+# zip's first positional operand is the archive the call creates or
+# replaces; the remaining positionals name the files it stores (reads,
+# but classified like cp's source operand: a mutating path command
+# inspects every operand). The value-taking options (the -b scratch
+# directory, -i/-x patterns, -n suffixes, -P password) are modeled so
+# their operands never surface as positional candidates.
+_ZIP_TABLE = _OptionTable(short_values=frozenset({"P", "b", "i", "n", "x"}))
+
+
+def _zip_policy(args: list[str]) -> ShellCommandPolicy:
+    parsed = _scan_options(args, _ZIP_TABLE)
+    return ShellCommandPolicy(
+        inspect_positional_paths=True, positional_values=parsed.positionals
+    )
+
+
+# 7z's grammar is `7z <command> [switches] <archive> [files...]`: every
+# positional operand is write-classified (the archive is created or
+# replaced by the mutating commands and read by the listing ones —
+# write-classified either way, matching tar's -f; the command letter and
+# the stored-file operands are classified like cp's source operand).
+# The -o switch names the extraction destination and is ATTACHED-ONLY in
+# 7z (`-o.git` extracts into .git; `-o .git` is rejected by 7z itself, and
+# `-o=.git` creates a directory literally named "=.git"), so it is an
+# optional short value: the attached spelling extracts, and a separate
+# value stays a positional candidate the scan still inspects.
+_SEVENZIP_TABLE = _OptionTable(optional_short_values=frozenset({"o"}))
+
+
+def _sevenzip_policy(args: list[str]) -> ShellCommandPolicy:
+    parsed = _scan_options(args, _SEVENZIP_TABLE)
+    return ShellCommandPolicy(
+        inspect_positional_paths=True,
+        option_path_values=parsed.values_for("-o"),
+        positional_values=parsed.positionals,
+    )
+
+
+# unar extracts into -o's directory (default: the current directory) and
+# spells the option in four forms: `-o DIR`, `-o=DIR`, and the single-dash
+# long `-output-directory DIR` / `-output-directory=DIR`. The attached
+# short form (`-oDIR`) is rejected by unar itself; the scanner's cluster
+# rules cannot model single-dash long options, so the forms are extracted
+# directly. Only these options name files unar writes: the positional
+# operands name the archive and the members to extract (reads).
+def _unar_output_policy(args: list[str]) -> ShellCommandPolicy:
+    values: list[str] = []
+    for index, token in enumerate(args):
+        if token in {"-o", "-output-directory"} and index + 1 < len(args):
+            values.append(args[index + 1])
+        elif token.startswith(("-o=", "-output-directory=")):
+            values.append(token.partition("=")[2])
+    return ShellCommandPolicy(option_path_values=tuple(values))
+
+
+# zstd (and its twins zstdmt/unzstd/zstdcat, which are the same binary)
+# mutates every positional operand in place — bzip2/xz/lzma style — and
+# additionally writes to -o's file (separate form only) and to the
+# --output-dir-flat/--output-dir-mirror directories, in both the `=` and
+# the separate spelling, so those options are extracted as write
+# operands. The remaining value-taking options (levels, sizes, formats)
+# name no written file and only ever over-block as leaked candidates.
+_ZSTD_TABLE = _OptionTable(
+    long_values=frozenset({"--output-dir-flat", "--output-dir-mirror"}),
+    short_values=frozenset({"o"}),
+)
+
+
+def _zstd_policy(args: list[str]) -> ShellCommandPolicy:
+    parsed = _scan_options(args, _ZSTD_TABLE)
+    return ShellCommandPolicy(
+        inspect_positional_paths=True,
+        option_path_values=parsed.values_for(
+            "-o", "--output-dir-flat", "--output-dir-mirror"
+        ),
+        positional_values=parsed.positionals,
+    )
+
+
+# mktemp creates a file at every template positional and in the directory
+# -p/--tmpdir names (the long form takes its directory only attached:
+# --tmpdir=DIR). The resolver's file-content surface inspects the
+# template positionals; this policy adds the -p/--tmpdir directories,
+# whose separate spelling also surfaces as a positional candidate and
+# whose attached spelling only the scan can reach. --suffix names no
+# directory (a slash in it fails), so it is consumed but not extracted.
+_MKTEMP_TABLE = _OptionTable(
+    long_values=frozenset({"--suffix"}),
+    short_values=frozenset({"p"}),
+    optional_long_values=frozenset({"--tmpdir"}),
+)
+
+
+def _mktemp_policy(args: list[str]) -> ShellCommandPolicy:
+    parsed = _scan_options(args, _MKTEMP_TABLE)
+    return ShellCommandPolicy(option_path_values=parsed.values_for("-p", "--tmpdir"))
+
+
 _COMMAND_POLICIES = {
     "chmod": _chmod_policy,
     "chown": _chown_policy,
@@ -2539,6 +4993,25 @@ _COMMAND_POLICIES = {
     "wc": lambda args: _standard_policy("wc", args),
     "xargs": lambda args: ShellCommandPolicy(requires_approval=True),
 }
+_COMMAND_POLICIES.update({
+    name: _compiler_output_policy for name in _COMPILER_OUTPUT_COMMANDS
+})
+_COMMAND_POLICIES.update({
+    name: _write_operand_policy(table) for name, table in _WRITE_OPERAND_TABLES.items()
+})
+_COMMAND_POLICIES["openssl"] = _openssl_output_policy
+_COMMAND_POLICIES["split"] = _split_output_policy
+_COMMAND_POLICIES["csplit"] = _csplit_output_policy
+_COMMAND_POLICIES["cpio"] = _cpio_policy
+_COMMAND_POLICIES["strip"] = _strip_policy
+_COMMAND_POLICIES["scp"] = _scp_policy
+_COMMAND_POLICIES["zip"] = _zip_policy
+_COMMAND_POLICIES.update({name: _sevenzip_policy for name in ("7z", "7za", "7zr")})
+_COMMAND_POLICIES["unar"] = _unar_output_policy
+_COMMAND_POLICIES.update({
+    name: _zstd_policy for name in ("zstd", "zstdcat", "zstdmt", "unzstd")
+})
+_COMMAND_POLICIES["mktemp"] = _mktemp_policy
 
 
 def _short_interpreter_option(
@@ -2820,6 +5293,19 @@ def analyze_shell_command_policy(tokens: list[str]) -> ShellCommandPolicy:
     return policy(tokens[1:]) if policy else ShellCommandPolicy()
 
 
+def _command_operand_paths(command: str, tokens: list[str]) -> list[str]:
+    """Native ``keyword=value`` operands of dd that name files.
+
+    dd's if=/of= operands name its input and output files. Other commands'
+    write operands come from their option tables (see _WRITE_OPERAND_TABLES
+    and the git policies), which extract separate, attached-short, and
+    attached-long spellings alike.
+    """
+    if command == "dd":
+        return [token[3:] for token in tokens[1:] if token.startswith(("if=", "of="))]
+    return []
+
+
 def path_candidates(
     tokens: list[str],
     *,
@@ -2847,6 +5333,7 @@ def path_candidates(
         candidates = [
             *(executable_paths if inspect_executable else []),
             *policy.option_path_values,
+            *policy.write_path_values,
         ]
         candidates.extend(policy.positional_values or ())
         candidates.extend(boundary.cwd_overrides)
@@ -2854,20 +5341,15 @@ def path_candidates(
             candidates.extend(boundary.native_targets)
         return tuple(dict.fromkeys(candidates))
     policy = analyze_shell_command_policy(tokens)
-    candidates = [*executable_paths, *policy.option_path_values]
+    candidates = [
+        *executable_paths,
+        *policy.option_path_values,
+        *policy.write_path_values,
+    ]
     if not (inspect_positional_paths or policy.inspect_positional_paths):
         return tuple(candidates)
     command = _command_name(tokens[0])
-    if command == "dd":
-        candidates.extend(
-            token[3:] for token in tokens[1:] if token.startswith(("if=", "of="))
-        )
-    if command == "tar":
-        for index, token in enumerate(tokens[1:], 1):
-            if token.startswith("--add-file="):
-                candidates.append(token.partition("=")[2])
-            elif token == "--add-file" and index + 1 < len(tokens):
-                candidates.append(tokens[index + 1])
+    candidates.extend(_command_operand_paths(command, tokens))
     if policy.positional_values is not None:
         candidates.extend(policy.positional_values)
         return tuple(candidates)

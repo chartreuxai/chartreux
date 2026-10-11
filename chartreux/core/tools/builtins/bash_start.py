@@ -31,7 +31,11 @@ class BashStart(
 
     def resolve_permission(self, args: BashStartArgs) -> PermissionContext | None:
         return ShellPermissionResolver(
-            self.config, self.cwd, self.workspace, self.path_authority
+            self.config,
+            self.cwd,
+            self.workspace,
+            self.path_authority,
+            self.dangerous_command_authorities_getter,
         ).resolve_permission(args)
 
     async def run(

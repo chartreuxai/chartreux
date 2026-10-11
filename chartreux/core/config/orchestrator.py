@@ -21,6 +21,14 @@ from chartreux.core.config._credential_authority import (
     CREDENTIAL_ENV_FIELD,
     validate_credential_env_source,
 )
+from chartreux.core.config._dangerous_command_authority import (
+    GRANTS_FIELD,
+    validate_grant_source,
+)
+from chartreux.core.config._dangerous_command_persistence import (
+    persist_dangerous_command_grant,
+    remove_dangerous_command_grant,
+)
 from chartreux.core.config._restrictions import ConfigCandidate, SourceRestrictions
 from chartreux.core.config._root_authority import ROOTS_FIELD, validate_root_source
 from chartreux.core.config._root_persistence import persist_project_root_grant
@@ -667,6 +675,57 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
                 self, project=project, root=root, expected_revision=expected_revision
             )
 
+    async def save_dangerous_command_grant(
+        self, *, project: Path, operation_id: str, expected_revision: str
+    ) -> ConfigSaveResult:
+        """Persist one approved dangerous-command grant to the actual user source only.
+
+        This dedicated path is the only sanctioned writer of
+        ``dangerous_command_grants_by_project``; generic config/write patches keep
+        rejecting the field. The merge reads a force-loaded copy of the user
+        layer, so unrelated projects and settings come from disk, and the
+        expected user revision is checked optimistically before an atomic
+        ``save_checked`` write. Runtime state is never published: live caches,
+        the accepted token, and the workspace stay unchanged (application is
+        "unchanged"); the caller applies any session grant itself.
+        """
+        async with self._mutation_lock:
+            if not self._can_persist or not expected_revision:
+                return ConfigSaveResult(
+                    "user", "not_saved", "unchanged", error="validation"
+                )
+            return await persist_dangerous_command_grant(
+                self,
+                project=project,
+                operation_id=operation_id,
+                expected_revision=expected_revision,
+            )
+
+    async def remove_dangerous_command_grant(
+        self, *, project: Path, operation_id: str, expected_revision: str
+    ) -> ConfigSaveResult:
+        """Remove one saved dangerous-command grant from the actual user source only.
+
+        The saved-grant removal is reported on its own: live authority does not
+        exist yet, so this outcome never describes (or performs) a live
+        revocation. The merge reads a force-loaded copy of the user layer, so
+        unrelated projects and settings come from disk, and the expected user
+        revision is checked optimistically before an atomic ``save_checked``
+        write. Runtime state is never published, exactly as in
+        ``save_dangerous_command_grant``.
+        """
+        async with self._mutation_lock:
+            if not self._can_persist or not expected_revision:
+                return ConfigSaveResult(
+                    "user", "not_saved", "unchanged", error="validation"
+                )
+            return await remove_dangerous_command_grant(
+                self,
+                project=project,
+                operation_id=operation_id,
+                expected_revision=expected_revision,
+            )
+
     async def set_field(
         self,
         path: str,
@@ -987,6 +1046,12 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
                     f"Field '{ROOTS_FIELD}' in source '{source_label}' requires "
                     "explicit root policy replacement"
                 )
+            if GRANTS_FIELD in fields:
+                source_label = "user" if type(layer) is UserConfigLayer else "non-user"
+                raise ConfigPatchValidationError(
+                    f"Field '{GRANTS_FIELD}' in source '{source_label}' requires "
+                    "explicit dangerous-command grant persistence"
+                )
             try:
                 validate_catalog_scope(
                     type(self.config),
@@ -1058,6 +1123,8 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
                     validate_credential_env_source(patched, layer=layer)
                     validate_root_source(raw, layer=layer)
                     validate_root_source(patched, layer=layer)
+                    validate_grant_source(raw, layer=layer)
+                    validate_grant_source(patched, layer=layer)
                     validate_source(
                         type(self.config),
                         patched,

@@ -22,6 +22,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from chartreux.config_values import THINKING_LEVELS as THINKING_LEVELS, ThinkingLevel
 from chartreux.core.config._defaults import DEFAULT_AUTO_COMPACT_THRESHOLD
+from chartreux.core.dangerous_commands import OPERATION_REGISTRY
 from chartreux.core.llm_models import Backend
 from chartreux.core.paths import SESSION_LOG_DIR
 from chartreux.utils.paths import get_chartreux_home_literal
@@ -68,6 +69,57 @@ class AuthorizedRootsInput(BaseModel):
     @classmethod
     def canonical_roots(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
         return normalize_authorized_roots(value)
+
+
+def normalize_dangerous_command_grants(
+    value: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    """Canonicalize saved grants without granting effective config authority.
+
+    Only persistable operation IDs survive: the frozen registry marks every
+    consequential operation non-persistable, so a saved grant can never carry
+    one even if a source spells it out.
+    """
+    result: dict[str, list[str]] = {}
+    try:
+        for project, operations in value.items():
+            if not isinstance(project, str) or not isinstance(operations, list):
+                raise ValueError
+            project_path = Path(project).expanduser()
+            if not project_path.is_absolute():
+                raise ValueError
+            key = str(project_path.resolve())
+            if key in result:
+                raise ValueError
+            persistable: list[str] = []
+            for operation_id in operations:
+                if not isinstance(operation_id, str):
+                    raise ValueError
+                operation = OPERATION_REGISTRY.get(operation_id)
+                if operation is None or not operation.persistable:
+                    raise ValueError
+                if operation_id not in persistable:
+                    persistable.append(operation_id)
+            result[key] = persistable
+    except (ValueError, TypeError, OSError, RuntimeError):
+        raise ValueError(
+            "Invalid dangerous_command_grants_by_project: absolute project paths, "
+            "unique canonical project keys, and persistable operation IDs required"
+        ) from None
+    return result
+
+
+class DangerousCommandGrantsInput(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    dangerous_command_grants_by_project: dict[str, list[str]] = Field(
+        default_factory=dict
+    )
+
+    @field_validator("dangerous_command_grants_by_project")
+    @classmethod
+    def canonical_grants(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        return normalize_dangerous_command_grants(value)
 
 
 class ProjectContextConfig(BaseSettings):

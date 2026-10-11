@@ -15,6 +15,11 @@ from chartreux.core.config.harness_files import (
     HarnessFilesManager,
     get_harness_files_manager,
 )
+from chartreux.core.dangerous_commands import (
+    OPERATION_REGISTRY,
+    DangerousCommandAuthority,
+    GitRepositoryRelocation,
+)
 from chartreux.core.dispatch.renderer import (
     contains_dispatch_placeholder,
     render_task_description_for_config,
@@ -32,6 +37,9 @@ from chartreux.utils.io import read_safe
 if TYPE_CHECKING:
     from chartreux.core.config import ChartreuxConfigSchema
     from chartreux.core.config._restrictions import SourceRestrictions
+    from chartreux.core.tools.builtins._shell_permission_resolver import (
+        DangerousCommandAuthorityProvider,
+    )
     from chartreux.core.tools.mcp.registry import MCPRegistry
 
 
@@ -109,6 +117,8 @@ class ToolManager:
         accepted_token_getter: Callable[[], object] | None = None,
         task_description: str | None = None,
         session_root_grants: object | None = None,
+        dangerous_command_authority_provider: DangerousCommandAuthorityProvider
+        | None = None,
     ) -> None:
         self._config_getter = config_getter
         self._cwd = (cwd or Path.cwd()).resolve()
@@ -116,6 +126,11 @@ class ToolManager:
         self._scratchpad_dir = scratchpad_dir
         self._plan_file_write_scope_getter = plan_file_write_scope_getter
         self._session_root_grants = session_root_grants
+        # Runtime-owned dangerous-command grants (session/once lifetimes); the
+        # runtime approval lifecycle implements this port.
+        self._dangerous_command_authority_provider = (
+            dangerous_command_authority_provider
+        )
         # Only accepted runtime contributions belong here, never a preview getter.
         # Fixed parent authority is independent of later local profile changes.
         self._restriction_getter = restriction_getter
@@ -628,6 +643,14 @@ class ToolManager:
                     reason="Shell execution is disabled by canonical bash policy",
                 )
             if context is not None and context.permission == ToolPermission.NEVER:
+                if context.denial_kind == "dangerous_command":
+                    # The parent ceiling is checked even when local dangerous
+                    # authority is missing: a parent dangerous-authority gap
+                    # is never locally grantable, so it classifies as the
+                    # parent ceiling instead of a grantable local denial.
+                    parent = self._parent_permission("bash_start", args)
+                    if parent is not None and parent.permission == ToolPermission.NEVER:
+                        return parent
                 return context
             return self._parent_permission("bash_start", args)
         except Exception:
@@ -674,6 +697,17 @@ class ToolManager:
                 if parent_context.denial_kind == "out_of_root":
                     parent_context = parent_context.model_copy(
                         update={"denial_kind": "parent_ceiling"}
+                    )
+                elif parent_context.denial_kind == "dangerous_command":
+                    # A parent's dangerous-authority gap is likewise a ceiling:
+                    # the parent re-resolves the call under its own authority,
+                    # so no local grant can lift it, and the grantable proposal
+                    # never travels up to the child.
+                    parent_context = parent_context.model_copy(
+                        update={
+                            "denial_kind": "parent_ceiling",
+                            "dangerous_command_proposal": None,
+                        }
                     )
                 return parent_context
         except Exception:
@@ -1156,6 +1190,65 @@ class ToolManager:
         self._workspace_cache = None
         self._authority_cache.clear()
 
+    def _invalidate_dangerous_command_authority(self) -> None:
+        """Invalidate cached authority after a runtime dangerous-command grant."""
+        self._authority_generation += 1
+        self._workspace_cache = None
+        self._authority_cache.clear()
+
+    def _dangerous_command_authorities(self) -> tuple[DangerousCommandAuthority, ...]:
+        """Assemble the immutable dangerous-command authority snapshot (read-only).
+
+        Combines accepted saved grants from restriction sources (the protected
+        config read side) with runtime-owned grants from the provider port.
+        The assembly is a pure snapshot: no grant mutation, no persistence, no
+        execution. A saved grant contributes authority only for the repository
+        scope governing its registered project, and only for persistable
+        operations; a project whose repository cannot be located contributes
+        nothing.
+        """
+        from chartreux.core.tools.builtins._shell_command_policy import (
+            resolve_repository_scope,
+        )
+
+        if self._authority_retired:
+            raise NoSuchToolError("Tool manager authority retired")
+        authorities: list[DangerousCommandAuthority] = []
+        sources = self._inherited_restrictions + (
+            self._restriction_getter() if self._restriction_getter else ()
+        )
+        for source in sources:
+            for grant in source.dangerous_command_grants:
+                scope = resolve_repository_scope(
+                    grant.project, GitRepositoryRelocation()
+                )
+                if scope is None:
+                    continue
+                operations = frozenset(
+                    operation_id
+                    for operation_id in grant.operations
+                    if (operation := OPERATION_REGISTRY.get(operation_id)) is not None
+                    and operation.persistable
+                )
+                if operations:
+                    authorities.append(
+                        DangerousCommandAuthority(
+                            operations=operations,
+                            scope=scope,
+                            source="protected_config",
+                        )
+                    )
+        provider = self._dangerous_command_authority_provider
+        if provider is not None:
+            try:
+                authorities.extend(provider.dangerous_command_authorities())
+            except Exception:
+                # A broken provider fails closed: no runtime authority.
+                logger.warning(
+                    "Dangerous-command authority provider failed", exc_info=True
+                )
+        return tuple(authorities)
+
     @property
     def workspace(self) -> Workspace:
         """Current accepted file authority, independent of effective/discovery data."""
@@ -1226,6 +1319,9 @@ class ToolManager:
         instance.scratchpad_roots_getter = lambda: self.scratchpad_roots
         instance.path_authority_getter = lambda: self.path_authority(tool_name)
         instance.owned_scratchpad_getter = lambda: self._scratchpad_dir
+        instance.dangerous_command_authorities_getter = lambda: (
+            self._dangerous_command_authorities()
+        )
         runtime_config_setter = getattr(instance, "_set_runtime_config_getter", None)
         if runtime_config_setter is not None:
             runtime_config_setter(self._config_getter)

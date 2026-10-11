@@ -12,6 +12,10 @@ from chartreux.core.config._credential_authority import (
     CREDENTIAL_ENV_FIELD,
     validate_credential_env_source,
 )
+from chartreux.core.config._dangerous_command_authority import (
+    GRANTS_FIELD,
+    validate_grant_source,
+)
 from chartreux.core.config._root_authority import ROOTS_FIELD, validate_root_source
 from chartreux.core.config._source_validation import (
     _environment_source_error,
@@ -66,6 +70,12 @@ class EnvironmentLayer(ConfigLayer[RawConfig]):
             for name in os.environ
         ):
             validate_root_source({ROOTS_FIELD: None}, layer=self)
+        if any(
+            name.upper().startswith("CHARTREUX_")
+            and name[len("CHARTREUX_") :].split("__", 1)[0].lower() == GRANTS_FIELD
+            for name in os.environ
+        ):
+            validate_grant_source({GRANTS_FIELD: None}, layer=self)
         if any(
             name.upper().startswith("CHARTREUX_")
             and name[len("CHARTREUX_") :].split("__", 1)[0].lower()

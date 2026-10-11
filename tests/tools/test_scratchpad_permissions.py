@@ -304,3 +304,45 @@ def test_inherited_scratch_symlink_escape_and_root_retarget_denied(tmp_path):
     scratch.symlink_to(outside, target_is_directory=True)
     result = tool.resolve_permission(ReadFileArgs(file_path=str(scratch / "notes.txt")))
     assert result is not None and result.permission == ToolPermission.NEVER
+
+
+# --- Shell policy v0.2 (ADR 0021): bash redirect targets and scratch roots ---
+
+
+def test_bash_scratchpad_redirect_allowed_and_follows_changed_roots(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "allowed").mkdir()
+    parent, _, grandchild, scratch = scratch_chain(tmp_path / "allowed")
+    tool = grandchild.get("bash")
+
+    def verdict(command: str) -> ToolPermission:
+        result = tool.resolve_permission(BashArgs(command=command))
+        assert result is not None, command
+        return result.permission
+
+    # An absolute redirect target inside the inherited scratchpad root is
+    # allowed; /etc stays denied.
+    assert verdict(f"echo hi > {scratch}/log.txt") is ToolPermission.ALWAYS
+    assert verdict("echo hi > /etc/x") is ToolPermission.NEVER
+
+    # Changed roots: the retired scratchpad is no longer authorized, the
+    # replacement root is.
+    replacement = tmp_path / "allowed" / "replacement"
+    parent.set_scratchpad_dir(replacement)
+    assert verdict(f"echo hi > {scratch}/log.txt") is ToolPermission.NEVER
+    assert verdict(f"echo hi > {replacement}/log.txt") is ToolPermission.ALWAYS
+    assert not scratch.exists() and not replacement.exists()
+
+
+def test_bash_scratchpad_redirect_obeys_parent_tool_ceiling(tmp_path: Path) -> None:
+    # A parent tool-level ceiling denies the same redirect target: the parent
+    # invocation guard re-resolves the call under the parent's authority.
+    (tmp_path / "ceiling").mkdir()
+    parent, _, grandchild, scratch = scratch_chain(tmp_path / "ceiling")
+    config = build_test_vibe_config(tools={"bash": {"permission": "never"}})
+    parent._config_getter = lambda: config
+    tool = grandchild.get("bash")
+    result = tool.resolve_permission(BashArgs(command=f"echo hi > {scratch}/log.txt"))
+    assert result is not None
+    assert result.permission is ToolPermission.NEVER

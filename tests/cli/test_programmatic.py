@@ -28,7 +28,11 @@ from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 
 _CATALOG_FIELDS = {"models", "providers"}
-_ORDINARY_OVERRIDE_EXCLUDED_FIELDS = {*_CATALOG_FIELDS, "authorized_roots_by_project"}
+_ORDINARY_OVERRIDE_EXCLUDED_FIELDS = {
+    *_CATALOG_FIELDS,
+    "authorized_roots_by_project",
+    "dangerous_command_grants_by_project",
+}
 
 
 def _options() -> LocalHarnessOptions:

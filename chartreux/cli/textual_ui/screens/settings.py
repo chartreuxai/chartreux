@@ -34,8 +34,13 @@ from chartreux.cli.textual_ui.screens.status_line_settings import (
     StatusLineSettingsResult,
     StatusLineSettingsScreen,
 )
+from chartreux.cli.textual_ui.widgets.shell_permissions_app import (
+    ShellPermissionsApp,
+    ShellPermissionsResult,
+)
 from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.settings_service import SettingsService
+from chartreux.ui.shell_permissions import ShellPermissionsService
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 from chartreux.ui.widgets.checklist import Checklist
 from chartreux.ui.widgets.navigable_option_list import NavigableOptionList
@@ -591,11 +596,16 @@ class SettingsScreen(ModalScreen[str | None]):
     ]
 
     def __init__(
-        self, service: SettingsService, snapshot: SettingsReadResponse
+        self,
+        service: SettingsService,
+        snapshot: SettingsReadResponse,
+        *,
+        shell_permissions: ShellPermissionsService | None = None,
     ) -> None:
         super().__init__(id="settings-screen")
         self.service = service
         self.snapshot = snapshot
+        self.shell_permissions = shell_permissions
         self.catalog = snapshot.catalog
         self.fields = {field.path: field for field in snapshot.fields}
         self._busy = False
@@ -1118,7 +1128,7 @@ class SettingsScreen(ModalScreen[str | None]):
             if item.kind == "bool"
             else "",
             item.label
-            if item.control in {"toggle_inventory", "status_line"}
+            if item.control in {"toggle_inventory", "status_line", "shell_permissions"}
             or item.kind == "link"
             else item.path,
             "    ",
@@ -1428,7 +1438,7 @@ class SettingsScreen(ModalScreen[str | None]):
             else "$warning"
             if feedback.startswith("! Warning:")
             else "$success"
-            if feedback.startswith(f"{chrome_glyph('success')} Saved:")
+            if feedback.startswith(chrome_glyph("success"))
             else "$primary"
             if feedback.startswith(f"{chrome_glyph('running')} Running:")
             else "$text-muted"
@@ -1477,6 +1487,16 @@ class SettingsScreen(ModalScreen[str | None]):
                     item.description
                     + "\nOpen to edit a draft; Apply changes saves to user settings."
                     + f"\nSaved user overrides: {count}/4 · Ctrl+R restores inheritance."
+                )
+            )
+            return
+        if item.control == "shell_permissions":
+            self.query_one("#settings-help", NoMarkupStatic).update(
+                self._help_with_feedback(
+                    item.description
+                    + "\nEnter opens the Shell Permissions panel: live session "
+                    "grants, saved project grants, and blocking denylist "
+                    "entries, with per-operation revocation."
                 )
             )
             return
@@ -1766,6 +1786,8 @@ class SettingsScreen(ModalScreen[str | None]):
                 ),
                 returned,
             )
+        elif item.control == "shell_permissions":
+            self._open_shell_permissions(item)
         elif item.kind == "link":
             options = self.query_one("#settings-options", SettingsOptionList)
             self.return_state = (
@@ -1796,6 +1818,44 @@ class SettingsScreen(ModalScreen[str | None]):
             self._expand(item)
         else:
             self._begin_input(item)
+
+    def _open_shell_permissions(self, item: SettingDescriptorWire) -> None:
+        if self.shell_permissions is None:
+            self._error_path = item.path
+            self._error = (
+                f"{chrome_glyph('error')} Failed: Shell Permissions is "
+                "unavailable for this session."
+            )
+            self._update_help()
+            return
+        self._remember_opener("child")
+        options = self.query_one("#settings-options", SettingsOptionList)
+        state = (
+            options._query,
+            str(options.highlighted_option.id) if options.highlighted_option else None,
+            int(options.scroll_y),
+            self.focused.id if self.focused is not None else None,
+        )
+
+        def shell_permissions_returned(result: ShellPermissionsResult | None) -> None:
+            if result is not None and result.feedback.startswith((
+                chrome_glyph("success"),
+                "! Warning:",
+                "Failed:",
+            )):
+                self._error_path = item.path
+                self._error = result.feedback
+                self._unresolved.pop(item.path, None)
+                if result.feedback.startswith("! Warning:"):
+                    self._unresolved[item.path] = result.feedback
+            self.return_state = state
+            self._child_returning = True
+            self._refresh_options()
+            self.call_after_refresh(self._restore_child_state)
+
+        self.app.push_screen(
+            ShellPermissionsApp(self.shell_permissions), shell_permissions_returned
+        )
 
     def _toggle_bool(self, item: SettingDescriptorWire) -> None:
         if not self._can_mutate():

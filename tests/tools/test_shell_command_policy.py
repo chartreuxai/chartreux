@@ -2,20 +2,26 @@ from __future__ import annotations
 
 from pathlib import Path
 import shlex
+import subprocess
 
 import pytest
 
+from chartreux.core.dangerous_commands import DangerousCommandAuthority
 from chartreux.core.tools.base import BaseToolState, ToolPermission
 from chartreux.core.tools.builtins._shell_command_policy import (
     EXECUTOR_REGISTRY,
+    GitRepositoryRelocation,
     _package_module_tokens,
     analyze_shell_command_policy,
     canonical_git_command,
     executor_boundary,
+    git_cwd_relocations,
     git_repository_config_risk,
+    git_work_tree_writing_subcommand,
     inline_interpreter_switch,
     matches_command_prefix,
     path_candidates,
+    resolve_repository_scope,
 )
 from chartreux.core.tools.builtins.bash import Bash, BashArgs, BashToolConfig
 
@@ -557,6 +563,618 @@ def test_unmodeled_git_builtins_are_not_described_as_aliases(
     assert "denied conservatively" in context.reason
     assert "permission settings cannot override" in context.reason
     assert "aliases" not in context.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # git resolves repeated booleans in order and accepts --no-
+        # spellings, so the final --no-dry-run cancels --dry-run (or -n) and
+        # re-enables the destructive clean: the shipped policy layer must
+        # require approval for it too, not only the classifier.
+        "git clean --force --dry-run --no-dry-run",
+        "git clean --force -n --no-dry-run",
+        "git clean -f --dry-run --no-dry-run",
+        "git clean -fd --no-dry-run",
+        "git clean -fd",
+        "git clean -f -d",
+    ],
+)
+def test_clean_dry_run_negation_requires_approval(command: str) -> None:
+    policy = analyze_shell_command_policy(shlex.split(command))
+    assert policy.requires_approval
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Effective last-wins semantics: --no-force cancels --force (git
+        # itself refuses to clean), and a trailing -n wins.
+        "git clean --force --no-force",
+        "git clean -f --no-force",
+        "git clean --no-dry-run -n",
+        "git clean -n",
+        "git clean -fdn",
+        "git clean -n -f",
+        "git clean",
+    ],
+)
+def test_negated_clean_flags_stay_permitted(command: str) -> None:
+    policy = analyze_shell_command_policy(shlex.split(command))
+    assert not policy.requires_approval
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git config remote.origin.mirror true",
+        "git config --global remote.x.push +HEAD:main",
+        "git config set remote.origin.mirror true",
+        "git config --unset remote.origin.mirror",
+        "git config -e",
+        # The remote definition, the program a push runs, url rewrites, and
+        # the bare push destination are push-effecting too.
+        "git config remote.origin.url https://example.com/x.git",
+        "git config remote.origin.pushurl ../evil.git",
+        "git config remote.origin.receivepack echo",
+        "git config remote.origin.uploadpack echo",
+        "git config remote.origin.proxy echo",
+        "git config url.https://evil/.pushInsteadOf https://github.com/",
+        "git config url.https://evil/.insteadOf https://github.com/",
+        "git config branch.main.remote origin",
+        "git config branch.main.pushremote ../evil.git",
+        "git config --unset remote.origin.url",
+        "git config set branch.main.remote origin",
+        "git config --remove-section url.https://evil/",
+        "git config --rename-section branch.old branch.new",
+        # The remote's vcs helper: git remote update executes the configured
+        # git-remote-<vcs> helper from PATH.
+        "git config remote.origin.vcs evil",
+        "git config --unset remote.origin.vcs",
+        # The program-execution family: the ssh command (even a --dry-run),
+        # the git:// proxy, the ask-pass program, and the credential helpers.
+        "git config core.sshCommand evil",
+        "git config core.gitProxy evil",
+        "git config core.askPass evil",
+        "git config set core.gitProxy evil",
+        "git config credential.helper evil",
+        "git config credential.https://example.com.helper evil",
+        "git config --unset credential.helper",
+        # An authored include folds a file into configuration resolution,
+        # which can set any push-effecting key for a verified remote.
+        "git config include.path /tmp/evil.cfg",
+        "git config includeIf.gitdir:~/work/.path /tmp/evil.cfg",
+        "git config set include.path /tmp/evil.cfg",
+        "git config --unset include.path",
+        # Section operations reaching the credential and include sections.
+        "git config --remove-section credential",
+        "git config --remove-section include",
+        "git config --rename-section includeIf.gitdir:/x includeIf.gitdir:/y",
+    ],
+)
+def test_push_effecting_config_writes_are_denied(bash_tool: Bash, command: str) -> None:
+    # A hard guard: denied with no grantable proposal, so no answer can
+    # authorize the write.
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None
+    assert context.permission is ToolPermission.NEVER
+    assert context.denial_kind is None
+    assert context.dangerous_command_proposal is None
+    assert context.reason
+
+
+def test_config_then_push_compound_is_denied_without_a_proposal(
+    bash_tool: Bash,
+) -> None:
+    # The same-call exploit: writing the config that turns an ordinary push
+    # into a mirror push is denied on the config segment, and the whole
+    # compound call carries no proposal.
+    context = bash_tool.resolve_permission(
+        BashArgs(command="git config remote.origin.mirror true && git push origin")
+    )
+    assert context is not None
+    assert context.permission is ToolPermission.NEVER
+    assert context.denial_kind is None
+    assert context.dangerous_command_proposal is None
+    assert context.reason
+    assert "push-effecting configuration" in context.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # core.hooksPath selects the directory git runs hooks from; the write
+        # is a hard guard in every scope, including --file and relocation.
+        "git config core.hooksPath /tmp/h",
+        "git config --global core.hooksPath /tmp/h",
+        "git config --worktree core.hooksPath /tmp/h",
+        "git config --file cfg core.hooksPath /tmp/h",
+        "git config set core.hooksPath /tmp/h",
+        "git config --unset core.hooksPath",
+        "git -C .git config core.hooksPath /tmp/h",
+        "git --git-dir=.git config core.hooksPath /tmp/h",
+        "env X=1 git config core.hooksPath /tmp/h",
+        # core.editor and sequence.editor select the programs git runs for
+        # commit/tag/rebase without -m and interactive rebase.
+        "git config core.editor evil",
+        "git config --global core.editor evil",
+        "git config --worktree core.editor evil",
+        "git config --file cfg core.editor evil",
+        "git config set core.editor evil",
+        "git config --unset core.editor",
+        "git -C .git config core.editor evil",
+        "git --git-dir=.git config core.editor evil",
+        "git config sequence.editor evil",
+        "git config --global sequence.editor evil",
+        "git config --worktree sequence.editor evil",
+        "git config --file cfg sequence.editor evil",
+        "git config set sequence.editor evil",
+        "git config --unset sequence.editor",
+        "git -C .git config sequence.editor evil",
+        "git --git-dir=.git config sequence.editor evil",
+        "env X=1 git config sequence.editor evil",
+        # filter.<name>.clean and filter.<name>.process select the programs
+        # git runs for files with that filter (git add, git checkout).
+        "git config filter.pwn.clean evil",
+        "git config --global filter.pwn.clean evil",
+        "git config --worktree filter.pwn.clean evil",
+        "git config --file cfg filter.pwn.clean evil",
+        "git config set filter.pwn.clean evil",
+        "git config --add filter.pwn.clean evil",
+        "git config --replace-all filter.pwn.clean evil",
+        "git config --unset filter.pwn.clean",
+        "git config unset filter.pwn.clean",
+        "git -C .git config filter.pwn.clean evil",
+        "git --git-dir=.git config filter.pwn.clean evil",
+        "git config filter.pwn.process evil",
+        "git config --file cfg filter.pwn.process evil",
+        "git config set filter.pwn.process evil",
+        "git config --unset-all filter.pwn.process",
+        "git -C .git config filter.pwn.process evil",
+        # merge.<name>.driver selects the program git runs for files with
+        # that merge driver (git merge).
+        "git config merge.ours.driver evil",
+        "git config --global merge.ours.driver evil",
+        "git config --worktree merge.ours.driver evil",
+        "git config --file cfg merge.ours.driver evil",
+        "git config set merge.ours.driver evil",
+        "git config --unset merge.ours.driver",
+        "git -C .git config merge.ours.driver evil",
+        "git --git-dir=.git config merge.ours.driver evil",
+        # diff.<name>.command/textconv/external select the programs git
+        # runs for diffs with that driver (git diff, git log -p).
+        "git config diff.external.command evil",
+        "git config --global diff.external.command evil",
+        "git config --worktree diff.external.command evil",
+        "git config --file cfg diff.external.command evil",
+        "git config set diff.external.command evil",
+        "git config --unset diff.external.command",
+        "git -C .git config diff.external.command evil",
+        "git --git-dir=.git config diff.external.command evil",
+        "git config diff.external.textconv evil",
+        "git config --file cfg diff.external.textconv evil",
+        "git config --unset-all diff.external.textconv",
+        "git config diff.external.external evil",
+        "git config set diff.external.external evil",
+        "git config --replace-all diff.external.external evil",
+        # Section and key names fold case-insensitively; the guard fails
+        # closed on any spelling.
+        "git config Filter.Pwn.Clean evil",
+        "git config MERGE.Ours.Driver evil",
+        "git config Diff.External.Command evil",
+        "git config diff.EXTERNAL.Textconv evil",
+        # Section renames reaching core/sequence (destination names included).
+        "git config --rename-section other core",
+        "git config --rename-section core.other core",
+        "git config --rename-section other sequence",
+        "git config rename-section other core",
+        "git config --file cfg --rename-section other core",
+        "git -C .git config --rename-section other core",
+        "git --git-dir=.git config --rename-section other core",
+        # The same bypass class for the driver sections: renaming into
+        # (or out of) filter/merge/diff lands an agent-authored driver key.
+        "git config --rename-section other filter",
+        "git config --rename-section filter other",
+        "git config --rename-section filter.lfs filter",
+        "git config --rename-section other merge",
+        "git config --rename-section merge ours2",
+        "git config --rename-section other diff",
+        "git config --rename-section diff ours",
+        "git config --file cfg --rename-section other filter",
+        "git -C .git config --rename-section other merge",
+        "git --git-dir=.git config --rename-section other diff",
+    ],
+)
+def test_program_selection_config_writes_are_denied(
+    bash_tool: Bash, command: str
+) -> None:
+    # A hard guard: denied with no grantable proposal, so no answer can
+    # authorize the write.
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None
+    assert context.permission is ToolPermission.NEVER
+    assert context.denial_kind is None
+    assert context.dangerous_command_proposal is None
+    assert context.reason
+    assert "program-selection" in context.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Reads of the program-selection keys never write.
+        "git config --get core.hooksPath",
+        "git config --get core.editor",
+        "git config --get sequence.editor",
+        "git config core.hooksPath",
+        "git config core.editor",
+        "git config sequence.editor",
+        "git config --get filter.pwn.clean",
+        "git config --get filter.pwn.process",
+        "git config --get merge.ours.driver",
+        "git config --get diff.external.command",
+        "git config --get diff.external.textconv",
+        "git config --get diff.external.external",
+        "git config filter.pwn.clean",
+        "git config merge.ours.driver",
+        "git config diff.external.command",
+        "git config --list",
+        # Writes to unrelated keys and sections stay routine, including
+        # section removals (a removal cannot move a key into a guarded
+        # section) and unrelated renames. The driver sections keep their
+        # non-program keys: required/smudge are boolean flags and data
+        # spellings, not command strings (a documented residual).
+        "git config user.name X",
+        "git config core.pager less",
+        "git config core.autocrlf true",
+        "git config sequence.squashWarning false",
+        "git config filter.pwn.required true",
+        "git config filter.pwn.smudge cat",
+        "git config merge.ours.name ours",
+        "git config merge.conflictStyle diff3",
+        "git config diff.external.foo bar",
+        "git config diff.renameLimit 100",
+        "git config --remove-section core.old",
+        "git config --remove-section sequence.old",
+        "git config --remove-section filter.old",
+        "git config --remove-section merge.old",
+        "git config --remove-section diff.old",
+        "git config --rename-section other.one other.two",
+    ],
+)
+def test_program_selection_config_reads_and_unrelated_writes_stay_permitted(
+    bash_tool: Bash, command: str
+) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None
+    assert context.permission is ToolPermission.ALWAYS
+
+
+# --- Attached write-operand extraction (delta review, family 2) ---
+
+
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        # cp/mv/install/ln: --target-directory= and the attached short -t<dir>.
+        ("cp --target-directory=.git seed.txt", ".git"),
+        ("cp -t.git seed.txt", ".git"),
+        ("mv --target-directory=.git/hooks f", ".git/hooks"),
+        ("install -t.git seed.txt", ".git"),
+        ("ln --target-directory=.git seed.txt", ".git"),
+        # tar: -C<dir> attached (also in a cluster), -f<archive>, --file=.
+        ("tar -C.git -xf evil.tgz", ".git"),
+        ("tar -xC.git -f evil.tgz", ".git"),
+        ("tar -cf.git/config seed.txt", ".git/config"),
+        ("tar --file=.git/config -c seed.txt", ".git/config"),
+        ("tar -xf evil.tgz --directory=.git", ".git"),
+        # unzip: -d<dir> attached.
+        ("unzip -d.git evil.zip", ".git"),
+        # patch: --output=/-o<val>, --reject-file=, -d<dir>, --prefix=.
+        ("patch --output=.git/config fix.diff", ".git/config"),
+        ("patch -o.git/config fix.diff", ".git/config"),
+        ("patch --reject-file=.git/rej fix.diff", ".git/rej"),
+        ("patch -d.git fix.diff", ".git"),
+        ("patch --prefix=.git/ -b fix.diff", ".git/"),
+        # openssl: -out= and --out= (single- and double-dash spellings).
+        ("openssl enc -out=.git/config -in seed.txt", ".git/config"),
+        ("openssl enc --out=.git/config -in seed.txt", ".git/config"),
+        ("openssl enc -out .git/config -in seed.txt", ".git/config"),
+        # iconv: -o<val> and --output=.
+        ("iconv -o.git/config seed.txt", ".git/config"),
+        ("iconv --output=.git/config seed.txt", ".git/config"),
+        # rsync: the write-directory options and -T<dir>.
+        ("rsync --temp-dir=.git a b", ".git"),
+        ("rsync -T.git a b", ".git"),
+        ("rsync --log-file=.git/log a b", ".git/log"),
+        # tee: the attached --output-error=.
+        ("tee --output-error=.git/config f", ".git/config"),
+        # csplit: --prefix= and the attached short -f<prefix>.
+        ("csplit --prefix=.git/cracked seed.txt 1", ".git/cracked"),
+        ("csplit -f.git/cracked seed.txt 1", ".git/cracked"),
+        # git's raw write operands: archive --output and a writing config
+        # --file (both flow through write_path_values).
+        ("git archive --output=.git/config HEAD", ".git/config"),
+        ("git archive -o.git/config HEAD", ".git/config"),
+        ("git config --file=.git/config user.name x", ".git/config"),
+        ("git config -f.git/config user.name x", ".git/config"),
+    ],
+)
+def test_attached_write_operands_are_extracted_as_path_candidates(
+    command: str, expected: str
+) -> None:
+    candidates = path_candidates(shlex.split(command), inspect_positional_paths=True)
+    assert expected in candidates, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Read forms do not put the destination in write_path_values: a
+        # reading config --file stays an authority-scoped operand.
+        "git config --file=.git/config --get user.name",
+        "git config --file=.git/config user.name",
+        "git config --file=.git/config --list",
+    ],
+)
+def test_git_config_read_file_is_not_a_write_operand(command: str) -> None:
+    policy = analyze_shell_command_policy(shlex.split(command))
+    assert policy.write_path_values == ()
+    assert ".git/config" in policy.option_path_values
+
+
+def test_split_extracts_only_the_prefix_operand() -> None:
+    # split's value options (a SIZE, a SEPARATOR) never become candidates;
+    # only the trailing PREFIX names the written output files.
+    candidates = path_candidates(
+        shlex.split("split -b 100 -t / seed.txt out"), inspect_positional_paths=False
+    )
+    assert candidates == ("out",)
+    candidates = path_candidates(
+        shlex.split("split -b 100 seed.txt"), inspect_positional_paths=False
+    )
+    assert candidates == ()
+
+
+def test_git_work_tree_writing_subcommand_detection() -> None:
+    assert git_work_tree_writing_subcommand(shlex.split("git merge evil")) == "merge"
+    assert (
+        git_work_tree_writing_subcommand(shlex.split("git -C .git apply p.diff"))
+        == "apply"
+    )
+    assert (
+        git_work_tree_writing_subcommand(
+            shlex.split("git --git-dir=.git --work-tree=.git stash pop")
+        )
+        == "stash"
+    )
+    # Readers, non-writers, and unmodeled forms carry nothing to check.
+    assert git_work_tree_writing_subcommand(shlex.split("git status")) is None
+    assert git_work_tree_writing_subcommand(shlex.split("git -C .git status")) is None
+    assert git_work_tree_writing_subcommand(shlex.split("git fetch origin")) is None
+    assert git_work_tree_writing_subcommand(shlex.split("git log")) is None
+    assert git_work_tree_writing_subcommand(shlex.split("git commit -m x")) is None
+    assert git_work_tree_writing_subcommand(shlex.split("ls")) is None
+
+
+# --- Git raw-write operand and work-tree governance (delta review, family 1) ---
+
+
+def _git_dir_with_bare_markers(root: Path) -> Path:
+    """A minimal git dir: discovery finds it as a repository git dir."""
+    git_dir = root / ".git"
+    git_dir.mkdir(exist_ok=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+    (git_dir / "config").write_text("[core]\n\tbare = false\n")
+    (git_dir / "objects").mkdir(exist_ok=True)
+    (git_dir / "refs").mkdir(exist_ok=True)
+    (root / "seed.txt").write_text("seed\n")
+    return root
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # git archive --output/-o writes the named file directly.
+        "git archive --output=.git/config HEAD",
+        "git archive --output .git/config HEAD",
+        "git archive -o .git/config HEAD",
+        "git archive -o.git/config HEAD",
+        "git archive --output=.git/hooks/pre-commit HEAD",
+        # A writing git config --file/-f names the written file.
+        "git config --file=.git/config user.name x",
+        "git config --file .git/config user.name x",
+        "git config -f.git/config user.name x",
+        "git config --file=.git/config set user.name x",
+        "git config --file=.git/config --unset user.name",
+        # The operand guard fires before the classifier's key guard for a
+        # metadata destination, and the key guard still covers the rest.
+        "git config --file=.git/config core.hooksPath /tmp/h",
+        # Work-tree relocation into the metadata dir.
+        "git -C .git apply ../hook.diff",
+        "git -C .git merge evil",
+        "git --git-dir=.git --work-tree=.git merge evil",
+        "git --git-dir=.git --work-tree=.git stash pop",
+        "git --git-dir=.git --work-tree=.git checkout main",
+        "git --work-tree=.git merge evil",
+        "git -C .git/hooks apply hook.diff",
+    ],
+)
+def test_git_raw_write_and_work_tree_bypasses_are_denied(
+    bash_tool: Bash, command: str
+) -> None:
+    _git_dir_with_bare_markers(bash_tool.cwd)
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.NEVER, f"{command}: {context.reason}"
+    assert "protected Git metadata" in (context.reason or ""), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # In-workspace destinations and readers stay permitted.
+        "git archive --output=bundle.tar HEAD",
+        "git archive -obundle.tar HEAD",
+        "git config --file=custom.cfg user.name X",
+        "git config --file=custom.cfg --get user.name",
+        "git config --file=.git/config --get user.name",
+        "git -C .git status",
+        "git --git-dir=.git log",
+        "git --work-tree=. --git-dir=.git diff",
+        # In-worktree tree-writing calls and legitimate relocations.
+        "git apply fix.diff",
+        "git merge evil",
+        "git stash pop",
+        "git switch main",
+        "git fetch origin",
+        "git --git-dir=.git --work-tree=wt merge evil",
+        "git -C sub apply ../fix.diff",
+    ],
+)
+def test_git_raw_write_and_work_tree_benign_forms_stay_permitted(
+    bash_tool: Bash, command: str
+) -> None:
+    _git_dir_with_bare_markers(bash_tool.cwd)
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.ALWAYS, f"{command}: {context.reason}"
+
+
+def test_include_then_push_compound_is_denied_without_a_proposal(
+    bash_tool: Bash,
+) -> None:
+    # The F-1 exploit shape: the include write folds an authored file that
+    # could set remote.<name>.pushurl for a verified remote, so it is
+    # denied on its own segment and the whole compound call — the push
+    # included — carries no proposal.
+    context = bash_tool.resolve_permission(
+        BashArgs(command="git config include.path /tmp/evil.cfg && git push origin")
+    )
+    assert context is not None
+    assert context.permission is ToolPermission.NEVER
+    assert context.denial_kind is None
+    assert context.dangerous_command_proposal is None
+    assert context.reason
+    assert "push-effecting configuration" in context.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git config user.name X",
+        "git config --global user.name X",
+        "git config --get remote.origin.mirror",
+        "git config --get remote.origin.url",
+        "git config --get branch.main.remote",
+        "git config --get url.https://x/.pushInsteadOf",
+        "git config --get remote.origin.vcs",
+        "git config --get core.sshCommand",
+        "git config --get core.gitProxy",
+        "git config --get core.askPass",
+        "git config --get credential.helper",
+        "git config --get credential.https://example.com.helper",
+        "git config --get include.path",
+        "git config --get includeIf.gitdir:/x.path",
+        "git config --list",
+        # Reads of the newly guarded keys never write: the bare-key form is
+        # git's read form too.
+        "git config core.sshCommand",
+        "git config credential.helper",
+        "git config include.path",
+        "git config remote.origin.vcs",
+        # push.default writes stay routine: they broaden what a bare push
+        # publishes, never force, delete, or mirror.
+        "git config push.default simple",
+        "git config remote.origin.fetch +refs/heads/*:refs/remotes/origin/*",
+    ],
+)
+def test_config_reads_and_unrelated_writes_stay_permitted(
+    bash_tool: Bash, command: str
+) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None
+    assert context.permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git remote add origin ../x",
+        "git remote set-url origin ../x",
+        "git remote rename origin evil",
+        "git remote remove origin",
+        "git remote rm origin",
+    ],
+)
+def test_git_remote_mutations_are_denied(bash_tool: Bash, command: str) -> None:
+    # A git remote mutation redefines where a granted push lands, so it is
+    # a hard guard: denied with no grantable proposal.
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None
+    assert context.permission is ToolPermission.NEVER
+    assert context.denial_kind is None
+    assert context.dangerous_command_proposal is None
+    assert context.reason
+    assert "redefines where a granted push lands" in context.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git remote",
+        "git remote -v",
+        "git remote get-url origin",
+        "git remote show origin",
+        "git remote prune origin",
+    ],
+)
+def test_git_remote_reads_stay_permitted(bash_tool: Bash, command: str) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None
+    assert context.permission is ToolPermission.ALWAYS
+
+
+def test_a_push_grant_does_not_authorize_the_config_write(tmp_path: Path) -> None:
+    # The guard's boundary: an approved ordinary push stays publication,
+    # but it never extends to the config write that would make the push a
+    # mirror push.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    # The push destination is a bare name, so the repository must resolve
+    # it: a configured remote keeps the ordinary push grantable.
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/x.git",
+        ],
+        check=True,
+    )
+    scope = resolve_repository_scope(repo, GitRepositoryRelocation())
+    assert scope is not None
+    config = BashToolConfig(denylist=[])
+    tool = Bash(config_getter=lambda: config, state=BaseToolState(), cwd=repo)
+    tool.dangerous_command_authorities_getter = lambda: (
+        DangerousCommandAuthority(
+            operations=frozenset({"git.push"}), scope=scope, source="runtime_grant"
+        ),
+    )
+    context = tool.resolve_permission(BashArgs(command="git push origin"))
+    assert context is not None
+    assert context.permission is ToolPermission.ALWAYS
+    context = tool.resolve_permission(
+        BashArgs(command="git config remote.origin.mirror true && git push origin")
+    )
+    assert context is not None
+    assert context.permission is ToolPermission.NEVER
+    assert context.denial_kind is None
+    assert context.dangerous_command_proposal is None
 
 
 @pytest.mark.parametrize(
@@ -2330,3 +2948,1016 @@ def test_package_destinations_are_consistently_scoped(
     assert context.permission == (
         ToolPermission.ALWAYS if destination == "local" else ToolPermission.NEVER
     )
+
+
+# --- git apply --directory write roots and the --unsafe-paths hard guard
+# --- (delta re-review, round 2) ---
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # --unsafe-paths disables the path refusal git itself applies
+        # outside the work tree, including paths inside .git metadata:
+        # a hard guard, whatever else the call carries.
+        "git apply --unsafe-paths hook.diff",
+        "git apply --unsafe-paths --directory=.git/hooks hook.diff",
+        "git apply --directory=.git/hooks --unsafe-paths hook.diff",
+        "git apply --unsafe-paths --directory=fixes hook.diff",
+        "git apply --unsafe-paths --directory=/abs/path hook.diff",
+    ],
+)
+def test_git_apply_unsafe_paths_is_a_hard_guard(command: str) -> None:
+    policy = analyze_shell_command_policy(shlex.split(command))
+    assert policy.requires_approval
+    assert policy.denial_reason is not None
+    assert "--unsafe-paths" in policy.denial_reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Benign apply forms carry no hard guard: an in-workspace
+        # --directory is an ordinary write operand, and git am's
+        # --directory names the mailbox it reads.
+        "git apply hook.diff",
+        "git apply --directory=fixes hook.diff",
+        "git apply --exclude=*.txt --include=*.py hook.diff",
+        "git am hook.diff",
+        "git am --directory=.git/hooks hook.diff",
+    ],
+)
+def test_git_apply_benign_forms_carry_no_hard_guard(command: str) -> None:
+    policy = analyze_shell_command_policy(shlex.split(command))
+    assert not policy.requires_approval
+
+
+@pytest.mark.parametrize(
+    "command, expected",
+    [
+        # git apply --directory relocates the patch's write root: the value
+        # is a write operand like any other, in every spelling.
+        ("git apply --directory=.git/hooks hook.diff", (".git/hooks",)),
+        ("git apply --directory .git/hooks hook.diff", (".git/hooks",)),
+        ("git apply --directory=.git/hooks/ hook.diff", (".git/hooks/",)),
+        ("git apply -p0 --directory=.git/hooks hook.diff", (".git/hooks",)),
+        ("git apply --directory=/abs/path hook.diff", ("/abs/path",)),
+        ("git apply hook.diff", ()),
+        # git init creates its positional directory and the git dir its
+        # --separate-git-dir names; --template is a read, and --shared
+        # takes an optional attached value only, so it never consumes the
+        # positional.
+        ("git init newdir", ("newdir",)),
+        ("git init --shared newdir", ("newdir",)),
+        ("git init --template=/usr/share/git-core/templates newdir", ("newdir",)),
+        ("git init --separate-git-dir=.git/evil newdir", ("newdir", ".git/evil")),
+        ("git init", ()),
+        # git worktree add's first positional is the new work tree;
+        # --reason/-b take values, --orphan is bare.
+        ("git worktree add wt2", ("wt2",)),
+        ("git worktree add --lock --reason why wt2", ("wt2",)),
+        ("git worktree add -b topic wt2", ("wt2",)),
+        ("git worktree add --orphan wt2", ("wt2",)),
+        ("git worktree list", ()),
+        ("git worktree add", ()),
+    ],
+)
+def test_git_apply_init_and_worktree_destinations_are_write_operands(
+    command: str, expected: tuple[str, ...]
+) -> None:
+    policy = analyze_shell_command_policy(shlex.split(command))
+    assert policy.write_path_values == expected, command
+
+
+def test_git_cwd_relocations_models_the_c_chain(tmp_path: Path) -> None:
+    root = tmp_path.resolve()
+    # No -C (or an empty -C value, a no-op relocation git itself accepts):
+    # the tracked cwds resolve unchanged.
+    assert git_cwd_relocations(shlex.split("git archive -o b.tar HEAD"), {root}) is None
+    assert (
+        git_cwd_relocations(shlex.split("git -C '' archive -o b.tar HEAD"), {root})
+        is None
+    )
+    assert (
+        git_cwd_relocations(
+            shlex.split("git --git-dir=.git archive -o b.tar HEAD"), {root}
+        )
+        is None
+    )
+    # -C relocates each tracked cwd through the chain, in turn.
+    assert git_cwd_relocations(
+        shlex.split("git -C .git archive -o config HEAD"), {root}
+    ) == {root / ".git"}
+    assert git_cwd_relocations(
+        shlex.split("git -C sub -C .. archive -o b.tar HEAD"), {root}
+    ) == {root}
+    assert git_cwd_relocations(
+        shlex.split("git -C /abs archive -o b.tar HEAD"), {root}
+    ) == {Path("/abs")}
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # git's own -C relocation moves the write root into the metadata.
+        "git -C .git archive -o config HEAD",
+        "git -C .git archive -o hooks/pre-commit HEAD",
+        "git -C .git/hooks archive -o pre-commit HEAD",
+        "git -C .git archive -o index HEAD",
+        "git -C .git config --file=config user.name x",
+        "git -C .git config --file=hooks/pre-commit user.name x",
+        "git -C .git/hooks config --file=pre-commit user.name x",
+        "git -C subdir archive -o ../.git/config HEAD",
+        "git -C subdir config --file=../.git/config user.name x",
+    ],
+)
+def test_git_c_relocated_write_operands_are_denied(
+    bash_tool: Bash, command: str
+) -> None:
+    _git_dir_with_bare_markers(bash_tool.cwd)
+    (bash_tool.cwd / "subdir").mkdir()
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.NEVER, f"{command}: {context.reason}"
+    assert "protected Git metadata" in (context.reason or ""), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Legitimate relocations: the write lands outside the metadata.
+        "git -C subdir archive -o bundle.tar HEAD",
+        "git -C subdir archive -o ../bundle.tar HEAD",
+        "git -C subdir config --file=custom.cfg user.name x",
+        "git -C subdir config --file=../custom.cfg user.name x",
+        "git -C . -C . archive -o bundle.tar HEAD",
+        "git -C .git status",
+        "git -C .git log",
+    ],
+)
+def test_git_c_relocated_benign_forms_stay_permitted(
+    bash_tool: Bash, command: str
+) -> None:
+    _git_dir_with_bare_markers(bash_tool.cwd)
+    (bash_tool.cwd / "subdir").mkdir()
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.ALWAYS, f"{command}: {context.reason}"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # --directory relocates the patch's write root into the metadata.
+        "git apply --directory=.git/hooks hook.diff",
+        "git apply --directory .git/hooks hook.diff",
+        "git apply --directory=./.git/hooks hook.diff",
+        "git apply --directory=.git/../.git/hooks hook.diff",
+        "git apply --directory=.git/hooks/ hook.diff",
+        "git apply -p0 --directory=.git/hooks hook.diff",
+        "git apply --directory=.git hook.diff",
+        "git -C subdir apply --directory=../.git/hooks hook.diff",
+        # ...and outside the workspace.
+        "git apply --directory=/tmp/outside hook.diff",
+        "git apply --directory=../outside hook.diff",
+    ],
+)
+def test_git_apply_directory_write_roots_are_denied(
+    bash_tool: Bash, command: str
+) -> None:
+    _git_dir_with_bare_markers(bash_tool.cwd)
+    (bash_tool.cwd / "subdir").mkdir()
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.NEVER, f"{command}: {context.reason}"
+    reason = context.reason or ""
+    if "outside" in command:
+        assert "outside the authorized workspace" in reason, command
+    else:
+        assert "protected Git metadata" in reason, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git apply --unsafe-paths hook.diff",
+        "git apply --unsafe-paths --directory=.git/hooks hook.diff",
+        "git apply --unsafe-paths --directory=fixes hook.diff",
+    ],
+)
+def test_git_apply_unsafe_paths_is_denied_without_a_proposal(
+    bash_tool: Bash, command: str
+) -> None:
+    _git_dir_with_bare_markers(bash_tool.cwd)
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.NEVER, f"{command}: {context.reason}"
+    assert context.denial_kind is None
+    assert context.dangerous_command_proposal is None
+    assert "--unsafe-paths" in (context.reason or ""), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git apply hook.diff",
+        "git apply --directory=fixes hook.diff",
+        "git apply --exclude=*.txt hook.diff",
+        "git am hook.diff",
+        "git am --directory=.git/hooks hook.diff",
+    ],
+)
+def test_git_apply_benign_forms_stay_permitted(bash_tool: Bash, command: str) -> None:
+    _git_dir_with_bare_markers(bash_tool.cwd)
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.ALWAYS, f"{command}: {context.reason}"
+
+
+# --- git init / git worktree add destinations (delta re-review, round 2) ---
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Destinations resolving into the metadata.
+        "git init .git/evil",
+        "git init .git/hooks/evil",
+        "git init --separate-git-dir=.git/evil newdir",
+        "git init --separate-git-dir .git/evil newdir",
+        "git worktree add .git/wt2",
+        "git worktree add .git/hooks/wt",
+        "git worktree add -b wtb .git/wt2",
+        "git worktree add --lock --reason why .git/wt2",
+        "git -C subdir init ../.git/evil",
+        "git -C subdir worktree add ../.git/wt2",
+        # ...and outside the workspace.
+        "git init /tmp/outside-init",
+        "git worktree add ../outside-wt",
+    ],
+)
+def test_git_init_and_worktree_add_metadata_destinations_are_denied(
+    bash_tool: Bash, command: str
+) -> None:
+    _git_dir_with_bare_markers(bash_tool.cwd)
+    (bash_tool.cwd / "subdir").mkdir()
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.NEVER, f"{command}: {context.reason}"
+    reason = context.reason or ""
+    if "outside" in command:
+        assert "outside the authorized workspace" in reason, command
+    else:
+        assert "protected Git metadata" in reason, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # No positional: git init creates .git in the cwd, which stays
+        # permitted; in-workspace destinations stay permitted.
+        "git init",
+        "git init newdir",
+        "git init --shared newdir",
+        "git init --shared=group newdir",
+        "git init -b trunk newdir",
+        "git init --template=/usr/share/git-core/templates newdir",
+        "git worktree add wt2",
+        "git worktree add -b wtb wt2",
+        "git worktree add --orphan wt2",
+        "git worktree list",
+        # git clone keeps its existing treatment (not a metadata destination).
+        "git clone -q . /tmp/x-clone",
+    ],
+)
+def test_git_init_and_worktree_add_benign_forms_stay_permitted(
+    bash_tool: Bash, command: str
+) -> None:
+    _git_dir_with_bare_markers(bash_tool.cwd)
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.ALWAYS, f"{command}: {context.reason}"
+
+
+# --- Newly inspected write/mutate commands (delta re-review, round 2) ---
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # cpio: the pass-through destination positional, the -D directory
+        # copy-in changes into, and the copy-out archive files.
+        "cpio -p .git/hooks",
+        "cpio --pass-through .git/hooks",
+        "cpio -i -D .git",
+        "cpio -o -F .git/config",
+        "cpio -o -O .git/config",
+        # shred and fallocate mutate their positional file in place.
+        "shred .git/config",
+        "shred -u .git/config",
+        "fallocate -l 100 .git/config",
+        # ar: the archive operand is created or replaced, and --output
+        # names the extraction destination.
+        "ar rcs .git/evil.a x.o",
+        "ar x --output=.git lib.a",
+        # pax/bsdtar: tar-family archive operands and extraction
+        # destinations.
+        "pax -w -f .git/bundle.tar seed.txt",
+        "pax -r -f .git/config",
+        "bsdtar -cf .git/bundle.tar seed.txt",
+        "bsdtar -C .git -xf evil.tgz",
+    ],
+)
+def test_unmodeled_file_command_metadata_writes_are_denied(
+    bash_tool: Bash, command: str
+) -> None:
+    _git_dir_with_bare_markers(bash_tool.cwd)
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.NEVER, f"{command}: {context.reason}"
+    assert "protected Git metadata" in (context.reason or ""), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cpio -p outdir",
+        "cpio -i -D outdir",
+        "cpio -o -F out.cpio",
+        "cpio -t",
+        "shred seed.txt",
+        "fallocate -l 100 seed.txt",
+        "ar rcs lib.a x.o",
+        "ar t lib.a",
+        "pax -w -f out.tar seed.txt",
+        "bsdtar -cf out.tar seed.txt",
+        "bsdtar -C outdir -xf good.tgz",
+    ],
+)
+def test_unmodeled_file_command_benign_forms_stay_permitted(
+    bash_tool: Bash, command: str
+) -> None:
+    _git_dir_with_bare_markers(bash_tool.cwd)
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.ALWAYS, f"{command}: {context.reason}"
+
+
+# --- Round-3 closures (P10 final enumeration round) ---
+#
+# The same-family gaps the closure check named: binutils/assembler output
+# operands, config-content writers, in-place compression mutators, archive
+# creation/extraction destinations, mktemp, the round-3 program-selection
+# config keys, and the worktree-move/submodule-add destinations. Grammar
+# facts verified against the shipped tools (binutils 2.46, Info-ZIP zip 3.0,
+# 7-Zip 26.00, unar 1.10.8, xz-utils 5.8.3, zstd 1.5.7, uutils mktemp 0.8.0,
+# OpenSSH scp 10.2p1, GnuPG 2.4.8, libxml2 xmllint 2.15.2).
+
+
+@pytest.mark.parametrize(
+    "tokens,expected",
+    [
+        # strip: -o names the written result in the separate and attached
+        # forms; every positional operand is mutated in place.
+        (["strip", "-o", "out", "evil"], ("out", "evil")),
+        (["strip", "-ores", "evil"], ("res", "evil")),
+        (["strip", "evil"], ("evil",)),
+        (["strip", "-R", ".text", "-o", "out", "evil"], ("out", "evil")),
+        # objcopy: the positional output operand (and the in-place input).
+        (["objcopy", "evil", "out"], ("evil", "out")),
+        (["objcopy", "evil"], ("evil",)),
+        # as: -o names the written object, separate and attached.
+        (["as", "-o", "out.o", "evil.s"], ("out.o",)),
+        (["as", "-ores.o", "evil.s"], ("res.o",)),
+    ],
+)
+def test_binutils_output_operands_are_write_operands(
+    tokens: list[str], expected: tuple[str, ...]
+) -> None:
+    policy = analyze_shell_command_policy(tokens)
+    assert not policy.requires_approval
+    candidates = path_candidates(tokens, inspect_positional_paths=True)
+    for value in expected:
+        assert value in candidates, (tokens, value)
+
+
+@pytest.mark.parametrize(
+    "tokens,expected",
+    [
+        # gpg: every -o/--output spelling names the written output file.
+        (["gpg", "--decrypt", "-o", "out", "payload.gpg"], ("out",)),
+        (["gpg", "--decrypt", "-ores", "payload.gpg"], ("res",)),
+        (["gpg", "--decrypt", "--output", "out", "payload.gpg"], ("out",)),
+        (["gpg", "--decrypt", "--output=out", "payload.gpg"], ("out",)),
+        # xmllint: --output/-o name the written XML result.
+        (["xmllint", "--output", "out", "doc.xml"], ("out",)),
+        (["xmllint", "-o", "out", "doc.xml"], ("out",)),
+        # scp: a local-to-local copy inspects BOTH operands (the ln rule);
+        # value-taking options never surface as positional candidates.
+        (["scp", "seed.txt", "copied.txt"], ("seed.txt", "copied.txt")),
+        (["scp", "-P", "22", "seed.txt", "copied.txt"], ("seed.txt", "copied.txt")),
+        (["scp", "-i", "id", "seed.txt", "host:x"], ("seed.txt", "host:x")),
+    ],
+)
+def test_config_content_writer_operands_are_write_operands(
+    tokens: list[str], expected: tuple[str, ...]
+) -> None:
+    policy = analyze_shell_command_policy(tokens)
+    assert not policy.requires_approval
+    candidates = path_candidates(tokens, inspect_positional_paths=True)
+    for value in expected:
+        assert value in candidates, (tokens, value)
+
+
+@pytest.mark.parametrize(
+    "tokens,expected",
+    [
+        # The in-place compression families: every positional operand is
+        # replaced or annotated in place.
+        (["bzip2", "seed.txt"], ("seed.txt",)),
+        (["bunzip2", "seed.txt.bz2"], ("seed.txt.bz2",)),
+        (["bzcat", "seed.txt.bz2"], ("seed.txt.bz2",)),
+        (["xz", "seed.txt"], ("seed.txt",)),
+        (["unxz", "seed.txt.xz"], ("seed.txt.xz",)),
+        (["xzcat", "seed.txt.xz"], ("seed.txt.xz",)),
+        (["lzma", "seed.txt"], ("seed.txt",)),
+        (["unlzma", "seed.txt.lzma"], ("seed.txt.lzma",)),
+        (["lzcat", "seed.txt.lzma"], ("seed.txt.lzma",)),
+        (["lzmainfo", "seed.txt.lzma"], ("seed.txt.lzma",)),
+        # zstd: the positionals mutate in place, and -o/--output-dir-*
+        # name written destinations in the separate and `=` spellings.
+        (["zstd", "seed.txt"], ("seed.txt",)),
+        (["zstdmt", "seed.txt"], ("seed.txt",)),
+        (["unzstd", "seed.txt.zst"], ("seed.txt.zst",)),
+        (["zstdcat", "seed.txt.zst"], ("seed.txt.zst",)),
+        (["zstd", "-o", "out.zst", "seed.txt"], ("out.zst", "seed.txt")),
+        (["zstd", "--output-dir-flat=odir", "seed.txt"], ("odir", "seed.txt")),
+        (["zstd", "--output-dir-mirror", "odm", "seed.txt"], ("odm", "seed.txt")),
+    ],
+)
+def test_compression_mutator_operands_are_write_operands(
+    tokens: list[str], expected: tuple[str, ...]
+) -> None:
+    policy = analyze_shell_command_policy(tokens)
+    assert not policy.requires_approval
+    candidates = path_candidates(tokens, inspect_positional_paths=True)
+    for value in expected:
+        assert value in candidates, (tokens, value)
+
+
+@pytest.mark.parametrize(
+    "tokens,expected",
+    [
+        # zip: the positional archive operand is created or replaced (the
+        # value-taking options are consumed, never candidates).
+        (["zip", "out.zip", "seed.txt"], ("out.zip", "seed.txt")),
+        (["zip", "-r", "-q", "out.zip", "sub"], ("out.zip", "sub")),
+        (["zip", "-P", "secret", "out.zip", "seed.txt"], ("out.zip", "seed.txt")),
+        # 7z/7zr/7za: the positional archive operand, plus the attached -o
+        # extraction destination (7z rejects the separate spelling, so its
+        # value stays a positional candidate the scan still inspects).
+        (["7z", "a", "out.7z", "seed.txt"], ("a", "out.7z", "seed.txt")),
+        (["7zr", "a", "out.7z", "seed.txt"], ("a", "out.7z", "seed.txt")),
+        (["7za", "a", "out.7z", "seed.txt"], ("a", "out.7z", "seed.txt")),
+        (["7z", "x", "-ooutdir", "evil.7z"], ("outdir", "x", "evil.7z")),
+        (["7z", "x", "-o", "outdir", "evil.7z"], ("outdir", "x", "evil.7z")),
+        # unar: the four real -o spellings name the extraction directory.
+        (["unar", "-f", "-o", "outdir", "evil.zip"], ("outdir",)),
+        (["unar", "-f", "-o=outdir", "evil.zip"], ("outdir",)),
+        (["unar", "-f", "-output-directory", "outdir", "evil.zip"], ("outdir",)),
+        (["unar", "-f", "-output-directory=outdir", "evil.zip"], ("outdir",)),
+    ],
+)
+def test_archive_destination_operands_are_write_operands(
+    tokens: list[str], expected: tuple[str, ...]
+) -> None:
+    policy = analyze_shell_command_policy(tokens)
+    assert not policy.requires_approval
+    candidates = path_candidates(tokens, inspect_positional_paths=True)
+    for value in expected:
+        assert value in candidates, (tokens, value)
+
+
+@pytest.mark.parametrize(
+    "tokens,expected",
+    [
+        # mktemp: the template positionals name the created files, and
+        # -p/--tmpdir name the directory they are created in (the long form
+        # takes its directory only attached).
+        (["mktemp", "tmpl.XXXXXX"], ("tmpl.XXXXXX",)),
+        (["mktemp", "-p", "tmpdir", "tmpl.XXXXXX"], ("tmpdir", "tmpl.XXXXXX")),
+        (["mktemp", "-ptmpdir", "tmpl.XXXXXX"], ("tmpdir", "tmpl.XXXXXX")),
+        (["mktemp", "--tmpdir=tmpdir", "tmpl.XXXXXX"], ("tmpdir", "tmpl.XXXXXX")),
+        (["mktemp", "-d", "-p", "tmpdir"], ("tmpdir",)),
+    ],
+)
+def test_mktemp_creation_operands_are_write_operands(
+    tokens: list[str], expected: tuple[str, ...]
+) -> None:
+    policy = analyze_shell_command_policy(tokens)
+    assert not policy.requires_approval
+    candidates = path_candidates(tokens, inspect_positional_paths=True)
+    for value in expected:
+        assert value in candidates, (tokens, value)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Binutils/assembler output operands into metadata.
+        "strip -o .git/hooks/pre-push evil",
+        "strip -o .git/config evil",
+        "strip -o.git/config evil",
+        "strip .git/config",
+        "strip -R .text .git/config",
+        "objcopy evil .git/hooks/pre-push",
+        "objcopy --strip-all evil .git/config",
+        "objcopy .git/config",
+        "as -o .git/config evil.s",
+        "as -o.git/config evil.s",
+        # Config-content writers into metadata (gpg/xmllint output, scp
+        # local-to-local in both directions).
+        "gpg --batch --yes --pinentry-mode loopback --passphrase x --decrypt -o .git/config payload.gpg",
+        "gpg --batch --yes --pinentry-mode loopback --passphrase x --decrypt --output .git/config payload.gpg",
+        "gpg --batch --yes --pinentry-mode loopback --passphrase x --decrypt --output=.git/config payload.gpg",
+        "gpg --batch --yes --pinentry-mode loopback --passphrase x --decrypt -o.git/config payload.gpg",
+        "xmllint --output .git/config doc.xml",
+        "xmllint -o .git/config doc.xml",
+        "xmllint --output=.git/config doc.xml",
+        "scp seed.txt .git/config",
+        "scp .git/config out.txt",
+        "scp -r .git host:x",
+        # In-place compression mutators.
+        "bzip2 .git/config",
+        "bunzip2 .git/config.bz2",
+        "bzcat .git/config.bz2",
+        "xz .git/config",
+        "unxz .git/config.xz",
+        "xzcat .git/config.xz",
+        "zstd .git/config",
+        "zstd -q -o .git/config seed.txt",
+        "zstd --output-dir-flat=.git seed.txt",
+        "zstd --output-dir-mirror .git seed.txt",
+        "zstdmt .git/config",
+        "unzstd .git/config.zst",
+        "lzma .git/config",
+        "unlzma .git/config.lzma",
+        "lzcat .git/config.lzma",
+        "lzmainfo .git/config.lzma",
+        # Archive creation/extraction destinations.
+        "zip .git/evil.zip seed.txt",
+        "zip -r .git/evil2.zip sub",
+        "7z a .git/evil.7z seed.txt",
+        "7zr a .git/evilr.7z seed.txt",
+        "7za a .git/evil.7z seed.txt",
+        "7z x -o.git evil.7z",
+        "7z x -o .git evil.7z",
+        "unar -f -o .git evil.zip",
+        "unar -f -o=.git evil.zip",
+        "unar -f -output-directory .git evil.zip",
+        "unar -f -output-directory=.git evil.zip",
+        # mktemp creation operands.
+        "mktemp .git/evil.XXXXXX",
+        "mktemp -p .git evil.XXXXXX",
+        "mktemp --tmpdir=.git evil.XXXXXX",
+        # git worktree move / submodule add destinations.
+        "git worktree move wt .git/wt2",
+        "git worktree move -f wt .git/wt2",
+        "git -C sub worktree move ../wt ../.git/wt2",
+        "git submodule add ../src .git/evilmod",
+        "git submodule add -b main ../src .git/evilmod",
+        "git submodule add --separate-git-dir=.git/evilmod ../src dest",
+        "git -C sub submodule add ../../src ../.git/evilmod",
+        # ...and outside the workspace (the write-operand authority denies
+        # them, exactly like the init/worktree-add flips).
+        "git worktree move wt ../outside-wt",
+        "git submodule add ../src ../outside-mod",
+    ],
+)
+def test_round3_write_operand_metadata_writes_are_denied(
+    bash_tool: Bash, command: str
+) -> None:
+    _git_dir_with_bare_markers(bash_tool.cwd)
+    (bash_tool.cwd / "sub").mkdir()
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.NEVER, f"{command}: {context.reason}"
+    reason = context.reason or ""
+    if "outside" in command:
+        assert "outside the authorized workspace" in reason, command
+    else:
+        assert "protected Git metadata" in reason, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Binutils/assembler benign forms.
+        "strip -o stripped evil",
+        "strip evil",
+        "strip -R .text -o stripped2 evil",
+        # --output abbreviates --output-target in real strip, so the form
+        # consumes the operand as a bfdname and errors: no write happens.
+        "strip --output .git/config evil",
+        "objcopy evil copied",
+        "objcopy --strip-all evil copied2",
+        "as -o evil.o evil.s",
+        # Config-content writers to workspace/scratchpad targets.
+        "gpg --batch --yes --pinentry-mode loopback --passphrase x --decrypt -o out.txt payload.gpg",
+        "xmllint --output out.xml doc.xml",
+        "xmllint -o out2.xml doc.xml",
+        "scp seed.txt copied.txt",
+        "scp -P 22 seed.txt copied2.txt",
+        "scp -i fake-id seed.txt copied3.txt",
+        # scp remote forms stay outside the local-metadata scope.
+        "scp seed.txt host:x",
+        "scp host:x local.txt",
+        # In-place compression mutators on workspace files.
+        "bzip2 seed.txt",
+        "bunzip2 seed.txt.bz2",
+        "bzcat seed.txt.bz2",
+        "xz seed.txt",
+        "unxz seed.txt.xz",
+        "xzcat seed.txt.xz",
+        "zstd seed.txt",
+        "zstd -q -o out.zst seed.txt",
+        "zstd --output-dir-flat=odir seed.txt",
+        "zstd --output-dir-mirror odm seed.txt",
+        "zstdmt seed.txt",
+        "unzstd seed.txt.zst",
+        "lzma seed.txt",
+        "unlzma seed.txt.lzma",
+        "lzcat seed.txt.lzma",
+        "lzmainfo seed.txt.lzma",
+        # Archive destinations in the workspace.
+        "zip out.zip seed.txt",
+        "zip -r out2.zip sub",
+        "zip -q -b . out3.zip seed.txt",
+        "zip -P secret out4.zip seed.txt",
+        "7z a out.7z seed.txt",
+        "7zr a outr.7z seed.txt",
+        "7za a out5.7z seed.txt",
+        "7z x -od7z evil.7z",
+        "7z l out.7z",
+        # -o= names a directory literally called "=.git" in real 7z (the
+        # value is everything after -o), never the metadata directory.
+        "7z x -o=.git evil.7z",
+        "unar -f -o unarout evil.zip",
+        "unar -f -o=unarout2 evil.zip",
+        # mktemp creation in the workspace (no operand: the default temp
+        # directory stays permitted).
+        "mktemp",
+        "mktemp tmpl.XXXXXX",
+        "mktemp -p . tmpl2.XXXXXX",
+        "mktemp --tmpdir=. tmpl3.XXXXXX",
+        # git worktree move / submodule add to workspace destinations.
+        "git worktree move wt wt3",
+        "git worktree move -f wt wt4",
+        "git submodule add ../src submod",
+        "git submodule add -b main ../src submod2",
+        "git submodule list",
+        "git worktree list",
+    ],
+)
+def test_round3_write_operand_benign_forms_stay_permitted(
+    bash_tool: Bash, command: str
+) -> None:
+    _git_dir_with_bare_markers(bash_tool.cwd)
+    (bash_tool.cwd / "sub").mkdir()
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None, command
+    assert context.permission is ToolPermission.ALWAYS, f"{command}: {context.reason}"
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("git worktree move wt dest", ("dest",)),
+        ("git worktree move -f wt dest", ("dest",)),
+        ("git worktree move --force wt dest", ("dest",)),
+        ("git worktree add dest", ("dest",)),
+        ("git submodule add ../src dest", ("dest",)),
+        ("git submodule add -b main --name nm ../src dest", ("dest",)),
+        ("git submodule add --separate-git-dir=gd ../src dest", ("dest", "gd")),
+        ("git submodule add ../src", ()),
+        ("git worktree move wt", ()),
+        ("git worktree prune", ()),
+        ("git submodule status", ()),
+    ],
+)
+def test_git_worktree_move_and_submodule_add_destinations_are_write_operands(
+    command: str, expected: tuple[str, ...]
+) -> None:
+    policy = analyze_shell_command_policy(shlex.split(command))
+    assert not policy.requires_approval, command
+    assert policy.write_path_values == expected, command
+
+
+# --- Shell policy v0.2 (ADR 0021): occurrence-local cd+redirect chains and
+# --- scratchpad absolute redirect targets ---
+
+
+@pytest.fixture
+def workspace(tmp_path: Path) -> Path:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "sub").mkdir()
+    (root / "sub" / "nested").mkdir()
+    (root / "file.txt").write_text("x\n")
+    (root / "sub" / "file.txt").write_text("x\n")
+    return root
+
+
+@pytest.fixture
+def scratchpad_dir(tmp_path: Path) -> Path:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    return scratch
+
+
+def _v02_tool(
+    cwd: Path,
+    scratchpad: Path | None = None,
+    *,
+    denylist: list[str] | None = None,
+    denylist_standalone: list[str] | None = None,
+) -> Bash:
+    config = BashToolConfig(
+        denylist=denylist if denylist is not None else ["bash -i", "curl"],
+        denylist_standalone=(
+            denylist_standalone if denylist_standalone is not None else ["python"]
+        ),
+    )
+    return Bash(
+        config_getter=lambda: config,
+        state=BaseToolState(),
+        cwd=cwd,
+        scratchpad_dir=scratchpad,
+    )
+
+
+def _v02_verdict(tool: Bash, command: str) -> ToolPermission:
+    result = tool.resolve_permission(BashArgs(command=command))
+    assert result is not None, command
+    return result.permission
+
+
+def _v02_reason(tool: Bash, command: str) -> str:
+    result = tool.resolve_permission(BashArgs(command=command))
+    assert result is not None, command
+    return result.reason or ""
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Compound investigation chains: cd, pipeline, separators (ADR 0021).
+        "cd sub && grep x file.txt | head; echo ---; git branch -a",
+        "cd sub && grep x file.txt 2>&1 | head; echo ---; git branch -a",
+        "cd sub && grep x file.txt > /dev/null",
+        "cd sub && grep x file.txt > out.log",
+        "cd sub && grep x file.txt >> out.log 2> err.log",
+        "cd sub; grep x file.txt > out.log",
+        "cd sub && grep x file.txt > out.log; cd sub/nested && grep y file.txt > y.log",
+        # A redirect before a cd resolves against the pre-cd working directory.
+        "grep x file.txt > out.log && cd sub",
+        "grep x file.txt > out.log && pushd sub",
+        # A redirect attached to the cd command itself resolves against the
+        # pre-cd working directory (bash opens the file before running cd).
+        "cd sub > log",
+        "pushd sub > log",
+        # Nested sources resolve occurrence-locally too.
+        "bash -c 'cd sub && grep x file.txt > out.log'",
+        "bash -c 'grep x file.txt > out.log && cd sub'",
+    ],
+)
+def test_cd_chains_with_redirects_are_allowed(workspace: Path, command: str) -> None:
+    tool = _v02_tool(workspace)
+    assert _v02_verdict(tool, command) is ToolPermission.ALWAYS, command
+
+
+@pytest.mark.parametrize(
+    ("command", "reason"),
+    [
+        # The redirect target itself leaves the workspace.
+        (
+            "cd sub && grep x file.txt > ../outside.log",
+            "outside the authorized workspace",
+        ),
+        # A cd outside the workspace is still denied, redirect or not.
+        ("grep x file.txt > out.log && cd /tmp", "outside the authorized workspace"),
+        ("cd /tmp > log", "outside the authorized workspace"),
+        ("cd /tmp && grep x file.txt > out.log", "outside the authorized workspace"),
+        # Dynamic cd forms stay fail-closed (documented residual): the
+        # unresolvable cd makes the relative redirect target's working
+        # directory unknown, and the analysis denies the expansion itself.
+        ("cd $HOME && grep x file.txt > out.log", "not statically known"),
+        ("cd $(pwd) && grep x file.txt > out.log", "not statically known"),
+        # A redirect after a cd that cannot be statically resolved fails
+        # closed on the unknown working directory.
+        ("popd +1 && grep x file.txt > out.log", "not statically known"),
+        ("cd - && grep x file.txt > out.log", "not statically known"),
+        # Heredocs stay fail-closed (documented residual).
+        ("cd sub && cat <<EOF > out.log\nhi\nEOF", "heredocs are unsupported"),
+    ],
+)
+def test_cd_chains_with_redirects_still_fail_closed(
+    workspace: Path, command: str, reason: str
+) -> None:
+    tool = _v02_tool(workspace)
+    assert _v02_verdict(tool, command) is ToolPermission.NEVER, command
+    assert reason in _v02_reason(tool, command), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo hi > {scratch}/log.txt",
+        "grep x file.txt > {scratch}/log.txt",
+        "grep x file.txt 2> {scratch}/err.log",
+        "cd sub && grep x file.txt > {scratch}/log.txt",
+        "grep x file.txt > {scratch}/log.txt && cd sub",
+        "cd {scratch} && echo hi > log.txt",
+        "bash -c 'echo hi > {scratch}/log.txt'",
+    ],
+)
+def test_absolute_scratchpad_redirect_targets_are_allowed(
+    workspace: Path, scratchpad_dir: Path, command: str
+) -> None:
+    tool = _v02_tool(workspace, scratchpad_dir)
+    resolved = command.format(scratch=scratchpad_dir)
+    assert _v02_verdict(tool, resolved) is ToolPermission.ALWAYS, resolved
+
+
+@pytest.mark.parametrize(
+    ("command", "reason"),
+    [
+        # Outside workspace and scratchpad.
+        ("echo hi > /etc/x", "outside the authorized workspace"),
+        # Absolute targets inside the workspace but outside the scratchpad
+        # stay denied: only scratchpad targets are authorized (ADR 0021).
+        ("echo hi > {workspace}/abs.log", "an absolute redirection target"),
+        # A sibling directory that merely spells like the scratchpad root:
+        # the path layer denies it as outside workspace+scratchpad, and the
+        # analysis would deny it as an absolute target under any roots.
+        (
+            "echo hi > {workspace}/../scratch-sibling/log.txt",
+            "outside the authorized workspace",
+        ),
+        # A path that escapes the scratchpad root through a parent component.
+        ("echo hi > {scratch}/../outside.log", "outside the authorized workspace"),
+        # Sensitive patterns still apply inside the scratchpad.
+        ("echo hi > {scratch}/.env", "Sensitive file"),
+    ],
+)
+def test_absolute_redirect_targets_outside_scratchpad_are_denied(
+    workspace: Path, scratchpad_dir: Path, command: str, reason: str
+) -> None:
+    (workspace.parent / "scratch-sibling").mkdir()
+    tool = _v02_tool(workspace, scratchpad_dir)
+    resolved = command.format(workspace=workspace, scratch=scratchpad_dir)
+    assert _v02_verdict(tool, resolved) is ToolPermission.NEVER, resolved
+    assert reason in _v02_reason(tool, resolved), resolved
+
+
+def test_absolute_scratchpad_redirect_symlink_escape_is_denied(
+    workspace: Path, scratchpad_dir: Path, tmp_path: Path
+) -> None:
+    # A symlink inside the scratchpad that points outside it is not a
+    # scratchpad target: the full realpath is matched, component-wise.
+    (scratchpad_dir / "escape").symlink_to(tmp_path, target_is_directory=True)
+    tool = _v02_tool(workspace, scratchpad_dir)
+    command = f"echo hi > {scratchpad_dir}/escape/log.txt"
+    assert _v02_verdict(tool, command) is ToolPermission.NEVER, command
+    assert "outside the authorized workspace" in _v02_reason(tool, command)
+
+
+def test_absolute_scratchpad_redirect_follows_changed_roots(
+    workspace: Path, scratchpad_dir: Path, tmp_path: Path
+) -> None:
+    # The roots are read from the live path authority per resolution.
+    tool = _v02_tool(workspace, scratchpad_dir)
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    command = f"echo hi > {scratchpad_dir}/log.txt"
+    assert _v02_verdict(tool, command) is ToolPermission.ALWAYS
+
+    other = _v02_tool(workspace, replacement)
+    assert _v02_verdict(other, command) is ToolPermission.NEVER
+    assert (
+        _v02_verdict(other, f"echo hi > {replacement}/log.txt") is ToolPermission.ALWAYS
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # The <redirect> marker keeps a redirected standalone-denylisted
+        # command runnable (ADR 0021: marker semantics preserved).
+        ("python > log.txt", ToolPermission.ALWAYS),
+        ("python script.py > log.txt", ToolPermission.ALWAYS),
+        ("python", ToolPermission.NEVER),
+        # Prefix denylisting is unaffected by the marker.
+        ("curl https://x.test/ > log.txt", ToolPermission.NEVER),
+        ("curl https://x.test/", ToolPermission.NEVER),
+    ],
+)
+def test_redirect_marker_standalone_and_prefix_semantics_are_preserved(
+    workspace: Path, command: str, expected: ToolPermission
+) -> None:
+    tool = _v02_tool(workspace)
+    assert _v02_verdict(tool, command) is expected, command
+    if expected is ToolPermission.NEVER:
+        reason = _v02_reason(tool, command)
+        assert "standalone" in reason or "denylist" in reason, reason
+
+
+# --- P11 fix round: redirect-target glob exemption, concatenation-target
+# --- attribution, and script-loading operand inspection ---
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Bash never pathname-expands a redirect destination, so a literal
+        # glob-looking target is a literal filename, not a glob.
+        "echo x > f[0]",
+        'echo x > f"*"',
+        'echo x > "f"[0]',
+        'echo x > "sub"/f[0]',
+        "echo x > out[1].log",
+    ],
+)
+def test_glob_looking_redirect_targets_are_literal_filenames(
+    workspace: Path, command: str
+) -> None:
+    tool = _v02_tool(workspace)
+    assert _v02_verdict(tool, command) is ToolPermission.ALWAYS, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # The path-glob heuristic still fires for command operands, where
+        # the shell really globs.
+        "cat f[0]",
+        "cp f* out",
+        "ls f[0]",
+    ],
+)
+def test_glob_command_operands_still_fail_closed(workspace: Path, command: str) -> None:
+    tool = _v02_tool(workspace)
+    assert _v02_verdict(tool, command) is ToolPermission.NEVER, command
+    assert "glob" in _v02_reason(tool, command), command
+
+
+def test_concatenation_redirect_target_escaping_workspace_is_denied(
+    workspace: Path,
+) -> None:
+    # Pre-v0.2 bypass closed by the broadened _literal_redirect_target: at
+    # HEAD only word/string/raw_string destinations were extracted, so a
+    # concatenation destination was never path-checked and this wrote
+    # outside the workspace.
+    tool = _v02_tool(workspace)
+    command = 'echo x > "sub"/../../outside.log'
+    assert _v02_verdict(tool, command) is ToolPermission.NEVER, command
+    assert "outside the authorized workspace" in _v02_reason(tool, command), command
+
+
+def test_source_operands_are_path_inspected(
+    workspace: Path, scratchpad_dir: Path, tmp_path: Path
+) -> None:
+    # source/. read their operand as shell source, so the script path joins
+    # the path-inspected surface as a READ operand: outside scripts are
+    # denied, benign in-workspace and scratchpad scripts stay allowed.
+    (workspace / "sub" / "setup.sh").write_text("echo setup\n")
+    (workspace / "lib.sh").write_text("echo lib\n")
+    (scratchpad_dir / "env.sh").write_text("echo env\n")
+    (tmp_path / "evil.sh").write_text("echo evil\n")
+    tool = _v02_tool(workspace, scratchpad_dir)
+
+    denied = [
+        # Absolute outside script, with and without a redirect.
+        f"source {tmp_path}/evil.sh",
+        f"source {tmp_path}/evil.sh > out",
+        # The dot builtin reads the same operand.
+        f". {tmp_path}/evil.sh",
+        # Relative escape from the workspace.
+        "source ../evil.sh",
+        # The cd+redirect variant: the sourced path resolves against the
+        # tracked cwds (the monotonic union keeps the pre-cd directory a
+        # candidate), so the outside script is denied there too.
+        "cd sub && source ../evil.sh > out",
+    ]
+    for command in denied:
+        assert _v02_verdict(tool, command) is ToolPermission.NEVER, command
+        assert "outside the authorized workspace" in _v02_reason(tool, command), command
+
+    allowed = [
+        "source sub/setup.sh",
+        f"source {scratchpad_dir}/env.sh",
+        ". ./lib.sh",
+        "source sub/setup.sh > out",
+    ]
+    for command in allowed:
+        assert _v02_verdict(tool, command) is ToolPermission.ALWAYS, command

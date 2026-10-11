@@ -47,7 +47,16 @@ def test_recursive_rm_original_option_and_alternative(
 )
 @pytest.mark.parametrize(
     "code",
-    ["path_glob", "denylist", "policy", "command", "analysis", "nested_analysis"],
+    [
+        "path_glob",
+        "denylist",
+        "policy",
+        "command",
+        "analysis",
+        "nested_analysis",
+        "dangerous_command",
+        "dangerous_guard",
+    ],
 )
 def test_untrusted_fields_cannot_inject(code: str, unsafe: str) -> None:
     rendered = render_diagnostic(Diagnostic(code, unsafe, unsafe, unsafe))
@@ -219,3 +228,71 @@ def test_long_fields_are_bounded_without_partial_escape() -> None:
     assert len(rendered) <= MAX_DIAGNOSTIC_LENGTH
     assert "..." in rendered
     assert "\\u001..." not in rendered
+
+
+def test_dangerous_authority_denial_names_operation_and_consequence(
+    tmp_path: Path,
+) -> None:
+    # Missing dangerous authority is distinguishable from a denylist veto and
+    # from a hard guard: it names the operation and its consequence.
+    tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=tmp_path)
+    result = tool.resolve_permission(BashArgs(command="git push origin main"))
+    assert result is not None and result.permission == ToolPermission.NEVER
+    assert result.denial_kind == "dangerous_command"
+    assert "requires approval for a dangerous git operation" in (result.reason or "")
+    assert "git.push" in (result.reason or "")
+    assert "Publish local commits to the remote" in (result.reason or "")
+
+
+def test_dangerous_authority_denial_redacts_secrets_and_escapes_markup(
+    tmp_path: Path,
+) -> None:
+    secret = "synthetic-dangerous-secret-0123456789"
+    tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=tmp_path)
+    with bind_policy(ScrubPolicy(redaction_credentials=(("TEST_TOKEN", secret),))):
+        result = tool.resolve_permission(
+            BashArgs(command=f"git push {shlex.quote(secret + '[bold]\n\x1b[31m')}")
+        )
+    assert result is not None and result.permission == ToolPermission.NEVER
+    assert result.denial_kind == "dangerous_command"
+    assert result.reason and secret not in result.reason
+    assert "REDACTED" in result.reason
+    assert "[bold]" not in result.reason
+    assert "\x1b" not in result.reason and "\n" not in result.reason
+    assert len(result.reason) <= MAX_DIAGNOSTIC_LENGTH
+
+
+def test_denylist_veto_and_hard_guards_are_distinguishable(tmp_path: Path) -> None:
+    # An absolute denylist veto and a hard guard never read as a missing
+    # dangerous authority, and neither carries a grantable proposal.
+    tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=tmp_path)
+
+    veto = tool.resolve_permission(BashArgs(command="vim file.txt"))
+    assert veto is not None and veto.permission == ToolPermission.NEVER
+    assert veto.denial_kind is None
+    assert veto.dangerous_command_proposal is None
+    assert "matches denylist pattern 'vim'" in (veto.reason or "")
+
+    guard = tool.resolve_permission(BashArgs(command="git push --bogus origin main"))
+    assert guard is not None and guard.permission == ToolPermission.NEVER
+    assert guard.denial_kind is None
+    assert guard.dangerous_command_proposal is None
+    assert "requires approval" not in (guard.reason or "")
+    assert "--bogus" in (guard.reason or "")
+
+    policy_guard = tool.resolve_permission(BashArgs(command="git reset --hard HEAD"))
+    assert policy_guard is not None and policy_guard.permission == ToolPermission.NEVER
+    assert policy_guard.denial_kind is None
+    assert policy_guard.dangerous_command_proposal is None
+
+
+def test_unlocatable_repository_is_a_hard_guard(tmp_path: Path) -> None:
+    # A repository marker that cannot be interpreted fails closed with no
+    # grantable proposal.
+    (tmp_path / ".git").write_text("not a gitdir pointer")
+    tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=tmp_path)
+    result = tool.resolve_permission(BashArgs(command="git push"))
+    assert result is not None and result.permission == ToolPermission.NEVER
+    assert result.denial_kind is None
+    assert result.dangerous_command_proposal is None
+    assert "cannot be located" in (result.reason or "")

@@ -132,7 +132,12 @@ def test_preserves_tool_specific_fields_from_overrides():
     assert config.default_timeout == 600  # type: ignore[attr-defined]
 
 
-def test_cleared_bash_denylist_removes_shipped_git_defaults(tmp_path: Path):
+def test_cleared_bash_denylist_still_requires_dangerous_command_authority(
+    tmp_path: Path,
+):
+    # Breaking change: an empty denylist no longer implicitly authorizes the
+    # recognized git forms; they are denied pending dangerous-command
+    # authority, with no runtime approval handler wired in this manager.
     from chartreux.core.tools.builtins.bash import BashArgs
 
     vibe_config = build_test_vibe_config(tools={"bash": {"denylist": []}})
@@ -142,25 +147,30 @@ def test_cleared_bash_denylist_removes_shipped_git_defaults(tmp_path: Path):
 
     assert config.denylist == []  # type: ignore[attr-defined]
     tool = manager.get("bash")
-    for command in (
-        "git push",
-        "git -C . push",
-        "git checkout main",
-        "git stash drop",
-        "git stash clear",
-        "git restore file.txt",
-        "git switch --discard-changes",
-        "git switch -f main",
-        "git -C . switch --discard-changes",
-        "git reflog expire --all",
-        "git reflog delete main",
+    for command, operation_ids in (
+        ("git push", ("git.push",)),
+        ("git -C . push", ("git.push",)),
+        ("git checkout main", ("git.checkout",)),
+        ("git stash drop", ("git.stash.drop",)),
+        ("git stash clear", ("git.stash.clear",)),
+        ("git restore file.txt", ("git.restore",)),
+        ("git switch --discard-changes", ("git.switch.discard",)),
+        ("git switch -f main", ("git.switch.discard",)),
+        ("git -C . switch --discard-changes", ("git.switch.discard",)),
+        ("git reflog expire --all", ("git.reflog.expire",)),
+        ("git reflog delete main", ("git.reflog.delete",)),
     ):
         result = tool.resolve_permission(BashArgs(command=command))
-        assert result is not None and result.permission is ToolPermission.ALWAYS
+        assert result is not None and result.permission is ToolPermission.NEVER
+        assert result.denial_kind == "dangerous_command"
+        assert result.dangerous_command_proposal is not None
+        assert result.dangerous_command_proposal.operations == operation_ids
     # The policy layer's hard guards survive the configured removal.
     for command in ("git reset --hard HEAD", "git clean -fd"):
         result = tool.resolve_permission(BashArgs(command=command))
         assert result is not None and result.permission is ToolPermission.NEVER
+        assert result.denial_kind is None
+        assert result.dangerous_command_proposal is None
 
 
 def test_replaced_bash_denylist_keeps_unrelated_defaults(tmp_path: Path):
@@ -187,9 +197,13 @@ def test_replaced_bash_denylist_keeps_unrelated_defaults(tmp_path: Path):
         "git reflog delete main",
     ):
         result = tool.resolve_permission(BashArgs(command=command))
-        assert result is not None and result.permission is ToolPermission.ALWAYS
+        assert result is not None and result.permission is ToolPermission.NEVER
+        assert result.denial_kind == "dangerous_command"
+        assert result.dangerous_command_proposal is not None
     result = tool.resolve_permission(BashArgs(command="curl example.org"))
     assert result is not None and result.permission is ToolPermission.NEVER
+    assert result.denial_kind is None
+    assert result.dangerous_command_proposal is None
     assert "matches denylist pattern 'curl'" in (result.reason or "")
 
 

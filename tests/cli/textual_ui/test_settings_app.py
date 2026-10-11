@@ -4072,3 +4072,156 @@ async def test_review_clean_enum_enter_collapses_without_override() -> None:
         await pilot.press(*"system_prompt_id", "enter", "down", "enter")
         assert screen._expanded is None and not service.saved
         assert not screen.fields["system_prompt_id"].saved_explicit
+
+
+class FakeAuthorityResource:
+    """Minimal P5 resource double for the Shell Permissions panel."""
+
+    def __init__(self) -> None:
+        from chartreux.app_server.protocol import (
+            DangerousCommandAuthorityReadResponse,
+            DangerousCommandGrantScopeWire,
+            DangerousCommandGrantWire,
+            DangerousCommandRevocationOutcome,
+            DangerousCommandRevokeResponse,
+        )
+
+        self.inspection = DangerousCommandAuthorityReadResponse(
+            project="/home/example/projects/shop",
+            live_authority_generation=1,
+            live_grants=[
+                DangerousCommandGrantWire(
+                    operation_id="git.push",
+                    scope=DangerousCommandGrantScopeWire(
+                        git_dir="/home/example/projects/shop/.git",
+                        work_tree="/home/example/projects/shop",
+                    ),
+                )
+            ],
+            accepted_saved_grants=[],
+            saved_operations=[],
+            disk_revision="rev-1",
+            blocking_denylist=[],
+        )
+        self.revoke = DangerousCommandRevokeResponse(
+            live=DangerousCommandRevocationOutcome(status="removed", generation=2),
+            saved=DangerousCommandRevocationOutcome(status="skipped"),
+            live_authority_generation=2,
+        )
+        self.revoke_calls: list[dict[str, object]] = []
+
+    async def read_dangerous_command_authority(self):
+        return self.inspection
+
+    async def revoke_dangerous_command_grant(
+        self,
+        *,
+        operation_id: str,
+        expected_live_generation: int,
+        expected_disk_revision: str | None,
+        user_initiated: bool,
+    ):
+        self.revoke_calls.append({
+            "operation_id": operation_id,
+            "expected_live_generation": expected_live_generation,
+            "expected_disk_revision": expected_disk_revision,
+            "user_initiated": user_initiated,
+        })
+        return self.revoke
+
+
+class ShellPermissionsHarness(App[None]):
+    def __init__(self, service: FakeService, shell_permissions) -> None:
+        super().__init__()
+        self.service = service
+        self.shell_permissions = shell_permissions
+
+    def on_mount(self) -> None:
+        self.push_screen(
+            SettingsScreen(
+                cast(SettingsService, self.service),
+                self.service.snapshot,
+                shell_permissions=self.shell_permissions,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_shell_permissions_row_uses_label_and_panel_help() -> None:
+    from chartreux.ui.shell_permissions import ShellPermissionsService
+
+    resource = FakeAuthorityResource()
+    async with ShellPermissionsHarness(
+        FakeService(), ShellPermissionsService(resource)
+    ).run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        screen = cast(SettingsScreen, pilot.app.screen)
+        item = next(item for item in screen.catalog if item.path == "shell_permissions")
+        assert item.control == "shell_permissions"
+        assert item.kind == "deferred"
+        # The row shows the human label, not the bare path.
+        row = screen._row(item, selected=False).plain
+        assert row.split("    ")[0].strip() == "Shell Permissions"
+        options = screen.query_one(SettingsOptionList)
+        options.highlighted = options.get_option_index("shell_permissions")
+        await pilot.pause()
+        help_text = str(screen.query_one("#settings-help", NoMarkupStatic).content)
+        assert "Shell Permissions panel" in help_text
+        assert ("Enter", "Open") in screen._available_actions()
+
+
+@pytest.mark.asyncio
+async def test_shell_permissions_enter_opens_panel_and_return_restores_state() -> None:
+    from chartreux.cli.textual_ui.widgets.shell_permissions_app import (
+        ShellPermissionsApp,
+    )
+    from chartreux.ui.shell_permissions import ShellPermissionsService
+
+    resource = FakeAuthorityResource()
+    app = ShellPermissionsHarness(FakeService(), ShellPermissionsService(resource))
+    async with app.run_test(size=(100, 32)) as pilot:
+        await pilot.pause()
+        screen = cast(SettingsScreen, pilot.app.screen)
+        await pilot.press(*"shell")
+        await pilot.pause()
+        options = screen.query_one(SettingsOptionList)
+        assert options._query == "shell"
+        assert options.highlighted_option is not None
+        assert str(options.highlighted_option.id) == "shell_permissions"
+        await pilot.press("enter")
+        await pilot.pause()
+        panel = pilot.app.screen
+        assert isinstance(panel, ShellPermissionsApp)
+        # The panel inspected through the service before it can be used.
+        deadline = asyncio.get_event_loop().time() + 2.0
+        while panel._inspection is None:
+            assert asyncio.get_event_loop().time() < deadline
+            await pilot.pause(0.01)
+        assert panel._inspection is not None
+        grants = panel.query_one("#shell-permissions-grants", OptionList)
+        row_ids = [str(row.id) for row in grants.options if row.id is not None]
+        assert "live:git.push" in row_ids
+        # Escape returns to Settings with focus, filter, and selection intact.
+        await pilot.press("escape")
+        await pilot.pause()
+        assert pilot.app.screen is screen
+        assert options._query == "shell"
+        assert options.highlighted_option is not None
+        assert str(options.highlighted_option.id) == "shell_permissions"
+        assert options.has_focus
+
+
+@pytest.mark.asyncio
+async def test_shell_permissions_unavailable_without_a_service() -> None:
+    async with Harness(FakeService()).run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        screen = cast(SettingsScreen, pilot.app.screen)
+        assert screen.shell_permissions is None
+        await pilot.press(*"shell")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        # No panel is pushed; the row reports the unavailable service.
+        assert pilot.app.screen is screen
+        help_text = str(screen.query_one("#settings-help", NoMarkupStatic).content)
+        assert "Shell Permissions is unavailable" in help_text

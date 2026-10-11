@@ -33,6 +33,8 @@ method list, including typed parameter and result models. It covers:
   statistics, and event reads;
 - session creation, continuation, resume, reading, history, fork, rename,
   compact, stop, delete, rewind, settings, shell commands, and turns;
+- dangerous-command authority inspection and revocation
+  (`policy/dangerous_commands/read` and `policy/dangerous_commands/revoke`);
 - queued-turn enqueue/read/remove/replace/resume operations;
 - agent transcripts, skills, tools, scheduled loops, reviews, and workspace
   trust and Git worktree operations; and
@@ -200,6 +202,39 @@ The server emits typed live notifications and can send typed callbacks or
 advertised `clientTool/*` requests to a capable client. It does not offer a
 generic command-execution RPC: clients map their own presentation commands to
 specific typed methods.
+
+## Dangerous-command authority
+
+`policy/dangerous_commands/read` inspects one registered session's
+dangerous-command authority. It takes `{"sessionId": "…"}` (no project key: the
+project is always the session's own working directory) and returns:
+
+| Field | Contract |
+| --- | --- |
+| `project` | The registered session's project identity. |
+| `liveAuthorityGeneration` | Live revision of the session's grant store; the expected value for a live revocation. |
+| `liveGrants` | Runtime-owned authority: session grants and pending once permits, each `{"operationId", "scope": {"gitDir", "workTree"}}`. |
+| `acceptedSavedGrants` | Saved user-config grants the session's accepted restrictions contribute for the registered project. |
+| `savedOperations` / `diskRevision` | Fresh disk read (`null` when unavailable); `diskRevision` is the expected revision for a saved removal. |
+| `blockingDenylist` | Explicit shell-denylist entries vetoing dangerous git operations, each `{"pattern", "operations"}` — reported apart from grants because no grant can lift them. |
+
+`policy/dangerous_commands/revoke` removes one operation's authority. It takes
+`{"sessionId", "operationId", "expectedLiveGeneration", "expectedDiskRevision",
+"userInitiated: true}` — `userInitiated` must be the literal `true`; lax truthy
+coercion is rejected. The response reports the live and saved sides separately
+(`live` and `saved`, each with `status` of `removed`, `conflict`, `skipped`,
+`not_applicable`, or `failed`), the post-attempt `liveAuthorityGeneration`, and a
+`warning` when a failed saved removal means the authority can return on the next
+reload or start. Live removal is immediate (pending once permits are invalidated),
+but a question already awaiting an answer is not cancelled: answering it after the
+revocation still grants fresh authority for the decided scope. A saved removal
+does not change the running session's accepted config until a reload, exactly as
+a save never applies to the running session.
+
+There is deliberately **no public grant endpoint**: no RPC grants an arbitrary
+dangerous operation. Grants come only from completing the runtime approval
+question; these two methods only inspect and revoke. See
+[dangerous git commands](../guides/tools-safety.md#dangerous-git-commands).
 
 ## Limits
 
