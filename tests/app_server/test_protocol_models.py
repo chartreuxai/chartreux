@@ -35,6 +35,8 @@ from chartreux.app_server.protocol import (
     AgentEvictionModel,
     AgentsCancelParams,
     AgentsCancelResponse,
+    AgentsReleaseParams,
+    AgentsReleaseResponse,
     AgentSummaryModel,
     AgentsUpdateParams,
     AgentTranscriptEntry,
@@ -53,6 +55,7 @@ from chartreux.app_server.protocol import (
     MCPToggleParams,
     MessageAnnotations,
     PageRequest,
+    ReleaseOutcome,
     SessionContinueResponse,
     SessionEmbeddedResourceContentBlock,
     SessionForkResponse,
@@ -338,6 +341,52 @@ def test_agents_cancel_rejects_private_response_spelling() -> None:
         validate_wire(AgentsCancelResponse, {"outcome": "not_running", "run_id": "r"})
     with pytest.raises(ValidationError):
         validate_wire(AgentsCancelResponse, {"outcome": "cancelled"})
+
+
+@pytest.mark.parametrize("outcome", list(ReleaseOutcome))
+def test_agents_release_public_wire_contract(outcome: ReleaseOutcome) -> None:
+    assert "agents/release" in SERVER_METHODS
+    assert (
+        validate_wire(AgentsReleaseParams, {"agentId": "agent"}).expected_run_id is None
+    )
+    params = validate_wire(
+        AgentsReleaseParams, {"agentId": "agent", "expectedRunId": "run"}
+    )
+    assert params.model_dump(mode="json") == {
+        "agentId": "agent",
+        "expectedRunId": "run",
+    }
+    wire = {"outcome": outcome.value, "reason": "why"}
+    response = validate_wire(AgentsReleaseResponse, wire)
+    assert response.outcome is outcome
+    assert response.model_dump(mode="json") == wire
+    assert (
+        validate_wire(AgentsReleaseResponse, {"outcome": outcome.value}).reason is None
+    )
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        {},
+        {"agent_id": "a"},
+        {"agentId": ""},
+        {"agentId": 1},
+        {"agentId": "a", "expected_run_id": "r"},
+        {"agentId": "a", "expectedRunId": ""},
+        {"agentId": "a", "extra": True},
+    ],
+)
+def test_agents_release_rejects_invalid_wire_params(wire: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(AgentsReleaseParams, wire)
+
+
+def test_agents_release_rejects_unknown_response_outcome() -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(AgentsReleaseResponse, {"outcome": "purged"})
+    with pytest.raises(ValidationError):
+        validate_wire(AgentsReleaseResponse, {"outcome": "released", "extra": True})
 
 
 def _turn_queue() -> PublicTurnQueue:
@@ -956,6 +1005,7 @@ def test_agents_update_carries_retention_metadata() -> None:
             AgentSummaryModel(
                 agent_id="agent-1",
                 profile="worker",
+                name="worker-base-1",
                 availability="evicted",
                 initial_task_summary="Initial task",
                 current_task_summary=None,
@@ -982,6 +1032,7 @@ def test_agents_update_carries_retention_metadata() -> None:
     assert update.model_dump(mode="json")["agents"][0] == {
         "agentId": "agent-1",
         "profile": "worker",
+        "name": "worker-base-1",
         "slotPurposes": [],
         "availability": "evicted",
         "currentRunId": None,
@@ -1008,7 +1059,12 @@ def test_agents_update_carries_retention_metadata() -> None:
 
 
 def test_agent_context_contract_accepts_older_wire_payloads() -> None:
-    old = {"agentId": "child", "profile": "worker", "availability": "idle"}
+    old = {
+        "agentId": "child",
+        "profile": "worker",
+        "name": "worker-child",
+        "availability": "idle",
+    }
     summary = validate_wire(AgentSummaryModel, old)
     assert summary.context_tokens is None and summary.context_window is None
     assert summary.compacting is False and summary.stop_reason is None
@@ -1055,10 +1111,12 @@ def test_run_stop_reason_contract(reason: str) -> None:
         "run",
         RunStatus.COMPLETED,
         stop_reason=CoreRunStopReason(reason),
+        name="worker-child",
     )
     wire = AgentSummaryModel(
         agent_id=core.agent_id,
         profile=core.profile,
+        name=core.name,
         availability=core.availability.value,
         stop_reason=RunStopReason(core.stop_reason),
     )

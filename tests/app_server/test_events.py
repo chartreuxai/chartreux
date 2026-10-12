@@ -212,6 +212,7 @@ def test_agents_update_carries_evictions() -> None:
             AgentSummaryModel(
                 agent_id="agent-1",
                 profile="worker",
+                name="worker-base-1",
                 availability="evicted",
                 last_run_status="completed",
                 latest_run_id="run-1",

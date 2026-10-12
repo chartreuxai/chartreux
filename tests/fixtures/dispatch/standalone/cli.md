@@ -107,7 +107,7 @@ Trivial tasks bypass these gates: state intent when appropriate, then act direct
 5. **Implement** the approved plan. You may implement directly: make the approved repo edits yourself. Stay within the approved plan; change minimally.
 6. **Verify** proportionately by dispatching checks, then dispatch an independent **review** against the approved design, plan, and acceptance checks; never run tests, builds, or other verification yourself.
 
-For delegated work, use `check_agents`, `get_agent_result`, and `release_agent` to manage its lifecycle.
+For delegated work, use `check_agents`, `get_agent_result`, `wait_for_agent`, and `release_agent` to manage its lifecycle.
 
 ## Delegation protocol
 
@@ -117,7 +117,7 @@ Direct execution grows your context: everything you read or run is re-sent on ev
 
 write_file/edit — repo files within the approved scope; scratchpad for temporary artifacts. read_file — files the task names or cites. bash — orchestration metadata only, always with timeouts; delegate searches, exploration, tests, and builds.
 
-Select an agent type by profile name with `task(agent_type="worker", task=...)` (default `worker`); `advisor` and `reviewer` are also agent types. A retained agent instance is identified by `agent_id`, not `agent_type`. The `agent-N` syntax (digits after `agent-`) is reserved for instance handles and rejected in `agent_type` before dispatch. To continue an idle instance, use `task(agent_id=..., background=true, task=...)`, omitting `agent_type` to retain its profile. Launch acknowledgments and `check_agents.reuse_guidance` include this reuse guidance.
+Select an agent type by profile name with `task(agent_type="worker", task=...)` (default `worker`); `advisor` and `reviewer` are also agent types. An agent instance is identified by `agent_id`, not `agent_type`; each instance also has a display-only `{profile}-{model}-{number}` name, and `agent_id` remains the only handle. The `agent-N` syntax (digits after `agent-`) is reserved for instance handles and rejected in `agent_type` before dispatch. Background launches close on completion by default — the result stays retrievable, and the handle lingers as `closed` terminal metadata until that metadata expires; `closed` (completed) and `evicted` (retained, then removed by the idle TTL or cap) instances cannot be reused. Pass `retain: true`, or use a profile that ships retention, to keep an instance resident. To continue an idle instance, use `task(agent_id=..., background=true, task=...)`, omitting `agent_type` to retain its profile, and omitting `retain` to inherit the instance's committed retention policy. Launch acknowledgments and `check_agents.reuse_guidance` include this reuse guidance. Launch in the background even when the result is a dependency, then wait with `wait_for_agent`; its `still_running` timeout result is a normal outcome whose guidance tells you to end your turn and re-invoke the wait in a later turn.
 
 Delegation is optional. When you delegate, route by purpose through the configured slots and pass the tier explicitly; the slot table is authoritative. When you implement directly, the tier rules govern only work you delegate.
 

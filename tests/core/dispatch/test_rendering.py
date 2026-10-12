@@ -320,6 +320,46 @@ def test_orchestrated_rendering_keeps_edit_prohibition() -> None:
     assert "never edit repo files yourself" in rendered
 
 
+# --- Lifecycle prose synchronization (WP5A) --------------------------------
+#
+# The $dispatch_reuse block and the orchestrated background-work paragraph
+# carry the subagent lifecycle semantics; pin their sentences so a prose
+# reversion fails the rendering suite, not just the golden diff.
+
+REUSE_LIFECYCLE_SENTENCES = (
+    "omit `retain` to inherit the instance's committed retention policy",
+    "a `still_running` timeout is a normal outcome",
+    "A `closed` or `evicted` agent cannot be reused",
+)
+
+
+@pytest.mark.parametrize("policy", list(SHIPPED_PRESETS.values()))
+@pytest.mark.parametrize("catalog", [SHIPPED_CATALOG, multi_model_catalog()])
+def test_rendered_task_description_documents_lifecycle_semantics(
+    policy: DispatchPolicy, catalog: ModelCatalog
+) -> None:
+    rendered = _render_task(policy, catalog)
+    for sentence in REUSE_LIFECYCLE_SENTENCES:
+        assert sentence in rendered
+    # Background-first launch guidance and opt-in retention come from the
+    # task skeleton itself.
+    assert "Launch in the background even when the result is a dependency" in rendered
+    assert "Retention is opt-in." in rendered
+    assert "for a final continuation that closes afterward" in rendered
+
+
+def test_rendered_orchestrated_cli_documents_retention_and_names() -> None:
+    rendered = _render_cli(ORCHESTRATED_PRESET, SHIPPED_CATALOG)
+    # The delegation paragraph (cli skeleton) applies to every mode.
+    assert "Background launches close on completion by default" in rendered
+    assert "display-only `{profile}-{model}-{number}` name" in rendered
+    assert "`still_running` timeout result is a normal outcome" in rendered
+    # The orchestrated background-work paragraph carries the rest.
+    assert "Retention is opt-in:" in rendered
+    assert "name is display-only; `agent_id` is the only handle" in rendered
+    assert "release discards retained results" in rendered
+
+
 # --- S8 reversion tripwire ---------------------------------------------------
 
 

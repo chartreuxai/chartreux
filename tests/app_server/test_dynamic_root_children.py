@@ -70,7 +70,11 @@ def _read_turn(target: Path, call_id: str) -> list[list[LLMChunk]]:
 
 
 def _task_call(
-    *, background: bool, agent_id: str | None = None, tool_call_id: str = "task-1"
+    *,
+    background: bool,
+    agent_id: str | None = None,
+    retain: bool | None = None,
+    tool_call_id: str = "task-1",
 ) -> ToolCall:
     arguments: dict[str, object] = {
         "task": "Read the granted note",
@@ -79,6 +83,8 @@ def _task_call(
     }
     if agent_id is not None:
         arguments["agent_id"] = agent_id
+    if retain is not None:
+        arguments["retain"] = retain
     return ToolCall(
         id=tool_call_id,
         index=0,
@@ -87,7 +93,11 @@ def _task_call(
 
 
 def _task_turn(
-    *, background: bool, agent_id: str | None = None, tool_call_id: str = "task-1"
+    *,
+    background: bool,
+    agent_id: str | None = None,
+    retain: bool | None = None,
+    tool_call_id: str = "task-1",
 ) -> list[list[LLMChunk]]:
     return [
         [
@@ -96,6 +106,7 @@ def _task_turn(
                     _task_call(
                         background=background,
                         agent_id=agent_id,
+                        retain=retain,
                         tool_call_id=tool_call_id,
                     )
                 ]
@@ -328,7 +339,9 @@ async def test_child_dispatched_before_a_root_grant_stays_frozen_across_retask(
     _use_child_backend(monkeypatch, child_backend)
     parent_backend = FakeBackend(
         _streams(
-            _task_turn(background=True, tool_call_id="task-launch"),
+            # The child is retasked below, so the first launch opts into
+            # retention explicitly instead of relying on the global default.
+            _task_turn(background=True, retain=True, tool_call_id="task-launch"),
             _read_turn(target, "root-read"),
             [[mock_llm_chunk(content="noted")]],
             [[mock_llm_chunk(content="noted")]],

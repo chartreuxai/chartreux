@@ -56,6 +56,8 @@ from chartreux.app_server.models import (
 from chartreux.app_server.protocol import (
     AgentsCancelParams,
     AgentsCancelResponse,
+    AgentsReleaseParams,
+    AgentsReleaseResponse,
     AppServerResponseError,
     CallbackCallParams,
     CallbackCallResponse,
@@ -679,6 +681,21 @@ class AppServerSession:  # noqa: PLR0904
         client = await self._ensure_attached()
         return validate_wire(
             AgentsCancelResponse, await client.request("agents/cancel", params)
+        )
+
+    async def release_agent(
+        self, agent_id: str, expected_run_id: str | None = None
+    ) -> AgentsReleaseResponse:
+        """Release a background agent through the guarded agents/release route.
+
+        ``expected_run_id`` is the optimistic-concurrency expectation: the
+        server conflicts instead of releasing when the agent is active,
+        reserved for replacement, or its latest run changed.
+        """
+        params = AgentsReleaseParams(agent_id=agent_id, expected_run_id=expected_run_id)
+        client = await self._ensure_attached()
+        return validate_wire(
+            AgentsReleaseResponse, await client.request("agents/release", params)
         )
 
     async def interrupt(self) -> None:

@@ -15,20 +15,25 @@ from chartreux.app_server.events import AgentsUpdate, TurnStarted
 from chartreux.app_server.models import PublicTurn, PublicTurnStatus
 from chartreux.app_server.protocol import (
     AgentsCancelResponse,
+    AgentsReleaseResponse,
     AgentSummaryModel,
     AgentTranscriptEntryKind,
     AgentTranscriptGetResponse,
     AgentTranscriptState,
     CancelOutcome,
+    ReleaseOutcome,
 )
 from chartreux.cli.textual_ui.widgets.agent_bar import AgentBar
 from chartreux.cli.textual_ui.widgets.agent_transcript import AgentTranscriptViewer
+from chartreux.cli.textual_ui.widgets.messages import UserCommandMessage
+from chartreux.core.subagents import derive_agent_name
 from chartreux.observability.logging import (
     get_effective_log_level,
     init_file_logging,
     logger,
     set_log_level,
 )
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from tests.cli.textual_ui.test_agent_transcript import _available, _entry
 from tests.cli.textual_ui.test_history_grouping import _message
 from tests.conftest import build_test_chartreux_app
@@ -36,7 +41,16 @@ from tests.conftest import build_test_chartreux_app
 
 def _agent(agent_id: str, availability: str = "idle") -> AgentSummaryModel:
     return AgentSummaryModel(
-        agent_id=agent_id, profile="worker", availability=availability
+        agent_id=agent_id,
+        profile="worker",
+        availability=availability,
+        name=derive_agent_name(
+            agent_id=agent_id,
+            profile="worker",
+            profile_display_label=None,
+            base_model=None,
+            effective_model=None,
+        ),
     )
 
 
@@ -398,7 +412,7 @@ async def test_interrupt_action_collapses_expanded_agent_bar_before_interrupting
 
 
 @pytest.mark.asyncio
-async def test_escape_interrupts_after_agents_are_released_from_expanded_bar(
+async def test_escape_interrupts_after_the_browser_closes_on_empty_inventory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app = build_test_chartreux_app()
@@ -410,10 +424,17 @@ async def test_escape_interrupts_after_agents_are_released_from_expanded_bar(
         await pilot.pause()
         assert app._agent_bar is not None and app._agent_bar.expanded
 
+        # The browser stays open on an empty inventory (all-empty state), so
+        # the first Escape closes the browser and the second interrupts.
         await app._handle_turn_event(AgentsUpdate([]))
         await pilot.pause()
-        assert app._agent_bar is not None and not app._agent_bar.display
+        assert app._agent_bar is not None and app._agent_bar.display
+        assert app._agent_bar.expanded
+
+        await pilot.press("escape")
+        await pilot.pause()
         assert not app._agent_bar.expanded
+        interrupt.assert_not_called()
 
         await pilot.press("escape")
         await pilot.pause()
@@ -421,7 +442,7 @@ async def test_escape_interrupts_after_agents_are_released_from_expanded_bar(
 
 
 @pytest.mark.asyncio
-async def test_empty_agent_bar_toggle_keeps_focus_on_chat_input() -> None:
+async def test_empty_agent_bar_toggle_opens_the_empty_browser() -> None:
     app = build_test_chartreux_app()
     async with app.run_test() as pilot:
         assert app._chat_input_container is not None
@@ -431,10 +452,21 @@ async def test_empty_agent_bar_toggle_keeps_focus_on_chat_input() -> None:
         assert input_widget is not None
         assert app.screen.focused is input_widget
 
+        # The expanded browser is independent of the collapsed segment: it is
+        # always reachable via /agents, even with an empty inventory.
         await pilot.press("ctrl+shift+a")
         await pilot.pause()
 
-        assert app._agent_bar is not None and not app._agent_bar.expanded
+        assert app._agent_bar is not None and app._agent_bar.expanded
+        assert app._agent_bar.display
+        assert app.screen.focused is app._agent_bar
+        assert "No background agents" in str(
+            app._agent_bar.query_one("#agent-bar-content").render()
+        )
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not app._agent_bar.expanded
         assert app.screen.focused is input_widget
 
 
@@ -842,3 +874,220 @@ async def test_stopped_agent_output_details_eviction_and_release(
         await pilot.pause()
         assert not app.query(AgentTranscriptViewer)
         assert app.query_one("#chat").display
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome,reason,notified",
+    [
+        (ReleaseOutcome.RELEASED, None, False),
+        (ReleaseOutcome.EVICTED, None, False),
+        (ReleaseOutcome.CONFLICT, "agent is running a new run", True),
+        (ReleaseOutcome.UNKNOWN, "metadata expired", True),
+    ],
+)
+async def test_release_chain_calls_rpc_and_notices_guard_outcomes(
+    outcome: ReleaseOutcome,
+    reason: str | None,
+    notified: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        app.app_server.resources.sessions.read_agent_transcript = AsyncMock(
+            return_value=AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+            )
+        )
+        release = AsyncMock(
+            return_value=AgentsReleaseResponse(outcome=outcome, reason=reason)
+        )
+        monkeypatch.setattr(app.app_server, "release_agent", release)
+        notices: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            app,
+            "notify",
+            lambda message, **kwargs: notices.append((
+                message,
+                str(kwargs.get("severity", "")),
+            )),
+        )
+        idle = _agent("one").model_copy(update={"latest_run_id": "r1"})
+        await app._handle_turn_event(AgentsUpdate([idle]))
+        await pilot.press("ctrl+shift+a", "down", "r", "left", "enter")
+        await pilot.pause()
+        # The RPC carries the captured handle and expected latest run identity.
+        release.assert_awaited_once_with("one", "r1")
+        if notified:
+            # Conflict/unknown mean nothing was stopped or purged; the notice
+            # explains the guard without reading a tombstone reason.
+            assert len(notices) == 1
+            assert "one" in notices[0][0]
+            assert (
+                "Nothing was released" in notices[0][0]
+                or "no longer known" in (notices[0][0])
+            )
+            assert notices[0][1] == "warning"
+        else:
+            assert notices == []
+
+
+@pytest.mark.asyncio
+async def test_release_chain_failure_notifies_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        app.app_server.resources.sessions.read_agent_transcript = AsyncMock(
+            return_value=AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+            )
+        )
+        release = AsyncMock(side_effect=RuntimeError("transport gone"))
+        monkeypatch.setattr(app.app_server, "release_agent", release)
+        notices: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            app,
+            "notify",
+            lambda message, **kwargs: notices.append((
+                message,
+                str(kwargs.get("severity", "")),
+            )),
+        )
+        idle = _agent("one").model_copy(update={"latest_run_id": "r1"})
+        await app._handle_turn_event(AgentsUpdate([idle]))
+        await pilot.press("ctrl+shift+a", "down", "r", "left", "enter")
+        await pilot.pause()
+        release.assert_awaited_once_with("one", "r1")
+        assert len(notices) == 1
+        assert "Failed to release one" in notices[0][0]
+        # The notice preserves uncertainty: the registry purges records and
+        # results before awaiting runtime teardown, so a lost RPC response
+        # does not prove the release did not commit.
+        assert "may or may not have completed" in notices[0][0]
+        assert "check the agents browser or check_agents" in notices[0][0]
+        assert "unchanged" not in notices[0][0]
+        assert notices[0][1] == "error"
+
+
+@pytest.mark.asyncio
+async def test_transcript_header_refreshes_in_place_on_retask() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        app.app_server.resources.sessions.read_agent_transcript = AsyncMock(
+            return_value=AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+            )
+        )
+        await app._handle_turn_event(AgentsUpdate([_agent("one")]))
+        await pilot.press("ctrl+shift+a", "down", "enter")
+        await pilot.pause()
+        viewer = app.query_one(AgentTranscriptViewer)
+        header = str(viewer.query_one("#agent-transcript-header").render())
+        assert header == "Subagent: worker-one (one) · worker"
+        # The same handle re-tasks: the reused viewer refreshes its header.
+        retasked = AgentSummaryModel(
+            agent_id="one",
+            profile="reviewer",
+            availability="running",
+            current_run_id="r2",
+            name="reviewer-glm-5-3-1",
+        )
+        await app._handle_turn_event(AgentsUpdate([retasked]))
+        await pilot.pause()
+        assert app.query_one(AgentTranscriptViewer) is viewer
+        header = str(viewer.query_one("#agent-transcript-header").render())
+        assert header == "Subagent: reviewer-glm-5-3-1 (one) · reviewer"
+
+
+@pytest.mark.asyncio
+async def test_transcript_header_renders_markup_literally() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        app.app_server.resources.sessions.read_agent_transcript = AsyncMock(
+            return_value=AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+            )
+        )
+        marked = AgentSummaryModel(
+            agent_id="one",
+            profile="worker",
+            availability="idle",
+            name="worker-[bold]one[/bold]",
+        )
+        await app._handle_turn_event(AgentsUpdate([marked]))
+        await pilot.press("ctrl+shift+a", "down", "enter")
+        await pilot.pause()
+        viewer = app.query_one(AgentTranscriptViewer)
+        header = viewer.query_one("#agent-transcript-header")
+        assert isinstance(header, NoMarkupStatic)
+        rendered = str(header.render())
+        assert rendered == "Subagent: worker-[bold]one[/bold] (one) · worker"
+
+
+@pytest.mark.asyncio
+async def test_transcript_metadata_renders_markup_literally() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        app.app_server.resources.sessions.read_agent_transcript = AsyncMock(
+            return_value=AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+            )
+        )
+        marked = AgentSummaryModel(
+            agent_id="one",
+            profile="worker",
+            availability="idle",
+            name="worker-[bold]one[/bold]",
+        )
+        await app._handle_turn_event(AgentsUpdate([marked]))
+        await pilot.press("ctrl+shift+a", "down", "enter")
+        await pilot.pause()
+        viewer = app.query_one(AgentTranscriptViewer)
+        metadata = viewer.query_one(".agent-transcript-metadata")
+        assert isinstance(metadata, NoMarkupStatic)
+        rendered = str(metadata.render())
+        # The derived name renders literally in the metadata area: markup
+        # in a custom profile's display name is never interpreted.
+        assert "Name: worker-[bold]one[/bold]" in rendered
+        # A set_metadata refresh (the AgentsUpdate handler for the same
+        # handle) keeps rendering the derived name literally.
+        refreshed = marked.model_copy(update={"name": "worker-[red]two[/red]"})
+        await app._handle_turn_event(AgentsUpdate([refreshed]))
+        await pilot.pause()
+        rendered = str(metadata.render())
+        assert "Name: worker-[red]two[/red]" in rendered
+        assert "[bold]" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_metadata_disappearance_returns_to_main_with_explanation() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        app.app_server.resources.sessions.read_agent_transcript = AsyncMock(
+            return_value=AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+            )
+        )
+        await app._handle_turn_event(AgentsUpdate([_agent("one")]))
+        await pilot.press("ctrl+shift+a", "down", "enter")
+        await pilot.pause()
+        assert app.query(AgentTranscriptViewer)
+        # The handle leaves the published inventory (release/metadata expiry):
+        # the viewer closes, Main returns, and a brief explanation is mounted.
+        await app._handle_turn_event(AgentsUpdate([]))
+        await pilot.pause()
+        assert not app.query(AgentTranscriptViewer)
+        assert app.query_one("#chat").display
+        explanations = [
+            message._content
+            for message in app.query(UserCommandMessage)
+            if "no longer available" in message._content
+        ]
+        assert explanations == [
+            "Background agent worker-one is no longer available; "
+            "returned to the main conversation."
+        ]
+        # No ghost rows remain in the browser.
+        bar = app._agent_bar
+        assert bar is not None and not bar.agents

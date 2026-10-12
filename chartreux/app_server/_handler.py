@@ -85,6 +85,8 @@ from chartreux.app_server.models import (
 from chartreux.app_server.protocol import (
     AgentsCancelParams,
     AgentsCancelResponse,
+    AgentsReleaseParams,
+    AgentsReleaseResponse,
     AgentTranscriptGetParams,
     AgentTranscriptGetResponse,
     AgentTranscriptState,
@@ -97,6 +99,7 @@ from chartreux.app_server.protocol import (
     ContextInjectParams,
     EmptyResponse,
     ProtocolErrorCode,
+    ReleaseOutcome,
     RunStopReason as PublicRunStopReason,
     RuntimeUpdatedParams,
     SessionCompactParams,
@@ -173,10 +176,28 @@ from chartreux.core.session_types import (
     ScheduledLoop as CoreScheduledLoop,
     SessionMetadata,
 )
-from chartreux.core.subagents import RunStopReason, UnknownAgentError
+from chartreux.core.subagents import (
+    ReleaseAgentOutcome,
+    RunStopReason,
+    UnknownAgentError,
+)
 from chartreux.observability.logging import logger
 
 DEFAULT_HISTORY_LIMIT = 200
+
+_RELEASE_REASONS: dict[ReleaseAgentOutcome, str] = {
+    ReleaseAgentOutcome.RELEASED: (
+        "Agent released; retained results and browser access are discarded."
+    ),
+    ReleaseAgentOutcome.EVICTED: (
+        "Terminal metadata removed; retained results and browser access are discarded."
+    ),
+    ReleaseAgentOutcome.CONFLICT: (
+        "Agent is active, reserved for replacement, or its latest run changed; "
+        "nothing was released."
+    ),
+    ReleaseAgentOutcome.UNKNOWN: "Unknown agent; nothing was released.",
+}
 
 type ReplaceRoot = Callable[[str, int], Awaitable[PublicSessionState]]
 type AdoptRoot = Callable[
@@ -369,29 +390,45 @@ class CoreRequestHandler:
     async def _dispatch_agents(
         self, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult:
-        if method != "agents/cancel":
-            raise method_not_found(method)
-        params = validate_wire(AgentsCancelParams, raw_params)
-        self._require_attached(self._agent_loop.session_id)
-        if self._closed:
-            raise RequestFailure(ProtocolErrorCode.CONFLICT, "Session is closing")
-        result = await self._sessions.cancel_run(
-            params.agent_id,
-            params.run_id,
-            reason=RunStopReason.USER_CANCELLED,
-            requester_session_id=self._agent_loop.session_id,
-        )
-        return DispatchResult(
-            AgentsCancelResponse(
-                outcome=CancelOutcome(result.outcome.value),
-                run_id=result.run_id,
-                stop_reason=(
-                    PublicRunStopReason(result.stop_reason.value)
-                    if result.stop_reason is not None
-                    else None
-                ),
+        if method == "agents/cancel":
+            params = validate_wire(AgentsCancelParams, raw_params)
+            self._require_attached(self._agent_loop.session_id)
+            if self._closed:
+                raise RequestFailure(ProtocolErrorCode.CONFLICT, "Session is closing")
+            result = await self._sessions.cancel_run(
+                params.agent_id,
+                params.run_id,
+                reason=RunStopReason.USER_CANCELLED,
+                requester_session_id=self._agent_loop.session_id,
             )
-        )
+            return DispatchResult(
+                AgentsCancelResponse(
+                    outcome=CancelOutcome(result.outcome.value),
+                    run_id=result.run_id,
+                    stop_reason=(
+                        PublicRunStopReason(result.stop_reason.value)
+                        if result.stop_reason is not None
+                        else None
+                    ),
+                )
+            )
+        if method == "agents/release":
+            # Guarded UI release: keeps the standard lifecycle guards (no
+            # cancel-style exemption) plus the registry's atomic race guards.
+            params = validate_wire(AgentsReleaseParams, raw_params)
+            self._require_attached(self._agent_loop.session_id)
+            if self._closed:
+                raise RequestFailure(ProtocolErrorCode.CONFLICT, "Session is closing")
+            outcome = await self._sessions.release_agent_guarded(
+                params.agent_id, params.expected_run_id
+            )
+            return DispatchResult(
+                AgentsReleaseResponse(
+                    outcome=ReleaseOutcome(outcome.value),
+                    reason=_RELEASE_REASONS[outcome],
+                )
+            )
+        raise method_not_found(method)
 
     async def _dispatch_agent(
         self, method: str, raw_params: dict[str, Any]

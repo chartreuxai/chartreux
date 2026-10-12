@@ -428,6 +428,12 @@ def test_default_prompt_renders_delegation_protocol(
     assert "route by purpose through the configured slots" in prompt
     assert "$dispatch" not in prompt
     assert "`@scout` for search" not in prompt
+    # The delegation paragraph documents the implemented lifecycle semantics:
+    # close-on-completion default, display-only names, and the still_running
+    # turn-yield wait outcome.
+    assert "Background launches close on completion by default" in prompt
+    assert "display-only `{profile}-{model}-{number}` name" in prompt
+    assert "`still_running` timeout result is a normal outcome" in prompt
 
 
 def test_system_prompt_builtin_ids_and_default_are_explicit() -> None:

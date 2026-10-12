@@ -188,6 +188,8 @@ class Task(
             raise ToolError("replace_run requires agent_id and background mode")
         if args.agent_id is not None and not args.background:
             raise ToolError("agent_id can only be used with background mode")
+        if args.retain is not None and not args.background:
+            raise ToolError("retain can only be used with background mode")
         if args.agent_id is not None and "agent_type" not in args.model_fields_set:
             if ctx.subagent_runner is None:
                 raise ToolError("Task tool requires a subagent runner in context")

@@ -278,7 +278,8 @@ EDITABLE_SETTINGS: tuple[SettingDescriptor, ...] = (
     _field(
         "subagents.idle_ttl_seconds",
         "Idle Agent Lifetime",
-        "Seconds before an idle subagent is retired; 0 disables TTL eviction.",
+        "Seconds before a retained idle agent's runtime is retired; 0 disables "
+        "TTL eviction. Resident-runtime limit; Recent metadata has its own bounds.",
         "int",
         "Subagents",
         minimum=0,
@@ -286,10 +287,37 @@ EDITABLE_SETTINGS: tuple[SettingDescriptor, ...] = (
     _field(
         "subagents.max_idle_agents",
         "Maximum Idle Agents",
-        "Maximum idle subagents retained; 0 disables the count cap.",
+        "Maximum retained idle agents kept resident; 0 disables the count cap. "
+        "Resident-runtime limit; Recent metadata has its own bounds.",
         "int",
         "Subagents",
         minimum=0,
+    ),
+    _field(
+        "subagents.retain_agents",
+        "Retain Agents",
+        "Keep completed background agents resident (idle) for reuse; off closes "
+        "each agent when its run completes, keeping only its result.",
+        "bool",
+        "Subagents",
+    ),
+    _field(
+        "subagents.tombstone_ttl_seconds",
+        "Recent Metadata Lifetime",
+        "Seconds a closed or evicted agent stays in the browser's Recent group; "
+        "0 retains no terminal metadata.",
+        "int",
+        "Subagents",
+        minimum=0,
+    ),
+    _field(
+        "subagents.max_tombstones",
+        "Maximum Recent Agents",
+        "Maximum Recent entries kept after closure or eviction; the oldest expire "
+        "first. At least 1.",
+        "int",
+        "Subagents",
+        minimum=1,
     ),
     _field(
         "session_logging.enabled",

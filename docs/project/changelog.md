@@ -2,6 +2,66 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.5.3 (2026-10-11)
+
+### Added
+
+- Ephemeral-by-default subagents: unretained background agents close their
+  runtime on completion and keep only a bounded terminal entry; their
+  results stay retrievable until result expiry. Retention is opt-in through
+  a per-launch `retain` argument, profile-level `retain`, or
+  `[subagents].retain_agents` (explicit argument, then profile, then the
+  generation-snapshotted default); reuse inherits the committed policy, an
+  explicit `retain=false` admits one final continuation, and the shipped
+  advisor profile is retained by default with a 3600s idle TTL.
+- Bounded terminal metadata: tombstones are unified for closed (ephemeral
+  completion, including failed and cancelled runs) and evicted (retained
+  agents removed by idle TTL or cap) agents, expire after
+  `tombstone_ttl_seconds` (900s; 0 stores none) plus an oldest-first
+  `max_tombstones` cap (32) enforced at insertion, and are pruned by the
+  extended single reaper with lazy deadline checks at every listing and
+  transcript authorization surface. Metadata expiry never expires results;
+  release purges them. `/clear` removes old-generation metadata and
+  publishes the reduced inventory even with no live records.
+- Agent display names: every surface (browser rows, transcript header,
+  completion and eviction notifications, launch acknowledgment,
+  `check_agents`) shows a server-derived `{profile}-{model}-{number}` name
+  built from the canonical base model; names are display-only,
+  handle-shaped derivations are sanitized, and `agent_id` remains the only
+  handle.
+- Typed `wait_for_agent` results: waits return a `completed` or
+  `still_running` disposition instead of raising on timeout; the default
+  timeout is 1500s, explicit `null` still means indefinite, timeouts never
+  cancel the run, and `still_running` guidance instructs the model to end
+  its turn (queued user input drains between turns) and re-invoke the wait
+  in a later turn.
+- `agents/release` RPC and a browser release action: idle and recent agents
+  can be released from the `/agents` browser through a confirmed,
+  race-guarded route that verifies attached-root authority, expected run
+  identity, and non-active state atomically under the registry lock;
+  conflict and unknown outcomes never stop or purge anything.
+
+### Changed
+
+- The `/agents` browser shows Active / Retained Idle / Recent groups with
+  Resident / Active / Idle / Recent / All filter tabs and truthful counts,
+  consumes server-side deterministic ordering, renders names with dimmed
+  handles, and drives keyboard, mouse, scrolling, and highlighting through
+  one shared visible-row mapping; the collapsed bar counts active work only
+  (with dim recent or idle notes at zero active).
+- Subagent defaults are tighter: `idle_ttl_seconds` 3600->300 and
+  `max_idle_agents` 16->4; the previous both-zero close-on-completion switch
+  now means retained with no limits (`max_running_subagents` is unchanged
+  and stays excluded from the settings catalog).
+- Task guidance is background-first: background launches are recommended
+  even when the result is a dependency (launch, then `wait_for_agent`),
+  keeping agents inspectable in the browser and amendable mid-flight;
+  foreground is reserved for calls that must block.
+- Prompts, dispatch renderer text, dispatch goldens, the builtin skill, the
+  settings catalog, and the docs set (configuration reference, subagents
+  guide, app-server protocol reference, commands reference) are synchronized
+  to the new lifecycle.
+
 ## 0.5.2 (2026-10-11)
 
 ### Added

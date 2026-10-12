@@ -18,6 +18,7 @@ from chartreux.app_server.protocol import AgentSummaryModel
 from chartreux.cli.textual_ui.widgets.agent_bar import agent_is_active
 from chartreux.cli.textual_ui.widgets.debug_console import DebugConsole
 from chartreux.cli.textual_ui.widgets.log_level_picker import LogLevelPickerApp
+from chartreux.core.subagents import derive_agent_name
 from tests.conftest import build_test_chartreux_app
 
 
@@ -134,6 +135,13 @@ async def test_no_output_completion_distinguishes_active_agents(
             availability="running",
             current_run_status="running",
             compacting=compacting,
+            name=derive_agent_name(
+                agent_id="agent-1",
+                profile="worker",
+                profile_display_label=None,
+                base_model=None,
+                effective_model=None,
+            ),
         )
         assert agent_is_active(agent)
         with patch(

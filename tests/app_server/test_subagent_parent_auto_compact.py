@@ -15,6 +15,7 @@ import pytest
 from chartreux.app_server.models import PublicCheckpointEntry
 from chartreux.app_server.server import AppServer
 from chartreux.core.llm_models import Role
+from chartreux.core.subagents import WaitStatus
 from tests.app_server.test_subagents import (
     GatedSequenceBackend,
     _config,
@@ -89,13 +90,17 @@ async def test_parent_auto_compact_during_background_run_keeps_result_deliverabl
         # The subagent completes after the parent's compaction boundary and its
         # accumulated result is intact and deliverable.
         child_release.set()
-        result = await asyncio.wait_for(
+        wait_disposition = await asyncio.wait_for(
             registry.wait_for_agent(agent_id, run_id), timeout=5
         )
+        assert wait_disposition.status is WaitStatus.COMPLETED
+        result = wait_disposition.result
+        assert result is not None
         assert result.completed
         assert result.response == "child finished"
         assert await registry.get_agent_result(agent_id, run_id) == result
         await _wait_for_turn_completion(session)
+        completed_summary = (await registry.check_agents())[0]
 
         # The notification lands after the boundary by construction.
         messages = list(parent.messages)
@@ -108,7 +113,8 @@ async def test_parent_auto_compact_during_background_run_keeps_result_deliverabl
             index
             for index, message in enumerate(messages)
             if message.role is Role.user
-            and f"Background agent {agent_id}" in str(message.content)
+            and f"Background agent {completed_summary.name} ({agent_id}"
+            in str(message.content)
         )
         assert notification_index > boundary_index
         assert messages[-1].role is Role.assistant
@@ -126,7 +132,8 @@ async def test_parent_auto_compact_during_background_run_keeps_result_deliverabl
         notification_positions = [
             index
             for index, message in enumerate(notification_request)
-            if f"Background agent {agent_id}" in str(message.content)
+            if f"Background agent {completed_summary.name} ({agent_id}"
+            in str(message.content)
         ]
         assert boundary_positions and notification_positions
         assert max(boundary_positions) < min(notification_positions)

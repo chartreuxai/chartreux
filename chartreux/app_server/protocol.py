@@ -107,6 +107,7 @@ from chartreux.utils.tool_presentation import (
 SERVER_METHODS: tuple[str, ...] = (
     "agent/transcript/get",
     "agents/cancel",
+    "agents/release",
     "callback/result",
     "config/fields/read",
     "config/settings/read",
@@ -669,6 +670,31 @@ class AgentsCancelResponse(ProtocolModel):
     outcome: CancelOutcome
     run_id: str | None = None
     stop_reason: RunStopReason | None = None
+
+
+class ReleaseOutcome(StrEnum):
+    RELEASED = "released"
+    EVICTED = "evicted"
+    CONFLICT = "conflict"
+    UNKNOWN = "unknown"
+
+
+class AgentsReleaseParams(ProtocolModel):
+    """Guarded release request with optimistic concurrency on the latest run."""
+
+    agent_id: str = Field(min_length=1)
+    expected_run_id: str | None = Field(default=None, min_length=1)
+
+
+class AgentsReleaseResponse(ProtocolModel):
+    """Guarded release disposition.
+
+    ``conflict``/``unknown`` outcomes never stopped or purged anything; the
+    reason explains which guard fired.
+    """
+
+    outcome: ReleaseOutcome
+    reason: str | None = None
 
 
 class AgentTranscriptGetParams(ProtocolModel):
@@ -2018,6 +2044,7 @@ class TurnCompletedParams(EventNotificationParams):
 class AgentSummaryModel(ProtocolModel):
     agent_id: str
     profile: str
+    name: str
     slot_purposes: list[str] = Field(default_factory=list)
     availability: str
     current_run_id: str | None = None

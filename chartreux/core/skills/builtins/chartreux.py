@@ -382,20 +382,27 @@ agent_paths = ["/path/to/custom/agents"]
 enabled_agents = ["worker", "custom-*"]
 disabled_agents = ["experimental-*"]
 
-# Background-agent idle retention; 0 disables either limit
+# Background-agent retention; agents close on completion unless retained
 [subagents]
-idle_ttl_seconds = 3600
-max_idle_agents = 16
+retain_agents = false
+idle_ttl_seconds = 300
+max_idle_agents = 4
+tombstone_ttl_seconds = 900
+max_tombstones = 32
 ```
 
 Chartreux has one primary agent; `--agent` and `Shift+Tab` mode selection are
 unavailable. `agent_paths`, `enabled_agents`, and `disabled_agents` control
 discovered subagents. If `enabled_agents` is set, only matching subagents are
 available; otherwise, `disabled_agents` excludes matching subagents. Background
-subagents remain resident while idle subject to the configured TTL and idle-agent
-cap; either setting may be `0` to disable that limit. Setting both to `0` closes
-the runtime as soon as each run completes. Eviction and close-on-completion preserve
-completed results until result expiry.
+subagents close when their run completes unless they are retained: retention
+comes from the per-launch `retain: true` argument, a profile's `retain` setting,
+or the `retain_agents` default (precedence: launch argument, then profile, then
+global default). Retained agents stay resident while idle subject to the
+configured TTL and idle-agent cap; either setting may be `0` to disable that
+limit, and setting both to `0` retains an agent with no limits. Close-on-
+completion, eviction, and terminal-metadata expiry preserve completed results
+until result expiry; `release_agent` discards them.
 
 Routine tool execution has no approval dialog. Runtime denials, sensitive-file
 protections, workspace-root checks, and other scope checks remain enforced.
@@ -708,9 +715,9 @@ scope checks remain enforced.
 
 ### Subagents
 
-- **worker**: General-purpose subagent with the `worker` role prompt; its default model role is `@worker`.
-- **advisor**: Independent, read-only advisor with the `advisor` role prompt; its default model role is `@heavy`. Its tools are limited to `read_file`, `grep`, `web_search`, and `web_fetch`, and its TTL is `0`.
-- **reviewer**: Independent, read-only reviewer with the `reviewer` role prompt; its default model role is `@worker`.
+- **worker**: General-purpose subagent with the `worker` role prompt; its default model role is `@worker`. It closes on completion unless retained.
+- **advisor**: Independent, read-only advisor with the `advisor` role prompt; its default model role is `@heavy`. Its tools are limited to `read_file`, `grep`, `web_search`, `web_fetch`, and `skill`. It ships retained by profile default (`retain = true`) with a 3600-second idle TTL.
+- **reviewer**: Independent, read-only reviewer with the `reviewer` role prompt; its default model role is `@worker`. It closes on completion unless retained.
 
 Routing is configured separately from profiles. Inspect the rendered dispatch
 slot table for the current session's purposes and eligible slots. Each slot
@@ -723,33 +730,13 @@ slot entries may override its bindings and purposes. Dispatch is not defined in
 project configuration or agent profiles. Saved dispatch changes apply next
 session, not as a mid-session mode switch.
 
-Use `task(agent_type="worker", task=...)` to create an agent instance. The agent type is a profile name (default `worker`); `agent_id` identifies a retained agent instance instead. The `agent-N` syntax (digits after `agent-`) is reserved for instance handles and rejected in `agent_type` before dispatch. Profiles are presets: the main agent can choose a configured canonical model or role, predefined system prompt, inline instructions, tools, and thinking for an individual launch, but never beyond the parent authority ceiling. Per-call configuration is not written to `config.toml`; committed child launch state is retained in child-session metadata and revalidated fail-closed on resume. For a bounded design, feature, or review loop,
-keep the engagement cast — advisors, planner, implementors, and reviewers —
-resident while exchanging findings, requirements, and plan updates between them.
-Background launches return stable `agent_id` and per-invocation `run_id` handles,
-and include guidance to continue the instance with `task(agent_id=..., background=true, task=...)`.
-`check_agents.reuse_guidance` also describes this reuse; omit `agent_type` to retain the profile.
-`task_summary` is an optional concise action plus subsystem or feature (up to 240
-characters); it identifies retained work in `check_agents`. `check_agents` includes
-an agent's effective model, thinking, initial and current task summaries, idle
-duration, and `ttl_remaining_seconds`; inspect those values and history suitability
-before reuse. Reuse an `idle` agent with `task(agent_id=..., background=true)` only
-for a genuine corrective continuation with the same profile and feature or
-subsystem; include the current scope and intervening changes because retained
-conversation is not proof that the working tree is unchanged. Persona is immutable
-on re-task: start a new agent when instructions, system prompt, role, stack, or
-independent judgment must change. A `running` agent is busy: wait when its result
-is required, and create another only for independent, non-conflicting work. Profile
-mismatch prevents reuse. The TTL estimate is advisory only. Idle agents are retained
-best-effort and can be evicted by the TTL or idle cap. An `evicted` agent cannot be
-reused, but its completed result remains available through
-`get_agent_result(agent_id, run_id)` or `wait_for_agent(agent_id, run_id, timeout)`
-until result expiry. A timeout stops only the wait. A result-expired error means the
-result is gone; an unknown-agent or unknown-run error means the handle is invalid.
-For further work after eviction or expiry, launch a new agent. `release_agent(agent_id)`
-closes a resident agent or removes an evicted tombstone and its retained results;
-release agents when the engagement concludes. Background agents cannot launch
-background agents.
+Use `task(agent_type="worker", task=...)` to create an agent instance. The agent type is a profile name (default `worker`); `agent_id` identifies an agent instance instead, and each instance also has a display-only `{profile}-{model}-{number}` name — `agent_id` remains the only handle. The `agent-N` syntax (digits after `agent-`) is reserved for instance handles and rejected in `agent_type` before dispatch. Profiles are presets: the main agent can choose a configured canonical model or role, predefined system prompt, inline instructions, tools, and thinking for an individual launch, but never beyond the parent authority ceiling. Per-call configuration is not written to `config.toml`; committed child launch state is retained in child-session metadata and revalidated fail-closed on resume. Launch in the background even when the result is a dependency, then wait for it with `wait_for_agent`; set `background: false` only when blocking is truly required.
+Background agents close when their run completes unless they are retained: the completed result stays retrievable, and the handle lingers as `closed` terminal metadata until that metadata expires. Retention is opt-in — pass `retain: true`, or use a profile that ships retention; precedence is the launch argument, then the profile's `retain` setting, then the `[subagents].retain_agents` default. For a bounded design, feature, or review loop, keep the engagement cast — advisors, planner, implementors, and reviewers — resident while exchanging findings, requirements, and plan updates between them; advisors are retained by profile default, and workers or reviewers need `retain: true`.
+Background launches return stable `agent_id` and per-invocation `run_id` handles, and include guidance to continue a retained instance with `task(agent_id=..., background=true, task=...)`.
+`check_agents.reuse_guidance` also describes this reuse; omit `agent_type` to retain the profile, and omit `retain` to inherit the instance's committed retention policy (`retain: false` is a final continuation that closes afterward).
+`task_summary` is an optional concise action plus subsystem or feature (up to 240 characters); it identifies retained work in `check_agents`. `check_agents` lists the bounded inventory — resident agents plus `closed`/`evicted` terminal metadata within its metadata window — and includes each agent's name, effective model, thinking, initial and current task summaries, idle duration, and `ttl_remaining_seconds`; inspect those values and history suitability before reuse. Reuse an `idle` agent with `task(agent_id=..., background=true)` only for a genuine corrective continuation with the same profile and feature or subsystem; include the current scope and intervening changes because retained conversation is not proof that the working tree is unchanged. Persona is immutable on re-task: start a new agent when instructions, system prompt, role, stack, or independent judgment must change. A `running` agent is busy: wait when its result is required, and create another only for independent, non-conflicting work. Profile mismatch prevents reuse. The TTL estimate is advisory only. Retained idle agents can be evicted by the TTL or idle cap. A `closed` or `evicted` agent cannot be reused, but its completed result remains available through `get_agent_result(agent_id, run_id)` or `wait_for_agent(agent_id, run_id, timeout)` until result expiry.
+`wait_for_agent` returns a typed disposition: `completed` carries the finished run's result, and `still_running` — at the default 1500-second timeout, or an explicit one — carries the wait progress and guidance to end your turn and re-invoke the wait in a later turn; a timeout stops only the wait, never the run. A result-expired error means the result is gone; an unknown-agent or unknown-run error means the handle is invalid.
+For further work after closure or eviction, launch a new agent. `release_agent(agent_id)` closes a resident agent or removes a `closed`/`evicted` tombstone, and discards its retained results — retrieve results before releasing; release agents when the engagement concludes. Background agents cannot launch background agents.
 
 `agent_paths`, `enabled_agents`, and `disabled_agents` control discovered
 subagents. Custom subagents are TOML files in `~/.chartreux/agents/NAME.toml`.
@@ -774,13 +761,21 @@ subagents. Custom subagents are TOML files in `~/.chartreux/agents/NAME.toml`.
   configuration, effective).
 - `/debug` - Toggle debug console
 - `/agents` - Toggle the expanded Background Agents list above the input. The
-  statusline summarizes agent states; the list shows retained subagents, their
-  profiles, task summaries, availability, run status, model, turns used, run ID,
-  and idle/TTL information. Select an agent to open its bordered transcript pane;
-  running agents refresh live about once per second. Use Up/Down and Enter or
-  mouse selection, PageUp for older pages, `r` to refresh, and Escape (or the
-  Main agent entry) to return to the conversation. `Ctrl+Shift+A` is the keyboard
-  shortcut for the same toggle.
+  statusline counts active work only (running and finalizing), with a dim
+  recent or idle note when no work is active. The list groups agents by
+  lifecycle —
+  Active, Retained Idle, and Recent (closed/evicted terminal metadata) —
+  behind the Resident (default), Active, Idle, Recent, and All filter tabs,
+  cycled with Left/Right. Rows show the agent's name with its handle dimmed,
+  plus profile, task summaries, availability, run status, model, turns used,
+  run ID, and idle/TTL information. Select an agent to open its bordered
+  transcript pane, available within the terminal-metadata window when a saved
+  transcript exists; running agents refresh live about once per second. Stop a
+  running agent with `C` and release an idle or recent agent with `R` (both
+  confirmed; release discards the agent's retained results). Use Up/Down and
+  Enter or mouse selection, PageUp for older pages, `r` to refresh, and Escape
+  (or the Main agent entry) to return to the conversation. `Ctrl+Shift+A` is
+  the keyboard shortcut for the same toggle.
 - `/compact` - Compact model context by summarizing. The session ID and visible
   conversation stay intact; the auto title is refreshed to reflect the
   compacted conversation (unless renamed manually).

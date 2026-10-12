@@ -57,6 +57,7 @@ from chartreux.core.config import SessionLoggingConfig
 from chartreux.core.events import UserMessageEvent
 from chartreux.core.llm_models import Role
 from chartreux.core.session_types import ScheduledLoop
+from chartreux.core.subagents import derive_agent_name
 from chartreux.setup.trusted_folders.trust_folder_dialog import TrustFolderApp
 from chartreux.utils import VIBE_WARNING_TAG
 from chartreux.utils.retry_prompt import build_retry_prompt
@@ -509,7 +510,18 @@ async def test_transcript_defers_incoming_decision_until_close() -> None:
         )
         await app._handle_turn_event(
             AgentsUpdate([
-                AgentSummaryModel(agent_id="one", profile="worker", availability="idle")
+                AgentSummaryModel(
+                    agent_id="one",
+                    profile="worker",
+                    availability="idle",
+                    name=derive_agent_name(
+                        agent_id="one",
+                        profile="worker",
+                        profile_display_label=None,
+                        base_model=None,
+                        effective_model=None,
+                    ),
+                )
             ])
         )
         await pilot.press("ctrl+shift+a", "down", "enter")
@@ -1189,7 +1201,18 @@ async def test_inspection_rejected_while_question_draft_is_visible() -> None:
     async with app.run_test():
         await app._handle_turn_event(
             AgentsUpdate([
-                AgentSummaryModel(agent_id="one", profile="worker", availability="idle")
+                AgentSummaryModel(
+                    agent_id="one",
+                    profile="worker",
+                    availability="idle",
+                    name=derive_agent_name(
+                        agent_id="one",
+                        profile="worker",
+                        profile_display_label=None,
+                        base_model=None,
+                        effective_model=None,
+                    ),
+                )
             ])
         )
         await app._handle_turn_event(CallbackRequested(callback))
@@ -1275,8 +1298,10 @@ def test_retry_and_empty_mcp_copy_and_availability() -> None:
 
 @pytest.mark.asyncio
 async def test_empty_mcp_and_agents_show_supported_next_action() -> None:
+    from textual.widgets import Static
+
     app = build_test_chartreux_app()
-    async with app.run_test():
+    async with app.run_test() as pilot:
         app.app_server.resources.mcp.read = AsyncMock(
             return_value=MagicMock(sources=[], statuses={})
         )
@@ -1285,7 +1310,14 @@ async def test_empty_mcp_and_agents_show_supported_next_action() -> None:
         await app.action_toggle_agent_browser()
         messages = [str(message._content) for message in app.query(UserCommandMessage)]
         assert sum("/mcp add <url>" in text for text in messages) == 2
-        assert any("No background agents" in text for text in messages)
+        # The expanded browser stays reachable on an empty inventory and shows
+        # its empty-state guidance in place of a command message (design §8).
+        bar = app._agent_bar
+        assert bar is not None
+        await pilot.pause()
+        assert bar.expanded
+        rendered = str(bar.query_one("#agent-bar-content", Static).render())
+        assert "No background agents" in rendered
 
 
 @pytest.mark.asyncio
@@ -1331,6 +1363,13 @@ async def test_confirmed_stop_calls_client_with_pinned_run_only(
             profile="worker",
             availability="running",
             current_run_id="r1",
+            name=derive_agent_name(
+                agent_id="one",
+                profile="worker",
+                profile_display_label=None,
+                base_model=None,
+                effective_model=None,
+            ),
         )
         sibling = target.model_copy(update={"agent_id": "two", "current_run_id": "s1"})
         await app._handle_turn_event(AgentsUpdate([target, sibling]))
@@ -1391,6 +1430,13 @@ async def test_stop_failure_surfaces_toast_and_restores_browser(
                     profile="worker",
                     availability="running",
                     current_run_id="r1",
+                    name=derive_agent_name(
+                        agent_id="one",
+                        profile="worker",
+                        profile_display_label=None,
+                        base_model=None,
+                        effective_model=None,
+                    ),
                 )
             ])
         )
@@ -1429,6 +1475,13 @@ async def test_escape_dismisses_stop_confirmation_before_browser_and_parent(
                     profile="worker",
                     availability="running",
                     current_run_id="r1",
+                    name=derive_agent_name(
+                        agent_id="one",
+                        profile="worker",
+                        profile_display_label=None,
+                        base_model=None,
+                        effective_model=None,
+                    ),
                 )
             ])
         )

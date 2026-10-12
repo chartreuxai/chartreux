@@ -103,6 +103,7 @@ from chartreux.app_server.protocol import (
     ConfigWriteOpWire,
     ProtocolError,
     ProtocolErrorCode,
+    ReleaseOutcome,
     UsageReadResponse,
     UsageUpdatedParams,
 )
@@ -381,6 +382,27 @@ def is_progress_event(event: AppServerEvent) -> bool:
     return isinstance(
         entry, (PublicMessageEntry, PublicReasoningEntry, PublicEffectEntry)
     )
+
+
+_MARKDOWN_INLINE_MARKUP = "\\`*_[]<&~"
+"""Characters that can open inline markup, entity or autolink sequences."""
+
+_MARKDOWN_ESCAPE_TABLE = str.maketrans({
+    char: f"\\{char}" for char in _MARKDOWN_INLINE_MARKUP
+})
+
+
+def _markdown_literal(text: str) -> str:
+    """Escape inline-Markdown-active characters so ``text`` renders literally.
+
+    ``UserCommandMessage`` renders its content through a Markdown widget, so
+    an interpolated derived agent name must not carry markup-active
+    characters (unlike toast notices, which render with markup disabled).
+    Only characters that can open emphasis, code, link, autolink, entity or
+    strikethrough sequences mid-text are escaped; plain names pass through
+    unchanged.
+    """
+    return text.translate(_MARKDOWN_ESCAPE_TABLE)
 
 
 class _ProviderCredentials:
@@ -3377,6 +3399,68 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 )
                 self._refresh_context_progress()
 
+    async def _handle_agents_update(
+        self, event: AgentsUpdate, received_at: float
+    ) -> None:
+        """Consume the authoritative inventory: browser, viewer, chrome."""
+        viewer = self._agent_transcript_viewer
+        selected_id = self._agent_selection_target or (
+            viewer.agent_id if viewer is not None else None
+        )
+        if selected_id is not None and not any(
+            agent.agent_id == selected_id for agent in event.agents
+        ):
+            # Releases and metadata expiry remove the agent from published
+            # summaries; evictions and closures remain tombstones in that
+            # list and stay browsable. Close the viewer, return to Main.
+            label = selected_id
+            for agent in self._agent_summaries:
+                if agent.agent_id == selected_id:
+                    label = agent.name or agent.agent_id
+                    break
+            await self._request_agent_transcript_close(restore_focus=True)
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    f"Background agent {_markdown_literal(label)} is no longer "
+                    "available; returned to the main conversation."
+                )
+            )
+        self._agent_summaries = event.agents
+        if self._turn_outcome_notice.display:
+            self._show_no_output_outcome()
+        self._agent_evictions.update({
+            eviction.agent_id: eviction for eviction in event.evictions
+        })
+        evicted_agent_ids = {
+            agent.agent_id
+            for agent in event.agents
+            if agent.availability.lower() == "evicted"
+        }
+        self._agent_evictions = {
+            agent_id: eviction
+            for agent_id, eviction in self._agent_evictions.items()
+            if agent_id in evicted_agent_ids
+        }
+        if self._agent_bar is not None:
+            self._agent_bar.update_agents(
+                event.agents,
+                tuple(self._agent_evictions.values()),
+                received_at=received_at,
+            )
+        viewer = self._agent_transcript_viewer
+        if viewer is None:
+            return
+        selected = next(
+            (agent for agent in event.agents if agent.agent_id == viewer.agent_id), None
+        )
+        viewer.set_live(selected is not None and agent_is_active(selected))
+        if selected is not None:
+            # The viewer is reused per agent: refresh its header in place
+            # when the selected handle re-tasks.
+            viewer.set_header(selected.name, selected.profile)
+            if self._agent_bar is not None:
+                viewer.set_metadata(self._agent_bar.full_metadata(selected))
+
     async def _handle_turn_event(self, event: AppServerEvent) -> None:
         received_at = time.monotonic()
         self._track_turn_outcome(event)
@@ -3387,51 +3471,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         ):
             self._loading_widget.set_waiting_only(event.turn.waiting_only)
         if isinstance(event, AgentsUpdate):
-            viewer = self._agent_transcript_viewer
-            selected_id = self._agent_selection_target or (
-                viewer.agent_id if viewer is not None else None
-            )
-            if selected_id is not None and not any(
-                agent.agent_id == selected_id for agent in event.agents
-            ):
-                # Releases remove the agent from published summaries. Evictions
-                # remain tombstones in that list and therefore stay browsable.
-                await self._request_agent_transcript_close(restore_focus=True)
-            self._agent_summaries = event.agents
-            if self._turn_outcome_notice.display:
-                self._show_no_output_outcome()
-            self._agent_evictions.update({
-                eviction.agent_id: eviction for eviction in event.evictions
-            })
-            evicted_agent_ids = {
-                agent.agent_id
-                for agent in event.agents
-                if agent.availability.lower() == "evicted"
-            }
-            self._agent_evictions = {
-                agent_id: eviction
-                for agent_id, eviction in self._agent_evictions.items()
-                if agent_id in evicted_agent_ids
-            }
-            if self._agent_bar is not None:
-                self._agent_bar.update_agents(
-                    event.agents,
-                    tuple(self._agent_evictions.values()),
-                    received_at=received_at,
-                )
-            viewer = self._agent_transcript_viewer
-            if viewer is not None:
-                selected = next(
-                    (
-                        agent
-                        for agent in event.agents
-                        if agent.agent_id == viewer.agent_id
-                    ),
-                    None,
-                )
-                viewer.set_live(selected is not None and agent_is_active(selected))
-                if selected is not None and self._agent_bar is not None:
-                    viewer.set_metadata(self._agent_bar.full_metadata(selected))
+            await self._handle_agents_update(event, received_at)
             return
         if isinstance(event, TurnQueueUpdated):
             await self._queue.sync_server_queue(event.queue)
@@ -4330,7 +4370,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     self._graduation.state.implementation_failed(
                         self._graduation_live_attempts[key], key, attempt_budgeted=True
                     )
-                if agent.availability == "idle":
+                # Idle (retained) and closed (ephemeral terminal) agents both
+                # end the live attempt; stale keys must not accumulate.
+                if agent.availability in {"idle", "closed"}:
                     self._graduation_live_attempts.pop(key, None)
 
     def _graduation_models_saved(
@@ -6504,16 +6546,13 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def action_toggle_agent_browser(self, **kwargs: Any) -> None:
         if self._agent_bar is None:
             return
-        if not self._agent_bar.agents:
-            await self._mount_and_scroll(
-                UserCommandMessage("No background agents to inspect yet.")
-            )
-            return
         if self._current_bottom_app == BottomApp.Question:
             await self._mount_and_scroll(
                 UserCommandMessage("Finish or cancel this question first.")
             )
             return
+        # The expanded browser is independent of the collapsed segment: it is
+        # always reachable, even while the inventory is empty (design §8).
         if not self._agent_bar.expanded:
             self._capture_agent_browser_origin(self.screen.focused)
             self._refresh_main_agent_details()
@@ -6528,6 +6567,50 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self.run_worker(
             self._cancel_agent_run(message.agent_id, message.run_id), exclusive=False
         )
+
+    def on_agent_bar_release_requested(
+        self, message: AgentBar.ReleaseRequested
+    ) -> None:
+        message.stop()
+        # Do not block agents/update processing while the RPC is outstanding.
+        self.run_worker(
+            self._release_agent(message.agent_id, message.expected_run_id),
+            exclusive=False,
+        )
+
+    async def _release_agent(self, agent_id: str, expected_run_id: str | None) -> None:
+        try:
+            response = await self.app_server.release_agent(agent_id, expected_run_id)
+        except Exception as exc:
+            # The registry purges records and results before awaiting runtime
+            # teardown, so a lost RPC response does not prove the release did
+            # not commit: keep the outcome uncertain instead of claiming the
+            # agent is unchanged.
+            self.notify(
+                f"Failed to release {agent_id}: {exc}. "
+                "Release may or may not have completed; "
+                "check the agents browser or check_agents before retrying.",
+                severity="error",
+                markup=False,
+            )
+            return
+        # The outcome never encodes the tombstone reason; conflict and unknown
+        # mean nothing was stopped or purged, so a stale reply cannot affect a
+        # replacement run's state.
+        if response.outcome is ReleaseOutcome.CONFLICT:
+            self.notify(
+                f"Release conflict for {agent_id}: "
+                f"{response.reason or 'the agent changed state'}. "
+                "Nothing was released; the agent may have started a new run.",
+                severity="warning",
+                markup=False,
+            )
+        elif response.outcome is ReleaseOutcome.UNKNOWN:
+            self.notify(
+                f"{agent_id} is no longer known to the server; nothing was released.",
+                severity="warning",
+                markup=False,
+            )
 
     async def _cancel_agent_run(self, agent_id: str, run_id: str) -> None:
         bar = self._agent_bar
@@ -6633,6 +6716,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     ),
                     agent.agent_id,
                     profile=agent.profile,
+                    name=agent.name,
                     metadata=(
                         self._agent_bar.full_metadata(agent)
                         if self._agent_bar is not None
@@ -6779,7 +6863,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
         for chrome_id in ("loading-area", "bottom-app-container", "bottom-bar"):
             self.query_one(f"#{chrome_id}").display = True
         if self._agent_bar is not None:
-            self._agent_bar.display = bool(self._agent_bar.agents)
+            # The expanded browser stays visible even with an empty inventory.
+            self._agent_bar.display = (
+                bool(self._agent_bar.agents) or self._agent_bar.expanded
+            )
 
     async def on_debug_console_closed(self, _message: DebugConsole.Closed) -> None:
         await self._close_debug_console()

@@ -21,7 +21,7 @@ from chartreux.core.dispatch.schema import DispatchMode
 from chartreux.core.dispatch.session import bind_policy
 from chartreux.core.model_catalog.loader import load_catalog
 from chartreux.core.prompts import SystemPrompt
-from chartreux.core.subagents import LaunchConfig
+from chartreux.core.subagents import LaunchConfig, derive_agent_name
 from chartreux.core.system_prompt import _interpolate_prompt
 from tests.conftest import build_test_vibe_config
 from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
@@ -178,6 +178,13 @@ async def test_bound_launch_agent_bar_identity_hides_dispatch_internals(tmp_path
         effective_model=candidate.effective_model.name,
         active_provider=candidate.effective_model.provider,
         effective_thinking=candidate.effective_thinking,
+        name=derive_agent_name(
+            agent_id="agent-1",
+            profile=candidate.profile.name,
+            profile_display_label=None,
+            base_model=candidate.committed_model.base_model,
+            effective_model=candidate.effective_model.name,
+        ),
     )
 
     class Host(App[None]):

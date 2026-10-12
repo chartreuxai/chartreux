@@ -20,6 +20,10 @@ from chartreux.core.subagents import (
     TaskArgs,
     TaskResult,
     UnknownAgentError,
+    WaitForAgentResult,
+    WaitStatus,
+    derive_agent_name,
+    still_running_guidance,
 )
 from chartreux.core.tools.base import BaseToolState, InvokeContext, ToolError
 from chartreux.core.tools.builtins.cancel_agent import (
@@ -74,18 +78,39 @@ class FakeSubagentManager:
 
     async def wait_for_agent(
         self, agent_id: str, run_id: str | None = None, *, timeout: float | None = None
-    ) -> TaskResult:
+    ) -> WaitForAgentResult:
         if self.wait_error is not None:
             raise self.wait_error
         key = (agent_id, run_id)
         if not any(agent.agent_id == agent_id for agent in self.agents):
             raise ValueError(f"Unknown agent: {agent_id}")
         event = self.completed.setdefault(key, asyncio.Event())
-        if timeout is None:
-            await event.wait()
-        else:
-            await asyncio.wait_for(event.wait(), timeout)
-        return self.results[key]
+        try:
+            if timeout is None:
+                await event.wait()
+            else:
+                await asyncio.wait_for(event.wait(), timeout)
+        except TimeoutError:
+            summary = next(agent for agent in self.agents if agent.agent_id == agent_id)
+            assert timeout is not None
+            elapsed = float(timeout)
+            turns_used = summary.turns_used or 0
+            return WaitForAgentResult(
+                status=WaitStatus.STILL_RUNNING,
+                agent_id=agent_id,
+                run_id=run_id,
+                elapsed_seconds=elapsed,
+                run_status=RunStatus.RUNNING,
+                turns_used=turns_used,
+                guidance=still_running_guidance(
+                    agent_id=agent_id,
+                    run_id=run_id or "",
+                    elapsed_seconds=elapsed,
+                    run_status=RunStatus.RUNNING,
+                    turns_used=turns_used,
+                ),
+            )
+        return WaitForAgentResult(status=WaitStatus.COMPLETED, result=self.results[key])
 
     async def cancel_run(
         self,
@@ -197,6 +222,7 @@ async def test_wait_tool_returns_cancelled_partial_result() -> None:
             availability=AgentAvailability.IDLE,
             current_run_id=None,
             current_run_status=None,
+            name=derive_agent_name("agent-1", "worker", None, None, None),
         )
     ])
     expected = TaskResult(
@@ -213,6 +239,7 @@ async def test_wait_tool_returns_cancelled_partial_result() -> None:
             WaitForAgentArgs(agent_id="agent-1", run_id="run-1"), _context(manager)
         )
     )
+    assert result.status is WaitStatus.COMPLETED
     assert result.result == expected
 
 
@@ -272,6 +299,7 @@ async def test_check_agents_returns_agent_summaries() -> None:
         context_window=200_000,
         compacting=False,
         stop_reason=RunStopReason.BUDGET_EXCEEDED,
+        name=derive_agent_name("agent-1", "worker", None, "base", "strong"),
     )
     result = await collect_result(
         _check_agents_tool().run(
@@ -303,6 +331,7 @@ async def test_check_agents_returns_agent_summaries() -> None:
         "context_window": 200_000,
         "compacting": False,
         "stop_reason": "budget_exceeded",
+        "name": "worker-base-1",
     }
 
 
@@ -388,6 +417,7 @@ async def test_wait_for_evicted_agent_returns_retained_result() -> None:
         availability=AgentAvailability.EVICTED,
         current_run_id="run-1",
         current_run_status=RunStatus.COMPLETED,
+        name=derive_agent_name("agent-1", "worker", None, None, None),
     )
     manager = FakeSubagentManager([summary])
     expected = TaskResult(response="done", turns_used=1, completed=True)
@@ -401,6 +431,7 @@ async def test_wait_for_evicted_agent_returns_retained_result() -> None:
         )
     )
 
+    assert result.status is WaitStatus.COMPLETED
     assert result.result == expected
     summary = AgentSummary(
         agent_id="agent-1",
@@ -408,6 +439,7 @@ async def test_wait_for_evicted_agent_returns_retained_result() -> None:
         availability=AgentAvailability.RUNNING,
         current_run_id="run-1",
         current_run_status=RunStatus.RUNNING,
+        name=derive_agent_name("agent-1", "worker", None, None, None),
     )
     manager = FakeSubagentManager([summary])
     wait = asyncio.create_task(
@@ -424,31 +456,57 @@ async def test_wait_for_evicted_agent_returns_retained_result() -> None:
     manager.results[("agent-1", "run-1")] = expected
     manager.completed[("agent-1", "run-1")].set()
 
-    assert (await wait).result == expected
+    wait_result = await wait
+    assert wait_result.status is WaitStatus.COMPLETED
+    assert wait_result.result == expected
 
 
 @pytest.mark.asyncio
-async def test_wait_for_agent_timeout_does_not_cancel_run() -> None:
+async def test_wait_for_agent_timeout_returns_still_running_without_cancelling() -> (
+    None
+):
     summary = AgentSummary(
         agent_id="agent-1",
         profile="worker",
         availability=AgentAvailability.RUNNING,
         current_run_id="run-1",
         current_run_status=RunStatus.RUNNING,
+        name=derive_agent_name("agent-1", "worker", None, None, None),
     )
     manager = FakeSubagentManager([summary])
 
-    with pytest.raises(
-        ToolError, match="Timed out waiting for agent agent-1 run run-1"
-    ):
-        await collect_result(
-            _wait_for_agent_tool().run(
-                WaitForAgentArgs(agent_id="agent-1", run_id="run-1", timeout=0.01),
-                _context(manager),
-            )
+    result = await collect_result(
+        _wait_for_agent_tool().run(
+            WaitForAgentArgs(agent_id="agent-1", run_id="run-1", timeout=0.01),
+            _context(manager),
         )
+    )
 
+    # A timed-out wait is a normal still_running result, not a tool failure.
+    assert result.status is WaitStatus.STILL_RUNNING
+    assert result.agent_id == "agent-1"
+    assert result.run_id == "run-1"
+    assert result.run_status is RunStatus.RUNNING
+    assert result.elapsed_seconds == 0.01
+    assert result.result is None
+    assert result.guidance is not None
+    assert "End your turn" in result.guidance
+    assert "later turn" in result.guidance
+    assert "check_agents" in result.guidance
+
+    # The run was never cancelled: the completion event stays unset.
     assert not manager.completed[("agent-1", "run-1")].is_set()
+
+    display = WaitForAgent.get_result_display(
+        ToolResultEvent(
+            tool_name="wait_for_agent",
+            tool_class=WaitForAgent,
+            result=result,
+            tool_call_id="call",
+        )
+    )
+    assert display.success is True
+    assert display.verb == "Waiting"
 
 
 @pytest.mark.asyncio
@@ -484,6 +542,7 @@ async def test_release_agent_calls_manager() -> None:
         availability=AgentAvailability.IDLE,
         current_run_id=None,
         current_run_status=None,
+        name=derive_agent_name("agent-1", "worker", None, None, None),
     )
     manager = FakeSubagentManager([summary])
 
@@ -507,6 +566,7 @@ async def test_release_evicted_agent_succeeds() -> None:
             availability=AgentAvailability.EVICTED,
             current_run_id=None,
             current_run_status=None,
+            name=derive_agent_name("agent-1", "worker", None, None, None),
         )
     ])
 

@@ -111,9 +111,13 @@ _BACKGROUND_SENTENCES = (
     "and `metadata.replacement_run_id` identify both runs. Use "
     "`cancel_agent(agent_id, run_id)` to request a stop without replacement, "
     "then wait for the terminal result; stop acceptance is not completion and "
-    "neither stop nor retask rolls back side effects. Retrieve results before "
-    "release; idle retention is best-effort, and evicted agents must be "
-    "recreated for further work."
+    "neither stop nor retask rolls back side effects. Retention is opt-in: "
+    "background agents close on completion unless retained (`retain: true` or "
+    "a retaining profile), and `closed` or `evicted` instances keep their "
+    "results retrievable but must be recreated for further work. Each "
+    "instance's `{profile}-{model}-{number}` name is display-only; `agent_id` "
+    "is the only handle. Retrieve results before release; release discards "
+    "retained results."
 )
 
 # --- Fixed developer-owned scaffolding: standalone mode (contracts B) -------
@@ -184,7 +188,9 @@ _REUSE_PREFIX = (
     "To continue genuine work on the same feature, first use `check_agents` "
     "to inspect each idle agent's effective model, thinking, and retained "
     "context. Reuse an idle handle with `agent_id` and `background: true`; "
-    "omit `agent_type` to retain its profile. Omit `config`, use `{}`, or "
+    "omit `agent_type` to retain its profile, and omit `retain` to inherit "
+    "the instance's committed retention policy (pass `retain: false` for a "
+    "final continuation that closes afterward). Omit `config`, use `{}`, or "
     "omit nested fields to retain effective launch choices; supplied lists "
     "replace earlier launch-layer lists and supplied per-tool fields patch "
     "that tool. Re-task the same idle agent for a genuine continuation, with "
@@ -200,10 +206,11 @@ _REUSE_SUFFIX = (
     "independent judgment. Include the current scope and intervening changes "
     "rather than restating its full context. A retained conversation is not "
     "proof that the working tree is unchanged. A running agent is busy; wait "
-    "when its result is a dependency, and spawn another only for independent, "
-    "non-conflicting work. An evicted agent cannot be reused; retrieve its "
-    "retained result with `get_agent_result` if needed, then start a new "
-    "agent."
+    "for its result with `wait_for_agent` (a `still_running` timeout is a "
+    "normal outcome: end your turn and re-invoke the wait in a later turn), "
+    "and spawn another only for independent, non-conflicting work. A `closed` "
+    "or `evicted` agent cannot be reused; retrieve its retained result with "
+    "`get_agent_result` if needed, then start a new agent."
 )
 
 _REVIEW_EXAMPLE_MULTI_MODEL = (

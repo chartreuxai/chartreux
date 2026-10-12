@@ -51,19 +51,21 @@ class TestAgentProfile:
             "prompt_id",
             "enabled_tools",
             "idle_ttl_seconds",
+            "retain",
             "thinking",
         ),
         [
-            (WORKER, "worker", "worker", None, None, None),
+            (WORKER, "worker", "worker", None, None, None, None),
             (
                 ADVISOR,
                 "heavy",
                 "advisor",
                 ["read_file", "grep", "web_search", "web_fetch", "skill"],
-                0,
+                3600,
+                True,
                 None,
             ),
-            (REVIEWER, "worker", "reviewer", None, None, None),
+            (REVIEWER, "worker", "reviewer", None, None, None, None),
         ],
     )
     def test_builtin_profiles_have_role_prompt_and_tools(
@@ -73,12 +75,14 @@ class TestAgentProfile:
         prompt_id: str,
         enabled_tools: list[str] | None,
         idle_ttl_seconds: int | None,
+        retain: bool | None,
         thinking: dict[str, str] | None,
     ) -> None:
         assert profile.agent_type == AgentType.SUBAGENT
         assert profile.safety == AgentSafety.NEUTRAL
         assert profile.role == role
         assert profile.idle_ttl_seconds == idle_ttl_seconds
+        assert profile.retain is retain
         assert profile.overrides["system_prompt_id"] == prompt_id
         assert profile.overrides.get("enabled_tools") == enabled_tools
         assert profile.overrides.get("thinking_overrides") == thinking
@@ -91,6 +95,33 @@ class TestAgentProfile:
 
         assert profile.idle_ttl_seconds == 0
         assert profile.overrides == {}
+
+    @pytest.mark.parametrize(
+        ("toml_body", "expected_display_name", "expected_explicit"),
+        [
+            ('display_name = "Scout Team"\n', "Scout Team", True),
+            ('description = "no display name"\n', "My Scout", False),
+        ],
+        ids=["explicit-display-name", "synthesized-display-name"],
+    )
+    def test_profile_display_name_explicitness_tracks_the_toml(
+        self,
+        tmp_path: Path,
+        toml_body: str,
+        expected_display_name: str,
+        expected_explicit: bool,
+    ) -> None:
+        # The picker-facing display_name keeps the title-case synthesis, but
+        # the §5 naming fallback keys off explicitness: a synthesized label
+        # must not become the agent-name profile segment (the admission
+        # capture stores the label only when it was explicit).
+        profile_path = tmp_path / "my-scout.toml"
+        profile_path.write_text(toml_body, encoding="utf-8")
+
+        profile = AgentProfile.from_toml(profile_path)
+
+        assert profile.display_name == expected_display_name
+        assert profile.display_name_explicit is expected_explicit
 
     def test_profile_role_is_metadata_not_an_override(self, tmp_path: Path) -> None:
         profile_path = tmp_path / "worker.toml"

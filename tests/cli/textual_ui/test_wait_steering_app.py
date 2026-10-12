@@ -14,7 +14,7 @@ from chartreux.app_server.protocol import ProtocolErrorCode
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.llm_models import FunctionCall, Role, ToolCall
-from chartreux.core.subagents import TaskArgs
+from chartreux.core.subagents import TaskArgs, WaitStatus
 from chartreux.core.tools.base import InvokeContext
 from tests.agent_loop.test_agent_wait_steering import wait_call
 from tests.app_server.test_subagents import BlockingBackend, _background_result
@@ -223,8 +223,12 @@ async def test_wait_submission_reaches_real_parent_before_children_complete(
                 assert await root.children.get_agent_result(*child) is None
             child_backend.release.set()
             for child in children:
-                result = await asyncio.wait_for(root.children.wait_for_agent(*child), 5)
-                assert result.response == "Child completed"
+                disposition = await asyncio.wait_for(
+                    root.children.wait_for_agent(*child), 5
+                )
+                assert disposition.status is WaitStatus.COMPLETED
+                assert disposition.result is not None
+                assert disposition.result.response == "Child completed"
     finally:
         child_backend.release.set()
 
@@ -454,9 +458,12 @@ async def test_full_app_child_completion_and_steering_emit_one_wait_result(
     assert len([m for m in parent.messages if m.content == "racing instructions"]) == 1
     assert not app.app_server.turn_queue.items
     assert not app._queue.has_unresolved_steering
-    result = await asyncio.wait_for(
+    disposition = await asyncio.wait_for(
         root.children.wait_for_agent(launch.agent_id, launch.run_id), 5
     )
+    assert disposition.status is WaitStatus.COMPLETED
+    result = disposition.result
+    assert result is not None
     assert result.response == "Child completed"
     assert (
         await root.children.get_agent_result(launch.agent_id, launch.run_id) is result

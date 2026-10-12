@@ -76,6 +76,7 @@ from chartreux.app_server.protocol import (
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._loop import _PreparedPolicyReplacement
 from chartreux.core.agents.launch import FrozenPersona, LaunchCandidate, resolve_launch
+from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config._dangerous_command_persistence import (
     read_saved_dangerous_command_grants,
 )
@@ -97,6 +98,7 @@ from chartreux.core.session_types import ChildSessionLink
 from chartreux.core.subagents import (
     AgentAvailability,
     AgentBusyError,
+    AgentClosedError,
     AgentEvictedError,
     AgentEviction,
     AgentProfileMismatchError,
@@ -108,6 +110,7 @@ from chartreux.core.subagents import (
     LaunchConfigError,
     LaunchOutcome,
     ReleaseAgentOutcome,
+    RetentionPolicy,
     RunStatus,
     RunStopReason,
     SubagentRunAccumulator,
@@ -115,8 +118,12 @@ from chartreux.core.subagents import (
     TaskArgs,
     TaskResult,
     UnknownAgentError,
+    WaitForAgentResult,
+    WaitStatus,
+    derive_agent_name,
     normalize_task_summary,
     prepare_subagent_prompt,
+    still_running_guidance,
 )
 from chartreux.core.tools.base import InvokeContext
 from chartreux.core.tools.builtins._shell_command_policy import (
@@ -255,6 +262,8 @@ class AgentRecord:
     runtime: SessionRuntime
     root_generation: int
     idle_ttl_seconds: int | None = None
+    retained: bool = False
+    profile_display_label: str | None = None
     parent_session_id: str = ""
     initial_task_summary: str | None = None
     state: _AgentState = _AgentState.IDLE
@@ -276,6 +285,7 @@ class AgentRecord:
     reserved_for_replacement: bool = False
     replacement_owner: _ReplacementClaim | None = None
     work_slot: _ActiveWorkSlot | None = None
+    first_admitted_at: float | None = None
 
     def effective_idle_ttl(self, global_ttl: int | float) -> int | float:
         return (
@@ -312,11 +322,23 @@ class _ReplacementClaim:
 
 @dataclass(frozen=True, slots=True)
 class _AgentTombstone:
-    """Private eviction data kept alongside the public agent summary."""
+    """Private terminal metadata kept alongside the public agent summary.
+
+    ``reason`` is ``"closed"`` for a completed-then-closed instance (reuse
+    raises :class:`AgentClosedError`) and ``"evicted"`` for a TTL/cap eviction
+    (reuse raises :class:`AgentEvictedError`). ``closed_at``/``expires_at`` bound
+    the metadata lifetime; ``expires_at`` is always set for a stored tombstone
+    (a zero tombstone TTL stores no terminal metadata at all).
+    ``profile_display_label`` is captured at admission for later naming work.
+    """
 
     summary: AgentSummary
     child_session_id: str
     parent_identity: tuple[str, int]
+    reason: str = "evicted"
+    closed_at: float = 0.0
+    expires_at: float | None = None
+    profile_display_label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -580,9 +602,25 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._clock = clock
         self._wakeup = wakeup
         self._reaper_task: asyncio.Task[None] | None = None
-        self._retention_policy = (0, 0)
+        self._reaper_deadline: float | None = None
+        # Reaper tasks that handed their schedule to a fresh timer before
+        # awaiting eviction cleanup (displaced reapers). Drain owns them
+        # until they settle, so drain_children cannot return — or publish
+        # its final empty inventory — while a displaced reaper can still
+        # deliver a payload.
+        self._detached_reaper_tasks: set[asyncio.Task[None]] = set()
+        self._pending_evictions: dict[str, object] = {}
+        self._retention_policy = RetentionPolicy(
+            idle_ttl_seconds=0, max_idle_agents=0, retain_agents=False
+        )
         self._generation_identity: tuple[str, int] | None = None
         self._draining_children = False
+        # Set while draining when an outstanding inventory publication is
+        # suppressed or cancelled (a reaper pruning across the drain
+        # boundary, or an in-flight publication aborted by cancelling its
+        # reaper): drain must still emit its final empty inventory so the
+        # disappearance is never lost.
+        self._drain_suppressed_inventory = False
         self._suppressed_notifications: set[str] = set()
         self._suppression_owners: dict[str, int] = {}
         self._admission_closed = False
@@ -1131,7 +1169,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
     def begin_root_generation(self) -> None:
         root = self._root
         if root is None:
-            self._retention_policy = (0, 0)
+            self._retention_policy = RetentionPolicy(
+                idle_ttl_seconds=0, max_idle_agents=0, retain_agents=False
+            )
             self._generation_identity = None
             return
         identity = (root.agent_loop.session_id, root.agent_loop._session_generation)
@@ -1142,7 +1182,13 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             self._retire_generation_agents()
         config = root.agent_loop.config.subagents
         self._restore_agent_id_high_water_mark(root)
-        self._retention_policy = (config.idle_ttl_seconds, config.max_idle_agents)
+        self._retention_policy = RetentionPolicy(
+            idle_ttl_seconds=config.idle_ttl_seconds,
+            max_idle_agents=config.max_idle_agents,
+            retain_agents=config.retain_agents,
+            tombstone_ttl_seconds=config.tombstone_ttl_seconds,
+            max_tombstones=config.max_tombstones,
+        )
         self._generation_identity = identity
 
     def _acquire_notification_suppression(self, agent_id: str) -> None:
@@ -1161,8 +1207,20 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
 
     def _retire_generation_agents(self) -> None:
         records = list(self._agent_records.values())
-        if not records:
-            return
+        # Drop terminal metadata belonging to the retiring generation. The
+        # matching is on the full (parent session, generation) identity captured
+        # at admission, which runs before `begin_root_generation` updates the
+        # identity. Results, expiry markers, latest-run indexes, and wait leases
+        # are deliberately preserved.
+        old_identity = self._generation_identity
+        removed_tombstones = [
+            agent_id
+            for agent_id, tombstone in self._evicted_agents.items()
+            if old_identity is not None and tombstone.parent_identity == old_identity
+        ]
+        for agent_id in removed_tombstones:
+            self._evicted_agents.pop(agent_id, None)
+            self._pending_evictions.pop(agent_id, None)
         for record in records:
             self._acquire_notification_suppression(record.agent_id)
             self._agent_records.pop(record.agent_id, None)
@@ -1195,6 +1253,19 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 name=f"vibe-subagent-generation-drain:{record.agent_id}",
             )
         self._rearm_reaper_locked()
+        if removed_tombstones or records:
+            # Publish the new inventory whenever anything was removed —
+            # terminal metadata or resident records. Retiring a generation
+            # that contains only resident agents (e.g. a retained idle
+            # advisor) removes records with no agents/update, and the browser
+            # would otherwise keep ghost rows until the next unrelated
+            # update.
+            publish = asyncio.create_task(
+                self._emit_agents_update(),
+                name="vibe-subagent-generation-agents-update",
+            )
+            self._teardown_tasks.add(publish)
+            publish.add_done_callback(self._teardown_tasks.discard)
 
     def _generation_is_current(self, generation: int) -> bool:
         root = self._root
@@ -1299,7 +1370,8 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 raise UnknownAgentError(f"Unknown agent: {agent_id}")
             record = self._agent_records.get(agent_id)
             if record is None:
-                if agent_id not in self._evicted_agents:
+                # Expired terminal metadata behaves as absent for transcript reads.
+                if self._live_tombstone_locked(agent_id, self._clock()) is None:
                     raise UnknownAgentError(f"Unknown agent: {agent_id}")
                 return None
             if (
@@ -1355,7 +1427,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             if self._generation_identity != identity:
                 raise UnknownAgentError(f"Unknown agent: {agent_id}")
             record = self._agent_records.get(agent_id)
-            tombstone = self._evicted_agents.get(agent_id)
+            tombstone = self._live_tombstone_locked(agent_id, self._clock())
             if record is not None:
                 if (
                     record.root_generation != identity[1]
@@ -1416,7 +1488,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             ):
                 return False
             record = self._agent_records.get(snapshot.agent_id)
-            tombstone = self._evicted_agents.get(snapshot.agent_id)
+            tombstone = self._live_tombstone_locked(snapshot.agent_id, self._clock())
             authorized = (
                 record is not None
                 and record.session_id == snapshot.child_session_id
@@ -1873,7 +1945,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
 
     async def _create_registered_child(
         self, parent: SessionRuntime, args: TaskArgs, ctx: InvokeContext
-    ) -> tuple[SessionRuntime, int | None]:
+    ) -> tuple[SessionRuntime, AgentProfile]:
         candidate = self._resolve_launch_candidate(parent, args)
         generation_identity = (
             parent.agent_loop.session_id,
@@ -1931,7 +2003,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                         child.session_id, child.config.session_logging
                     )
                 raise
-            return runtime, candidate.profile.idle_ttl_seconds
+            return runtime, candidate.profile
 
     @staticmethod
     def _start_child_turn(
@@ -1966,7 +2038,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             )
 
     async def _rollback_reused_claim(
-        self, record: AgentRecord, previous_idle_since: float | None
+        self,
+        record: AgentRecord,
+        previous_idle_since: float | None,
+        *,
+        apply_policy: bool = False,
     ) -> None:
         async with self._registry_lock:
             if (
@@ -1983,6 +2059,20 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 if previous_idle_since is not None
                 else self._clock()
             )
+            # Re-apply the committed policy only for a busy-replacement unwind:
+            # a failed admission that followed a stopped run closes an unretained
+            # instance instead of leaving it resident. A plain reuse failure
+            # restores the prior idle residency. No-op for retained records.
+            if apply_policy:
+                closed = self._close_unretained_locked(
+                    record,
+                    record.run_history[-1] if record.run_history else None,
+                    name=f"vibe-subagent-replacement-unwind:{record.agent_id}",
+                )
+                if closed:
+                    # Publish the terminal transition: the client inventory
+                    # must reflect the closure.
+                    self._schedule_agents_update_locked()
             self._rearm_reaper_locked()
 
     def _require_task_profile_allowed(
@@ -2016,6 +2106,27 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             else record.stop_reason,
         )
 
+    @staticmethod
+    def _tombstone_reuse_error(
+        agent_id: str, tombstone: _AgentTombstone
+    ) -> AgentClosedError:
+        """Select the typed reuse error by tombstone reason (§3.1 matrix).
+
+        A ``closed`` tombstone rejects reuse with :class:`AgentClosedError` and
+        continuation guidance; an ``evicted`` tombstone rejects it with the
+        :class:`AgentEvictedError` subtype. Both admission sites look the
+        tombstone up through :meth:`_live_tombstone_locked`, so a tombstone
+        whose metadata deadline passed (before the reaper prunes it) behaves
+        as unknown for reuse, per the §3.1 matrix.
+        """
+        if tombstone.reason == "closed":
+            return AgentClosedError(
+                "This instance is closed; launch a new task without "
+                "agent_id. Use retain=true when a resident continuation "
+                "is required."
+            )
+        return AgentEvictedError(f"Agent evicted: {agent_id}; start a new agent")
+
     async def _reserve_replacement(
         self, args: TaskArgs, ctx: InvokeContext
     ) -> _ReplacementClaim | TaskResult | None:
@@ -2029,10 +2140,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             self._validate_background_admission(parent, identity)
             record = self._agent_records.get(args.agent_id)
             if record is None:
-                if args.agent_id in self._evicted_agents:
-                    raise AgentEvictedError(
-                        f"Agent evicted: {args.agent_id}; start a new agent"
-                    )
+                tombstone = self._live_tombstone_locked(args.agent_id, self._clock())
+                if tombstone is not None:
+                    raise self._tombstone_reuse_error(args.agent_id, tombstone)
                 raise UnknownAgentError(
                     f"Unknown agent_id instance handle: {args.agent_id}. Check the agent_id with check_agents"
                 )
@@ -2071,6 +2181,10 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             if args.config is not None:
                 raise LaunchConfigError(
                     "Busy replacement cannot change launch configuration"
+                )
+            if args.retain is not None and args.retain is not record.retained:
+                raise LaunchConfigError(
+                    "Busy replacement cannot change retention policy"
                 )
             if (
                 record.runtime._closed is True
@@ -2126,19 +2240,26 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 self._active_work_slots.discard(record.work_slot)
             if self._agent_records.get(record.agent_id) is record:
                 latest = record.run_history[-1] if record.run_history else None
-                record.state = (
-                    _AgentState.IDLE
-                    if latest is None or latest.completion_task.done()
-                    else _AgentState.FINALIZING
-                )
-                record.idle_since = self._clock()
                 if latest is not None and not latest.completion_task.done():
+                    record.state = _AgentState.FINALIZING
+                    record.idle_since = self._clock()
                     task = asyncio.create_task(
                         self._finish_replacement_unwind(record, latest),
                         name=f"vibe-subagent-replacement-unwind:{record.agent_id}",
                     )
                     self._teardown_tasks.add(task)
                     task.add_done_callback(self._teardown_tasks.discard)
+                # Re-apply the committed policy: an unretained instance whose run
+                # settled closes instead of returning to idle.
+                elif self._close_unretained_locked(
+                    record,
+                    latest,
+                    name=f"vibe-subagent-replacement-unwind:{record.agent_id}",
+                ):
+                    self._schedule_agents_update_locked()
+                else:
+                    record.state = _AgentState.IDLE
+                    record.idle_since = self._clock()
         self._rearm_reaper_locked()
 
     async def _finish_replacement_unwind(
@@ -2161,8 +2282,16 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 and record.state is _AgentState.FINALIZING
                 and not record.reserved_for_replacement
             ):
-                record.state = _AgentState.IDLE
-                record.idle_since = self._clock()
+                # Re-apply the committed policy after the awaited run settles.
+                if self._close_unretained_locked(
+                    record,
+                    run,
+                    name=f"vibe-subagent-replacement-unwind:{record.agent_id}",
+                ):
+                    self._schedule_agents_update_locked()
+                else:
+                    record.state = _AgentState.IDLE
+                    record.idle_since = self._clock()
                 self._rearm_reaper_locked()
 
     @asynccontextmanager
@@ -2222,6 +2351,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                         claim.slot,
                         defer_launch_agents_update=defer_launch_agents_update,
                         replacement=claim,
+                        summary_task=args.task,
                     )
                     try:
                         async for event in launch:
@@ -2277,6 +2407,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         *,
         defer_launch_agents_update: bool = False,
         replacement: _ReplacementClaim | None = None,
+        summary_task: str | None = None,
     ) -> AsyncGenerator[ToolStreamEvent | TaskResult, None]:
         if ctx.is_subagent:
             raise RuntimeError("Agent depth limit of 1 reached")
@@ -2296,10 +2427,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     self._validate_background_admission(parent, parent_identity)
                     record = self._agent_records.get(args.agent_id)
                     if record is None:
-                        if args.agent_id in self._evicted_agents:
-                            raise AgentEvictedError(
-                                f"Agent evicted: {args.agent_id}; start a new agent"
-                            )
+                        tombstone = self._live_tombstone_locked(
+                            args.agent_id, self._clock()
+                        )
+                        if tombstone is not None:
+                            raise self._tombstone_reuse_error(args.agent_id, tombstone)
                         raise UnknownAgentError(
                             f"Unknown agent_id instance handle: {args.agent_id}. Check the agent_id with check_agents"
                         )
@@ -2343,6 +2475,8 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             else:
                 record = None
             created_record = False
+            launch_profile: AgentProfile | None = None
+            effective_task = summary_task if summary_task is not None else args.task
             prepared_reconfiguration = None
             if record is not None:
                 if args.config is not None or isinstance(
@@ -2353,7 +2487,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                             parent, args, runtime=record.runtime, profile=record.profile
                         )
                     except BaseException:
-                        await self._rollback_reused_claim(record, previous_idle_since)
+                        await self._rollback_reused_claim(
+                            record,
+                            previous_idle_since,
+                            apply_policy=replacement is not None,
+                        )
                         raise
                 if retained_candidate is not None:
                     try:
@@ -2365,7 +2503,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                             expected_parent_authority_revision=reserved_parent_authority_revision,
                         )
                     except BaseException:
-                        await self._rollback_reused_claim(record, previous_idle_since)
+                        await self._rollback_reused_claim(
+                            record,
+                            previous_idle_since,
+                            apply_policy=replacement is not None,
+                        )
                         raise
                 if parent.turns._projector is not None:
                     try:
@@ -2390,14 +2532,19 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                                     prepared_reconfiguration
                                 )
                             )
-                        await self._rollback_reused_claim(record, previous_idle_since)
+                        await self._rollback_reused_claim(
+                            record,
+                            previous_idle_since,
+                            apply_policy=replacement is not None,
+                        )
                         raise
                 runtime = record.runtime
             else:
                 self._require_task_profile_allowed(parent, args.agent_type)
-                runtime, idle_ttl_seconds = await self._create_registered_child(
+                runtime, profile = await self._create_registered_child(
                     parent, args, ctx
                 )
+                launch_profile = profile
                 agent_id = await self._issue_agent_id(parent)
                 record = AgentRecord(
                     agent_id=agent_id,
@@ -2405,10 +2552,10 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     session_id=runtime.agent_loop.session_id,
                     runtime=runtime,
                     root_generation=parent.agent_loop._session_generation,
-                    idle_ttl_seconds=idle_ttl_seconds,
+                    idle_ttl_seconds=profile.idle_ttl_seconds,
                     parent_session_id=parent.agent_loop.session_id,
                     initial_task_summary=normalize_task_summary(
-                        args.task_summary, fallback=args.task
+                        args.task_summary, fallback=effective_task
                     ),
                     state=_AgentState.RUNNING,
                 )
@@ -2431,6 +2578,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             agent_id = record.agent_id
             run_id = self._new_run_id(agent_id)
             prior_current_run = record.current_run
+            prior_retained = record.retained
             prior_latest_run_id = record.latest_run_id
             prior_registry_latest_present = agent_id in self._latest_run_ids
             prior_registry_latest = self._latest_run_ids.get(agent_id)
@@ -2449,12 +2597,40 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 status=RunStatus.RUNNING,
                 completion_task=completion_placeholder,
                 task_summary=normalize_task_summary(
-                    args.task_summary, fallback=args.task
+                    args.task_summary, fallback=effective_task
                 ),
             )
             record.current_run = run_record
             record.latest_run_id = run_id
             self._latest_run_ids[agent_id] = run_id
+            # Commit the retention policy for this admission. A fresh launch
+            # resolves explicit task arg -> profile setting -> generation
+            # snapshot default; a reuse inherits the committed policy unless
+            # the caller explicitly overrides it (retain=False is a final
+            # continuation that closes after this run).
+            if created_record:
+                assert launch_profile is not None
+                # Stable first-admission timestamp for deterministic Active
+                # ordering; preserved across reuse and run-history pruning.
+                record.first_admitted_at = self._clock()
+                if args.retain is not None:
+                    record.retained = args.retain
+                elif launch_profile.retain is not None:
+                    record.retained = launch_profile.retain
+                else:
+                    record.retained = self._retention_policy.retain_agents
+                # Capture the profile display label only when the profile's
+                # display_name was explicitly provided (design §5): a TOML
+                # profile without display_name synthesizes a title-case
+                # picker label, which must not become the name segment —
+                # the derivation helper falls back to the profile name.
+                record.profile_display_label = (
+                    launch_profile.display_name
+                    if launch_profile.display_name_explicit
+                    else None
+                )
+            elif args.retain is not None:
+                record.retained = args.retain
             run_record.start_count = sum(
                 message.role is Role.assistant
                 for message in runtime.agent_loop.messages
@@ -2675,8 +2851,12 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                                 if run_record.stop_reason is RunStopReason.RETASKED
                                 else "cancelled"
                             )
+                            # The notification derives from this run's own
+                            # record state at completion (§5): name alongside
+                            # handle, run, and outcome.
                             notification = (
-                                f"Background agent {agent_id} (run {run_id})"
+                                f"Background agent {self._record_name(record)} "
+                                f"({agent_id}, run {run_id})"
                                 f" {status_word}."
                                 " Use get_agent_result to retrieve the result."
                             )
@@ -2730,60 +2910,18 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                                         record.root_generation
                                     )
                                 ):
-                                    if (
-                                        record.effective_idle_ttl(
-                                            self._retention_policy[0]
-                                        )
-                                        == 0
-                                        and record.idle_ttl_seconds is None
-                                        and self._retention_policy[1] == 0
+                                    # Completion transition: a retained instance
+                                    # returns to idle; an unretained instance closes
+                                    # (detach + `closed` tombstone + tracked runtime
+                                    # close) after the result was published above.
+                                    if not self._close_unretained_locked(
+                                        record,
+                                        run_record,
+                                        name=(
+                                            "vibe-subagent-close-on-completion:"
+                                            f"{agent_id}"
+                                        ),
                                     ):
-                                        record.state = _AgentState.EVICTING
-                                        self._agent_records.pop(agent_id, None)
-                                        self._children.pop(record.session_id, None)
-                                        self._child_links.pop(record.session_id, None)
-                                        self._evicted_agents[agent_id] = (
-                                            _AgentTombstone(
-                                                summary=AgentSummary(
-                                                    agent_id=agent_id,
-                                                    profile=record.profile,
-                                                    availability=AgentAvailability.EVICTED,
-                                                    current_run_id=run_id,
-                                                    current_run_status=run_record.status,
-                                                    last_run_status=record.last_run_status,
-                                                    initial_task_summary=record.initial_task_summary,
-                                                    current_task_summary=run_record.task_summary,
-                                                    idle_seconds=0.0,
-                                                    latest_run_id=run_id,
-                                                    run_elapsed_seconds=self._run_elapsed_seconds(
-                                                        run_record, self._clock()
-                                                    ),
-                                                    effective_model=record.effective_model,
-                                                    base_model=record.base_model,
-                                                    active_provider=record.active_provider,
-                                                    effective_thinking=record.effective_thinking,
-                                                    context_tokens=record.context_tokens,
-                                                    context_window=record.context_window,
-                                                    compacting=False,
-                                                    stop_reason=record.stop_reason,
-                                                    result_expired=(agent_id, run_id)
-                                                    in self._expired_results,
-                                                ),
-                                                child_session_id=record.session_id,
-                                                parent_identity=(
-                                                    record.parent_session_id,
-                                                    record.root_generation,
-                                                ),
-                                            )
-                                        )
-                                        self._track_child_close(
-                                            runtime,
-                                            name=(
-                                                "vibe-subagent-zero-retention-teardown:"
-                                                f"{agent_id}"
-                                            ),
-                                        )
-                                    else:
                                         record.state = _AgentState.IDLE
                                 self._expire_results_locked()
                                 if not self._draining_children:
@@ -2793,7 +2931,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                                     await self._emit_agents_update()
                                 except Exception as exc:
                                     logger.warning(
-                                        "Failed to publish zero-retention eviction",
+                                        "Failed to publish agent completion transition",
                                         exc_info=exc,
                                     )
 
@@ -2910,6 +3048,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     )
                     if owns_attempt:
                         record.current_run = prior_current_run
+                        record.retained = prior_retained
                         record.latest_run_id = prior_latest_run_id
                         record.idle_since = prior_idle_since
                         if self._latest_run_ids.get(agent_id) == run_id:
@@ -2926,7 +3065,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                         parent, runtime, ctx.tool_call_id
                     )
                 else:
-                    await self._rollback_reused_claim(record, previous_idle_since)
+                    await self._rollback_reused_claim(
+                        record,
+                        previous_idle_since,
+                        apply_policy=replacement is not None,
+                    )
                 if isinstance(exc, asyncio.CancelledError):
                     raise exc
                 raise
@@ -2943,13 +3086,32 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                         exc_info=exc,
                     )
             # An explicit status distinguishes this successful launch acknowledgment
-            # from the terminal result that get_agent_result later returns.
+            # from the terminal result that get_agent_result later returns. The
+            # guidance is policy-aware: retained agents stay resident and can be
+            # continued; unretained agents close on completion with the result
+            # still retrievable.
+            if record.retained:
+                policy_guidance = (
+                    " This agent is retained and stays resident after the run "
+                    "completes; to continue this instance, use "
+                    f'task(agent_id="{agent_id}", background=true, task="...").'
+                )
+            else:
+                policy_guidance = (
+                    " This agent is not retained and closes when the run "
+                    "completes; the result stays retrievable via "
+                    "get_agent_result. Launch with retain=true to keep a "
+                    "resident agent."
+                )
+            # The name is derived from the record's committed admission state;
+            # refusals and failed admissions never relabel (§5).
+            agent_name = self._record_name(record)
             yield TaskResult(
                 response=(
-                    "Background agent launched and running; use check_agents to monitor, "
-                    "get_agent_result or wait_for_agent to retrieve the result. "
-                    f'To continue this instance, use task(agent_id="{agent_id}", '
-                    'background=true, task="...").'
+                    f"Background agent {agent_name} ({agent_id}, run {run_id}) "
+                    "launched and running; use check_agents to monitor, "
+                    "get_agent_result or wait_for_agent to retrieve the "
+                    "result." + policy_guidance
                 ),
                 turns_used=0,
                 completed=True,
@@ -2957,6 +3119,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 launch_outcome=LaunchOutcome.LAUNCHED,
                 agent_id=agent_id,
                 run_id=run_id,
+                name=agent_name,
                 metadata={
                     "base_model": record.base_model,
                     "active_provider": record.active_provider,
@@ -2975,6 +3138,8 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
 
         if args.agent_id is not None:
             raise ValueError("agent_id is only supported for background tasks")
+        if args.retain is not None:
+            raise ValueError("retain is only supported for background tasks")
         self._require_task_profile_allowed(parent, args.agent_type)
         runtime, _idle_ttl_seconds = await self._create_registered_child(
             parent, args, ctx
@@ -3153,10 +3318,43 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         end = run.completed_at if run.completed_at is not None else now
         return max(0.0, end - run.started_at)
 
+    @staticmethod
+    def _record_launch_key(record: AgentRecord) -> float:
+        """First-admission timestamp (active sort).
+
+        The timestamp is set at first admission and survives reuse and
+        run-history pruning; the earliest run start is only a fallback for
+        records admitted before the timestamp was tracked.
+        """
+        if record.first_admitted_at is not None:
+            return record.first_admitted_at
+        starts = [
+            run.started_at
+            for run in (record.current_run, *record.run_history)
+            if run is not None and run.started_at is not None
+        ]
+        return min(starts) if starts else float("inf")
+
+    @staticmethod
+    def _record_name(record: AgentRecord) -> str:
+        """Derive the human-facing ``{profile}-{model}-{number}`` name (§5).
+
+        The name is derived from the record's committed admission state
+        (profile display label captured at admission, canonical base model
+        with the effective-model fallback) and the handle's sequence digits.
+        """
+        return derive_agent_name(
+            record.agent_id,
+            record.profile,
+            record.profile_display_label,
+            record.base_model,
+            record.effective_model,
+        )
+
     def _agent_summaries(self) -> list[AgentSummary]:
         now = self._clock()
         global_ttl = (
-            self._retention_policy[0]
+            self._retention_policy.idle_ttl_seconds
             if self._generation_identity is not None
             else (
                 self._root.agent_loop.config.subagents.idle_ttl_seconds
@@ -3164,7 +3362,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 else 0
             )
         )
-        resident = []
+        entries: list[tuple[AgentRecord, AgentSummary]] = []
         for record in self._agent_records.values():
             ttl = record.effective_idle_ttl(global_ttl)
             run = record.current_run
@@ -3177,50 +3375,106 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 and record.idle_since is not None
                 else None
             )
-            resident.append(
-                AgentSummary(
-                    agent_id=record.agent_id,
-                    profile=record.profile,
-                    availability=record.availability,
-                    current_run_id=run.run_id if run is not None else None,
-                    current_run_status=run.status if run is not None else None,
-                    turns_used=self._agent_turns_used(record),
-                    last_run_status=record.last_run_status,
-                    initial_task_summary=record.initial_task_summary,
-                    current_task_summary=(
-                        run.task_summary
-                        if run is not None
-                        else record.last_task_summary
-                    ),
-                    idle_seconds=idle_seconds,
-                    latest_run_id=latest_run_id,
-                    run_elapsed_seconds=self._run_elapsed_seconds(
-                        run or (record.run_history[-1] if record.run_history else None),
-                        now,
-                    ),
-                    ttl_remaining_seconds=(
-                        max(0.0, ttl - idle_seconds)
-                        if ttl and idle_seconds is not None
-                        else None
-                    ),
-                    effective_model=record.effective_model,
-                    base_model=record.base_model,
-                    active_provider=record.active_provider,
-                    effective_thinking=record.effective_thinking,
-                    context_tokens=record.context_tokens,
-                    context_window=record.context_window,
-                    compacting=record.compacting,
-                    stop_reason=record.stop_reason,
-                    result_expired=(
-                        (record.agent_id, latest_run_id) in self._expired_results
-                        if latest_run_id is not None
-                        else False
-                    ),
-                )
+            summary = AgentSummary(
+                agent_id=record.agent_id,
+                profile=record.profile,
+                availability=record.availability,
+                current_run_id=run.run_id if run is not None else None,
+                current_run_status=run.status if run is not None else None,
+                turns_used=self._agent_turns_used(record),
+                last_run_status=record.last_run_status,
+                initial_task_summary=record.initial_task_summary,
+                current_task_summary=(
+                    run.task_summary if run is not None else record.last_task_summary
+                ),
+                idle_seconds=idle_seconds,
+                latest_run_id=latest_run_id,
+                run_elapsed_seconds=self._run_elapsed_seconds(
+                    run or (record.run_history[-1] if record.run_history else None), now
+                ),
+                ttl_remaining_seconds=(
+                    max(0.0, ttl - idle_seconds)
+                    if ttl and idle_seconds is not None
+                    else None
+                ),
+                effective_model=record.effective_model,
+                base_model=record.base_model,
+                active_provider=record.active_provider,
+                effective_thinking=record.effective_thinking,
+                context_tokens=record.context_tokens,
+                context_window=record.context_window,
+                compacting=record.compacting,
+                stop_reason=record.stop_reason,
+                result_expired=(
+                    (record.agent_id, latest_run_id) in self._expired_results
+                    if latest_run_id is not None
+                    else False
+                ),
+                name=self._record_name(record),
             )
+            entries.append((record, summary))
+        # Deterministic server ordering: Active (oldest launch first), then
+        # Retained Idle (most recently completed first), then Recent terminal
+        # metadata (newest closure first); numeric agent id breaks ties.
+        active = [
+            entry
+            for entry in entries
+            if entry[0].state in {_AgentState.RUNNING, _AgentState.FINALIZING}
+        ]
+        idle = [
+            entry
+            for entry in entries
+            if entry[0].state not in {_AgentState.RUNNING, _AgentState.FINALIZING}
+        ]
+        active.sort(
+            key=lambda entry: (
+                self._record_launch_key(entry[0]),
+                self._agent_id_sort_key(entry[0].agent_id),
+            )
+        )
+        idle.sort(
+            key=lambda entry: (
+                -(
+                    entry[0].idle_since
+                    if entry[0].idle_since is not None
+                    else float("-inf")
+                ),
+                self._agent_id_sort_key(entry[0].agent_id),
+            )
+        )
+        tombstones = sorted(
+            self._evicted_agents.values(),
+            key=lambda tombstone: (
+                -tombstone.closed_at,
+                self._agent_id_sort_key(tombstone.summary.agent_id),
+            ),
+        )
         return [
-            *resident,
-            *(tombstone.summary for tombstone in self._evicted_agents.values()),
+            *(summary for _record, summary in active),
+            *(summary for _record, summary in idle),
+            *(tombstone.summary for tombstone in tombstones),
+        ]
+
+    def _visible_summaries(self) -> list[AgentSummary]:
+        """Public inventory: summaries minus expired terminal metadata.
+
+        An expired tombstone behaves as absent in every published listing.
+        The internal `_agent_summaries` helper stays unfiltered (bounded by
+        the reaper and the insertion cap) so frozen snapshots remain
+        readable until the reaper prunes them.
+        """
+        now = self._clock()
+        expired = {
+            agent_id
+            for agent_id, tombstone in self._evicted_agents.items()
+            if self._tombstone_expired(tombstone, now)
+        }
+        if not expired:
+            return self._agent_summaries()
+        return [
+            summary
+            for summary in self._agent_summaries()
+            if summary.agent_id not in expired
         ]
 
     async def _emit_agents_update(
@@ -3233,6 +3487,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 AgentSummaryModel(
                     agent_id=summary.agent_id,
                     profile=summary.profile,
+                    name=summary.name,
                     slot_purposes=(
                         project_launch_slot_purposes(
                             record.runtime.agent_loop, summary.profile
@@ -3274,15 +3529,36 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     ),
                     result_expired=summary.result_expired,
                 )
-                for summary in self._agent_summaries()
+                for summary in self._visible_summaries()
             ],
             evictions or [],
         )
 
+    def _schedule_agents_update_locked(self) -> None:
+        """Publish the current inventory on a later turn (caller holds the lock)."""
+        if self._notify_agents is None or self._draining_children:
+            return
+
+        async def publish() -> None:
+            try:
+                await self._emit_agents_update()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to publish background agent update", exc_info=exc
+                )
+
+        task = asyncio.create_task(publish(), name="vibe-subagent-agents-update")
+        self._teardown_tasks.add(task)
+        task.add_done_callback(self._teardown_tasks.discard)
+
     async def check_agents(self) -> list[AgentSummary]:
         async with self._registry_lock:
             self._expire_results_locked()
-            return self._agent_summaries()
+            # Lazy terminal-metadata expiry: an expired tombstone behaves as
+            # absent in the public listing. The internal `_agent_summaries`
+            # helper stays unfiltered (bounded by the reaper and the insertion
+            # cap) so frozen snapshots remain readable until reaped.
+            return self._visible_summaries()
 
     @staticmethod
     def _interrupt_run(record: AgentRecord, run: RunRecord) -> bool:
@@ -3482,9 +3758,19 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
 
     async def wait_for_agent(
         self, agent_id: str, run_id: str | None = None, *, timeout: float | None = None
-    ) -> TaskResult:
+    ) -> WaitForAgentResult:
+        """Wait for a run and return the typed disposition (design §6).
+
+        ``completed`` carries the finished run's TaskResult; ``still_running``
+        is a normal outcome when the timeout expires first. The timeout never
+        cancels the run (the completion task is shielded) and the wait lease
+        keeps the result protected from count expiry. Race rule: every
+        disposition reports the run the caller pinned at wait start, never a
+        newer run's progress.
+        """
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive or None")
+        wait_started_at = self._clock()
         async with self._registry_lock:
             resolved = self._resolve_run(agent_id, run_id)
             if resolved is None:
@@ -3505,6 +3791,14 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                         released = key not in self._wait_leases
                     if not released:
                         raise
+                except TimeoutError:
+                    return await self._still_running_disposition(
+                        agent_id,
+                        key,
+                        target,
+                        run_id=run_id,
+                        wait_started_at=wait_started_at,
+                    )
             async with self._registry_lock:
                 if key not in self._wait_leases:
                     resolved = self._resolve_run(agent_id, run_id)
@@ -3519,7 +3813,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 result = stored.result if stored is not None else target.result
                 if result is None:
                     raise RuntimeError(f"Run {key[1]} completed without a result")
-                return result
+                return WaitForAgentResult(status=WaitStatus.COMPLETED, result=result)
         finally:
             async with self._registry_lock:
                 leases = self._wait_leases.get(key, 0)
@@ -3528,6 +3822,64 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 else:
                     self._wait_leases.pop(key, None)
                 self._expire_results_locked()
+
+    async def _still_running_disposition(
+        self,
+        agent_id: str,
+        key: tuple[str, str],
+        target: RunRecord,
+        *,
+        run_id: str | None,
+        wait_started_at: float,
+    ) -> WaitForAgentResult:
+        """Build the ``still_running`` disposition for an expired wait (§6).
+
+        The pinned run identity is preserved across timeout/release/replacement
+        races: the disposition reports the run this wait targeted. When the
+        pinned run actually settled at the timeout boundary, the completed
+        disposition is returned instead. A wait fenced by release keeps the
+        existing typed errors.
+        """
+        async with self._registry_lock:
+            if key not in self._wait_leases:
+                # Released while waiting: keep the release fencing semantics.
+                resolved = self._resolve_run(agent_id, run_id)
+                if resolved is None:
+                    raise UnknownAgentError(
+                        f"Unknown run {run_id} for agent {agent_id}"
+                    )
+                raise AgentResultExpiredError(
+                    f"Result expired for run {key[1]} on agent {agent_id}"
+                )
+            stored = self._result_store.get(key)
+            result = stored.result if stored is not None else target.result
+            if result is not None:
+                return WaitForAgentResult(status=WaitStatus.COMPLETED, result=result)
+            if target.status is not RunStatus.RUNNING:
+                raise RuntimeError(f"Run {key[1]} completed without a result")
+            elapsed = max(0.0, self._clock() - wait_started_at)
+            record = self._agent_records.get(agent_id)
+            # Pinned-run progress: only the record's live current run has a
+            # meaningful in-flight turn count; a displaced run reports zero.
+            if record is not None and record.current_run is target:
+                turns_used = self._agent_turns_used(record) or 0
+            else:
+                turns_used = 0
+            return WaitForAgentResult(
+                status=WaitStatus.STILL_RUNNING,
+                agent_id=agent_id,
+                run_id=key[1],
+                elapsed_seconds=elapsed,
+                run_status=target.status,
+                turns_used=turns_used,
+                guidance=still_running_guidance(
+                    agent_id=agent_id,
+                    run_id=key[1],
+                    elapsed_seconds=elapsed,
+                    run_status=target.status,
+                    turns_used=turns_used,
+                ),
+            )
 
     def _eligible_idle_locked(self) -> list[AgentRecord]:
         return [
@@ -3539,47 +3891,257 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             and self._generation_is_current(record.root_generation)
         ]
 
-    def _rearm_reaper_locked(self) -> None:
+    @staticmethod
+    def _agent_id_sort_key(agent_id: str) -> int:
+        """Numeric suffix of an ``agent-N`` handle for deterministic tie-breaks."""
+        prefix = "agent-"
+        if agent_id.startswith(prefix):
+            tail = agent_id[len(prefix) :]
+            if tail.isdigit():
+                return int(tail)
+        return -1
+
+    def _build_terminal_tombstone(
+        self,
+        record: AgentRecord,
+        run: RunRecord | None,
+        availability: AgentAvailability,
+        idle_seconds: float,
+    ) -> _AgentTombstone | None:
+        """Construct terminal metadata shared by close-on-completion and eviction.
+
+        The summary freezes the record/run fields at insertion time.
+        ``expires_at`` is ``closed_at + tombstone_ttl_seconds``. Returns
+        ``None`` when the tombstone TTL is zero: no terminal metadata is
+        retained at all, and the handle behaves as metadata-expired/unknown
+        once the record detaches (the result stays published and
+        retrievable).
+        """
+        agent_id = record.agent_id
+        latest_run_id = record.latest_run_id or (
+            run.run_id if run is not None else None
+        )
+        now = self._clock()
+        ttl = self._retention_policy.tombstone_ttl_seconds
+        if ttl <= 0:
+            return None
+        summary = AgentSummary(
+            agent_id=agent_id,
+            profile=record.profile,
+            availability=availability,
+            current_run_id=run.run_id if run is not None else None,
+            current_run_status=run.status if run is not None else None,
+            turns_used=self._agent_turns_used(record),
+            last_run_status=record.last_run_status,
+            initial_task_summary=record.initial_task_summary,
+            current_task_summary=run.task_summary if run is not None else None,
+            idle_seconds=idle_seconds,
+            latest_run_id=latest_run_id,
+            run_elapsed_seconds=self._run_elapsed_seconds(run, now),
+            effective_model=record.effective_model,
+            base_model=record.base_model,
+            active_provider=record.active_provider,
+            effective_thinking=record.effective_thinking,
+            context_tokens=record.context_tokens,
+            context_window=record.context_window,
+            compacting=record.compacting,
+            stop_reason=record.stop_reason,
+            result_expired=(
+                (agent_id, latest_run_id) in self._expired_results
+                if latest_run_id is not None
+                else False
+            ),
+            name=self._record_name(record),
+        )
+        return _AgentTombstone(
+            summary=summary,
+            child_session_id=record.session_id,
+            parent_identity=(record.parent_session_id, record.root_generation),
+            reason="closed" if availability is AgentAvailability.CLOSED else "evicted",
+            closed_at=now,
+            expires_at=now + ttl,
+            profile_display_label=record.profile_display_label,
+        )
+
+    def _insert_tombstone_locked(
+        self, agent_id: str, tombstone: _AgentTombstone
+    ) -> None:
+        """Store terminal metadata and enforce the oldest-first count cap."""
+        self._evicted_agents[agent_id] = tombstone
+        cap = self._retention_policy.max_tombstones
+        if cap <= 0:
+            return
+        while len(self._evicted_agents) > cap:
+            oldest_id = min(
+                self._evicted_agents,
+                key=lambda aid: (
+                    self._evicted_agents[aid].closed_at,
+                    self._agent_id_sort_key(aid),
+                ),
+            )
+            self._evicted_agents.pop(oldest_id, None)
+            # The capped tombstone's pending-eviction authority settles with
+            # it: the eviction it authorized can no longer notify once its
+            # metadata is gone, so the entry must not outlive the tombstone.
+            self._pending_evictions.pop(oldest_id, None)
+
+    @staticmethod
+    def _tombstone_expired(tombstone: _AgentTombstone, now: float) -> bool:
+        return tombstone.expires_at is not None and now >= tombstone.expires_at
+
+    def _live_tombstone_locked(
+        self, agent_id: str, now: float
+    ) -> _AgentTombstone | None:
+        """Return the tombstone for ``agent_id`` unless its metadata has expired."""
+        tombstone = self._evicted_agents.get(agent_id)
+        if tombstone is not None and not self._tombstone_expired(tombstone, now):
+            return tombstone
+        return None
+
+    def _prune_expired_tombstones_locked(self, now: float) -> list[str]:
+        """Drop expired terminal metadata only (results, markers, leases survive).
+
+        Returns the pruned agent ids so callers can publish the reduced
+        inventory.
+        """
+        expired = [
+            agent_id
+            for agent_id, tombstone in self._evicted_agents.items()
+            if self._tombstone_expired(tombstone, now)
+        ]
+        for agent_id in expired:
+            self._evicted_agents.pop(agent_id, None)
+            self._pending_evictions.pop(agent_id, None)
+        return expired
+
+    def _close_unretained_locked(
+        self, record: AgentRecord, run: RunRecord | None, *, name: str
+    ) -> bool:
+        """Detach and close a settled resident record whose policy is unretained.
+
+        Stores a ``closed`` tombstone (none at all when the tombstone TTL is
+        zero) and joins the runtime close through the tracked teardown set.
+        Returns ``False`` without acting when the record is not a settled
+        resident (draining, detached, reserved, retained, or still running).
+        """
+        agent_id = record.agent_id
+        if self._draining_children:
+            return False
+        if self._agent_records.get(agent_id) is not record:
+            return False
+        if record.reserved_for_replacement or record.retained:
+            return False
+        active = record.current_run
+        if active is not None and active.status is RunStatus.RUNNING:
+            return False
+        record.state = _AgentState.EVICTING
+        self._agent_records.pop(agent_id, None)
+        self._children.pop(record.session_id, None)
+        self._child_links.pop(record.session_id, None)
+        tombstone = self._build_terminal_tombstone(
+            record, run, AgentAvailability.CLOSED, idle_seconds=0.0
+        )
+        if tombstone is not None:
+            self._insert_tombstone_locked(agent_id, tombstone)
+        self._track_child_close(record.runtime, name=name)
+        return True
+
+    def _rearm_reaper_locked(self, exclude: frozenset[str] = frozenset()) -> None:
         if self._draining_children:
             return
         current = asyncio.current_task()
         if self._reaper_task is current:
             return
-        if self._reaper_task is not None:
-            self._reaper_task.cancel()
-        self._reaper_task = None
-        ttl, cap = self._retention_policy
-        eligible = self._eligible_idle_locked()
-        ttl_eligible = [
-            record for record in eligible if record.effective_idle_ttl(ttl) > 0
+        # Replacing a live reaper displaces it: register the displaced task
+        # as drain-owned (its finalizer discards it when it settles) so
+        # drain_children cannot return while it can still publish.
+        displaced = self._detach_reaper_locked()
+        if displaced is not None:
+            displaced.cancel()
+        self._reaper_deadline = None
+        policy = self._retention_policy
+        now = self._clock()
+        delays: list[float] = []
+        eligible = [
+            record
+            for record in self._eligible_idle_locked()
+            if record.agent_id not in exclude
         ]
-        if not eligible or (not ttl_eligible and cap == 0):
-            return
-        if cap and len(eligible) > cap:
-            delay = 0.0
+        ttl_eligible = [
+            record
+            for record in eligible
+            if record.effective_idle_ttl(policy.idle_ttl_seconds) > 0
+        ]
+        if policy.max_idle_agents and len(eligible) > policy.max_idle_agents:
+            delays.append(0.0)
         elif ttl_eligible:
-            delay = max(
-                0.0,
-                min(
-                    cast(float, record.idle_since) + record.effective_idle_ttl(ttl)
-                    for record in ttl_eligible
+            delays.append(
+                max(
+                    0.0,
+                    min(
+                        cast(float, record.idle_since)
+                        + record.effective_idle_ttl(policy.idle_ttl_seconds)
+                        for record in ttl_eligible
+                    )
+                    - now,
                 )
-                - self._clock(),
             )
-        else:
+        if policy.tombstone_ttl_seconds > 0:
+            expiries = [
+                tombstone.expires_at
+                for tombstone in self._evicted_agents.values()
+                if tombstone.expires_at is not None
+            ]
+            if expiries:
+                delays.append(max(0.0, min(expiries) - now))
+        if not delays:
             return
+        delay = min(delays)
         self._reaper_task = asyncio.create_task(
             self._run_reaper(delay), name="vibe-subagent-idle-reaper"
         )
+        self._reaper_deadline = now + delay
+
+    async def _publish_inventory_update(self) -> None:
+        """Publish the current (possibly reduced) inventory after reaping."""
+        if self._draining_children:
+            # Drain owns the final inventory publication: a reaper settling
+            # mid-drain must not publish a transient pre-drain snapshot on
+            # top of the empty payload drain is about to emit. The
+            # suppression is recorded so drain still emits the final empty
+            # inventory — the disappearance must not be lost at the boundary.
+            self._drain_suppressed_inventory = True
+            return
+        try:
+            await self._emit_agents_update()
+        except Exception as exc:
+            logger.warning("Failed to publish tombstone expiry update", exc_info=exc)
+
+    def _detach_reaper_locked(self) -> asyncio.Task[None] | None:
+        """Unregister the live reaper, keeping drain ownership of its task.
+
+        The caller holds the registry lock. The displaced task is
+        registered in ``_detached_reaper_tasks`` so drain_children
+        joins/cancels it like any other tracked task instead of returning
+        while it can still publish; the displaced task's finalizer discards
+        it when it settles (cancel, normal completion, or exception).
+        Returns the displaced task (``None`` when no reaper is registered).
+        """
+        displaced = self._reaper_task
+        self._reaper_task = None
+        if displaced is not None:
+            self._detached_reaper_tasks.add(displaced)
+        return displaced
 
     async def _run_reaper(self, delay: float) -> None:
+        pruned_tombstones: list[str] = []
         try:
             await self._wakeup(delay)
             async with self._registry_lock:
                 if asyncio.current_task() is not self._reaper_task:
                     return
                 now = self._clock()
-                ttl, cap = self._retention_policy
+                policy = self._retention_policy
                 eligible = sorted(
                     self._eligible_idle_locked(),
                     key=lambda record: (record.idle_since, record.agent_id),
@@ -3590,19 +4152,39 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     for record in eligible
                     if (
                         now - cast(float, record.idle_since)
-                        >= record.effective_idle_ttl(ttl)
+                        >= record.effective_idle_ttl(policy.idle_ttl_seconds)
                         > 0
                     )
                 )
                 selected = {agent_id for agent_id, _ in victims}
                 remaining = [r for r in eligible if r.agent_id not in selected]
-                if cap and len(remaining) > cap:
+                if policy.max_idle_agents and len(remaining) > policy.max_idle_agents:
                     victims.extend(
                         (record.agent_id, "idle_cap")
-                        for record in remaining[: len(remaining) - cap]
+                        for record in remaining[
+                            : len(remaining) - policy.max_idle_agents
+                        ]
+                    )
+                # Expired terminal metadata is pruned here; results, expiry
+                # markers, latest-run indexes, and wait leases are untouched.
+                pruned_tombstones = self._prune_expired_tombstones_locked(now)
+                if victims:
+                    # Hand the schedule to a fresh timer BEFORE awaiting
+                    # eviction cleanup: stalled runtime cleanup must not hold
+                    # idle/metadata deadline scheduling hostage. This task
+                    # unregisters itself (no self-cancellation), so its
+                    # finalizer will not rearm; the fresh timer owns the
+                    # schedule from here. The victims are excluded because
+                    # their idle deadlines are moot once evicted. The
+                    # displaced task is registered as drain-owned so
+                    # drain_children joins/cancels it like any other tracked
+                    # task instead of returning while it can still publish.
+                    self._detach_reaper_locked()
+                    self._rearm_reaper_locked(
+                        exclude=frozenset(agent_id for agent_id, _ in victims)
                     )
             eviction_notifications: list[
-                tuple[AgentRecord, AgentEviction, _AgentTombstone]
+                tuple[AgentRecord, AgentEviction, _AgentTombstone | None, object]
             ] = []
             eviction_tasks = [
                 asyncio.create_task(
@@ -3614,6 +4196,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             self._eviction_tasks.update(eviction_tasks)
             for task in eviction_tasks:
                 task.add_done_callback(self._eviction_tasks.discard)
+            published = False
             if eviction_tasks:
                 eviction_results = asyncio.gather(
                     *eviction_tasks, return_exceptions=True
@@ -3622,20 +4205,46 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     await asyncio.shield(eviction_results)
                 except asyncio.CancelledError:
                     await asyncio.shield(eviction_results)
-                    await self._notify_evictions(eviction_notifications)
+                    published = await self._notify_evictions(eviction_notifications)
+                    if not published and (pruned_tombstones or eviction_notifications):
+                        await self._publish_inventory_update()
                     raise
-                await self._notify_evictions(eviction_notifications)
+                published = await self._notify_evictions(eviction_notifications)
+            # Publish whenever the inventory actually changed — pruned
+            # terminal metadata and/or actual evictions — regardless of
+            # whether eviction tasks existed or what they did. Permitted
+            # eviction notifications already published this same inventory.
+            if not published and (pruned_tombstones or eviction_notifications):
+                await self._publish_inventory_update()
         finally:
-            async with self._registry_lock:
-                if asyncio.current_task() is self._reaper_task:
-                    self._reaper_task = None
-                    self._rearm_reaper_locked()
+            # A pending reaper can be destroyed while no event loop is
+            # running (teardown or interpreter shutdown); the rearm
+            # bookkeeping is meaningless there and must stay silent. With a
+            # running loop, rearm failures propagate normally.
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                # No running loop: nothing to rearm and nowhere to report.
+                pass
+            else:
+                # This reaper is settling — handoff-displaced or
+                # rearm-displaced: drain ownership ends with the task, on
+                # every settle path (cancel, normal completion, exception).
+                current = asyncio.current_task()
+                if current is not None:
+                    self._detached_reaper_tasks.discard(current)
+                async with self._registry_lock:
+                    if asyncio.current_task() is self._reaper_task:
+                        self._reaper_task = None
+                        self._rearm_reaper_locked()
 
     async def _evict_agent(
         self,
         agent_id: str,
         reason: str,
-        notifications: list[tuple[AgentRecord, AgentEviction, _AgentTombstone]]
+        notifications: list[
+            tuple[AgentRecord, AgentEviction, _AgentTombstone | None, object]
+        ]
         | None = None,
     ) -> bool:
         if reason not in {"ttl", "idle_cap"}:
@@ -3649,7 +4258,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 or not self._generation_is_current(record.root_generation)
             ):
                 return False
-            _, cap = self._retention_policy
+            cap = self._retention_policy.max_idle_agents
             if reason == "idle_cap" and (
                 not cap or len(self._eligible_idle_locked()) <= cap
             ):
@@ -3658,6 +4267,12 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             self._agent_records.pop(agent_id)
             self._children.pop(record.session_id, None)
             self._child_links.pop(record.session_id, None)
+            # Release-invalidatable authority for this pending eviction. A
+            # TTL>0 eviction is authorized by the stored tombstone; a zero-TTL
+            # eviction stores no metadata, so this entry is what authorizes
+            # (and release revokes) its notification.
+            authority = object()
+            self._pending_evictions[agent_id] = authority
             run = record.current_run or (
                 record.run_history[-1] if record.run_history else None
             )
@@ -3675,36 +4290,31 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     else self._clock()
                 ),
             )
-            tombstone = _AgentTombstone(
-                summary=AgentSummary(
-                    agent_id=agent_id,
-                    profile=record.profile,
-                    availability=AgentAvailability.EVICTED,
-                    current_run_id=run.run_id if run is not None else None,
-                    current_run_status=run.status if run is not None else None,
-                    turns_used=self._agent_turns_used(record),
-                    last_run_status=record.last_run_status,
-                    initial_task_summary=record.initial_task_summary,
-                    current_task_summary=run.task_summary if run is not None else None,
-                    idle_seconds=idle_duration,
-                    latest_run_id=latest_run_id,
-                    run_elapsed_seconds=self._run_elapsed_seconds(run, self._clock()),
-                    effective_model=record.effective_model,
-                    base_model=record.base_model,
-                    active_provider=record.active_provider,
-                    effective_thinking=record.effective_thinking,
-                    context_tokens=record.context_tokens,
-                    context_window=record.context_window,
-                    compacting=record.compacting,
-                    stop_reason=record.stop_reason,
-                    result_expired=(agent_id, latest_run_id) in self._expired_results
-                    if latest_run_id is not None
-                    else False,
-                ),
-                child_session_id=record.session_id,
-                parent_identity=(record.parent_session_id, record.root_generation),
+            tombstone = self._build_terminal_tombstone(
+                record, run, AgentAvailability.EVICTED, idle_duration
             )
-            self._evicted_agents[agent_id] = tombstone
+            if tombstone is not None:
+                self._insert_tombstone_locked(agent_id, tombstone)
+                # Rearm promptly so tombstone expiry is scheduled even when
+                # the awaited runtime cleanup below stalls. A reaper-driven
+                # eviction skips this while its coordinating reaper is still
+                # registered (that reaper rearms when it finishes; cancelling
+                # it here would abort the in-flight run) — but after a
+                # schedule handoff (no reaper registered), or when this
+                # tombstone expires before the armed timer, the rearm is
+                # safe and required.
+                if (
+                    asyncio.current_task() not in self._eviction_tasks
+                    or self._reaper_task is None
+                    or (
+                        tombstone.expires_at is not None
+                        and (
+                            self._reaper_deadline is None
+                            or tombstone.expires_at < self._reaper_deadline
+                        )
+                    )
+                ):
+                    self._rearm_reaper_locked()
         teardown = self._track_child_close(
             record.runtime, name=f"vibe-subagent-teardown:{agent_id}"
         )
@@ -3725,24 +4335,78 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             root_generation=record.root_generation,
         )
         if notifications is not None:
-            notifications.append((record, eviction, tombstone))
+            notifications.append((record, eviction, tombstone, authority))
         else:
-            await self._notify_evictions([(record, eviction, tombstone)])
+            await self._notify_evictions([(record, eviction, tombstone, authority)])
         return True
 
+    @staticmethod
+    def _eviction_run_segments(
+        record: AgentRecord, eviction: AgentEviction
+    ) -> tuple[str, str]:
+        """The latest-run identity and outcome segments for an eviction notice.
+
+        Design §5: eviction notifications carry the name alongside the handle,
+        run, and outcome. Both segments stay empty when the evicted record has
+        no run matching the eviction's run id, so a run-less eviction keeps its
+        handle-only wording.
+        """
+        run = next(
+            (
+                candidate
+                for candidate in (record.current_run, *record.run_history)
+                if candidate is not None and candidate.run_id == eviction.run_id
+            ),
+            None,
+        )
+        if run is None:
+            return "", ""
+        outcome = (
+            "completed"
+            if run.status is RunStatus.COMPLETED
+            else "failed"
+            if run.status is RunStatus.FAILED
+            else "cancelled"
+            if run.status is RunStatus.CANCELLED
+            else "unknown"
+        )
+        return f", run {run.run_id}", f", last run {outcome}"
+
     async def _notify_evictions(
-        self, notifications: list[tuple[AgentRecord, AgentEviction, _AgentTombstone]]
-    ) -> None:
+        self,
+        notifications: list[
+            tuple[AgentRecord, AgentEviction, _AgentTombstone | None, object]
+        ],
+    ) -> bool:
+        """Authorize and deliver eviction notifications.
+
+        Returns ``True`` when an inventory update was published. A TTL>0
+        eviction is authorized only while the tombstone it built is still
+        stored; a zero-TTL eviction stores no metadata, so it is authorized
+        only while its release-invalidatable authority entry survives. The
+        authority entry is consumed by this check on every settlement path
+        (both TTL variants): a settled eviction notification never leaves
+        the entry behind.
+        """
         permitted: list[tuple[AgentRecord, AgentEviction]] = []
         async with self._registry_lock:
-            for record, eviction, tombstone in sorted(
+            for record, eviction, tombstone, authority in sorted(
                 notifications, key=lambda notification: notification[1].agent_id
             ):
+                # Consume the release-invalidatable authority on every
+                # settlement: this notification attempt settles the pending
+                # entry for both TTL variants, so a delivered (or fenced)
+                # eviction never leaves its authority behind.
+                stored_authority = self._pending_evictions.pop(record.agent_id, None)
+                if tombstone is not None:
+                    authorized = self._evicted_agents.get(record.agent_id) is tombstone
+                else:
+                    authorized = stored_authority is authority
                 if (
                     self._generation_is_current(record.root_generation)
                     and not self._draining_children
                     and record.agent_id not in self._suppressed_notifications
-                    and self._evicted_agents.get(record.agent_id) is tombstone
+                    and authorized
                 ):
                     permitted.append((record, eviction))
 
@@ -3763,16 +4427,25 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 if parent is None:
                     continue
                 parent_notifications = list(parent_notifications)
+                detailed = [
+                    (record, eviction, *self._eviction_run_segments(record, eviction))
+                    for record, eviction in parent_notifications
+                ]
                 details = "; ".join(
-                    f"{eviction.agent_id} ({eviction.reason}, idle "
-                    f"{eviction.idle_duration_seconds:g}s)"
-                    for _record, eviction in parent_notifications
+                    f"{self._record_name(record)} "
+                    f"({eviction.agent_id}{run_segment}, "
+                    f"{eviction.reason}, idle {eviction.idle_duration_seconds:g}s"
+                    f"{outcome_segment})"
+                    for record, eviction, run_segment, outcome_segment in detailed
                 )
-                if len(parent_notifications) == 1:
-                    _record, eviction = parent_notifications[0]
+                if len(detailed) == 1:
+                    record, eviction, run_segment, outcome_segment = detailed[0]
                     notification = (
-                        f"Background agent {eviction.agent_id} evicted "
-                        f"({eviction.reason}, idle {eviction.idle_duration_seconds:g}s); "
+                        f"Background agent {self._record_name(record)} "
+                        f"({eviction.agent_id}{run_segment}) evicted "
+                        f"({eviction.reason}, "
+                        f"idle {eviction.idle_duration_seconds:g}s"
+                        f"{outcome_segment}); "
                         "launch a new agent for further work."
                     )
                 else:
@@ -3820,120 +4493,142 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 logger.warning(
                     "Failed to publish background agent eviction", exc_info=exc
                 )
+                return False
+            return True
+        return False
 
-    async def release_agent(self, agent_id: str) -> ReleaseAgentOutcome:  # noqa: PLR0915
-        async with self._registry_lock:  # noqa: PLR1702
-            self._acquire_notification_suppression(agent_id)
-            record = self._agent_records.pop(agent_id, None)
-            if record is not None and record.reserved_for_replacement:
-                self._clear_replacement_locked(record)
-            known_evicted = self._evicted_agents.pop(agent_id, None) is not None
-            release_generation = (
-                record.root_generation
-                if record is not None
-                else self._root.agent_loop._session_generation
-                if self._root is not None
-                else None
-            )
-            notify_release = (
-                record is not None
-                and self._generation_is_current(record.root_generation)
-            ) or known_evicted
-            keys = {key for key in self._result_store if key[0] == agent_id}
-            keys.update(key for key in self._expired_results if key[0] == agent_id)
-            keys.update(
-                key for key in self._pending_notifications if key[0] == agent_id
-            )
-            keys.update(key for key in self._wait_leases if key[0] == agent_id)
-            keys.update(key for key in self._result_write_tokens if key[0] == agent_id)
-            for key in keys:
-                self._result_store.pop(key, None)
-                self._expired_results.discard(key)
-                self._pending_notifications.discard(key)
-                self._wait_leases.pop(key, None)
-                self._result_write_tokens.pop(key, None)
-            self._latest_run_ids.pop(agent_id, None)
-            if record is None and not known_evicted and not keys:
-                self._release_notification_suppression(agent_id)
-                raise UnknownAgentError(f"Unknown agent: {agent_id}")
-            self._rearm_reaper_locked()
+    def _prepare_release_locked(  # noqa: PLR0915
+        self, agent_id: str
+    ) -> tuple[asyncio.Task[None], ReleaseAgentOutcome]:
+        """Destructive release critical section; the caller must hold the lock.
 
-            async def cleanup() -> None:
-                errors: list[BaseException] = []
-                try:
-                    if record is not None:
-                        monitor_tasks = {
-                            run.completion_task
-                            for run in [*record.run_history, record.current_run]
-                            if run is not None
-                            and isinstance(run.completion_task, asyncio.Task)
-                            and run.completion_task in self._monitor_tasks
-                            and not run.completion_task.done()
-                        }
-                        current_run = record.current_run
-                        for task in monitor_tasks:
-                            task.cancel()
+        Purges results, expiry markers, pending notifications, wait leases,
+        and write tokens; detaches the record; clears a replacement
+        reservation; removes terminal metadata and its pending-eviction
+        authority; rearms the reaper; and returns the tracked teardown task
+        together with the release outcome. Raises UnknownAgentError when
+        nothing about the handle is known.
+        """
+        self._acquire_notification_suppression(agent_id)
+        record = self._agent_records.pop(agent_id, None)
+        if record is not None and record.reserved_for_replacement:
+            self._clear_replacement_locked(record)
+        known_evicted = self._evicted_agents.pop(agent_id, None) is not None
+        # Purge the pending-eviction authority alongside everything else:
+        # a zero-TTL eviction's notification is authorized only while
+        # this entry survives.
+        pending_eviction = self._pending_evictions.pop(agent_id, None) is not None
+        release_generation = (
+            record.root_generation
+            if record is not None
+            else self._root.agent_loop._session_generation
+            if self._root is not None
+            else None
+        )
+        notify_release = (
+            record is not None and self._generation_is_current(record.root_generation)
+        ) or known_evicted
+        keys = {key for key in self._result_store if key[0] == agent_id}
+        keys.update(key for key in self._expired_results if key[0] == agent_id)
+        keys.update(key for key in self._pending_notifications if key[0] == agent_id)
+        keys.update(key for key in self._wait_leases if key[0] == agent_id)
+        keys.update(key for key in self._result_write_tokens if key[0] == agent_id)
+        for key in keys:
+            self._result_store.pop(key, None)
+            self._expired_results.discard(key)
+            self._pending_notifications.discard(key)
+            self._wait_leases.pop(key, None)
+            self._result_write_tokens.pop(key, None)
+        self._latest_run_ids.pop(agent_id, None)
+        if record is None and not known_evicted and not pending_eviction and not keys:
+            self._release_notification_suppression(agent_id)
+            raise UnknownAgentError(f"Unknown agent: {agent_id}")
+        self._rearm_reaper_locked()
+
+        async def cleanup() -> None:
+            errors: list[BaseException] = []
+            try:
+                if record is not None:
+                    monitor_tasks = {
+                        run.completion_task
+                        for run in [*record.run_history, record.current_run]
+                        if run is not None
+                        and isinstance(run.completion_task, asyncio.Task)
+                        and run.completion_task in self._monitor_tasks
+                        and not run.completion_task.done()
+                    }
+                    current_run = record.current_run
+                    for task in monitor_tasks:
+                        task.cancel()
+                    try:
+                        if current_run is not None:
+                            interrupted = self._interrupt_run(record, current_run)
+                            if (
+                                not interrupted
+                                and current_run.status is RunStatus.RUNNING
+                            ):
+                                await record.runtime.turns.close()
+                        if monitor_tasks:
+                            await asyncio.gather(*monitor_tasks, return_exceptions=True)
+                    except BaseException as exc:
+                        errors.append(exc)
+                    finally:
+                        self._children.pop(record.session_id, None)
+                        self._child_links.pop(record.session_id, None)
                         try:
-                            if current_run is not None:
-                                interrupted = self._interrupt_run(record, current_run)
-                                if (
-                                    not interrupted
-                                    and current_run.status is RunStatus.RUNNING
-                                ):
-                                    await record.runtime.turns.close()
-                            if monitor_tasks:
-                                await asyncio.gather(
-                                    *monitor_tasks, return_exceptions=True
-                                )
+                            await record.runtime.close()
                         except BaseException as exc:
                             errors.append(exc)
-                        finally:
-                            self._children.pop(record.session_id, None)
-                            self._child_links.pop(record.session_id, None)
-                            try:
-                                await record.runtime.close()
-                            except BaseException as exc:
-                                errors.append(exc)
-                    if notify_release:
-                        async with self._registry_lock:
-                            notification_permitted = (
-                                (
-                                    release_generation is None
-                                    and self._generation_identity is None
-                                )
-                                or (
-                                    release_generation is not None
-                                    and self._generation_is_current(release_generation)
-                                )
-                            ) and (
-                                not self._draining_children
-                                and self._suppression_owners.get(agent_id) == 1
+                if notify_release:
+                    async with self._registry_lock:
+                        notification_permitted = (
+                            (
+                                release_generation is None
+                                and self._generation_identity is None
                             )
-                        if notification_permitted:
-                            try:
-                                await self._emit_agents_update()
-                            except BaseException as exc:
-                                errors.append(exc)
-                    if len(errors) == 1:
-                        raise errors[0]
-                    if errors:
-                        raise BaseExceptionGroup(
-                            "Failed to release background agent", errors
+                            or (
+                                release_generation is not None
+                                and self._generation_is_current(release_generation)
+                            )
+                        ) and (
+                            not self._draining_children
+                            and self._suppression_owners.get(agent_id) == 1
                         )
-                finally:
-                    self._release_notification_suppression(agent_id)
+                    if notification_permitted:
+                        try:
+                            await self._emit_agents_update()
+                        except BaseException as exc:
+                            errors.append(exc)
+                if len(errors) == 1:
+                    raise errors[0]
+                if errors:
+                    raise BaseExceptionGroup(
+                        "Failed to release background agent", errors
+                    )
+            finally:
+                self._release_notification_suppression(agent_id)
 
-            if record is not None:
-                teardown = self._track_child_close(
-                    record.runtime, cleanup(), name=f"vibe-subagent-release:{agent_id}"
-                )
-            else:
-                teardown = asyncio.create_task(
-                    cleanup(), name=f"vibe-subagent-release:{agent_id}"
-                )
-                self._teardown_tasks.add(teardown)
-                teardown.add_done_callback(self._teardown_tasks.discard)
+        if record is not None:
+            teardown = self._track_child_close(
+                record.runtime, cleanup(), name=f"vibe-subagent-release:{agent_id}"
+            )
+        else:
+            teardown = asyncio.create_task(
+                cleanup(), name=f"vibe-subagent-release:{agent_id}"
+            )
+            self._teardown_tasks.add(teardown)
+            teardown.add_done_callback(self._teardown_tasks.discard)
+        return (
+            teardown,
+            ReleaseAgentOutcome.EVICTED
+            if known_evicted
+            else ReleaseAgentOutcome.RELEASED,
+        )
 
+    async def _join_release_teardown(
+        self, teardown: asyncio.Task[None], agent_id: str, outcome: ReleaseAgentOutcome
+    ) -> ReleaseAgentOutcome:
+        """Join a release teardown task, preserving cancellation semantics."""
         cancellation: asyncio.CancelledError | None = None
         while not teardown.done():
             try:
@@ -3952,11 +4647,81 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             )
         if cancellation is not None:
             raise cancellation
-        return (
-            ReleaseAgentOutcome.EVICTED
-            if known_evicted
-            else ReleaseAgentOutcome.RELEASED
-        )
+        return outcome
+
+    async def release_agent(self, agent_id: str) -> ReleaseAgentOutcome:
+        """Close and remove a retained agent or evicted tombstone.
+
+        Unguarded by design: the model tool may release active instances
+        (design §3.1). Returns RELEASED for a live agent and EVICTED when
+        removing its tombstone. Raises ValueError for unknown agent_id.
+        """
+        async with self._registry_lock:
+            teardown, outcome = self._prepare_release_locked(agent_id)
+        return await self._join_release_teardown(teardown, agent_id, outcome)
+
+    async def release_agent_guarded(  # noqa: PLR0911
+        self, agent_id: str, expected_run_id: str | None = None
+    ) -> ReleaseAgentOutcome:
+        """Guarded release for UI callers (design §3.1, §8).
+
+        ATOMIC under the registry lock: attached-root/current-generation
+        authority, the expected latest-run identity, a non-active state, and
+        no replacement reservation are all verified BEFORE any destructive
+        work — never a check-then-release sequence across lock releases. A
+        running/finalizing or replacement-reserved record, or a stale
+        ``expected_run_id``, returns CONFLICT without stopping or purging
+        anything (a stale idle→running race never stops the new run).
+        Released, metadata-expired, or unknown handles return UNKNOWN.
+        Attached-root authority is verified exactly like the transcript
+        authorization sites: the handle must belong to the currently attached
+        root session and current generation, so a foreign-parent or
+        stale-generation record or tombstone behaves as unknown — never a
+        purge. On success the existing release cleanup semantics run:
+        results, expiry markers, leases, tokens, and pending-eviction
+        authorities are purged, the runtime close is tracked, the reaper is
+        rearmed, and the reduced inventory is published.
+        """
+        async with self._registry_lock:
+            record = self._agent_records.get(agent_id)
+            tombstone = self._live_tombstone_locked(agent_id, self._clock())
+            if record is None and tombstone is None:
+                # Released, metadata-expired, or never seen: nothing to guard.
+                return ReleaseAgentOutcome.UNKNOWN
+            root = self._root
+            identity = (
+                (root.agent_loop.session_id, root.agent_loop._session_generation)
+                if root is not None
+                else None
+            )
+            if identity is None or self._generation_identity != identity:
+                # No attached root (or a stale generation snapshot): there is
+                # no authority to release under.
+                return ReleaseAgentOutcome.UNKNOWN
+            if record is not None:
+                if (
+                    record.parent_session_id != identity[0]
+                    or record.root_generation != identity[1]
+                ):
+                    # Foreign-parent or stale-generation resident record.
+                    return ReleaseAgentOutcome.UNKNOWN
+                if record.reserved_for_replacement:
+                    return ReleaseAgentOutcome.CONFLICT
+                if record.state in {_AgentState.RUNNING, _AgentState.FINALIZING}:
+                    return ReleaseAgentOutcome.CONFLICT
+                latest_run_id = record.latest_run_id or (
+                    record.run_history[-1].run_id if record.run_history else None
+                )
+            else:
+                assert tombstone is not None
+                if tombstone.parent_identity != identity:
+                    # Foreign-parent or stale-generation terminal metadata.
+                    return ReleaseAgentOutcome.UNKNOWN
+                latest_run_id = tombstone.summary.latest_run_id
+            if expected_run_id is not None and latest_run_id != expected_run_id:
+                return ReleaseAgentOutcome.CONFLICT
+            teardown, outcome = self._prepare_release_locked(agent_id)
+        return await self._join_release_teardown(teardown, agent_id, outcome)
 
     @classmethod
     def _resolve_run_outcome(
@@ -4240,9 +5005,33 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         try:
             reaper = self._reaper_task
             self._reaper_task = None
+            self._reaper_deadline = None
             if reaper is not None and reaper is not asyncio.current_task():
+                # Cancelling the reaper may abort an in-flight publication:
+                # record the lost intent so the final empty inventory below
+                # still surfaces the disappearance.
+                self._drain_suppressed_inventory = True
                 reaper.cancel()
                 await asyncio.gather(reaper, return_exceptions=True)
+            # A reaper that handed its schedule to a fresh timer (a
+            # displaced reaper) is still an inventory producer until it
+            # settles: drain owns it too, so drain cannot return — or
+            # publish its final empty inventory — while a displaced reaper
+            # can still deliver a payload. The registered reaper is never
+            # in the detached set (the handoff unregisters before arming
+            # the fresh timer); the guard keeps the join single.
+            detached_reapers = [
+                task
+                for task in self._detached_reaper_tasks
+                if task is not asyncio.current_task() and task is not reaper
+            ]
+            for task in detached_reapers:
+                task.cancel()
+            if detached_reapers:
+                # Same for displaced reapers: a cancelled reaper may have
+                # been about to publish its reduced inventory.
+                self._drain_suppressed_inventory = True
+                await asyncio.gather(*detached_reapers, return_exceptions=True)
             monitors = [
                 task
                 for task in self._monitor_tasks
@@ -4274,6 +5063,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 agents_changed = bool(self._agent_records or self._evicted_agents)
                 self._agent_records.clear()
                 self._evicted_agents.clear()
+                self._pending_evictions.clear()
                 self._result_store.clear()
                 self._expired_results.clear()
                 self._latest_run_ids.clear()
@@ -4322,7 +5112,13 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     await runtime.close()
                 except BaseException as exc:
                     errors.append(exc)
-            if agents_changed:
+            # A disappearance publication suppressed or cancelled at the
+            # drain boundary (a reaper pruning the final tombstone across
+            # the boundary, or an in-flight publication aborted by
+            # cancelling its reaper) must still surface: the final empty
+            # inventory is emitted so the delivered client inventory never
+            # keeps a ghost row for the drained registry.
+            if agents_changed or self._drain_suppressed_inventory:
                 try:
                     await self._emit_agents_update()
                 except BaseException as exc:
@@ -4335,6 +5131,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 )
         finally:
             self._draining_children = False
+            self._drain_suppressed_inventory = False
 
     @staticmethod
     async def _discard_child(child: AgentLoop) -> None:

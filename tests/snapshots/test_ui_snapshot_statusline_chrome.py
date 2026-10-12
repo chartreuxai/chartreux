@@ -19,6 +19,7 @@ from chartreux.cli.textual_ui.widgets.session_status_line import (
     SessionStatusLine,
     SessionStatusState,
 )
+from chartreux.core.subagents import derive_agent_name
 from tests.snapshots.snap_compare import SnapCompare
 from tests.snapshots.snapshot_event_loop import install_snapshot_wake
 
@@ -76,6 +77,13 @@ class ChromeSnapshotApp(App[None]):
                 AgentSummaryModel.model_validate({
                     "agent_id": agent_id,
                     "profile": "reviewer",
+                    "name": derive_agent_name(
+                        agent_id=agent_id,
+                        profile="reviewer",
+                        profile_display_label=None,
+                        base_model=None,
+                        effective_model=None,
+                    ),
                     "availability": availability,
                     "compacting": compacting,
                     "stop_reason": stop_reason,
@@ -109,7 +117,7 @@ def test_agent_sheet(snap_compare: SnapCompare, state: str) -> None:
         elif state == "main-details":
             await pilot.press("d")
         await pilot.pause()
-        assert bar.region.height == 10
+        assert bar.region.height == 11
         assert bar.region.bottom <= pilot.app.query_one(SessionStatusLine).region.y
         assert bar.selected_agent_id == (
             "agent-running" if state == "details" else None
@@ -133,7 +141,7 @@ def test_agent_sheet(snap_compare: SnapCompare, state: str) -> None:
     )
 
 
-@pytest.mark.parametrize("availability", ["running", "idle", "evicted"])
+@pytest.mark.parametrize("availability", ["running", "idle", "evicted", "closed"])
 @pytest.mark.parametrize(
     "width,ascii_mode", [(80, False), (40, False), (80, True), (40, True)]
 )
@@ -167,12 +175,19 @@ def test_agent_duration_details(
                 active_provider="ZAI",
                 base_model="glm-5.3",
                 turns_used=2,
+                name=derive_agent_name(
+                    agent_id="agent-review",
+                    profile="reviewer",
+                    profile_display_label=None,
+                    base_model="glm-5.3",
+                    effective_model=None,
+                ),
             ),
         ))
         bar.open_browser()
         await pilot.press("down")
         await pilot.pause()
-        assert bar.region.height == 10
+        assert bar.region.height == 11
         assert bar.region.bottom <= pilot.app.query_one(SessionStatusLine).region.y
         footer = bar.query_one("#agent-bar-footer", Static).render()
         assert cell_len(str(footer)) <= width - 2
@@ -187,6 +202,15 @@ def test_agent_duration_details(
                 assert "C Stop run" in str(footer)
         else:
             assert "Stop run" not in str(footer)
+            # Idle and Recent rows offer the release action.
+            if width == 80:
+                assert "R Release" in str(footer)
+            if availability == "closed":
+                detail = str(bar.query_one("#agent-bar-detail", Static).render())
+                assert "Closed" in detail
+                assert "Last run 4m12s" in detail
+                # A closed tombstone is terminal: it keeps no idle segment.
+                assert "Idle" not in detail
 
     assert snap_compare(app, terminal_size=(width, 24), run_before=before)
 

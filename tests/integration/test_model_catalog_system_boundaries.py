@@ -34,7 +34,13 @@ from chartreux.core.model_catalog.resolver import ModelResolutionError, ModelRes
 from chartreux.core.model_catalog.schema import ModelCatalog, RoleDefinition
 from chartreux.core.session.session_loader import SessionLoader
 from chartreux.core.session_types import CommittedModelIdentity
-from chartreux.core.subagents import LaunchConfig, TaskArgs, TaskResult
+from chartreux.core.subagents import (
+    LaunchConfig,
+    RetentionPolicy,
+    TaskArgs,
+    TaskResult,
+    WaitStatus,
+)
 from chartreux.core.tools.base import InvokeContext
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
@@ -407,7 +413,11 @@ async def test_failover_terminal_identity_survives_eviction_and_result_serializa
     root.turns._projector = MagicMock()
     root.turns.link_subagent = AsyncMock()
     registry.bind_root(root)
-    registry._retention_policy = (0, 0)
+    # The launch carries no retain argument, so the default-ephemeral policy
+    # closes the runtime on completion and leaves no resident record behind.
+    registry._retention_policy = RetentionPolicy(
+        idle_ttl_seconds=0, max_idle_agents=0, retain_agents=False
+    )
     try:
         task = asyncio.create_task(
             _task_result(
@@ -427,9 +437,12 @@ async def test_failover_terminal_identity_survives_eviction_and_result_serializa
         assert launch.status == "launched"
         assert launch.agent_id is not None and launch.run_id is not None
         failed.release.set()
-        result = await asyncio.wait_for(
+        wait_disposition = await asyncio.wait_for(
             registry.wait_for_agent(launch.agent_id, launch.run_id), timeout=1
         )
+        assert wait_disposition.status is WaitStatus.COMPLETED
+        result = wait_disposition.result
+        assert result is not None
         assert result.completed
         assert registry._agent_records == {}
         serialized = result.model_dump(mode="json")
@@ -596,7 +609,9 @@ async def test_reload_while_background_child_runs_keeps_child_snapshot_isolated(
     try:
         launch = await _task_result(
             registry,
-            TaskArgs(task="snapshot", agent_type="worker", background=True),
+            TaskArgs(
+                task="snapshot", agent_type="worker", background=True, retain=True
+            ),
             InvokeContext(tool_call_id="background", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None

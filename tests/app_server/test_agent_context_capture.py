@@ -27,7 +27,7 @@ from chartreux.app_server.protocol import (
     StatsUpdatedParams,
     TurnCompletedParams,
 )
-from chartreux.core.subagents import RunStatus, RunStopReason
+from chartreux.core.subagents import RunStatus, RunStopReason, WaitStatus
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.stubs.fake_backend import FakeBackend
 
@@ -163,7 +163,7 @@ async def test_actual_compaction_phase_cancel_clears_activity_and_preserves_reas
     monkeypatch: pytest.MonkeyPatch, phase: str
 ) -> None:
     from chartreux.core.middleware import AutoCompactMiddleware
-    from chartreux.core.subagents import CancelOutcome, TaskArgs
+    from chartreux.core.subagents import CancelOutcome, RetentionPolicy, TaskArgs
     from chartreux.core.tools.base import InvokeContext
     from tests.app_server.test_subagents import (
         _background_result,
@@ -176,7 +176,9 @@ async def test_actual_compaction_phase_cancel_clears_activity_and_preserves_reas
         [mock_llm_chunk(content="<summary>compacted</summary>")],
     ])
     registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
-    registry._retention_policy = (1000, 10)
+    registry._retention_policy = RetentionPolicy(
+        idle_ttl_seconds=1000, max_idle_agents=10, retain_agents=True
+    )
     entered, release, stopped = asyncio.Event(), asyncio.Event(), asyncio.Event()
     ctx = InvokeContext(tool_call_id="compact", session_id=parent.session_id)
     try:
@@ -222,7 +224,12 @@ async def test_actual_compaction_phase_cancel_clears_activity_and_preserves_reas
             requester_session_id=parent.session_id,
         )
         assert outcome.outcome is CancelOutcome.STOP_REQUESTED
-        result = await asyncio.wait_for(registry.wait_for_agent(record.agent_id), 3)
+        wait_disposition = await asyncio.wait_for(
+            registry.wait_for_agent(record.agent_id), 3
+        )
+        assert wait_disposition.status is WaitStatus.COMPLETED
+        result = wait_disposition.result
+        assert result is not None
         assert (
             result.stop_reason is RunStopReason.USER_CANCELLED and not result.completed
         )

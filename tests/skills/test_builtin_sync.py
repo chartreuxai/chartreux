@@ -63,9 +63,17 @@ class TestBuiltinSkills:
         ).read_text()
 
         assert (
-            "Availability is `running`, `finalizing`, `idle`, or `evicted`." in prompt
+            "Availability is `running`, `finalizing`, `idle`, `evicted`, or `closed`."
+            in prompt
         )
         assert "cannot yet be reused" in prompt
+        # Closed (completed without retention) and evicted (retained, then
+        # removed) are distinct terminal states; both keep results retrievable.
+        assert "A `closed` agent completed without retention" in prompt
+        assert "An `evicted` agent was retained but its runtime was removed" in prompt
+        assert (
+            "remain available through `get_agent_result` until result expiry" in prompt
+        )
 
     def test_bash_prompt_documents_dangerous_command_approval_flow(self) -> None:
         prompt = (
@@ -140,8 +148,10 @@ class TestBuiltinSkills:
         prompt = BUILTIN_SKILLS["chartreux"].prompt
         for documented in (
             "[subagents]",
+            "retain_agents",
             "idle_ttl_seconds",
             "max_idle_agents",
+            "tombstone_ttl_seconds",
             "task_summary",
             "check_agents",
             "get_agent_result",
@@ -149,11 +159,29 @@ class TestBuiltinSkills:
             "release_agent",
             "ttl_remaining_seconds",
             "evicted",
+            "closed",
+            "still_running",
+            "1500",
+            "display-only",
         ):
             assert documented in prompt
         assert prompt.count("Reuse an `idle` agent") == 1
         assert prompt.count("Persona is immutable") == 1
         assert prompt.count("A `running` agent is busy") == 1
+        # Retention is opt-in with launch-argument precedence, and reuse
+        # inherits the instance's committed policy.
+        assert "close when their run completes unless they are retained" in prompt
+        assert (
+            "precedence is the launch argument, then the profile's `retain` setting"
+            in prompt
+        )
+        assert (
+            "omit `retain` to inherit the instance's committed retention policy"
+            in prompt
+        )
+        # The advisor profile ships retained by default (resident-cast).
+        assert "advisors are retained by profile default" in prompt
+        assert "`retain = true`) with a 3600-second idle TTL" in prompt
 
     def test_chartreux_skill_documents_dangerous_command_approval(self) -> None:
         prompt = BUILTIN_SKILLS["chartreux"].prompt

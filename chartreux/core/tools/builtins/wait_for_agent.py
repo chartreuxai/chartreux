@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+from typing import cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -11,6 +12,8 @@ from chartreux.core.subagents import (
     AgentResultExpiredError,
     TaskResult,
     UnknownAgentError,
+    WaitForAgentResult,
+    WaitStatus,
 )
 from chartreux.core.tools.base import (
     BaseTool,
@@ -23,6 +26,8 @@ from chartreux.core.tools.base import (
 from chartreux.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from chartreux.utils.tool_presentation import ToolEffectKind
 
+DEFAULT_WAIT_TIMEOUT_SECONDS = 1500.0
+
 
 class WaitForAgentArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -33,16 +38,16 @@ class WaitForAgentArgs(BaseModel):
         description="The specific run to wait for; defaults to the agent's latest run",
     )
     timeout: float | None = Field(
-        default=None,
+        default=DEFAULT_WAIT_TIMEOUT_SECONDS,
         gt=0,
-        description="Maximum seconds to wait without cancelling the agent run",
+        description=(
+            "Maximum seconds to wait without cancelling the agent run. "
+            f"Defaults to {DEFAULT_WAIT_TIMEOUT_SECONDS:g}s; pass null explicitly "
+            "to wait indefinitely. On timeout the wait returns a still_running "
+            "result (a normal outcome, not a failure) whose guidance tells you "
+            "to end your turn and re-invoke the wait in a later turn."
+        ),
     )
-
-
-class WaitForAgentResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    result: TaskResult = Field(description="The completed task result")
 
 
 class WaitForAgentConfig(BaseToolConfig):
@@ -69,13 +74,17 @@ class WaitForAgent(
 
     @classmethod
     def get_result_display(cls, event: ToolResultEvent) -> ToolResultDisplay:
-        if isinstance(event.result, WaitForAgentResult):
+        result = event.result
+        if isinstance(result, WaitForAgentResult):
+            if result.status is WaitStatus.STILL_RUNNING:
+                # A timed-out wait is a normal checkpoint, not a failure.
+                return ToolResultDisplay(
+                    success=True,
+                    verb="Waiting",
+                    message=f"agent {result.agent_id} still running",
+                )
             return ToolResultDisplay(
                 success=True, verb="Completed", message="agent run"
-            )
-        if isinstance(event.error, str) and "timed out" in event.error.lower():
-            return ToolResultDisplay(
-                success=False, verb="Timeout", message="waiting for agent"
             )
         if event.error is not None:
             return ToolResultDisplay(success=False, verb="Failed", message=event.error)
@@ -98,7 +107,9 @@ class WaitForAgent(
                 result = await wait
             else:
                 task = asyncio.create_task(wait)
-                ctx.register_wait_task(task)
+                # The loop only ever cancels registered wait tasks, so the
+                # disposition type is irrelevant to cancellation.
+                ctx.register_wait_task(cast("asyncio.Task[TaskResult] | None", task))
                 try:
                     result = await asyncio.shield(task)
                 finally:
@@ -129,9 +140,4 @@ class WaitForAgent(
             ) from exc
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
-        except TimeoutError as exc:
-            raise ToolError(
-                f"Timed out waiting for agent {args.agent_id}"
-                + (f" run {args.run_id}" if args.run_id else "")
-            ) from exc
-        yield WaitForAgentResult(result=result)
+        yield result

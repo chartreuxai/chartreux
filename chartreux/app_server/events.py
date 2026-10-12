@@ -30,6 +30,7 @@ from chartreux.app_server.protocol import (
     AgentsUpdateParams,
     HistoryEntryAddedParams,
     HistoryEntryUpdatedParams,
+    JsonValue,
     MCPAuthRequiredParams,
     Notification,
     ServerErrorParams,
@@ -691,10 +692,37 @@ class ClientProjection:
         return SessionUpdated(previous=previous, session=session, patch=params.patch)
 
 
+def _normalize_legacy_agents_update_params(
+    params: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """Accept pre-0.5.3 ``agents/update`` payloads that predate the name field.
+
+    The server always populates ``name``; older servers omit it. Client-side
+    parsing normalizes a missing ``name`` to the empty string BEFORE wire
+    validation so legacy payloads stay acceptable (design §5).
+    """
+    agents = params.get("agents")
+    if not isinstance(agents, list):
+        return params
+    normalized: list[JsonValue] = []
+    changed = False
+    for agent in agents:
+        if isinstance(agent, dict) and "name" not in agent:
+            agent = {**agent, "name": ""}
+            changed = True
+        normalized.append(agent)
+    if not changed:
+        return params
+    return {**params, "agents": normalized}
+
+
 def _parse_event_params(notification: Notification) -> _KnownEventParams:
     params_type = _PROJECTION_EVENT_PARAMS.get(notification.method)
     if params_type is None:
         raise UnknownNotificationError(
             f"Unknown app-server notification: {notification.method}"
         )
-    return validate_wire(params_type, notification.params)
+    params = notification.params
+    if params_type is AgentsUpdateParams:
+        params = _normalize_legacy_agents_update_params(params)
+    return validate_wire(params_type, params)

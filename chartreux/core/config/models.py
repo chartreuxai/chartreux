@@ -132,8 +132,11 @@ class ProjectContextConfig(BaseSettings):
 class SubagentsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    idle_ttl_seconds: int = Field(default=3600, ge=0, strict=True)
-    max_idle_agents: int = Field(default=16, ge=0, strict=True)
+    idle_ttl_seconds: int = Field(default=300, ge=0, strict=True)
+    max_idle_agents: int = Field(default=4, ge=0, strict=True)
+    retain_agents: bool = Field(default=False, strict=True)
+    tombstone_ttl_seconds: int = Field(default=900, ge=0, strict=True)
+    max_tombstones: int = Field(default=32, ge=1, strict=True)
     max_running_subagents: int = Field(default=16, ge=1, strict=True)
 
 

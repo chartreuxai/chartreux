@@ -86,7 +86,7 @@ can add commands.
 | `/log` | Show the current interaction-log path. |
 | `/log-level` | Change the session log level or persist it. |
 | `/debug` | Toggle the debug console. |
-| `/agents` | Toggle the docked agent browser above the input, including Main and retained subagents. |
+| `/agents` | Toggle the docked agent browser above the input: Main plus subagents grouped by lifecycle (Active, Retained Idle, Recent) with Resident/Active/Idle/Recent/All filter tabs, name-first rows with dimmed handles, and active-only status counts. |
 | `/compact [instructions]` | Summarize the conversation context. |
 | `/exit`, `exit`, `quit`, `:q`, `:quit` | Exit immediately while idle. During consequential active work, opens the exit confirmation dialog. |
 | `/status` | Display agent statistics. |

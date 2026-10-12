@@ -38,12 +38,21 @@ required; the role profile and the task skill serve different purposes:
 task(task="Load the sub-finder skill and locate all callers of the parser.", agent_type="worker")
 ```
 
-A task launches in the background by default (`background: true`). The call
-returns a successful launch acknowledgment with `status: "launched"`, non-empty
-guidance, and stable `agent_id` and `run_id` handles rather than waiting for the
-answer; it is not the subagent's terminal result. Set `background: false` only
-when the parent must have the result before it can proceed. Subagents cannot
+A task launches in the background by default (`background: true`). Prefer
+background launches even when you need the result: background agents stay
+inspectable in the agent browser and can be amended mid-flight, and you collect
+the outcome with `wait_for_agent`. Set `background: false` only when blocking is
+truly required. The call returns a successful launch acknowledgment with
+`status: "launched"`, non-empty guidance, and stable `agent_id` and `run_id`
+handles rather than waiting for the answer; it is not the subagent's terminal
+result. The acknowledgment also carries the instance's human-facing `name` and
+states whether the agent is retained or closes on completion. Subagents cannot
 launch other subagents.
+
+Background agents are ephemeral by default: pass `retain: true` to keep the
+instance resident after the run completes, or set `retain` on a profile or via
+`[subagents].retain_agents` globally. `retain` is only valid for background
+launches. See [Lifecycle and results](#lifecycle-and-results).
 
 ## Built-in profiles and role prompts
 
@@ -56,9 +65,12 @@ The built-in profiles are presets for common delegated work:
 | `reviewer` | `worker` | `reviewer` | Independent read-only reviews of code, documentation, specifications, and plans. |
 
 `advisor` is restricted to the read-only tools `read_file`, `grep`,
-`web_search`, `web_fetch`, and `skill`. It is configured with no idle-TTL eviction so it
-can be retained across related design and planning iterations. The normal idle
-cap and explicit `release_agent` lifecycle still apply.
+`web_search`, `web_fetch`, and `skill`. The profile ships retained
+(`retain = true`) with a 3,600-second idle TTL so an advisor stays resident
+across related design and planning iterations; the `worker` and `reviewer`
+profiles inherit the global default and are ephemeral unless retained. The
+normal idle cap and explicit `release_agent` lifecycle still apply to a
+retained advisor.
 
 Each role prompt includes the shared noninteractive contract plus guidance for
 that role. A profile's built-in prompt can be customized by placing a prompt
@@ -130,13 +142,18 @@ sensitive-file protections still apply.
 ## Lifecycle and results
 
 A background subagent starts **running**, may be **compacting**, then passes
-through **finishing** while cleanup and result publication settle. It becomes
-**idle** and remains available for inspection or reuse, subject to retention
-policy. The browser shows the last run's outcome, including **Cancelled**, even
-when the retained agent is idle. **Stopping** is a local TUI presentation state
-for a pending stop, not a registry availability state or a terminal outcome.
-The parent receives a completion notification that points it to
-`get_agent_result`.
+through **finishing** while cleanup and result publication settle. What happens
+next is the retention policy: a retained instance becomes **idle** and remains
+available for inspection or reuse, while an unretained instance **closes** — its
+runtime is removed and only terminal metadata plus the stored result remain.
+**Closed** records cover normal completion, including failed and cancelled runs;
+**evicted** records cover retained runtimes removed by the idle TTL or idle
+cap. Availability is separate from the run outcome: the browser shows the last
+run's outcome, including **Failed**, **Cancelled**, or **Budget stopped**, on
+idle, closed, and evicted rows alike. **Stopping** is a local TUI presentation
+state for a pending stop, not a registry availability state or a terminal
+outcome. The parent receives a completion notification that names the agent and
+points it to `get_agent_result`.
 
 A would-be successful run without final prose is reported as **Failed**, with
 `completed: false` and stop reason `error`, not as an empty successful result.
@@ -148,24 +165,58 @@ If the parent is only waiting on subagents, submitting a new message in the TUI
 cancels its waits, not the child runs, and steers the same parent turn immediately.
 See [Input and queueing](terminal.md#input-and-queueing).
 
-- `check_agents` lists retained subagents, including status and effective model
-  and thinking information.
+- `check_agents` lists resident and Recent subagents with their names, handles,
+  availability (`running`, `finalizing`, `idle`, `closed`, or `evicted`), and
+  effective model and thinking information.
 - `get_agent_result(agent_id, run_id)` returns a completed result without
-  waiting; it returns no result while the run is active.
-- `wait_for_agent(agent_id, run_id, timeout=...)` waits for completion. A
-  timeout only stops the wait; it does not cancel the subagent.
-- Pass an idle agent instance's `agent_id` to
+  waiting; it returns no result while the run is active. It keeps working for
+  closed and evicted records while their stored result is retained; a released
+  or never-seen handle reports an unknown-run error, and an expired result
+  raises a result-expired error.
+- `wait_for_agent(agent_id, run_id, timeout=...)` waits for completion. The
+  default timeout is 1500 seconds; a timeout returns a `still_running` result —
+  a normal outcome, not a failure — reporting the elapsed wait, run status, and
+  turns used, and instructing you to end your turn or continue other work now
+  and re-invoke `wait_for_agent` in a later turn (queued user input is only
+  delivered between turns). A timeout never cancels the subagent. Pass an
+  explicit larger timeout to wait longer, or `timeout: null` to wait
+  indefinitely.
+- Pass a retained idle instance's `agent_id` to
   `task(agent_id=..., background=true, task=...)` to give it another assignment;
-  omit `agent_type` to retain its profile. Both launch acknowledgments and
-  `check_agents.reuse_guidance` include this reuse guidance.
-- `release_agent(agent_id)` closes and removes a retained subagent when it is no
-  longer useful.
+  omit `agent_type` to retain its profile. Omitting `retain` preserves the
+  instance's committed policy; pass `retain: false` for a final continuation
+  that closes afterward. Both launch acknowledgments and
+  `check_agents.reuse_guidance` include this reuse guidance. Reusing a closed
+  handle is rejected with guidance to launch a new task (use `retain: true` when
+  a resident continuation is required); an evicted handle is rejected as
+  evicted, and a released or unknown handle reports unknown.
+- `release_agent(agent_id)` closes and removes a subagent — resident or
+  terminal — when it is no longer useful, purging its stored results and wait
+  leases.
 
-Idle subagents are retained by default for 3,600 seconds, with at most 16 idle
-subagents kept. TTL and idle-cap eviction remove the runtime but preserve a
-tombstone and stored results, so `get_agent_result` remains usable after
-eviction. Result expiry is separate: each root generation retains at most 32
-unreferenced stored results. Release subagents when you are done.
+Retention is opt-in and layered: an explicit `task` `retain` argument wins over
+the profile's `retain` setting, which wins over the global
+`[subagents].retain_agents` default (off). A profile's `idle_ttl_seconds` alone
+does not opt into retention. Retained idle agents are kept for
+`idle_ttl_seconds` (default 300) with at most `max_idle_agents` (default 4)
+resident; `0` disables each limit, so a retained agent with both limits at zero
+stays resident without a time or count bound. TTL and idle-cap eviction remove
+the runtime but preserve terminal metadata and stored results, so
+`get_agent_result` remains usable after eviction.
+
+Terminal metadata feeds the browser's bounded **Recent** group: it expires after
+`tombstone_ttl_seconds` (default 900) and is capped at `max_tombstones` (default
+32, oldest first); `tombstone_ttl_seconds = 0` retains no terminal metadata, and
+`max_tombstones` must stay positive. Reads do not extend the deadline. Metadata
+expiry is independent of result expiry: each root generation retains at most 32
+unreferenced stored results, and an expired record's result can remain
+retrievable after its metadata disappears. Release is the opposite: it discards
+the record, stored results, expiry markers, and wait leases immediately, so a
+released handle has nothing left to retrieve. Because ephemeral agents leave no
+idle row and the status line counts active work only, completion and eviction
+notifications — which carry the agent name, handle, run, and outcome — are the
+primary failure surface for ephemeral agents. Release subagents when you are
+done.
 
 ### Cancelling and replacing background work
 
@@ -188,12 +239,14 @@ operations. The first accepted stop reason wins. A genuine completion or error
 is not rewritten by a late stop. Stopping does not undo file, shell, or remote
 side effects, generate a summary, or salvage additional output.
 
-The retained conversation, transcript, partial result, and existing waits remain
-available subject to retention policy. Zero-retention agents evict at
-finalization; other agents may evict on TTL or idle-cap limits. Eviction keeps
-stored results until separate result expiry. Saved transcript inspection depends
-on session logging and disk availability. Explicit `release_agent` removes the
-agent and purges its stored results and wait leases.
+The conversation, transcript, partial result, and existing waits remain available
+subject to the retention policy: an unretained agent closes at finalization (the
+cancelled run's result stays retrievable), while a retained agent stays idle and
+may later be evicted on TTL or idle-cap limits. Eviction keeps terminal metadata
+within the Recent bounds and stored results until separate result expiry. Saved
+transcript inspection depends on session logging and disk availability, and only
+within the metadata window. Explicit `release_agent` removes the agent and
+purges its stored results and wait leases.
 
 To replace a busy assignment in the same retained conversation:
 
@@ -205,16 +258,32 @@ task(agent_id="<agent-id>", task="Investigate the revised requirement", replace_
 run with reason `retasked`, waits for its cleanup, and launches the replacement
 without overlapping execution. The replacement prompt states that it supersedes
 the interrupted task; the acknowledgment metadata includes both run IDs.
-Busy replacement cannot change the profile or launch configuration. An idle
-target uses ordinary reuse, which still permits runtime configuration overrides.
-Ordinary reuse of a busy agent without `replace_run=True` is rejected. Already
-stopping or finishing targets are not replaced; if replacement admission fails,
-the old run remains stopped and the error is reported.
+Busy replacement cannot change the profile or launch configuration. It preserves
+the instance's committed retention policy and rejects a conflicting `retain`
+override before stopping anything. An idle target uses ordinary reuse, which
+still permits runtime configuration overrides. Ordinary reuse of a busy agent
+without `replace_run=True` is rejected. Already stopping or finishing targets are
+not replaced; if replacement admission fails after the old run was stopped, an
+unretained instance still closes rather than lingering resident, and the error is
+reported.
 
 A user stop notifies the parent as an injected message **without starting a
 parent turn**. An idle parent learns of the cancellation on its next turn. The
 notification attributes the cancellation to the user; orchestrator cancellation
 and retask are attributed separately.
+
+## Agent names
+
+Every instance gets a human-facing name of the form `{profile}-{model}-{number}`
+— for example `worker-mistral-large-4-3` or `reviewer-glm-5-3-7`. The profile
+segment is the profile name (a custom profile uses its display name with
+whitespace runs collapsed to hyphens), the model segment is the canonical base
+model, and the number is the handle's sequence digits (`agent-15` ↔ `...-15`).
+Names appear in browser rows, the details panel, the transcript header,
+completion and eviction notifications, the launch acknowledgment, and
+`check_agents` output. Names are display-only: `agent_id` is the only
+programmatic handle, there is no name-to-handle lookup, and a name never parses
+as a handle.
 
 ## Managed shell jobs
 
@@ -265,8 +334,9 @@ available in the settings UI.
 The root session's effective configuration controls admission, not a child's
 configuration. Accepted changes apply to later admissions without stopping
 existing runs. Completion, cancellation, release, or failed creation frees
-capacity. The active-work cap is separate from the idle-retention limits above;
-see the [configuration reference](../reference/configuration.md#agents-and-skills).
+capacity. The active-work cap is separate from the resident-runtime and
+Recent-metadata limits above; see the
+[configuration reference](../reference/configuration.md#agents-and-skills).
 
 ## Parallel tasks
 
@@ -278,29 +348,45 @@ the [configuration reference](../reference/configuration.md) for role presets.
 
 ## TUI monitoring
 
-The TUI shows a one-line agent summary above the input with aggregate counts by
-state. Click it, type `/agents`, or press `Ctrl+Shift+A` to open the docked
-agent browser.
+The TUI shows a one-line agent summary above the input. The collapsed segment
+counts active work only — running and finalizing instances, each once. Failed,
+cancelled, and budget outcomes surface as completion and eviction notifications,
+not status-line counts. With zero active agents, the bar shows a dim note
+instead of hiding entirely: `N recent` when Recent entries exist, otherwise
+`N idle` when retained-idle agents exist. Click the bar, type
+`/agents`, or press `Ctrl+Shift+A` to open the docked agent browser.
 
-The browser keeps **Main agent** pinned at the top, followed by retained agents
-in stable order. Its ten-row sheet scrolls internally. Rows show identity,
-profile, and a static state marker: **Running**, **Compacting**, **Stopping**, **Finishing**
-(with the run outcome), **Idle**, **Failed**, **Cancelled**, **Budget stopped**,
-or **Evicted**. Compacting is a presentation substate of active work, not a
-separate lifecycle state. Released agents disappear; evicted tombstones remain
-browsable with their stored-result metadata.
+The browser keeps **Main agent** pinned at the top, followed by subagents grouped
+by lifecycle: **Active** (running, stopping, compacting, finalizing), **Retained
+Idle**, and **Recent** (closed and evicted records with their outcomes). The
+server orders each group deterministically — Active oldest launch first, Retained
+Idle most recently completed first, Recent newest closure first — and the browser
+consumes that order. Filter tabs **Resident** (the default: Active plus Retained
+Idle), **Active**, **Idle**, **Recent**, and **All** show truthful counts;
+`Left`/`Right` cycles them. Group headers are labels, never selections. When the
+Resident view is empty but Recent entries exist, the browser shows the Recent
+group with a note — never an empty screen. Its ten-row sheet scrolls internally.
+Rows show the agent's name with the `agent_id` handle dimmed beside it, the
+profile, and a static state marker: **Running**, **Compacting**, **Stopping**,
+**Finishing** (with the run outcome), **Idle**, **Failed**, **Cancelled**,
+**Budget stopped**, **Closed**, or **Evicted**. Compacting is a presentation
+substate of active work, not a separate lifecycle state. Expired metadata and
+released agents have no rows; a Recent row's details show **result preserved** or
+**result expired** for its stored result.
 
 Use `Up`/`Down` to select a row, then `Enter` or a single click to open its output.
 Two detail rows show the selection's state, running or last-run duration, idle
 duration where applicable, context usage, model, and turns. Running and idle
-elapsed times are anchored to receipt of the server snapshot; evicted values
-remain frozen at the last recorded measurement. Context usage uses the effective
-compaction threshold as its denominator, not the model's maximum context window.
+elapsed times are anchored to receipt of the server snapshot; closed and evicted
+values remain frozen at the last recorded measurement. Context usage uses the
+effective compaction threshold as its denominator, not the model's maximum
+context window.
 
-Press `D` for scrollable full metadata, including task, provider, model, thinking,
-run ID, stop reason, and retention information. Details also works on **Main
-agent**. `F1` opens local help; `Escape` returns from help, then details, then
-closes the browser and restores input focus. The footer lists available actions.
+Press `D` for scrollable full metadata, including the agent's `Name` and
+explicitly labeled `Agent ID`, task, provider, model, thinking, run ID, stop
+reason, and retention information. Details also works on **Main agent**. `F1`
+opens local help; `Escape` returns from help, then details, then closes the
+browser and restores input focus. The footer lists available actions.
 `/agents` and `Ctrl+Shift+A` toggle the browser.
 
 On a highlighted **Running** or **Compacting** child with a current run ID,
@@ -322,15 +408,27 @@ or replace the captured run invalidate the confirmation or pending display; late
 responses cannot mark a replacement run as Stopping. There is no `T` retask key:
 ask the orchestrator in prose to use `task(..., replace_run=True)`.
 
+On a highlighted **Idle** or **Recent** entry, press `R` for a confirmed
+**[Release] [Cancel]** action: the confirmation names the agent and explains that
+release discards its retained results and browser access; **Cancel** has default
+focus. Release is the browser counterpart of `release_agent`, guarded against
+races: an agent that started running, is reserved for replacement, or changed its
+latest run reports a conflict instead of being released. Release keeps the
+lifecycle guards (it is not exempt during root lifecycle work), and it is
+available for resident idle and Recent entries; **Stop** (`C`) stays for active
+entries. Both confirmations use the same keyboard pattern (`Tab` or arrow keys to
+choose, `Enter` to activate, `Escape` to dismiss).
+
 Selecting an agent replaces the conversation area with a bordered pane titled
-`Subagent: <id> · <profile>`. Running or finalizing agents show a live,
-append-only transcript refreshed about once per second; the view uses the same
-entry structure as the saved transcript, so it converges when the run finishes.
-Older pages do not jump during refresh: use `PageUp` to paginate and `r` for a
-manual refresh. The pane identifies saved transcripts when the agent is no
-longer running. Press `Escape`, or select **Main agent**, to return to the
-conversation. Main-agent activity does not close inspection; releasing an
-agent closes its pane, while an evicted agent remains inspectable when its saved
+`Subagent: <name> (<agent_id>) · <profile>`. Running or finalizing agents show a
+live, append-only transcript refreshed about once per second; the view uses the
+same entry structure as the saved transcript, so it converges when the run
+finishes. Older pages do not jump during refresh: use `PageUp` to paginate and
+`r` for a manual refresh. The pane identifies saved transcripts when the agent
+is no longer running. Press `Escape`, or select **Main agent**, to return to the
+conversation. Main-agent activity does not close inspection; releasing an agent
+closes its pane, and transcript access ends with the metadata window, while a
+closed or evicted agent remains inspectable within that window when its saved
 transcript is available.
 
 Completion notifications still arrive in the parent session; use the result
@@ -366,8 +464,12 @@ discovery.
 
 Profile fields are validated during discovery; an invalid profile is not made
 available. Use `role` to bind a profile to a role; `active_model` is rejected in
-profile TOML. A retained subagent keeps its committed model and thinking level
-when reused, even if its profile's role has since been edited, unless the task
-supplies an explicit model or thinking override. Project profiles are subject to the same trusted-project
-rules as other local configuration. See [configuration](configuration.md) for the
+profile TOML. A profile can set `retain` (strict boolean) to keep its instances
+resident after completion, and `idle_ttl_seconds` (integer seconds, at least 0)
+to bound how long they stay idle; `retain` is what opts a profile into
+retention — `idle_ttl_seconds` alone does not. A retained subagent keeps its
+committed model and thinking level when reused, even if its profile's role has
+since been edited, unless the task supplies an explicit model or thinking
+override. Project profiles are subject to the same trusted-project rules as
+other local configuration. See [configuration](configuration.md) for the
 configuration model and [tools and safety](tools-safety.md) for tool policy.

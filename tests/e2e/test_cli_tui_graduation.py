@@ -344,6 +344,7 @@ async def test_limit_stops_require_implementation_slot(
     )
     from chartreux.core.dispatch.presets import STANDALONE_PRESET
     from chartreux.core.launch_types import LaunchConfig
+    from chartreux.core.subagents import derive_agent_name
     from tests.conftest import build_test_agent_loop
 
     home = tmp_path / "attempt-home"
@@ -383,6 +384,13 @@ async def test_limit_stops_require_implementation_slot(
                     current_run_status="running",
                     current_task_summary="same task",
                     slot_purposes=purposes,
+                    name=derive_agent_name(
+                        agent_id="worker-1",
+                        profile="worker",
+                        profile_display_label=None,
+                        base_model=None,
+                        effective_model=None,
+                    ),
                 )
                 for stopped in (False, True):
                     if stopped:

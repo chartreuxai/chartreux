@@ -33,7 +33,10 @@ class CheckAgentsResult(BaseModel):
     agents: list[AgentSummary] = Field(
         default_factory=list,
         description=(
-            "All retained agents and their status. ttl_remaining_seconds is advisory "
+            "The bounded agent inventory and its status: resident records "
+            "(running, finalizing, idle) plus closed/evicted terminal metadata "
+            "within its metadata window. Each entry's name is display-only; "
+            "agent_id is the only handle. ttl_remaining_seconds is advisory "
             "and does not guarantee the agent will remain available."
         ),
     )

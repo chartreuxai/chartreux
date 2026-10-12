@@ -13,6 +13,7 @@ from chartreux.cli.textual_ui.widgets.agent_bar import AgentBar
 from chartreux.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
 from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
 from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLine
+from chartreux.core.subagents import derive_agent_name
 from tests.cli.textual_ui.test_history_grouping import _message
 from tests.conftest import build_test_chartreux_app
 
@@ -71,11 +72,22 @@ async def test_status_overflow_reserves_known_usage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_docked_agent_sheet_has_fixed_ten_row_geometry() -> None:
+async def test_docked_agent_sheet_has_fixed_eleven_row_geometry() -> None:
     app = build_test_chartreux_app()
     async with app.run_test(size=(80, 24)) as pilot:
         agents = [
-            AgentSummaryModel(agent_id=str(i), profile="worker", availability="running")
+            AgentSummaryModel(
+                agent_id=str(i),
+                profile="worker",
+                availability="running",
+                name=derive_agent_name(
+                    agent_id=str(i),
+                    profile="worker",
+                    profile_display_label=None,
+                    base_model=None,
+                    effective_model=None,
+                ),
+            )
             for i in range(8)
         ]
         await app._handle_turn_event(AgentsUpdate(agents))
@@ -83,9 +95,12 @@ async def test_docked_agent_sheet_has_fixed_ten_row_geometry() -> None:
         await pilot.pause()
         bar = app.query_one(AgentBar)
         for _ in range(7):
-            assert bar.region.height == 10
+            assert bar.region.height == 11
             assert bar.border_title == "Background agents"
-            assert not app.query_one("#agent-bar-title").display
+            # The title row carries the filter tabs while expanded.
+            assert app.query_one("#agent-bar-title").display
+            tabs = str(app.query_one("#agent-bar-title").render())
+            assert "Resident 8" in tabs and "Active 8" in tabs and "All 8" in tabs
             assert app.query_one("#agent-bar-rows").size.height == 5
             assert app.query_one("#agent-bar-detail").size.height == 2
             footer = app.query_one("#agent-bar-footer")
@@ -99,18 +114,18 @@ async def test_docked_agent_sheet_has_fixed_ten_row_geometry() -> None:
             ])
         )
         await pilot.pause()
-        assert bar.region.height == 10
+        assert bar.region.height == 11
         await pilot.press("d")
         await pilot.pause()
-        assert bar.region.height == 10
+        assert bar.region.height == 11
         assert app.query_one("#agent-bar-full-details").size.height == 7
         await pilot.press("escape", "f1")
         await pilot.pause()
-        assert bar.region.height == 10
+        assert bar.region.height == 11
         await pilot.resize_terminal(100, 30)
         await pilot.resize_terminal(80, 24)
         await pilot.pause()
-        assert bar.region.height == 10
+        assert bar.region.height == 11
 
 
 @pytest.mark.asyncio

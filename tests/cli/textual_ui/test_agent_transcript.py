@@ -1002,6 +1002,49 @@ def test_escape_key_stops_event_and_posts_close_message() -> None:
     event.prevent_default.assert_called_once()
 
 
+def test_header_uses_name_handle_and_profile_and_renders_literally() -> None:
+    viewer = AgentTranscriptViewer(
+        _FakeSource(), "agent-7", profile="reviewer", name="reviewer-[bold]glm[/bold]-7"
+    )
+    assert viewer._header_text() == (
+        "Subagent: reviewer-[bold]glm[/bold]-7 (agent-7) · reviewer"
+    )
+    # A legacy nameless payload keeps the handle-only header shape.
+    legacy = AgentTranscriptViewer(_FakeSource(), "agent-7", profile="reviewer")
+    assert legacy._header_text() == "Subagent: agent-7 · reviewer"
+
+
+@pytest.mark.asyncio
+async def test_header_widget_is_markup_safe_and_refreshes_in_place() -> None:
+    from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
+
+    source = _FakeSource()
+    viewer = AgentTranscriptViewer(
+        source, "agent-7", profile="reviewer", name="reviewer-glm-7"
+    )
+    app = App()
+    async with app.run_test() as pilot:
+        await app.mount(viewer)
+        await pilot.pause()
+        header = viewer.query_one("#agent-transcript-header")
+        assert isinstance(header, NoMarkupStatic)
+        assert str(header.render()) == ("Subagent: reviewer-glm-7 (agent-7) · reviewer")
+        # A markup-containing name renders literally, never as styling.
+        viewer.set_header("reviewer-[bold]x[/bold]-7", "reviewer")
+        await pilot.pause()
+        assert str(header.render()) == (
+            "Subagent: reviewer-[bold]x[/bold]-7 (agent-7) · reviewer"
+        )
+        assert viewer.query_one("#agent-transcript-header") is header
+        # A no-op refresh leaves the widget untouched.
+        viewer.set_header("reviewer-[bold]x[/bold]-7", "reviewer")
+        await pilot.pause()
+        assert str(header.render()) == (
+            "Subagent: reviewer-[bold]x[/bold]-7 (agent-7) · reviewer"
+        )
+        await viewer.dispose()
+
+
 @pytest.mark.asyncio
 async def test_dispose_during_mount_waits_for_worker_before_draining(
     monkeypatch: pytest.MonkeyPatch,

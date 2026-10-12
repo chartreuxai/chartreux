@@ -25,6 +25,7 @@ from chartreux.cli.textual_ui.widgets.messages import (
     UserMessage,
 )
 from chartreux.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
+from chartreux.core.subagents import derive_agent_name
 from chartreux.utils.tool_presentation import EffectCallDisplay
 from tests.snapshots.snap_compare import SnapCompare
 from tests.snapshots.snapshot_event_loop import install_snapshot_wake
@@ -148,7 +149,16 @@ class AgentTranscriptViewerSnapshotApp(App[None]):
         super().__init__()
         self._tools_collapsed = False
         self.viewer = AgentTranscriptViewer(
-            _SnapshotSource(stamped=self.STAMPED), "agent-snapshot", profile="reviewer"
+            _SnapshotSource(stamped=self.STAMPED),
+            "agent-snapshot",
+            profile="reviewer",
+            name=derive_agent_name(
+                agent_id="agent-snapshot",
+                profile="reviewer",
+                profile_display_label=None,
+                base_model="glm-5.3",
+                effective_model=None,
+            ),
         )
 
     def compose(self) -> ComposeResult:

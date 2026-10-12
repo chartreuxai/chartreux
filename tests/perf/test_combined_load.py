@@ -22,7 +22,7 @@ from chartreux.cli.textual_ui.widgets.messages import AssistantMessage
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agents.launch import LaunchCandidate
 from chartreux.core.llm_models import LLMChunk, LLMMessage
-from chartreux.core.subagents import TaskResult
+from chartreux.core.subagents import TaskResult, WaitStatus
 from tests.mock.utils import mock_llm_chunk
 from tests.perf._harness import (
     GatedSequenceBackend,
@@ -339,7 +339,12 @@ async def _await_children(harness: SubagentHarness, results: list[TaskResult]) -
         ),
         timeout=120,
     )
-    assert all(completion.completed for completion in completions)
+    assert all(
+        completion.status is WaitStatus.COMPLETED
+        and completion.result is not None
+        and completion.result.completed
+        for completion in completions
+    )
 
 
 async def _iteration(

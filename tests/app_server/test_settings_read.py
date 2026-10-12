@@ -65,8 +65,8 @@ def test_tools_inventory_intersects_filters_without_changing_other_categories(
 
 
 def test_curated_registry_is_complete_and_validated() -> None:
-    assert len(EDITABLE_SETTINGS) == len(EDITABLE_BY_PATH) == 45
-    assert len(VISIBLE_SETTINGS) == 40
+    assert len(EDITABLE_SETTINGS) == len(EDITABLE_BY_PATH) == 48
+    assert len(VISIBLE_SETTINGS) == 43
     visible = {item.path: item for item in VISIBLE_SETTINGS}
     assert visible["status_line"].control == "status_line"
     assert "status_line" not in EDITABLE_BY_PATH
@@ -89,6 +89,9 @@ def test_curated_registry_is_complete_and_validated() -> None:
     )
     assert EDITABLE_BY_PATH["subagents.max_idle_agents"].minimum == 0
     assert EDITABLE_BY_PATH["subagents.idle_ttl_seconds"].minimum == 0
+    assert EDITABLE_BY_PATH["subagents.retain_agents"].kind == "bool"
+    assert EDITABLE_BY_PATH["subagents.tombstone_ttl_seconds"].minimum == 0
+    assert EDITABLE_BY_PATH["subagents.max_tombstones"].minimum == 1
     assert "subagents.max_running_subagents" not in EDITABLE_BY_PATH
     assert "subagents.max_running_subagents" not in {
         item.path for item in VISIBLE_SETTINGS
@@ -110,6 +113,16 @@ def test_curated_registry_is_complete_and_validated() -> None:
     EDITABLE_BY_PATH["project_context.timeout_seconds"].validate(0.0)
     with pytest.raises(ValueError):
         EDITABLE_BY_PATH["subagents.max_idle_agents"].validate(True)
+    with pytest.raises(ValueError):
+        EDITABLE_BY_PATH["subagents.tombstone_ttl_seconds"].validate(True)
+    with pytest.raises(ValueError):
+        EDITABLE_BY_PATH["subagents.max_tombstones"].validate(True)
+    with pytest.raises(ValueError):
+        EDITABLE_BY_PATH["subagents.retain_agents"].validate(1)
+    with pytest.raises(ValueError):
+        EDITABLE_BY_PATH["subagents.max_tombstones"].validate(0)
+    EDITABLE_BY_PATH["subagents.tombstone_ttl_seconds"].validate(0)
+    EDITABLE_BY_PATH["subagents.retain_agents"].validate(False)
 
 
 @pytest.mark.asyncio

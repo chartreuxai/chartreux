@@ -37,7 +37,11 @@ from chartreux.core.subagents import SubagentRunnerPort, TaskArgs
 from chartreux.core.tools.base import InvokeContext
 from chartreux.core.usage import UsageOutcome, UsagePurpose, UsageRecord
 from tests.agent_loop.test_agent_wait_steering import WaitManager, make_loop, wait_call
-from tests.app_server.test_subagents import BlockingBackend, _background_result
+from tests.app_server.test_subagents import (
+    BlockingBackend,
+    _background_result,
+    _wait_result,
+)
 from tests.app_server.test_usage_attribution import AttemptBackend, open_test_root
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
@@ -1009,7 +1013,7 @@ async def test_real_child_survives_parent_wait_steering_and_ledger_is_unchanged(
         assert not child_backend.stopped.is_set()
         assert await registry.get_agent_result(launch.agent_id, launch.run_id) is None
         child_backend.release.set()
-        result = await asyncio.wait_for(registry.wait_for_agent(*key), 3)
+        result = await asyncio.wait_for(_wait_result(registry, *key), 3)
         assert result.response == "Child completed"
         assert await registry.get_agent_result(*key) is result
         records = [

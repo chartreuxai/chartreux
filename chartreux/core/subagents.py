@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from chartreux.core.agents.models import BUILTIN_SUBAGENTS
 from chartreux.core.events import (
     AssistantEvent,
     BaseEvent,
@@ -53,21 +54,39 @@ class TaskArgs(BaseModel):
     background: bool = Field(
         default=True,
         description=(
-            "If true, launch the subagent in the background and return a handle "
-            "instead of blocking until completion. Set false only when you need "
-            "the result immediately."
+            "If true (the default), launch the subagent in the background and "
+            "return a launch acknowledgment with handles instead of blocking "
+            "until completion. Launch in the background even when the result "
+            "is a dependency, then collect it with wait_for_agent; set false "
+            "only when blocking is truly required."
         ),
     )
     agent_id: str | None = Field(
         default=None,
         description=(
-            "Retained agent instance handle to continue with background: true. "
-            "If omitted, create a new instance using the agent_type profile name."
+            "Retained agent instance handle to continue with background: true; "
+            "reuse inherits the instance's committed retention policy unless "
+            "retain is passed. If omitted, create a new instance using the "
+            "agent_type profile name."
         ),
     )
     replace_run: bool = Field(
         default=False,
         description="Stop busy background work before reusing agent_id in the same conversation.",
+    )
+    retain: bool | None = Field(
+        default=None,
+        strict=True,
+        description=(
+            "Retain the agent instance after this run completes so it stays "
+            "resident for reuse with agent_id; by default a background agent "
+            "closes on completion and its result stays retrievable. Precedence "
+            "for a new launch: this argument, then the profile's retain "
+            "setting, then the [subagents].retain_agents default. On reuse, "
+            "omitting retain keeps the instance's committed policy; "
+            "retain=false is a final continuation that closes afterward. "
+            "Only valid for background launches."
+        ),
     )
     config: LaunchConfig | None = Field(
         default=None,
@@ -145,6 +164,15 @@ class TaskResult(BaseModel):
         default=None,
         description="Unique run identifier for this invocation. Populated for background launches; None for foreground.",
     )
+    name: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Human-facing agent name ({profile}-{model}-{number}) for background "
+            "launches; None for foreground results. Display-only: agent_id "
+            "remains the only handle."
+        ),
+    )
     stop_reason: RunStopReason | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -196,16 +224,137 @@ class RunStatus(enum.StrEnum):
     CANCELLED = "cancelled"
 
 
+class WaitStatus(enum.StrEnum):
+    """Disposition status for a wait_for_agent call (design §6)."""
+
+    COMPLETED = "completed"
+    STILL_RUNNING = "still_running"
+
+
+class WaitForAgentResult(BaseModel):
+    """Typed wait disposition for wait_for_agent (design §6).
+
+    ``completed`` carries the finished run's TaskResult; ``still_running``
+    carries the wait progress (agent_id, run_id, elapsed_seconds, run_status,
+    turns_used) plus guidance instructing the model to yield its turn and
+    re-invoke wait_for_agent in a later turn. The variants are mutually
+    exclusive: ``completed`` rejects the progress fields and ``still_running``
+    rejects ``result``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: WaitStatus
+    result: TaskResult | None = Field(
+        default=None,
+        description="The completed run's result; set only when status is completed.",
+    )
+    agent_id: str | None = Field(
+        default=None,
+        description="Agent handle waited on; set only when status is still_running.",
+    )
+    run_id: str | None = Field(
+        default=None,
+        description="Run handle waited on; set only when status is still_running.",
+    )
+    elapsed_seconds: float | None = Field(
+        default=None,
+        description="Seconds waited before the timeout; still_running only.",
+    )
+    run_status: RunStatus | None = Field(
+        default=None, description="Current run status; still_running only."
+    )
+    turns_used: int | None = Field(
+        default=None, description="Turns used by the run so far; still_running only."
+    )
+    guidance: str | None = Field(
+        default=None, description="Guidance for the still_running outcome."
+    )
+
+    @model_validator(mode="after")
+    def _require_variant_fields(self) -> WaitForAgentResult:
+        progress = (
+            self.agent_id,
+            self.run_id,
+            self.elapsed_seconds,
+            self.run_status,
+            self.turns_used,
+            self.guidance,
+        )
+        if self.status is WaitStatus.COMPLETED:
+            if self.result is None:
+                raise ValueError("completed wait disposition requires a result")
+            if any(field is not None for field in progress):
+                raise ValueError(
+                    "completed wait disposition cannot carry still_running fields "
+                    "(agent_id, run_id, elapsed_seconds, run_status, turns_used, "
+                    "guidance)"
+                )
+            return self
+        if self.result is not None:
+            raise ValueError("still_running wait disposition cannot carry a result")
+        if any(field is None for field in progress):
+            raise ValueError(
+                "still_running wait disposition requires agent_id, run_id, "
+                "elapsed_seconds, run_status, turns_used, and guidance"
+            )
+        return self
+
+
 class AgentAvailability(enum.StrEnum):
+    """Lifecycle availability of an agent record or terminal metadata.
+
+    ``running``, ``finalizing``, and ``idle`` are resident records.
+    ``closed`` is terminal metadata for a normally completed run
+    (including failed or cancelled runs) of an unretained agent;
+    ``evicted`` is terminal metadata for a retained runtime removed by
+    the idle TTL or idle cap. Terminal metadata is bounded (a TTL and a
+    count cap) and disappears without expiring retained results.
+    """
+
     RUNNING = "running"
     FINALIZING = "finalizing"
     IDLE = "idle"
     EVICTED = "evicted"
+    CLOSED = "closed"
 
 
 class ReleaseAgentOutcome(enum.StrEnum):
+    """Outcome of a release request.
+
+    ``RELEASED`` removes a live agent; ``EVICTED`` removes its terminal
+    tombstone (``closed`` or ``evicted``). The guarded release path used
+    by the agent browser (the ``agents/release`` RPC) additionally reports
+    ``CONFLICT`` when the agent is active, reserved for replacement, or
+    pinned to a different latest run, and ``UNKNOWN`` when the handle is
+    already released or its terminal metadata expired. Release discards
+    retained results, expiry markers, and wait leases.
+    """
+
     RELEASED = "released"
     EVICTED = "evicted"
+    CONFLICT = "conflict"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionPolicy:
+    """Per-root-generation retention snapshot for background subagents.
+
+    Replaces the legacy ``(idle_ttl_seconds, max_idle_agents)`` 2-tuple and adds
+    the generation-snapshotted global retention default. ``idle_ttl_seconds=0``
+    disables TTL eviction and ``max_idle_agents=0`` disables the idle cap for
+    retained instances. Terminal metadata (tombstones) expires
+    ``tombstone_ttl_seconds`` after closure and is capped at ``max_tombstones``
+    entries, oldest first; ``tombstone_ttl_seconds=0`` stores no terminal
+    metadata.
+    """
+
+    idle_ttl_seconds: int
+    max_idle_agents: int
+    retain_agents: bool
+    tombstone_ttl_seconds: int = 900
+    max_tombstones: int = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +397,94 @@ class AgentSummary:
     compacting: bool = False
     stop_reason: RunStopReason | None = None
     """Current/latest run's structured stop reason, retained after finalization."""
+    name: str = ""
+    """Human-facing ``{profile}-{model}-{number}`` name (design §5).
+
+    The server always populates this when projecting summaries; the empty
+    string is the legacy-constructor default for older in-process callers.
+    """
+
+
+_AGENT_HANDLE_PREFIX = "agent-"
+
+_AGENT_HANDLE_PATTERN = re.compile(r"agent-\d+")
+"""The allocated handle shape (``agent-{sequence}``); derived names never match."""
+
+
+def _strip_model_namespace(model: str) -> str:
+    """Drop a provider namespace prefix (``mistral/zai-glm-5-3`` → ``zai-glm-5-3``)."""
+    stripped = model.rpartition("/")[2]
+    return stripped or model
+
+
+def _agent_sequence_number(agent_id: str) -> str:
+    """The agent sequence digits of a handle (``agent-15`` → ``15``)."""
+    if agent_id.startswith(_AGENT_HANDLE_PREFIX):
+        return agent_id[len(_AGENT_HANDLE_PREFIX) :]
+    return agent_id
+
+
+def derive_agent_name(
+    agent_id: str,
+    profile: str,
+    profile_display_label: str | None,
+    base_model: str | None,
+    effective_model: str | None,
+) -> str:
+    """Derive the human-facing agent name ``{profile}-{model}-{number}`` (design §5).
+
+    The profile segment is the profile name for builtin profiles and the
+    whitespace-collapsed display label for custom profiles, falling back to
+    the profile name when no label was captured at admission. The model
+    segment is the namespace-stripped canonical ``base_model``, falling back
+    to the namespace-stripped ``effective_model``, and is omitted entirely
+    when neither is known. The number is the agent sequence digits of the
+    handle (``agent-15`` ↔ ``...-15``). The helper is stateless: names are
+    derived from accepted task publication state, never persisted.
+
+    The result never parses as a handle (design §5): if it would match the
+    ``agent-\\d+`` handle shape — a custom profile or display label of
+    exactly ``agent`` with no known model yields ``agent-7`` — the profile
+    segment is prefixed to break the shape deterministically.
+    """
+    if profile_display_label is not None and profile not in BUILTIN_SUBAGENTS:
+        profile_segment = "-".join(profile_display_label.split())
+    else:
+        profile_segment = profile
+    model = base_model if base_model is not None else effective_model
+    number = _agent_sequence_number(agent_id)
+    if model is None:
+        name = f"{profile_segment}-{number}"
+    else:
+        name = f"{profile_segment}-{_strip_model_namespace(model)}-{number}"
+    if _AGENT_HANDLE_PATTERN.fullmatch(name) is not None:
+        name = f"{profile_segment}-{name}"
+    return name
+
+
+def still_running_guidance(
+    *,
+    agent_id: str,
+    run_id: str,
+    elapsed_seconds: float,
+    run_status: RunStatus,
+    turns_used: int,
+) -> str:
+    """Turn-yield guidance carried by a ``still_running`` wait (design §6).
+
+    A tool result does not end the turn by itself: the model must yield so
+    queued user input can drain between turns. The guidance therefore
+    instructs ending the turn or continuing other work now and re-invoking
+    ``wait_for_agent`` in a later turn — never a same-turn re-invocation.
+    """
+    turn_word = "turn" if turns_used == 1 else "turns"
+    return (
+        f"Agent {agent_id} (run {run_id}) is still {run_status.value} after "
+        f"{elapsed_seconds:g}s and {turns_used} {turn_word}. End your turn or "
+        "continue other work now: queued user input is only delivered between "
+        "turns. Re-invoke wait_for_agent in a later turn to keep waiting, or "
+        "call check_agents to inspect progress."
+    )
 
 
 class EmptySubagentResponseError(ValueError):
@@ -258,7 +495,11 @@ class SubagentManagementError(ValueError):
     """Base error for a retained subagent lifecycle operation."""
 
 
-class AgentEvictedError(SubagentManagementError):
+class AgentClosedError(SubagentManagementError):
+    """The agent is closed and cannot be reused."""
+
+
+class AgentEvictedError(AgentClosedError):
     """The agent was evicted and cannot be reused."""
 
 
@@ -325,7 +566,11 @@ class SubagentManagementPort(Protocol):
     """Port for managing background subagent lifecycle."""
 
     async def check_agents(self) -> list[AgentSummary]:
-        """List all retained agents and their current run status. Nonblocking."""
+        """List the bounded agent inventory and current run status. Nonblocking.
+
+        The inventory covers resident records (running, finalizing, idle)
+        plus terminal metadata (closed, evicted) that has not expired.
+        """
         ...
 
     async def get_agent_result(
@@ -341,12 +586,15 @@ class SubagentManagementPort(Protocol):
 
     async def wait_for_agent(
         self, agent_id: str, run_id: str | None = None, *, timeout: float | None = None
-    ) -> TaskResult:
-        """Block until the specified run completes, with optional timeout.
+    ) -> WaitForAgentResult:
+        """Block until the specified run completes, returning a typed disposition.
 
-        Timeout must NOT cancel the background run — it only unblocks the waiter.
-        Raises TimeoutError if the timeout expires before completion.
-        Raises ValueError for invalid agent_id, run_id mismatch, or non-positive timeout.
+        Returns a ``completed`` disposition carrying the finished run's
+        TaskResult, or a ``still_running`` disposition when the timeout
+        expires first (the timeout is a bounded checkpoint, never a failure).
+        Timeout must NOT cancel the background run — it only unblocks the
+        waiter. Raises ValueError for invalid agent_id, run_id mismatch, or
+        non-positive timeout.
         """
         ...
 
@@ -362,10 +610,13 @@ class SubagentManagementPort(Protocol):
         ...
 
     async def release_agent(self, agent_id: str) -> ReleaseAgentOutcome:
-        """Close and remove a retained agent or evicted tombstone.
+        """Close and remove a resident agent or its terminal tombstone.
 
-        Returns RELEASED for a live agent and EVICTED when removing its tombstone.
-        Raises ValueError for unknown agent_id.
+        Unguarded by design: the model tool may release active instances
+        (design §3.1). Returns RELEASED for a live agent and EVICTED when
+        removing a closed or evicted tombstone. Raises ValueError for
+        unknown agent_id. Release purges retained results, expiry markers,
+        and wait leases.
         """
         ...
 

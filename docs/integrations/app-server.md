@@ -159,6 +159,32 @@ User-cancelled completion is injected into the parent: an idle parent learns at
 its next turn and is never auto-started. Root interruption remains the separate
 `turn/interrupt` operation.
 
+## Background agent release
+
+`agents/release` accepts `{"agentId": "…", "expectedRunId": "…"}`.
+`expectedRunId` may be omitted to release whatever run is current; interactive
+confirmations should pin it so a newer assignment is not released by mistake.
+`AppServerSession.release_agent(agent_id, expected_run_id)` returns a typed
+public response with `outcome` and a nullable `reason`.
+
+The outcomes are `released` (a resident record was released), `evicted` (a
+terminal-metadata record was removed), `conflict` (the agent is active,
+reserved for replacement, or its latest run changed — nothing was released), and
+`unknown` (no such agent — nothing was released). `conflict` and `unknown` never
+stopped or purged anything; the reason explains which guard fired.
+
+Release is a guarded, user-authorized removal. The registry verifies
+attached-root and current-generation authority, the expected latest-run
+identity, a non-active state, and the absence of a replacement reservation
+atomically before any destructive work, so a stale idle-to-running race reports
+`conflict` instead of stopping the new run. A successful release discards the
+agent's retained results, expiry markers, and wait leases, and ends its browser
+and transcript access; observe `agents/update` for the resulting inventory.
+Unlike `agents/cancel`, release gets no lifecycle-transition exemption: it is
+rejected while a root lifecycle transition is active, while attachment and
+shutdown fences still apply. The model tool `release_agent(agent_id)` stays
+unguarded and may still release an active instance.
+
 ## Managed-job state
 
 `PublicSessionState.active_background_job_count` (wire

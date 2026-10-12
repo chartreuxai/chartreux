@@ -75,15 +75,13 @@ async def test_agents_cancel_lifecycle_allow_policy(
         for method, params in [
             ("session/read", {"sessionId": parent.session_id}),
             ("agent/transcript/get", {"agentId": "child"}),
-            ("agents/release", {"agentId": "child"}),
+            # Release keeps the standard lifecycle guards (no cancel-style
+            # exemption), so it conflicts during lifecycle transitions.
+            ("agents/release", {"agentId": "child", "expectedRunId": "captured"}),
         ]:
             with pytest.raises(AppServerResponseError) as exc:
                 await client.request(method, params)
-            assert exc.value.error.code is (
-                ProtocolErrorCode.METHOD_NOT_FOUND
-                if method == "agents/release"
-                else ProtocolErrorCode.CONFLICT
-            )
+            assert exc.value.error.code is ProtocolErrorCode.CONFLICT
         with pytest.raises(AppServerResponseError) as exc:
             await client.request("agents/cancel", {"agent_id": "child"})
         assert exc.value.error.code is ProtocolErrorCode.INVALID_PARAMS

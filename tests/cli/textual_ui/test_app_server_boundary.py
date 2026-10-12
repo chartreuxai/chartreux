@@ -358,3 +358,24 @@ def test_agent_stop_uses_public_protocol_models(
     }
     for symbol in symbols:
         assert imported[symbol] == ("chartreux.app_server.protocol", symbol)
+
+
+@pytest.mark.parametrize(
+    "relative_path,symbols",
+    [
+        ("cli/textual_ui/app.py", {"ReleaseOutcome"}),
+        ("app_server/session.py", {"AgentsReleaseParams", "AgentsReleaseResponse"}),
+    ],
+)
+def test_agent_release_uses_public_protocol_models(
+    relative_path: str, symbols: set[str]
+) -> None:
+    tree = ast.parse(read_safe(CHARTREUX_ROOT / relative_path).text)
+    imported = {
+        alias.asname or alias.name: (node.module, alias.name)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    for symbol in symbols:
+        assert imported[symbol] == ("chartreux.app_server.protocol", symbol)

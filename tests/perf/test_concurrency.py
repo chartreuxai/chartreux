@@ -15,7 +15,7 @@ from typing import TypedDict
 import pytest
 
 from chartreux.app_server.protocol import AgentSummaryModel
-from chartreux.core.subagents import AgentEviction
+from chartreux.core.subagents import AgentEviction, WaitStatus
 from tests.perf._harness import (
     GatedSequenceBackend,
     SubagentHarness,
@@ -268,7 +268,12 @@ async def _iteration(
             timeout=120,
         )
         assert len(completions) == agent_count
-        assert all(completion.completed for completion in completions)
+        assert all(
+            completion.status is WaitStatus.COMPLETED
+            and completion.result is not None
+            and completion.result.completed
+            for completion in completions
+        )
         # Every independent child publishes its own launch and terminal updates.
         await _await_update_count(harness, 2 * agent_count + 1)
         agents_update_count = len(harness.agents_update_sizes)

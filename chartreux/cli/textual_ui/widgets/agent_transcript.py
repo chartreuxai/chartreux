@@ -57,6 +57,7 @@ from chartreux.cli.textual_ui.widgets.tools import (
 from chartreux.cli.textual_ui.windowing.history import build_history_widgets
 from chartreux.observability.logging import get_effective_log_level, logger
 from chartreux.ui.chrome_glyphs import chrome_glyph
+from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
 DEFAULT_TRANSCRIPT_PAGE_SIZE = 50
 MAX_MOUNTED_TRANSCRIPT_ENTRIES = 100
@@ -173,6 +174,7 @@ class AgentTranscriptViewer(Vertical):
         agent_id: str,
         *,
         profile: str = "unknown",
+        name: str = "",
         metadata: str = "",
         live: bool = False,
         page_size: int = DEFAULT_TRANSCRIPT_PAGE_SIZE,
@@ -182,8 +184,13 @@ class AgentTranscriptViewer(Vertical):
         self._source = source
         self._agent_id = agent_id
         self._profile = profile
+        self._name = name
         self._metadata = metadata
-        self._metadata_widget: Static | None = None
+        # NoMarkupStatic renders the metadata literally: the derived name (and
+        # the other full_metadata fields) may contain markup-looking characters
+        # from a custom profile's display name.
+        self._metadata_widget: NoMarkupStatic | None = None
+        self._header_widget: NoMarkupStatic | None = None
         self._live = live
         self._live_timer: Timer | None = None
         self._on_newest_page = True
@@ -217,11 +224,27 @@ class AgentTranscriptViewer(Vertical):
     def agent_id(self) -> str:
         return self._agent_id
 
+    def _header_text(self) -> str:
+        # NoMarkupStatic renders the label literally: a custom profile's
+        # display name may contain markup-looking characters.
+        if self._name:
+            return f"Subagent: {self._name} ({self._agent_id}) · {self._profile}"
+        return f"Subagent: {self._agent_id} · {self._profile}"
+
+    def set_header(self, name: str, profile: str) -> None:
+        """Refresh the identity header in place (a re-task reuses the viewer)."""
+        if name == self._name and profile == self._profile:
+            return
+        self._name = name
+        self._profile = profile
+        if self._header_widget is not None:
+            self._header_widget.update(self._header_text())
+
     def compose(self) -> ComposeResult:
-        yield Static(
-            f"Subagent: {self._agent_id} · {self._profile}",
-            id="agent-transcript-header",
+        self._header_widget = NoMarkupStatic(
+            self._header_text(), id="agent-transcript-header"
         )
+        yield self._header_widget
         yield Static(self._notice_text(), id="agent-transcript-notice")
         feedback = InlineNotice(id="agent-transcript-feedback")
         if self._feedback is not None:
@@ -236,7 +259,7 @@ class AgentTranscriptViewer(Vertical):
         with _TranscriptScroll(id="agent-transcript-content-scroll") as content_scroll:
             self._content_scroll = content_scroll
             if self._metadata:
-                self._metadata_widget = Static(
+                self._metadata_widget = NoMarkupStatic(
                     self._metadata, classes="agent-transcript-metadata"
                 )
                 yield self._metadata_widget
