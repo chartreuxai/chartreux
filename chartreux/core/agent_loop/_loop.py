@@ -28,6 +28,14 @@ from chartreux.core.agent_loop._dangerous_command_grants import (
     derive_call_requirements,
     parse_dangerous_command_result,
 )
+from chartreux.core.agent_loop._execution_admission import (
+    ExecutionAdmission,
+    revalidate_execution_admission,
+)
+from chartreux.core.agent_loop._file_state_context import (
+    FileStateContext,
+    RevisionRegistryPort,
+)
 from chartreux.core.agent_loop._request_broker import InteractionRequestBroker
 from chartreux.core.agent_loop._root_grants import (
     ROOT_GRANT_DECLINED_FEEDBACK,
@@ -121,6 +129,7 @@ from chartreux.core.events import (
     ToolWaitStateChangedEvent,
     UserMessageEvent,
 )
+from chartreux.core.file_state import FileStateStore
 from chartreux.core.git.errors import GitError
 from chartreux.core.git.worktree.repository import WorktreeRepository
 from chartreux.core.hooks.config import load_hooks_from_fs
@@ -213,6 +222,7 @@ from chartreux.core.tools.io_port import ToolIOPort
 from chartreux.core.tools.manager import NoSuchToolError, ToolManager
 from chartreux.core.tools.permissions import PermissionContext
 from chartreux.core.tools.ui import ToolUIDataAdapter
+from chartreux.core.tools.utils import DEFAULT_SENSITIVE_PATTERNS
 from chartreux.core.usage import AsyncUsageWriter, UsageAttribution, UsagePurpose
 from chartreux.core.utils import (
     TOOL_ERROR_TAG,
@@ -336,6 +346,11 @@ class ToolDecision(BaseModel):
     approval_type: ToolPermission
     feedback: str | None = None
     result_note: str | None = None
+    # Invocation-bound authority the execution-admission gate revalidates at
+    # the handoff (after the snapshot await, immediately before invoke). Only
+    # an "Allow once" approval carries one: its permit is consumed before the
+    # call resumes, so the gate re-arms it for exactly this invocation.
+    admission: ExecutionAdmission | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -571,6 +586,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         root_grant_port: RootGrantPort | None = None,
         dangerous_command_grant_port: DangerousCommandGrantPersistencePort
         | None = None,
+        file_revision_registry: RevisionRegistryPort | None = None,
+        parent_file_state: FileStateStore | None = None,
     ) -> None:
         self._background_job_registry = None if is_subagent else BackgroundJobRegistry()
         self.background_jobs = (
@@ -730,6 +747,19 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._setup_middleware()
 
         self.messages = MessageList()
+        # Working-set file state: the session-side view of the files this
+        # worker has observed (path -> last-seen revision + outline). A child
+        # is seeded with a deep copy of its parent's working set at spawn; the
+        # registry is the dispatcher-level revision truth shared across the
+        # session tree (None when this loop was constructed outside it).
+        self.file_state_context = FileStateContext(
+            store=(
+                parent_file_state.model_copy(deep=True)
+                if parent_file_state is not None
+                else None
+            ),
+            registry=file_revision_registry,
+        )
         # Only the active completion retains execution arguments; transcript
         # copies are sanitized before insertion and never used for execution.
         self._execution_message: LLMMessage | None = None
@@ -826,6 +856,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             ),
             tool_choice=self.format_handler.get_tool_choice,
             save=self._save_messages,
+            file_state_getter=lambda: self.file_state_context.store,
         )
 
         if defer_heavy_init:
@@ -2092,6 +2123,76 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         # plan without an explicit user selection.
         return self._user_plan
 
+    @property
+    def file_state(self) -> FileStateStore:
+        """The working-set file state store (path -> last-seen revision + outline)."""
+        return self.file_state_context.store
+
+    @property
+    def file_revision_registry(self) -> RevisionRegistryPort | None:
+        """The dispatcher-level revision registry shared across the session tree."""
+        return self.file_state_context.registry
+
+    def file_state_handoff_message(self) -> LLMMessage | None:
+        """The spawn handoff block for this loop's working set, if any.
+
+        Redacted like every message entering the transcript; ``None`` when the
+        working set is empty (nothing was handed down).
+        """
+        message = self.file_state_context.handoff_message()
+        if message is None:
+            return None
+        return message.model_copy(
+            update={"content": secret_redaction.redact(message.content or "")}
+        )
+
+    def _observe_file_state(self, tool_name: str, result_model: BaseModel) -> None:
+        """Record one successful tool result into the working-set file state.
+
+        Fail-safe: an observation bug must never break a turn — the store and
+        registry are updated at observation time, so a failure here only loses
+        metadata, never conversation state.
+        """
+        try:
+            self.file_state_context.observe_tool_result(
+                tool_name,
+                result_model,
+                sensitive_patterns=self._tool_sensitive_patterns(tool_name),
+            )
+        except Exception as exc:
+            logger.warning(
+                "File state observation failed tool=%s error=%s",
+                tool_name,
+                type(exc).__name__,
+            )
+
+    def _tool_sensitive_patterns(self, tool_name: str) -> list[str]:
+        """The observing tool's sensitive patterns (defaults when unknown)."""
+        try:
+            config = self.tool_manager.get_tool_config(tool_name)
+        except Exception:
+            return list(DEFAULT_SENSITIVE_PATTERNS)
+        return list(config.sensitive_patterns) or list(DEFAULT_SENSITIVE_PATTERNS)
+
+    def _flush_file_state_blocks(self) -> None:
+        """Append pending working-set state blocks as the last messages.
+
+        Blocks are append-only and last-positioned: nothing already in the
+        transcript is rewritten, so the cached request prefix stays valid.
+        Fail-safe like observation: a flush bug must never break a turn.
+        """
+        try:
+            blocks = self.file_state_context.flush_blocks()
+        except Exception as exc:
+            logger.warning("File state block flush failed error=%s", type(exc).__name__)
+            return
+        for message in blocks:
+            self.messages.append(
+                message.model_copy(
+                    update={"content": secret_redaction.redact(message.content or "")}
+                )
+            )
+
     def set_user_plan(self, user_plan: str | None) -> None:
         self._user_plan = user_plan
 
@@ -2554,6 +2655,16 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
     async def _perform_llm_turn(self) -> AsyncGenerator[BaseEvent, None]:
         await self._settle_steering_injections()
+        # Append point for working-set state blocks. This is the ONLY flush
+        # point: the conversation loop continues while the last message is a
+        # tool result, so a block must never be appended after a batch (it
+        # would end the turn early). Flushing here appends the block as the
+        # last message at append time — after the previous batch's tool
+        # results, before this turn's assistant message — which keeps provider
+        # tool_use/tool_result adjacency intact and the cached request prefix
+        # stable. It also catches steering-injected reads (e.g. @mentioned
+        # files) observed outside a tool batch.
+        self._flush_file_state_blocks()
         self._execution_message = None
         try:
             if self.enable_streaming:
@@ -3072,6 +3183,39 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if snapshot is not None:
             self.checkpoint_recorder.add_snapshot(snapshot)
 
+        # The snapshot await is a world-change window: dangerous-command
+        # authority — or any other permission dimension — may have been
+        # revoked while it ran. Re-run the full resolution at the execution
+        # handoff, after the snapshot and immediately before invoke, so no
+        # unguarded await remains between the last admission decision and the
+        # actual execution. The gate covers every execution path of the tool,
+        # including the shell tool's client-terminal delegation.
+        admission_denial = revalidate_execution_admission(
+            tool_instance,
+            tool_call.validated_args,
+            self.tool_manager,
+            self._dangerous_command_grants,
+            decision.admission,
+        )
+        if admission_denial is not None:
+            self.stats.tool_calls_agreed -= 1
+            logger.info(
+                "Tool call denied at execution admission tool=%s tool_call_id=%s "
+                "outcome=denied",
+                tool_call.tool_name,
+                tool_call.call_id,
+            )
+            async for ev in self._handle_tool_skip(
+                tool_call,
+                ToolDecision(
+                    verdict=ToolExecutionResponse.SKIP,
+                    approval_type=ToolPermission.NEVER,
+                    feedback=admission_denial,
+                ),
+            ):
+                yield ev
+            return
+
         timing.start()
         logger.debug(
             "Tool call starting tool=%s tool_call_id=%s",
@@ -3166,6 +3310,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             ),
         ):
             yield ev
+        if not result_cancelled:
+            # Observation intake: a successful authorized file interaction
+            # (read / edit / write) enrolls the path and publishes its revision
+            # to the dispatcher-level registry at observation time.
+            self._observe_file_state(tool_call.tool_name, result_model)
         self.stats.tool_calls_succeeded += 1
         logger.info(
             "Tool call completed tool=%s tool_call_id=%s duration_ms=%d outcome=%s",
@@ -3429,47 +3578,28 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         world-change window: the full resolution runs again after it, so the
         last recheck is the final admission gate exactly as the roots flow
         rechecks last.
+
+        An installed once permit never outlives this function unless the call
+        resumes: the recheck runs while the permit is live, so an exception
+        from it — or a cancellation delivered at any later await — would
+        otherwise leave reusable authority behind. The finally block destroys
+        an unconsumed permit and invalidates the cached authority it fed on
+        every exit path, so a failed or interrupted recheck leaks no
+        authority. A session grant is intentional and persistent: it is never
+        rolled back here.
         """
         store = self._dangerous_command_grants
         permit = None
-        if choice == "allow_once":
-            if requirements:
-                permit = store.install_once(requirements)
+        try:
+            if choice == "allow_once":
+                if requirements:
+                    permit = store.install_once(requirements)
+                    self.tool_manager._invalidate_dangerous_command_authority()
+            elif store.grant_session(requirements):
                 self.tool_manager._invalidate_dangerous_command_authority()
-        elif store.grant_session(requirements):
-            self.tool_manager._invalidate_dangerous_command_authority()
-        # Full recheck of the original call under the approved authority. A
-        # failed recheck executes nothing, destroys any unused once
-        # authority, and never persists.
-        resolved = tool.resolve_permission(args)
-        if resolved is not None and resolved.permission == ToolPermission.NEVER:
-            if permit is not None:
-                store.destroy_once(permit)
-                self.tool_manager._invalidate_dangerous_command_authority()
-            return ToolDecision(
-                verdict=ToolExecutionResponse.SKIP,
-                approval_type=ToolPermission.NEVER,
-                feedback=(
-                    resolved.reason or f"Tool '{tool_name}' is disabled by policy"
-                ),
-            )
-        if permit is not None:
-            # The permit authorized exactly this invocation; it is consumed
-            # before the call resumes, so no authority outlives the approval.
-            store.destroy_once(permit)
-            self.tool_manager._invalidate_dangerous_command_authority()
-        result_note = None
-        if choice == "allow_project":
-            result_note = await self._persist_project_dangerous_command_grant(proposal)
-            # The persist await sits between the recheck above and execution,
-            # so that recheck is not yet the final admission gate: the world
-            # may have changed while it ran. Invalidate cached authority —
-            # an in-place config change does not move the manager's authority
-            # token — and re-run the full resolution, exactly as the roots
-            # flow rechecks last. A mid-await change (denylist, disablement,
-            # a retired manager) skips the call cleanly instead of executing
-            # it or failing at invoke time.
-            self.tool_manager._invalidate_dangerous_command_authority()
+            # Full recheck of the original call under the approved authority. A
+            # failed recheck executes nothing, destroys any unused once
+            # authority, and never persists.
             resolved = tool.resolve_permission(args)
             if resolved is not None and resolved.permission == ToolPermission.NEVER:
                 return ToolDecision(
@@ -3479,11 +3609,59 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                         resolved.reason or f"Tool '{tool_name}' is disabled by policy"
                     ),
                 )
-        return ToolDecision(
-            verdict=ToolExecutionResponse.EXECUTE,
-            approval_type=ToolPermission.ALWAYS,
-            result_note=result_note,
-        )
+            if permit is not None:
+                # The permit authorized exactly this invocation; it is consumed
+                # before the call resumes, so no authority outlives the approval.
+                store.destroy_once(permit)
+                self.tool_manager._invalidate_dangerous_command_authority()
+                permit = None
+            result_note = None
+            if choice == "allow_project":
+                result_note = await self._persist_project_dangerous_command_grant(
+                    proposal
+                )
+                # The persist await sits between the recheck above and
+                # execution, so that recheck is not yet the final admission
+                # gate: the world may have changed while it ran. Invalidate
+                # cached authority — an in-place config change does not move
+                # the manager's authority token — and re-run the full
+                # resolution, exactly as the roots flow rechecks last. A
+                # mid-await change (denylist, disablement, a retired manager)
+                # skips the call cleanly instead of executing it or failing at
+                # invoke time.
+                self.tool_manager._invalidate_dangerous_command_authority()
+                resolved = tool.resolve_permission(args)
+                if resolved is not None and resolved.permission == ToolPermission.NEVER:
+                    return ToolDecision(
+                        verdict=ToolExecutionResponse.SKIP,
+                        approval_type=ToolPermission.NEVER,
+                        feedback=(
+                            resolved.reason
+                            or f"Tool '{tool_name}' is disabled by policy"
+                        ),
+                    )
+            return ToolDecision(
+                verdict=ToolExecutionResponse.EXECUTE,
+                approval_type=ToolPermission.ALWAYS,
+                result_note=result_note,
+                # The once permit was consumed above, before the call resumed;
+                # the admission carries its requirements so the execution
+                # gate can revalidate exactly this invocation without
+                # authorizing any other call.
+                admission=(
+                    ExecutionAdmission(once_requirements=tuple(requirements))
+                    if choice == "allow_once"
+                    else None
+                ),
+            )
+        finally:
+            if permit is not None:
+                # The permit was installed but never consumed: an exception or
+                # a cancellation left this function before the call resumed.
+                # Destroy it so no reusable authority outlives the approval,
+                # and invalidate the cached authority it fed.
+                store.destroy_once(permit)
+                self.tool_manager._invalidate_dangerous_command_authority()
 
     async def _persist_project_dangerous_command_grant(
         self, proposal: DangerousCommandProposal
@@ -4506,6 +4684,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             self._apply_active_model_pricing()
         self._reset_session_scoped_state()
         self._restore_todo_state(loaded_messages)
+        self._restore_file_state(loaded_messages)
         self.tool_manager._install_task_description(resumed_task_description)
         self._publish_system_prompt(resumed_prompt)
         cleanup_scratchpad(previous_scratchpad)
@@ -4516,6 +4695,19 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         except NoSuchToolError:
             return
         todo.state = TodoState.replay(messages)
+
+    def _restore_file_state(self, messages: Sequence[LLMMessage]) -> None:
+        """Restore the working-set file state from the resumed transcript.
+
+        Structural replay across compaction, mirroring ``_restore_todo_state``:
+        the last compaction boundary's envelope wins, merged into the live
+        store (the registry breaks ties between the live and replayed views).
+        Fail-safe: a corrupt envelope degrades to the live state.
+        """
+        try:
+            self.file_state_context.merge_replayed(FileStateStore.replay(messages))
+        except Exception as exc:
+            logger.warning("File state restore failed error=%s", type(exc).__name__)
 
     def _apply_active_model_pricing(self) -> None:
         try:
@@ -4567,6 +4759,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
         self.middleware_pipeline.reset()
         self.tool_manager.reset_all()
+        # A history clear starts a fresh context: the working set is
+        # session-scoped state and does not survive it (the dispatcher-level
+        # revision registry does — it is tree truth, not session state).
+        self.file_state_context.reset()
 
     @requires_init
     async def compact(self, extra_instructions: str = "") -> str:

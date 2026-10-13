@@ -526,11 +526,18 @@ async def test_match_limit_on_both_backends(
     result = await collect_result(tool.run(GrepArgs(pattern="hit", max_matches=limit)))
 
     expected_count = 1 if limit == 1 else 3 if limit == 3 else 2
-    assert result.matches.splitlines() == [
+    match_lines = [
         f"{tmp_path / 'test.py'}:{index}:hit {word}"
         for index, word in enumerate(("one", "two", "three")[:expected_count], 1)
     ]
+    lines = result.matches.splitlines()
+    # The default output leads with the match lines; any further lines are
+    # +/-2 context rendered as path-line-content, never extra matches.
+    assert lines[:expected_count] == match_lines
+    for extra in lines[expected_count:]:
+        assert extra.startswith(f"{tmp_path / 'test.py'}-")
     assert result.match_count == expected_count
+    assert len(result.parsed_matches) == expected_count
     assert result.was_truncated is (expected_count < 3)
 
 
@@ -1133,3 +1140,195 @@ class TestRipgrepBackend:
         )
         assert "included.py" in result_without_ignore.matches
         assert "ignored_by_rg/file.py" in result_without_ignore.matches
+
+
+class TestGrepDefaultContext:
+    """The default output shows +/-2 context lines around each match."""
+
+    @pytest.fixture
+    def context_grep(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        config = GrepToolConfig()
+        return Grep(config_getter=lambda: config, state=BaseToolState())
+
+    @pytest.mark.asyncio
+    async def test_context_lines_surround_matches_by_default(
+        self, context_grep, tmp_path
+    ):
+        (tmp_path / "f.py").write_text("a\nb\nmatch\nc\nd\ne\nf\n")
+        path = tmp_path / "f.py"
+
+        result = await collect_result(context_grep.run(GrepArgs(pattern="match")))
+
+        assert result.matches.splitlines() == [
+            f"{path}-1-a",
+            f"{path}-2-b",
+            f"{path}:3:match",
+            f"{path}-4-c",
+            f"{path}-5-d",
+        ]
+        assert result.match_count == 1
+        assert len(result.parsed_matches) == 1
+        assert result.parsed_matches[0].line == 3
+
+    @pytest.mark.asyncio
+    async def test_overlapping_context_regions_are_merged(self, context_grep, tmp_path):
+        (tmp_path / "f.py").write_text("m1\nx\nm2\nx\nm3\n")
+        path = tmp_path / "f.py"
+
+        result = await collect_result(context_grep.run(GrepArgs(pattern="m")))
+
+        # One merged region: every line once, no separator, no duplicates.
+        assert result.matches.splitlines() == [
+            f"{path}:1:m1",
+            f"{path}-2-x",
+            f"{path}:3:m2",
+            f"{path}-4-x",
+            f"{path}:5:m3",
+        ]
+        assert result.match_count == 3
+        assert len(result.parsed_matches) == 3
+
+    @pytest.mark.asyncio
+    async def test_disjoint_context_regions_are_separated(self, context_grep, tmp_path):
+        (tmp_path / "f.py").write_text("m\nx\nx\nx\nx\nx\nm\n")
+        path = tmp_path / "f.py"
+
+        result = await collect_result(context_grep.run(GrepArgs(pattern="m")))
+
+        assert result.matches.splitlines() == [
+            f"{path}:1:m",
+            f"{path}-2-x",
+            f"{path}-3-x",
+            "--",
+            f"{path}-5-x",
+            f"{path}-6-x",
+            f"{path}:7:m",
+        ]
+        assert result.match_count == 2
+
+    @pytest.mark.asyncio
+    async def test_counts_exclude_context_lines_that_look_like_matches(
+        self, context_grep, tmp_path
+    ):
+        # The context line contains ":12:" so the raw display text would
+        # misparse as a match under a naive parser; counts must not.
+        (tmp_path / "f.py").write_text("target\nsee x:12:y here\n")
+        path = tmp_path / "f.py"
+
+        result = await collect_result(context_grep.run(GrepArgs(pattern="target")))
+
+        assert result.match_count == 1
+        assert len(result.parsed_matches) == 1
+        assert result.parsed_matches[0].line == 1
+        assert result.parsed_matches[0].path == str(path.resolve())
+        assert f"{path}-2-see x:12:y here" in result.matches.splitlines()
+
+    @pytest.mark.asyncio
+    async def test_context_of_a_sensitive_file_does_not_leak(
+        self, context_grep, tmp_path
+    ):
+        (tmp_path / ".env").write_text("A=1\nSECRET_TOKEN=x\nB=2\n")
+        (tmp_path / "app.py").write_text("uses SECRET_TOKEN here\n")
+
+        result = await collect_result(
+            context_grep.run(GrepArgs(pattern="SECRET_TOKEN", path="."))
+        )
+
+        assert "app.py" in result.matches
+        assert "A=1" not in result.matches
+        assert "B=2" not in result.matches
+        assert "SECRET_TOKEN=x" not in result.matches
+
+    @pytest.mark.asyncio
+    async def test_max_matches_still_caps_matches_not_context(
+        self, context_grep, tmp_path
+    ):
+        (tmp_path / "f.py").write_text("\n".join(f"hit {i}" for i in range(20)))
+
+        result = await collect_result(
+            context_grep.run(GrepArgs(pattern="hit", max_matches=5))
+        )
+
+        assert result.match_count == 5
+        assert len(result.parsed_matches) == 5
+        assert result.was_truncated
+        # The display leads with the five match lines; context lines follow.
+        lines = result.matches.splitlines()
+        assert lines[0].endswith(":1:hit 0")
+        assert lines[4].endswith(":5:hit 4")
+
+    @pytest.mark.asyncio
+    async def test_output_byte_cap_still_truncates(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        config = GrepToolConfig(max_output_bytes=100)
+        grep_tool = Grep(config_getter=lambda: config, state=BaseToolState())
+        (tmp_path / "f.py").write_text("a\nmatch\nb\nc\nd\n")
+
+        result = await collect_result(grep_tool.run(GrepArgs(pattern="match")))
+
+        assert len(result.matches) <= 100
+        assert result.was_truncated
+        assert result.match_count == 1
+
+    @pytest.mark.asyncio
+    async def test_context_lines_zero_disables_context(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        config = GrepToolConfig(context_lines=0)
+        grep_tool = Grep(config_getter=lambda: config, state=BaseToolState())
+        (tmp_path / "f.py").write_text("a\nb\nmatch\nc\nd\n")
+        path = tmp_path / "f.py"
+
+        result = await collect_result(grep_tool.run(GrepArgs(pattern="match")))
+
+        assert result.matches.splitlines() == [f"{path}:3:match"]
+        assert result.match_count == 1
+
+    @pytest.mark.asyncio
+    async def test_context_groups_per_file(self, context_grep, tmp_path):
+        (tmp_path / "a.py").write_text("x\nmatch\ny\n")
+        (tmp_path / "b.py").write_text("p\nmatch\nq\n")
+
+        result = await collect_result(context_grep.run(GrepArgs(pattern="match")))
+
+        lines = result.matches.splitlines()
+        assert len(lines) == 7  # 3 lines per file plus one separator
+        assert lines.count("--") == 1
+        assert result.match_count == 2
+        a_lines = [line for line in lines if str(tmp_path / "a.py") in line]
+        b_lines = [line for line in lines if str(tmp_path / "b.py") in line]
+        assert a_lines == [
+            f"{tmp_path / 'a.py'}-1-x",
+            f"{tmp_path / 'a.py'}:2:match",
+            f"{tmp_path / 'a.py'}-3-y",
+        ]
+        assert b_lines == [
+            f"{tmp_path / 'b.py'}-1-p",
+            f"{tmp_path / 'b.py'}:2:match",
+            f"{tmp_path / 'b.py'}-3-q",
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("fixture_name", "executable"), [("grep", "rg"), ("grep_gnu_only", "grep")]
+    )
+    async def test_context_on_both_backends(
+        self, request, fixture_name, executable, tmp_path
+    ):
+        if not shutil.which(executable):
+            pytest.skip(f"{executable} not available")
+        tool = request.getfixturevalue(fixture_name)
+        (tmp_path / "f.py").write_text("a\nb\nmatch\nc\nd\n")
+        path = tmp_path / "f.py"
+
+        result = await collect_result(tool.run(GrepArgs(pattern="match")))
+
+        assert result.matches.splitlines() == [
+            f"{path}-1-a",
+            f"{path}-2-b",
+            f"{path}:3:match",
+            f"{path}-4-c",
+            f"{path}-5-d",
+        ]
+        assert result.match_count == 1
+        assert len(result.parsed_matches) == 1

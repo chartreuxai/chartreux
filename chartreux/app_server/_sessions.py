@@ -1956,6 +1956,13 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             child = await self._runtime_factory.create_child(
                 parent.agent_loop, candidate
             )
+            # Spawn handoff, inside the creation fence: the child's first
+            # message lists the working-set files the dispatcher hands it
+            # (paths + last-seen revisions + current outlines), ahead of the
+            # task brief. None when the parent has no working set.
+            handoff = child.file_state_handoff_message()
+            if handoff is not None:
+                child.messages.append(handoff)
         try:
             self._validate_background_admission(parent, generation_identity)
         except BaseException:

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from chartreux.core.checkpoints import FileSnapshot
 from chartreux.core.events import ToolResultEvent, ToolStreamEvent
+from chartreux.core.file_revision import FileRevision, full_revision
 from chartreux.core.scratchpad import is_scratchpad_display_path
 from chartreux.core.tools.base import (
     BaseTool,
@@ -48,6 +49,13 @@ class WriteFileResult(BaseModel):
     file_path: str
     bytes_written: int
     content: str
+    # Post-write evidence, serialized to the model like EditResult.revision:
+    # the full content revision of the written file (the content is the
+    # complete written file), or None for a client-mediated write — the tool
+    # I/O port performed it, so the host cannot attest the file's bytes (the
+    # same degradation as a client-mediated edit; reads and edits degrade to
+    # revision=None in exactly this case, so writes must too).
+    revision: FileRevision | None = None
 
 
 class WriteFileConfig(BaseToolConfig):
@@ -126,12 +134,23 @@ class WriteFile(
     ) -> AsyncGenerator[ToolStreamEvent | WriteFileResult, None]:
         file_path, content_bytes = self._prepare_and_validate_path(args)
 
-        await self._write_file(
-            args, file_path, ctx.tool_io if ctx is not None else None
-        )
+        tool_io = ctx.tool_io if ctx is not None else None
+        await self._write_file(args, file_path, tool_io)
 
+        # A client-mediated write went through the tool I/O port: the host
+        # cannot attest the file's bytes, so no revision is published (the
+        # same degradation as a client-mediated edit). A host write knows the
+        # exact bytes it wrote.
+        revision = (
+            None
+            if tool_io is not None and tool_io.supports_write
+            else full_revision(args.content.encode("utf-8"))
+        )
         yield WriteFileResult(
-            file_path=str(file_path), bytes_written=content_bytes, content=args.content
+            file_path=str(file_path),
+            bytes_written=content_bytes,
+            content=args.content,
+            revision=revision,
         )
 
     def _prepare_and_validate_path(self, args: WriteFileArgs) -> tuple[Path, int]:

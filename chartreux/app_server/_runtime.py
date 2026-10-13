@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import ValidationError
 
 from chartreux import __version__
+from chartreux.app_server._file_revision_registry import FileRevisionRegistry
 from chartreux.app_server._host import HostRequestHandler
 from chartreux.app_server._projection import (
     project_config_view,
@@ -52,6 +53,7 @@ from chartreux.core._usage_startup import (
     create_startup_accounting_context,
 )
 from chartreux.core.agent_loop import AgentLoop, AgentRuntimePolicy
+from chartreux.core.agent_loop._file_state_context import RevisionRegistryPort
 from chartreux.core.agent_loop._loop import RootAccountingOwner
 from chartreux.core.agents.launch import FrozenPersona, LaunchCandidate, resolve_launch
 from chartreux.core.agents.manager import AgentManager
@@ -71,6 +73,7 @@ from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.config.types import ConfigSaveResult
 from chartreux.core.dispatch.session import BoundDispatchPolicy, resume_policy
+from chartreux.core.file_state import FileStateStore
 from chartreux.core.hooks.config import load_hooks_from_fs
 from chartreux.core.hooks.models import HookConfigResult
 from chartreux.core.llm_models import LLMMessage, Role
@@ -255,6 +258,13 @@ class _AgentLoopBlueprint:
     accounting_owner: RootAccountingOwner | None = None
     background_jobs: BackgroundJobsPort | None = None
     process: HarnessProcess | None = None
+    # The dispatcher-level revision registry: shared across the session tree
+    # (children and forks inherit the source loop's instance; a root gets a
+    # fresh one), so every worker sees other workers' revision bumps.
+    file_revision_registry: RevisionRegistryPort | None = None
+    # The parent's working-set file state, deep-copied into a child at spawn
+    # (the spawn handoff); None for roots and resumes-from-nothing.
+    parent_file_state: FileStateStore | None = None
 
     def build(self) -> AgentLoop:
         agent_loop = AgentLoop(
@@ -294,6 +304,8 @@ class _AgentLoopBlueprint:
             session_lease=self.session_lease,
             accounting_owner=self.accounting_owner,
             background_jobs=self.background_jobs,
+            file_revision_registry=self.file_revision_registry,
+            parent_file_state=self.parent_file_state,
         )
         if self.process is not None:
             self.process._track_accounting_loop(agent_loop)
@@ -379,6 +391,9 @@ class _RootRuntimeBlueprint:
             accounting_owner=accounting_owner,
             process=self.process,
             mcp_registry=self.mcp_registry,
+            # A root session owns the tree's revision registry; every child
+            # created from it shares this one instance.
+            file_revision_registry=FileRevisionRegistry(),
         ).build()
 
 
@@ -652,6 +667,11 @@ class AgentRuntimeFactory:
         # message needs to be present here.
         try:
             replacement.messages.reset_preserving_system(loaded_messages)
+            # Structural replay across compaction: restore the working-set
+            # file state from the resumed transcript's last envelope.
+            replacement.file_state_context.merge_replayed(
+                FileStateStore.replay(loaded_messages)
+            )
             _apply_stored_stats(replacement, metadata)
             _mark_legacy_root_cost_incomplete(replacement.stats, session_metadata)
         except BaseException:
@@ -718,6 +738,11 @@ class AgentRuntimeFactory:
                 policy=policy,
                 launch_candidate=candidate,
                 accounting_owner=parent.accounting_owner,
+                # Spawn handoff: the child starts from a deep copy of the
+                # parent's working set (path -> last-seen revision + outline),
+                # so it never mutates the parent's store and no state leaks
+                # back or across siblings.
+                parent_file_state=parent.file_state.model_copy(deep=True),
             )
             metadata = child.session_logger.session_metadata
             if metadata is not None:
@@ -794,6 +819,12 @@ class AgentRuntimeFactory:
         # when _complete_init finishes, same pattern as resume_blueprint.
         try:
             child.messages.reset_preserving_system(loaded_messages)
+            # Structural replay across compaction: the child's own transcript
+            # envelope (its last compaction boundary) merges into the store it
+            # was seeded with from the parent at spawn.
+            child.file_state_context.merge_replayed(
+                FileStateStore.replay(loaded_messages)
+            )
             child.session_logger.apply_resumed_session(
                 session_id, session_dir, metadata
             )
@@ -850,6 +881,10 @@ class AgentRuntimeFactory:
                 session_id=session_id,
                 session_lease=lease,
                 accounting_owner=owner,
+                # A fork continues the source's work: it starts from a deep
+                # copy of the source's working set (its copied transcript
+                # carries the history; no handoff block is appended).
+                parent_file_state=source.file_state.model_copy(deep=True),
             )
             await forked.wait_until_ready()
             forked.messages.extend(_messages_for_fork(source, message_id))
@@ -864,7 +899,7 @@ class AgentRuntimeFactory:
             raise
         return forked
 
-    def _create_like(
+    def _create_like(  # noqa: PLR0913 - the blueprint fans the source's launch state out
         self,
         source: AgentLoop,
         *,
@@ -877,6 +912,8 @@ class AgentRuntimeFactory:
         policy: AgentRuntimePolicy | None = None,
         launch_candidate: LaunchCandidate | None = None,
         accounting_owner: RootAccountingOwner | None = None,
+        file_revision_registry: RevisionRegistryPort | None = None,
+        parent_file_state: FileStateStore | None = None,
     ) -> AgentLoop:
         if policy is None:
             policy = (
@@ -925,6 +962,14 @@ class AgentRuntimeFactory:
                 if source.mcp_registry is not None
                 else None
             ),
+            # One registry instance per session tree: children and forks share
+            # the source loop's registry unless a caller passes another one.
+            file_revision_registry=(
+                file_revision_registry
+                if file_revision_registry is not None
+                else source.file_revision_registry
+            ),
+            parent_file_state=parent_file_state,
         ).build()
         return replacement
 

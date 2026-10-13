@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
 import time
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from chartreux.core.agent_loop._file_state_context import (
+    render_file_state_compaction_summary,
+)
 from chartreux.core.agent_loop.errors import EmptyLLMResponseError
 from chartreux.core.compaction.context import (
     collect_prior_user_messages,
@@ -13,6 +16,7 @@ from chartreux.core.compaction.context import (
     select_model_context,
 )
 from chartreux.core.errors import ContextTooLongError
+from chartreux.core.file_state import FileStateStore
 from chartreux.core.llm.thinking_levels import get_thinking_levels
 from chartreux.core.llm_models import LLMMessage, PersistedToolResult, Role
 from chartreux.core.prompts import UtilityPrompt
@@ -74,6 +78,7 @@ class CompactionManager:
         available_tools: Callable[[], list[AvailableTool]],
         tool_choice: Callable[[], StrToolChoice | AvailableTool],
         save: Callable[[], Awaitable[None]],
+        file_state_getter: Callable[[], FileStateStore] | None = None,
     ) -> None:
         self._messages = messages
         self._stats = stats_getter
@@ -82,6 +87,7 @@ class CompactionManager:
         self._available_tools = available_tools
         self._tool_choice = tool_choice
         self._save = save
+        self._file_state_getter = file_state_getter
 
     async def compact(self, extra_instructions: str = "") -> str:
         summary_prefix = UtilityPrompt.COMPACT_SUMMARY_PREFIX.read()
@@ -90,13 +96,34 @@ class CompactionManager:
 
         summary = await self._summarize(snapshot, extra_instructions)
         todo_state = TodoState.replay(self._messages).model_dump(mode="json")
+        output: dict[str, Any] = {"todo_state": todo_state}
+        file_state_section: str | None = None
+        if self._file_state_getter is not None:
+            # The working-set file state rides the envelope exactly like the
+            # todo state (metadata only: path -> last-seen revision + outline).
+            # Trimming happens only here — a compaction boundary is the one
+            # place a working-set eviction is cache-safe, because the boundary
+            # rewrites the model-facing prefix anyway.
+            file_store = self._file_state_getter()
+            file_store.trim_to_cap()
+            output.update(file_store.to_envelope())
+            # The envelope is structural only (replayed on resume): the
+            # backend drops tool_result from the converted LLM request, so
+            # the model would otherwise lose all pre-compaction file knowledge
+            # (unchanged files generate no new state block). The bounded
+            # working-set summary — paths, last-seen revisions, current
+            # outlines — is therefore rendered into the boundary CONTENT once,
+            # at this boundary.
+            file_state_section = render_file_state_compaction_summary(file_store)
 
         envelope = LLMMessage(
             role=Role.user,
-            content=render_compaction_context(prior_user_messages, summary),
+            content=render_compaction_context(
+                prior_user_messages, summary, file_state_section
+            ),
             injected=True,
             context_boundary="compaction",
-            tool_result=PersistedToolResult(output={"todo_state": todo_state}),
+            tool_result=PersistedToolResult(output=output),
         )
         self._messages.append(envelope)
         # Context size is unknown without an API call; the next LLM turn

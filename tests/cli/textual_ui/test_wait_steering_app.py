@@ -489,9 +489,17 @@ async def test_wait_completion_consumes_queue_item_while_edit_preserves_copy_onc
     await asyncio.wait_for(
         root.children.wait_for_agent(launch.agent_id, launch.run_id), 5
     )
+    # The consumed-edit notice keys off the UI-side queue drain: the client
+    # projection runs ahead of the UI event listener (which drops the
+    # promoted item's widget on TurnStarted), so wait for the drain rather
+    # than asserting point-in-time.
     assert await _wait_until(
         pilot,
-        lambda: not app.app_server.turn_queue.items and not app.app_server.turn_active,
+        lambda: (
+            not app.app_server.turn_queue.items
+            and not app.app_server.turn_active
+            and len(app._queue) == 0
+        ),
     )
     assert (
         len([m for m in parent.messages if m.content == "older queued instructions"])

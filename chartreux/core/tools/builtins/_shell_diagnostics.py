@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 import unicodedata
 
 from chartreux.core.tools.secret_redaction import (
@@ -11,6 +12,23 @@ from chartreux.core.tools.secret_redaction import (
     redact,
     redact_shell_source as _redact_shell_source,
 )
+
+
+class DenialClass(StrEnum):
+    """Why a shell command was denied.
+
+    SYNTAX denials report an unmodeled v0.1 shell construct — the model's
+    standard vocabulary — so their message names the compliant alternative.
+    POLICY denials report a deliberate security decision: the message states
+    the blocked requirement plainly and suggests nothing, because suggesting
+    an alternative invites the refused action through another tool. POLICY is
+    the fail-closed default: mixed, unknown, and uncategorized denials are
+    policy denials.
+    """
+
+    SYNTAX = "syntax"
+    POLICY = "policy"
+
 
 MAX_DIAGNOSTIC_LENGTH = 1024
 _PREVIEW_LENGTH = 240
@@ -39,6 +57,35 @@ class Diagnostic:
     command_part: str | None = None
     detail: str | None = None
     related: tuple[Diagnostic, ...] = ()
+    # Decided where the denial is created, never inferred from rendered
+    # text. The default is the fail-closed class: a denial created without an
+    # explicit class is a policy denial and names no alternative.
+    denial_class: DenialClass = DenialClass.POLICY
+    # The compliant alternative a SYNTAX denial names. Attached where the
+    # denial is created; only SYNTAX denials carry one.
+    alternative: str | None = None
+
+
+def aggregate_denial_class(related: tuple[Diagnostic, ...]) -> DenialClass:
+    """The fail-closed class of an aggregate denial.
+
+    An aggregate is a syntax denial only when every related diagnostic is
+    one. A mixed construct — unmodeled syntax plus a policy violation — and
+    any unknown or unclassified component classify as a policy denial, which
+    names no alternative.
+    """
+    if related and all(item.denial_class is DenialClass.SYNTAX for item in related):
+        return DenialClass.SYNTAX
+    return DenialClass.POLICY
+
+
+def _alternatives(diagnostic: Diagnostic) -> tuple[str, ...]:
+    """The alternatives carried by a denial and its related diagnostics."""
+    found: list[str] = []
+    for item in (diagnostic, *diagnostic.related):
+        if item.alternative and item.alternative not in found:
+            found.append(item.alternative)
+    return tuple(found)
 
 
 def _preview(value: str, limit: int = _PREVIEW_LENGTH) -> str:
@@ -74,7 +121,7 @@ def _command_preview(value: str, limit: int = _PREVIEW_LENGTH) -> str:
     return _preview(REDACTED_PLACEHOLDER if sanitized is None else sanitized, limit)
 
 
-def render_diagnostic(diagnostic: Diagnostic) -> str:
+def render_diagnostic(diagnostic: Diagnostic) -> str:  # noqa: PLR0912
     """The single redaction, escaping and bounding boundary for shell denials."""
     field_preview = _command_preview if known_secret_values() else _preview
     token = field_preview(diagnostic.offending_token or "")
@@ -87,10 +134,11 @@ def render_diagnostic(diagnostic: Diagnostic) -> str:
     detail = field_preview(original_detail, 640)
     match diagnostic.code:
         case "recursive_rm":
+            # A policy hard guard: the blocked requirement is stated plainly
+            # and no alternative deletion method is suggested.
             message = (
                 f"Command denied: recursive rm option '{token}' in '{part}'. "
-                "This is a hard guard regardless of target. "
-                "Use non-recursive rm -- 'file', then rmdir -- 'dir'."
+                "This is a hard guard regardless of target."
             )
         case "path_glob":
             message = (
@@ -111,11 +159,28 @@ def render_diagnostic(diagnostic: Diagnostic) -> str:
         case "policy":
             message = f"Command denied: {detail}: '{part}'"
         case "analysis":
-            message = f"Command denied: unsupported shell syntax: {detail}"
+            if diagnostic.denial_class is DenialClass.SYNTAX:
+                message = f"Command denied: unsupported shell syntax: {detail}"
+            else:
+                # A policy denial is not unsupported syntax: state the blocked
+                # requirement plainly and suggest nothing.
+                message = f"Command denied: {detail}"
         case "nested_analysis":
-            message = f"Command denied: nested shell syntax cannot be safely inspected: {detail}"
+            if diagnostic.denial_class is DenialClass.SYNTAX:
+                message = (
+                    "Command denied: nested shell syntax cannot be safely "
+                    f"inspected: {detail}"
+                )
+            else:
+                message = f"Command denied: {detail}"
         case "command":
             message = f"Command denied: {detail}"
         case _:
             message = _STATIC_MESSAGES.get(diagnostic.code, detail)
+    if diagnostic.denial_class is DenialClass.SYNTAX:
+        # Only a syntax denial names the compliant alternative; the renderer
+        # never invents one for a policy denial.
+        alternatives = _alternatives(diagnostic)
+        if alternatives:
+            message = f"{message} Instead, {'; '.join(alternatives)}."
     return message[:MAX_DIAGNOSTIC_LENGTH]

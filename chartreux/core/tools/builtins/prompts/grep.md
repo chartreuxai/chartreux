@@ -1,1 +1,1 @@
-Search file contents with a regex. Returns matching file paths, line numbers, and lines. Use `path` to narrow the search scope.
+Search file contents with a regex. Returns matching file paths, line numbers, and lines, each with 2 lines of surrounding context by default: matches use `path:line:content`, context lines use `path-line-content`, and disjoint regions are separated by `--`. `match_count` counts matches only, never context lines. Use `path` to narrow the search scope.

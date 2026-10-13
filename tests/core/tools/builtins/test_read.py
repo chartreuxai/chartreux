@@ -109,11 +109,41 @@ async def test_offset_beyond_file_returns_warning(
 
 
 @pytest.mark.asyncio
-async def test_exceeds_max_bytes_raises(
+async def test_oversize_read_opens_traversal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    # Create file that generates output exceeding MAX_BYTES
+    # Create a file whose rendered output exceeds MAX_BYTES.
+    big_line = "x" * 200 + "\n"
+    lines_needed = (MAX_BYTES // len(big_line)) + 100
+    (tmp_path / "big.txt").write_text(big_line * lines_needed, encoding="utf-8")
+    tool = _make_read()
+
+    result = await collect_result(
+        tool.run(ReadFileArgs(file_path=str(tmp_path / "big.txt")))
+    )
+
+    # The oversize read is served as the first chunk of a traversal, not an
+    # error: range, next offset, traversal id, and content revision.
+    assert result.next_offset is not None
+    assert result.traversal_id is not None
+    assert result.revision is not None
+    assert result.total_lines == lines_needed
+    assert result.start_line == 1
+    assert result.end_line == result.start_line + result.num_lines - 1
+    assert result.was_truncated is True
+    assert len(result.content.encode("utf-8")) <= MAX_BYTES
+    assert f"offset={result.next_offset}" in result.content
+    assert result.traversal_id in result.content
+
+
+@pytest.mark.asyncio
+async def test_bounded_oversize_read_still_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    # An explicitly bounded request is honored as given: it is not an oversize
+    # event and must not be converted into a continuation traversal.
     big_line = "x" * 200 + "\n"
     lines_needed = (MAX_BYTES // len(big_line)) + 100
     (tmp_path / "big.txt").write_text(big_line * lines_needed, encoding="utf-8")
@@ -121,7 +151,9 @@ async def test_exceeds_max_bytes_raises(
 
     with pytest.raises(ToolError, match="exceeds maximum allowed size"):
         await collect_result(
-            tool.run(ReadFileArgs(file_path=str(tmp_path / "big.txt")))
+            tool.run(
+                ReadFileArgs(file_path=str(tmp_path / "big.txt"), offset=1, limit=2000)
+            )
         )
 
 
@@ -144,17 +176,27 @@ async def test_truncated_when_more_lines_than_limit(
 
 
 @pytest.mark.asyncio
-async def test_single_oversized_line_raises(
+async def test_single_oversized_line_slices_with_continuation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    # A single line longer than the chunk budget is served as an explicit
+    # slice with a continuation marker, not an error.
     (tmp_path / "wide.txt").write_text("x" * (MAX_BYTES + 10), encoding="utf-8")
     tool = _make_read()
 
-    with pytest.raises(ToolError, match="exceeds maximum allowed size"):
-        await collect_result(
-            tool.run(ReadFileArgs(file_path=str(tmp_path / "wide.txt")))
-        )
+    result = await collect_result(
+        tool.run(ReadFileArgs(file_path=str(tmp_path / "wide.txt")))
+    )
+
+    assert result.num_lines == 1
+    assert result.start_line == 1
+    assert result.end_line == 1
+    assert result.line_continues is True
+    assert result.next_offset == 1
+    assert result.traversal_id is not None
+    assert "bytes in this line" in result.content
+    assert len(result.content.encode("utf-8")) <= MAX_BYTES
 
 
 @pytest.mark.asyncio

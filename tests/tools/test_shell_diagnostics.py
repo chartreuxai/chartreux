@@ -2,32 +2,52 @@ from __future__ import annotations
 
 from pathlib import Path
 import shlex
+import subprocess
 
 import pytest
 
 from chartreux.core.tools.base import BaseToolState, ToolPermission
 from chartreux.core.tools.builtins._shell_diagnostics import (
     MAX_DIAGNOSTIC_LENGTH,
+    DenialClass,
     Diagnostic,
+    aggregate_denial_class,
     render_diagnostic,
 )
 from chartreux.core.tools.builtins.bash import Bash, BashArgs, BashToolConfig
 from chartreux.core.tools.secret_redaction import ScrubPolicy, bind_policy
 
+# Phrasing the renderer adds only for SYNTAX denials; a POLICY denial must
+# never carry it.
+_ALTERNATIVE_MARKERS = (
+    "Instead,",
+    "Instead ",
+    "use read_file",
+    "use grep",
+    "use the edit tool",
+    "use write_file",
+    "use bash_start",
+    "use non-recursive",
+    "rmdir",
+    "try ",
+)
+
 
 @pytest.mark.parametrize("token", ["-r", "-rf", "-R", "--recursive", "--rec"])
 @pytest.mark.parametrize("prefix", ["", "uv run ", "env CI=1 uv run "])
-def test_recursive_rm_original_option_and_alternative(
+def test_recursive_rm_original_option_is_a_hard_guard_without_alternative(
     tmp_path: Path, token: str, prefix: str
 ) -> None:
+    # Recursive rm is a policy hard guard: the message states the blocked
+    # requirement plainly and suggests no alternative deletion method.
     tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=tmp_path)
     result = tool.resolve_permission(BashArgs(command=f"{prefix}rm {token} file"))
     assert result is not None and result.permission == ToolPermission.NEVER
     assert result.reason == (
         f"Command denied: recursive rm option '{token}' in 'rm {token} file'. "
-        "This is a hard guard regardless of target. "
-        "Use non-recursive rm -- 'file', then rmdir -- 'dir'."
+        "This is a hard guard regardless of target."
     )
+    assert not any(marker in (result.reason or "") for marker in _ALTERNATIVE_MARKERS)
 
 
 @pytest.mark.parametrize(
@@ -296,3 +316,376 @@ def test_unlocatable_repository_is_a_hard_guard(tmp_path: Path) -> None:
     assert result.denial_kind is None
     assert result.dangerous_command_proposal is None
     assert "cannot be located" in (result.reason or "")
+
+
+def test_denial_class_defaults_to_policy_fail_closed() -> None:
+    # A diagnostic created without an explicit class is a policy denial:
+    # unknown and uncategorized denials name no alternative.
+    unclassified = Diagnostic("denylist", "vim", "vim file")
+    assert unclassified.denial_class is DenialClass.POLICY
+    assert unclassified.alternative is None
+    analysis_default = Diagnostic("analysis", detail="anything")
+    assert analysis_default.denial_class is DenialClass.POLICY
+    assert analysis_default.alternative is None
+
+
+@pytest.mark.parametrize(
+    ("code", "detail", "alternative"),
+    [
+        (
+            "analysis",
+            "command substitution",
+            "use read_file with offset and limit to read files; "
+            "use grep to locate content and line numbers; "
+            "use the edit tool to modify files",
+        ),
+        (
+            "nested_analysis",
+            "command substitution",
+            "use read_file with offset and limit to read files; "
+            "use grep to locate content and line numbers; "
+            "use the edit tool to modify files",
+        ),
+        (
+            "command",
+            "malformed shell quoting",
+            "write the command with well-formed shell quoting",
+        ),
+    ],
+)
+def test_syntax_denials_name_the_compliant_alternative(
+    code: str, detail: str, alternative: str
+) -> None:
+    diagnostic = Diagnostic(
+        code, detail=detail, denial_class=DenialClass.SYNTAX, alternative=alternative
+    )
+    rendered = render_diagnostic(diagnostic)
+    assert diagnostic.denial_class is DenialClass.SYNTAX
+    assert rendered.endswith(f"Instead, {alternative}.")
+    assert detail in rendered
+
+
+def test_syntax_aggregate_joins_related_alternatives() -> None:
+    first = Diagnostic(
+        "analysis",
+        detail="command substitution",
+        denial_class=DenialClass.SYNTAX,
+        alternative="use read_file with offset and limit to read files",
+    )
+    second = Diagnostic(
+        "analysis",
+        detail="heredocs are unsupported in v0.1",
+        denial_class=DenialClass.SYNTAX,
+        alternative="use write_file to create the content",
+    )
+    aggregate = Diagnostic(
+        "analysis",
+        related=(first, second),
+        denial_class=aggregate_denial_class((first, second)),
+    )
+    rendered = render_diagnostic(aggregate)
+    assert aggregate.denial_class is DenialClass.SYNTAX
+    assert "command substitution" in rendered
+    assert "heredocs are unsupported in v0.1" in rendered
+    assert (
+        "Instead, use read_file with offset and limit to read files; "
+        "use write_file to create the content." in rendered
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "requirement"),
+    [
+        ("analysis", "the blocked requirement"),
+        ("nested_analysis", "the blocked requirement"),
+        ("command", "the blocked requirement"),
+        ("policy", "the blocked requirement"),
+        ("dangerous_guard", "the blocked requirement"),
+        ("text", "the blocked requirement"),
+        ("denylist", "matches denylist pattern"),
+        ("standalone", "is not allowed as a standalone command"),
+        ("dangerous_command", "requires approval for a dangerous git operation"),
+        ("recursive_rm", "This is a hard guard regardless of target."),
+        ("path_glob", "cannot be safely inspected"),
+        ("eval_exec", "eval and exec cannot be safely inspected"),
+        ("protected_env", "unsetting a protected shell environment variable"),
+        ("sensitive_command", "sensitive command rule"),
+        ("git_cwd_unknown", "not statically known"),
+        ("tool_denied", "Tool denied: bash"),
+        ("cwd_outside", "outside the authorized workspace"),
+        ("operand_cwd_unknown", "not statically known"),
+        ("path_outside", "outside the authorized workspace"),
+        ("metadata_unlocated", "protected Git metadata cannot be located"),
+        ("metadata_redirect", "redirection to protected Git metadata"),
+        ("metadata_operand", "file operand reaches protected Git metadata"),
+        ("metadata_hardlink", "hard link to protected Git metadata"),
+        ("metadata_worktree", "work tree resolves inside protected Git metadata"),
+        ("byte_budget", "shell analysis budget exceeded"),
+    ],
+)
+def test_policy_denials_state_the_requirement_without_alternative(
+    code: str, requirement: str
+) -> None:
+    # A policy denial states the blocked requirement plainly and suggests
+    # nothing: no alternative phrasing of any kind.
+    rendered = render_diagnostic(
+        Diagnostic(code, detail="the blocked requirement", command_part="part")
+    )
+    assert requirement in rendered
+    assert not any(marker in rendered for marker in _ALTERNATIVE_MARKERS)
+
+
+def test_aggregate_denial_class_is_fail_closed() -> None:
+    syntax = Diagnostic(
+        "analysis",
+        detail="command substitution",
+        denial_class=DenialClass.SYNTAX,
+        alternative="use read_file with offset and limit to read files",
+    )
+    policy = Diagnostic("analysis", detail="dangerous environment assignment (PATH)")
+    unknown = Diagnostic("analysis", detail="unsupported syntax (mystery_node)")
+    assert aggregate_denial_class((syntax,)) is DenialClass.SYNTAX
+    # A mixed construct — unmodeled syntax plus a policy violation — and any
+    # unknown or unclassified component classify as POLICY.
+    assert aggregate_denial_class((syntax, policy)) is DenialClass.POLICY
+    assert aggregate_denial_class((policy, syntax)) is DenialClass.POLICY
+    assert aggregate_denial_class((syntax, unknown)) is DenialClass.POLICY
+    assert aggregate_denial_class((unknown,)) is DenialClass.POLICY
+    assert aggregate_denial_class(()) is DenialClass.POLICY
+
+
+def test_syntax_alternative_survives_redaction_and_bounds() -> None:
+    # The enrichment must not weaken the redaction, escaping and bounding
+    # boundary: a secret in the detail is still redacted and the enriched
+    # message stays within the diagnostic budget.
+    secret = "synthetic-enriched-secret-0123456789"
+    policy = ScrubPolicy(redaction_credentials=(("TEST_TOKEN", secret),))
+    with bind_policy(policy):
+        rendered = render_diagnostic(
+            Diagnostic(
+                "analysis",
+                detail="command substitution in " + secret,
+                denial_class=DenialClass.SYNTAX,
+                alternative=(
+                    "use read_file with offset and limit to read files; "
+                    "use grep to locate content and line numbers; "
+                    "use the edit tool to modify files"
+                ),
+            )
+        )
+    assert secret not in rendered
+    assert "REDACTED" in rendered
+    assert "Instead," in rendered
+    assert "use read_file with offset and limit" in rendered
+    assert len(rendered) <= MAX_DIAGNOSTIC_LENGTH
+
+
+@pytest.mark.parametrize(
+    ("command", "requirement", "alternative"),
+    [
+        (
+            "cat $(locate chartreux)",
+            "command substitution",
+            "use read_file with offset and limit to read files; "
+            "use grep to locate content and line numbers; "
+            "use the edit tool to modify files",
+        ),
+        (
+            "python3 << 'EOF'\nprint(42)\nEOF",
+            "heredocs are unsupported in v0.1",
+            "use write_file to create the content, or use read_file with "
+            "offset and limit, grep, and the edit tool for existing files",
+        ),
+        (
+            "for i in 1 2; do echo $i; done",
+            "for loop",
+            "split the work into separate simple commands, or use read_file "
+            "with offset and limit, grep, and the edit tool for file work",
+        ),
+        (
+            "echo =ls",
+            "Zsh equals expansion",
+            "drop the leading equals sign and invoke the command by its "
+            "name or absolute path",
+        ),
+        (
+            "echo $HOME",
+            "variable expansion",
+            "write the literal value directly as the argument",
+        ),
+        (
+            "bash -c 'echo $(x)'",
+            "command substitution",
+            "use read_file with offset and limit to read files",
+        ),
+    ],
+)
+def test_syntax_denials_name_alternative_end_to_end(
+    tmp_path: Path, command: str, requirement: str, alternative: str
+) -> None:
+    tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=tmp_path)
+    result = tool.resolve_permission(BashArgs(command=command))
+    assert result is not None and result.permission == ToolPermission.NEVER
+    reason = result.reason or ""
+    assert requirement in reason
+    assert "Instead," in reason
+    assert alternative in reason
+    assert len(reason) <= MAX_DIAGNOSTIC_LENGTH
+
+
+@pytest.mark.parametrize(
+    ("command", "requirements"),
+    [
+        ("rm -r build", ("This is a hard guard regardless of target.",)),
+        ("python3", ("is not allowed as a standalone command",)),
+        ("vim file.txt", ("matches denylist pattern 'vim'",)),
+        ("eval 'echo hi'", ("eval and exec cannot be safely inspected",)),
+        (
+            "PYTHONPATH=/abs python x",
+            ("dangerous environment assignment", "PYTHONPATH"),
+        ),
+        ("LD_PRELOAD=x ls", ("dangerous environment assignment", "PRELOAD")),
+        ("foo=bar ls", ("an environment assignment with a non-uppercase name",)),
+        (
+            "unset PATH",
+            ("unsetting shell environment variables cannot be safely inspected",),
+        ),
+        (
+            "hash -p /usr/bin/curl harmless",
+            ("unsupported command lookup modification", "hash"),
+        ),
+        ("echo hi > .git/config", ("redirection to protected Git metadata",)),
+        ("cd / && pwd", ("outside the authorized workspace",)),
+        ("find . -exec id \\;", ("find execution predicates are not permitted",)),
+    ],
+)
+def test_policy_denials_suggest_nothing_end_to_end(
+    tmp_path: Path, command: str, requirements: tuple[str, ...]
+) -> None:
+    tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=tmp_path)
+    result = tool.resolve_permission(BashArgs(command=command))
+    assert result is not None and result.permission == ToolPermission.NEVER
+    reason = result.reason or ""
+    # The rendered detail escapes markup characters, so the requirement is
+    # asserted on escape-free fragments.
+    for requirement in requirements:
+        assert requirement in reason
+    assert not any(marker in reason for marker in _ALTERNATIVE_MARKERS)
+    assert len(reason) <= MAX_DIAGNOSTIC_LENGTH
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Unmodeled syntax plus a policy violation in one command.
+        "PYTHONPATH=/abs cat $(ls)",
+        # A non-literal redirect target expands a variable.
+        "echo hi > $TMP/x",
+        # A herestring leaves an unrecognized node in the command.
+        "cat <<<x",
+    ],
+)
+def test_mixed_constructs_classify_as_policy_end_to_end(
+    tmp_path: Path, command: str
+) -> None:
+    # Fail closed: a mixed construct is a policy denial and names no
+    # alternative, even though part of it is unmodeled syntax.
+    tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=tmp_path)
+    result = tool.resolve_permission(BashArgs(command=command))
+    assert result is not None and result.permission == ToolPermission.NEVER
+    reason = result.reason or ""
+    assert not any(marker in reason for marker in _ALTERNATIVE_MARKERS)
+    assert len(reason) <= MAX_DIAGNOSTIC_LENGTH
+
+
+def test_mixed_syntax_and_dangerous_authority_renders_as_policy(tmp_path: Path) -> None:
+    # AM-F: the whole-call denial class is decided before rendering. A call
+    # that also lacks a dangerous-command authority carries a policy-class
+    # reason, so the aggregate is a policy denial: it names the blocked
+    # requirements and suggests no alternative — suggesting one invites the
+    # refused action through another tool.
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=tmp_path)
+    result = tool.resolve_permission(
+        BashArgs(command="git checkout main; echo $(cat AGENTS.md)")
+    )
+    assert result is not None and result.permission is ToolPermission.NEVER
+    reason = result.reason or ""
+    assert "command substitution" in reason
+    assert "git.checkout" in reason
+    assert not any(marker in reason for marker in _ALTERNATIVE_MARKERS)
+    assert len(reason) <= MAX_DIAGNOSTIC_LENGTH
+    # The authorization outcome is unchanged: still a plain denial with no
+    # grantable proposal (the dangerous flow reports only the sole missing
+    # authority).
+    assert result.denial_kind is None
+    assert result.dangerous_command_proposal is None
+
+    # A pure-syntax denial keeps its compliant alternative.
+    result = tool.resolve_permission(BashArgs(command="echo $(cat AGENTS.md)"))
+    assert result is not None and result.permission is ToolPermission.NEVER
+    assert "Instead," in (result.reason or "")
+
+
+def test_authorization_outcomes_are_unchanged(tmp_path: Path) -> None:
+    # The class-aware messages change denial text and typing only: no
+    # currently-denied command becomes allowed and vice versa.
+    tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=tmp_path)
+    denied = [
+        "rm -r build",
+        "cat $(locate chartreux)",
+        "python3 << 'EOF'\nprint(42)\nEOF",
+        "for i in 1 2; do echo $i; done",
+        "echo =ls",
+        "echo $HOME",
+        "python3",
+        "vim file.txt",
+        "eval 'echo hi'",
+        "PYTHONPATH=/abs python x",
+        "unset PATH",
+        "echo hi > .git/config",
+        "cd / && pwd",
+        "find . -exec id \\;",
+        "git push origin main",
+        "git reset --hard HEAD",
+        "bash -c 'echo $(x)'",
+    ]
+    allowed = [
+        "echo hi",
+        "ls",
+        "git status",
+        "echo hi > out.txt",
+        "echo hi 2>&1",
+        "echo hi > /dev/null",
+    ]
+    for command in denied:
+        result = tool.resolve_permission(BashArgs(command=command))
+        assert result is not None and result.permission == ToolPermission.NEVER, command
+    for command in allowed:
+        result = tool.resolve_permission(BashArgs(command=command))
+        assert result is None or result.permission != ToolPermission.NEVER, command
+
+
+def test_recognized_but_rejected_shapes_keep_their_typed_class(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A recognized-but-rejected static-expansion shape keeps its proper
+    # class: the multi-match locate-then-print variant is an unexecutable
+    # construct, so its denial is SYNTAX and names the compliant alternative
+    # through the standard renderer.
+    from chartreux.core.tools.builtins._shell_permission_analysis import (
+        analyze_shell_command,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "lines.txt").write_text("lit\nalpha\nlit\n")
+    tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=tmp_path)
+    command = "sed -n \"$(grep -n 'lit' lines.txt | cut -d: -f1),+45p\" lines.txt"
+    context = tool.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission == ToolPermission.NEVER
+    analysis = analyze_shell_command(command)
+    assert analysis.approval_diagnostic.denial_class is DenialClass.SYNTAX
+    rendered = render_diagnostic(analysis.approval_diagnostic)
+    assert "locating multiple lines" in rendered
+    assert "Instead," in rendered
+    assert "head -1" in rendered

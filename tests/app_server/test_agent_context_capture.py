@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -27,9 +28,14 @@ from chartreux.app_server.protocol import (
     StatsUpdatedParams,
     TurnCompletedParams,
 )
+from chartreux.core.file_revision import FileRevision
 from chartreux.core.subagents import RunStatus, RunStopReason, WaitStatus
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.stubs.fake_backend import FakeBackend
+
+
+def _matches_revision(known: FileRevision | None, expected: FileRevision) -> bool:
+    return known is not None and known.matches(expected)
 
 
 def _capture_registry():
@@ -406,3 +412,68 @@ def test_structured_budget_stop_mapping(reason) -> None:
         else RunStopReason.BUDGET_UNVERIFIABLE
     )
     assert SessionRuntimeRegistry._run_stop_reason(turn) is expected
+
+
+@pytest.mark.asyncio
+async def test_child_compaction_envelope_carries_file_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A spawned child's compaction boundary carries its working-set state.
+
+    The parent's working set is handed to the child at spawn; the child's own
+    compaction envelope (produced through the sessions-side manager) carries
+    path -> last-seen revision + outline alongside the todo state, and
+    structural replay restores it — the capture path observes the same
+    boundary message the transcript keeps.
+    """
+    from chartreux.core.file_revision import full_revision
+    from chartreux.core.file_state import FileStateStore
+    from chartreux.core.subagents import TaskArgs
+    from chartreux.core.tools.base import InvokeContext
+    from tests.app_server.test_subagents import (
+        _background_result,
+        _zero_retention_registry,
+    )
+    from tests.mock.utils import mock_llm_chunk
+
+    target = tmp_path / "mod.py"
+    target.write_text("def f():\n    return 1\n")
+    seeded = full_revision(b"def f():\n    return 1\n")
+    backend = FakeBackend([
+        [mock_llm_chunk(content="initial")],
+        [mock_llm_chunk(content="<summary>compacted</summary>")],
+    ])
+    registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
+    # The parent's working set is what the dispatcher hands the child at spawn.
+    parent.file_state_context.observe_edit(str(target), seeded)
+    ctx = InvokeContext(tool_call_id="spawn", session_id=parent.session_id)
+    try:
+        launch = await _background_result(registry, TaskArgs(task="work"), ctx)
+        assert launch.agent_id is not None
+        record = registry._agent_records[launch.agent_id]
+        child = record.runtime.agent_loop
+        # The child inherited the parent's working set (path + revision +
+        # outline) through the spawn handoff.
+        assert _matches_revision(child.file_state.known_revision(str(target)), seeded)
+        assert child.file_state.outline_for(str(target)) is not None
+
+        # The child compacts through its own manager (the sessions capture path
+        # observes the same boundary message).
+        summary = await child.compaction_manager.compact()
+        assert summary == "compacted"
+        boundary = child.messages[-1]
+        assert boundary.context_boundary == "compaction"
+        assert boundary.tool_result is not None
+        output = boundary.tool_result.output
+        # The existing TodoState replay keeps working alongside file_state.
+        assert "todo_state" in output
+        assert "file_state" in output
+        # Structural replay restores the working-set state (metadata only).
+        replayed = FileStateStore.replay(child.messages)
+        assert _matches_revision(replayed.known_revision(str(target)), seeded)
+        assert replayed.outline_for(str(target)) is not None
+        # The live store is untouched by the replay.
+        assert _matches_revision(child.file_state.known_revision(str(target)), seeded)
+    finally:
+        await registry.drain_children()
+        await parent.aclose()

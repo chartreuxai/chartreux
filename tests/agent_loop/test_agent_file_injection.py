@@ -82,8 +82,19 @@ async def test_user_turn_keeps_literal_mention(tmp_working_directory: Path) -> N
 
     await _act_and_collect(agent_loop, "look at @notes.md please")
 
-    user_msgs = [m for m in agent_loop.messages if m.role == Role.user]
+    user_msgs = [
+        m for m in agent_loop.messages if m.role == Role.user and not m.injected
+    ]
     assert user_msgs[-1].content == "look at @notes.md please"
+    # The mention's synthetic read enrolls the file in the working set, so a
+    # state block is appended as an injected user message at LLM-turn start;
+    # the block never rewrites the literal mention.
+    state_blocks = [
+        m
+        for m in agent_loop.messages
+        if m.injected and m.role == Role.user and "<file_state " in str(m.content)
+    ]
+    assert len(state_blocks) == 1
 
 
 @pytest.mark.asyncio

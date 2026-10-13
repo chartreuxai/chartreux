@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from chartreux.core.tools.builtins._shell_diagnostics import (
+    DenialClass,
+    Diagnostic,
+    render_diagnostic,
+)
 from chartreux.core.tools.builtins._shell_permission_analysis import (
+    aggregate_approval_diagnostic,
     analyze_shell_command,
+    argv_permission_diagnostics,
     argv_permission_reasons,
 )
 
@@ -720,3 +729,779 @@ def test_source_commands_are_extracted_as_parts(
 
     assert not analysis.requires_approval
     assert analysis.command_parts == (expected_part,)
+
+
+@pytest.mark.parametrize(
+    ("command", "reason", "alternative"),
+    [
+        (
+            "echo $(whoami)",
+            "command substitution",
+            "use read_file with offset and limit to read files; "
+            "use grep to locate content and line numbers; "
+            "use the edit tool to modify files",
+        ),
+        (
+            "cat <<EOF\nhi\nEOF",
+            "heredocs are unsupported in v0.1",
+            "use write_file to create the content, or use read_file with "
+            "offset and limit, grep, and the edit tool for existing files",
+        ),
+        (
+            "for i in 1 2; do echo $i; done",
+            "for loop",
+            "split the work into separate simple commands, or use read_file "
+            "with offset and limit, grep, and the edit tool for file work",
+        ),
+        (
+            "echo =cmd",
+            "Zsh equals expansion",
+            "drop the leading equals sign and invoke the command by its "
+            "name or absolute path",
+        ),
+        (
+            "echo $HOME",
+            "variable expansion (unsupported in v0.1 because it can change arguments)",
+            "write the literal value directly as the argument",
+        ),
+        (
+            "echo $((1+1))",
+            "arithmetic expansion",
+            "compute the value and write the literal result as the argument",
+        ),
+        (
+            "echo {a,b}",
+            "brace expansion",
+            "write each expanded value literally as its own argument",
+        ),
+        (
+            "cat <(ls)",
+            "process substitution",
+            "write the command output to a file first, then pass the file path",
+        ),
+        (
+            "sleep 1 &",
+            "background execution",
+            "run the command in the foreground, or use bash_start for a "
+            "long-running job",
+        ),
+        (
+            "echo $'x'",
+            "ANSI-C quoted arguments",
+            "write the argument as an ordinary quoted string",
+        ),
+        (
+            "echo 'unclosed",
+            "a syntax error",
+            "write the command as well-formed shell syntax",
+        ),
+        (
+            "uv run pip install fixture[extra]",
+            "unquoted package bracket syntax may expand as a shell glob",
+            "quote the package argument with single quotes so the shell "
+            "cannot expand it",
+        ),
+        (
+            "echo hi < input.txt",
+            "unsupported redirection (only >, >>, 2>, and 2>&1 are allowed)",
+            "read the file with read_file, or pass its content as a literal argument",
+        ),
+        (
+            "echo hi >&2",
+            "unsupported redirection (only >, >>, 2>, and 2>&1 are allowed)",
+            "use an allowed redirection form instead: plain output, append, "
+            "stderr, or combined stderr to stdout",
+        ),
+        (
+            "> out.txt",
+            "redirect-only statements are not permitted",
+            "attach the redirection to a command, or use write_file or the "
+            "edit tool to create or change the file",
+        ),
+        (
+            "FOO=bar",
+            "assignment-only statements are not permitted",
+            "attach the assignment to a command in the same statement",
+        ),
+    ],
+)
+def test_syntax_reasons_carry_class_and_alternative(
+    command: str, reason: str, alternative: str
+) -> None:
+    # A SYNTAX denial is an unmodeled v0.1 construct: the diagnostic carries
+    # the SYNTAX class and the compliant alternative its message names.
+    analysis = analyze_shell_command(command)
+    diagnostic = next(item for item in analysis.diagnostics if item.detail == reason)
+    assert diagnostic.denial_class is DenialClass.SYNTAX
+    assert diagnostic.alternative == alternative
+    assert analysis.approval_diagnostic.denial_class is DenialClass.SYNTAX
+    rendered = render_diagnostic(analysis.approval_diagnostic)
+    assert "Instead," in rendered
+    assert alternative in rendered
+
+
+@pytest.mark.parametrize(
+    ("command", "reason", "fragments"),
+    [
+        (
+            "PYTHONPATH=/abs python x",
+            "dangerous environment assignment (PYTHONPATH)",
+            ("dangerous environment assignment", "PYTHONPATH"),
+        ),
+        (
+            "LD_PRELOAD=x ls",
+            "dangerous environment assignment (LD_PRELOAD)",
+            ("dangerous environment assignment", "PRELOAD"),
+        ),
+        (
+            "foo=bar ls",
+            "an environment assignment with a non-uppercase name",
+            ("an environment assignment with a non-uppercase name",),
+        ),
+        (
+            "echo hi > -weird",
+            "an invalid redirection path target",
+            ("an invalid redirection path target",),
+        ),
+        (
+            "echo hi > /abs/path",
+            "an absolute redirection target",
+            ("an absolute redirection target",),
+        ),
+        (
+            "unset PATH",
+            "unsetting shell environment variables cannot be safely inspected",
+            ("unsetting shell environment variables cannot be safely inspected",),
+        ),
+        (
+            "hash -p /usr/bin/curl harmless",
+            "unsupported command lookup modification (hash)",
+            ("unsupported command lookup modification", "hash"),
+        ),
+    ],
+)
+def test_policy_reasons_carry_policy_class_and_no_alternative(
+    command: str, reason: str, fragments: tuple[str, ...]
+) -> None:
+    # A POLICY denial is a deliberate security decision: the diagnostic
+    # carries the POLICY class and no alternative.
+    analysis = analyze_shell_command(command)
+    diagnostic = next(item for item in analysis.diagnostics if item.detail == reason)
+    assert diagnostic.denial_class is DenialClass.POLICY
+    assert diagnostic.alternative is None
+    assert analysis.approval_diagnostic.denial_class is DenialClass.POLICY
+    rendered = render_diagnostic(analysis.approval_diagnostic)
+    # The rendered detail escapes markup characters, so the requirement is
+    # asserted on escape-free fragments.
+    for fragment in fragments:
+        assert fragment in rendered
+    assert "Instead," not in rendered
+
+
+def test_mixed_constructs_classify_as_policy() -> None:
+    # A command with both unmodeled syntax and a policy violation is a
+    # policy denial: it names no alternative.
+    analysis = analyze_shell_command("PYTHONPATH=/abs cat $(ls)")
+    assert "command substitution" in analysis.approval_reasons
+    assert "dangerous environment assignment (PYTHONPATH)" in analysis.approval_reasons
+    assert analysis.approval_diagnostic.denial_class is DenialClass.POLICY
+    rendered = render_diagnostic(analysis.approval_diagnostic)
+    assert "command substitution" in rendered
+    assert "dangerous environment assignment" in rendered
+    assert "PYTHONPATH" in rendered
+    assert "Instead," not in rendered
+
+
+def test_unknown_and_failed_analysis_classifies_as_policy() -> None:
+    # Unknown and uncategorized denials fail closed to POLICY.
+    analysis = analyze_shell_command("echo\x00hi")
+    assert analysis.approval_reasons == ("shell analysis failed",)
+    assert analysis.approval_diagnostic.denial_class is DenialClass.POLICY
+    rendered = render_diagnostic(analysis.approval_diagnostic)
+    assert rendered == "Command denied: shell analysis failed"
+    assert "Instead," not in rendered
+
+
+def test_diagnostics_keep_their_reasons_class_and_alternative() -> None:
+    analysis = analyze_shell_command("echo $(whoami)")
+    assert tuple(item.detail for item in analysis.diagnostics) == (
+        analysis.approval_reasons
+    )
+    (diagnostic,) = analysis.diagnostics
+    assert diagnostic.detail == "command substitution"
+    assert diagnostic.denial_class is DenialClass.SYNTAX
+    assert diagnostic.alternative is not None
+    assert analysis.approval_diagnostic.related == analysis.diagnostics
+    assert analysis.approval_diagnostic.denial_class is DenialClass.SYNTAX
+
+
+@pytest.mark.parametrize(
+    ("argv", "reason"),
+    [
+        (
+            ["env", "PATH=/outside", "echo", "hi"],
+            "dangerous environment assignment (PATH)",
+        ),
+        (
+            ["env", "PYTHONPATH=../outside", "python", "-c", "code"],
+            "dangerous environment assignment (PYTHONPATH)",
+        ),
+        (
+            ["env", "foo=bar", "echo", "hi"],
+            "an environment assignment with a non-uppercase name",
+        ),
+        (
+            ["hash", "-p", "./fake", "git"],
+            "unsupported command lookup modification (hash)",
+        ),
+        (["alias", "git=./fake"], "unsupported command lookup modification (alias)"),
+    ],
+)
+def test_argv_permission_diagnostics_are_policy_class(
+    argv: list[str], reason: str
+) -> None:
+    # Environment-assignment and command-lookup findings are policy
+    # decisions: classed POLICY, no alternative, and the string view of the
+    # reasons is unchanged.
+    diagnostics = argv_permission_diagnostics(argv)
+    diagnostic = next(item for item in diagnostics if item.detail == reason)
+    assert diagnostic.denial_class is DenialClass.POLICY
+    assert diagnostic.alternative is None
+    assert reason in argv_permission_reasons(argv)
+    assert argv_permission_reasons(["echo", *argv]) == ()
+
+
+# --- tier-2 static expansion wiring -------------------------------------------
+
+_LocateFile = "lines.txt"
+
+
+@pytest.fixture
+def locate_workspace(tmp_path, monkeypatch) -> None:
+    """A cwd holding the file the locate-then-print idiom greps."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / _LocateFile).write_text(
+        "alpha\nlit\nbeta\n" + "\n".join(f"line{i}" for i in range(4, 60)) + "\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "expanded"),
+    [
+        (
+            "sed -n \"$(grep -n 'lit' lines.txt | head -1 | cut -d: -f1),+45p\" lines.txt",
+            "sed -n 2,+45p lines.txt",
+        ),
+        (
+            "sed -n \"$(grep -n 'lit' lines.txt | head -3 | cut -d: -f1),+45p\" lines.txt",
+            "sed -n 2,+45p lines.txt",
+        ),
+        (
+            "sed -n \"$(grep -n 'lit' lines.txt | cut -d: -f1),+45p\" lines.txt",
+            "sed -n 2,+45p lines.txt",
+        ),
+        (
+            "sed -n \"$(grep -n 'lit' lines.txt | tail -1 | cut -d: -f1),87p\" lines.txt",
+            "sed -n 2,87p lines.txt",
+        ),
+        (
+            "sed -n \"$(grep -n 'lit' lines.txt | head -1 | cut -d: -f1)p\" lines.txt",
+            "sed -n 2p lines.txt",
+        ),
+        # A no-match expansion degrades to the suffix alone: `p` prints the
+        # whole file (benign); a `,+Np` suffix is a sed runtime error.
+        (
+            "sed -n \"$(grep -n 'absent' lines.txt | head -1 | cut -d: -f1)p\" lines.txt",
+            "sed -n p lines.txt",
+        ),
+    ],
+)
+def test_sed_locate_print_idiom_expands_to_literal_script(
+    locate_workspace, command: str, expanded: str
+) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert not analysis.requires_approval
+    assert analysis.command_parts[0] == expanded
+    # The whitelisted inner pipeline stages stay visible as command parts so
+    # their read operands remain path-checked by the resolver.
+    assert any(part.startswith("grep -n '") for part in analysis.command_parts)
+    assert "cut -d: -f1" in analysis.command_parts
+
+
+def test_sed_locate_print_multi_match_is_rejected_as_unexecutable(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / _LocateFile).write_text("lit\nalpha\nlit\n")
+
+    analysis = analyze_shell_command(
+        "sed -n \"$(grep -n 'lit' lines.txt | cut -d: -f1),+45p\" lines.txt"
+    )
+
+    assert analysis.requires_approval
+    diagnostic = next(
+        item
+        for item in analysis.diagnostics
+        if item.detail == "a sed locate-then-print expansion locating multiple lines"
+    )
+    assert diagnostic.denial_class is DenialClass.SYNTAX
+    assert diagnostic.alternative == (
+        "narrow the grep pattern or select one located line (for example with "
+        "head -1) so the sed script has a single numeric address"
+    )
+    assert analysis.approval_diagnostic.denial_class is DenialClass.SYNTAX
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # head without the numeric-extraction stage: raw file content would
+        # reach the sed script (probed write vector).
+        "sed -n \"$(grep -n 'lit' lines.txt | head -1),+45p\" lines.txt",
+        # Nested substitution inside the construct.
+        'sed -n "$(grep -n "$(id)" lines.txt | head -1 | cut -d: -f1),+45p" lines.txt',
+        # A redirect inside the substitution.
+        "sed -n \"$(grep -n 'lit' lines.txt > out.txt | head -1 | cut -d: -f1)p\" lines.txt",
+        # A non-literal (unquoted, pattern-shaped) grep argument.
+        'sed -n "$(grep -n lit lines.txt | head -1 | cut -d: -f1)p" lines.txt',
+        # A prefix assignment keeps the invocation text unrecognizable.
+        "X=1 sed -n \"$(grep -n 'lit' lines.txt | head -1 | cut -d: -f1)p\" lines.txt",
+    ],
+)
+def test_sed_locate_print_variants_deny_unchanged(
+    locate_workspace, command: str
+) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert analysis.requires_approval
+    assert "command substitution" in analysis.approval_reasons
+    assert analysis.approval_diagnostic.denial_class is DenialClass.SYNTAX
+    rendered = render_diagnostic(analysis.approval_diagnostic)
+    assert "Instead," in rendered
+
+
+def test_arithmetic_in_sed_script_stays_denied(locate_workspace) -> None:
+    analysis = analyze_shell_command('sed -n "$((1+1))p" lines.txt')
+
+    assert analysis.requires_approval
+    assert "arithmetic expansion" in analysis.approval_reasons
+    assert analysis.approval_diagnostic.denial_class is DenialClass.SYNTAX
+
+
+@pytest.fixture
+def equals_path(tmp_path, monkeypatch) -> str:
+    directory = tmp_path / "bin"
+    directory.mkdir()
+    tool = directory / "mytool"
+    tool.write_text("#!/bin/sh\nexit 0\n")
+    tool.chmod(0o755)
+    monkeypatch.setenv("PATH", str(directory))
+    return str(directory)
+
+
+def test_equals_command_position_resolves_to_executable_path(equals_path: str) -> None:
+    analysis = analyze_shell_command("=mytool -la")
+
+    assert not analysis.requires_approval
+    # The resolved executable's basename is inlined: the policy keys every
+    # command surface by name, and zsh's =name runs the same PATH lookup as
+    # the plain name, so the authorization is exactly the hand-written form.
+    assert analysis.command_parts == ("mytool -la",)
+
+
+def test_equals_unresolvable_command_keeps_its_denial(equals_path: str) -> None:
+    analysis = analyze_shell_command("=notacommand -la")
+
+    assert analysis.requires_approval
+    assert analysis.approval_reasons == ("Zsh equals expansion",)
+    diagnostic = analysis.diagnostics[0]
+    assert diagnostic.denial_class is DenialClass.SYNTAX
+    assert diagnostic.alternative == (
+        "drop the leading equals sign and invoke the command by its name or "
+        "absolute path"
+    )
+
+
+def test_equals_in_argument_position_stays_denied(equals_path: str) -> None:
+    analysis = analyze_shell_command("echo =mytool")
+
+    assert analysis.requires_approval
+    assert analysis.approval_reasons == ("Zsh equals expansion",)
+
+
+@pytest.mark.parametrize(
+    ("command", "expanded"),
+    [
+        ("X=5; grep -m $X lit lines.txt", "grep -m 5 lit lines.txt"),
+        ("X=lit; grep $X lines.txt", "grep lit lines.txt"),
+        ("X=5; cat $X", "cat 5"),
+        ("N=2; head -n $((N+1)) lines.txt", "head -n 3 lines.txt"),
+        ("grep -m $((2+3)) lit lines.txt", "grep -m 5 lit lines.txt"),
+        ("X=5; head -n$X lines.txt", "head -n5 lines.txt"),
+        ("X=5; cut -d $X -f1 lines.txt", "cut -d 5 -f1 lines.txt"),
+        # Multiple literal assignments bind in one statement.
+        ("X=5 Y=3; grep -m $((X+Y)) lit lines.txt", "grep -m 8 lit lines.txt"),
+        # A binding persists for later statements of the same invocation
+        # (the shell keeps the assignment); a later assignment rebinds.
+        (
+            "X=5; grep -m $X lit lines.txt; head -n $X lines.txt",
+            "grep -m 5 lit lines.txt",
+        ),
+    ],
+)
+def test_read_only_positions_inline_the_resolved_literal(
+    locate_workspace, command: str, expanded: str
+) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert not analysis.requires_approval
+    assert analysis.command_parts[0] == expanded
+
+
+@pytest.mark.parametrize(
+    ("command", "reason"),
+    [
+        # Write positions reject everything: every sed position is not
+        # read-only, so the expansion stays unmodeled.
+        ("N=2; sed -n $((N))p lines.txt", "arithmetic expansion"),
+        (
+            "X=5; sed -n $X lines.txt",
+            "variable expansion (unsupported in v0.1 because it can change arguments)",
+        ),
+        # A command-prefix assignment never binds same-line expansions:
+        # every POSIX shell expands argument words before the command's own
+        # assignments take effect (probed in zsh, bash, and sh), so the
+        # variable is unknown to the analysis exactly as it is to the shell.
+        (
+            "X=5 grep -m $X lit lines.txt",
+            "variable expansion (unsupported in v0.1 because it can change arguments)",
+        ),
+        # An assignment guarded by && / || may be skipped at runtime, so it
+        # is not a binding source.
+        (
+            "X=5 && grep -m $X lit lines.txt",
+            "variable expansion (unsupported in v0.1 because it can change arguments)",
+        ),
+        # An unknown variable is not resolvable.
+        (
+            "grep -m $X lit lines.txt",
+            "variable expansion (unsupported in v0.1 because it can change arguments)",
+        ),
+        # Quoted expansion text is not an unquoted word.
+        (
+            'X=5; grep -m "$X" lit lines.txt',
+            "variable expansion (unsupported in v0.1 because it can change arguments)",
+        ),
+        # A boolean option before the expansion: the position is ambiguous
+        # (option-arg:-c is unclassified), so it fails closed.
+        (
+            "X=5; grep -c $X lit lines.txt",
+            "variable expansion (unsupported in v0.1 because it can change arguments)",
+        ),
+        # A value with shell metacharacters is inert, not inlinable.
+        (
+            "X='a;b'; grep -m $X lit lines.txt",
+            "variable expansion (unsupported in v0.1 because it can change arguments)",
+        ),
+    ],
+)
+def test_unresolvable_or_write_position_expansions_deny_unchanged(
+    locate_workspace, command: str, reason: str
+) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert analysis.requires_approval
+    assert reason in analysis.approval_reasons
+    assert analysis.approval_diagnostic.denial_class is DenialClass.SYNTAX
+
+
+def test_for_loop_body_expansion_stays_denied(locate_workspace) -> None:
+    analysis = analyze_shell_command(
+        "for i in 1; do X=5 grep -m $X lit lines.txt; done"
+    )
+
+    assert analysis.requires_approval
+    assert "for loop" in analysis.approval_reasons
+
+
+def test_dangerous_assignment_wins_over_expansion_resolution(locate_workspace) -> None:
+    analysis = analyze_shell_command("X=5; PYTHONPATH=/abs grep -m $X lit lines.txt")
+
+    assert analysis.requires_approval
+    assert "dangerous environment assignment (PYTHONPATH)" in analysis.approval_reasons
+    assert analysis.approval_diagnostic.denial_class is DenialClass.POLICY
+    rendered = render_diagnostic(analysis.approval_diagnostic)
+    assert "Instead," not in rendered
+
+
+def test_approval_label_reflects_the_policy_class() -> None:
+    syntax = analyze_shell_command("echo $(whoami)").approval_label
+    policy = analyze_shell_command("PYTHONPATH=/abs python x").approval_label
+
+    assert syntax.startswith("unsupported shell syntax: ")
+    assert policy.startswith("shell policy restriction: ")
+    assert "PYTHONPATH" in policy
+
+
+def test_unrecognized_idiom_variants_are_drift_logged(locate_workspace, caplog) -> None:
+    with caplog.at_level(
+        "DEBUG", logger="chartreux.core.tools.builtins._shell_permission_analysis"
+    ):
+        analyze_shell_command(
+            "sed -n \"$(grep -n 'lit' lines.txt | head -1),+45p\" lines.txt"
+        )
+        analyze_shell_command("=notacommand-xyz -la")
+        analyze_shell_command("echo $HOME")
+
+    messages = caplog.messages
+    assert any("sed locate-then-print" in message for message in messages)
+    assert any("zsh equals expansion" in message for message in messages)
+    # Generic expansion misses are too common to be tier-3 signal.
+    assert not any("$HOME" in message for message in messages)
+
+
+# --- F1: zsh modifier/subscript suffixes after a bare `$NAME` -------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Each resolves to a workspace-looking operand in the policy while
+        # zsh re-interprets the suffix (probed) into an out-of-workspace
+        # path — the resolver must refuse the whole expansion.
+        "X=a; cat $X:s,a,../x,",
+        "X=a; cat $X:gs,a,../x,",
+        "X=a; cat $X:h",
+        "X=a; cat $X[1]",
+        "X=a; cat $X:q:s,a,../x,",
+        "X=a; cat ${X}:h",
+        "X=a; cat $((X)):h",
+    ],
+)
+def test_zsh_modifier_suffix_expansions_deny(locate_workspace, command: str) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert analysis.requires_approval
+    # The construct keeps its ordinary dynamic-syntax denial (the reason
+    # names the node type: variable, parameter, or arithmetic expansion).
+    assert analysis.approval_diagnostic.denial_class is DenialClass.SYNTAX
+    assert any(
+        reason in analysis.approval_reasons
+        for reason in (
+            "variable expansion (unsupported in v0.1 because it can change arguments)",
+            "parameter expansion",
+            "arithmetic expansion",
+        )
+    )
+
+
+# --- B1: unmodeled reassignment invalidates the binding -------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # export/typeset/readonly/declare/local arguments reassign the name
+        # in a form the binding collection does not model.
+        "X=AGENTS.md; export X=/etc/passwd; cat $X",
+        "X=AGENTS.md; typeset X=/etc/passwd; cat $X",
+        "X=AGENTS.md; readonly X=/etc/passwd; cat $X",
+        "X=AGENTS.md; declare X=/etc/passwd; cat $X",
+        "X=AGENTS.md; local X=/etc/passwd; cat $X",
+        # A quoted declaration argument is not even a variable_assignment.
+        "X=AGENTS.md; export 'X=/etc/passwd'; cat $X",
+        # An &&/||-guarded reassignment DOES bind at runtime.
+        "X=AGENTS.md; true && X=/etc/passwd; cat $X",
+        "X=AGENTS.md; false || X=/etc/passwd; cat $X",
+        # A command-prefix assignment is not a proven non-reassignment.
+        "X=AGENTS.md; X=/etc/passwd cat /dev/null; cat $X",
+        # A subshell assignment is not modeled either (conservative).
+        "X=AGENTS.md; (X=/etc/passwd); cat $X",
+        # A non-literal value is not a provable reassignment.
+        "X=AGENTS.md; X=$Y; cat $X",
+    ],
+)
+def test_unmodeled_reassignment_invalidates_the_binding(
+    locate_workspace, command: str
+) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert analysis.requires_approval
+    assert (
+        "variable expansion (unsupported in v0.1 because it can change arguments)"
+        in analysis.approval_reasons
+        or "a non-literal environment assignment" in analysis.approval_reasons
+    )
+
+
+def test_literal_rebinding_resolves_to_the_last_binding(locate_workspace) -> None:
+    # Only the LAST top-level literal binding is in force at the use.
+    analysis = analyze_shell_command("X=a; X=AGENTS.md; cat $X")
+
+    assert not analysis.requires_approval
+    assert analysis.command_parts[0] == "cat AGENTS.md"
+
+
+def test_bare_export_without_value_keeps_the_binding(locate_workspace) -> None:
+    # `export X` carries no value, so the runtime value is unchanged and the
+    # binding still resolves.
+    analysis = analyze_shell_command("X=AGENTS.md; export X; cat $X")
+
+    assert not analysis.requires_approval
+    assert analysis.command_parts[0] == "cat AGENTS.md"
+
+
+def test_rebinding_after_an_unmodeled_reassignment_resolves(locate_workspace) -> None:
+    # A later literal assignment rebinds after the invalidation, exactly as
+    # the shell's last assignment wins.
+    analysis = analyze_shell_command("X=a; export X=/etc/passwd; X=AGENTS.md; cat $X")
+
+    assert not analysis.requires_approval
+    assert analysis.command_parts[0] == "cat AGENTS.md"
+
+
+# --- H1: whitespace and empty resolved values -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A splitting value is not one inert argv element under every
+        # executor (latent today: zsh runs with SH_WORD_SPLIT off).
+        'X="AGENTS.md /etc/passwd"; cat $X',
+        'X="a\tb"; cat $X',
+        # An empty unquoted word is dropped by zsh entirely, so the policy
+        # would authorize a different argv than the runtime runs.
+        "X=; cat $X",
+    ],
+)
+def test_whitespace_and_empty_values_deny(locate_workspace, command: str) -> None:
+    analysis = analyze_shell_command(command)
+
+    assert analysis.requires_approval
+    assert (
+        "variable expansion (unsupported in v0.1 because it can change arguments)"
+        in analysis.approval_reasons
+    )
+
+
+# --- F2: the simulation read is gated to the authorized roots -------------------
+
+
+def _ban_simulation_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prove the recognizer never reads the gated source (call after setup)."""
+
+    def _no_read(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the simulation must not read this source")
+
+    monkeypatch.setattr(Path, "read_text", _no_read)
+    monkeypatch.setattr(Path, "open", _no_read)
+
+
+def test_out_of_workspace_source_denies_without_being_read(
+    locate_workspace, tmp_path, monkeypatch, caplog
+) -> None:
+    outside = tmp_path.parent / "ame-outside"
+    outside.mkdir(exist_ok=True)
+    (outside / "secret.txt").write_text("needle\n")
+    command = (
+        "sed -n \"$(grep -n 'needle' ../ame-outside/secret.txt "
+        '| head -1 | cut -d: -f1),+45p" lines.txt'
+    )
+    _ban_simulation_reads(monkeypatch)
+
+    with caplog.at_level(
+        "DEBUG", logger="chartreux.core.tools.builtins._shell_permission_analysis"
+    ):
+        analysis = analyze_shell_command(command)
+
+    # The pre-check refuses the source before the recognizer runs: the
+    # construct keeps its ordinary denial and the file is never read.
+    assert analysis.requires_approval
+    assert "command substitution" in analysis.approval_reasons
+    assert any("sed locate-then-print" in message for message in caplog.messages)
+
+
+def test_device_source_denies_without_being_read(locate_workspace, monkeypatch) -> None:
+    # /dev/stdin on a FIFO would hang the synchronous analysis; the root
+    # gate refuses it before the recognizer (and its stat gate) runs.
+    _ban_simulation_reads(monkeypatch)
+    analysis = analyze_shell_command(
+        'sed -n "$(grep -n x /dev/stdin | cut -d: -f1)p" lines.txt'
+    )
+
+    assert analysis.requires_approval
+    assert "command substitution" in analysis.approval_reasons
+
+
+def test_in_workspace_oversized_source_denies_without_being_read(
+    locate_workspace, tmp_path, monkeypatch
+) -> None:
+    from chartreux.core.tools.builtins._shell_static_expansion import (
+        _SIMULATION_READ_CAP_BYTES,
+    )
+
+    big = tmp_path / "big.txt"
+    big.write_bytes(b"needle\n" + b"x" * _SIMULATION_READ_CAP_BYTES)
+    _ban_simulation_reads(monkeypatch)
+    analysis = analyze_shell_command(
+        f"sed -n \"$(grep -n 'needle' {big} | head -1 | cut -d: -f1),+45p\" lines.txt"
+    )
+
+    assert analysis.requires_approval
+    assert "command substitution" in analysis.approval_reasons
+
+
+def test_in_workspace_binary_source_denies(locate_workspace, tmp_path) -> None:
+    binary = tmp_path / "binary.txt"
+    binary.write_bytes(b"needle\n\x00binary\n")
+    analysis = analyze_shell_command(
+        f"sed -n \"$(grep -n 'needle' {binary} | head -1 | cut -d: -f1),+45p\" lines.txt"
+    )
+
+    assert analysis.requires_approval
+    assert "command substitution" in analysis.approval_reasons
+
+
+def test_workspace_roots_gate_the_simulation_read(locate_workspace, tmp_path) -> None:
+    command = (
+        "sed -n \"$(grep -n 'lit' lines.txt | head -1 | cut -d: -f1),+45p\" lines.txt"
+    )
+
+    # No roots at all: fail closed, the simulation may not read anything.
+    analysis = analyze_shell_command(
+        command, scratchpad_roots=frozenset(), workspace_roots=frozenset()
+    )
+    assert analysis.requires_approval
+    # The ambient workspace (the analysis-time working directory) allows the
+    # in-workspace source, and so do explicit workspace roots.
+    assert not analyze_shell_command(command).requires_approval
+    assert not analyze_shell_command(
+        command, workspace_roots=frozenset({tmp_path.resolve()})
+    ).requires_approval
+    # A root that does not contain the source denies it.
+    assert analyze_shell_command(
+        command, workspace_roots=frozenset({tmp_path / "elsewhere"})
+    ).requires_approval
+
+
+# --- W7 support: the whole-call aggregate includes policy-class reasons ---------
+
+
+def test_aggregate_approval_diagnostic_includes_policy_reasons() -> None:
+    analysis = analyze_shell_command("echo $(whoami)")
+    assert analysis.approval_diagnostic.denial_class is DenialClass.SYNTAX
+
+    policy_reason = Diagnostic(
+        "analysis", detail="a dangerous git operation requiring approval (git.push)"
+    )
+    aggregate = aggregate_approval_diagnostic(analysis, policy_reason)
+
+    assert aggregate.denial_class is DenialClass.POLICY
+    rendered = render_diagnostic(aggregate)
+    assert "command substitution" in rendered
+    assert "git.push" in rendered
+    assert "Instead," not in rendered
+    # Without the policy reason the aggregate keeps the syntax class.
+    assert aggregate_approval_diagnostic(analysis).denial_class is DenialClass.SYNTAX

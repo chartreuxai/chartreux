@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from pathlib import Path
+import re
 
 import pytest
 
@@ -11,10 +12,16 @@ from chartreux.core.config.harness_files import (
     reset_harness_files_manager,
 )
 from chartreux.core.events import ToolResultEvent
+from chartreux.core.file_revision import full_revision
 from chartreux.core.tools.base import BaseToolState, ToolError
+from chartreux.core.tools.builtins._edit_result_context import (
+    EDIT_DIFF_MAX_SITES,
+    EDIT_WINDOW_MAX_LINES,
+)
 from chartreux.core.tools.builtins.edit import Edit, EditArgs, EditConfig, EditResult
 from chartreux.core.tools.ui import ToolCallDisplay, ToolResultDisplay
 from chartreux.core.trusted_folders import trusted_folders_manager
+from chartreux.utils.io import content_revision
 from tests.mock.utils import collect_result
 
 
@@ -443,3 +450,357 @@ def test_get_result_display_relative_to_cwd(tmp_path: Path) -> None:
     assert display.success is True
     assert display.message == "pkg/config.py"
     assert display.message != "config.py"
+
+
+def _parse_window(context: str | None) -> dict[int, str]:
+    """Parse the ``N→text`` entries of a rendered context window."""
+    assert context is not None
+    entries: dict[int, str] = {}
+    for line in context.splitlines():
+        match = re.match(r"^\s*(\d+)→(.*)$", line)
+        if match:
+            entries[int(match.group(1))] = match.group(2)
+    return entries
+
+
+def _assert_window_matches_current_file(
+    context: str | None, current_lines: list[str]
+) -> dict[int, str]:
+    """Every numbered window line points at the current text on disk."""
+    window = _parse_window(context)
+    assert window, "context window rendered no numbered lines"
+    for number, text in window.items():
+        assert current_lines[number - 1] == text
+    return window
+
+
+@pytest.mark.asyncio
+async def test_evidence_window_line_numbers_after_newline_insertion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = _write(tmp_path, "f.txt", "alpha\nbeta\ngamma\ndelta\n")
+    edit = _make_edit()
+
+    result = await collect_result(
+        edit.run(
+            EditArgs(file_path="f.txt", old_string="beta", new_string="BETA1\nBETA2")
+        )
+    )
+
+    current = path.read_text().splitlines()
+    assert current == ["alpha", "BETA1", "BETA2", "gamma", "delta"]
+    window = _assert_window_matches_current_file(result.context, current)
+    assert window[2] == "BETA1"
+    assert window[3] == "BETA2"
+    assert window[4] == "gamma"
+
+
+@pytest.mark.asyncio
+async def test_evidence_window_line_numbers_after_newline_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = _write(tmp_path, "f.txt", "a\nb\nc\nd\ne\n")
+    edit = _make_edit()
+
+    result = await collect_result(
+        edit.run(EditArgs(file_path="f.txt", old_string="b\nc\n", new_string=""))
+    )
+
+    current = path.read_text().splitlines()
+    assert current == ["a", "d", "e"]
+    assert result.applied_diff == "@@ line 2 (current) @@\n- b\n- c"
+    window = _assert_window_matches_current_file(result.context, current)
+    # "d" moved up from line 4 to line 2; the window numbers it correctly.
+    assert window[2] == "d"
+    assert window[3] == "e"
+
+
+@pytest.mark.asyncio
+async def test_evidence_diff_describes_actual_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write(tmp_path, "f.txt", "foo = bar + baz\n")
+    edit = _make_edit()
+
+    result = await collect_result(
+        edit.run(EditArgs(file_path="f.txt", old_string="bar", new_string="qux"))
+    )
+
+    assert result.applied_diff == (
+        "@@ line 1 (current) @@\n- foo = bar + baz\n+ foo = qux + baz"
+    )
+    assert result.replaced_count == 1
+
+
+@pytest.mark.asyncio
+async def test_evidence_replace_all_names_every_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = _write(tmp_path, "f.txt", "x = bar + 1\ny = bar - 2\nz = bar\n")
+    edit = _make_edit()
+
+    result = await collect_result(
+        edit.run(
+            EditArgs(
+                file_path="f.txt", old_string="bar", new_string="qux", replace_all=True
+            )
+        )
+    )
+
+    assert result.replaced_count == 3
+    assert result.applied_diff == (
+        "@@ line 1 (current) @@\n"
+        "- x = bar + 1\n"
+        "+ x = qux + 1\n"
+        "@@ line 2 (current) @@\n"
+        "- y = bar - 2\n"
+        "+ y = qux - 2\n"
+        "@@ line 3 (current) @@\n"
+        "- z = bar\n"
+        "+ z = qux"
+    )
+    current = path.read_text().splitlines()
+    _assert_window_matches_current_file(result.context, current)
+
+
+@pytest.mark.asyncio
+async def test_evidence_replace_all_sites_shift_after_newline_insertion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = _write(tmp_path, "f.txt", "a\ntgt\nb\ntgt\nc\n")
+    edit = _make_edit()
+
+    result = await collect_result(
+        edit.run(
+            EditArgs(
+                file_path="f.txt",
+                old_string="tgt",
+                new_string="t1\nt2",
+                replace_all=True,
+            )
+        )
+    )
+
+    assert result.replaced_count == 2
+    current = path.read_text().splitlines()
+    assert current == ["a", "t1", "t2", "b", "t1", "t2", "c"]
+    # The second site moved down one line because of the first replacement.
+    assert result.applied_diff == (
+        "@@ line 2 (current) @@\n"
+        "- tgt\n"
+        "+ t1\n"
+        "+ t2\n"
+        "@@ line 5 (current) @@\n"
+        "- tgt\n"
+        "+ t1\n"
+        "+ t2"
+    )
+    window = _assert_window_matches_current_file(result.context, current)
+    assert window[2] == "t1"
+
+
+@pytest.mark.asyncio
+async def test_evidence_revision_matches_independent_post_edit_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = _write(tmp_path, "f.txt", "hello world\n")
+    edit = _make_edit()
+
+    result = await collect_result(
+        edit.run(EditArgs(file_path="f.txt", old_string="hello", new_string="goodbye"))
+    )
+
+    raw = path.read_bytes()
+    assert result.revision is not None
+    assert result.revision.revision == content_revision(raw)
+    assert result.revision == full_revision(raw, line_count=1)
+    assert result.revision.scope == "full"
+    assert result.revision.size_bytes == len(raw)
+
+
+@pytest.mark.asyncio
+async def test_evidence_revision_changes_after_second_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = _write(tmp_path, "f.txt", "one\ntwo\n")
+    edit = _make_edit()
+
+    first = await collect_result(
+        edit.run(EditArgs(file_path="f.txt", old_string="one", new_string="ONE"))
+    )
+    second = await collect_result(
+        edit.run(EditArgs(file_path="f.txt", old_string="two", new_string="TWO"))
+    )
+
+    assert first.revision is not None
+    assert second.revision is not None
+    assert first.revision.revision != second.revision.revision
+    assert second.revision.revision == content_revision(path.read_bytes())
+
+
+@pytest.mark.asyncio
+async def test_failed_edit_publishes_no_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = _write(tmp_path, "f.txt", "hello world\n")
+    edit = _make_edit()
+
+    yielded: list[object] = []
+    with pytest.raises(ToolError, match="String to replace not found in file"):
+        async for item in edit.run(
+            EditArgs(file_path="f.txt", old_string="missing", new_string="x")
+        ):
+            yielded.append(item)
+
+    assert yielded == []
+    assert path.read_text() == "hello world\n"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_edit_publishes_no_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = _write(tmp_path, "f.txt", "aaa bbb aaa\n")
+    edit = _make_edit()
+
+    yielded: list[object] = []
+    with pytest.raises(ToolError, match="Found 2 matches"):
+        async for item in edit.run(
+            EditArgs(file_path="f.txt", old_string="aaa", new_string="ccc")
+        ):
+            yielded.append(item)
+
+    assert yielded == []
+    assert path.read_text() == "aaa bbb aaa\n"
+
+
+@pytest.mark.asyncio
+async def test_evidence_serialized_through_loop_public_field_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The agent loop serializes tool results with
+    # result_model.model_dump(mode="json") and renders "k: v" lines
+    # (chartreux/core/agent_loop/_loop.py); the evidence must ride along.
+    monkeypatch.chdir(tmp_path)
+    path = _write(tmp_path, "f.txt", "alpha\nbeta\ngamma\n")
+    edit = _make_edit()
+
+    result = await collect_result(
+        edit.run(EditArgs(file_path="f.txt", old_string="beta", new_string="BETA"))
+    )
+
+    result_dict = result.model_dump(mode="json")
+    text = "\n".join(f"{k}: {v}" for k, v in result_dict.items())
+    assert {"applied_diff", "context", "revision", "replaced_count"} <= (
+        result_dict.keys()
+    )
+    assert "_ui_occurrences" not in result_dict
+    assert "ui_occurrences" not in result_dict
+    assert result_dict["applied_diff"] == result.applied_diff
+    assert result_dict["context"] == result.context
+    assert result_dict["replaced_count"] == 1
+    assert result_dict["revision"]["revision"] == content_revision(path.read_bytes())
+    assert result_dict["revision"]["scope"] == "full"
+    assert "@@ line 2 (current) @@" in text
+    assert "2→BETA" in text
+
+
+@pytest.mark.asyncio
+async def test_evidence_for_empty_file_population(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = _write(tmp_path, "f.txt", "")
+
+    result = await collect_result(
+        _make_edit().run(
+            EditArgs(file_path="f.txt", old_string="", new_string="content")
+        )
+    )
+
+    assert result.replaced_count == 1
+    assert result.applied_diff == "@@ line 1 (current) @@\n+ content"
+    assert _parse_window(result.context) == {1: "content"}
+    assert result.revision is not None
+    assert result.revision.revision == content_revision(path.read_bytes())
+
+
+@pytest.mark.asyncio
+async def test_evidence_diff_caps_rendered_sites_but_counts_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write(tmp_path, "f.txt", "".join(f"tgt {i}\n" for i in range(10)))
+    edit = _make_edit()
+
+    result = await collect_result(
+        edit.run(
+            EditArgs(
+                file_path="f.txt", old_string="tgt", new_string="TGT", replace_all=True
+            )
+        )
+    )
+
+    assert result.replaced_count == 10
+    assert result.applied_diff is not None
+    assert result.applied_diff.count("@@ line") == EDIT_DIFF_MAX_SITES
+    assert "… 2 more replaced site(s) not shown (total 10)." in result.applied_diff
+
+
+@pytest.mark.asyncio
+async def test_evidence_window_caps_lines_for_wide_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = _write(tmp_path, "f.txt", "head\nmid\ntail\n")
+    edit = _make_edit()
+
+    result = await collect_result(
+        edit.run(
+            EditArgs(
+                file_path="f.txt",
+                old_string="mid",
+                new_string="\n".join(f"m{i}" for i in range(30)),
+            )
+        )
+    )
+
+    current = path.read_text().splitlines()
+    window = _assert_window_matches_current_file(result.context, current)
+    assert len(window) <= EDIT_WINDOW_MAX_LINES
+    assert window[2] == "m0"
+    assert result.applied_diff is not None
+    assert "… [+18 line(s)]" in result.applied_diff
+
+
+@pytest.mark.asyncio
+async def test_evidence_window_elides_oversized_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    long_line = "x" * 2000
+    path = _write(tmp_path, "f.txt", f"before\n{long_line}\nafter\n")
+    edit = _make_edit()
+
+    result = await collect_result(
+        edit.run(EditArgs(file_path="f.txt", old_string="before", new_string="BEFORE"))
+    )
+
+    current = path.read_text().splitlines()
+    assert current[1] == long_line
+    window = _parse_window(result.context)
+    assert window[1] == "BEFORE"
+    # The oversized neighbour is elided to a byte-safe prefix with a marker,
+    # never cut mid-line and never silently truncated.
+    assert window[2].startswith("x" * 512)
+    assert window[2].endswith("…[+1488 bytes]")
+    assert window[3] == "after"

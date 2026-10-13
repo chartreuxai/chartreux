@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import glob
 from pathlib import Path
@@ -40,7 +40,9 @@ from chartreux.core.tools.builtins._shell_command_policy import (
     resolve_repository_scope,
 )
 from chartreux.core.tools.builtins._shell_diagnostics import (
+    DenialClass,
     Diagnostic,
+    aggregate_denial_class,
     render_diagnostic,
 )
 from chartreux.core.tools.builtins._shell_permission_analysis import (
@@ -48,8 +50,9 @@ from chartreux.core.tools.builtins._shell_permission_analysis import (
     DANGEROUS_ENV_NAMES,
     ShellPermissionAnalysis,
     _has_active_bracket_glob,
+    aggregate_approval_diagnostic,
     analyze_shell_command,
-    argv_permission_reasons,
+    argv_permission_diagnostics,
 )
 from chartreux.core.tools.permissions import PermissionContext
 from chartreux.core.tools.utils import (
@@ -91,6 +94,29 @@ def _denied(diagnostic: Diagnostic) -> PermissionContext:
     )
 
 
+def _dangerous_policy_reason(context: PermissionContext) -> Diagnostic:
+    """The policy-class reason a dangerous-command denial contributes to a call.
+
+    A denial carrying a grantable proposal names the missing operations; a
+    hard guard (unmodeled, unclassifiable, or unlocatable git form) is stated
+    as uninspectable. Either way the reason is policy-class, so a call that
+    also has unmodeled syntax aggregates to a policy denial.
+    """
+    proposal = context.dangerous_command_proposal
+    if proposal is not None:
+        return Diagnostic(
+            "analysis",
+            detail=(
+                "a dangerous git operation requiring approval ("
+                + ", ".join(proposal.operations)
+                + ")"
+            ),
+        )
+    return Diagnostic(
+        "analysis", detail="a dangerous git command that cannot be safely inspected"
+    )
+
+
 def _authority_denial(
     decision: PermissionContext, token: str, command_part: str
 ) -> PermissionContext:
@@ -127,7 +153,23 @@ _MAX_ANALYZED_BYTES = 64 * 1024
 
 
 class _UnsafeShellSyntax(ValueError):
-    pass
+    """A fail-closed expansion failure carrying its denial class.
+
+    The class is decided where the failure is raised. The default is POLICY:
+    an unclassified expansion failure is a policy denial and names no
+    alternative.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        denial_class: DenialClass = DenialClass.POLICY,
+        alternative: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.denial_class = denial_class
+        self.alternative = alternative
 
 
 @dataclass(frozen=True)
@@ -159,6 +201,7 @@ def _expand_guardrail_parts(  # noqa: PLR0915
     *,
     scratchpad_roots: frozenset[Path] = frozenset(),
     redirect_operands: tuple[tuple[str, ...], ...] = (),
+    workspace_roots: frozenset[Path] | None = None,
 ) -> tuple[list[_GuardrailPart], list[str], list[Diagnostic]]:
     """Expand in occurrence order, preserving child-shell cwd isolation.
 
@@ -214,7 +257,11 @@ def _expand_guardrail_parts(  # noqa: PLR0915
         try:
             tokens = shlex.split(part)
         except ValueError as exc:
-            raise _UnsafeShellSyntax("malformed shell quoting") from exc
+            raise _UnsafeShellSyntax(
+                "malformed shell quoting",
+                denial_class=DenialClass.SYNTAX,
+                alternative="write the command with well-formed shell quoting",
+            ) from exc
         try:
             inline_interpreter_switch(tokens)  # Preserve legacy option diagnostics.
             boundary = executor_boundary(tokens, admission=True)
@@ -232,7 +279,10 @@ def _expand_guardrail_parts(  # noqa: PLR0915
                 raise _UnsafeShellSyntax("shell nesting depth limit exceeded")
             for source in boundary.inline_payloads:
                 analysis = _analyze_guardrail_source(
-                    source, nested_source=True, scratchpad_roots=scratchpad_roots
+                    source,
+                    nested_source=True,
+                    scratchpad_roots=scratchpad_roots,
+                    workspace_roots=workspace_roots,
                 )
                 errors.extend(analysis.approval_diagnostic.related)
                 nested_operands = analysis.redirect_operands
@@ -257,10 +307,8 @@ def _expand_guardrail_parts(  # noqa: PLR0915
             start, end = boundary.inner_command_range or (0, 0)
             child_tokens = list(boundary.module_command) or tokens[start:end]
             errors.extend(
-                Diagnostic(
-                    "analysis", command_part=shlex.join(child_tokens), detail=reason
-                )
-                for reason in argv_permission_reasons(
+                replace(reason, command_part=shlex.join(child_tokens))
+                for reason in argv_permission_diagnostics(
                     child_tokens, nested_source=bool(scope)
                 )
             )
@@ -809,27 +857,36 @@ def _analyze_guardrail_source(
     *,
     nested_source: bool = False,
     scratchpad_roots: frozenset[Path] = frozenset(),
+    workspace_roots: frozenset[Path] | None = None,
 ) -> ShellPermissionAnalysis:
     """Analyze shell source, reusing pure syntax analysis within one launch.
 
-    The cache key stays (command, nested_source); the scratchpad roots are
-    deliberately not part of it. Within one launch the local resolver and the
-    parent invocation guard can hold different authorities, so a cached
-    analysis may carry another caller's roots — a spurious approval reason at
-    worst (the false-denial direction). A cached scratchpad exemption can
-    never authorize a write outside workspace+scratchpad: the resolver's path
-    layer independently gates every literal redirect target as a WRITE
-    against the caller's own authority.
+    The cache key stays (command, nested_source); the scratchpad roots and the
+    workspace roots are deliberately not part of it. Within one launch the
+    local resolver and the parent invocation guard can hold different
+    authorities, so a cached analysis may carry another caller's roots — a
+    spurious approval reason at worst (the false-denial direction). A cached
+    scratchpad exemption can never authorize a write outside
+    workspace+scratchpad: the resolver's path layer independently gates every
+    literal redirect target as a WRITE against the caller's own authority.
+    The workspace roots gate only the sed simulation's READ — which file the
+    analysis may read at all — never an authorization.
     """
     cache = _analysis_cache.get()
     key = (command, nested_source)
     if cache is None:
         return analyze_shell_command(
-            command, nested_source=nested_source, scratchpad_roots=scratchpad_roots
+            command,
+            nested_source=nested_source,
+            scratchpad_roots=scratchpad_roots,
+            workspace_roots=workspace_roots,
         )
     if key not in cache:
         cache[key] = analyze_shell_command(
-            command, nested_source=nested_source, scratchpad_roots=scratchpad_roots
+            command,
+            nested_source=nested_source,
+            scratchpad_roots=scratchpad_roots,
+            workspace_roots=workspace_roots,
         )
     return cache[key]
 
@@ -977,7 +1034,13 @@ class ShellPermissionResolver:
         command_parts: list[str],
         expanded_parts: list[_GuardrailPart] | None = None,
     ) -> PermissionContext | None:
-        expanded = expanded_parts or _expand_guardrail_parts(command_parts)[0]
+        expanded = (
+            expanded_parts
+            or _expand_guardrail_parts(
+                command_parts,
+                workspace_roots=frozenset(self.workspace.authorized_roots),
+            )[0]
+        )
         for entry in expanded:
             if entry.access is not None:
                 continue  # Synthetic redirect operands are not executable commands.
@@ -1496,8 +1559,11 @@ class ShellPermissionResolver:
         ):
             return _denied(Diagnostic("byte_budget"))
         scratchpad_roots = effective_scratchpad_roots(self.path_authority)
+        workspace_roots = frozenset(self.workspace.authorized_roots)
         analysis = _analyze_guardrail_source(
-            args.command, scratchpad_roots=scratchpad_roots
+            args.command,
+            scratchpad_roots=scratchpad_roots,
+            workspace_roots=workspace_roots,
         )
         command_parts = list(analysis.command_parts)
         try:
@@ -1505,10 +1571,17 @@ class ShellPermissionResolver:
                 command_parts,
                 scratchpad_roots=scratchpad_roots,
                 redirect_operands=analysis.redirect_operands,
+                workspace_roots=workspace_roots,
             )
         except _UnsafeShellSyntax as exc:
             return _denied(
-                Diagnostic("command", detail=str(exc), command_part=args.command)
+                Diagnostic(
+                    "command",
+                    detail=str(exc),
+                    command_part=args.command,
+                    denial_class=exc.denial_class,
+                    alternative=exc.alternative,
+                )
             )
         expanded_command_parts = [entry.text for entry in expanded]
         if "shell analysis failed" in analysis.approval_reasons:
@@ -1520,7 +1593,15 @@ class ShellPermissionResolver:
         if guardrail_permission is not None:
             return guardrail_permission
         if inner_errors:
-            return _denied(Diagnostic("nested_analysis", related=tuple(inner_errors)))
+            return _denied(
+                Diagnostic(
+                    "nested_analysis",
+                    related=tuple(inner_errors),
+                    # Fail closed: any policy or unknown inner finding makes
+                    # the nested denial a policy denial with no alternative.
+                    denial_class=aggregate_denial_class(tuple(inner_errors)),
+                )
+            )
 
         if any(
             _split_command_tokens(part)
@@ -1548,6 +1629,23 @@ class ShellPermissionResolver:
             return path_permission
 
         if analysis.requires_approval:
+            # The whole-call denial class is decided BEFORE rendering: a call
+            # that also lacks a dangerous-command authority carries a
+            # policy-class reason, so the aggregate is a policy denial that
+            # names no alternative — suggesting one invites the refused
+            # action through another tool (AM-F). The authorization outcome
+            # is unchanged: the call was already denied, and the
+            # dangerous-command flow below still reports only the sole
+            # missing authority.
+            dangerous_permission = self._resolve_dangerous_command_permission(
+                args, expanded
+            )
+            if dangerous_permission is not None:
+                return _denied(
+                    aggregate_approval_diagnostic(
+                        analysis, _dangerous_policy_reason(dangerous_permission)
+                    )
+                )
             return _denied(analysis.approval_diagnostic)
 
         # The dangerous-command flow runs last: it only ever reports the sole

@@ -406,7 +406,15 @@ class TestOrderingInvariant:
             BashArgs(command="git push origin $(whoami)")
         )
         assert_other_denial(context)
-        assert "unsupported shell syntax" in (context.reason or "")  # type: ignore[union-attr]
+        assert context is not None
+        # The whole-call denial class is decided before rendering (AM-F): the
+        # call also lacks the git.push authority, a policy-class reason, so
+        # the aggregate is a policy denial. The unmodeled syntax is still
+        # named (never masked), but no alternative is suggested for a call
+        # that also contains a policy violation.
+        reason = context.reason or ""
+        assert "command substitution" in reason
+        assert "Instead," not in reason
 
     def test_hard_denied_git_segment_masks_a_grantable_gap(self, tmp_path: Path):
         # Unmodeled forms fail closed for the whole call: no proposal.

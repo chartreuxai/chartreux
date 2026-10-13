@@ -670,11 +670,25 @@ class SubagentRunAccumulator:
         return TaskResult(response=response, turns_used=turns_used, completed=completed)
 
 
+# The worker disclosure requirement rides in every task brief, with or without
+# a scratchpad, in both dispatch modes, and on agent reuse: whatever report
+# format the brief or a loaded skill specifies must carry the denial record
+# and the cumulative touched-path set.
+_BRIEF_DISCLOSURE = (
+    "Report disclosure: whatever report format this task or a loaded skill "
+    "specifies, your final report must include the denial record (each denied "
+    "command and the runtime's stated reason, or none) and the complete "
+    "cumulative touched-path set (every repository path you create, edit, "
+    "rename, or delete, including edits later reverted)."
+)
+
+
 def prepare_subagent_prompt(task: str, ctx: InvokeContext) -> str:
+    brief = f"{_BRIEF_DISCLOSURE}\n\n{task}"
     if ctx.scratchpad_dir is None:
-        return task
+        return brief
     return (
         f"Scratchpad directory: {ctx.scratchpad_dir}\n"
         "You can read and write files here without permission prompts.\n\n"
-        f"{task}"
+        f"{brief}"
     )

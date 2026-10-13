@@ -157,6 +157,31 @@ class TestTaskArgs:
         assert "stronger `model`" not in prompt
         assert "for corrective work, including" not in prompt
 
+    def test_task_prompt_carries_worker_report_disclosure_region(self) -> None:
+        prompt = (
+            Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/task.md"
+        ).read_text()
+
+        # The disclosure region is rendered scaffolding: the orchestrator reads
+        # that every brief must carry the denial record and touched-path set.
+        assert "$dispatch_disclosure" in prompt
+
+    @pytest.mark.parametrize("policy", [ORCHESTRATED_PRESET, STANDALONE_PRESET])
+    @pytest.mark.parametrize(
+        "catalog", [multi_model_catalog(), single_model_catalog(), SHIPPED_CATALOG]
+    )
+    def test_rendered_task_description_carries_worker_report_disclosure(
+        self, policy: DispatchPolicy, catalog: ModelCatalog
+    ) -> None:
+        rendered = render_task_description(
+            policy, roster_for(catalog, policy), task_skeleton()
+        )
+
+        assert "Every task brief must carry the worker disclosure requirement" in (
+            rendered
+        )
+        assert "including edits later reverted" in rendered
+
     def test_default_subagent_is_worker(self) -> None:
         args = TaskArgs(task="do something")
         assert args.agent_type == "worker"
@@ -592,3 +617,15 @@ def test_background_task_result_display_uses_launch_handle() -> None:
     assert display.verb == "Launched"
     assert display.message == "agent agent-1 (run run-1): provider/base"
     assert Task.project_result(result) == {"models": ["provider/base"]}
+
+    def test_task_prompt_documents_working_set_handoff(self) -> None:
+        prompt = (
+            Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/task.md"
+        ).read_text()
+
+        # The dispatch documentation surfaces the spawn handoff: the working-set
+        # files with revisions and outlines, and the append-only state blocks.
+        assert "file_state_handoff" in prompt
+        assert "working-set files" in prompt
+        assert "<file_state>" in prompt
+        assert "never rewritten" in prompt

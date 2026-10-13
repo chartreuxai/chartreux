@@ -43,14 +43,32 @@ CLI_PLACEHOLDERS: Mapping[str, str] = {
     "implement": "$dispatch_implement",
     "identity": "$dispatch_identity",
     "tools": "$dispatch_tools",
+    "disclosure": "$dispatch_disclosure",
     "routing": "$dispatch_routing",
 }
 TASK_PLACEHOLDERS: Mapping[str, str] = {
+    "disclosure": "$dispatch_disclosure",
     "reuse": "$dispatch_reuse",
     "review": "$dispatch_review",
     "routing": "$dispatch_routing",
 }
 _PLACEHOLDER_PREFIX = "$dispatch_"
+
+# The worker disclosure requirement is dispatch scaffolding: the orchestrator
+# composes every task brief, so the brief-composition rule is fixed here and
+# spliced into both the CLI prompt and the task tool description in every
+# dispatch mode. The task-brief composition seam (prepare_subagent_prompt)
+# carries the same requirement to workers whose briefs arrive with their own
+# report templates.
+_BRIEF_DISCLOSURE = (
+    "Every task brief must carry the worker disclosure requirement: whatever "
+    "report format the brief or a loaded skill specifies, the worker's final "
+    "report must include the denial record (each denied command and the "
+    "runtime's stated reason, or none) and the complete cumulative "
+    "touched-path set (every repository path the worker created, edited, "
+    "renamed, or deleted, including edits later reverted). State this in the "
+    "brief whenever it names a report format."
+)
 
 
 class DispatchRenderError(ValueError):
@@ -506,6 +524,7 @@ def render_cli_regions(policy: DispatchPolicy, shape: RosterShape) -> dict[str, 
         "implement": (_IMPLEMENT_STANDALONE if standalone else _IMPLEMENT_ORCHESTRATED),
         "identity": _IDENTITY_STANDALONE if standalone else _IDENTITY_ORCHESTRATED,
         "tools": _TOOLS_STANDALONE if standalone else _TOOLS_ORCHESTRATED,
+        "disclosure": _BRIEF_DISCLOSURE,
         "routing": render_routing_region(policy, shape),
     }
 
@@ -546,6 +565,7 @@ def render_task_regions(policy: DispatchPolicy, shape: RosterShape) -> dict[str,
             "work on a previously `@scout` agent runs at `@worker`. "
         )
     return {
+        "disclosure": _BRIEF_DISCLOSURE,
         "reuse": _REUSE_PREFIX + tier + _REUSE_SUFFIX,
         "review": (
             _REVIEW_EXAMPLE_SINGLE_MODEL if single else _REVIEW_EXAMPLE_MULTI_MODEL

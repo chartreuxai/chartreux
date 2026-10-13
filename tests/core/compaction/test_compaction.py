@@ -260,6 +260,25 @@ def test_compaction_context_preserves_summary_angle_brackets() -> None:
     assert "summary with <code>" in context
 
 
+def test_compaction_context_appends_file_state_section() -> None:
+    # B3: the bounded working-set summary rides the boundary content (the
+    # model-visible part), after the compaction summary.
+    section = "<file_state_summary>\n- /repo/a.py (revision blake2b-128:x)\n</file_state_summary>"
+    context = render_compaction_context([_user("hello")], "summary", section)
+
+    assert context.endswith(section)
+    assert "<compaction_summary>\nsummary\n</compaction_summary>" in context
+    # The section does not disturb prior-user-message parsing.
+    assert parse_previous_user_messages(context) == ["hello"]
+
+
+def test_compaction_context_without_file_state_section_is_unchanged() -> None:
+    with_section = render_compaction_context([_user("hello")], "summary", None)
+    without_section = render_compaction_context([_user("hello")], "summary")
+
+    assert with_section == without_section
+
+
 def test_budget_drops_oldest_first() -> None:
     # max_tokens=2 → 8 char budget. Walks newest-first, so "old" gets dropped.
     messages = [
@@ -455,3 +474,77 @@ def _assert_no_result_before_its_call(messages: list[LLMMessage]) -> None:
             assert message.tool_call_id in seen_calls, (
                 f"tool_result {message.tool_call_id} precedes its tool_use"
             )
+
+
+def _state_block(path: str = "/repo/a.py") -> LLMMessage:
+    return LLMMessage(
+        role=Role.user,
+        content=f"<file_state path='{path}' revision='blake2b-128:x' source='self'>\n"
+        "Working-set file state block (metadata only).\n</file_state>",
+        injected=True,
+    )
+
+
+def test_state_blocks_are_skipped_as_prior_user_messages() -> None:
+    messages = [
+        _msg(Role.system, "sys"),
+        _user("real ask"),
+        _state_block(),
+        _user("another ask"),
+    ]
+    selected = collect_prior_user_messages(messages, "prefix")
+    # Injected state blocks are system-internal injections, never preserved
+    # as prior user turns.
+    assert [m.content for m in selected] == ["real ask", "another ask"]
+
+
+def test_drop_oldest_round_drops_state_block_with_its_round() -> None:
+    messages = [
+        _msg(Role.system, "sys"),
+        _user("oldest"),
+        _msg(Role.assistant, "calls tool"),
+        _msg(Role.tool, "tool output"),
+        _state_block(),
+        _msg(Role.assistant, "replies"),
+        _user("newest"),
+    ]
+    trimmed = drop_oldest_round(messages)
+    assert trimmed is not None
+    # The oldest round (user turn + its tool traffic) drops whole; the state
+    # block opens the surviving round together with the assistant turn it
+    # preceded, so no block is ever orphaned or split from its round.
+    assert [m.content for m in trimmed] == [
+        "sys",
+        str(_state_block().content),
+        "replies",
+        "newest",
+    ]
+    # Dropping once more removes the block together with its round.
+    trimmed_again = drop_oldest_round(trimmed)
+    assert trimmed_again is not None
+    assert [m.content for m in trimmed_again] == ["sys", "newest"]
+
+
+def test_select_model_context_keeps_state_blocks_after_the_boundary() -> None:
+    boundary = LLMMessage(
+        role=Role.user,
+        content="compaction context",
+        injected=True,
+        context_boundary="compaction",
+    )
+    messages = [
+        _msg(Role.system, "sys"),
+        _user("old ask"),
+        boundary,
+        _state_block(),
+        _msg(Role.assistant, "after compaction"),
+    ]
+    selected = select_model_context(messages)
+    # State blocks after the boundary are ordinary messages: they ride the
+    # post-compaction model context like any other turn content.
+    assert [m.content for m in selected] == [
+        "sys",
+        "compaction context",
+        str(_state_block().content),
+        "after compaction",
+    ]

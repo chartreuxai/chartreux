@@ -84,6 +84,61 @@ def test_shell_feedback_redacts_registered_secret_before_preview() -> None:
     assert "\n" not in feedback
 
 
+def test_shell_feedback_redaction_and_bounds_hold_on_enriched_messages() -> None:
+    # A SYNTAX denial names the compliant alternative; the enrichment must
+    # not weaken the redaction, escaping and bounding boundary.
+    from chartreux.core.tools.builtins._shell_diagnostics import (
+        MAX_DIAGNOSTIC_LENGTH,
+        DenialClass,
+        Diagnostic,
+        render_diagnostic,
+    )
+
+    secret = "synthetic-enriched-[secret]\n" + "x" * 300
+    with sr.bind_policy(sr.ScrubPolicy(redaction_credentials=((FAKE_NAME, secret),))):
+        feedback = render_diagnostic(
+            Diagnostic(
+                "analysis",
+                detail="command substitution in " + secret,
+                denial_class=DenialClass.SYNTAX,
+                alternative=(
+                    "use read_file with offset and limit to read files; "
+                    "use grep to locate content and line numbers; "
+                    "use the edit tool to modify files"
+                ),
+            )
+        )
+    assert "synthetic-enriched" not in feedback
+    assert "REDACTED" in feedback
+    assert "\n" not in feedback
+    assert "Instead," in feedback
+    assert "use read_file with offset and limit" in feedback
+    assert len(feedback) <= MAX_DIAGNOSTIC_LENGTH
+
+
+def test_shell_feedback_redaction_holds_for_syntax_denials_end_to_end(
+    tmp_path: Path,
+) -> None:
+    # The rendered SYNTAX denial for a command substitution keeps the
+    # registered secret out of the permission feedback while still naming
+    # the compliant alternative, within the diagnostic budget.
+    from chartreux.core.tools.base import BaseToolState, ToolPermission
+    from chartreux.core.tools.builtins._shell_diagnostics import MAX_DIAGNOSTIC_LENGTH
+    from chartreux.core.tools.builtins.bash import Bash, BashArgs, BashToolConfig
+
+    secret = "synthetic-syntax-[secret]-0123456789"
+    tool = Bash(config_getter=BashToolConfig, state=BaseToolState(), cwd=tmp_path)
+    with sr.bind_policy(sr.ScrubPolicy(redaction_credentials=((FAKE_NAME, secret),))):
+        context = tool.resolve_permission(BashArgs(command=f"cat $(echo {secret})"))
+    assert context is not None and context.permission == ToolPermission.NEVER
+    feedback = context.reason or ""
+    assert secret not in feedback
+    assert "synthetic-syntax" not in feedback
+    assert "Instead," in feedback
+    assert "use read_file with offset and limit" in feedback
+    assert len(feedback) <= MAX_DIAGNOSTIC_LENGTH
+
+
 @pytest.mark.parametrize("secret", [1234567890123456, 1234567890.125])
 def test_registered_numeric_json_secrets_are_redacted_without_mutation(
     secret: int | float,

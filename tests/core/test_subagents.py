@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from pydantic import ValidationError
 import pytest
@@ -27,7 +28,9 @@ from chartreux.core.subagents import (
     TaskResult,
     UnknownAgentError,
     normalize_task_summary,
+    prepare_subagent_prompt,
 )
+from chartreux.core.tools.base import InvokeContext
 from chartreux.core.tools.builtins.bash import Bash, CapturedShellResult
 
 
@@ -436,3 +439,35 @@ def test_lifecycle_errors_and_eviction_metadata_are_distinguishable() -> None:
         ).reason
         == "ttl"
     )
+
+
+def test_prepare_subagent_prompt_carries_report_disclosure_always() -> None:
+    disclosure = (
+        "Report disclosure: whatever report format this task or a loaded skill "
+        "specifies, your final report must include the denial record (each "
+        "denied command and the runtime's stated reason, or none) and the "
+        "complete cumulative touched-path set (every repository path you "
+        "create, edit, rename, or delete, including edits later reverted)."
+    )
+    task = "Implement package AM-A."
+
+    # Without a scratchpad the brief still opens with the disclosure
+    # requirement: it reaches workers in every dispatch mode and on reuse.
+    without_scratchpad = prepare_subagent_prompt(
+        task, InvokeContext(tool_call_id="call-1")
+    )
+    assert without_scratchpad.startswith(disclosure)
+    assert without_scratchpad.endswith(task)
+    assert "Scratchpad directory" not in without_scratchpad
+
+    # With a scratchpad the framing is preserved and the disclosure still
+    # precedes the task text.
+    with_scratchpad = prepare_subagent_prompt(
+        task, InvokeContext(tool_call_id="call-2", scratchpad_dir=Path("/tmp/sp"))
+    )
+    assert with_scratchpad.startswith("Scratchpad directory: /tmp/sp\n")
+    assert (
+        "You can read and write files here without permission prompts."
+        in with_scratchpad
+    )
+    assert with_scratchpad.index(disclosure) < with_scratchpad.index(task)

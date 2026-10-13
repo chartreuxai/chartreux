@@ -8,12 +8,14 @@ notification lands after the boundary by construction.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
 from chartreux.app_server.models import PublicCheckpointEntry
 from chartreux.app_server.server import AppServer
+from chartreux.core.file_revision import FileRevision
 from chartreux.core.llm_models import Role
 from chartreux.core.subagents import WaitStatus
 from tests.app_server.test_subagents import (
@@ -31,6 +33,10 @@ from tests.stubs.app_server import (
     start_test_app_server,
 )
 from tests.stubs.fake_backend import FakeBackend
+
+
+def _matches_revision(known: FileRevision | None, expected: FileRevision) -> bool:
+    return known is not None and known.matches(expected)
 
 
 @pytest.mark.asyncio
@@ -137,6 +143,94 @@ async def test_parent_auto_compact_during_background_run_keeps_result_deliverabl
         ]
         assert boundary_positions and notification_positions
         assert max(boundary_positions) < min(notification_positions)
+    finally:
+        child_release.set()
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_auto_compact_envelope_carries_file_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The parent's auto-compaction boundary carries its working-set state.
+
+    The parent's working set (path -> last-seen revision + outline) rides the
+    compaction envelope produced while a background child runs, and structural
+    replay restores it — the child's run is undisturbed by the boundary.
+    """
+    from chartreux.core.file_revision import full_revision
+    from chartreux.core.file_state import FileStateStore
+
+    child_backend = GatedSequenceBackend([[mock_llm_chunk(content="child finished")]])
+    child_started, child_release = child_backend.add_gate()
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: child_backend
+    )
+    target = tmp_path / "mod.py"
+    target.write_text("def f():\n    return 1\n")
+    seeded = full_revision(b"def f():\n    return 1\n")
+    parent_backend = FakeBackend([
+        # Turn 1: launch the background subagent, then acknowledge it.
+        [mock_llm_chunk(content="", tool_calls=[_task_call(background=True)])],
+        [mock_llm_chunk(content="parent acknowledged the launch")],
+        # Turn 2: auto-compact fires first (summary), then the turn itself.
+        [mock_llm_chunk(content="<summary>parent compacted mid-run</summary>")],
+        [mock_llm_chunk(content="parent continued after compaction")],
+        # Notification turn after the child completes.
+        [mock_llm_chunk(content="notification acknowledged")],
+    ])
+    parent = build_test_agent_loop(
+        config=_config(), backend=parent_backend, enable_streaming=True, cwd=tmp_path
+    )
+    # The parent's working set: one observed file with revision and outline.
+    parent.file_state_context.observe_edit(str(target), seeded)
+    client = start_test_app_server(parent)
+    run_peer = client._run_peer
+    assert run_peer is not None
+    server = cast(AppServer, cast(Any, run_peer).__self__)
+    session = await attach_test_app_server_session(client)
+
+    try:
+        await _consume(session.act("launch background work"))
+        await asyncio.wait_for(child_started.wait(), timeout=5)
+        registry = legacy_backend(server).children
+        summary = (await registry.check_agents())[0]
+        assert summary.availability.value == "running"
+        assert summary.current_run_id is not None
+        agent_id = summary.agent_id
+        run_id = summary.current_run_id
+
+        # Force the parent's auto-compact to fire mid-run.
+        parent.stats.context_tokens = 500_000
+        await _consume(session.act("continue while the child works"))
+
+        # The compaction boundary carries the working-set file state next to
+        # the todo state, and structural replay restores it (metadata only).
+        boundaries = [
+            message
+            for message in parent.messages
+            if message.context_boundary == "compaction"
+        ]
+        assert boundaries
+        boundary = boundaries[-1]
+        assert boundary.tool_result is not None
+        output = boundary.tool_result.output
+        assert "file_state" in output
+        assert "todo_state" in output
+        replayed = FileStateStore.replay(parent.messages)
+        assert _matches_revision(replayed.known_revision(str(target)), seeded)
+        assert replayed.outline_for(str(target)) is not None
+        # The live store is untouched by the replay.
+        assert _matches_revision(parent.file_state.known_revision(str(target)), seeded)
+
+        # The child run survived the parent's compaction boundary untouched.
+        child_release.set()
+        wait_disposition = await asyncio.wait_for(
+            registry.wait_for_agent(agent_id, run_id), timeout=5
+        )
+        assert wait_disposition.status is WaitStatus.COMPLETED
+        assert wait_disposition.result is not None
+        assert wait_disposition.result.response == "child finished"
     finally:
         child_release.set()
         await session.close()

@@ -33,7 +33,7 @@ from chartreux.core.tools.utils import (
     resolve_tool_path,
 )
 from chartreux.core.utils import kill_async_subprocess
-from chartreux.utils.io import decode_console_safe, read_safe
+from chartreux.utils.io import decode_console_safe, read_lines_hashed, read_safe
 from chartreux.utils.tool_presentation import ToolEffectKind
 
 if TYPE_CHECKING:
@@ -42,6 +42,8 @@ if TYPE_CHECKING:
 
 _GATE_SECONDS = 0.005
 _RESTARTS = 3
+# Default context lines shown around each match in the model-facing output.
+DEFAULT_CONTEXT_LINES = 2
 
 
 class GrepBackend(StrEnum):
@@ -58,6 +60,14 @@ class GrepToolConfig(BaseToolConfig):
 
     max_output_bytes: int = Field(
         default=64_000, description="Hard cap for the total size of matched lines."
+    )
+    context_lines: int = Field(
+        default=DEFAULT_CONTEXT_LINES,
+        ge=0,
+        description=(
+            "Lines of context included around each match in the default output "
+            "(0 disables context). Context lines are never counted as matches."
+        ),
     )
     default_max_matches: int = Field(
         default=100, description="Default maximum number of matches to return."
@@ -122,6 +132,37 @@ class GrepArgs(BaseModel):
     )
 
 
+def _match_line_parts(raw: str) -> tuple[str, int | None] | None:
+    """Split a ``path:line:content`` output line into its raw path and number.
+
+    Mirrors :meth:`GrepMatch.from_output_line` (including Windows drive-letter
+    paths) but keeps the path exactly as the backend emitted it, so context
+    lines can be rendered in the same format.
+    """
+    parts = raw.split(":", 3)
+    MIN_MATCH_PARTS = 2
+    if len(parts) < MIN_MATCH_PARTS:
+        return None
+
+    # Windows drive letter: first part is a single letter (e.g. "C")
+    MIN_WINDOWS_PARTS = 3
+    is_windows_path = (
+        len(parts[0]) == 1 and parts[0].isalpha() and len(parts) >= MIN_WINDOWS_PARTS
+    )
+    if is_windows_path:
+        raw_path = f"{parts[0]}:{parts[1]}"
+        line_str = parts[2]
+    else:
+        raw_path = parts[0]
+        line_str = parts[1]
+
+    try:
+        line_num = int(line_str) if line_str else None
+    except (ValueError, TypeError):
+        line_num = None
+    return raw_path, line_num
+
+
 class GrepMatch(BaseModel):
     path: str
     line: int | None = None
@@ -136,30 +177,11 @@ class GrepMatch(BaseModel):
         cwd, so the resolved path is correct regardless of where the agent was
         launched from.
         """
-        parts = raw.split(":", 3)
-        MIN_MATCH_PARTS = 2
-        if len(parts) < MIN_MATCH_PARTS:
+        parts = _match_line_parts(raw)
+        if parts is None:
             return None
-
-        # Windows drive letter: first part is a single letter (e.g. "C")
-        MIN_WINDOWS_PARTS = 3
-        is_windows_path = (
-            len(parts[0]) == 1
-            and parts[0].isalpha()
-            and len(parts) >= MIN_WINDOWS_PARTS
-        )
-        if is_windows_path:
-            file_path = f"{parts[0]}:{parts[1]}"
-            line_str = parts[2]
-        else:
-            file_path = parts[0]
-            line_str = parts[1]
-
-        try:
-            line_num = int(line_str) if line_str else None
-        except (ValueError, TypeError):
-            line_num = None
-        return cls(path=str((base / file_path).resolve()), line=line_num)
+        raw_path, line_num = parts
+        return cls(path=str((base / raw_path).resolve()), line=line_num)
 
 
 class GrepResult(BaseModel):
@@ -168,6 +190,16 @@ class GrepResult(BaseModel):
     pattern: str = ""
     was_truncated: bool = Field(
         description="True if output was cut short by max_matches or max_output_bytes."
+    )
+    match_lines: list[str] = Field(
+        default_factory=list,
+        exclude=True,
+        description=(
+            "The actual match lines behind ``matches``; context and separator "
+            "lines are excluded. Excluded from serialization: it feeds "
+            "parsed_matches only, and duplicating the match text would double "
+            "the model-facing output."
+        ),
     )
     cwd: str = Field(
         default_factory=lambda: str(Path.cwd()),
@@ -182,8 +214,12 @@ class GrepResult(BaseModel):
     @property
     def parsed_matches(self) -> list[GrepMatch]:
         base = Path(self.cwd)
+        # Prefer the recorded match lines: the display text also carries
+        # context lines (``path-line-content``) and separators, which must
+        # never be counted or parsed as matches.
+        lines = self.match_lines if self.match_lines else self.matches.splitlines()
         results: list[GrepMatch] = []
-        for line in self.matches.splitlines():
+        for line in lines:
             if match := GrepMatch.from_output_line(line, base):
                 results.append(match)
         return results
@@ -197,6 +233,7 @@ class _GrepSettings:
     max_matches: int
     timeout: int
     cwd: Path
+    context_lines: int = DEFAULT_CONTEXT_LINES
 
 
 class _AuthorityChanged(Exception):
@@ -361,6 +398,112 @@ def _decode_output(
     return result
 
 
+def _merge_regions(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge overlapping or touching ``(start, end)`` line spans."""
+    merged: list[list[int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def _render_group(
+    raw_path: str,
+    matches: list[tuple[int, str]],
+    settings: _GrepSettings,
+    stop: threading.Event,
+) -> list[str]:
+    """Render one file's matches with surrounding context lines.
+
+    Match lines keep their original ``path:line:content`` form; context lines
+    render as ``path-line-content`` (the ripgrep/grep convention) and disjoint
+    regions are separated by ``--``. Context is read back through the same
+    bounded whole-line reader the read tool uses; a file that can no longer be
+    read contributes its match lines without context.
+    """
+    context = settings.context_lines
+    path = settings.cwd / raw_path
+    match_lines = {line_no: line for line_no, line in matches}
+    spans = [(max(1, line_no - context), line_no + context) for line_no, _ in matches]
+    output: list[str] = []
+    for region_start, region_end in _merge_regions(spans):
+        _checkpoint(stop)
+        if output:
+            output.append("--")
+        try:
+            read = read_lines_hashed(
+                path,
+                start_line=region_start,
+                limit=region_end - region_start + 1,
+                max_bytes=settings.max_output_bytes,
+            )
+        except OSError:
+            read = None
+        region = (
+            {region_start + index: text for index, text in enumerate(read.lines)}
+            if read is not None
+            else {}
+        )
+        for line_no in range(region_start, region_end + 1):
+            if line_no in match_lines:
+                output.append(match_lines[line_no])
+            elif line_no in region:
+                output.append(f"{raw_path}-{line_no}-{region[line_no]}")
+    return output
+
+
+def _expand_context(
+    selected: list[str], settings: _GrepSettings, stop: threading.Event
+) -> tuple[str, list[str]]:
+    r"""Expand kept match lines with surrounding context for the default output.
+
+    Match lines keep their ``path:line:content`` form; context lines render as
+    ``path-line-content`` and disjoint regions are separated by ``--``.
+    Overlapping or touching regions are merged so no line is emitted twice, and
+    a line that is both a match and inside another match's context is emitted
+    once, as the match. Returns the display text and the match lines, which
+    are the only lines counted by ``match_count`` and ``parsed_matches``.
+    """
+    context = settings.context_lines
+    if context <= 0 or not selected:
+        return "\n".join(selected), list(selected)
+    output: list[str] = []
+    pending: list[tuple[int, str]] = []
+    pending_path: str | None = None
+
+    def flush() -> None:
+        nonlocal pending, pending_path
+        if pending and pending_path is not None:
+            if output:
+                # Disjoint groups (different files) are separated like
+                # disjoint context regions.
+                output.append("--")
+            output.extend(_render_group(pending_path, pending, settings, stop))
+        pending = []
+        pending_path = None
+
+    for line in selected:
+        _checkpoint(stop)
+        parts = _match_line_parts(line)
+        if parts is None:
+            flush()
+            output.append(line)
+            continue
+        raw_path, line_no = parts
+        if line_no is None:
+            flush()
+            output.append(line)
+            continue
+        if pending_path is not None and raw_path != pending_path:
+            flush()
+        pending_path = raw_path
+        pending.append((line_no, line))
+    flush()
+    return "\n".join(output), list(selected)
+
+
 def _finish_output(
     kept: list[str],
     max_matches: int,
@@ -370,14 +513,15 @@ def _finish_output(
 ) -> GrepResult:
     _checkpoint(stop)
     selected = kept[:max_matches]
-    output = "\n".join(selected)
+    display, match_lines = _expand_context(selected, settings, stop)
     _checkpoint(stop)
     return GrepResult(
-        matches=output[: settings.max_output_bytes],
+        matches=display[: settings.max_output_bytes],
         match_count=len(selected),
+        match_lines=match_lines,
         pattern=pattern,
         was_truncated=len(kept) > max_matches
-        or len(output) > settings.max_output_bytes,
+        or len(display) > settings.max_output_bytes,
         cwd=str(settings.cwd),
     )
 
@@ -448,6 +592,7 @@ class Grep(
             config.default_max_matches,
             config.default_timeout,
             self.cwd,
+            config.context_lines,
         )
         manager = getattr(self, "_grep_authority_manager", None)
         if manager is None:

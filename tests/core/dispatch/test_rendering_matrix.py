@@ -33,6 +33,9 @@ def test_policy_roster_rendering_matrix(mode, policy, catalog):
     assert not re.search(r"\$dispatch(?:_[a-z_]+)?", cli + task)
     assert lint_rendered(cli, policy.mode) == ()
     assert "Route by" in task
+    # The worker disclosure requirement rides in both rendered documents.
+    assert "worker disclosure requirement" in cli
+    assert "worker disclosure requirement" in task
     if shape.single_model:
         assert all(tier not in cli and tier not in task for tier in TIERS)
     elif policy.mode.value == "orchestrated":

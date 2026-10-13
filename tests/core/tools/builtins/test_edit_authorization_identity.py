@@ -9,6 +9,7 @@ from chartreux.core.tools.base import BaseToolState, ToolPermission
 from chartreux.core.tools.builtins import edit as edit_module
 from chartreux.core.tools.builtins.edit import Edit, EditArgs, EditConfig
 from chartreux.core.tools.permissions import PermissionContext
+from chartreux.utils.io import content_revision
 from tests.mock.utils import collect_result
 
 
@@ -158,3 +159,25 @@ def test_padded_scratchpad_path_retains_permission(tmp_path: Path) -> None:
 
     assert permission is not None
     assert permission.permission is ToolPermission.ALWAYS
+
+
+@pytest.mark.asyncio
+async def test_authorized_edit_publishes_post_edit_evidence(tmp_path: Path) -> None:
+    target = tmp_path / "allowed.txt"
+    target.write_text("prefix before suffix\n", encoding="utf-8")
+    edit = _make_edit(tmp_path)
+
+    result = await collect_result(
+        edit.run(
+            EditArgs(
+                file_path=f"\t {target} \t", old_string="before", new_string="after"
+            )
+        )
+    )
+
+    assert result.replaced_count == 1
+    assert result.applied_diff == (
+        "@@ line 1 (current) @@\n- prefix before suffix\n+ prefix after suffix"
+    )
+    assert result.revision is not None
+    assert result.revision.revision == content_revision(target.read_bytes())

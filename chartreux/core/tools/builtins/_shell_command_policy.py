@@ -4292,12 +4292,12 @@ def _sed_script_paths(script: str) -> tuple[str, ...]:  # noqa: PLR0912
     index = 0
     while index < len(script):
         character = script[index]
-        if (
-            character.isspace()
-            or character in ";{},!"
-            or character.isdigit()
-            or character == "$"
-        ):
+        if character.isspace() or character in ";{},!+$" or character.isdigit():
+            # `+` is the GNU relative-address joiner (`,+N`), the form the
+            # statically expanded locate-then-print idiom produces. A `+`
+            # outside an address is a sed runtime error, never a write, and
+            # this scan continues linearly, so any later file command is
+            # still found. The `first~step` address stays unmodeled.
             index += 1
             continue
         if character == "/":  # Regex address.

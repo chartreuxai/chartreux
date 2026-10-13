@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, JsonValue, PrivateAttr, field_validator
 
 from chartreux.core.checkpoints import FileSnapshot
 from chartreux.core.events import ToolResultEvent, ToolStreamEvent
+from chartreux.core.file_revision import FileRevision
 from chartreux.core.scratchpad import is_scratchpad_display_path
 from chartreux.core.tools.base import (
     BaseTool,
@@ -17,6 +18,7 @@ from chartreux.core.tools.base import (
     ToolError,
     ToolPermission,
 )
+from chartreux.core.tools.builtins._edit_result_context import build_edit_evidence
 from chartreux.core.tools.io_port import ToolIOPort
 from chartreux.core.tools.permissions import PermissionContext
 from chartreux.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
@@ -75,6 +77,17 @@ class EditResult(BaseModel):
     message: str
     old_string: str
     new_string: str
+    # Post-edit evidence, computed from the file as it stands after the
+    # applied edit and serialized to the model (see _edit_result_context):
+    # applied_diff renders each replaced site as whole lines (old, then new)
+    # under its current line number; context is a numbered window of the
+    # current content around the first site; revision identifies the
+    # post-edit file state (None for client-mediated writes); replaced_count
+    # is the number of applied replacement sites.
+    applied_diff: str | None = None
+    context: str | None = None
+    revision: FileRevision | None = None
+    replaced_count: int = 0
     # UI hint for the diff renderer; not part of the serialized result contract.
     # One entry per replaced occurrence (replace_all yields several), each as
     # (start_line, old_lines, new_lines) where old/new are the changed snippet
@@ -236,6 +249,16 @@ class Edit(
                     await self._write_file(
                         file_path, modified, result.encoding, result.newline, tool_io
                     )
+
+                evidence = await build_edit_evidence(
+                    file_path=file_path,
+                    original=original,
+                    modified=modified,
+                    old_string=args.old_string,
+                    new_string=args.new_string,
+                    replace_all=args.replace_all,
+                    host_written=tool_io is None or not tool_io.supports_write,
+                )
         except UnicodeDecodeError as e:
             raise ToolError(
                 f"Cannot edit {file_path}: file is not valid text "
@@ -258,6 +281,10 @@ class Edit(
             message=message,
             old_string=args.old_string,
             new_string=args.new_string,
+            applied_diff=evidence.applied_diff,
+            context=evidence.context,
+            revision=evidence.revision,
+            replaced_count=evidence.replaced_count,
         )
         result._ui_occurrences = [
             (

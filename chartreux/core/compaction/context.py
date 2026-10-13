@@ -70,7 +70,9 @@ def drop_oldest_round(messages: Sequence[LLMMessage]) -> list[LLMMessage] | None
 
 
 def render_compaction_context(
-    previous_user_messages: Sequence[LLMMessage], summary: str
+    previous_user_messages: Sequence[LLMMessage],
+    summary: str,
+    file_state_section: str | None = None,
 ) -> str:
     lines = [
         "You are continuing a trajectory after a context compaction.",
@@ -94,6 +96,14 @@ def render_compaction_context(
         summary,
         _COMPACTION_SUMMARY_CLOSE,
     ])
+    if file_state_section:
+        # The working-set file state rides the envelope structurally (replayed
+        # on resume), but the envelope is not model-visible — the backend
+        # drops tool_result from the converted request. The bounded
+        # working-set summary is therefore rendered into the boundary content,
+        # so the model sees the working-set paths and their revisions right
+        # after compaction, without re-reading the files.
+        lines.extend(["", file_state_section])
     return "\n".join(lines)
 
 

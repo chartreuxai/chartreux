@@ -2299,10 +2299,11 @@ def test_executor_inner_commands_reenter_hard_policy(
 ) -> None:
     result = _w11_permission(command, tmp_path)
     assert result.permission is ToolPermission.NEVER
+    # A policy hard guard: the blocked requirement is stated plainly and no
+    # alternative deletion method is suggested.
     assert result.reason == (
         "Command denied: recursive rm option '-r' in 'rm -r build'. "
-        "This is a hard guard regardless of target. "
-        "Use non-recursive rm -- 'file', then rmdir -- 'dir'."
+        "This is a hard guard regardless of target."
     )
 
 
@@ -2394,10 +2395,14 @@ def test_executor_argv_is_not_reparsed_as_shell(tmp_path: Path, monkeypatch) -> 
         *,
         nested_source: bool = False,
         scratchpad_roots: frozenset = frozenset(),
+        workspace_roots: frozenset | None = None,
     ):
         calls.append(source)
         return original(
-            source, nested_source=nested_source, scratchpad_roots=scratchpad_roots
+            source,
+            nested_source=nested_source,
+            scratchpad_roots=scratchpad_roots,
+            workspace_roots=workspace_roots,
         )
 
     monkeypatch.setattr(resolver, "_analyze_guardrail_source", record)
@@ -2498,3 +2503,440 @@ async def test_local_shell_children_inherit_suppressed_pager(tmp_path: Path) -> 
     stdout, _stderr = await proc.communicate()
     assert proc.returncode == 0
     assert stdout == b"cat cat"
+
+
+@pytest.mark.parametrize(
+    ("command", "requirement", "alternative"),
+    [
+        (
+            "cat $(locate chartreux)",
+            "command substitution",
+            "use read_file with offset and limit to read files; "
+            "use grep to locate content and line numbers; "
+            "use the edit tool to modify files",
+        ),
+        (
+            "python3 << 'EOF'\nprint(42)\nEOF",
+            "heredocs are unsupported in v0.1",
+            "use write_file to create the content, or use read_file with "
+            "offset and limit, grep, and the edit tool for existing files",
+        ),
+        (
+            "for i in 1 2; do echo $i; done",
+            "for loop",
+            "split the work into separate simple commands, or use read_file "
+            "with offset and limit, grep, and the edit tool for file work",
+        ),
+        (
+            "echo =ls",
+            "Zsh equals expansion",
+            "drop the leading equals sign and invoke the command by its "
+            "name or absolute path",
+        ),
+        (
+            "echo $HOME",
+            "variable expansion",
+            "write the literal value directly as the argument",
+        ),
+        (
+            "bash -c 'echo $(x)'",
+            "command substitution",
+            "use read_file with offset and limit to read files",
+        ),
+    ],
+)
+def test_syntax_denials_name_the_compliant_alternative(
+    bash, command: str, requirement: str, alternative: str
+) -> None:
+    # A SYNTAX denial (unmodeled v0.1 construct) names the compliant
+    # alternative concretely.
+    context = bash.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission == ToolPermission.NEVER
+    reason = context.reason or ""
+    assert requirement in reason
+    assert "Instead," in reason
+    assert alternative in reason
+
+
+@pytest.mark.parametrize(
+    ("command", "requirements"),
+    [
+        ("rm -r build", ("This is a hard guard regardless of target.",)),
+        ("python3", ("is not allowed as a standalone command",)),
+        ("vim file.txt", ("matches denylist pattern 'vim'",)),
+        ("eval 'echo hi'", ("eval and exec cannot be safely inspected",)),
+        (
+            "PYTHONPATH=/abs python x",
+            ("dangerous environment assignment", "PYTHONPATH"),
+        ),
+        (
+            "unset PATH",
+            ("unsetting shell environment variables cannot be safely inspected",),
+        ),
+        ("echo hi > .git/config", ("redirection to protected Git metadata",)),
+        ("find . -exec id \\;", ("find execution predicates are not permitted",)),
+    ],
+)
+def test_policy_denials_state_the_requirement_and_suggest_nothing(
+    bash, command: str, requirements: tuple[str, ...]
+) -> None:
+    # A POLICY denial (deliberate security decision) states the blocked
+    # requirement plainly and suggests no alternative. The rendered detail
+    # escapes markup characters, so the requirement is asserted on
+    # escape-free fragments.
+    context = bash.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission == ToolPermission.NEVER
+    reason = context.reason or ""
+    for requirement in requirements:
+        assert requirement in reason
+    assert "Instead," not in reason
+    assert "use read_file" not in reason
+    assert "use grep" not in reason
+    assert "use the edit tool" not in reason
+    assert "use write_file" not in reason
+    assert "rmdir" not in reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Unmodeled syntax plus a policy violation in one command.
+        "PYTHONPATH=/abs cat $(ls)",
+        # A herestring leaves an unrecognized node in the command.
+        "cat <<<x",
+    ],
+)
+def test_mixed_constructs_deny_as_policy_without_alternative(
+    bash, command: str
+) -> None:
+    # Fail closed: a mixed construct is a policy denial and names no
+    # alternative, even though part of it is unmodeled syntax.
+    context = bash.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission == ToolPermission.NEVER
+    reason = context.reason or ""
+    assert "Instead," not in reason
+    assert "use read_file" not in reason
+
+
+# --- tier-2 static expansion: whitelisted idioms end to end --------------------
+
+_LocateFileBody = "alpha\nlit\nbeta\n" + "\n".join(f"line{i}" for i in range(4, 60))
+
+
+@pytest.fixture
+def locate_file(tmp_path) -> str:
+    (tmp_path / "lines.txt").write_text(_LocateFileBody + "\n")
+    return "lines.txt"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "contains", "absent"),
+    [
+        # The observed idiom.
+        (
+            "sed -n \"$(grep -n 'lit' lines.txt | head -1 | cut -d: -f1),+45p\" lines.txt",
+            ("lit", "line46"),
+            ("alpha", "line48"),
+        ),
+        # head -N with a single located line: the selector is a no-op that
+        # still narrows to one address.
+        (
+            "sed -n \"$(grep -n 'lit' lines.txt | head -2 | cut -d: -f1),+3p\" lines.txt",
+            ("lit", "line5"),
+            ("alpha", "line7"),
+        ),
+        # No head: a single match needs no selector.
+        (
+            "sed -n \"$(grep -n 'lit' lines.txt | cut -d: -f1),+45p\" lines.txt",
+            ("lit", "line46"),
+            ("alpha", "line48"),
+        ),
+        # tail -1 selects the last match.
+        (
+            "sed -n \"$(grep -n 'line' lines.txt | tail -1 | cut -d: -f1),+2p\" lines.txt",
+            ("line59",),
+            ("line56", "alpha"),
+        ),
+        # The `,Np` absolute-range suffix.
+        (
+            "sed -n \"$(grep -n 'lit' lines.txt | head -1 | cut -d: -f1),3p\" lines.txt",
+            ("lit", "beta"),
+            ("line4",),
+        ),
+    ],
+)
+async def test_sed_locate_print_idiom_executes_successfully(
+    bash,
+    locate_file: str,
+    command: str,
+    contains: tuple[str, ...],
+    absent: tuple[str, ...],
+) -> None:
+    context = bash.resolve_permission(BashArgs(command=command))
+    assert context is None or context.permission is ToolPermission.ALWAYS
+
+    result = await collect_result(bash.run(BashArgs(command=command)))
+
+    assert result.exit_code == 0
+    for fragment in contains:
+        assert fragment in result.stdout
+    for fragment in absent:
+        assert fragment not in result.stdout
+
+
+@pytest.mark.asyncio
+async def test_sed_locate_print_no_match_prints_the_whole_file(
+    bash, locate_file: str
+) -> None:
+    command = (
+        "sed -n \"$(grep -n 'absent' lines.txt | head -1 | cut -d: -f1)p\" lines.txt"
+    )
+    context = bash.resolve_permission(BashArgs(command=command))
+    assert context is None or context.permission is ToolPermission.ALWAYS
+
+    result = await collect_result(bash.run(BashArgs(command=command)))
+
+    # No match degrades to the suffix alone: `p` prints every line (benign).
+    assert result.exit_code == 0
+    assert "alpha" in result.stdout
+    assert "line59" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # head without the numeric-extraction stage: raw file content would
+        # reach the sed script (the probed write vector).
+        "sed -n \"$(grep -n 'lit' lines.txt | head -1),+45p\" lines.txt",
+        # Nested substitution inside the construct.
+        'sed -n "$(grep -n "$(id)" lines.txt | head -1 | cut -d: -f1),+45p" lines.txt',
+        # A redirect inside the substitution.
+        "sed -n \"$(grep -n 'lit' lines.txt > out.txt | head -1 | cut -d: -f1),+45p\" lines.txt",
+        # A non-literal (unquoted) grep argument.
+        'sed -n "$(grep -n lit lines.txt | head -1 | cut -d: -f1),+45p" lines.txt',
+        # Further substitution layers inside the sed script.
+        'sed -n "$((1+1))p" lines.txt',
+        # A grep source outside the workspace stays path-denied even though
+        # the idiom itself is recognized.
+        "sed -n \"$(grep -n 'lit' ../outside.txt | head -1 | cut -d: -f1),+45p\" lines.txt",
+        # Arithmetic in a write position (a sed script operand).
+        "N=2; sed -n $((N))p lines.txt",
+        # An unknown variable is not resolvable.
+        "grep -m $X lit lines.txt",
+    ],
+)
+def test_adversarial_static_expansion_shapes_deny(
+    bash, locate_file: str, command: str
+) -> None:
+    context = bash.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+def test_sed_locate_print_injection_content_never_reaches_the_script(
+    bash, tmp_path
+) -> None:
+    # The grep target contains a sed write command as file content: without
+    # the mandatory cut stage this is the probed write vector; with it, the
+    # expanded address is digits regardless of file content.
+    (tmp_path / "evil.txt").write_text("w /tmp/marker\nlit\n")
+    missing_cut = "sed -n \"$(grep -n 'lit' evil.txt | head -1),+1p\" evil.txt"
+    context = bash.resolve_permission(BashArgs(command=missing_cut))
+    assert context is not None and context.permission is ToolPermission.NEVER
+    recognized = (
+        "sed -n \"$(grep -n 'lit' evil.txt | head -1 | cut -d: -f1),+1p\" evil.txt"
+    )
+    context = bash.resolve_permission(BashArgs(command=recognized))
+    assert context is None or context.permission is ToolPermission.ALWAYS
+
+
+def test_equals_expansion_authorizes_the_resolved_command(bash) -> None:
+    # =ls resolves to the found executable path and authorizes as ls.
+    context = bash.resolve_permission(BashArgs(command="=ls --version"))
+    assert context is None or context.permission is ToolPermission.ALWAYS
+    # The resolved command goes through the NORMAL command policy: a
+    # denylisted program reached via equals stays denylisted.
+    context = bash.resolve_permission(BashArgs(command="=vim lines.txt"))
+    assert context is not None and context.permission is ToolPermission.NEVER
+    assert "matches denylist pattern 'vim'" in (context.reason or "")
+
+
+def test_equals_unresolvable_denies_with_the_established_message(bash) -> None:
+    context = bash.resolve_permission(BashArgs(command="=notacommand-xyz -la"))
+    assert context is not None and context.permission is ToolPermission.NEVER
+    reason = context.reason or ""
+    assert "Zsh equals expansion" in reason
+    assert "drop the leading equals sign" in reason
+    assert "Instead," in reason
+
+
+@pytest.mark.asyncio
+async def test_read_only_position_expansion_executes_with_inlined_literal(
+    bash, tmp_path
+) -> None:
+    (tmp_path / "matches.txt").write_text("lit\n" * 7)
+    command = "X=5; grep -m $X lit matches.txt"
+
+    context = bash.resolve_permission(BashArgs(command=command))
+    assert context is None or context.permission is ToolPermission.ALWAYS
+
+    result = await collect_result(bash.run(BashArgs(command=command)))
+
+    # The inlined literal is the real max-count: exactly five matches print.
+    assert result.exit_code == 0
+    assert result.stdout.splitlines() == ["lit"] * 5
+
+
+@pytest.mark.asyncio
+async def test_arithmetic_in_read_only_position_executes(
+    bash, locate_file: str
+) -> None:
+    command = "N=2; head -n $((N+1)) lines.txt"
+
+    context = bash.resolve_permission(BashArgs(command=command))
+    assert context is None or context.permission is ToolPermission.ALWAYS
+
+    result = await collect_result(bash.run(BashArgs(command=command)))
+
+    assert result.exit_code == 0
+    assert result.stdout.splitlines() == ["alpha", "lit", "beta"]
+
+
+def test_write_position_expansion_denies(bash, locate_file: str) -> None:
+    context = bash.resolve_permission(BashArgs(command="X=5; sed -n $X lines.txt"))
+    assert context is not None and context.permission is ToolPermission.NEVER
+    reason = context.reason or ""
+    assert "variable expansion" in reason
+    assert "Instead," in reason
+
+
+def test_dangerous_environment_still_denies_with_expansion_present(
+    bash, locate_file: str
+) -> None:
+    context = bash.resolve_permission(
+        BashArgs(command="X=5; PYTHONPATH=/abs grep -m $X lit lines.txt")
+    )
+    assert context is not None and context.permission is ToolPermission.NEVER
+    reason = context.reason or ""
+    assert "dangerous environment assignment" in reason
+    assert "PYTHONPATH" in reason
+    assert "Instead," not in reason
+
+
+# --- security-fix regression round: the AM-E attack strings deny end to end -----
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # F1: a zsh modifier/subscript suffix after a bare `$NAME` resolves
+        # to a workspace-looking operand in the policy while zsh
+        # re-interprets it (probed) into an out-of-workspace path.
+        "X=a; cat $X:s,a,../outside.txt,",
+        "X=a; cat $X:gs,a,../outside.txt,",
+        "X=a; cat $X:h",
+        "X=a; cat $X[1]",
+        "X=a; cat $X:q:s,a,../outside.txt,",
+    ],
+)
+def test_zsh_modifier_suffix_attack_strings_deny(bash, command: str) -> None:
+    context = bash.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # B1: a reassignment in a form the binding collection does not
+        # model overwrites the collected binding at runtime.
+        "X=AGENTS.md; export X=/etc/passwd; cat $X",
+        "X=AGENTS.md; typeset X=/etc/passwd; cat $X",
+        "X=AGENTS.md; readonly X=/etc/passwd; cat $X",
+        "X=AGENTS.md; declare X=/etc/passwd; cat $X",
+        "X=AGENTS.md; local X=/etc/passwd; cat $X",
+        "X=AGENTS.md; export 'X=/etc/passwd'; cat $X",
+        "X=AGENTS.md; true && X=/etc/passwd; cat $X",
+    ],
+)
+def test_stale_binding_attack_strings_deny(bash, command: str) -> None:
+    context = bash.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # H1: a splitting value is not one inert argv element under every
+        # executor; an empty value is dropped by zsh entirely.
+        'X="AGENTS.md /etc/passwd"; cat $X',
+        "X=; cat $X",
+    ],
+)
+def test_value_policy_attack_strings_deny(bash, command: str) -> None:
+    context = bash.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # F2: a device source (would hang the synchronous analysis on a
+        # FIFO) and an out-of-workspace source the simulation must never
+        # read at all.
+        "sed -n \"$(grep -n 'x' /dev/stdin | cut -d: -f1)p\" lines.txt",
+        "sed -n \"$(grep -n 'lit' ../outside.txt "
+        '| head -1 | cut -d: -f1),+45p" lines.txt',
+    ],
+)
+def test_simulation_read_attack_strings_deny(
+    bash, locate_file: str, command: str
+) -> None:
+    context = bash.resolve_permission(BashArgs(command=command))
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+def test_in_workspace_binary_and_oversized_sources_deny(bash, tmp_path) -> None:
+    # W2 and F2 at the recognizer's own gates: both sources stay
+    # in-workspace, so only the NUL-byte and size-cap guards refuse them.
+    from chartreux.core.tools.builtins._shell_static_expansion import (
+        _SIMULATION_READ_CAP_BYTES,
+    )
+
+    binary = tmp_path / "binary.txt"
+    binary.write_bytes(b"needle\n\x00binary\n")
+    context = bash.resolve_permission(
+        BashArgs(
+            command=(
+                "sed -n \"$(grep -n 'needle' binary.txt "
+                '| head -1 | cut -d: -f1),+1p" binary.txt'
+            )
+        )
+    )
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+    big = tmp_path / "big.txt"
+    big.write_bytes(b"needle\n" + b"x" * _SIMULATION_READ_CAP_BYTES)
+    context = bash.resolve_permission(
+        BashArgs(
+            command=(
+                "sed -n \"$(grep -n 'needle' big.txt "
+                '| head -1 | cut -d: -f1),+1p" big.txt'
+            )
+        )
+    )
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+def test_am_e_attack_string_controls_stay_allowed(bash, tmp_path) -> None:
+    (tmp_path / "AGENTS.md").write_text("workspace\n")
+    for command in (
+        # B1 control: a plain literal binding still resolves.
+        "X=AGENTS.md; cat $X",
+        # B1 control: the last literal binding wins.
+        "X=a; X=AGENTS.md; cat $X",
+        # F1 control: a literal suffix after a bare name is genuinely
+        # literal in zsh (probed) and still resolves.
+        "X=AGENS; cat $X.md",
+    ):
+        context = bash.resolve_permission(BashArgs(command=command))
+        assert context is None or context.permission is ToolPermission.ALWAYS, command

@@ -2,7 +2,104 @@
 
 All notable changes to Chartreux are documented in this file.
 
-## 0.5.3 (2026-10-11)
+## 0.5.4 (2026-10-12)
+
+### Added
+
+- Worker report disclosure across every output path: the denial record
+  (each denied command and the runtime's stated reason, or none) and the
+  complete cumulative touched-path set (including later-reverted edits) are
+  required in every report format layer - task-specified, skill-specified,
+  the JSON fallback, and blocker reports. The requirement is carried by the
+  worker prompt, rule 5, the dispatch scaffolding in both dispatch modes,
+  the task tool description, and the task-brief composition seam (with and
+  without a scratchpad, on launch and reuse).
+- Read continuation contract: an unbounded read that would exceed the
+  output cap returns the first chunk with its line range, total lines, a
+  traversal id, the content revision, and the next offset to continue -
+  a big file is one intentional traversal instead of an error-and-window
+  habit. Mid-traversal revision changes restart the traversal with a
+  notice; explicitly bounded offset/limit requests are honored exactly and
+  never converted; a 32 KiB chunk target leaves headroom under the cap.
+- Content revision contract (`chartreux.core.file_revision`): a
+  blake2b-128 revision computed by the tool's own read path identifies a
+  file state; client-mediated reads and writes that the host cannot attest
+  publish no revision (a documented degradation), and traversal state is
+  carried by a bounded LRU registry.
+- Grep default context: matches return +/- 2 context lines with merged
+  overlaps and per-file grouping; `match_count` and parsed matches count
+  actual matches only, never context or separator lines; the context
+  expansion applies identically to both grep backends.
+- Post-edit evidence in `EditResult`: the applied diff (per-site, capped),
+  a post-edit context window with CURRENT line numbers, and the post-edit
+  file revision - computed after the applied replacement, serialized to
+  the model; the UI-only occurrence projection is unchanged.
+- Workspace state: a stdlib-AST outline generator (symbol -> current line
+  ranges, size-capped, degrading to revision-only tracking), a bounded
+  working-set store, a tree-shared dispatcher revision registry, and
+  per-revision state blocks - one injected message per working-set
+  revision change, appended at LLM-turn start, immutable, trimmed only at
+  compaction boundaries. Children receive a spawn handoff with named
+  working-set files and current outlines; external bumps by sibling
+  workers are reported; the compaction boundary serves the bounded
+  working-set summary back to the model and replays state structurally.
+- Shell policy tier 2: statically modeled, never-executed whitelisted shell
+  idioms - the sed locate-then-print idiom (recognized only when the
+  `cut -d: -f1` numeric-extraction stage guarantees a literal numeric
+  address; the fully expanded script is authorized under the normal sed
+  policy), zsh `=command` equals expansion (resolved against PATH without
+  executing; the resolved command is authorized under its normal policy),
+  and variable/arithmetic expansion in provably read-only argument
+  positions with literal bounds (statement-level bindings only; prefix and
+  guarded assignments never bind). Unrecognized-but-recurring shapes are
+  drift-logged for tier-3 candidates.
+- Typed denial classes: every shell denial carries a SYNTAX or POLICY
+  class decided where the denial is created, with fail-closed aggregation
+  (mixed or unknown -> POLICY). SYNTAX denials name the compliant
+  alternative; POLICY denials state the blocked requirement and suggest
+  nothing (the recursive-rm alternative suggestion is removed); the whole
+  call's class is decided before rendering so a mixed syntax-plus-policy
+  denial never suggests alternatives.
+
+### Fixed
+
+- Dangerous-command once-permit leak: an allow-once permit installed before
+  the post-approval recheck is now destroyed on every exit path (resolver
+  exception, cancellation, failed recheck), so no authorization outlives a
+  failed recheck.
+- Dangerous-command revocation window: permission is revalidated after the
+  file-snapshot await and immediately before execution (covering both
+  local execution and client-terminal delegation), so a grant revoked
+  during that window blocks the call; the once permit stays
+  invocation-bound and synchronous.
+- Static-expansion authorization bypasses found by the deep review: zsh
+  `:s`/`:gs`/`:h`-family modifier and `[...]` subscript suffixes after a
+  bare `$NAME` no longer resolve (they re-interpret the operand at
+  runtime); variable bindings are invalidated by any unmodeled
+  reassignment (`export`/`typeset`/`readonly`/`declare`/`local`, guarded
+  or non-literal forms); whitespace and empty-string values never resolve;
+  the sed simulation stats its source (regular files only, 8 MiB cap)
+  before reading and the wiring pre-checks the source against the
+  workspace/scratchpad roots, so analysis never blocks on FIFOs or reads
+  out-of-workspace or oversized files; NUL-containing (binary) sources are
+  refused.
+- Workspace-state correctness from the deep review: non-vouching
+  observations (windowed and port-path reads) never erase a previously
+  vouched revision, so unchanged files no longer produce phantom
+  revision-change blocks and external-bump detection stays armed;
+  registry publication is ordered per path (superseded deliveries are
+  rejected instead of regressing tree truth); client-mediated writes
+  publish no fabricated revision.
+
+### Changed
+
+- The worker efficiency rule (Operational discipline rule 7) is deleted
+  entirely, including its batching clause; rules now run 1-6 with no
+  dangling references.
+- The recursive-rm denial message states the hard guard without suggesting
+  an alternative deletion method; the approval label is class-aware
+  (`unsupported shell syntax:` only for SYNTAX aggregates).
+
 
 ### Added
 

@@ -123,6 +123,23 @@ def test_goldens_are_deterministic() -> None:
         )
 
 
+@pytest.mark.parametrize("policy", list(SHIPPED_PRESETS.values()))
+@pytest.mark.parametrize("catalog", [SHIPPED_CATALOG, multi_model_catalog()])
+def test_rendered_prompts_carry_worker_report_disclosure(
+    policy: DispatchPolicy, catalog: ModelCatalog
+) -> None:
+    # The dispatch scaffolding tells the orchestrator that every task brief
+    # must carry the denial record and the cumulative touched-path set, in
+    # both the CLI prompt and the task tool description, in every mode.
+    cli = _render_cli(policy, catalog)
+    task = _render_task(policy, catalog)
+    for rendered in (cli, task):
+        assert "Every task brief must carry the worker disclosure requirement" in (
+            rendered
+        )
+        assert "including edits later reverted" in rendered
+
+
 @pytest.mark.parametrize("catalog", [SHIPPED_CATALOG, multi_model_catalog()])
 def test_standalone_context_valve_is_operational_and_prominent(
     catalog: ModelCatalog,

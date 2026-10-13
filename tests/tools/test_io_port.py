@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import pytest
 
@@ -109,3 +110,49 @@ async def test_canonical_bash_uses_host_terminal() -> None:
     assert result.stdout == "host output"
     assert tool_io.shell_requests[0].tool_call_id == "shell-1"
     assert tool_io.shell_requests[0].session_id == "session-1"
+
+
+def _parse_window(context: str | None) -> dict[int, str]:
+    """Parse the ``N→text`` entries of a rendered context window."""
+    assert context is not None
+    entries: dict[int, str] = {}
+    for line in context.splitlines():
+        match = re.match(r"^\s*(\d+)→(.*)$", line)
+        if match:
+            entries[int(match.group(1))] = match.group(2)
+    return entries
+
+
+@pytest.mark.asyncio
+async def test_client_mediated_edit_degrades_revision_but_keeps_evidence(
+    tmp_path: Path,
+) -> None:
+    edit_path = (tmp_path / "edit.txt").resolve()
+    edit_path.touch()
+    tool_io = FakeToolIO({edit_path: "alpha\r\nbeta\r\ngamma\r\n"})
+    context = InvokeContext(tool_call_id="call", tool_io=tool_io)
+    edit = Edit(lambda: EditConfig(), BaseToolState())
+
+    result = await collect_result(
+        edit.run(
+            EditArgs(
+                file_path=str(edit_path), old_string="beta", new_string="BETA1\nBETA2"
+            ),
+            context,
+        )
+    )
+
+    # The write is client-mediated: the host may not have the file at all, so
+    # no post-edit content revision is published (documented degradation).
+    assert result.revision is None
+    # The rest of the post-edit evidence is computed from the exact content
+    # the tool wrote to the client.
+    assert result.replaced_count == 1
+    assert result.applied_diff == ("@@ line 2 (current) @@\n- beta\n+ BETA1\n+ BETA2")
+    current = tool_io.files[edit_path].replace("\r\n", "\n").splitlines()
+    assert current == ["alpha", "BETA1", "BETA2", "gamma"]
+    window = _parse_window(result.context)
+    assert window
+    for number, text in window.items():
+        assert current[number - 1] == text
+    assert window[2] == "BETA1"

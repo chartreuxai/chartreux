@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from chartreux.core.agent_loop._file_state_context import MAX_HANDOFF_BYTES
 from chartreux.core.agent_loop.errors import EmptyLLMResponseError
 from chartreux.core.agent_loop.llm_gateway import apply_usage
 from chartreux.core.compaction import CompactionFailedError, CompactionManager
@@ -13,6 +14,9 @@ from chartreux.core.compaction.context import (
     select_model_context,
 )
 from chartreux.core.errors import ContextTooLongError
+from chartreux.core.file_outline import outline_source
+from chartreux.core.file_revision import full_revision
+from chartreux.core.file_state import MAX_TRACKED_FILES, FileStateStore
 from chartreux.core.llm_models import (
     FunctionCall,
     LLMChunk,
@@ -97,6 +101,7 @@ def _build_manager(
     messages: MessageList,
     stats: AgentStats,
     raise_on_failure: bool = False,
+    file_state: FileStateStore | None = None,
 ) -> tuple[CompactionManager, _FakeComplete]:
     cfg = build_test_vibe_config(
         models=make_test_models(auto_compact_threshold=999),
@@ -111,6 +116,7 @@ def _build_manager(
         available_tools=lambda: [],
         tool_choice=lambda: "auto",
         save=_noop,
+        file_state_getter=(lambda: file_state) if file_state is not None else None,
     )
     return manager, complete
 
@@ -692,3 +698,261 @@ async def test_dispatch_handoff_survives_repeated_overflow_and_fallback() -> Non
         _assert_pending_approval_handoff_intact(text)
         assert "missing budget means consumed" in text.lower()
     _assert_pending_approval_handoff_intact(messages[-1].content or "")
+
+
+@pytest.mark.asyncio
+async def test_compaction_envelope_carries_file_state_alongside_todo_state() -> None:
+    messages = _conversation()
+    stats = AgentStats()
+    file_state = FileStateStore()
+    file_state.record_revision("/repo/a.py", full_revision(b"a = 1\n"))
+    file_state.record_revision("/repo/b.py", full_revision(b"b = 2\n"))
+    manager, _complete = _build_manager(
+        [mock_llm_chunk(content="<summary>all done</summary>")],
+        messages=messages,
+        stats=stats,
+        file_state=file_state,
+    )
+
+    await manager.compact()
+
+    boundary = messages[-1]
+    assert boundary.context_boundary == "compaction"
+    assert boundary.tool_result is not None
+    output = boundary.tool_result.output
+    # The existing TodoState replay keeps working alongside file_state.
+    assert output["todo_state"] == {"todos": []}
+    assert "file_state" in output
+    # Structural replay restores the working-set state (metadata only).
+    replayed = FileStateStore.replay(messages)
+    assert replayed.known_revision("/repo/a.py") == full_revision(b"a = 1\n")
+    assert replayed.known_revision("/repo/b.py") == full_revision(b"b = 2\n")
+    assert len(replayed) == 2
+
+
+@pytest.mark.asyncio
+async def test_compaction_trims_file_state_to_cap_at_the_boundary() -> None:
+    messages = _conversation()
+    stats = AgentStats()
+    file_state = FileStateStore()
+    for index in range(MAX_TRACKED_FILES + 5):
+        file_state.record_revision(
+            f"/repo/file_{index}.py", full_revision(f"{index}".encode())
+        )
+    assert file_state.is_over_cap()
+    manager, _complete = _build_manager(
+        [mock_llm_chunk(content="<summary>all done</summary>")],
+        messages=messages,
+        stats=stats,
+        file_state=file_state,
+    )
+
+    await manager.compact()
+
+    # Eviction happens only here, at the boundary: the store is trimmed to the
+    # cap and the envelope carries at most MAX_TRACKED_FILES entries.
+    assert not file_state.is_over_cap()
+    assert len(file_state) == MAX_TRACKED_FILES
+    replayed = FileStateStore.replay(messages)
+    assert len(replayed) == MAX_TRACKED_FILES
+    # The oldest entries were evicted first.
+    assert "/repo/file_0.py" not in replayed
+    assert f"/repo/file_{MAX_TRACKED_FILES + 4}.py" in replayed
+
+
+@pytest.mark.asyncio
+async def test_repeated_compaction_last_boundary_wins() -> None:
+    messages = _conversation()
+    stats = AgentStats()
+    file_state = FileStateStore()
+    file_state.record_revision("/repo/a.py", full_revision(b"v1"))
+    manager, _complete = _build_manager(
+        [mock_llm_chunk(content="<summary>first</summary>")],
+        messages=messages,
+        stats=stats,
+        file_state=file_state,
+    )
+    await manager.compact()
+    # Post-compaction observation: the live store moves ahead of the envelope.
+    file_state.record_revision("/repo/a.py", full_revision(b"v2"))
+    file_state.record_revision("/repo/b.py", full_revision(b"b"))
+    manager, _complete = _build_manager(
+        [mock_llm_chunk(content="<summary>second</summary>")],
+        messages=messages,
+        stats=stats,
+        file_state=file_state,
+    )
+    await manager.compact()
+
+    replayed = FileStateStore.replay(messages)
+    assert replayed.known_revision("/repo/a.py") == full_revision(b"v2")
+    assert replayed.known_revision("/repo/b.py") == full_revision(b"b")
+
+
+@pytest.mark.asyncio
+async def test_fallback_and_overflow_compaction_still_carry_file_state() -> None:
+    messages = _conversation()
+    stats = AgentStats()
+    file_state = FileStateStore()
+    file_state.record_revision("/repo/a.py", full_revision(b"a"))
+    # Primary overflows once, then returns a tool call (fallback path), and
+    # the fallback succeeds: the envelope is built once, after the summary.
+    manager, _complete = _build_manager(
+        [
+            ContextTooLongError("p", "m"),
+            _tool_call_chunk(),
+            mock_llm_chunk(content="<summary>recovered</summary>"),
+        ],
+        messages=messages,
+        stats=stats,
+        file_state=file_state,
+    )
+
+    summary = await manager.compact()
+
+    assert summary == "recovered"
+    boundary = messages[-1]
+    assert boundary.context_boundary == "compaction"
+    assert boundary.tool_result is not None
+    assert "file_state" in boundary.tool_result.output
+    assert "todo_state" in boundary.tool_result.output
+    replayed = FileStateStore.replay(messages)
+    assert replayed.known_revision("/repo/a.py") == full_revision(b"a")
+
+
+@pytest.mark.asyncio
+async def test_compaction_boundary_content_serves_the_working_set() -> None:
+    # B3 regression: the boundary message's CONTENT — the model-visible part;
+    # the backend drops tool_result from the converted request — carries the
+    # bounded working-set summary: paths, last-seen revisions, outlines.
+    messages = _conversation()
+    stats = AgentStats()
+    file_state = FileStateStore()
+    file_state.record_observation(
+        "/repo/a.py",
+        revision=full_revision(b"def f():\n    return 1\n"),
+        outline=outline_source("def f():\n    return 1\n"),
+    )
+    file_state.record_revision("/repo/b.py", full_revision(b"b = 2\n"))
+    manager, _complete = _build_manager(
+        [mock_llm_chunk(content="<summary>all done</summary>")],
+        messages=messages,
+        stats=stats,
+        file_state=file_state,
+    )
+
+    await manager.compact()
+
+    boundary = messages[-1]
+    assert boundary.context_boundary == "compaction"
+    content = str(boundary.content)
+    # The model-facing content lists the working set with revisions and
+    # outlines, without re-reading the files.
+    assert "<file_state_summary>" in content
+    assert "/repo/a.py" in content
+    assert full_revision(b"def f():\n    return 1\n").revision in content
+    assert "function f (lines 1-2)" in content
+    assert "/repo/b.py" in content
+    assert full_revision(b"b = 2\n").revision in content
+    # The envelope still carries the structural state alongside todo_state.
+    assert boundary.tool_result is not None
+    output = boundary.tool_result.output
+    assert "file_state" in output
+    assert output["todo_state"] == {"todos": []}
+    # The boundary (with its content) is the model context after compaction.
+    model_context = select_model_context(messages)
+    assert model_context[-1] is boundary
+
+
+@pytest.mark.asyncio
+async def test_second_compaction_re_renders_the_working_set_summary() -> None:
+    # B3: each compaction boundary re-renders the current working set; the
+    # earlier boundary is immutable history.
+    messages = _conversation()
+    stats = AgentStats()
+    file_state = FileStateStore()
+    file_state.record_revision("/repo/a.py", full_revision(b"v1"))
+    manager, _complete = _build_manager(
+        [mock_llm_chunk(content="<summary>first</summary>")],
+        messages=messages,
+        stats=stats,
+        file_state=file_state,
+    )
+    await manager.compact()
+    first_boundary = messages[-1]
+    first_content = str(first_boundary.content)
+    assert full_revision(b"v1").revision in first_content
+
+    # Post-compaction observation: the live store moves ahead of the envelope.
+    file_state.record_revision("/repo/a.py", full_revision(b"v2"))
+    manager, _complete = _build_manager(
+        [mock_llm_chunk(content="<summary>second</summary>")],
+        messages=messages,
+        stats=stats,
+        file_state=file_state,
+    )
+    await manager.compact()
+
+    second_boundary = messages[-1]
+    assert second_boundary is not first_boundary
+    second_content = str(second_boundary.content)
+    # The second boundary re-renders the current working set ...
+    assert full_revision(b"v2").revision in second_content
+    assert full_revision(b"v1").revision not in second_content
+    # ... and the first boundary is unchanged (immutable history).
+    assert str(first_boundary.content) == first_content
+
+
+@pytest.mark.asyncio
+async def test_compaction_file_state_summary_is_bounded_with_a_marker() -> None:
+    # B3: the rendered working-set summary stays bounded (the store cap plus
+    # the MAX_HANDOFF_BYTES-style budget); the file list truncates with a
+    # degradation marker.
+    messages = _conversation()
+    stats = AgentStats()
+    file_state = FileStateStore()
+    big = "class Big:\n" + "".join(
+        f"    def method_{i}(self):\n        return {i}\n" for i in range(200)
+    )
+    for index in range(MAX_TRACKED_FILES):
+        file_state.record_observation(
+            f"/repo/big_{index}.py",
+            revision=full_revision(f"big{index}".encode()),
+            outline=outline_source(big),
+        )
+    manager, _complete = _build_manager(
+        [mock_llm_chunk(content="<summary>all done</summary>")],
+        messages=messages,
+        stats=stats,
+        file_state=file_state,
+    )
+
+    await manager.compact()
+
+    content = str(messages[-1].content)
+    # The store cap was enforced at the boundary (trim_to_cap) ...
+    assert not file_state.is_over_cap()
+    assert len(file_state) == MAX_TRACKED_FILES
+    # ... and the rendered section truncated with a degradation marker.
+    assert "summary budget reached" in content
+    section = content[content.index("<file_state_summary>") :]
+    assert len(section.encode("utf-8")) <= MAX_HANDOFF_BYTES + 200
+
+
+@pytest.mark.asyncio
+async def test_envelope_without_file_state_getter_is_unchanged() -> None:
+    # Backward compatibility: a manager built without a file-state getter
+    # produces exactly the pre-existing envelope and boundary content.
+    messages = _conversation()
+    stats = AgentStats()
+    manager, _complete = _build_manager(
+        [mock_llm_chunk(content="<summary>all done</summary>")],
+        messages=messages,
+        stats=stats,
+    )
+
+    await manager.compact()
+
+    assert messages[-1].tool_result is not None
+    assert messages[-1].tool_result.output == {"todo_state": {"todos": []}}
+    assert "<file_state_summary>" not in str(messages[-1].content)

@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator, Iterator
 import contextlib
 from contextlib import asynccontextmanager
+import hashlib
 import locale
 import os
 from pathlib import Path
@@ -207,6 +208,174 @@ async def read_lines_safe_async(
     """Async :func:`read_lines_safe` (runs the blocking read in a thread)."""
     return await asyncio.to_thread(
         read_lines_safe, path, start_line=start_line, limit=limit, max_bytes=max_bytes
+    )
+
+
+CONTENT_REVISION_ALGORITHM = "blake2b-128"
+_CONTENT_REVISION_DIGEST_BYTES = 16
+
+
+class ContentRevisionHasher:
+    r"""Incremental hasher producing the content-revision identifier form.
+
+    blake2b is stable across processes and platforms (unlike the built-in
+    ``hash``), cheap to feed while streaming a file, and a 128-bit digest is
+    ample for change detection. The identifier is ``"blake2b-128:<hex>"``.
+    """
+
+    def __init__(self) -> None:
+        self._hash = hashlib.blake2b(digest_size=_CONTENT_REVISION_DIGEST_BYTES)
+
+    def update(self, data: bytes) -> None:
+        self._hash.update(data)
+
+    def identifier(self) -> str:
+        return f"{CONTENT_REVISION_ALGORITHM}:{self._hash.hexdigest()}"
+
+
+def content_revision(data: bytes) -> str:
+    """Return the stable content-revision identifier for exact file bytes."""
+    hasher = ContentRevisionHasher()
+    hasher.update(data)
+    return hasher.identifier()
+
+
+class WindowReadResult(NamedTuple):
+    r"""A whole-line window of a file plus content-revision metadata.
+
+    ``lines`` are decoded and ``\n``-normalized, without trailing newlines, and
+    are never cut mid-line: a line that would exceed the remaining byte budget
+    starts the next window instead. The first selected line is exempt (it is
+    collected whole, bounded by ``max_line_bytes``) so callers can slice an
+    oversized line explicitly; ``first_line_truncated`` reports that this
+    elision happened. ``last_line_may_be_partial`` marks windows produced by a
+    transport that cuts its tail line at a byte cap (the tool I/O port), so
+    callers can avoid serving the possibly-cut line.
+
+    ``revision`` is the content revision of the entire file and is present only
+    when the read consumed the whole file: either a full scan that reached EOF
+    (any ``start_line``), or a bounded window that reached EOF starting from
+    line 1. Otherwise it is ``None`` (the window is a partial view of the
+    file, which is not a stable file-state identifier).
+
+    ``total_lines`` is the exact line count when the scan reached EOF (always
+    true for a full scan), otherwise ``None``. ``was_truncated`` is true when
+    the window stopped before end of file. ``raw_bytes`` is the number of raw
+    bytes the scan consumed, or ``None`` when unknown (tool I/O port).
+    """
+
+    lines: list[str]
+    total_lines: int | None
+    was_truncated: bool
+    revision: str | None
+    raw_bytes: int | None
+    first_line_truncated: bool
+    last_line_may_be_partial: bool
+
+
+def read_lines_hashed(
+    path: Path,
+    *,
+    start_line: int = 1,
+    limit: int,
+    max_bytes: int,
+    full_scan: bool = False,
+    max_line_bytes: int | None = None,
+) -> WindowReadResult:
+    r"""Read up to ``limit`` whole lines from ``start_line`` (1-indexed), bounded by bytes.
+
+    Streams the file line-by-line in binary. Unlike :func:`read_lines_safe`, a
+    line is never cut mid-way: when the next line would exceed the remaining
+    byte budget the window ends before it, so no served line is silently
+    truncated. The first selected line is collected whole (up to
+    ``max_line_bytes``, default ``max(4 * max_bytes, 256 KiB)``) so oversized
+    lines can be sliced explicitly by the caller.
+
+    Every consumed byte feeds a content-revision hash. With ``full_scan`` the
+    scan continues past the window to EOF, so ``total_lines`` and ``revision``
+    describe the whole file even though only the window is retained; memory
+    stays bounded by the window plus one line.
+    """
+    if max_line_bytes is None:
+        max_line_bytes = max(4 * max_bytes, 256 * 1024)
+    raw_lines: list[bytes] = []
+    bytes_read = 0
+    line_number = 0
+    raw_bytes = 0
+    was_truncated = True
+    first_line_truncated = False
+    collecting = True
+    scan_reached_eof = False
+    hasher = ContentRevisionHasher()
+
+    with path.open("rb") as f:
+        while raw_line := f.readline():
+            line_number += 1
+            raw_bytes += len(raw_line)
+            hasher.update(raw_line)
+            if not collecting or line_number < start_line:
+                continue
+            if len(raw_lines) >= limit or (
+                raw_lines and bytes_read + len(raw_line) > max_bytes
+            ):
+                # The window ends before this line; it starts the next window.
+                if not full_scan:
+                    break
+                collecting = False
+                continue
+            if not raw_lines and len(raw_line) > max_line_bytes:
+                # Oversized first line: keep a bounded slice and report the
+                # elision; the caller surfaces it explicitly.
+                raw_lines.append(raw_line[:max_line_bytes])
+                bytes_read += max_line_bytes
+                first_line_truncated = True
+                if not full_scan:
+                    break
+                collecting = False
+                continue
+            raw_lines.append(raw_line)
+            bytes_read += len(raw_line)
+        else:
+            scan_reached_eof = True
+            if collecting:
+                was_truncated = False
+
+    total_lines = line_number if scan_reached_eof else None
+    revision = (
+        hasher.identifier()
+        if scan_reached_eof and (full_scan or start_line == 1)
+        else None
+    )
+    lines = decode_safe(b"".join(raw_lines)).text.splitlines()
+    return WindowReadResult(
+        lines,
+        total_lines,
+        was_truncated,
+        revision,
+        raw_bytes,
+        first_line_truncated,
+        False,
+    )
+
+
+async def read_lines_hashed_async(
+    path: Path,
+    *,
+    start_line: int = 1,
+    limit: int,
+    max_bytes: int,
+    full_scan: bool = False,
+    max_line_bytes: int | None = None,
+) -> WindowReadResult:
+    """Async :func:`read_lines_hashed` (runs the blocking read in a thread)."""
+    return await asyncio.to_thread(
+        read_lines_hashed,
+        path,
+        start_line=start_line,
+        limit=limit,
+        max_bytes=max_bytes,
+        full_scan=full_scan,
+        max_line_bytes=max_line_bytes,
     )
 
 

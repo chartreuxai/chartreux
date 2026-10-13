@@ -34,12 +34,15 @@ carry the latest run id and outcome (single and batched).
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from chartreux.agents import AgentSafety, AgentType
+from chartreux.app_server._file_revision_registry import FileRevisionRegistry
 from chartreux.app_server._sessions import (
     AgentRecord,
     RunRecord,
@@ -47,7 +50,10 @@ from chartreux.app_server._sessions import (
     _AgentState,
     _AgentTombstone,
 )
+from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agents.models import AgentProfile
+from chartreux.core.file_revision import FileRevision, full_revision
+from chartreux.core.llm_models import FunctionCall, LLMMessage, Role, ToolCall
 from chartreux.core.message_list import MessageList
 from chartreux.core.subagents import (
     AgentAvailability,
@@ -67,6 +73,7 @@ from tests.app_server.test_subagents import (
     ImmediateFailureBackend,
     _assert_default_ephemeral_outcome,
     _background_result,
+    _config,
     _evicted_tombstone,
     _GatedWakeup,
     _idle_record,
@@ -77,8 +84,14 @@ from tests.app_server.test_subagents import (
     _stored_result,
     _zero_retention_registry,
 )
+from tests.conftest import build_test_agent_loop
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
+
+
+def _matches_revision(known: FileRevision | None, expected: FileRevision) -> bool:
+    return known is not None and known.matches(expected)
+
 
 # ---------------------------------------------------------------------------
 # Local helpers
@@ -2166,3 +2179,250 @@ async def test_batched_eviction_notification_identifies_each_run_and_outcome() -
         "launch a new agent for further work."
     )
     await registry.drain_children()
+
+
+# ---------------------------------------------------------------------------
+# Working-set spawn handoff (AM-D2): the dispatcher hands each child its named
+# working-set files + current outlines, shares one revision registry across the
+# session tree, and leaks no state across children.
+# ---------------------------------------------------------------------------
+
+
+async def _file_state_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: FakeBackend,
+    *,
+    cwd: Path,
+    seed: dict[str, bytes] | None = None,
+) -> tuple[SessionRuntimeRegistry, AgentLoop]:
+    """A retention registry whose parent owns a working set and the tree registry."""
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: backend
+    )
+    parent = build_test_agent_loop(
+        config=_config(enabled_tools=["task", "read_file", "edit"]),
+        backend=FakeBackend(),
+        cwd=cwd,
+        file_revision_registry=FileRevisionRegistry(),
+    )
+    for path, content in (seed or {}).items():
+        parent.file_state_context.observe_edit(path, full_revision(content))
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    return registry, parent
+
+
+async def _spawned_child(
+    registry: SessionRuntimeRegistry, parent: AgentLoop, task: str
+) -> AgentLoop:
+    """Spawn a background child through the registry and await its completion."""
+    ctx = InvokeContext(tool_call_id=f"spawn-{task}", session_id=parent.session_id)
+    launch = await _background_result(registry, TaskArgs(task=task), ctx)
+    assert launch.agent_id is not None
+    record = registry._agent_records[launch.agent_id]
+    run = record.current_run
+    assert run is not None
+    await run.completion_task
+    return record.runtime.agent_loop
+
+
+def _handoff_blocks(loop: AgentLoop) -> list[LLMMessage]:
+    return [
+        message
+        for message in loop.messages
+        if message.injected
+        and message.role == Role.user
+        and "file_state_handoff" in str(message.content)
+    ]
+
+
+def _state_blocks(loop: AgentLoop) -> list[LLMMessage]:
+    return [
+        message
+        for message in loop.messages
+        if message.injected
+        and message.role == Role.user
+        and "<file_state " in str(message.content)
+    ]
+
+
+def _edit_call(target: Path, old: str, new: str, call_id: str) -> ToolCall:
+    return ToolCall(
+        id=call_id,
+        index=0,
+        function=FunctionCall(
+            name="edit",
+            arguments=json.dumps({
+                "file_path": str(target),
+                "old_string": old,
+                "new_string": new,
+            }),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_handoff_gives_child_working_set_and_outlines(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "mod.py"
+    target.write_text("class Foo:\n    pass\n\n\ndef bar():\n    return 1\n")
+    backend = FakeBackend([[mock_llm_chunk(content="child done")]])
+    registry, parent = await _file_state_registry(
+        monkeypatch, backend, cwd=tmp_path, seed={str(target): target.read_bytes()}
+    )
+    try:
+        child = await _spawned_child(registry, parent, "work")
+
+        # The child receives the parent's named working set: one handoff
+        # block ahead of the task brief, with the path, its last-seen
+        # revision, and the current outline.
+        handoffs = _handoff_blocks(child)
+        assert len(handoffs) == 1
+        handoff = handoffs[0]
+        assert handoff.role == Role.user and handoff.injected is True
+        content = str(handoff.content)
+        assert str(target) in content
+        seeded = parent.file_state.known_revision(str(target))
+        assert seeded is not None
+        assert seeded.revision in content
+        assert "class Foo (lines 1-2)" in content
+        assert "function bar (lines 5-6)" in content
+        # The handoff precedes the task brief in the transcript.
+        user_messages = [
+            message for message in child.messages if message.role == Role.user
+        ]
+        assert user_messages[0] is handoff
+
+        # The child's store is seeded (a deep copy) and the revision registry
+        # is the one shared instance of the session tree.
+        assert child.file_state.known_revision(str(target)) == seeded
+        assert child.file_state.outline_for(str(target)) is not None
+        assert child.file_revision_registry is parent.file_revision_registry
+        assert child.file_state.entry(str(target)) is not parent.file_state.entry(
+            str(target)
+        )
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_spawn_handoff_absent_when_parent_has_no_working_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    backend = FakeBackend([[mock_llm_chunk(content="child done")]])
+    registry, parent = await _file_state_registry(monkeypatch, backend, cwd=tmp_path)
+    try:
+        child = await _spawned_child(registry, parent, "work")
+        assert _handoff_blocks(child) == []
+        assert len(child.file_state) == 0
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_child_state_never_leaks_to_parent_siblings_or_after_close(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "mod.py"
+    target.write_text("a = 1\n")
+    other = tmp_path / "other.py"
+    other.write_text("b = 2\n")
+    backend = FakeBackend([[mock_llm_chunk(content="child done")]])
+    registry, parent = await _file_state_registry(
+        monkeypatch, backend, cwd=tmp_path, seed={str(target): b"a = 1\n"}
+    )
+    try:
+        child_a = await _spawned_child(registry, parent, "work")
+        # The child observes another file (its own working-set extension).
+        child_a.file_state_context.observe_edit(str(other), full_revision(b"b = 2\n"))
+        child_a.file_state_context.flush_blocks()
+        assert str(other) in child_a.file_state
+
+        # A sibling spawned afterwards sees only the parent's working set.
+        child_b = await _spawned_child(registry, parent, "more")
+        assert str(target) in child_b.file_state
+        assert str(other) not in child_b.file_state
+        assert str(other) not in parent.file_state
+
+        # A child history clear resets only that child's working set; the
+        # parent's set and the tree registry survive.
+        await child_a.clear_history()
+        assert len(child_a.file_state) == 0
+        assert str(target) in parent.file_state
+        assert str(target) in child_b.file_state
+        tree_registry = parent.file_revision_registry
+        assert tree_registry is not None
+        assert tree_registry.known_revision(str(target)) is not None
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_external_bump_from_sibling_reported_in_next_block(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "mod.py"
+    target.write_text("def f():\n    return 1\n")
+    original = full_revision(b"def f():\n    return 1\n")
+    edited = full_revision(b"def f():\n    return 2\n")
+    backend = FakeBackend([
+        # Worker A's turn: edit the file, then finish.
+        [
+            mock_llm_chunk(
+                tool_calls=[_edit_call(target, "return 1", "return 2", "edit")]
+            )
+        ],
+        [mock_llm_chunk(content="A done")],
+        # Worker B's turn (driven manually below): one text reply.
+        [mock_llm_chunk(content="B done")],
+    ])
+    registry, parent = await _file_state_registry(
+        monkeypatch,
+        backend,
+        cwd=tmp_path,
+        seed={str(target): b"def f():\n    return 1\n"},
+    )
+    child_b: AgentLoop | None = None
+    try:
+        # Worker B is created (and seeded with the parent's pre-edit
+        # baseline) before worker A runs, so its baseline is deterministic.
+        child_b = await registry._runtime_factory.create_child(parent, "worker")
+        assert _matches_revision(
+            child_b.file_state.known_revision(str(target)), original
+        )
+        assert child_b.file_revision_registry is parent.file_revision_registry
+
+        # Worker A edits the file through its own loop: the edit result
+        # publishes the post-edit revision to the shared registry.
+        child_a = await _spawned_child(registry, parent, "edit")
+        assert _matches_revision(child_a.file_state.known_revision(str(target)), edited)
+        tree_registry = parent.file_revision_registry
+        assert tree_registry is not None
+        assert _matches_revision(tree_registry.known_revision(str(target)), edited)
+
+        # Worker B's next turn reports the external bump: the registry moved
+        # past B's baseline, which B never observed itself.
+        async for _event in child_b.act("look"):
+            pass
+        blocks = _state_blocks(child_b)
+        assert len(blocks) == 1
+        content = str(blocks[0].content)
+        assert "source='external'" in content
+        assert str(target) in content
+        # The fresh on-disk outline is included in the bump report.
+        assert "function f (lines 1-2)" in content
+        # The bumped revision is adopted: no repeated report on the next flush.
+        assert _matches_revision(child_b.file_state.known_revision(str(target)), edited)
+        assert child_b.file_state_context.flush_blocks() == []
+    finally:
+        if child_b is not None:
+            await child_b.aclose()
+        await registry.drain_children()
+        await parent.aclose()

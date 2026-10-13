@@ -28,6 +28,7 @@ from chartreux.app_server.models import (
     validate_history_entry,
 )
 from chartreux.core.events import ToolCallEvent, ToolResultEvent
+from chartreux.core.file_revision import FileRevision
 from chartreux.core.subagents import TaskArgs
 from chartreux.core.tools.builtins.bash import Bash, BashArgs, CapturedShellResult
 from chartreux.core.tools.builtins.edit import Edit, EditResult
@@ -359,6 +360,44 @@ def test_file_edit_projection_preserves_all_rendering_occurrences() -> None:
             FileEditEffectOccurrence(
                 start_line=2, old_text="y = bar - 2", new_text="y = qux - 2"
             ),
+        ],
+    ).model_dump(mode="json", by_alias=True)
+
+
+def test_file_edit_projection_ignores_model_facing_evidence() -> None:
+    # The post-edit evidence (applied_diff/context/revision/replaced_count) is
+    # model-facing; the UI projection must keep rendering only the occurrence
+    # hints and never leak the evidence fields into the effect output.
+    result = EditResult(
+        file="example.py",
+        message="updated",
+        old_string="bar",
+        new_string="qux",
+        applied_diff="@@ line 1 (current) @@\n- x = bar + 1\n+ x = qux + 1",
+        context="Current content, lines 1\u20131:\n        1\u2192x = qux + 1",
+        revision=FileRevision(
+            revision="blake2b-128:" + "0" * 32, size_bytes=11, line_count=1
+        ),
+        replaced_count=1,
+    )
+    result._ui_occurrences = [(1, "x = bar + 1", "x = qux + 1")]
+    event = ToolResultEvent(
+        tool_name="edit", tool_class=Edit, result=result, tool_call_id="call-1"
+    )
+    event = event.model_copy(
+        update={"presentation": ToolUIDataAdapter(Edit).get_result_presentation(event)}
+    )
+
+    completed = cast(CompletedEffectState, project_effect_state(event))
+
+    assert completed.output == FileEditEffectOutput(
+        file="example.py",
+        old_string="bar",
+        new_string="qux",
+        occurrences=[
+            FileEditEffectOccurrence(
+                start_line=1, old_text="x = bar + 1", new_text="x = qux + 1"
+            )
         ],
     ).model_dump(mode="json", by_alias=True)
 

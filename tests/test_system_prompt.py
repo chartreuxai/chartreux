@@ -545,9 +545,7 @@ def test_role_prompts_retire_stop_rule_and_failure_retries(prompt_id: str) -> No
     assert "Do not run verification reserved to the parent" not in prompt
 
 
-def test_worker_prompt_operational_discipline_has_strategy_switch_and_efficiency() -> (
-    None
-):
+def test_worker_prompt_operational_discipline_has_strategy_switch() -> None:
     prompt = SystemPrompt.WORKER.read()
 
     # Denials rule: persistent recording, consult-before-next-call, and
@@ -616,20 +614,51 @@ def test_worker_prompt_operational_discipline_has_strategy_switch_and_efficiency
     assert (
         "Disclose repeated denials and the method change in the final report." in prompt
     )
-    # Efficiency rule with its precedence carve-out and freshness exception.
+    # The edited-paths rule carries the cross-format disclosure requirement.
     assert (
-        "Efficiency: batch related shell operations into one invocation when "
-        "it can replace several sequential calls." in prompt
+        "If the task or a skill specifies a different report format, include the "
+        "denial record and the complete touched-path set in that format as well"
+        in prompt
+    )
+    assert "the disclosure requirement applies to every output form." in prompt
+    # The efficiency rule (former rule 7) is deleted entirely, batching clause
+    # included; no rule-number references point at it.
+    assert "Efficiency:" not in prompt
+    assert "batch related shell operations" not in prompt
+    assert "Read each file at most once per session" not in prompt
+
+
+def test_worker_prompt_output_format_disclosure_covers_every_layer() -> None:
+    prompt = SystemPrompt.WORKER.read()
+
+    # Every layer of the format resolution — task-specified, skill-specified,
+    # and the JSON fallback — must disclose the denial record and the complete
+    # cumulative touched-path set, including in a structured blocker report.
+    assert (
+        "Every layer of that resolution — the task-specified format, the "
+        "skill-specified format, and the JSON fallback below — must disclose "
+        "two things in the final report, including in a structured blocker "
+        "report: the denial record (each denied command and the runtime's stated "
+        "reason, or an empty list when there were none) and the complete "
+        "cumulative touched-path set (every repository path you created, edited, "
+        "renamed, or deleted, including edits later reverted; the record is "
+        "cumulative and is never rewritten to exclude reverts)." in prompt
     )
     assert (
-        "Read each file at most once per session unless it changes; after a "
-        "change, re-read only the changed region or needed range, never the "
-        "whole file to locate one edit." in prompt
+        "A task- or skill-specified format that omits either disclosure is "
+        "incomplete: add the denial record and the touched-path set to it in "
+        "that format's own terms." in prompt
+    )
+    # The JSON fallback gains an explicit denials field, and files_touched is
+    # documented as the cumulative record, not a clean-diff projection.
+    assert (
+        '"files_touched": ["the cumulative record of every repository path '
+        "created, edited, renamed, or deleted, including edits later reverted; "
+        'empty array if none"]' in prompt
     )
     assert (
-        "Unless the loaded skill requires otherwise, observe these limits; they "
-        "never forbid a bounded re-read when the file's current state matters "
-        "(before changing a file, re-read it when its current state matters)." in prompt
+        '"denials": ["each denied command with the runtime\'s stated reason, '
+        'or an empty array"]' in prompt
     )
 
 
@@ -953,7 +982,7 @@ def test_worker_prompt_dispatches_skill_first_with_format_precedence() -> None:
     # Output precedence: task-specified format, then skill format, then JSON.
     assert (
         "Return the format the task specifies when it names one; otherwise the "
-        "loaded skill's specified format; otherwise this JSON fallback:" in prompt
+        "loaded skill's specified format; otherwise this JSON fallback." in prompt
     )
     # The unconditional "return only valid JSON" wording is retired.
     assert "return only valid JSON" not in prompt

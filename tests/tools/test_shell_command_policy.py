@@ -112,6 +112,40 @@ def test_recursive_rm_diagnostic_retains_original_option(option: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "argv",
+    [
+        ["rm", "-r", "file"],
+        ["rm", "--recursive", "file"],
+        ["sed", "-f", "script.sed", "file"],
+        ["git", "reset", "--hard", "HEAD"],
+    ],
+)
+def test_policy_module_denials_classify_as_policy_without_alternative(
+    argv: list[str],
+) -> None:
+    # Denials created by the command policy layer arrive without an explicit
+    # class and fail closed to POLICY: the rendered message states the
+    # blocked requirement and names no alternative.
+    from chartreux.core.tools.builtins._shell_diagnostics import (
+        DenialClass,
+        render_diagnostic,
+    )
+
+    policy = analyze_shell_command_policy(argv)
+    assert policy.requires_approval
+    diagnostic = policy.denial_diagnostic(shlex.join(argv))
+    assert diagnostic.denial_class is DenialClass.POLICY
+    assert diagnostic.alternative is None
+    rendered = render_diagnostic(diagnostic)
+    assert "Instead," not in rendered
+    assert "use read_file" not in rendered
+    assert "use grep" not in rendered
+    assert "use the edit tool" not in rendered
+    assert "use write_file" not in rendered
+    assert "rmdir" not in rendered
+
+
+@pytest.mark.parametrize(
     "command,expected",
     [
         ('uv run python -c "print(1 * 2)"', ()),
@@ -1496,6 +1530,85 @@ def test_sed_backup_directory_suffix_is_denied(bash_tool: Bash) -> None:
         BashArgs(command="sed --in-place=../* s/a/b/ input.txt")
     )
     assert context is not None and context.permission is ToolPermission.NEVER
+
+
+@pytest.mark.parametrize("script", ["42,+45p", "42,87p", "42p", "p", "3,+2p"])
+def test_numeric_address_print_scripts_are_allowed(
+    bash_tool: Bash, script: str
+) -> None:
+    # The GNU relative-address joiner `,+N` is the form the statically
+    # expanded locate-then-print idiom produces; a hand-written literal
+    # script of the same shape is allowed by the normal sed script policy.
+    context = bash_tool.resolve_permission(
+        BashArgs(command=f"sed -n '{script}' input.txt")
+    )
+    assert context is not None and context.permission is ToolPermission.ALWAYS
+
+
+def test_sed_step_address_stays_unmodeled(bash_tool: Bash) -> None:
+    context = bash_tool.resolve_permission(BashArgs(command="sed -n '1~2p' input.txt"))
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+def test_sed_relative_address_does_not_hide_write_commands(bash_tool: Bash) -> None:
+    # The `+` skip is address-scoped in effect only: this scan continues
+    # linearly, so a file command after it is still found and denied.
+    context = bash_tool.resolve_permission(
+        BashArgs(command="sed -n '2,+45p; w ../outside' input.txt")
+    )
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+def test_sed_locate_print_idiom_is_authorized_end_to_end(bash_tool: Bash) -> None:
+    (bash_tool.cwd / "lines.txt").write_text(
+        "alpha\nlit\nbeta\n" + "\n".join(f"line{i}" for i in range(4, 60)) + "\n"
+    )
+    context = bash_tool.resolve_permission(
+        BashArgs(
+            command=(
+                "sed -n \"$(grep -n 'lit' lines.txt | head -1 "
+                '| cut -d: -f1),+45p" lines.txt'
+            )
+        )
+    )
+    assert context is not None and context.permission is ToolPermission.ALWAYS
+    # The inner pipeline's read operand stays path-checked: a source file
+    # outside the workspace denies the recognized idiom.
+    context = bash_tool.resolve_permission(
+        BashArgs(
+            command=(
+                "sed -n \"$(grep -n 'lit' ../outside.txt | head -1 "
+                '| cut -d: -f1),+45p" lines.txt'
+            )
+        )
+    )
+    assert context is not None and context.permission is ToolPermission.NEVER
+
+
+def test_sed_locate_print_multi_match_is_denied_end_to_end(bash_tool: Bash) -> None:
+    (bash_tool.cwd / "lines.txt").write_text("lit\nalpha\nlit\n")
+    context = bash_tool.resolve_permission(
+        BashArgs(
+            command=(
+                "sed -n \"$(grep -n 'lit' lines.txt | cut -d: -f1),+45p\" lines.txt"
+            )
+        )
+    )
+    assert context is not None and context.permission is ToolPermission.NEVER
+    # The resolver's guardrail denies the raw (unexpanded) script text first,
+    # so end-to-end the multi-match denial carries the sed-script message; the
+    # locate-then-print-specific reason is carried by the analysis diagnostics.
+    assert "unsupported" in (context.reason or "")
+    # Selecting one located line restores the single-address guarantee.
+    context = bash_tool.resolve_permission(
+        BashArgs(
+            command=(
+                "sed -n \"$(grep -n 'lit' lines.txt | head -1 "
+                '| cut -d: -f1),+45p" lines.txt'
+            )
+        )
+    )
+    assert context is not None and context.permission is ToolPermission.ALWAYS
 
 
 def test_inline_interpreter_switch_scans_only_real_options() -> None:
