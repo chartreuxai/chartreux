@@ -5,7 +5,6 @@ import pytest
 import respx
 
 from chartreux.core.tools.search.brave import BraveSearchProvider
-from chartreux.core.tools.search.models import MAX_UPSTREAM_JSON_BYTES
 from chartreux.core.tools.search.provider import SearchProviderError
 
 
@@ -121,62 +120,8 @@ async def test_malformed_result_entry_fails(provider: BraveSearchProvider) -> No
         await provider.search("bad", max_results=1)
 
 
-@pytest.mark.asyncio
-@respx.mock
-@pytest.mark.parametrize("status", [401, 403, 429, 500])
-async def test_http_failures_are_sanitized(
-    provider: BraveSearchProvider, status: int
-) -> None:
-    secret = "brave-secret response body"
-    respx.get("https://gateway.example/api/res/v1/web/search").mock(
-        return_value=httpx.Response(status, text=secret)
-    )
-
-    with pytest.raises(SearchProviderError) as caught:
-        await provider.search("failure", max_results=1)
-
-    assert str(caught.value) == f"Search provider returned HTTP status {status}"
-    assert secret not in str(caught.value)
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_network_failure_is_sanitized(provider: BraveSearchProvider) -> None:
-    respx.get("https://gateway.example/api/res/v1/web/search").mock(
-        side_effect=httpx.ConnectError("brave-secret")
-    )
-
-    with pytest.raises(SearchProviderError, match="Search request failed"):
-        await provider.search("failure", max_results=1)
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_oversized_body_fails_at_transport_seam(
-    provider: BraveSearchProvider,
-) -> None:
-    respx.get("https://gateway.example/api/res/v1/web/search").mock(
-        return_value=httpx.Response(200, content=b"{" + b"x" * MAX_UPSTREAM_JSON_BYTES)
-    )
-
-    with pytest.raises(SearchProviderError, match="size limit"):
-        await provider.search("large", max_results=1)
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_cross_origin_redirect_does_not_forward_credentials(
-    provider: BraveSearchProvider,
-) -> None:
-    respx.get("https://gateway.example/api/res/v1/web/search").mock(
-        return_value=httpx.Response(
-            302, headers={"Location": "https://other.example/search"}
-        )
-    )
-    target = respx.get("https://other.example/search").mock(
-        return_value=httpx.Response(200, json={"web": {"results": []}})
-    )
-
-    with pytest.raises(SearchProviderError, match="not permitted"):
-        await provider.search("redirect", max_results=1)
-    assert target.call_count == 0
+# The provider-level transport-seam tests (HTTP failure sanitization, network
+# failure, oversized body, cross-origin redirect) migrated to the adapter
+# harness in tests/tools/search/test_contract.py (stage 12c-ii), parametrized
+# over BRAVE_ADAPTER. The provider-specific envelope, credential
+# (X-Subscription-Token), and query-boundary tests above stay in this module.

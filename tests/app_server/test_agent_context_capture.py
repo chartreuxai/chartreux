@@ -171,7 +171,7 @@ async def test_actual_compaction_phase_cancel_clears_activity_and_preserves_reas
     from chartreux.core.middleware import AutoCompactMiddleware
     from chartreux.core.subagents import CancelOutcome, RetentionPolicy, TaskArgs
     from chartreux.core.tools.base import InvokeContext
-    from tests.app_server.test_subagents import (
+    from tests.app_server._subagent_test_support import (
         _background_result,
         _zero_retention_registry,
     )
@@ -430,7 +430,7 @@ async def test_child_compaction_envelope_carries_file_state(
     from chartreux.core.file_state import FileStateStore
     from chartreux.core.subagents import TaskArgs
     from chartreux.core.tools.base import InvokeContext
-    from tests.app_server.test_subagents import (
+    from tests.app_server._subagent_test_support import (
         _background_result,
         _zero_retention_registry,
     )

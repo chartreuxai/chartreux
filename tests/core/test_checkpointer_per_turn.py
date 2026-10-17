@@ -444,6 +444,8 @@ class TestTurnGate:
         cp.seal_turn()
         cp.begin_turn(2)
 
+        assert cp.has_open_turn
+
     def test_record_requires_open_turn(self) -> None:
         cp = Checkpointer()
         cp.begin_turn(1)
@@ -456,6 +458,8 @@ class TestTurnGate:
         cp.begin_turn(1)
         cp.seal_turn()
         cp.seal_turn()
+
+        assert not cp.has_open_turn
 
 
 class TestRevertPersistNoPhantom:

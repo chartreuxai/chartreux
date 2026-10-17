@@ -37,7 +37,7 @@ from chartreux.core.subagents import SubagentRunnerPort, TaskArgs
 from chartreux.core.tools.base import InvokeContext
 from chartreux.core.usage import UsageOutcome, UsagePurpose, UsageRecord
 from tests.agent_loop.test_agent_wait_steering import WaitManager, make_loop, wait_call
-from tests.app_server.test_subagents import (
+from tests.app_server._subagent_test_support import (
     BlockingBackend,
     _background_result,
     _wait_result,

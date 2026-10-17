@@ -130,6 +130,9 @@ class TestClose:
         await session.close()
         await session.close()
 
+        # The second close returned early: the backend was closed exactly once.
+        assert cast(AsyncMock, session.app_server.close).await_count == 1
+
     @pytest.mark.asyncio
     async def test_close_can_retry_failed_app_server_cleanup(self) -> None:
         session = _make_session()

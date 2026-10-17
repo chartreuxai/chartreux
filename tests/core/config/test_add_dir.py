@@ -46,6 +46,8 @@ class TestHarnessFilesManagerAdditionalDirs:
         # to the same dir.
         init_harness_files_manager("user", "project", additional_dirs=[link])
 
+        assert get_harness_files_manager()._additional_dirs == (target.resolve(),)
+
     def test_init_without_additional_dirs(self) -> None:
         reset_harness_files_manager()
         init_harness_files_manager("user", "project")
@@ -62,6 +64,8 @@ class TestHarnessFilesManagerAdditionalDirs:
         init_harness_files_manager("user", "project", additional_dirs=[d])
         # Same sources + same additional_dirs: no-op, no raise.
         init_harness_files_manager("user", "project", additional_dirs=[d])
+
+        assert get_harness_files_manager()._additional_dirs == (d.resolve(),)
 
     def test_reinit_with_different_additional_dirs_raises(self, tmp_path: Path) -> None:
         d1 = tmp_path / "extra1"

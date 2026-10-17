@@ -21,7 +21,7 @@ from chartreux.core.subagents import UnsupportedChildForkError
 from chartreux.core.tools.builtins.bash import BashArgs
 from chartreux.core.tools.builtins.read_file import ReadFileArgs
 from chartreux.core.tools.models import ToolPermission
-from tests.core.agent_loop.test_accepted_source_snapshot import make_orchestrator
+from tests.agent_loop.test_accepted_source_snapshot import make_orchestrator
 from tests.stubs.fake_backend import FakeBackend
 
 pytestmark = pytest.mark.asyncio

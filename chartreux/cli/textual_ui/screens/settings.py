@@ -2,37 +2,53 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
-from fnmatch import fnmatch
-import re
 from typing import Any, ClassVar, Literal
 
 from pydantic import JsonValue
 from rich.cells import cell_len
-from rich.segment import Segment
-from rich.style import Style
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Vertical
 from textual.content import Content
 from textual.screen import ModalScreen
-from textual.strip import Strip
-from textual.visual import VisualType
 from textual.widget import Widget
 from textual.widgets import Input, OptionList, SelectionList
 from textual.widgets.option_list import Option, OptionDoesNotExist
-from textual.widgets.selection_list import Selection
 
 from chartreux.app_server.protocol import (
     STATUS_LINE_PATHS,
     SettingDescriptorWire,
     SettingsReadResponse,
 )
+from chartreux.cli.textual_ui.screens.settings_collections import (
+    SettingsCollectionsController,
+)
+from chartreux.cli.textual_ui.screens.settings_confirmation import (
+    SettingsConfirmationController,
+)
+from chartreux.cli.textual_ui.screens.settings_editor import SettingsEditorController
+from chartreux.cli.textual_ui.screens.settings_write import SettingsWriteController
 from chartreux.cli.textual_ui.screens.status_line_settings import (
     StatusLineSettingsResult,
     StatusLineSettingsScreen,
+)
+from chartreux.cli.textual_ui.widgets.settings_help import SettingsHelp, SettingsHints
+from chartreux.cli.textual_ui.widgets.settings_lists import (
+    ConfirmationText,
+    SettingsChecklist,
+    SettingsConfirmationList,
+    SettingsGroupList,
+    SettingsOptionList,
+    _draft_values,
+    _DraftEntry,
+    _ListEditorContext,
+    inventory_item_state,  # noqa: F401
+    inventory_name_matches,  # noqa: F401
+    parse_setting_value,  # noqa: F401
+    toggle_inventory_name,  # noqa: F401
 )
 from chartreux.cli.textual_ui.widgets.shell_permissions_app import (
     ShellPermissionsApp,
@@ -42,115 +58,12 @@ from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.settings_service import SettingsService
 from chartreux.ui.shell_permissions import ShellPermissionsService
 from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
-from chartreux.ui.widgets.checklist import Checklist
-from chartreux.ui.widgets.navigable_option_list import NavigableOptionList
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.ui.widgets.vscode_compat import VscodeCompatInput
 
-DOUBLE_CLICK = 2
 MIN_MODAL_WIDTH = 84
 MIN_MODAL_HEIGHT = 28
 MIN_SHORTCUTS_WITH_OVERFLOW = 2
-
-
-@dataclass(frozen=True)
-class _DraftEntry:
-    token: int
-    value: str
-
-
-@dataclass(frozen=True)
-class _ListEditorContext:
-    mode: Literal["edit", "add-item", "add-pattern"]
-    token: int | None = None
-
-
-def _draft_values(entries: list[_DraftEntry] | None) -> list[str]:
-    return [entry.value for entry in entries or []]
-
-
-def inventory_name_matches(name: str, entries: list[str]) -> bool:
-    """Mirror the server's case-insensitive full-name glob and re: matching."""
-    for raw in entries:
-        if not (entry := (raw or "").strip()):
-            continue
-        if entry.startswith("re:"):
-            try:
-                if re.fullmatch(entry[3:], name, flags=re.IGNORECASE) is not None:
-                    return True
-            except re.error:
-                continue
-        elif fnmatch(name.lower(), entry.lower()):
-            return True
-    return False
-
-
-def inventory_item_state(
-    name: str,
-    enabled: list[str],
-    disabled: list[str],
-    *,
-    category: Literal["tools", "skills", "agents"] = "tools",
-) -> tuple[bool, bool]:
-    active = enabled + disabled if category == "tools" else enabled or disabled
-    effective = (
-        (not enabled or inventory_name_matches(name, enabled))
-        and not inventory_name_matches(name, disabled)
-        if category == "tools"
-        else inventory_name_matches(name, enabled)
-        if enabled
-        else not inventory_name_matches(name, disabled)
-    )
-    pattern_driven = any(
-        entry.lower() != name.lower() and inventory_name_matches(name, [entry])
-        for entry in active
-    )
-    return effective, pattern_driven
-
-
-def toggle_inventory_name(
-    name: str,
-    enabled: list[str],
-    disabled: list[str],
-    *,
-    is_enabled: bool,
-    category: Literal["tools", "skills", "agents"] = "tools",
-) -> tuple[list[str], list[str]]:
-    enabled, disabled = list(enabled), list(disabled)
-    if category == "tools":
-        if is_enabled:
-            enabled = [entry for entry in enabled if entry.lower() != name.lower()]
-            # An empty allowlist restores defaults, so keep this name blocked.
-            if not enabled and not inventory_name_matches(name, disabled):
-                disabled.append(name)
-        else:
-            disabled = [entry for entry in disabled if entry.lower() != name.lower()]
-            if enabled and not inventory_name_matches(name, enabled):
-                enabled.append(name)
-        return enabled, disabled
-    target = enabled if enabled else disabled
-    if is_enabled:
-        if enabled:
-            target[:] = [entry for entry in target if entry.lower() != name.lower()]
-        else:
-            target.append(name)
-    elif enabled:
-        target.append(name)
-    else:
-        target[:] = [entry for entry in target if entry.lower() != name.lower()]
-    return enabled, disabled
-
-
-class ConfirmationText(VerticalScroll):
-    """Focusable scroll target for long confirmation consequences."""
-
-    can_focus = True
-    BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("up", "scroll_up", show=False),
-        Binding("down", "scroll_down", show=False),
-        Binding("pageup", "page_up", show=False),
-        Binding("pagedown", "page_down", show=False),
-    ]
 
 
 @dataclass(frozen=True)
@@ -162,217 +75,6 @@ class _GroupPosition:
     scroll_x: float
     scroll_y: float
     cursor_position: int | None = None
-
-
-class _BoundedOptionList(OptionList):
-    """Settings-local movement never wraps or transfers focus."""
-
-    def focus_on_click(self) -> bool:
-        # Focus only after the pointer command's ownership guard has run.
-        return False
-
-    def _on_mouse_move(self, event: events.MouseMove) -> None:
-        event.stop()
-
-    def on_show(self, event: events.Show | None = None) -> None:
-        # OptionList's default Show handler scrolls *after* layout callbacks,
-        # overwriting the immediate opener's restored viewport.
-        if event is not None:
-            event.prevent_default()
-
-    def _move_bounded(self, direction: int, distance: int = 1) -> None:
-        valid = [i for i, option in enumerate(self.options) if not option.disabled]
-        if not valid:
-            self.highlighted = None
-            return
-        current = self.highlighted
-        if current not in valid:
-            self.highlighted = valid[0 if direction > 0 else -1]
-            return
-        ordinal = valid.index(current)
-        self.highlighted = valid[
-            max(0, min(len(valid) - 1, ordinal + direction * distance))
-        ]
-
-    def action_cursor_down(self) -> None:
-        self._move_bounded(1)
-
-    def action_cursor_up(self) -> None:
-        self._move_bounded(-1)
-
-    def action_first(self) -> None:
-        self.highlighted = next(
-            (i for i, option in enumerate(self.options) if not option.disabled), None
-        )
-
-    def action_last(self) -> None:
-        self.highlighted = next(
-            (
-                i
-                for i in reversed(range(self.option_count))
-                if not self.options[i].disabled
-            ),
-            None,
-        )
-
-    def action_page_down(self) -> None:
-        self._move_bounded(1, max(1, self.scrollable_content_region.height))
-
-    def action_page_up(self) -> None:
-        self._move_bounded(-1, max(1, self.scrollable_content_region.height))
-
-
-class SettingsConfirmationList(_BoundedOptionList):
-    """Page keys inspect consequences without leaving confirmation actions."""
-
-    async def _on_click(self, event: events.Click) -> None:
-        event.prevent_default()
-        event.stop()
-        screen = self.screen
-        if not isinstance(screen, SettingsScreen) or screen._busy:
-            return
-        if event.chain != 1:
-            return
-        index = event.style.meta.get("option")
-        if index is not None and not self.get_option_at_index(index).disabled:
-            self.highlighted = index
-            self.focus()
-            screen._pointer_command_started = True
-            self.action_select()
-
-    def action_page_down(self) -> None:
-        self.screen.query_one(
-            "#settings-confirmation-scroll", ConfirmationText
-        ).action_page_down()
-
-    def action_page_up(self) -> None:
-        self.screen.query_one(
-            "#settings-confirmation-scroll", ConfirmationText
-        ).action_page_up()
-
-
-class SettingsChecklist(_BoundedOptionList, Checklist):
-    """Membership activation changes only the collection draft."""
-
-    COMPONENT_CLASSES: ClassVar[set[str]] = SelectionList.COMPONENT_CLASSES
-
-    BINDINGS: ClassVar[list[BindingType]] = [
-        *SelectionList.BINDINGS,
-        Binding("j", "cursor_down", "Down", show=False),
-        Binding("k", "cursor_up", "Up", show=False),
-        Binding("enter", "select", "Toggle draft", show=False, priority=True),
-    ]
-
-    def render_line(self, y: int) -> Strip:
-        line = super().render_line(y)
-        index = self.scroll_offset.y + y
-        if index >= self.option_count:
-            return line
-        option = self.get_option_at_index(index)
-        segments = list(line)
-        if not segments:
-            return line
-        focused = self.has_focus and self.highlighted == index
-        style = Style(reverse=True, bold=True) if focused else Style()
-        if option.value.startswith(("\x00pattern:", "\x00state:")):
-            # Replace the membership column on action rows with ordinary spacing.
-            text = "".join(segment.text for segment in segments)
-            text = "     " + text[5:]
-            segments = [
-                Segment(
-                    text,
-                    (segments[0].style or self.rich_style)
-                    + style
-                    + Style(meta={"option": index}),
-                )
-            ]
-        elif focused:
-            segments = [
-                Segment(segment.text, (segment.style or self.rich_style) + style)
-                for segment in segments
-            ]
-        if self.highlighted == index:
-            text = "".join(segment.text for segment in segments)
-            cursor_style = (
-                (segments[0].style or self.rich_style)
-                + style
-                + Style(meta={"option": index})
-            )
-            segments = (
-                [
-                    Segment(f"{chrome_glyph('cursor')} ", cursor_style),
-                    Segment(text[2:], cursor_style),
-                ]
-                if focused
-                else [
-                    Segment(f"{chrome_glyph('cursor')} ", cursor_style),
-                    *list(Strip(segments).crop(2, len(text))),
-                ]
-            )
-        return Strip(segments).extend_cell_length(
-            self.size.width, self.rich_style + style
-        )
-
-    def _on_option_list_option_highlighted(
-        self, event: OptionList.OptionHighlighted
-    ) -> None:
-        event.prevent_default()
-        # A queued highlight from before a draft refresh may no longer exist.
-        if (
-            event.option_index >= self.option_count
-            or self.get_option_at_index(event.option_index) is not event.option
-        ):
-            event.stop()
-            return
-        super()._on_option_list_option_highlighted(event)
-
-    def on_selection_list_selection_highlighted(
-        self, event: SelectionList.SelectionHighlighted
-    ) -> None:
-        if isinstance(self.screen, SettingsScreen):
-            self.screen._update_help()
-            self.screen._update_hint()
-
-    async def _on_click(self, event: events.Click) -> None:
-        event.prevent_default()
-        event.stop()
-        screen = self.screen
-        if (
-            not isinstance(screen, SettingsScreen)
-            or not screen._begin_pointer_event(event)
-            or not screen._can_mutate()
-        ):
-            return
-        index = event.style.meta.get("option")
-        if index is not None and not self.get_option_at_index(index).disabled:
-            self.highlighted = index
-            self.focus()
-            if event.chain == 1:
-                self.action_select()
-
-    def action_select(self) -> None:
-        if not isinstance(self.screen, SettingsScreen) or not self.screen._can_mutate():
-            return
-        if self.highlighted is not None:
-            value = self.get_option_at_index(self.highlighted).value
-            if value.startswith(("\x00pattern:", "\x00state:")):
-                return
-            screen = self.screen
-            if (
-                isinstance(screen, SettingsScreen)
-                and screen._inventory_draft is not None
-            ):
-                if screen._toggle_inventory(value):
-                    screen._render_checklist(highlight=value)
-                return
-        super().action_select()
-
-    def on_key(self, event: events.Key) -> None:
-        if event.key == "space" and self.highlighted is not None:
-            value = self.get_option_at_index(self.highlighted).value
-            if value.startswith(("\x00pattern:", "\x00state:")):
-                event.stop()
-                event.prevent_default()
 
 
 GROUPS = (
@@ -393,192 +95,6 @@ def format_value(value: JsonValue) -> str:
     if value == "":
         return '""'
     return str(value)
-
-
-def parse_setting_value(descriptor: SettingDescriptorWire, text: str) -> JsonValue:
-    """Parse numeric text without relaxing descriptor domain constraints."""
-    try:
-        if descriptor.kind == "int":
-            value: JsonValue = int(text.strip())
-        elif descriptor.kind == "float":
-            value = float(text.strip())
-        else:
-            value = text.strip()
-        descriptor.validate_value(value)
-    except (ValueError, OverflowError) as exc:
-        bound = descriptor.minimum
-        rule = (
-            f" ({'greater than' if descriptor.exclusive_minimum else 'at least'} {bound})"
-            if bound is not None
-            else ""
-        )
-        raise ValueError(f"Enter a valid {descriptor.kind} value{rule}.") from exc
-    return value
-
-
-class SettingsGroupList(_BoundedOptionList, NavigableOptionList):
-    """Separate collection navigation surface with focus-dependent hints."""
-
-    def _on_mouse_move(self, event: events.MouseMove) -> None:
-        event.stop()
-
-    async def _on_click(self, event: events.Click) -> None:
-        event.prevent_default()
-        event.stop()
-        screen = self.screen
-        if not isinstance(screen, SettingsScreen):
-            return
-        if (
-            screen._busy
-            or not screen._begin_pointer_event(event)
-            or screen._help_open
-            or screen._confirmation is not None
-            or screen._editing is not None
-        ):
-            return
-        index = event.style.meta.get("option")
-        if index is None or self.get_option_at_index(index).disabled:
-            return
-        self.highlighted = index
-        self.focus()
-        if self.id == "settings-choices":
-            if event.chain == 1:
-                screen._select_enum_draft()
-        elif self.id == "settings-actions":
-            if event.chain == 1:
-                screen._pointer_command_started = True
-                self.action_select()
-        elif event.chain == DOUBLE_CLICK:
-            self.action_select()
-
-    def on_focus(self) -> None:
-        if isinstance(self.screen, SettingsScreen):
-            self.screen.call_later(self.screen._mark_cursor)
-
-    def on_blur(self) -> None:
-        if isinstance(self.screen, SettingsScreen):
-            self.screen.call_later(self.screen._mark_cursor)
-
-
-class SettingsOptionList(_BoundedOptionList, NavigableOptionList):
-    """Keep the list focused while printable keys edit the search query."""
-
-    def __init__(self, on_filter: Callable[[str], None], **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._query = ""
-        self.on_filter = on_filter
-        self.editing = False
-
-    def on_key(self, event: events.Key) -> None:
-        if self.editing or event.key == "space":
-            return
-        if event.key in {"j", "k"} and not self._query:
-            return
-        if event.key == "backspace":
-            self._query = self._query[:-1]
-        elif (
-            (char := event.character) is not None
-            and len(char) == 1
-            and char.isprintable()
-        ):
-            self._query += char
-        else:
-            return
-        self.on_filter(self._query)
-        event.stop()
-        event.prevent_default()
-
-    async def _on_click(self, event: events.Click) -> None:
-        event.prevent_default()
-        event.stop()
-        screen = self.screen
-        if isinstance(screen, SettingsScreen):
-            if not screen._begin_pointer_event(event):
-                return
-            if (
-                screen._busy
-                or screen._help_open
-                or screen._editing is not None
-                or screen._confirmation is not None
-            ):
-                return
-        index = event.style.meta.get("option")
-        if index is not None and not self.get_option_at_index(index).disabled:
-            self.highlighted = index
-            self.focus()
-            if event.chain == DOUBLE_CLICK:
-                self.action_select()
-
-
-class SettingsHints(NoMarkupStatic):
-    """Clickable shortcut text does not add keyboard focus stops."""
-
-    targets: list[tuple[int, int, str]]
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.targets = []
-
-    def pointer_action_at(self, x: int, y: int) -> str | None:
-        return next(
-            (action for start, end, action in self.targets if start <= x < end), None
-        )
-
-    async def on_click(self, event: events.Click) -> None:
-        action = self.pointer_action_at(event.x, event.y)
-        if action and event.chain == 1:
-            event.stop()
-            if isinstance(self.screen, SettingsScreen):
-                self.screen._pointer_command_started = True
-            await self.screen.run_action(action)
-
-
-class SettingsHelp(SettingsHints):
-    """The detail region opens help; named mutation shortcuts stay explicit."""
-
-    BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("up,k", "scroll_up", show=False),
-        Binding("down,j", "scroll_down", show=False),
-        Binding("pageup", "page_up", show=False),
-        Binding("pagedown", "page_down", show=False),
-        Binding("home", "scroll_home", show=False),
-        Binding("end", "scroll_end", show=False),
-    ]
-
-    def compose(self) -> ComposeResult:
-        yield NoMarkupStatic(self.content, id="settings-help-text")
-
-    def update(self, content: VisualType = "", *, layout: bool = True) -> None:
-        super().update(content, layout=layout)
-        if self.is_mounted:
-            self.query_one("#settings-help-text", NoMarkupStatic).update(
-                content, layout=layout
-            )
-
-    async def on_click(self, event: events.Click) -> None:
-        event.prevent_default()
-        # Child text clicks bubble with child-local coordinates.
-        action = self.pointer_action_at(
-            event.screen_x - self.region.x, event.screen_y - self.region.y
-        )
-        if action and event.chain == 1:
-            event.stop()
-            if isinstance(self.screen, SettingsScreen):
-                self.screen._pointer_command_started = True
-            await self.screen.run_action(action)
-
-    def pointer_action_at(self, x: int, y: int) -> str | None:
-        child = self.query_one("#settings-help-text", NoMarkupStatic)
-        line = "".join(
-            segment.text for segment in child.render_line(y + int(self.scroll_y))
-        )
-        for key, action in (("Ctrl+R", "remove_override"), ("Ctrl+D", "delete_item")):
-            index = line.find(key)
-            if index >= 0 and cell_len(line[:index]) <= x < cell_len(
-                line[:index]
-            ) + len(key):
-                return action
-        return "help"
 
 
 class SettingsScreen(ModalScreen[str | None]):
@@ -613,25 +129,79 @@ class SettingsScreen(ModalScreen[str | None]):
         self._needs_refresh = False
         self._cursor: str | None = None
         self._expanded: str | None = None
-        self._next_draft_token = 0
-        self._list_editor: _ListEditorContext | None = None
-        self._list_draft: list[_DraftEntry] | None = None
-        self._enum_draft: str | None = None
-        self._inventory_draft: dict[str, list[_DraftEntry]] | None = None
-        self._editing: str | None = None
         self._error = ""
         self._error_path: str | None = None
         self._unresolved: dict[str, str] = {}
-        self._confirmation: tuple[str, SettingDescriptorWire, Any] | None = None
-        self._confirmation_return_focus: _GroupPosition | None = None
         self._positions: dict[tuple[str, str], _GroupPosition] = {}
         self._group_contents_context: dict[str, str] = {}
         self._openers: dict[str, _GroupPosition] = {}
-        self._pending_navigation: SettingDescriptorWire | None = None
         self._help_open = False
         self._child_returning = False
         self._help_return_focus: _GroupPosition | None = None
         self.return_state: tuple[str, str | None, int, str | None] | None = None
+        # The write controller owns the save path; the screen is its late-bound
+        # host and keeps the _start_write/_write/_write_changes delegates.
+        self._write_controller = SettingsWriteController(self)
+        # The collections controller owns the draft token/sequence state and
+        # the collection edit/save/expand/collapse surface; the screen is its
+        # late-bound host, forwards the moved draft fields through the
+        # properties below, and keeps the collection delegates.
+        self._collections = SettingsCollectionsController(self)
+        # The editor controller owns the inline editor surface and the
+        # _editing/_list_editor state; the screen is its late-bound host,
+        # forwards the moved fields through the properties below, and keeps
+        # the editor delegates (including the on_input_* handlers).
+        self._editor = SettingsEditorController(self)
+        # The confirmation controller owns the confirmation surface and the
+        # _confirmation/_pending_navigation state (_confirmation_return_focus
+        # is internal); the screen is its late-bound host, forwards the moved
+        # fields through the properties below, and keeps the confirmation
+        # delegates (including action_delete_item/action_remove_override).
+        self._confirmation_controller = SettingsConfirmationController(self)
+
+    @property
+    def _list_draft(self) -> list[_DraftEntry] | None:
+        return self._collections._list_draft
+
+    @_list_draft.setter
+    def _list_draft(self, value: list[_DraftEntry] | None) -> None:
+        self._collections._list_draft = value
+
+    @property
+    def _enum_draft(self) -> str | None:
+        return self._collections._enum_draft
+
+    @property
+    def _inventory_draft(self) -> dict[str, list[_DraftEntry]] | None:
+        return self._collections._inventory_draft
+
+    @_inventory_draft.setter
+    def _inventory_draft(self, value: dict[str, list[_DraftEntry]] | None) -> None:
+        self._collections._inventory_draft = value
+
+    @property
+    def _list_editor(self) -> _ListEditorContext | None:
+        return self._editor._list_editor
+
+    @_list_editor.setter
+    def _list_editor(self, value: _ListEditorContext | None) -> None:
+        self._editor._list_editor = value
+
+    @property
+    def _editing(self) -> str | None:
+        return self._editor._editing
+
+    @property
+    def _confirmation(self) -> tuple[str, SettingDescriptorWire, Any] | None:
+        return self._confirmation_controller._confirmation
+
+    @property
+    def _pending_navigation(self) -> SettingDescriptorWire | None:
+        return self._confirmation_controller._pending_navigation
+
+    @_pending_navigation.setter
+    def _pending_navigation(self, value: SettingDescriptorWire | None) -> None:
+        self._confirmation_controller._pending_navigation = value
 
     def _group_context(self, group: str) -> str:
         return (
@@ -769,28 +339,15 @@ class SettingsScreen(ModalScreen[str | None]):
         self._cycle_group(-1)
 
     def _new_draft_entry(self, value: str) -> _DraftEntry:
-        entry = _DraftEntry(self._next_draft_token, value)
-        self._next_draft_token += 1
-        return entry
+        return self._collections.new_draft_entry(value)
 
     def _make_draft(self, values: list[str]) -> list[_DraftEntry]:
-        return [self._new_draft_entry(value) for value in values]
+        return self._collections.make_draft(values)
 
     def _reconcile_draft(
         self, entries: list[_DraftEntry], values: list[str]
     ) -> list[_DraftEntry]:
-        remaining = list(entries)
-        result = []
-        for value in values:
-            index = next(
-                (i for i, entry in enumerate(remaining) if entry.value == value), None
-            )
-            result.append(
-                remaining.pop(index)
-                if index is not None
-                else self._new_draft_entry(value)
-            )
-        return result
+        return self._collections.reconcile_draft(entries, values)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="settings-content"):
@@ -805,12 +362,18 @@ class SettingsScreen(ModalScreen[str | None]):
                 "Filter: type to filter · Click selects; double-click activates",
                 id="settings-filter",
             )
-            yield SettingsOptionList(self._filter, id="settings-options")
+            yield SettingsOptionList(self._filter, id="settings-options", host=self)
             yield NoMarkupStatic("", id="settings-active-editor")
-            yield SettingsGroupList(id="settings-entries", classes="expanded-body")
-            yield SettingsGroupList(id="settings-choices", classes="expanded-body")
-            yield SettingsChecklist(id="settings-checklist", classes="expanded-body")
-            yield SettingsGroupList(id="settings-actions")
+            yield SettingsGroupList(
+                id="settings-entries", classes="expanded-body", host=self
+            )
+            yield SettingsGroupList(
+                id="settings-choices", classes="expanded-body", host=self
+            )
+            yield SettingsChecklist(
+                id="settings-checklist", classes="expanded-body", host=self
+            )
+            yield SettingsGroupList(id="settings-actions", host=self)
             with Vertical(id="settings-editor"):
                 yield NoMarkupStatic("", id="settings-editor-label")
                 yield VscodeCompatInput(
@@ -820,9 +383,11 @@ class SettingsScreen(ModalScreen[str | None]):
             with Vertical(id="settings-confirmation"):
                 with ConfirmationText(id="settings-confirmation-scroll"):
                     yield NoMarkupStatic("", id="settings-confirmation-text")
-                yield SettingsConfirmationList(id="settings-confirmation-actions")
-            yield SettingsHelp("", id="settings-help")
-            yield SettingsHints("", id="settings-hint")
+                yield SettingsConfirmationList(
+                    id="settings-confirmation-actions", host=self
+                )
+            yield SettingsHelp("", id="settings-help", host=self)
+            yield SettingsHints("", id="settings-hint", host=self)
 
     def on_mount(self) -> None:
         if getattr(self.app, "_pending_callbacks", None) or getattr(
@@ -1615,13 +1180,7 @@ class SettingsScreen(ModalScreen[str | None]):
             self.focused.action_select()
 
     def _select_enum_draft(self) -> None:
-        if not self._can_mutate():
-            return
-        choices = self.query_one("#settings-choices", OptionList)
-        option = choices.highlighted_option
-        if choices.has_focus and option and str(option.id).startswith("choice:"):
-            self._enum_draft = str(option.id).split(":", 2)[2]
-            self._refresh_options()
+        self._collections.select_enum_draft()
 
     def action_select_draft(self) -> None:
         if not self._can_mutate():
@@ -1638,21 +1197,10 @@ class SettingsScreen(ModalScreen[str | None]):
             self.action_activate_focused()
 
     def _apply_collection(self, item: SettingDescriptorWire) -> None:
-        if not self._can_mutate() or self._expanded != item.path:
-            return
-        self._capture_group_position()
-        if self._inventory_draft is not None:
-            self._save_inventory(item)
-        else:
-            self._save_list(item)
+        self._collections.apply_collection(item)
 
     def _accept_enum_draft(self, item: SettingDescriptorWire) -> None:
-        if self._enum_draft not in item.choices:
-            return
-        if self._draft_is_dirty(item):
-            self._start_write(item, {item.path: self._enum_draft})
-        else:
-            self._collapse(restore_opener=False)
+        self._collections.accept_enum_draft(item)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:  # noqa: PLR0911
         if event.option_list.id == "settings-confirmation-actions":
@@ -1714,24 +1262,7 @@ class SettingsScreen(ModalScreen[str | None]):
         self._open_setting(item)
 
     def _draft_is_dirty(self, item: SettingDescriptorWire) -> bool:
-        field = self.fields.get(item.path)
-        if (
-            item.kind == "list"
-            and self._list_draft is not None
-            and self._inventory_draft is None
-        ):
-            return _draft_values(self._list_draft) != (
-                field.effective_value if field else []
-            )
-        if item.kind == "enum" and self._enum_draft is not None:
-            return self._enum_draft != (field.effective_value if field else None)
-        if self._inventory_draft is not None:
-            enabled, disabled = self._inventory_values(item.inventory or "tools")
-            return (
-                _draft_values(self._inventory_draft["enabled"]) != enabled
-                or _draft_values(self._inventory_draft["disabled"]) != disabled
-            )
-        return False
+        return self._collections.draft_is_dirty(item)
 
     def _open_setting(self, item: SettingDescriptorWire) -> None:
         if item.control == "status_line":
@@ -1874,375 +1405,59 @@ class SettingsScreen(ModalScreen[str | None]):
             self._start_write(item, {item.path: value})
 
     def _expand(self, item: SettingDescriptorWire) -> None:
-        self._remember_opener("expansion")
-        self._expanded = item.path
-        field = self.fields.get(item.path)
-        value = field.effective_value if field else None
-        if item.kind == "enum":
-            self._enum_draft = str(value) if value is not None else None
-        if item.kind == "list":
-            self._list_draft = self._make_draft(
-                [entry for entry in value if isinstance(entry, str)]
-                if isinstance(value, list)
-                else []
-            )
-        if item.control == "toggle_inventory":
-            self._open_checklist(item)
-            return
-        options = self.query_one("#settings-options", SettingsOptionList)
-        options.editing = True
-        body_id = "settings-entries" if item.kind == "list" else "settings-choices"
-        remembered = self._positions.get((body_id, item.path))
-        self._refresh_options()
-        body = self.query_one(f"#{body_id}", OptionList)
-        ids = [row.id for row in body.options]
-        target = f"choice:{item.path}:{value}"
-        if remembered is None and target in ids:
-            body.highlighted = ids.index(target)
-        body.focus(scroll_visible=remembered is None)
-        if remembered is None:
-            self.call_after_refresh(body.scroll_to_highlight)
+        self._collections.expand(item)
 
     def _save_list(self, item: SettingDescriptorWire) -> None:
-        if not self._can_mutate():
-            return
-        values = _draft_values(self._list_draft)
-        saved = self.fields.get(item.path)
-        original = saved.effective_value if saved is not None else []
-        if values != original:
-            self._start_write(item, {item.path: values})
-        else:
-            self._collapse(restore_opener=False)
+        self._collections.save_list(item)
 
     def _inventory_values(self, category: str) -> tuple[list[str], list[str]]:
-        def values(path: str) -> list[str]:
-            field = self.fields.get(path)
-            value = field.saved_value if field and field.saved_explicit else None
-            return (
-                [entry for entry in value if isinstance(entry, str)]
-                if isinstance(value, list)
-                else []
-            )
-
-        return values(f"enabled_{category}"), values(f"disabled_{category}")
+        return self._collections.inventory_values(category)
 
     def _inventory_item_state(self, name: str) -> tuple[bool, bool]:
-        draft = self._inventory_draft
-        if draft is None:
-            return False, False
-        item = next(item for item in self.catalog if item.path == self._expanded)
-        return inventory_item_state(
-            name,
-            _draft_values(draft["enabled"]),
-            _draft_values(draft["disabled"]),
-            category=item.inventory or "tools",
-        )
+        return self._collections.inventory_item_state(name)
 
     def _pattern_driven(
         self, category: Literal["tools", "skills", "agents"], name: str
     ) -> bool:
-        return self._inventory_item_state(name)[1]
+        return self._collections.pattern_driven(category, name)
 
     def _effective_inventory_item(
         self, category: Literal["tools", "skills", "agents"], name: str
     ) -> bool:
-        return self._inventory_item_state(name)[0]
+        return self._collections.effective_inventory_item(category, name)
 
     def _render_checklist(self, *, highlight: str | None = None) -> None:
-        item = next(entry for entry in self.catalog if entry.path == self._expanded)
-        category = item.inventory or "tools"
-        draft = self._inventory_draft
-        if draft is None:
-            return
-        enabled, disabled = draft["enabled"], draft["disabled"]
-        names = self.snapshot.inventories.get(category, [])
-        checklist = self.query_one("#settings-checklist", SettingsChecklist)
-        position = self._position_before_rebuild(checklist)
-        checklist.highlighted = None
-        checklist.clear_options()
-        checklist.add_options(
-            [
-                Selection(
-                    f"  {name}"
-                    + (
-                        " (pattern-controlled)"
-                        if self._pattern_driven(category, name)
-                        else ""
-                    ),
-                    name,
-                    self._effective_inventory_item(category, name),
-                    id=f"inventory:{category}:{name}",
-                )
-                for name in names
-            ]
-            + [
-                Selection(
-                    f"  {entry.value} ({side} pattern)",
-                    f"\x00pattern:{side}:{entry.token}",
-                    False,
-                    id=f"pattern:{item.path}:{side}:{entry.token}",
-                )
-                for side, values in (("enabled", enabled), ("disabled", disabled))
-                for entry in values
-                if entry.value.lower() not in {name.lower() for name in names}
-            ]
-            + (
-                []
-                if names
-                or any(
-                    entry.value.lower() not in {name.lower() for name in names}
-                    for entry in enabled + disabled
-                )
-                else [
-                    Selection(
-                        "  No members", "\x00state:members", False, id="state:members"
-                    )
-                ]
-            )
-        )
-        if position is None:
-            checklist.highlighted = 0 if checklist.option_count else None
-        self._restore_group_position(position, restore_focus=False)
-        if highlight is not None:
-            checklist.highlighted = next(
-                (
-                    index
-                    for index in range(checklist.option_count)
-                    if checklist.get_option_at_index(index).value == highlight
-                ),
-                checklist.highlighted,
-            )
-            self._capture_group_position(checklist)
-        self._update_help()
+        self._collections.render_checklist(highlight=highlight)
 
     def _toggle_inventory(self, name: str) -> bool:
-        if not self._can_mutate():
-            return False
-        draft = self._inventory_draft
-        if draft is None:
-            return False
-        item = next(item for item in self.catalog if item.path == self._expanded)
-        category = item.inventory or "tools"
-        if self._pattern_driven(category, name):
-            return False
-        is_enabled = self._effective_inventory_item(category, name)
-        enabled, disabled = toggle_inventory_name(
-            name,
-            _draft_values(draft["enabled"]),
-            _draft_values(draft["disabled"]),
-            is_enabled=is_enabled,
-            category=category,
-        )
-        draft["enabled"] = self._reconcile_draft(draft["enabled"], enabled)
-        draft["disabled"] = self._reconcile_draft(draft["disabled"], disabled)
-        return True
+        return self._collections.toggle_inventory(name)
 
     def _open_checklist(self, item: SettingDescriptorWire) -> None:
-        checklist = self.query_one("#settings-checklist", SettingsChecklist)
-        enabled, disabled = self._inventory_values(item.inventory or "tools")
-        self._inventory_draft = {
-            "enabled": self._make_draft(enabled),
-            "disabled": self._make_draft(disabled),
-        }
-        self._render_checklist()
-        options = self.query_one("#settings-options", SettingsOptionList)
-        options.editing = True
-        self._refresh_collection()
-        checklist.focus()
-        self._update_hint()
-        self._update_help()
+        self._collections.open_checklist(item)
 
     def _save_inventory(self, item: SettingDescriptorWire) -> None:
-        if not self._can_mutate():
-            return
-        draft = self._inventory_draft
-        if draft is None:
-            return
-        category = item.inventory or "tools"
-        saved_enabled, saved_disabled = self._inventory_values(category)
-        changes = {
-            f"{side}_{category}": _draft_values(draft[side])
-            for side, saved in (
-                ("enabled", saved_enabled),
-                ("disabled", saved_disabled),
-            )
-            if _draft_values(draft[side]) != saved
-        }
-        if changes:
-            self._start_write(item, changes)
-        else:
-            self._collapse(restore_opener=False)
+        self._collections.save_inventory(item)
 
     def _collapse(self, *, restore_opener: bool = True) -> None:
-        for group in self._visible_focus_groups():
-            self._capture_group_position(group)
-        path = self._expanded
-        catalog_position = self._positions.get(("settings-options", "catalog"))
-        opener = self._openers.pop("expansion", None)
-        self._expanded = None
-        self._list_draft = None
-        self._enum_draft = None
-        self._inventory_draft = None
-        self._list_editor = None
-        self._collection_visibility()
-        options = self.query_one("#settings-options", SettingsOptionList)
-        options.focus()
-        options.editing = False
-        if path is not None:
-            self._refresh_options()
-        self._restore_group_position(opener if restore_opener else catalog_position)
+        self._collections.collapse(restore_opener=restore_opener)
 
     def _begin_list_input(self, item: SettingDescriptorWire, index: str) -> None:
-        entries = self._list_draft or []
-        if index == "add":
-            self._list_editor = _ListEditorContext(
-                "add-pattern" if item.control == "toggle_inventory" else "add-item"
-            )
-            value, label = "", "Add item"
-        else:
-            token = int(index)
-            position = next(
-                (i for i, entry in enumerate(entries) if entry.token == token), None
-            )
-            if position is None:
-                return
-            self._list_editor = _ListEditorContext("edit", token)
-            value, label = entries[position].value, f"Edit item {position + 1}"
-        self._show_editor(item, value, label)
+        self._editor.begin_list_input(item, index)
 
     def _begin_input(self, item: SettingDescriptorWire) -> None:
-        field = self.fields.get(item.path)
-        value = (
-            ""
-            if field is None or field.effective_value is None
-            else str(field.effective_value)
-        )
-        self._show_editor(item, value, item.label)
+        self._editor.begin_input(item)
 
     def _show_editor(self, item: SettingDescriptorWire, value: str, label: str) -> None:
-        self._remember_opener("editor")
-        self._editing = item.path
-        self.query_one("#settings-options", SettingsOptionList).editing = True
-        self.query_one("#settings-options", SettingsOptionList).display = False
-        self._collection_visibility(hidden=True)
-        self.query_one("#settings-editor-label", NoMarkupStatic).update(
-            f"{label} — Enter adds to draft; Apply changes saves; Esc cancels"
-            if self._list_editor is not None
-            else f"{label} — Enter saves to user settings immediately; Esc cancels"
-        )
-        self.query_one("#settings-editor-error", NoMarkupStatic).update("")
-        editor = self.query_one("#settings-input", Input)
-        editor.value = value
-        editor.remove_class("-invalid")
-        self.query_one("#settings-editor").display = True
-        editor.focus()
-        self._update_hint()
+        self._editor.show_editor(item, value, label)
 
     def _cancel_input(self) -> None:
-        list_input = self._list_editor is not None
-        self._editing = None
-        self.query_one("#settings-editor").display = False
-        self.query_one("#settings-editor-error", NoMarkupStatic).update("")
-        self.query_one("#settings-input", Input).remove_class("-invalid")
-        self._collection_visibility()
-        checklist = self.query_one("#settings-checklist", SettingsChecklist)
-        if list_input and self._inventory_draft is not None:
-            self.query_one("#settings-options", SettingsOptionList).display = True
-            checklist.focus()
-        else:
-            options = self.query_one("#settings-options", SettingsOptionList)
-            options.display = True
-            options.editing = self._expanded is not None
-            if list_input:
-                self.query_one("#settings-entries").focus()
-            else:
-                options.focus()
-        self._list_editor = None
-        self._restore_group_position(self._openers.pop("editor", None))
-        self._update_hint()
+        self._editor.cancel_input()
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:  # noqa: PLR0911
-        if self._editing is None or not self._can_mutate(editor=True):
-            return
-        item = next(entry for entry in self.catalog if entry.path == self._editing)
-        if self._list_editor is not None:
-            if self._list_editor.mode == "add-pattern":
-                text = event.value.strip()
-                draft = self._inventory_draft
-                if draft is None or not text:
-                    self._cancel_input()
-                    return
-                side = "enabled" if draft["enabled"] else "disabled"
-                if text not in _draft_values(draft[side]):
-                    draft[side].append(self._new_draft_entry(text))
-                entry = next(entry for entry in draft[side] if entry.value == text)
-                self._cancel_input()
-                self._render_checklist(highlight=f"\x00pattern:{side}:{entry.token}")
-                checklist = self.query_one("#settings-checklist", SettingsChecklist)
-
-                def reveal_added_pattern() -> None:
-                    checklist.scroll_to_highlight()
-                    self._capture_group_position(checklist)
-
-                checklist.call_after_refresh(reveal_added_pattern)
-                return
-            values = list(self._list_draft or [])
-            text = event.value.strip()
-            if not text:
-                event.input.add_class("-invalid")
-                self.query_one("#settings-editor-error", NoMarkupStatic).update(
-                    "Error: Enter a nonempty item; use Ctrl+D to delete an existing item."
-                )
-                return
-            token = self._list_editor.token
-            if self._list_editor.mode == "edit":
-                position = next(
-                    (i for i, entry in enumerate(values) if entry.token == token), None
-                )
-                if position is None:
-                    self._cancel_input()
-                    return
-                entry = _DraftEntry(values[position].token, text)
-                values[position] = entry
-            else:
-                entry = self._new_draft_entry(text)
-                values.append(entry)
-            self._cancel_input()
-            self._list_draft = values
-            self._refresh_options()
-            options = self.query_one("#settings-entries", OptionList)
-            ids = [row.id for row in options.options]
-            target = f"list:{item.path}:{entry.token}"
-            if target in ids:
-                options.highlighted = ids.index(target)
-            return
-        try:
-            value = parse_setting_value(item, event.value)
-        except ValueError as exc:
-            event.input.add_class("-invalid")
-            self.query_one("#settings-editor-error", NoMarkupStatic).update(
-                f"Error: {exc}"
-            )
-            return
-        self._cancel_input()
-        self._start_write(item, {item.path: value})
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._editor.submit(event)
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        if self._editing is None or not event.input.has_class("-invalid"):
-            return
-        item = next(entry for entry in self.catalog if entry.path == self._editing)
-        if self._list_editor is not None and item.kind == "list":
-            if not event.value.strip():
-                return
-            event.input.remove_class("-invalid")
-            self.query_one("#settings-editor-error", NoMarkupStatic).update("")
-            return
-        try:
-            parse_setting_value(item, event.value)
-        except ValueError:
-            return
-        event.input.remove_class("-invalid")
-        self.query_one("#settings-editor-error", NoMarkupStatic).update("")
+        self._editor.value_changed(event)
 
     def _open_confirmation(
         self,
@@ -2252,89 +1467,12 @@ class SettingsScreen(ModalScreen[str | None]):
         message: str,
         action: str,
     ) -> None:
-        self._confirmation_return_focus = self._capture_group_position()
-        self._confirmation = (kind, item, value)
-        self.query_one("#settings-options", SettingsOptionList).display = False
-        self._collection_visibility(hidden=True)
-        self.query_one("#settings-confirmation-text", NoMarkupStatic).update(message)
-        choices = self.query_one("#settings-confirmation-actions", OptionList)
-        choices.clear_options()
-        choices.add_options([
-            Option(Content.assemble(("[Cancel]", "$foreground")), id="cancel"),
-            Option(
-                Content.assemble((
-                    f"[{action}]",
-                    "$error"
-                    if kind in {"delete", "pattern", "reset", "discard", "override"}
-                    else "$foreground",
-                )),
-                id="apply",
-            ),
-        ])
-        self.query_one("#settings-confirmation").display = True
-        choices.highlighted = 0
-        choices.focus()
-        self._update_help()
-        self._update_hint()
+        self._confirmation_controller.open_confirmation(
+            kind, item, value, message, action
+        )
 
     def _dismiss_confirmation(self, *, apply: bool = False) -> None:
-        if self._busy:
-            return
-        if (
-            apply
-            and (self.snapshot.view_only or self._needs_refresh)
-            and self._confirmation is not None
-            and self._confirmation[0] != "discard"
-        ):
-            return
-        if apply and self._help_open:
-            self._close_help()
-        pending = self._confirmation
-        self._confirmation = None
-        self.query_one("#settings-confirmation").display = False
-        options = self.query_one("#settings-options", SettingsOptionList)
-        options.display = self._editing is None
-        self._collection_visibility(hidden=self._editing is not None)
-        self._restore_group_position(self._confirmation_return_focus)
-        self._confirmation_return_focus = None
-        self._update_help()
-        self._update_hint()
-        if not apply or pending is None:
-            self._pending_navigation = None
-            return
-        kind, item, value = pending
-        if kind == "pattern":
-            side, token = value
-            if self._inventory_draft is not None:
-                self._inventory_draft[side] = [
-                    entry
-                    for entry in self._inventory_draft[side]
-                    if entry.token != token
-                ]
-                self._render_checklist()
-        elif kind == "delete":
-            entries = self._list_draft or []
-            self._list_draft = [entry for entry in entries if entry.token != value]
-            self._refresh_options()
-        elif kind == "discard":
-            self._collapse()
-            target = self._pending_navigation
-            self._pending_navigation = None
-            if target is not None:
-                options = self.query_one("#settings-options", SettingsOptionList)
-                ids = [row.id for row in options.options]
-                if target.path in ids:
-                    options.highlighted = ids.index(target.path)
-                self._open_setting(target)
-        elif kind == "status-reset":
-            self._start_write(item, value)
-        elif kind == "reset":
-            category = item.inventory or "tools"
-            self._start_write(
-                item, {f"enabled_{category}": None, f"disabled_{category}": None}
-            )
-        else:
-            self._start_write(item, {item.path: value})
+        self._confirmation_controller.dismiss_confirmation(apply=apply)
 
     def on_key(self, event: events.Key) -> None:
         if self._confirmation is not None:
@@ -2344,159 +1482,23 @@ class SettingsScreen(ModalScreen[str | None]):
             event.stop()
             event.prevent_default()
 
-    def action_delete_item(self) -> None:  # noqa: PLR0911
-        if not self._can_mutate() or self._expanded is None:
-            return
-        checklist = self.query_one("#settings-checklist", SettingsChecklist)
-        if self._inventory_draft is not None and checklist.has_focus:
-            value = checklist.get_option_at_index(checklist.highlighted or 0).value
-            if value.startswith("\x00pattern:"):
-                _, side, index = value.rsplit(":", 2)
-                item = next(
-                    entry for entry in self.catalog if entry.path == self._expanded
-                )
-                target = next(
-                    (
-                        entry.value
-                        for entry in self._inventory_draft[side]
-                        if entry.token == int(index)
-                    ),
-                    None,
-                )
-                if target is None:
-                    return
-                self._open_confirmation(
-                    "pattern",
-                    item,
-                    (side, int(index)),
-                    f"Delete pattern {target} from {side}_{item.inventory}? Cancel preserves the pattern and current draft.",
-                    "Delete pattern",
-                )
-            return
-        options = self.query_one("#settings-entries", OptionList)
-        if not options.has_focus:
-            return
-        option = options.highlighted_option
-        identifier = str(option.id) if option and option.id else ""
-        if not identifier.startswith(f"list:{self._expanded}:"):
-            return
-        index = identifier.rsplit(":", 1)[-1]
-        if not index.isdigit():
-            return
-        item = next(entry for entry in self.catalog if entry.path == self._expanded)
-        target = next(
-            (
-                entry.value
-                for entry in self._list_draft or []
-                if entry.token == int(index)
-            ),
-            None,
-        )
-        if target is None:
-            return
-        self._open_confirmation(
-            "delete",
-            item,
-            int(index),
-            f"Delete {target} from the {item.label} draft? Apply changes will save the shortened list. Cancel preserves the item and stored list.",
-            "Delete item",
-        )
+    def action_delete_item(self) -> None:
+        self._confirmation_controller.delete_item()
 
-    def action_remove_override(self) -> None:  # noqa: PLR0911
-        if self._help_open and not self._busy and self._confirmation is None:
-            self._close_help()
-        if (
-            self._busy
-            or self._help_open
-            or self._needs_refresh
-            or self._confirmation is not None
-        ):
-            return
-        item = self._current_item()
-        if item is not None and item.control == "status_line":
-            self._error_path = item.path
-            if self.snapshot.view_only:
-                self._error = f"{chrome_glyph('error')} User configuration is unavailable (view only)."
-                self._update_help()
-                return
-            changes = {
-                path: None
-                for path in STATUS_LINE_PATHS
-                if path in self.fields and self.fields[path].saved_explicit
-            }
-            if not changes:
-                self._error = "Info: Status line has no user override."
-                self._update_help()
-                return
-            self._open_confirmation(
-                "status-reset",
-                item,
-                changes,
-                "Remove saved status line overrides? Restores inheritance, not necessarily defaults. Cancel preserves saved values.",
-                "Remove overrides",
-            )
-            return
-        if item is not None and item.control == "toggle_inventory":
-            if self.snapshot.view_only:
-                return
-            opener = (
-                self._openers.get("editor")
-                if self._editing is not None
-                else self._capture_group_position()
-            )
-            if self._editing is not None:
-                self._cancel_input()
-            self._open_confirmation(
-                "reset",
-                item,
-                None,
-                f"Reset {item.label}? Clears enabled and disabled {item.inventory} lists. Cancel preserves both saved lists and the current draft.",
-                "Reset lists",
-            )
-            self._confirmation_return_focus = opener
-            return
-        if item is None or item.kind in {"link", "deferred"}:
-            return
-        if self.snapshot.view_only:
-            self._error_path = item.path
-            self._error = f"{chrome_glyph('error')} User configuration is unavailable (view only)."
-            self._update_help()
-        elif not (field := self.fields.get(item.path)) or not field.saved_explicit:
-            self._error_path = item.path
-            self._error = f"Info: {item.label} has no user override."
-            self._update_help()
-        else:
-            if self._editing is not None:
-                self._cancel_input()
-            self._open_confirmation(
-                "override",
-                item,
-                None,
-                f"Remove saved override for {item.label}? The effective value will fall back to its other sources. Cancel preserves the saved override.",
-                "Remove override",
-            )
+    def action_remove_override(self) -> None:
+        self._confirmation_controller.remove_override()
 
     def _start_write(
         self,
         item: SettingDescriptorWire,
         changes: Mapping[str, JsonValue | list[str] | None],
     ) -> None:
-        if not self._can_mutate():
-            return
-        # Reserve synchronously: queued activations cannot race worker startup.
-        self._busy = True
-        self._error_path = item.path
-        self._error = f"{chrome_glyph('running')} Running: Saving {item.label}"
-        self._update_help()
-        self._update_hint()
-        self.run_worker(
-            self._write_changes(item, changes, reserved=True), group="settings-write"
-        )
+        self._write_controller.start_write(item, changes)
 
     async def _write(
         self, item: SettingDescriptorWire, value: JsonValue | list[str] | None
     ) -> None:
-        await self._write_changes(item, {item.path: value})
+        await self._write_controller.write(item, value)
 
     async def _write_changes(
         self,
@@ -2505,78 +1507,7 @@ class SettingsScreen(ModalScreen[str | None]):
         *,
         reserved: bool = False,
     ) -> None:
-        if self._busy and not reserved:
-            return
-        self._busy = True
-        self._error_path = item.path
-        self._error = f"{chrome_glyph('running')} Running: Saving {item.label}"
-        self._update_help()
-        self._update_hint()
-        try:
-            if self._needs_refresh:
-                self._error_path = item.path
-                self._error = f"{chrome_glyph('error')} Failed: Could not save settings; close and reopen Settings to reconcile external changes."
-                self._unresolved[item.path] = self._error
-                self._update_help()
-                return
-            outcome = await self.service.save(
-                {
-                    path: list[JsonValue](value) if isinstance(value, list) else value
-                    for path, value in changes.items()
-                },
-                self.snapshot.user_revision,
-            )
-            if outcome.persistence == "not_saved":
-                if outcome.error == "conflict":
-                    self._needs_refresh = True
-                self._error_path = item.path
-                self._error = f"{chrome_glyph('error')} Failed: Could not save {item.label}: {outcome.error or 'write failed'}."
-                self._unresolved[item.path] = self._error
-                self._update_help()
-                return
-            # End drafts only after persistence, including saved-but-unknown.
-            if self._expanded == item.path:
-                self._collapse(restore_opener=False)
-            if outcome.snapshot is None:
-                self._needs_refresh = True
-                self._error = "! Warning: Settings saved; current state unknown. Reopen Settings before editing."
-                self._unresolved[item.path] = self._error
-                self._update_help()
-                return
-            self.snapshot = outcome.snapshot
-            self.catalog = self.snapshot.catalog
-            self.fields = {field.path: field for field in self.snapshot.fields}
-            self._unresolved.pop(item.path, None)
-            self._error = f"{chrome_glyph('success')} Saved: {item.label} updated"
-            if outcome.shadowed:
-                self._error = (
-                    "! Warning: Saved but shadowed by a higher layer: "
-                    + ", ".join(outcome.shadowed)
-                )
-            if (
-                outcome.persistence == "durability_uncertain"
-                or outcome.application == "failed"
-            ):
-                self._error = "! Warning: Settings saved, but durability or application is uncertain."
-            if self._error.startswith("! Warning:"):
-                self._unresolved[item.path] = self._error
-            self._refresh_options()
-        except Exception as exc:
-            self._error_path = item.path
-            self._error = (
-                f"{chrome_glyph('error')} Failed: Could not save {item.label}: {exc}"
-            )
-            self._unresolved[item.path] = self._error
-            self._update_help()
-        finally:
-            self._busy = False
-            if (
-                self._expanded is None
-                and self._editing is None
-                and self._confirmation is None
-            ):
-                self.query_one("#settings-options", SettingsOptionList).focus()
-            self._update_hint()
+        await self._write_controller.write_changes(item, changes, reserved=reserved)
 
     def action_close(self) -> None:
         if self._busy:

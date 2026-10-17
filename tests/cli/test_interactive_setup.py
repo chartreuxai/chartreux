@@ -116,7 +116,10 @@ def test_startup_accounting_is_forwarded_independently_of_resume(
     )
 
 
-def test_experimental_harness_is_forwarded_to_local_harness(
+def test_add_dir_is_forwarded_to_the_local_harness_workspace_roots(
     captured_startup: dict[str, Any],
 ) -> None:
-    _run(_make_args(experimental_harness=True))
+    _run(_make_args(add_dir=["/extra/one", "/extra/two"]))
+
+    options = captured_startup["harness_options"]
+    assert options.session_options.workspace_roots == ["/extra/one", "/extra/two"]

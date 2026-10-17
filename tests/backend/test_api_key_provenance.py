@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from http import HTTPStatus
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -13,7 +15,7 @@ from chartreux.app_server._runtime import RuntimeAuthenticationError
 from chartreux.app_server._utils import public_error
 from chartreux.app_server.models import TurnErrorCode
 from chartreux.app_server.session import AppServerTurnError
-from chartreux.cli.textual_ui.app import ChartreuxApp
+from chartreux.cli.textual_ui.turn_supervisor import TurnSupervisor
 from chartreux.core.config import ModelConfig, ProviderConfig
 from chartreux.core.llm.backend.generic import GenericBackend
 from chartreux.core.llm.backend.mistral import MistralBackend
@@ -87,13 +89,14 @@ async def test_rejected_key_flows_from_producer_through_server_to_tui_without_re
     server_error = public_error(backend_error)
     turn_error = AppServerTurnError(server_error)
     app = MagicMock()
-    app._retry_hint = ChartreuxApp._retry_hint
+    app._retry_hint = TurnSupervisor._retry_hint
     app._tools_collapsed = False
     app._mount_and_scroll = AsyncMock()
     app.event_handler = MagicMock()
+    supervisor = cast(Any, SimpleNamespace(_app=app))
 
-    message = ChartreuxApp._resolve_turn_error_message(app, turn_error)
-    await ChartreuxApp._mount_turn_error(app, turn_error, message)
+    message = TurnSupervisor._resolve_turn_error_message(app, turn_error)
+    await TurnSupervisor._mount_turn_error(supervisor, turn_error, message)
 
     assert backend_error.api_key_origin == ApiKeyOrigin(
         ApiKeySource.ENVIRONMENT, _ENV_VAR

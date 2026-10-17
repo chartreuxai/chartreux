@@ -19,7 +19,7 @@ from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.ui.providers.workbench import ProviderWorkbenchScreen, WorkbenchView
-from tests.ui.providers.test_workbench import Host, setup
+from tests.ui.providers._workbench_support import Host, setup
 
 
 def _host() -> Host:

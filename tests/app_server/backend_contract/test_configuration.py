@@ -96,29 +96,26 @@ async def test_first_turn_does_not_pin_default_and_resume_keeps_committed_defaul
             {"active_model": "alternate"}, reload_runtime=True
         )
         assert session.resources.config.current.active_model.alias == "alternate"
-        assert (
-            _session_model_is_persisted(session_root, session.session_id, False)
-            is False
-        )
+        assert _session_model_is_persisted(session_root, session.session_id) is False
         await session.resources.config.update({"active_model": ""}, reload_runtime=True)
         _ = [event async for event in session.act("use the default without pinning")]
         session_id = session.session_id
         assert session.resources.config.current.active_model_pinned is False
-        assert _stored_active_model(session_root, session_id, False) == ""
+        assert _stored_active_model(session_root, session_id) == ""
 
         await session.resources.config.update(
             {"active_model": "alternate"}, reload_runtime=True
         )
         assert session.resources.config.current.active_model.alias == "alternate"
-        assert _stored_active_model(session_root, session_id, False) == ""
+        assert _stored_active_model(session_root, session_id) == ""
         _ = [event async for event in session.act("persist the alternate model")]
-        assert _stored_active_model(session_root, session_id, False) == ("alternate")
+        assert _stored_active_model(session_root, session_id) == ("alternate")
 
         await session.resources.config.update({"active_model": ""}, reload_runtime=True)
         assert session.resources.config.current.active_model.alias == default_model
-        assert _stored_active_model(session_root, session_id, False) == "alternate"
+        assert _stored_active_model(session_root, session_id) == "alternate"
         _ = [event async for event in session.act("persist the unpinned selection")]
-        assert _stored_active_model(session_root, session_id, False) == ""
+        assert _stored_active_model(session_root, session_id) == ""
     finally:
         await session.close()
 
@@ -171,10 +168,7 @@ async def test_explicit_active_model_target_controls_session_pin_update(
             {"active_model": pinned_model}, target_layer="overrides"
         )
         _ = [event async for event in session.act("record the explicit selection")]
-        assert (
-            _stored_active_model(session_root, session.session_id, False)
-            == pinned_model
-        )
+        assert _stored_active_model(session_root, session.session_id) == pinned_model
 
         if target_layer == "user-toml":
             fields = await session.resources.config.read_fields()
@@ -194,16 +188,10 @@ async def test_explicit_active_model_target_controls_session_pin_update(
 
         active_model = "alternate" if updates_session_pin else pinned_model
         assert session.resources.config.current.active_model.alias == active_model
-        assert (
-            _stored_active_model(session_root, session.session_id, False)
-            == pinned_model
-        )
+        assert _stored_active_model(session_root, session.session_id) == pinned_model
 
         _ = [event async for event in session.act("persist the selected model")]
-        assert (
-            _stored_active_model(session_root, session.session_id, False)
-            == active_model
-        )
+        assert _stored_active_model(session_root, session.session_id) == active_model
     finally:
         await session.close()
 
@@ -241,7 +229,7 @@ async def test_removed_session_active_model_falls_back_to_default(
         )
         _ = [event async for event in session.act("pin the removed model")]
         session_id = session.session_id
-        assert _stored_active_model(session_root, session_id, False) == "removed-model"
+        assert _stored_active_model(session_root, session_id) == "removed-model"
     finally:
         await session.close()
 
@@ -271,33 +259,13 @@ def _write_catalog(config_dir: Path, models: dict[str, str]) -> None:
     )
 
 
-def _stored_active_model(
-    session_root: Path, session_id: str, experimental_harness: bool
-) -> str | None:
-    if experimental_harness:
-        from mistralai_vibe_local_harness.vibe._storage import (  # pyright: ignore[reportMissingImports]
-            UnifiedSessionStore,
-        )
-
-        return (
-            UnifiedSessionStore(session_root, session_id)
-            .load()
-            .runtime_state.session_metadata.active_model
-        )
+def _stored_active_model(session_root: Path, session_id: str) -> str | None:
     metadata_path = next(session_root.glob(f"*_{session_id[:8]}/meta.json"))
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     return metadata["config"].get("active_model")
 
 
-def _session_model_is_persisted(
-    session_root: Path, session_id: str, experimental_harness: bool
-) -> bool:
-    if experimental_harness:
-        from mistralai_vibe_local_harness.vibe._storage import (  # pyright: ignore[reportMissingImports]
-            UnifiedSessionStore,
-        )
-
-        return UnifiedSessionStore(session_root, session_id).exists
+def _session_model_is_persisted(session_root: Path, session_id: str) -> bool:
     return any(session_root.glob(f"*_{session_id[:8]}/meta.json"))
 
 

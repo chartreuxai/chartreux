@@ -12,7 +12,7 @@ from chartreux.core.model_catalog.contracts import DiscoveryItem, DiscoveryResul
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.presets import MISTRAL
 from chartreux.core.model_catalog.schema import ModelCatalog
-from tests.ui.providers.test_workbench import Host, add_preset, expand, setup
+from tests.ui.providers._workbench_support import Host, add_preset, expand, setup
 
 
 @pytest.mark.asyncio

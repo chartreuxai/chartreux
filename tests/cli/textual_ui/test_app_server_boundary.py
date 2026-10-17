@@ -26,26 +26,54 @@ ACP_RUNTIME_PATHS = (
     CHARTREUX_ROOT / "acp" / "utils.py",
     *sorted((CHARTREUX_ROOT / "acp" / "commands").rglob("*.py")),
 )
-PUBLIC_APP_SERVER_PATHS = tuple(
-    CHARTREUX_ROOT / "app_server" / name
-    for name in (
-        "__init__.py",
-        "_connection_protocol.py",
-        "_effect_models.py",
-        "_model.py",
-        "client.py",
-        "client_state.py",
-        "client_tools.py",
-        "config.py",
-        "connection.py",
-        "events.py",
-        "host.py",
-        "models.py",
-        "protocol.py",
-        "resources.py",
-        "session.py",
-        "transport.py",
-    )
+PROTOCOL_MODULE_PATH = CHARTREUX_ROOT / "app_server" / "protocol.py"
+PROTOCOL_PACKAGE_PATH = CHARTREUX_ROOT / "app_server" / "protocol"
+
+
+def _protocol_source_paths() -> tuple[Path, ...]:
+    """The protocol's physical sources: the module, or every package file."""
+    if PROTOCOL_MODULE_PATH.is_file():
+        return (PROTOCOL_MODULE_PATH,)
+    return tuple(sorted(PROTOCOL_PACKAGE_PATH.glob("*.py")))
+
+
+def _protocol_config_area_owner() -> str:
+    """The module that physically owns the settings-catalog import.
+
+    The config-area models live in the protocol module (or the package
+    initializer before the config-area peel) and in ``protocol.config`` once
+    that peel moves them; the core-import exception follows the actual owner.
+    """
+    if (
+        PROTOCOL_MODULE_PATH.is_file()
+        or not (PROTOCOL_PACKAGE_PATH / "config.py").is_file()
+    ):
+        return "chartreux.app_server.protocol"
+    return "chartreux.app_server.protocol.config"
+
+
+PUBLIC_APP_SERVER_PATHS = (
+    *(
+        CHARTREUX_ROOT / "app_server" / name
+        for name in (
+            "__init__.py",
+            "_connection_protocol.py",
+            "_effect_models.py",
+            "_model.py",
+            "client.py",
+            "client_state.py",
+            "client_tools.py",
+            "config.py",
+            "connection.py",
+            "events.py",
+            "host.py",
+            "models.py",
+            "resources.py",
+            "session.py",
+            "transport.py",
+        )
+    ),
+    *_protocol_source_paths(),
 )
 SERVER_ONLY_APP_SERVER_MODULES = (
     "chartreux.app_server._",
@@ -56,9 +84,11 @@ SERVER_ONLY_APP_SERVER_MODULES = (
     "chartreux.app_server.server",
     "chartreux.app_server.stdio",
 )
-# protocol is a public app_server module, so its core dependency is legal.
+# protocol is a public app_server module, so its core dependency is legal —
+# keyed to the module that physically owns the config-area models, in either
+# the module or the package layout.
 ALLOWED_CORE_IMPORTS = {
-    "chartreux.app_server.protocol": {"chartreux.core.config.settings_catalog"},
+    _protocol_config_area_owner(): {"chartreux.core.config.settings_catalog"},
     "chartreux.core.config.settings_catalog": {
         "chartreux.core.config.chartreux_schema",
         "chartreux.core.config.models",
@@ -206,6 +236,20 @@ def test_app_server_clients_do_not_import_core(source_path: Path) -> None:
     assert not violations, "\n".join(violations)
 
 
+def test_settings_catalog_import_stays_with_protocol_config_area() -> None:
+    """The catalog exception is narrow: one owner, and the keyed one."""
+    owners = [
+        _module_name(source_path)
+        for source_path in _protocol_source_paths()
+        if any(
+            module == "chartreux.core.config.settings_catalog"
+            for _, module in _imports(source_path)
+        )
+    ]
+
+    assert owners == [_protocol_config_area_owner()]
+
+
 def test_core_does_not_import_app_server_or_textual() -> None:
     violations = [
         f"{source_path.relative_to(CORE_ROOT)}:{line}: {module}"
@@ -338,7 +382,9 @@ def test_agent_stop_clients_do_not_access_registry() -> None:
 @pytest.mark.parametrize(
     "relative_path,symbols",
     [
-        ("cli/textual_ui/app.py", {"CancelOutcome"}),
+        # The stop/release UI flow lives in the agent-browser controller
+        # since stage 8.3b (the app keeps only thin delegates).
+        ("cli/textual_ui/agent_browser.py", {"CancelOutcome"}),
         (
             "cli/textual_ui/widgets/agent_bar.py",
             {"AgentsCancelResponse", "CancelOutcome"},
@@ -363,7 +409,9 @@ def test_agent_stop_uses_public_protocol_models(
 @pytest.mark.parametrize(
     "relative_path,symbols",
     [
-        ("cli/textual_ui/app.py", {"ReleaseOutcome"}),
+        # See test_agent_stop_uses_public_protocol_models: the release flow
+        # moved to the agent-browser controller in stage 8.3b.
+        ("cli/textual_ui/agent_browser.py", {"ReleaseOutcome"}),
         ("app_server/session.py", {"AgentsReleaseParams", "AgentsReleaseResponse"}),
     ],
 )

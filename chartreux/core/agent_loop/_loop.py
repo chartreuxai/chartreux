@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Callable, Generator, Sequence
+from collections.abc import AsyncGenerator, Callable, Sequence
 import contextlib
 import copy
 from dataclasses import dataclass, field, replace
-from enum import StrEnum, auto
 from functools import wraps
 import inspect
-import json
 import os
 from pathlib import Path
 import shutil
@@ -19,37 +17,52 @@ from uuid import uuid4
 
 from pydantic import BaseModel, JsonValue
 
-from chartreux.core.agent_loop._dangerous_command_grants import (
-    DANGEROUS_COMMAND_DECLINED_FEEDBACK,
-    DangerousCommandCallIdentity,
-    DangerousCommandGrantStore,
-    dangerous_command_grant_save_note,
-    dangerous_command_request,
-    derive_call_requirements,
-    parse_dangerous_command_result,
+from chartreux.core.agent_loop import _config_transactions
+from chartreux.core.agent_loop._completion_coordinator import CompletionCoordinator
+from chartreux.core.agent_loop._config_transactions import (
+    _PreparedLaunchReconfiguration,
+    _PreparedPolicyReplacement,
+    _PreparedReload,
+    _SwappableConfigSource as _SwappableConfigSource,
 )
-from chartreux.core.agent_loop._execution_admission import (
-    ExecutionAdmission,
-    revalidate_execution_admission,
+from chartreux.core.agent_loop._context_injection import ContextInjector
+from chartreux.core.agent_loop._dangerous_command_grants import (
+    DangerousCommandGrantStore,
 )
 from chartreux.core.agent_loop._file_state_context import (
     FileStateContext,
     RevisionRegistryPort,
 )
+from chartreux.core.agent_loop._loop_types import (
+    AgentRuntimePolicy,
+    AgentTurnOptions,
+    RootAccountingOwner,
+    ToolDecision,
+    ToolExecutionResponse,
+)
+from chartreux.core.agent_loop._outward_redaction import OutwardEventRedactor
 from chartreux.core.agent_loop._request_broker import InteractionRequestBroker
-from chartreux.core.agent_loop._root_grants import (
-    ROOT_GRANT_DECLINED_FEEDBACK,
-    ROOT_GRANT_DENY,
-    ROOT_GRANT_PROJECT,
-    ROOT_GRANT_TOOLS,
-    SessionRootGrants,
-    parse_root_grant_result,
-    propose_root_grant,
-    root_grant_request,
-    root_grant_save_note,
-    root_grant_target,
+from chartreux.core.agent_loop._root_grants import SessionRootGrants
+from chartreux.core.agent_loop._session_transitions import (
+    _PREPARE_SCRATCHPAD,
+    SessionTransitions,
+    _PrepareScratchpad,
 )
 from chartreux.core.agent_loop._title_cadence import TitleCadence
+from chartreux.core.agent_loop._tool_batch_runner import (
+    ToolBatchRunner,
+    _ToolInvocation,
+)
+from chartreux.core.agent_loop._tool_decisions import (
+    ToolDecisionCoordinator,
+    _dangerous_command_denial as _dangerous_command_denial,
+    _declined_dangerous_command_decision as _declined_dangerous_command_decision,
+    _declined_root_decision as _declined_root_decision,
+    _out_of_root_denial as _out_of_root_denial,
+)
+from chartreux.core.agent_loop._tool_executor import ToolExecutor
+from chartreux.core.agent_loop._transcript_recorder import TranscriptRecorder
+from chartreux.core.agent_loop._workspace_relocator import WorkspaceRelocator
 from chartreux.core.agent_loop.backend_lifetime import BackendLifetime, BackendPublish
 from chartreux.core.agent_loop.errors import (
     AgentLoopError,
@@ -71,10 +84,9 @@ from chartreux.core.agent_loop.title_controller import (
     TitleGateInputs,
     TitleScheduleInputs,
 )
-from chartreux.core.agent_loop_hooks import AgentLoopHooksMixin, PostToolFinalization
+from chartreux.core.agent_loop_hooks import AgentLoopHooksMixin
 from chartreux.core.agents.launch import LaunchCandidate
 from chartreux.core.agents.manager import AgentManager
-from chartreux.core.autocompletion.path_prompt import build_path_prompt_payload
 from chartreux.core.background_jobs import (
     BackgroundJobRegistry,
     BackgroundJobsPort,
@@ -84,10 +96,9 @@ from chartreux.core.checkpoints import Checkpointer, CheckpointRecorder, FileSto
 from chartreux.core.compaction import (
     CompactionFailedError as CompactionFailedError,
     CompactionManager,
-    reorder_for_tool_adjacency,
 )
 from chartreux.core.compaction.context import select_model_context
-from chartreux.core.config import ChartreuxConfigSchema, ModelConfig, ProviderConfig
+from chartreux.core.config import ChartreuxConfigSchema, ModelConfig
 from chartreux.core.config._dangerous_command_persistence import (
     read_saved_dangerous_command_grants,
 )
@@ -97,22 +108,10 @@ from chartreux.core.config.harness_files import (
     HarnessFilesManager,
     get_harness_files_manager,
 )
-from chartreux.core.config.layers.project import ProjectConfigLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
-from chartreux.core.config.types import ConfigSaveResult
 from chartreux.core.dangerous_command_grants import DangerousCommandGrantPersistencePort
-from chartreux.core.dangerous_commands import (
-    OPERATION_REGISTRY,
-    DangerousCommandProposal,
-    GrantChoice,
-    RepositoryScope,
-)
 from chartreux.core.dispatch.renderer import task_description_for_config
-from chartreux.core.dispatch.session import (
-    BoundDispatchPolicy,
-    bind_policy,
-    resume_policy,
-)
+from chartreux.core.dispatch.session import BoundDispatchPolicy, bind_policy
 from chartreux.core.errors import ContextTooLongError
 from chartreux.core.events import (
     AssistantEvent,
@@ -123,31 +122,21 @@ from chartreux.core.events import (
     ReasoningEvent,
     SessionTitleUpdatedEvent,
     ToolCallEvent,
-    ToolCancellationOrigin,
     ToolResultEvent,
     ToolStreamEvent,
-    ToolWaitStateChangedEvent,
     UserMessageEvent,
 )
 from chartreux.core.file_state import FileStateStore
-from chartreux.core.git.errors import GitError
-from chartreux.core.git.worktree.repository import WorktreeRepository
 from chartreux.core.hooks.config import load_hooks_from_fs
 from chartreux.core.hooks.manager import HooksManager
-from chartreux.core.hooks.models import HookConfigResult, HookEvent
+from chartreux.core.hooks.models import HookConfigResult, HookEvent, HookSessionContext
 from chartreux.core.llm.backend.factory import create_backend
-from chartreux.core.llm.failures import RequestRetryBudget, classify
-from chartreux.core.llm.format import (
-    APIToolFormatHandler,
-    FailedToolCall,
-    ResolvedMessage,
-    ResolvedToolCall,
-)
+from chartreux.core.llm.failures import RequestRetryBudget
+from chartreux.core.llm.format import APIToolFormatHandler, ResolvedToolCall
 from chartreux.core.llm.types import BackendLike
 from chartreux.core.llm.utility_completion import is_fast_utility_model
 from chartreux.core.llm_models import (
     AvailableTool,
-    FunctionCall,
     ImageAttachment,
     LLMChunk,
     LLMMessage,
@@ -171,16 +160,13 @@ from chartreux.core.middleware import (
     TokenLimitMiddleware,
     TurnLimitMiddleware,
 )
-from chartreux.core.model_catalog.availability import (
-    EligibleDeployment,
-    eligible_deployments,
-)
+from chartreux.core.model_catalog.availability import EligibleDeployment
 from chartreux.core.plan_session import PlanSession
 from chartreux.core.review import ReviewManager
 from chartreux.core.rewind import RewindManager
 from chartreux.core.root_grants import RootGrantPort
 from chartreux.core.scratchpad import cleanup_scratchpad, init_scratchpad
-from chartreux.core.session.session_id import extract_suffix, generate_session_id
+from chartreux.core.session.session_id import generate_session_id
 from chartreux.core.session.session_lease import SessionLease
 from chartreux.core.session.session_logger import SessionLogger
 from chartreux.core.session_types import (
@@ -196,128 +182,26 @@ from chartreux.core.subagents import (
     LaunchConfig,
     SubagentManagementPort,
     SubagentRunnerPort,
-    TaskResult,
 )
 from chartreux.core.system_prompt import get_universal_system_prompt
 from chartreux.core.timing import CompletedTurnTiming, InvocationTiming
 from chartreux.core.tools import secret_redaction
-from chartreux.core.tools.base import (
-    BaseTool,
-    CancellableToolResult,
-    InvokeContext,
-    ToolError,
-    ToolPermission,
-    ToolPermissionError,
-)
-from chartreux.core.tools.builtins.read_file import ReadFileArgs
-from chartreux.core.tools.builtins.skill import (
-    Skill as SkillTool,
-    SkillArgs,
-    build_skill_result,
-    skill_content_marker,
-)
-from chartreux.core.tools.builtins.todo import TodoState
-from chartreux.core.tools.builtins.wait_for_agent import WaitForAgent
+from chartreux.core.tools.base import BaseTool, InvokeContext, ToolPermission
+from chartreux.core.tools.builtins.skill import build_skill_result
 from chartreux.core.tools.io_port import ToolIOPort
-from chartreux.core.tools.manager import NoSuchToolError, ToolManager
-from chartreux.core.tools.permissions import PermissionContext
-from chartreux.core.tools.ui import ToolUIDataAdapter
+from chartreux.core.tools.manager import ToolManager
 from chartreux.core.tools.utils import DEFAULT_SENSITIVE_PATTERNS
-from chartreux.core.usage import AsyncUsageWriter, UsageAttribution, UsagePurpose
+from chartreux.core.usage import UsagePurpose
 from chartreux.core.utils import (
-    TOOL_ERROR_TAG,
     VIBE_STOP_EVENT_TAG,
-    CancellationReason,
     RetryObserver,
     RetryReason,
-    get_user_cancellation_message,
     is_user_cancellation_event,
 )
 from chartreux.core.workspace import Workspace
 from chartreux.observability.logging import logger
 from chartreux.user_content import UserDisplayContent, UserResource
-from chartreux.utils import VIBE_WARNING_TAG
 from chartreux.utils.cache_store import CacheStore, InMemoryCacheStore
-from chartreux.utils.http import get_user_agent
-
-
-def _retrieve_future_exception(future: asyncio.Future[str]) -> None:
-    if not future.cancelled():
-        future.exception()
-
-
-def _out_of_root_denial(ctx: PermissionContext, tool_name: str) -> ToolDecision:
-    """Denial decision that names the persistent config knob for the path."""
-    reason = ctx.reason or f"Tool '{tool_name}' is disabled by policy"
-    return ToolDecision(
-        verdict=ToolExecutionResponse.SKIP,
-        approval_type=ToolPermission.NEVER,
-        feedback=(
-            f"{reason} Add the path to authorized_roots_by_project for this "
-            "project in your user config.toml to authorize it."
-        ),
-    )
-
-
-def _declined_root_decision() -> ToolDecision:
-    return ToolDecision(
-        verdict=ToolExecutionResponse.SKIP,
-        approval_type=ToolPermission.NEVER,
-        feedback=ROOT_GRANT_DECLINED_FEEDBACK,
-    )
-
-
-def _dangerous_command_denial(
-    ctx: PermissionContext, tool_name: str, proposal: DangerousCommandProposal
-) -> ToolDecision:
-    """Denial decision naming the persistent config knob for the operation."""
-    reason = ctx.reason or f"Tool '{tool_name}' is disabled by policy"
-    persistable = tuple(
-        operation_id
-        for operation_id in proposal.operations
-        if (operation := OPERATION_REGISTRY.get(operation_id)) is not None
-        and operation.persistable
-    )
-    blocked = tuple(
-        operation_id
-        for operation_id in proposal.operations
-        if (operation := OPERATION_REGISTRY.get(operation_id)) is None
-        or not operation.persistable
-    )
-    if persistable and not blocked:
-        remediation = (
-            f"Add {', '.join(persistable)} to "
-            "dangerous_command_grants_by_project for this project in your "
-            "user config.toml to authorize it."
-        )
-    elif persistable:
-        # A mixed call: the saved grant covers only the persistable subset,
-        # so the message must not claim the config edit authorizes the call.
-        remediation = (
-            f"Add {', '.join(persistable)} to "
-            "dangerous_command_grants_by_project for this project in your "
-            "user config.toml to pre-authorize only part of this call; the "
-            f"remaining operations ({', '.join(blocked)}) cannot be "
-            "pre-authorized and require approval in an interactive session."
-        )
-    else:
-        remediation = (
-            "This operation cannot be pre-authorized; it requires approval in "
-            "an interactive session."
-        )
-    return ToolDecision(
-        verdict=ToolExecutionResponse.SKIP,
-        approval_type=ToolPermission.NEVER,
-        feedback=f"{reason} {remediation}",
-    )
-
-
-def _declined_dangerous_command_decision() -> ToolDecision:
-    return ToolDecision(
-        verdict=ToolExecutionResponse.SKIP,
-        approval_type=ToolPermission.NEVER,
-        feedback=DANGEROUS_COMMAND_DECLINED_FEEDBACK,
-    )
 
 
 def _is_git_executable_available() -> bool:
@@ -336,144 +220,12 @@ if TYPE_CHECKING:
     from chartreux.core.tools.mcp.registry import MCPRegistry
 
 
-class ToolExecutionResponse(StrEnum):
-    SKIP = auto()
-    EXECUTE = auto()
-
-
-class ToolDecision(BaseModel):
-    verdict: ToolExecutionResponse
-    approval_type: ToolPermission
-    feedback: str | None = None
-    result_note: str | None = None
-    # Invocation-bound authority the execution-admission gate revalidates at
-    # the handoff (after the snapshot await, immediately before invoke). Only
-    # an "Allow once" approval carries one: its permit is consumed before the
-    # call resumes, so the gate re-arms it for exactly this invocation.
-    admission: ExecutionAdmission | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class RootAccountingOwner:
-    """Immutable root identity and shared writer, independent of transcript logging.
-
-    Session bindings capture attribution per invocation. Writer retirement belongs
-    to the runtime, after all producers sharing this owner have settled.
-    """
-
-    root_session_id: str
-    project_key: str
-    writer: AsyncUsageWriter
-    # Runtime-owned allocation seam for clear/rewind, which mint root identities.
-    owner_factory: Callable[[str, str], RootAccountingOwner] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class AgentRuntimePolicy:
-    max_turns: int | None
-    max_price: float | None
-    max_tokens: int | None
-    max_session_tokens: int | None
-    enable_streaming: bool
-    launch_context: dict[str, object] | None
-    headless: bool
-    hook_config_result: HookConfigResult | None
-    cache_store: CacheStore
-    user_input_capability: bool = False
-    # Whether this surface wants background LLM session titles. Core owns the
-    # capability; the delivery layer (app server) owns this policy decision.
-    auto_title_enabled: bool = False
-    inherited_workspace: Workspace | None = None
-    inherited_restrictions: tuple[SourceRestrictions, ...] = ()
-    inherited_mode_restrictions: tuple[SourceRestrictions, ...] = ()
-    inherited_plan_write_scopes: tuple[tuple[Path, Path | None], ...] = ()
-    # Bare canonical roots granted to the launching session at dispatch time.
-    # A dedicated slot, never a synthesized config-source authority, so policy
-    # replacement and partitioning never treat session grants as policy.
-    inherited_root_grants: tuple[Path, ...] = ()
-    parent_authority_getter: Callable[[], ToolManager] | None = None
-    parent_authority_revision_getter: Callable[[], int] | None = None
-
-
-class _SwappableConfigSource:
-    """Config getter for reload-prepared managers.
-
-    Points at the target agent's config while preparation runs off-loop, then is
-    repointed to the live config inside the synchronous commit. The prepared
-    managers are not shared with the running turn until commit, so the running
-    turn only ever observes the live getter.
-    """
-
-    def __init__(self, getter: Callable[[], ChartreuxConfigSchema]) -> None:
-        self._getter = getter
-        self.live = False
-
-    def get(self) -> ChartreuxConfigSchema:
-        return self._getter()
-
-    def point_to(self, getter: Callable[[], ChartreuxConfigSchema]) -> None:
-        self._getter = getter
-        self.live = True
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedPolicyReplacement:
-    owner: AgentLoop
-    session_generation: int
-    expected_token: object
-    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema]
-    previous_manager: ToolManager
-    tool_manager: ToolManager
-    inherited_restrictions: tuple[SourceRestrictions, ...]
-    inherited_workspace: Workspace | None
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedReload:
-    config: ChartreuxConfigSchema
-    backend: BackendLike
-    agent_manager: AgentManager
-    tool_manager: ToolManager
-    skill_manager: SkillManager
-    system_prompt: str
-    config_source: _SwappableConfigSource
-    hook_config_result: HookConfigResult | None
-    skills_adopted: int
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedLaunchReconfiguration:
-    candidate: LaunchCandidate
-    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema]
-    consumers: _PreparedReload
-    previous_orchestrator: ConfigOrchestrator[ChartreuxConfigSchema]
-    previous_agent_manager: AgentManager
-    previous_tool_manager: ToolManager
-    previous_skill_manager: SkillManager
-    previous_system_message: LLMMessage | None
-    previous_instruction_read_files: frozenset[Path]
-    previous_prices: tuple[float, float, float | None]
-    previous_launch_overrides: LaunchConfig | None
-    previous_committed_model: CommittedModelIdentity | None
-    session_generation: int
-    parent_authority_revision: int | None
-    owns_backend: bool
-
-
 class _QueueTitleEventSink(TitleEventSink):
     def __init__(self, queue: asyncio.Queue[BaseEvent]) -> None:
         self._queue = queue
 
     def publish(self, event: BaseEvent) -> None:
         self._queue.put_nowait(event)
-
-
-@dataclass(frozen=True, slots=True)
-class AgentTurnOptions:
-    turn_id: str | None = None
-    retry_sink: RetryObserver | None = None
-    injected: bool = False
-    user_initiated_retry: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,22 +240,7 @@ class _ActiveTurn:
     prose_ids: list[str] = field(default_factory=list)
 
 
-@dataclass(slots=True)
-class _ToolInvocation:
-    task: asyncio.Task[None]
-    is_wait: bool
-    wait_task: asyncio.Task[TaskResult] | None = None
-    steering_cancel_requested: bool = False
-
-
 _NO_TURN = _ActiveTurn()
-
-
-class _PrepareScratchpad:
-    pass
-
-
-_PREPARE_SCRATCHPAD = _PrepareScratchpad()
 
 # Test-only kill switch for harnesses that run the real CLI against a mock model.
 _DISABLE_AUTO_TITLE_ENV_VAR = "CHARTREUX_TEST_DISABLE_AUTO_TITLE"
@@ -624,7 +361,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         for inherited_root in inherited_root_grants:
             self._session_root_grants.grant(inherited_root)
         self._root_grant_port = root_grant_port
-        self._root_grant_askers: set[asyncio.Task[None]] = set()
         # Runtime-owned dangerous-command grants (session/once/refusal); the
         # store is the provider port every tool manager of this loop consumes.
         self._dangerous_command_grants = DangerousCommandGrantStore()
@@ -765,18 +501,209 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._execution_message: LLMMessage | None = None
 
         self.stats = AgentStats()
-        self._tool_event_queue: asyncio.Queue[BaseEvent | None] | None = None
-        self._tool_invocations: dict[tuple[str, str], _ToolInvocation] = {}
-        self._waiting_only = False
-        # Retain admission names and resolved values only until outward emission.
-        self._admitted_tool_policies: dict[str, secret_redaction.ScrubPolicy] = {}
-        # Tool-response ordering: while a tool batch is active, response
-        # messages are staged and appended in tool-call index order even
-        # though their events keep streaming in completion order.
-        self._tool_response_order: dict[str, int] | None = None
-        self._staged_tool_responses: dict[int, list[LLMMessage]] = {}
-        self._next_tool_response_index = 0
+        # Retains admission names and resolved values only until outward
+        # emission; the redactor re-reads the live scrub policy per event.
+        self._outward_redactor = OutwardEventRedactor(
+            scrub_policy_getter=lambda: self.scrub_policy,
+            record_tool_call_event=lambda event: self._recorded_tool_call_event(event),
+        )
+        # Tool-response ordering and recording: while a tool batch is active,
+        # response messages are staged and appended in tool-call index order
+        # even though their events keep streaming in completion order; the
+        # recorder also owns sanitized call copies, response messages, and
+        # committed completion appends, borrowing this loop's MessageList.
+        self._transcript_recorder = TranscriptRecorder(
+            messages=self.messages,
+            scrub_policy_getter=lambda: self.scrub_policy,
+            format_handler_getter=lambda: self.format_handler,
+            set_execution_message=lambda message: self._set_execution_message(message),
+            note_prose=lambda message: self._note_transcript_prose(message),
+            invalidate_cursor=lambda: (
+                self.session_logger.invalidate_transcript_cursor()
+            ),
+        )
         self._request_broker = InteractionRequestBroker()
+        # Tool decisions: the approval workflows (dangerous-command and
+        # out-of-root denial formatting, prompts, resume, persistence) and
+        # the shared root-prompt asker lifecycle live on the coordinator.
+        self._tool_decisions = ToolDecisionCoordinator(
+            grants_store=self._dangerous_command_grants,
+            request_broker=self._request_broker,
+            user_input_capability_getter=lambda: self._user_input_capability,
+            is_subagent_getter=lambda: self._is_subagent,
+            grant_port_getter=lambda: self._dangerous_command_grant_port,
+            tool_manager_getter=lambda: self.tool_manager,
+            session_id_getter=lambda: self.session_id,
+            config_orchestrator_getter=lambda: self.config_orchestrator,
+            read_saved_grants=(
+                lambda orchestrator, project: read_saved_dangerous_command_grants(
+                    orchestrator, project=project
+                )
+            ),
+            root_grants_store=self._session_root_grants,
+            root_grant_port_getter=lambda: self._root_grant_port,
+            cwd_getter=lambda: self.cwd,
+            read_saved_roots=(
+                lambda orchestrator, project: read_saved_roots(
+                    orchestrator, project=project
+                )
+            ),
+            apply_approved_root_grant=lambda root: self._apply_approved_root_grant(
+                root
+            ),
+        )
+        # Batch runner: the wait registry, the batch queue, the tool tasks
+        # and their completion monitor, the batch teardown, and the
+        # call-event preparation/ordering bracket live on the runner; the
+        # loop keeps read-only views and compatibility delegates.
+        self._tool_batch_runner = ToolBatchRunner(
+            active_turn_id_getter=lambda: self._turn.turn_id,
+            transcript_recorder=self._transcript_recorder,
+            request_broker=self._request_broker,
+            stats_getter=lambda: self.stats,
+            tool_manager_getter=lambda: self.tool_manager,
+            harness_files_getter=lambda: self.harness_files,
+            scrub_policy_getter=lambda: self.scrub_policy,
+            format_handler_getter=lambda: self.format_handler,
+            record_tool_call_event=lambda event: self._recorded_tool_call_event(event),
+            execute_tool=lambda tool_call: self._process_one_tool_call(tool_call),
+            register_admissions=lambda tool_calls, admitted: (
+                self._outward_redactor.register_batch_admissions(tool_calls, admitted)
+            ),
+            tool_failure_event=lambda tool_call, error_msg: self._tool_failure_event(
+                tool_call, error_msg
+            ),
+            abandon_root_requests=lambda: self._tool_decisions.abandon_root_requests(),
+        )
+        # Context injection: the skill-loaded detection, the synthetic skill
+        # expansion (its separate direct path), and the mentioned-file
+        # expansion (through the single-tool execution callback) live on
+        # the injector; the loop keeps one compatibility delegate for the
+        # directly driven skill path and re-points its call sites.
+        self._context_injector = ContextInjector(
+            messages=self.messages,
+            transcript_recorder=self._transcript_recorder,
+            skill_manager_getter=lambda: self.skill_manager,
+            tool_manager_getter=lambda: self.tool_manager,
+            harness_files_getter=lambda: self.harness_files,
+            cwd_getter=lambda: self.cwd,
+            model_context_getter=lambda: self._current_model_context(),
+            record_tool_call=lambda tool_call: self._recorded_tool_call(tool_call),
+            record_tool_call_event=lambda event: self._recorded_tool_call_event(event),
+            execute_tool=lambda tool_call: self._process_one_tool_call(tool_call),
+            build_skill_result=lambda skill_info, already_loaded: build_skill_result(
+                skill_info, already_loaded=already_loaded
+            ),
+            save_messages=lambda: self._save_messages(),
+        )
+        # Completion coordination: the input/header/resource assembly, the
+        # candidate/attempt helpers, the synchronous publication/rollback
+        # helpers, and the entire attempt generator live on the coordinator;
+        # the loop keeps compatibility delegates for every rider-referenced
+        # helper and for the generator itself (returning the coordinator's
+        # iterator directly, no per-chunk forwarding layer).
+        self._completion_coordinator = CompletionCoordinator(
+            config_getter=lambda: self.config,
+            config_orchestrator=self._config_orchestrator,
+            backend_lifetime=self._backend_lifetime,
+            llm_gateway=self._llm_gateway,
+            committed_model_getter=lambda: self.committed_model,
+            stats_getter=lambda: self.stats,
+            format_handler_getter=lambda: self.format_handler,
+            session_id_getter=lambda: self.session_id,
+            parent_session_id_getter=lambda: self.parent_session_id,
+            is_subagent_getter=lambda: self._is_subagent,
+            launch_profile_getter=lambda: self.launch_profile,
+            accounting_owner_getter=lambda: self.accounting_owner,
+            accounting_sink_getter=lambda: getattr(self, "_accounting_sink", None),
+            usage_attribution_getter=lambda: getattr(self, "_usage_attribution", None),
+            injected_backend_getter=lambda: self._injected_backend,
+            max_tokens_getter=lambda: self._max_tokens,
+            notice_retry=self.notice_retry,
+            admit_replay_getter=lambda: self._admit_empty_replay,
+            create_backend=lambda **kwargs: create_backend(**kwargs),
+            restore_committed_model=lambda identity: self._restore_committed_model(
+                identity
+            ),
+            install_launch_metadata=lambda: self.install_launch_metadata(),
+            backend_metadata=lambda call_type: self._build_backend_metadata(call_type),
+            enumerate_candidates=lambda messages, attempted_model, call_type=None: (
+                self._failover_candidates(
+                    messages, attempted_model, call_type=call_type
+                )
+            ),
+            prepare_inputs=lambda **kwargs: self._completion_inputs(**kwargs),
+            bind_resources=lambda backend, budget=None: self._call_resources(
+                backend, budget
+            ),
+            materialize_model=lambda resolved, call_type, thinking=None: (
+                self._attempt_model(resolved, call_type=call_type, thinking=thinking)
+            ),
+            select_budget=lambda budget, has_alternative: self._attempt_retry_budget(
+                budget, has_alternative=has_alternative
+            ),
+            backend_for_candidate=lambda model, budget: self._backend_for_attempt(
+                model, budget
+            ),
+            rollback_publication=lambda publication, previous_identity, candidate: (
+                self._rollback_attempt(publication, previous_identity, candidate)
+            ),
+            append_transcript=lambda outcome: self._append_transcript(outcome),
+            record_providers=lambda providers: self._record_completion_providers(
+                providers
+            ),
+            record_switch=lambda **kwargs: self._record_failover_switch(**kwargs),
+            commit_identity=lambda identity: self._commit_attempt_identity(identity),
+            attempt_stream=lambda **kwargs: self._attempt_completion(**kwargs),
+        )
+        # Session transitions: the todo/file-state replay participants, the
+        # active-model pricing helper, the resume preparation (its synchronous
+        # commit stays on the loop), the reset preparation with its lease
+        # cleanup (its commit stays on the loop too), and the clear-history
+        # orchestration live on the service; the loop retains identity,
+        # generation, stats, the accounting owner, and lease publication.
+        self._session_transitions = SessionTransitions(
+            file_state_context=self.file_state_context,
+            out_of_band_events=self._out_of_band_events,
+            detached_accounting_producers=self._detached_accounting_producers,
+            config_getter=lambda: self.config,
+            agent_manager_getter=lambda: self.agent_manager,
+            tool_manager_getter=lambda: self.tool_manager,
+            skill_manager_getter=lambda: self.skill_manager,
+            stats_getter=lambda: self.stats,
+            is_subagent_getter=lambda: self._is_subagent,
+            background_jobs_getter=lambda: self.background_jobs,
+            job_lifetime_generation_getter=lambda: self._job_lifetime_generation,
+            scratchpad_dir_getter=lambda: self.scratchpad_dir,
+            accounting_owner_getter=lambda: self.accounting_owner,
+            auto_title_task_getter=lambda: self._auto_title_task,
+            require_background_jobs_idle=lambda: self.require_background_jobs_idle(),
+            prepare_scratchpad=lambda session_id: self.prepare_scratchpad_for_session(
+                session_id
+            ),
+            render_system_prompt=(
+                lambda skill_manager, config, bound_policy, scratchpad_dir: (
+                    self._render_system_prompt(
+                        skill_manager,
+                        config,
+                        bound_policy=bound_policy,
+                        scratchpad_dir=scratchpad_dir,
+                    )
+                )
+            ),
+            messages=self.messages,
+            session_id_getter=lambda: self.session_id,
+            parent_session_id_getter=lambda: self.parent_session_id,
+            session_lease_getter=lambda: self._session_lease,
+            bound_dispatch_policy_getter=lambda: self.bound_dispatch_policy,
+            session_logger_getter=lambda: self.session_logger,
+            middleware_pipeline_getter=lambda: self.middleware_pipeline,
+            reset_session=lambda keep_parent: self._reset_session(
+                keep_parent=keep_parent
+            ),
+            publish_fresh_stats=lambda: self._publish_fresh_stats(),
+            generate_session_id=lambda suffix: generate_session_id(suffix=suffix),
+        )
         self._active_turn: _ActiveTurn | None = None
         self.completed_turn_timing: CompletedTurnTiming | None = None
         # Operations that are not turns but still hold the session: anything
@@ -786,9 +713,32 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         # it exists. A turn will not start while one is held either, which is
         # what makes it safe for a holder to await.
         self._holders: list[str] = []
-        # The directory a move granted session trust to, so a later move
-        # releases that and not a grant somebody else made.
-        self._trust_taken_by_move: Path | None = None
+        # The workspace relocator owns the relocation transaction and the
+        # trust a move acquired: the directory a move granted session trust
+        # to, so a later move releases that and not a grant somebody else
+        # made. The loop keeps the workspace roots themselves, the session
+        # holder gate, and the consumer-rebuild facade.
+        self._workspace_relocator = WorkspaceRelocator(
+            cwd_getter=lambda: self.cwd,
+            harness_files_getter=lambda: self.harness_files,
+            agent_manager_getter=lambda: self.agent_manager,
+            config_orchestrator_getter=lambda: self.config_orchestrator,
+            session_logger_getter=lambda: self.session_logger,
+            has_active_turn=lambda: self._active_turn is not None,
+            require_background_jobs_idle=lambda: self.require_background_jobs_idle(),
+            take_session=lambda operation: self._take_session(operation),
+            release_session=lambda operation: self._release_session(operation),
+            assign_workspace=lambda cwd, harness_files: self._assign_workspace(
+                cwd, harness_files
+            ),
+            destination_checkout=lambda target: self._destination_checkout(target),
+            bind_workspace=lambda cwd, harness_files: self._bind_workspace(
+                cwd, harness_files
+            ),
+            reload_with_initial_messages=lambda **kwargs: (
+                self.reload_with_initial_messages(**kwargs)
+            ),
+        )
         self.launch_context = launch_context
         config = self.config
         try:
@@ -802,8 +752,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._current_user_message_id: str | None = None
         self._is_user_prompt_call: bool = False
         self._reactive_recovery_used: bool = False
-        self._pending_injected_messages: list[LLMMessage] = []
-        self._steering_injections: set[asyncio.Task[Any]] = set()
+        # The pending injected-message buffer and the tracked steering tasks
+        # are owned by the context injector; the loop keeps compatibility
+        # views (see the properties below).
         self._pending_clear_context: bool = False
 
         self.session_logger = SessionLogger(
@@ -832,10 +783,69 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             hook_config_result.issues if hook_config_result else []
         )
         self.hooks_count = len(hook_config_result.hooks) if hook_config_result else 0
+        # Explicit hook-mixin seams (stage 14.3c): the mixin reads its host
+        # dependencies through these late-bound callbacks, never directly,
+        # so hook reload, session reset, and relocation stay visible.
+        self._hooks_manager_getter = lambda: self._hooks_manager
+        self._hook_session_context = lambda: self._build_hook_session_context()
+        self._stats_getter = lambda: self.stats
+        self._messages_getter = lambda: self.messages
         checkpointer = Checkpointer()
         file_store = FileStore()
         self.checkpoint_recorder = CheckpointRecorder(
             checkpointer, self.messages, file_store
+        )
+        # Single-tool execution: the invocation helper with today's
+        # snapshot/admission/invoke span lives on the executor; the loop
+        # keeps the decision port, the wait registry, the transcript choke
+        # points, and the synchronous invoke-context builder.
+        self._tool_executor = ToolExecutor(
+            stats_getter=lambda: self.stats,
+            tool_manager_getter=lambda: self.tool_manager,
+            dangerous_command_grants=self._dangerous_command_grants,
+            checkpoint_recorder=self.checkpoint_recorder,
+            harness_files_getter=lambda: self.harness_files,
+            build_invoke_context=lambda tool_call: self._build_invoke_context(
+                tool_call
+            ),
+            handle_tool_skip=lambda tool_call, decision: self._handle_tool_skip(
+                tool_call, decision
+            ),
+            run_post_tool_and_finalize=(
+                lambda tool_call, finalization: self._run_post_tool_and_finalize(
+                    tool_call, finalization
+                )
+            ),
+            observe_file_state=lambda tool_name, result_model: self._observe_file_state(
+                tool_name, result_model
+            ),
+            serialize_tool_input=lambda tool_call: self._serialize_tool_input(
+                tool_call
+            ),
+            run_pre_tool_pipeline=(
+                lambda tool_call, tool_input: self._run_pre_tool_pipeline(
+                    tool_call, tool_input
+                )
+            ),
+            should_execute_tool=lambda tool, args, call_id: self._should_execute_tool(
+                tool, args, call_id
+            ),
+            is_steering_cancellation=lambda call_id: self._is_steering_cancellation(
+                call_id
+            ),
+            finalize_cancelled_tool=(
+                lambda tool_call, tool_input, cancel_text, **kwargs: (
+                    self._finalize_cancelled_tool(
+                        tool_call, tool_input, cancel_text, **kwargs
+                    )
+                )
+            ),
+            tool_failure_event=lambda tool_call, error_msg: self._tool_failure_event(
+                tool_call, error_msg
+            ),
+            handle_tool_response=lambda tool_call, text: self._handle_tool_response(
+                tool_call, text
+            ),
         )
         self.review_manager = ReviewManager(checkpointer, file_store)
         self.rewind_manager = RewindManager(
@@ -865,6 +875,45 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             self._complete_init()
             if err := self._init_error:
                 raise err
+
+    @property
+    def _admitted_tool_policies(self) -> dict[str, secret_redaction.ScrubPolicy]:
+        """Read-only compatibility view of the redactor's retained snapshots."""
+        return self._outward_redactor.admitted_tool_policies
+
+    @property
+    def _tool_response_order(self) -> dict[str, int] | None:
+        """Read-only compatibility view of the recorder's ordering window."""
+        return self._transcript_recorder.response_order
+
+    @property
+    def _staged_tool_responses(self) -> dict[int, list[LLMMessage]]:
+        """Read-only compatibility view of the recorder's staging buffers."""
+        return self._transcript_recorder.staged_responses
+
+    @property
+    def _tool_invocations(self) -> dict[tuple[str, str], _ToolInvocation]:
+        """Read-only compatibility view of the runner's wait registry."""
+        return self._tool_batch_runner.invocations
+
+    @property
+    def _tool_event_queue(self) -> asyncio.Queue[BaseEvent | None] | None:
+        """Read-only compatibility view of the runner's active batch queue."""
+        return self._tool_batch_runner.tool_event_queue
+
+    @property
+    def _pending_injected_messages(self) -> list[LLMMessage]:
+        """Read/write compatibility view of the injector's pending buffer."""
+        return self._context_injector.pending_injected_messages
+
+    @_pending_injected_messages.setter
+    def _pending_injected_messages(self, messages: list[LLMMessage]) -> None:
+        self._context_injector.pending_injected_messages = messages
+
+    @property
+    def _steering_injections(self) -> set[asyncio.Task[Any]]:
+        """Read-only compatibility view of the injector's steering tasks."""
+        return self._context_injector.steering_injections
 
     def _start_deferred_init(self) -> threading.Thread:
         """Spawn a daemon thread that finishes deferred heavy I/O once."""
@@ -1109,26 +1158,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         await self._save_messages(allow_empty=True)
 
     async def refresh_config(self) -> None:
-        async def preflight(config: ChartreuxConfigSchema) -> None:
-            self._guard_job_authority_config(config)
-
-        await self._config_orchestrator.reload(preflight=preflight)
-        self._execution_authority_config = self._job_authority_config(self.config)
-        self.scrub_policy = secret_redaction.ScrubPolicy.from_config(self.config)
-        secret_redaction.register_session_policy(self, self.scrub_policy)
-        secret_redaction.reset_cache()
-        self._retire_mcp_pool()
-        self._ensure_remote_registries()
-        if self.mcp_registry is not None:
-            self.mcp_registry.sync_active_servers(self.config.mcp_servers)
-
-    def _drain_pending_injections(self) -> bool:
-        if not self._pending_injected_messages:
-            return False
-        for injected in self._pending_injected_messages:
-            self.messages.append(injected)
-        self._pending_injected_messages.clear()
-        return True
+        await _config_transactions.refresh_config(self)
 
     def resolve_user_input_request(self, request_id: str, result: BaseModel) -> None:
         self._request_broker.resolve_user_input(request_id, result)
@@ -1197,31 +1227,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
     @staticmethod
     def _job_authority_config(config: ChartreuxConfigSchema) -> dict[str, Any]:
-        data = config.model_dump(mode="python")
-        data["tools"] = {
-            # Custom Bash configs may add restriction-bearing fields. Preserve
-            # the whole canonical configuration rather than an incomplete allowlist.
-            name: settings
-            for name, settings in data.get("tools", {}).items()
-            if name in {"bash", "bash_start"}
-        }
-        data["credential_names"] = secret_redaction.ScrubPolicy.from_config(config)
-        return copy.deepcopy({
-            key: data.get(key)
-            for key in (
-                "enabled_tools",
-                "disabled_tools",
-                "tools",
-                "tool_paths",
-                "authorized_roots_by_project",
-                "credential_env_passthrough",
-                "credential_names",
-            )
-        })
+        return _config_transactions._job_authority_config(config)
 
     def _guard_job_authority_config(self, config: ChartreuxConfigSchema) -> None:
-        if self._job_authority_config(config) != self._execution_authority_config:
-            self.require_background_jobs_idle()
+        _config_transactions._guard_job_authority_config(self, config)
 
     async def retire_background_jobs(self) -> None:
         """Settle the old root lifetime without stranding admission on resume failure."""
@@ -1286,11 +1295,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             # A later close can join a timed-out worker; it must not replay its call.
             raise BaseExceptionGroup("MCP shutdown cleanup incomplete", errors)
         await self._backend_lifetime.aclose()
-        if self._trust_taken_by_move is not None:
-            self.harness_files.trust_store.revoke_session_trust(
-                self._trust_taken_by_move
-            )
-            self._trust_taken_by_move = None
+        self._workspace_relocator.release_move_trust()
         self.harness_files.revoke_session_trusts()
         cleanup_scratchpad(self.scratchpad_dir)
         lease = self._session_lease
@@ -1377,88 +1382,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         expected_session_generation: int,
         expected_parent_authority_revision: int,
     ) -> _PreparedLaunchReconfiguration:
-        """Stage only changed retained-child consumers without publishing them."""
-        await self.wait_until_ready()
-        self._require_policy_idle()
-        if expected_session_generation != self._session_generation:
-            raise AgentLoopStateError("Stale launch reconfiguration generation")
-        parent_revision = (
-            self._parent_authority_revision_getter()
-            if self._parent_authority_revision_getter is not None
-            else None
-        )
-        if parent_revision != expected_parent_authority_revision:
-            raise AgentLoopStateError("Parent authority changed during reservation")
-        orchestrator = candidate.orchestrator.copy()
-        self._guard_job_authority_config(orchestrator.config)
-        reuse_backend = (
-            self._injected_backend is not None
-            or orchestrator.config.get_active_provider()
-            == self.config.get_active_provider()
-        )
-        tool_fields = ("enabled_tools", "disabled_tools", "tools")
-        previous_overrides = self.launch_overrides or LaunchConfig()
-        replace_tools = any(
-            getattr(previous_overrides, field)
-            != getattr(candidate.semantic_overrides, field)
-            for field in tool_fields
-        )
-        preparation = asyncio.create_task(
-            asyncio.to_thread(
-                self._prepare_launch_consumers,
-                orchestrator.config,
-                replace_tools=replace_tools,
-                reuse_backend=reuse_backend,
-            )
-        )
-        try:
-            consumers = await asyncio.shield(preparation)
-        except asyncio.CancelledError as cancellation:
-            while not preparation.done():
-                try:
-                    await asyncio.shield(preparation)
-                except asyncio.CancelledError:
-                    continue
-                except Exception:
-                    break
-            if not preparation.cancelled():
-                try:
-                    abandoned = preparation.result()
-                except Exception:
-                    abandoned = None
-                if abandoned is not None and not reuse_backend:
-                    with contextlib.suppress(Exception):
-                        await abandoned.backend.__aexit__(None, None, None)
-            raise cancellation
-        system_message = (
-            self.messages[0].model_copy(deep=True)
-            if self.messages and self.messages[0].role is Role.system
-            else None
-        )
-        return _PreparedLaunchReconfiguration(
-            candidate=candidate,
-            orchestrator=orchestrator,
-            consumers=consumers,
-            previous_orchestrator=self._config_orchestrator,
-            previous_agent_manager=self.agent_manager,
-            previous_tool_manager=self.tool_manager,
-            previous_skill_manager=self.skill_manager,
-            previous_system_message=system_message,
-            previous_instruction_read_files=self.tool_manager._instruction_read_files,
-            previous_prices=(
-                self.stats.input_price_per_million,
-                self.stats.output_price_per_million,
-                self.stats.cached_input_price_per_million,
-            ),
-            previous_launch_overrides=(
-                self.launch_overrides.model_copy(deep=True)
-                if self.launch_overrides is not None
-                else None
-            ),
-            previous_committed_model=self.committed_model,
-            session_generation=expected_session_generation,
-            parent_authority_revision=parent_revision,
-            owns_backend=not reuse_backend,
+        return await _config_transactions.prepare_launch_reconfiguration(
+            self,
+            candidate,
+            expected_session_generation=expected_session_generation,
+            expected_parent_authority_revision=expected_parent_authority_revision,
         )
 
     def _prepare_launch_consumers(
@@ -1468,110 +1396,24 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         replace_tools: bool,
         reuse_backend: bool,
     ) -> _PreparedReload:
-        """Build the narrow consumer set required by a retained re-task."""
-        target_config.attach_dispatch_policy(self.bound_dispatch_policy)
-        config_source = _SwappableConfigSource(lambda: target_config)
-        tool_manager = self.tool_manager
-        if replace_tools:
-            tool_manager = ToolManager(
-                config_source.get,
-                mcp_registry=self.mcp_registry,
-                defer_mcp=True,
-                discovery_source=self.tool_manager,
-                restriction_getter=lambda: self.config_orchestrator.restrictions,
-                accepted_token_getter=lambda: (
-                    self.config_orchestrator.accepted_token
-                    if config_source.live
-                    else None
-                ),
-                inherited_restrictions=self._inherited_restrictions,
-                inherited_workspace=self._inherited_workspace,
-                inherited_plan_write_scopes=self._inherited_plan_write_scopes,
-                parent_authority_getter=self._parent_authority_getter,
-                parent_authority_revision_getter=self._parent_authority_revision_getter,
-                cwd=self.cwd,
-                harness_files=self.harness_files,
-                scratchpad_dir=self.scratchpad_dir,
-                task_description=task_description_for_config(target_config),
-                session_root_grants=self._session_root_grants,
-                dangerous_command_authority_provider=self._dangerous_command_grants,
-            )
-        system_prompt = self._render_system_prompt(
-            self.skill_manager, target_config, tool_manager, self.agent_manager
-        )
-        return _PreparedReload(
-            config=target_config,
-            backend=self.backend
-            if reuse_backend
-            else self.backend_factory(target_config),
-            agent_manager=self.agent_manager,
-            tool_manager=tool_manager,
-            skill_manager=self.skill_manager,
-            system_prompt=system_prompt,
-            config_source=config_source,
-            hook_config_result=self._hook_config_result,
-            skills_adopted=self._skills_adopted,
+        return _config_transactions._prepare_launch_consumers(
+            self,
+            target_config,
+            replace_tools=replace_tools,
+            reuse_backend=reuse_backend,
         )
 
     def publish_launch_reconfiguration(
         self, prepared: _PreparedLaunchReconfiguration
     ) -> BackendPublish:
-        """Synchronously publish reversible state immediately before turn start."""
-        self._require_policy_idle()
-        parent_revision = (
-            self._parent_authority_revision_getter()
-            if self._parent_authority_revision_getter is not None
-            else None
-        )
-        if (
-            prepared.previous_orchestrator is not self._config_orchestrator
-            or prepared.session_generation != self._session_generation
-            or prepared.parent_authority_revision != parent_revision
-        ):
-            raise AgentLoopStateError("Stale launch reconfiguration")
-        self._guard_job_authority_config(prepared.orchestrator.config)
-        backend_publish = self._backend_lifetime.publish_reversible(
-            prepared.consumers.backend
-        )
-        self._config_orchestrator = prepared.orchestrator
-        prepared.consumers.agent_manager._orchestrator = prepared.orchestrator
-        self.agent_manager = prepared.consumers.agent_manager
-        self.tool_manager = prepared.consumers.tool_manager
-        self.skill_manager = prepared.consumers.skill_manager
-        prepared.consumers.config_source.point_to(lambda: self.config)
-        self._publish_system_prompt(prepared.consumers.system_prompt)
-        model = prepared.candidate.effective_model
-        self.stats.update_pricing(
-            model.input_price, model.output_price, model.cached_input_price
-        )
-        self.launch_overrides = prepared.candidate.semantic_overrides.model_copy(
-            deep=True
-        )
-        self.committed_model = prepared.candidate.committed_model
-        self.config.attach_committed_model(self.committed_model)
-        return backend_publish
+        return _config_transactions.publish_launch_reconfiguration(self, prepared)
 
     def rollback_launch_reconfiguration(
         self, prepared: _PreparedLaunchReconfiguration, backend_publish: BackendPublish
     ) -> None:
-        backend_publish.rollback()
-        self._config_orchestrator = prepared.previous_orchestrator
-        prepared.previous_agent_manager._orchestrator = prepared.previous_orchestrator
-        self.agent_manager = prepared.previous_agent_manager
-        self.tool_manager = prepared.previous_tool_manager
-        self.skill_manager = prepared.previous_skill_manager
-        self.tool_manager.set_instruction_read_files(
-            prepared.previous_instruction_read_files
+        _config_transactions.rollback_launch_reconfiguration(
+            self, prepared, backend_publish
         )
-        self._authority_revision += 1
-        if prepared.previous_system_message is not None:
-            self.messages.update_system_prompt(
-                str(prepared.previous_system_message.content or "")
-            )
-        self.stats.update_pricing(*prepared.previous_prices)
-        self.launch_overrides = prepared.previous_launch_overrides
-        self.committed_model = prepared.previous_committed_model
-        self.config.attach_committed_model(self.committed_model)
 
     def _model_choice_pending(self) -> bool:
         """True while a recovered session awaits an explicit model selection.
@@ -1622,17 +1464,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
     async def abort_launch_reconfiguration(
         self, prepared: _PreparedLaunchReconfiguration
     ) -> None:
-        if prepared.owns_backend:
-            with contextlib.suppress(Exception):
-                await prepared.consumers.backend.__aexit__(None, None, None)
+        await _config_transactions.abort_launch_reconfiguration(self, prepared)
 
     def finalize_launch_reconfiguration(
         self, prepared: _PreparedLaunchReconfiguration, backend_publish: BackendPublish
     ) -> None:
-        self._execution_authority_config = self._job_authority_config(self.config)
-        backend_publish.finalize(whole_turn_active=True)
-        if prepared.previous_tool_manager is not prepared.consumers.tool_manager:
-            prepared.previous_tool_manager._retire_authority()
+        _config_transactions.finalize_launch_reconfiguration(
+            self, prepared, backend_publish
+        )
 
     @requires_init
     async def refresh_system_prompt(self) -> None:
@@ -1707,100 +1546,23 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         on_injected_event: Callable[[BaseEvent], None] | None = None,
         on_context_ready: Callable[[], object] | None = None,
     ) -> list[BaseEvent]:
-        task = asyncio.current_task()
-        if on_context_ready is not None and task is not None:
-            self._steering_injections.add(task)
-        try:
-            return await self._inject_user_context(
-                content,
-                as_message=as_message,
-                inject_implicit=inject_implicit,
-                images=images,
-                input_text=input_text,
-                resources=resources,
-                client_message_id=client_message_id,
-                manual_shell=manual_shell,
-                before_commit=before_commit,
-                on_commit=on_commit,
-                on_injected_event=on_injected_event,
-                on_context_ready=on_context_ready,
-            )
-        finally:
-            if task is not None:
-                self._steering_injections.discard(task)
-
-    async def _inject_user_context(  # noqa: PLR0913
-        self,
-        content: str,
-        *,
-        as_message: bool,
-        inject_implicit: bool,
-        images: list[ImageAttachment] | None,
-        input_text: str | None,
-        resources: list[UserResource] | None,
-        client_message_id: str | None,
-        manual_shell: ManualShellContext | None,
-        before_commit: Callable[[], None] | None,
-        on_commit: Callable[[UserMessageEvent], None] | None,
-        on_injected_event: Callable[[BaseEvent], None] | None,
-        on_context_ready: Callable[[], object] | None,
-    ) -> list[BaseEvent]:
-        events: list[BaseEvent] = []
-        if as_message:
-            message = LLMMessage(
-                role=Role.user,
-                content=content,
-                message_id=client_message_id or str(uuid4()),
-                posted_at=posting_time(),
-                images=images or None,
-                input_text=input_text,
-                resources=resources or None,
-                manual_shell=manual_shell,
-            )
-            if message.message_id is None:
-                raise AgentLoopError("User message must have a message_id")
-            event = UserMessageEvent(
-                content=input_text if input_text is not None else content,
-                message_id=message.message_id,
-                posted_at=message.posted_at,
-                images=list(message.images or []),
-                resources=list(message.resources or []),
-            )
-            if before_commit is not None:
-                before_commit()
-            self.messages.append(message)
-            if on_commit is not None:
-                on_commit(event)
-            events.append(event)
-            try:
-                if inject_implicit:
-                    async for event in self._inject_invoked_skill(content):
-                        events.append(event)
-                        if on_injected_event is not None:
-                            on_injected_event(event)
-                    async for event in self._inject_mentioned_files(content):
-                        events.append(event)
-                        if on_injected_event is not None:
-                            on_injected_event(event)
-            finally:
-                # Only release the parent's waits after expansion has completed
-                # or unwound. The turn also joins this task before continuing.
-                if on_context_ready is not None:
-                    on_context_ready()
-        else:
-            self.messages.append(
-                LLMMessage(
-                    role=Role.user,
-                    content=content,
-                    injected=True,
-                    images=images or None,
-                    input_text=input_text,
-                    resources=resources or None,
-                    manual_shell=manual_shell,
-                )
-            )
-        await self._save_messages()
-        return events
+        # Compatibility delegate: the user-context construction, the callback
+        # bracketing, and the pending/steering state live on the context
+        # injector; the deferred-init gate stays on this entrypoint.
+        return await self._context_injector.inject_user_context(
+            content,
+            as_message=as_message,
+            inject_implicit=inject_implicit,
+            images=images,
+            input_text=input_text,
+            resources=resources,
+            client_message_id=client_message_id,
+            manual_shell=manual_shell,
+            before_commit=before_commit,
+            on_commit=on_commit,
+            on_injected_event=on_injected_event,
+            on_context_ready=on_context_ready,
+        )
 
     @requires_init
     async def act(
@@ -1841,7 +1603,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             self.config_orchestrator.availability_registry.reset_base(
                 self.committed_model.base_model
             )
-        self._admitted_tool_policies.clear()
+        self._outward_redactor.clear_admissions()
         self.completed_turn_timing = None
         self._active_turn = _ActiveTurn(
             turn_id=options.turn_id or str(uuid4()),
@@ -1866,7 +1628,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                         injected=options.injected,
                     )
                 ) as conversation:
-                    async for event in self._sanitize_outward_events(conversation):
+                    async for event in self._outward_redactor.sanitize(conversation):
                         yield event
             finally:
                 try:
@@ -1874,11 +1636,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 finally:
                     self.checkpoint_recorder.seal_turn()
         finally:
-            self._admitted_tool_policies.clear()
-            for key in tuple(self._tool_invocations):
-                if key[0] == self._turn.turn_id:
-                    del self._tool_invocations[key]
-            self._waiting_only = False
+            self._outward_redactor.clear_admissions()
+            self._tool_batch_runner.clear_turn(self._turn.turn_id)
             self._active_turn = None
             self._backend_lifetime.drain(whole_turn_active=False)
 
@@ -1905,123 +1664,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 except Exception:
                     logger.warning("Could not persist turn timing", exc_info=True)
                 break
-
-    async def _sanitize_outward_events(
-        self, events: AsyncGenerator[BaseEvent]
-    ) -> AsyncGenerator[BaseEvent]:
-        # Hold events behind the earliest unfinished stream so concurrent tool
-        # completions cannot reorder the events seen by consumers.
-        marker = "[Unchecked tool stream remainder suppressed]"
-        pending: list[BaseEvent] = []
-        streams: dict[str, list[ToolStreamEvent]] = {}
-        stream_sizes: dict[str, int] = {}
-        truncated: set[str] = set()
-        async for event in events:
-            ready: list[BaseEvent] = []
-            with secret_redaction.bind_policy(
-                secret_redaction.ScrubPolicy.for_redaction(
-                    self._admitted_tool_policies.values(), self.scrub_policy
-                )
-            ):
-                if isinstance(event, ToolStreamEvent):
-                    call_id = event.tool_call_id
-                    is_first = call_id not in streams
-                    used = stream_sizes.get(call_id, 0)
-                    remaining = max(0, 8192 * 128 - used)
-                    if len(event.message) > remaining:
-                        truncated.add(call_id)
-                    if remaining and event.message:
-                        streams.setdefault(call_id, []).append(
-                            event.model_copy(
-                                update={"message": event.message[:remaining]}
-                            )
-                        )
-                    elif call_id not in streams:
-                        streams[call_id] = [event.model_copy(update={"message": ""})]
-                    stream_sizes[call_id] = used + min(len(event.message), remaining)
-                    if is_first:
-                        pending.append(streams[call_id][0])
-                elif isinstance(event, ToolResultEvent):
-                    chunks = streams.pop(event.tool_call_id, [])
-                    stream_sizes.pop(event.tool_call_id, None)
-                    if chunks:
-                        replacement = self._sanitize_stream(
-                            chunks, marker, event.tool_call_id in truncated
-                        )
-                        first = pending.index(chunks[0])
-                        pending[first] = replacement
-                    truncated.discard(event.tool_call_id)
-                    pending.append(self._sanitize_outward_event(event))
-                    self._admitted_tool_policies.pop(event.tool_call_id, None)
-                else:
-                    pending.append(self._sanitize_outward_event(event))
-                while pending and not (
-                    isinstance(pending[0], ToolStreamEvent)
-                    and pending[0].tool_call_id in streams
-                ):
-                    ready.append(pending.pop(0))
-            for item in ready:
-                yield item
-        # A stream with no result is still output; never expose its unchecked
-        # remainder if the source generator ended unexpectedly.
-        for item in pending:
-            if isinstance(item, ToolStreamEvent) and item.tool_call_id in streams:
-                with secret_redaction.bind_policy(
-                    secret_redaction.ScrubPolicy.for_redaction(
-                        self._admitted_tool_policies.values(), self.scrub_policy
-                    )
-                ):
-                    item = item.model_copy(
-                        update={
-                            "message": marker,
-                            "tool_name": secret_redaction.redact(item.tool_name),
-                            "tool_call_id": secret_redaction.redact(item.tool_call_id),
-                        }
-                    )
-            yield item
-
-    @staticmethod
-    def _sanitize_stream(
-        chunks: list[ToolStreamEvent], marker: str, truncated: bool
-    ) -> ToolStreamEvent:
-        body = "".join(chunk.message for chunk in chunks)
-        # Streams are buffered, so scan the entire retained body once. A window
-        # cannot prove that a credential crossing its edge was checked (even at
-        # the documented 16 KiB maximum); never emit independently checked
-        # windows. The 1 MiB retention cap still bounds this whole-body scan.
-        sanitized = secret_redaction.redact(body)
-        if truncated:
-            sanitized += marker
-        return chunks[0].model_copy(
-            update={
-                "message": sanitized,
-                "tool_name": secret_redaction.redact(chunks[0].tool_name),
-                "tool_call_id": secret_redaction.redact(chunks[0].tool_call_id),
-            }
-        )
-
-    def _sanitize_outward_event(self, event: BaseEvent) -> BaseEvent:
-        """Sanitize tool and hook payloads before UI/ACP consumers see them."""
-        if isinstance(event, ToolCallEvent):
-            return self._recorded_tool_call_event(event)
-        if not isinstance(event, (ToolResultEvent, HookEvent)):
-            return event
-        try:
-            return secret_redaction.redact_model(event)
-        except Exception:
-            logger.warning(
-                "Tool event sanitation failed; suppressing payload", exc_info=True
-            )
-            if isinstance(event, ToolResultEvent):
-                return ToolResultEvent(
-                    tool_name="tool",
-                    tool_class=None,
-                    tool_call_id=secret_redaction.redact(event.tool_call_id),
-                    error="Tool result unavailable",
-                    duration=event.duration,
-                    cancelled=event.cancelled,
-                )
-            return HookEvent()
 
     def _last_user_message(self) -> LLMMessage | None:
         return AgentLoop._last_user_message_from(select_model_context(self.messages))
@@ -2233,15 +1875,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     metadata[key] = str(value)
         return metadata
 
-    def _get_extra_headers(
-        self, provider: ProviderConfig | None = None
-    ) -> dict[str, str]:
-        provider = self.config.get_active_provider() if provider is None else provider
-        headers: dict[str, str] = {}
-        headers["user-agent"] = get_user_agent(provider.backend)
-        headers["x-affinity"] = self.session_id
-        return headers
-
     async def _open_user_turn(
         self,
         user_msg: str | None,
@@ -2306,10 +1939,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             resources=list(user_message.resources or []),
         )
 
-        async for event in self._inject_invoked_skill(user_msg):
+        async for event in self._context_injector.inject_skill(user_msg):
             yield event
 
-        async for event in self._inject_mentioned_files(user_msg):
+        async for event in self._context_injector.inject_mentions(user_msg):
             yield event
 
         if auto_title is not None and self.session_logger.set_initial_auto_title(
@@ -2399,7 +2032,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
                 await self._settle_steering_injections()
                 last_message = self.messages[-1]
-                drained = self._drain_pending_injections()
+                drained = self._context_injector.drain_pending()
                 should_break_loop = last_message.role != Role.tool and not drained
 
                 if user_cancelled:
@@ -2417,7 +2050,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                         await self._save_messages()
                     had_steering = bool(self._steering_injections)
                     await self._settle_steering_injections()
-                    if self._drain_pending_injections() or had_steering:
+                    if self._context_injector.drain_pending() or had_steering:
                         should_break_loop = False
             completed_normally = True
         finally:
@@ -2426,17 +2059,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 await self._save_messages()
 
     async def _settle_steering_injections(self, *, cancel: bool = False) -> None:
-        while tasks := self._steering_injections.copy():
-            if cancel:
-                for task in tasks:
-                    task.cancel()
-            try:
-                await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
-            except asyncio.CancelledError:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
+        # Compatibility delegate: settlement lives on the context injector;
+        # the patch rider (tests/app_server/test_wait_steering.py:869/:875)
+        # captures and patches this name on the loop, and the loop call sites
+        # keep going through it.
+        await self._context_injector.settle(cancel=cancel)
 
     def _queue_post_turn_retry(self, retry_msg: LLMMessage | None) -> bool:
         # Returns whether the loop should still break (no retry queued).
@@ -2501,157 +2128,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         while not self._out_of_band_events.empty():
             self._out_of_band_events.get_nowait()
 
-    def _skill_already_loaded(self, name: str) -> bool:
-        marker = skill_content_marker(name)
-        return any(
-            m.role == Role.tool and m.name == "skill" and marker in (m.content or "")
-            for m in self._current_model_context()
-        )
-
     async def _inject_invoked_skill(
         self, user_msg: str
     ) -> AsyncGenerator[BaseEvent, None]:
-        parsed = self.skill_manager.parse_skill_command(user_msg)
-        if parsed is None:
-            return
-        skill_info = self.skill_manager.get_skill(parsed.name)
-        if skill_info is None:
-            return
-
-        timing = InvocationTiming()
-        timing.start()
-        result = await build_skill_result(
-            skill_info, already_loaded=self._skill_already_loaded(parsed.name)
-        )
-        duration = timing.finish()
-        call_id = str(uuid4())
-        tool_class = self.tool_manager.available_tools.get("skill", SkillTool)
-        call_event = ToolCallEvent(
-            tool_call_id=call_id,
-            tool_call_index=0,
-            tool_name="skill",
-            tool_class=tool_class,
-            args=SkillArgs(name=parsed.name),
-        )
-        call_event = call_event.model_copy(
-            update={
-                "presentation": ToolUIDataAdapter(
-                    tool_class, harness_files=self.harness_files
-                ).get_call_presentation(call_event)
-            }
-        )
-        result_event = ToolResultEvent(
-            tool_name="skill",
-            tool_class=tool_class,
-            result=result,
-            duration=duration,
-            tool_call_id=call_id,
-        )
-        result_event = result_event.model_copy(
-            update={
-                "presentation": ToolUIDataAdapter(
-                    tool_class, harness_files=self.harness_files
-                ).get_result_presentation(result_event)
-            }
-        )
-
-        call_event = self._recorded_tool_call_event(call_event)
-        self.messages.append(
-            LLMMessage(
-                role=Role.assistant,
-                content="",
-                tool_calls=[
-                    self._recorded_tool_call(
-                        ToolCall(
-                            id=call_id,
-                            index=0,
-                            function=FunctionCall(
-                                name="skill",
-                                arguments=json.dumps({"name": parsed.name}),
-                            ),
-                            presentation=call_event.presentation,
-                        )
-                    )
-                ],
-            )
-        )
-        result_text = "\n".join(f"{k}: {v}" for k, v in result.model_dump().items())
-        self.messages.append(
-            LLMMessage(
-                role=Role.tool,
-                tool_call_id=call_id,
-                name="skill",
-                content=result_text,
-                tool_result=PersistedToolResult(
-                    output=cast(dict[str, JsonValue], result.model_dump(mode="json")),
-                    duration=duration,
-                    presentation=result_event.presentation,
-                ),
-            )
-        )
-
-        yield call_event
-        yield result_event
-
-    async def _inject_mentioned_files(
-        self, user_msg: str
-    ) -> AsyncGenerator[BaseEvent, None]:
-        payload = build_path_prompt_payload(user_msg, base_dir=self.cwd)
-        file_resources = [r for r in payload.resources if r.kind == "file"]
-        if not file_resources:
-            return
-        try:
-            tool_instance = self.tool_manager.get("read_file")
-        except NoSuchToolError:
-            return
-        tool_class = type(tool_instance)
-
-        for resource in file_resources:
-            file_path = str(resource.path)
-            call_id = str(uuid4())
-            self.messages.append(
-                LLMMessage(
-                    role=Role.assistant,
-                    content="",
-                    tool_calls=[
-                        self._recorded_tool_call(
-                            ToolCall(
-                                id=call_id,
-                                index=0,
-                                function=FunctionCall(
-                                    name="read_file",
-                                    arguments=json.dumps({"file_path": file_path}),
-                                ),
-                            )
-                        )
-                    ],
-                )
-            )
-            tool_call = ResolvedToolCall(
-                tool_name="read_file",
-                tool_class=tool_class,
-                validated_args=ReadFileArgs(file_path=file_path),
-                call_id=call_id,
-            )
-            call_event = ToolCallEvent(
-                tool_call_id=call_id,
-                tool_call_index=0,
-                tool_name="read_file",
-                tool_class=tool_class,
-                args=ReadFileArgs(file_path=file_path),
-            )
-            call_event = call_event.model_copy(
-                update={
-                    "presentation": ToolUIDataAdapter(
-                        tool_class, harness_files=self.harness_files
-                    ).get_call_presentation(call_event)
-                }
-            )
-            call_event = self._recorded_tool_call_event(call_event)
-            self._record_tool_call_presentation(call_event)
-            yield call_event
-            async for event in self._process_one_tool_call(tool_call):
-                yield event
+        # Compatibility delegate: the synthetic skill expansion lives on the
+        # context injector; tests drive this name directly
+        # (test_agent_tool_call.py:503).
+        async for event in self._context_injector.inject_skill(user_msg):
+            yield event
 
     async def _perform_llm_turn(self) -> AsyncGenerator[BaseEvent, None]:
         await self._settle_steering_injections()
@@ -2684,38 +2168,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if not resolved.tool_calls and not resolved.failed_calls:
             return
 
-        async with contextlib.aclosing(self._handle_tool_calls(resolved)) as calls:
+        async with contextlib.aclosing(
+            self._tool_batch_runner.handle_tool_calls(resolved)
+        ) as calls:
             async for event in calls:
                 yield event
-
-    def _build_tool_call_events(
-        self, tool_calls: list[ToolCall] | None, emitted_ids: set[str]
-    ) -> Generator[ToolCallEvent, None, None]:
-        for tc in tool_calls or []:
-            if tc.id is None or not tc.function.name:
-                continue
-            if tc.id in emitted_ids:
-                continue
-
-            tool_class = self.tool_manager.available_tools.get(tc.function.name)
-            if tool_class is None:
-                continue
-
-            event = ToolCallEvent(
-                tool_call_id=tc.id,
-                tool_call_index=tc.index,
-                tool_name=tc.function.name,
-                tool_class=tool_class,
-            )
-            yield self._recorded_tool_call_event(
-                event.model_copy(
-                    update={
-                        "presentation": ToolUIDataAdapter(
-                            tool_class, harness_files=self.harness_files
-                        ).get_call_presentation(event)
-                    }
-                )
-            )
 
     async def _stream_assistant_events(
         self,
@@ -2744,7 +2201,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     posted_at=chunk.message.posted_at,
                 )
 
-            for event in self._build_tool_call_events(
+            for event in self._tool_batch_runner.build_tool_call_events(
                 chunk.message.tool_calls, emitted_tool_call_ids
             ):
                 emitted_tool_call_ids.add(event.tool_call_id)
@@ -2758,570 +2215,79 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             posted_at=llm_result.message.posted_at,
         )
 
-    async def _handle_tool_calls(
-        self, resolved: ResolvedMessage
-    ) -> AsyncGenerator[BaseEvent]:
-        self._begin_tool_response_ordering()
-        try:
-            async for event in self._emit_failed_tool_events(resolved.failed_calls):
-                yield event
-            if not resolved.tool_calls:
-                return
-
-            for batch in [resolved.tool_calls]:
-                async with contextlib.aclosing(
-                    self._handle_tool_batch(batch)
-                ) as events:
-                    async for event in events:
-                        yield event
-        finally:
-            self._end_tool_response_ordering()
-
-    async def _handle_tool_batch(
-        self, tool_calls: list[ResolvedToolCall]
-    ) -> AsyncGenerator[BaseEvent]:
-        for tool_call in tool_calls:
-            event = ToolCallEvent(
-                tool_name=tool_call.tool_name,
-                tool_class=tool_call.tool_class,
-                args=tool_call.validated_args,
-                tool_call_id=tool_call.call_id,
-            )
-            event = event.model_copy(
-                update={
-                    "presentation": ToolUIDataAdapter(
-                        tool_call.tool_class, harness_files=self.harness_files
-                    ).get_call_presentation(event)
-                }
-            )
-            event = self._recorded_tool_call_event(event)
-            self._record_tool_call_presentation(event)
-            yield event
-
-        async with contextlib.aclosing(
-            self._run_tools_concurrently(tool_calls)
-        ) as events:
-            async for event in events:
-                yield event
-
     def _recorded_tool_call(self, tool_call: ToolCall) -> ToolCall:
-        with secret_redaction.bind_policy(self.scrub_policy):
-            return secret_redaction.sanitize_recorded_tool_call(tool_call)
+        return self._transcript_recorder.record_call(tool_call)
 
     def _recorded_tool_call_event(self, event: ToolCallEvent) -> ToolCallEvent:
-        with secret_redaction.bind_policy(self.scrub_policy):
-            return secret_redaction.sanitize_recorded_tool_call(event)
-
-    def _record_tool_call_presentation(self, event: ToolCallEvent) -> None:
-        if event.presentation is None:
-            return
-        for message in reversed(self.messages):
-            for tool_call in message.tool_calls or []:
-                if tool_call.id == event.tool_call_id:
-                    tool_call.presentation = event.presentation
-                    return
-
-    async def _emit_failed_tool_events(
-        self, failed_calls: list[FailedToolCall]
-    ) -> AsyncGenerator[ToolResultEvent]:
-        for failed in failed_calls:
-            error_msg = f"<{TOOL_ERROR_TAG}>{failed.tool_name}: {failed.error}</{TOOL_ERROR_TAG}>"
-            yield ToolResultEvent(
-                tool_name=failed.tool_name,
-                tool_class=None,
-                error=error_msg,
-                tool_call_id=failed.call_id,
-            )
-            self.stats.tool_calls_failed += 1
-            # Same choke point as successful responses: pydantic validation
-            # errors echo model-supplied argument values, so the failure text
-            # can carry a secret and must be redacted before it joins the
-            # message list.
-            self._append_tool_response(
-                failed.call_id,
-                self.format_handler.create_failed_tool_response_message(
-                    failed, secret_redaction.redact(error_msg)
-                ),
-            )
-
-    @staticmethod
-    async def _join_tool_tasks(
-        tasks: list[asyncio.Task[None]],
-    ) -> list[None | BaseException]:
-        return await asyncio.gather(*tasks, return_exceptions=True)
+        return self._transcript_recorder.record_call_event(event)
 
     def outstanding_wait_call_ids(self, turn_id: str) -> tuple[str, ...]:
-        return tuple(
-            call_id
-            for (identity, call_id), invocation in self._tool_invocations.items()
-            if identity == turn_id and invocation.is_wait and not invocation.task.done()
-        )
+        # Compatibility delegate: the batch wait registry lives on the
+        # runner; tests and the app server call this name on the loop.
+        return self._tool_batch_runner.outstanding_wait_call_ids(turn_id)
 
     def is_waiting_only(self, turn_id: str) -> bool:
-        live = [
-            invocation
-            for (identity, _), invocation in self._tool_invocations.items()
-            if identity == turn_id and not invocation.task.done()
-        ]
-        return bool(live) and all(
-            invocation.is_wait
-            and not invocation.task.cancelling()
-            and not invocation.steering_cancel_requested
-            and invocation.wait_task is not None
-            and not invocation.wait_task.done()
-            and not invocation.wait_task.cancelling()
-            for invocation in live
-        )
+        # Compatibility delegate: tests patch this name on the loop
+        # instance and the app server reads it, so the delegate stays.
+        return self._tool_batch_runner.is_waiting_only(turn_id)
 
     def cancel_outstanding_waits_for_steering(self, turn_id: str) -> tuple[str, ...]:
-        cancelled = []
-        for (identity, call_id), invocation in self._tool_invocations.items():
-            wait = invocation.wait_task
-            if identity != turn_id or not invocation.is_wait:
-                continue
-            if invocation.task.done() or invocation.task.cancelling():
-                continue
-            if (
-                invocation.steering_cancel_requested
-                or wait is None
-                or wait.done()
-                or wait.cancelling()
-            ):
-                continue
-            invocation.steering_cancel_requested = True
-            wait.cancel()
-            cancelled.append(call_id)
-        self._publish_wait_state(turn_id)
-        return tuple(cancelled)
-
-    def _publish_wait_state(self, turn_id: str) -> None:
-        if turn_id != self._turn.turn_id:
-            return
-        waiting_only = self.is_waiting_only(turn_id)
-        if waiting_only != self._waiting_only:
-            self._waiting_only = waiting_only
-            if self._tool_event_queue is not None:
-                self._tool_event_queue.put_nowait(
-                    ToolWaitStateChangedEvent(
-                        turn_id=turn_id, waiting_only=waiting_only
-                    )
-                )
-
-    def _register_wait_task(
-        self, key: tuple[str, str], task: asyncio.Task[TaskResult] | None
-    ) -> None:
-        if (invocation := self._tool_invocations.get(key)) is not None:
-            invocation.wait_task = task
-            self._publish_wait_state(key[0])
+        # Compatibility delegate: tests wrap this name on the loop
+        # instance and the app server calls it, so the delegate stays.
+        return self._tool_batch_runner.cancel_waits_for_steering(turn_id)
 
     def _is_steering_cancellation(self, call_id: str) -> bool:
-        invocation = self._tool_invocations.get((self._turn.turn_id, call_id))
-        task = asyncio.current_task()
-        return (
-            invocation is not None
-            and invocation.steering_cancel_requested
-            and task is not None
-            and not task.cancelling()
-        )
-
-    @staticmethod
-    async def _cancel_and_join_tool_tasks(tasks: list[asyncio.Task[None]]) -> bool:
-        for task in tasks:
-            if not task.done() and not task.cancelling():
-                task.cancel()
-        joined = asyncio.gather(*tasks, return_exceptions=True)
-        interrupted = False
-        while not joined.done():
-            try:
-                await asyncio.shield(joined)
-            except asyncio.CancelledError:
-                interrupted = True
-        return interrupted
-
-    async def _run_tools_concurrently(
-        self, tool_calls: list[ResolvedToolCall]
-    ) -> AsyncGenerator[BaseEvent]:
-        """Execute multiple tool calls concurrently, yielding events as they arrive."""
-        queue: asyncio.Queue[BaseEvent | None] = asyncio.Queue()
-        if self._tool_event_queue is not None:
-            raise AgentLoopStateError("A tool batch is already active")
-        self._tool_event_queue = queue
-        self._request_broker.bind(queue)
-
-        # Execution retains only names/passthrough; the value snapshot is never
-        # bound in a tool task or placed in a queue/event.
-        admitted = self.scrub_policy
-        redaction_snapshot = admitted.capture_for_redaction()
-        self._admitted_tool_policies.update(
-            (tc.call_id, redaction_snapshot) for tc in tool_calls
-        )
-        turn_id = self._turn.turn_id
-        keys = [(turn_id, tc.call_id) for tc in tool_calls]
-        tasks = []
-        for tc, key in zip(tool_calls, keys, strict=True):
-            task = asyncio.create_task(
-                self._execute_tool_to_queue(tc, queue, admitted, key)
-            )
-            tasks.append(task)
-            self._tool_invocations[key] = _ToolInvocation(
-                task=task, is_wait=issubclass(tc.tool_class, WaitForAgent)
-            )
-
-        async def _signal_when_all_done() -> None:
-            try:
-                results = await self._join_tool_tasks(tasks)
-                for tool_call, result in zip(tool_calls, results, strict=True):
-                    if not isinstance(result, BaseException):
-                        continue
-                    if isinstance(result, asyncio.CancelledError):
-                        continue
-                    error_msg = (
-                        f"<{TOOL_ERROR_TAG}>{tool_call.tool_name} failed during "
-                        f"pre-tool processing: {result}</{TOOL_ERROR_TAG}>"
-                    )
-                    logger.warning(
-                        "Pre-tool processing failed tool=%s tool_call_id=%s error=%s",
-                        tool_call.tool_name,
-                        tool_call.call_id,
-                        type(result).__name__,
-                    )
-                    self.stats.tool_calls_failed += 1
-                    with secret_redaction.bind_policy(admitted):
-                        await queue.put(self._tool_failure_event(tool_call, error_msg))
-            finally:
-                await queue.put(None)
-
-        monitor = asyncio.create_task(_signal_when_all_done())
-
-        try:
-            while True:
-                event = await queue.get()
-                if event is None:
-                    break
-                yield event
-        finally:
-            # Closing the event stream must join tools before act() releases its
-            # active-turn guard, just as cancellation and normal completion do.
-            interrupted = await self._cancel_and_join_tool_tasks(tasks)
-            for key in keys:
-                self._tool_invocations.pop(key, None)
-            self._publish_wait_state(turn_id)
-            self._close_tool_batch(queue)
-            self._tool_event_queue = None
-            if not monitor.done():
-                monitor.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await monitor
-            if interrupted:
-                raise asyncio.CancelledError
-
-    async def _execute_tool_to_queue(
-        self,
-        tc: ResolvedToolCall,
-        queue: asyncio.Queue[BaseEvent | None],
-        admitted: secret_redaction.ScrubPolicy,
-        key: tuple[str, str],
-    ) -> None:
-        """Run a single tool call under its admission policy, sending events to the queue."""
-        try:
-            with secret_redaction.bind_policy(admitted):
-                async with contextlib.aclosing(
-                    self._process_one_tool_call(tc)
-                ) as events:
-                    async for event in events:
-                        await queue.put(event)
-        finally:
-            self._tool_invocations.pop(key, None)
-            self._publish_wait_state(key[0])
+        # Compatibility delegate: the executor's wait-registration port
+        # resolves this name on the loop, so instance patches of it keep
+        # intercepting (test_agent_wait_steering.py:454-461).
+        return self._tool_batch_runner.is_steering_cancellation(call_id)
 
     async def _process_one_tool_call(
         self, tool_call: ResolvedToolCall
     ) -> AsyncGenerator[ToolResultEvent | ToolStreamEvent | HookEvent]:
-        try:
-            tool_instance = self.tool_manager.get(tool_call.tool_name)
-        except Exception as exc:
-            error_msg = f"Error getting tool '{tool_call.tool_name}': {exc}"
-            yield self._tool_failure_event(tool_call, error_msg)
-            return
+        # Compatibility delegate: one complete tool lifecycle (lookup,
+        # serialization, pre-hook pipeline, decision, invocation, and the
+        # cancellation/failure envelope) lives on the executor. The loop
+        # call sites keep going through this name so instance patches of it
+        # keep intercepting (test_secret_redaction_exfil.py:437/:487) and
+        # direct calls keep working (test_background_jobs.py:367/:435).
+        async for event in self._tool_executor.process(tool_call):
+            yield event
 
-        try:
-            tool_input = self._serialize_tool_input(tool_call)
-        except Exception as exc:
-            error_msg = (
-                f"<{TOOL_ERROR_TAG}>Failed to serialize tool input for "
-                f"'{tool_call.tool_name}': {exc}</{TOOL_ERROR_TAG}>"
-            )
-            self.stats.tool_calls_failed += 1
-            yield ToolResultEvent(
-                tool_name=tool_call.tool_name,
-                tool_class=tool_call.tool_class,
-                error=error_msg,
-                tool_call_id=tool_call.call_id,
-            )
-            self._handle_tool_response(tool_call, error_msg)
-            return
+    def _build_invoke_context(self, tool_call: ResolvedToolCall) -> InvokeContext:
+        """Build the invocation context for one tool call (executor seam).
 
-        events, resolution = await self._run_pre_tool_pipeline(tool_call, tool_input)
-        for ev in events:
-            yield ev
-        if resolution.denial_event is not None:
-            yield resolution.denial_event
-            return
-        tool_call = resolution.tool_call
-        tool_input = resolution.tool_input
-
-        decision: ToolDecision | None = None
-        tool_started = False
-        timing = InvocationTiming()
-        try:
-            decision = await self._should_execute_tool(
-                tool_instance, tool_call.validated_args, tool_call.call_id
-            )
-
-            if decision.verdict == ToolExecutionResponse.SKIP:
-                async for ev in self._handle_tool_skip(tool_call, decision):
-                    yield ev
-                return
-
-            tool_started = True
-            async for ev in self._invoke_tool(
-                tool_call, tool_instance, tool_input, decision, timing
-            ):
-                yield ev
-
-        except asyncio.CancelledError:
-            steering = self._is_steering_cancellation(tool_call.call_id)
-            timing.finish()
-            cancel = str(
-                get_user_cancellation_message(CancellationReason.TOOL_INTERRUPTED)
-            )
-            logger.info(
-                "Tool call cancelled tool=%s tool_call_id=%s outcome=cancelled",
-                tool_call.tool_name,
-                tool_call.call_id,
-            )
-            self.stats.tool_calls_failed += 1
-            yield ToolResultEvent(
-                tool_name=tool_call.tool_name,
-                tool_class=tool_call.tool_class,
-                error=cancel,
-                cancelled=True,
-                cancellation_origin=(
-                    ToolCancellationOrigin.STEERING if steering else None
-                ),
-                duration=timing.duration,
-                tool_call_id=tool_call.call_id,
-            )
-            async for ev in self._finalize_cancelled_tool(
-                tool_call,
-                tool_input,
-                cancel,
-                tool_started=tool_started,
-                duration=timing.duration,
-            ):
-                yield ev
-            raise
-
-        except Exception as exc:
-            timing.finish()
-            # One prefix for both: the model reads `error`, the client `display`.
-            failure = f"{tool_instance.get_name()} failed: "
-            error_msg = f"<{TOOL_ERROR_TAG}>{failure}{exc}</{TOOL_ERROR_TAG}>"
-            if isinstance(exc, ToolPermissionError):
-                logger.info(
-                    "Tool call denied tool=%s tool_call_id=%s outcome=denied",
-                    tool_call.tool_name,
-                    tool_call.call_id,
-                )
-                self.stats.tool_calls_agreed -= 1
-                self.stats.tool_calls_rejected += 1
-            else:
-                logger.warning(
-                    "Tool call failed tool=%s tool_call_id=%s outcome=error error=%s",
-                    tool_call.tool_name,
-                    tool_call.call_id,
-                    type(exc).__name__,
-                )
-                self.stats.tool_calls_failed += 1
-            yield ToolResultEvent(
-                tool_name=tool_call.tool_name,
-                tool_class=tool_call.tool_class,
-                error=error_msg,
-                duration=timing.duration,
-                error_display=(
-                    f"{failure}{exc.display}" if isinstance(exc, ToolError) else None
-                ),
-                tool_call_id=tool_call.call_id,
-            )
-            async for ev in self._run_post_tool_and_finalize(
-                tool_call,
-                PostToolFinalization(
-                    tool_input=tool_input,
-                    tool_status="failure",
-                    response_status="failure",
-                    tool_error=str(exc),
-                    duration_ms=timing.duration_ms,
-                    duration=timing.duration,
-                    initial_text=error_msg,
-                ),
-            ):
-                yield ev
-
-    async def _invoke_tool(
-        self,
-        tool_call: ResolvedToolCall,
-        tool_instance: BaseTool,
-        tool_input: dict[str, Any],
-        decision: ToolDecision,
-        timing: InvocationTiming,
-    ) -> AsyncGenerator[ToolResultEvent | ToolStreamEvent | HookEvent]:
-        self.stats.tool_calls_agreed += 1
-
-        snapshot = await asyncio.to_thread(
-            tool_instance.get_file_snapshot, tool_call.validated_args
-        )
-        if snapshot is not None:
-            self.checkpoint_recorder.add_snapshot(snapshot)
-
-        # The snapshot await is a world-change window: dangerous-command
-        # authority — or any other permission dimension — may have been
-        # revoked while it ran. Re-run the full resolution at the execution
-        # handoff, after the snapshot and immediately before invoke, so no
-        # unguarded await remains between the last admission decision and the
-        # actual execution. The gate covers every execution path of the tool,
-        # including the shell tool's client-terminal delegation.
-        admission_denial = revalidate_execution_admission(
-            tool_instance,
-            tool_call.validated_args,
-            self.tool_manager,
-            self._dangerous_command_grants,
-            decision.admission,
-        )
-        if admission_denial is not None:
-            self.stats.tool_calls_agreed -= 1
-            logger.info(
-                "Tool call denied at execution admission tool=%s tool_call_id=%s "
-                "outcome=denied",
-                tool_call.tool_name,
-                tool_call.call_id,
-            )
-            async for ev in self._handle_tool_skip(
-                tool_call,
-                ToolDecision(
-                    verdict=ToolExecutionResponse.SKIP,
-                    approval_type=ToolPermission.NEVER,
-                    feedback=admission_denial,
-                ),
-            ):
-                yield ev
-            return
-
-        timing.start()
-        logger.debug(
-            "Tool call starting tool=%s tool_call_id=%s",
-            tool_call.tool_name,
-            tool_call.call_id,
-        )
-        result_model = None
-        async for item in tool_instance.invoke(
-            ctx=InvokeContext(
-                tool_call_id=tool_call.call_id,
-                agent_manager=self.agent_manager,
-                session_dir=self.session_logger.session_dir,
-                launch_context=self.launch_context,
-                interaction_requests=self._request_broker,
-                subagent_runner=self._turn.subagent_runner,
-                subagent_manager=(
-                    None
-                    if self._is_subagent
-                    else cast(SubagentManagementPort, self._turn.subagent_runner)
-                ),
-                plan_file_path=self._plan_session.plan_file_path,
-                request_clear_context_callback=self._request_clear_context,
-                skill_manager=self.skill_manager,
-                is_skill_loaded=self._skill_already_loaded,
-                scratchpad_dir=self.scratchpad_dir,
-                hook_config_result=self._hook_config_result,
-                session_id=self.session_id,
-                mcp_pool=self._mcp_pool,
-                tool_io=self._turn.tool_io,
-                background_jobs=self.background_jobs,
-                is_subagent=self._is_subagent,
-                register_wait_task=lambda task, key=(self._turn.turn_id, tool_call.call_id): (
-                    self._register_wait_task(key, task)
-                ),
-            ),
-            **tool_call.args_dict,
-        ):
-            if isinstance(item, ToolStreamEvent):
-                yield item
-            else:
-                result_model = item
-
-        duration = timing.finish()
-        assert duration is not None
-        if result_model is None:
-            raise ToolError("Tool did not yield a result")
-
-        result_dict = result_model.model_dump(mode="json")
-        text = "\n".join(f"{k}: {v}" for k, v in result_dict.items())
-        extra = tool_instance.get_result_extra(result_model)
-        if extra:
-            text += "\n\n" + extra
-        if decision.result_note:
-            text += (
-                f"\n\n<{VIBE_WARNING_TAG}>{decision.result_note}</{VIBE_WARNING_TAG}>"
-            )
-
-        result_cancelled = (
-            isinstance(result_model, CancellableToolResult) and result_model.cancelled
-        )
-        images = (
-            None if result_cancelled else tool_instance.get_result_images(result_model)
-        )
-        result_event = ToolResultEvent(
-            tool_name=tool_call.tool_name,
-            tool_class=tool_call.tool_class,
-            result=result_model,
-            cancelled=result_cancelled,
-            duration=duration,
+        Synchronous on purpose: the executor enters the invocation right
+        after the execution admission gate, so no await or yielding helper
+        may sit between the gate and the invoke. Every live turn value
+        stays on the loop's side of the seam.
+        """
+        return InvokeContext(
             tool_call_id=tool_call.call_id,
-        )
-        result_event = result_event.model_copy(
-            update={
-                "presentation": ToolUIDataAdapter(
-                    tool_call.tool_class, harness_files=self.harness_files
-                ).get_result_presentation(result_event)
-            }
-        )
-        yield result_event
-        async for ev in self._run_post_tool_and_finalize(
-            tool_call,
-            PostToolFinalization(
-                tool_input=tool_input,
-                tool_status="cancelled" if result_cancelled else "success",
-                response_status="success",
-                tool_output=result_dict,
-                tool_presentation=result_event.presentation,
-                images=images,
-                duration_ms=duration * 1000.0,
-                duration=duration,
-                initial_text=text,
+            agent_manager=self.agent_manager,
+            session_dir=self.session_logger.session_dir,
+            launch_context=self.launch_context,
+            interaction_requests=self._request_broker,
+            subagent_runner=self._turn.subagent_runner,
+            subagent_manager=(
+                None
+                if self._is_subagent
+                else cast(SubagentManagementPort, self._turn.subagent_runner)
             ),
-        ):
-            yield ev
-        if not result_cancelled:
-            # Observation intake: a successful authorized file interaction
-            # (read / edit / write) enrolls the path and publishes its revision
-            # to the dispatcher-level registry at observation time.
-            self._observe_file_state(tool_call.tool_name, result_model)
-        self.stats.tool_calls_succeeded += 1
-        logger.info(
-            "Tool call completed tool=%s tool_call_id=%s duration_ms=%d outcome=%s",
-            tool_call.tool_name,
-            tool_call.call_id,
-            int(duration * 1000),
-            "cancelled" if result_cancelled else "success",
+            plan_file_path=self._plan_session.plan_file_path,
+            request_clear_context_callback=self._request_clear_context,
+            skill_manager=self.skill_manager,
+            is_skill_loaded=self._context_injector.skill_already_loaded,
+            scratchpad_dir=self.scratchpad_dir,
+            hook_config_result=self._hook_config_result,
+            session_id=self.session_id,
+            mcp_pool=self._mcp_pool,
+            tool_io=self._turn.tool_io,
+            background_jobs=self.background_jobs,
+            is_subagent=self._is_subagent,
+            register_wait_task=lambda task, key=(self._turn.turn_id, tool_call.call_id): (
+                self._tool_batch_runner.register_wait_task(key, task)
+            ),
         )
 
     async def _should_execute_tool(
@@ -3339,7 +2305,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 and ctx.denial_kind == "out_of_root"
                 and config_perm != ToolPermission.NEVER
             ):
-                decision = await self._resolve_out_of_root_grant(
+                decision = await self._tool_decisions.resolve_out_of_root_grant(
                     tool, args, ctx, tool_name, tool_call_id
                 )
                 if decision is not None:
@@ -3350,7 +2316,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 and ctx.dangerous_command_proposal is not None
                 and config_perm != ToolPermission.NEVER
             ):
-                decision = await self._resolve_dangerous_command_grant(
+                decision = await self._tool_decisions.resolve_dangerous_command_grant(
                     tool, args, ctx, tool_name, tool_call_id
                 )
                 if decision is not None:
@@ -3368,413 +2334,33 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             verdict=ToolExecutionResponse.EXECUTE, approval_type=ToolPermission.ALWAYS
         )
 
-    async def _resolve_out_of_root_grant(
-        self,
-        tool: BaseTool,
-        args: BaseModel,
-        ctx: PermissionContext,
-        tool_name: str,
-        tool_call_id: str | None,
-    ) -> ToolDecision | None:
-        """Resolve an out-of-root file denial, prompting when the runtime allows.
-
-        Returns None when the denial must keep the existing behavior: the tool
-        is not a promptable file tool, or no promptable target can be proposed.
-        """
-        if tool_name not in ROOT_GRANT_TOOLS:
-            return None
-        if not self._user_input_capability or (
-            self._is_subagent and self._root_grant_port is None
-        ):
-            # A runtime-managed session that cannot prompt names the persistent
-            # config knob; a bare loop keeps the existing denial text unchanged.
-            # A runtime-bound child may prompt: its approved grant resolves back
-            # to this child's own store, never to the parent or a sibling.
-            return (
-                _out_of_root_denial(ctx, tool_name)
-                if self._root_grant_port is not None
-                else None
-            )
-        target = root_grant_target(tool_name, args, self.cwd)
-        root = propose_root_grant(target) if target is not None else None
-        if root is None:
-            return None
-        store = self._session_root_grants
-        try:
-            decision = (
-                ROOT_GRANT_DENY
-                if root in store.denied_roots
-                else await self._prompt_session_root_grant(root, tool_call_id)
-            )
-        except Exception:
-            logger.warning(
-                "Session root grant prompt failed; keeping the denial", exc_info=True
-            )
-            return _out_of_root_denial(ctx, tool_name)
-        if decision == ROOT_GRANT_DENY:
-            store.deny(root)
-            return _declined_root_decision()
-        return await self._resume_after_root_grant(
-            tool, args, tool_name, root, decision
-        )
-
-    async def _resume_after_root_grant(
-        self, tool: BaseTool, args: BaseModel, tool_name: str, root: Path, decision: str
-    ) -> ToolDecision:
-        """Apply an approved grant, then re-resolve and resume the original call."""
-        # The session grant is applied first: the tool call resumes only with
-        # the grant in force, whatever the optional project save reports.
-        await self._apply_approved_root_grant(root)
-        result_note = None
-        if decision == ROOT_GRANT_PROJECT:
-            result_note = await self._persist_project_root_grant(root)
-        resolved = tool.resolve_permission(args)
-        if resolved is not None and resolved.permission == ToolPermission.NEVER:
-            return ToolDecision(
-                verdict=ToolExecutionResponse.SKIP,
-                approval_type=ToolPermission.NEVER,
-                feedback=(
-                    resolved.reason or f"Tool '{tool_name}' is disabled by policy"
-                ),
-            )
-        return ToolDecision(
-            verdict=ToolExecutionResponse.EXECUTE,
-            approval_type=ToolPermission.ALWAYS,
-            result_note=result_note,
-        )
-
     async def _persist_project_root_grant(self, root: Path) -> str:
-        """Attempt to persist an approved grant; report grant and save apart.
-
-        The user revision is fetched from the saved-roots read surface at
-        decision time and never cached across turns. A failed or uncertain save
-        never blocks the already-applied session grant; cancellation propagates
-        so the tool cannot resume without the session grant.
-        """
-        port = self._root_grant_port
-        if port is None:
-            return (
-                f"Root grant for {root} applies to this session; this session "
-                "cannot save roots to your user config."
-            )
-        try:
-            saved = await read_saved_roots(self.config_orchestrator, project=self.cwd)
-        except Exception:
-            logger.warning("Saved roots read failed for %s", self.cwd, exc_info=True)
-            saved = None
-        if saved is None or saved.unavailable is not None or not saved.user_revision:
-            return (
-                f"Root grant for {root} applies to this session only; your saved "
-                "roots could not be read, so it was not saved to your config."
-            )
-        try:
-            result = await port.save_root(self.session_id, root, saved.user_revision)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.warning("Project root grant save failed for %s", root, exc_info=True)
-            return (
-                f"Root grant for {root} applies to this session only; saving it "
-                "to your user config failed."
-            )
-        return root_grant_save_note(root, self.cwd, result)
-
-    async def _resolve_dangerous_command_grant(
-        self,
-        tool: BaseTool,
-        args: BaseModel,
-        ctx: PermissionContext,
-        tool_name: str,
-        tool_call_id: str | None,
-    ) -> ToolDecision | None:
-        """Resolve a grantable dangerous-command denial, prompting when allowed.
-
-        Returns None when the denial must keep the existing behavior: no typed
-        proposal, or a call that can no longer be re-derived, or a bare loop
-        without user input keeps the plain resolver denial. A runtime-managed
-        session that cannot prompt denies promptly with the remediation
-        instead of waiting. A decided call identity is never re-prompted: it
-        returns the honest refusal.
-        """
-        proposal = ctx.dangerous_command_proposal
-        command = getattr(args, "command", None)
-        # Derive the approval's coverage in the same synchronous window as the
-        # denial, so a world change before the answer fails the recheck instead
-        # of silently re-scoping the approval to a different repository.
-        requirements = (
-            derive_call_requirements(command, proposal.project, proposal.operations)
-            if proposal is not None and isinstance(command, str)
-            else None
-        )
-        if proposal is None or requirements is None:
-            # No typed proposal, or the call can no longer be re-derived:
-            # keep the plain denial.
-            return None
-        if not self._user_input_capability or (
-            self._is_subagent and self._dangerous_command_grant_port is None
-        ):
-            # A runtime-managed session that cannot prompt names the
-            # persistent config knob (publication only); a bare loop keeps the
-            # existing denial text unchanged.
-            return (
-                _dangerous_command_denial(ctx, tool_name, proposal)
-                if self._dangerous_command_grant_port is not None
-                else None
-            )
-        store = self._dangerous_command_grants
-        identity = DangerousCommandCallIdentity(
-            scope=proposal.scope, command=proposal.command
-        )
-        if store.is_refused(identity):
-            return _declined_dangerous_command_decision()
-        choice = await self._prompt_dangerous_command_grant(proposal, tool_call_id)
-        if choice is None:
-            return _dangerous_command_denial(ctx, tool_name, proposal)
-        if choice == "deny":
-            store.record_refusal(identity)
-            return _declined_dangerous_command_decision()
-        return await self._resume_after_dangerous_command_grant(
-            tool, args, tool_name, proposal, choice, requirements
-        )
-
-    async def _prompt_dangerous_command_grant(
-        self, proposal: DangerousCommandProposal, tool_call_id: str | None
-    ) -> GrantChoice | None:
-        """Ask the user to approve *proposal*; None when the prompt fails.
-
-        A failed prompt is never a user decision: it denies without recording
-        a refusal, so a retry can prompt again.
-        """
-        try:
-            answer = await self._request_broker.request_user_input(
-                dangerous_command_request(proposal), tool_call_id or ""
-            )
-            return parse_dangerous_command_result(answer, proposal.operations)
-        except Exception:
-            logger.warning(
-                "Dangerous-command prompt failed; keeping the denial", exc_info=True
-            )
-            return None
-
-    async def _resume_after_dangerous_command_grant(
-        self,
-        tool: BaseTool,
-        args: BaseModel,
-        tool_name: str,
-        proposal: DangerousCommandProposal,
-        choice: GrantChoice,
-        requirements: frozenset[tuple[str, RepositoryScope]],
-    ) -> ToolDecision:
-        """Apply an approved grant, fully re-resolve, and resume the call.
-
-        The approval installs runtime authority first — a once permit bound to
-        exactly this invocation, or a session grant keyed by operation and
-        repository scope — then the original call is FULLY re-resolved
-        (disablement, denylist, sensitivity, paths, parent ceilings, repository
-        identity, retired manager). A failed recheck executes nothing and
-        destroys any unused once authority; a passed recheck consumes the
-        permit before the call resumes, leaving no reusable authority. A
-        project grant then awaits persistence, and that await is itself a
-        world-change window: the full resolution runs again after it, so the
-        last recheck is the final admission gate exactly as the roots flow
-        rechecks last.
-
-        An installed once permit never outlives this function unless the call
-        resumes: the recheck runs while the permit is live, so an exception
-        from it — or a cancellation delivered at any later await — would
-        otherwise leave reusable authority behind. The finally block destroys
-        an unconsumed permit and invalidates the cached authority it fed on
-        every exit path, so a failed or interrupted recheck leaks no
-        authority. A session grant is intentional and persistent: it is never
-        rolled back here.
-        """
-        store = self._dangerous_command_grants
-        permit = None
-        try:
-            if choice == "allow_once":
-                if requirements:
-                    permit = store.install_once(requirements)
-                    self.tool_manager._invalidate_dangerous_command_authority()
-            elif store.grant_session(requirements):
-                self.tool_manager._invalidate_dangerous_command_authority()
-            # Full recheck of the original call under the approved authority. A
-            # failed recheck executes nothing, destroys any unused once
-            # authority, and never persists.
-            resolved = tool.resolve_permission(args)
-            if resolved is not None and resolved.permission == ToolPermission.NEVER:
-                return ToolDecision(
-                    verdict=ToolExecutionResponse.SKIP,
-                    approval_type=ToolPermission.NEVER,
-                    feedback=(
-                        resolved.reason or f"Tool '{tool_name}' is disabled by policy"
-                    ),
-                )
-            if permit is not None:
-                # The permit authorized exactly this invocation; it is consumed
-                # before the call resumes, so no authority outlives the approval.
-                store.destroy_once(permit)
-                self.tool_manager._invalidate_dangerous_command_authority()
-                permit = None
-            result_note = None
-            if choice == "allow_project":
-                result_note = await self._persist_project_dangerous_command_grant(
-                    proposal
-                )
-                # The persist await sits between the recheck above and
-                # execution, so that recheck is not yet the final admission
-                # gate: the world may have changed while it ran. Invalidate
-                # cached authority — an in-place config change does not move
-                # the manager's authority token — and re-run the full
-                # resolution, exactly as the roots flow rechecks last. A
-                # mid-await change (denylist, disablement, a retired manager)
-                # skips the call cleanly instead of executing it or failing at
-                # invoke time.
-                self.tool_manager._invalidate_dangerous_command_authority()
-                resolved = tool.resolve_permission(args)
-                if resolved is not None and resolved.permission == ToolPermission.NEVER:
-                    return ToolDecision(
-                        verdict=ToolExecutionResponse.SKIP,
-                        approval_type=ToolPermission.NEVER,
-                        feedback=(
-                            resolved.reason
-                            or f"Tool '{tool_name}' is disabled by policy"
-                        ),
-                    )
-            return ToolDecision(
-                verdict=ToolExecutionResponse.EXECUTE,
-                approval_type=ToolPermission.ALWAYS,
-                result_note=result_note,
-                # The once permit was consumed above, before the call resumed;
-                # the admission carries its requirements so the execution
-                # gate can revalidate exactly this invocation without
-                # authorizing any other call.
-                admission=(
-                    ExecutionAdmission(once_requirements=tuple(requirements))
-                    if choice == "allow_once"
-                    else None
-                ),
-            )
-        finally:
-            if permit is not None:
-                # The permit was installed but never consumed: an exception or
-                # a cancellation left this function before the call resumed.
-                # Destroy it so no reusable authority outlives the approval,
-                # and invalidate the cached authority it fed.
-                store.destroy_once(permit)
-                self.tool_manager._invalidate_dangerous_command_authority()
-
-    async def _persist_project_dangerous_command_grant(
-        self, proposal: DangerousCommandProposal
-    ) -> str:
-        """Attempt to persist an approved grant; report grant and save apart.
-
-        The user revision is fetched from the saved-grants read surface at
-        decision time and never cached across turns. A failed or uncertain
-        save never blocks the already-applied session grant; cancellation
-        propagates so the tool cannot resume without the session grant.
-        """
-        repository = proposal.scope.work_tree or proposal.scope.git_dir
-        operations = ", ".join(proposal.operations)
-        port = self._dangerous_command_grant_port
-        if port is None:
-            return (
-                f"Dangerous-command grant for {operations} in {repository} "
-                "applies to this session; this session cannot save "
-                "dangerous-command grants to your user config."
-            )
-        try:
-            saved = await read_saved_dangerous_command_grants(
-                self.config_orchestrator, project=proposal.project
-            )
-        except Exception:
-            logger.warning(
-                "Saved dangerous-command grants read failed for %s",
-                proposal.project,
-                exc_info=True,
-            )
-            saved = None
-        if saved is None or saved.unavailable is not None or not saved.user_revision:
-            return (
-                f"Dangerous-command grant for {operations} in {repository} "
-                "applies to this session only; your saved grants could not be "
-                "read, so it was not saved to your config."
-            )
-        outcomes: list[tuple[str, ConfigSaveResult | None]] = []
-        for operation_id in proposal.operations:
-            operation = OPERATION_REGISTRY.get(operation_id)
-            if operation is None or not operation.persistable:
-                continue  # Only publication grants are persistable.
-            try:
-                result = await port.save_dangerous_command_grant(
-                    self.session_id, proposal.project, operation_id, saved.user_revision
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "Project dangerous-command grant save failed for %s",
-                    operation_id,
-                    exc_info=True,
-                )
-                result = None
-            outcomes.append((operation_id, result))
-        if not outcomes:
-            return (
-                f"Dangerous-command grant for {operations} in {repository} "
-                "applies to this session; no persistable operation was saved "
-                "to your user config."
-            )
-        return dangerous_command_grant_save_note(
-            proposal.project, proposal.scope, tuple(outcomes)
-        )
-
-    def _close_tool_batch(self, queue: asyncio.Queue[BaseEvent | None]) -> None:
-        self._request_broker.unbind(queue)
-        # Every waiter is settled when a tool batch ends, so no prompt can
-        # still have one; a lingering asker only holds an abandoned request.
-        for asker in tuple(self._root_grant_askers):
-            asker.cancel()
+        # Compatibility delegate: root persistence lives on the coordinator.
+        return await self._tool_decisions.persist_project_root_grant(root)
 
     async def _prompt_session_root_grant(
         self, root: Path, tool_call_id: str | None
     ) -> str:
-        """Ask about *root*, coalescing concurrent waiters on one shared decision."""
-        store = self._session_root_grants
-        pending = store.pending.get(root)
-        if pending is None:
-            pending = asyncio.get_running_loop().create_future()
-            store.pending[root] = pending
-            asker = asyncio.create_task(
-                self._ask_session_root_grant(root, pending, tool_call_id)
-            )
-            self._root_grant_askers.add(asker)
-            asker.add_done_callback(self._root_grant_askers.discard)
-        # One waiter's cancellation must not cancel the shared decision.
-        return await asyncio.shield(pending)
+        # Compatibility delegate: the shared root-prompt implementation and
+        # its asker lifecycle live on the coordinator.
+        return await self._tool_decisions.prompt_root(root, tool_call_id)
 
-    async def _ask_session_root_grant(
-        self, root: Path, pending: asyncio.Future[str], tool_call_id: str | None
-    ) -> None:
-        """Own the single user-input request behind a shared root decision."""
-        try:
-            answer = await self._request_broker.request_user_input(
-                root_grant_request(root), tool_call_id or ""
-            )
-            decision = parse_root_grant_result(answer)
-        except asyncio.CancelledError:
-            if not pending.done():
-                pending.cancel()
-            raise
-        except Exception as exc:
-            if not pending.done():
-                pending.set_exception(exc)
-                pending.add_done_callback(_retrieve_future_exception)
-            logger.warning("Session root grant prompt failed for %s: %s", root, exc)
-        else:
-            if not pending.done():
-                pending.set_result(decision)
-        finally:
-            self._session_root_grants.pending.pop(root, None)
+    def _build_hook_session_context(self) -> HookSessionContext:
+        """Build the hook session context (mixin seam, stage 14.3c).
+
+        The mixin reaches this through the late-bound _hook_session_context
+        callback, so the session identity, transcript path, cwd, and parent
+        stay on the loop's side of the seam and relocation stays visible.
+        """
+        transcript = ""
+        if self.session_logger.enabled and self.session_logger.session_dir is not None:
+            transcript = str(self.session_logger.messages_filepath.resolve())
+        return HookSessionContext(
+            session_id=self.session_id,
+            transcript_path=transcript,
+            cwd=str(self.cwd),
+            parent_session_id=self.parent_session_id,
+        )
 
     def _handle_tool_response(
         self,
@@ -3783,25 +2369,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         persisted_result: PersistedToolResult | None = None,
         images: list[ImageAttachment] | None = None,
     ) -> None:
-        # Single choke point for every tool response entering the message list:
-        # redacting here covers both model input and the persisted session log,
-        # including the structured tool_result payload carried alongside.
-        text = secret_redaction.redact(text)
-        if persisted_result is not None:
-            persisted_result = secret_redaction.redact_persisted_result(
-                persisted_result
-            )
-        message = LLMMessage.model_validate(
-            self.format_handler.create_tool_response_message(tool_call, text)
-        )
-        updates: dict[str, Any] = {}
-        if persisted_result is not None:
-            updates["tool_result"] = persisted_result
-        if images is not None:
-            updates["images"] = images
-        self._append_tool_response(
-            tool_call.call_id,
-            message.model_copy(update=updates) if updates else message,
+        # Host seam for AgentLoopHooksMixin: the single choke point for every
+        # tool response entering the message list lives on the recorder.
+        self._transcript_recorder.record_response(
+            tool_call, text, persisted_result, images
         )
 
     def _tool_failure_event(
@@ -3817,64 +2388,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             tool_call_id=tool_call.call_id,
         )
 
-    def _begin_tool_response_ordering(self) -> None:
-        """Stage tool-response messages so they append in tool-call order.
-
-        Providers require ``tool_response`` messages to follow the order of
-        the ``tool_calls`` that produced them, but batched tools complete out
-        of order and their events must keep streaming in completion order.
-        While ordering is active, ``_append_tool_response`` buffers each
-        message and appends index ``i`` only once index ``i - 1`` has
-        appended, so streaming stays responsive and the message list stays
-        deterministic.
-        """
-        ordered_calls: list[ToolCall] = []
-        for message in reversed(self.messages):
-            if message.role == Role.assistant and message.tool_calls:
-                ordered_calls = list(message.tool_calls)
-                break
-        order: dict[str, int] = {}
-        for index, tool_call in enumerate(ordered_calls):
-            if tool_call.id and tool_call.id not in order:
-                order[tool_call.id] = index
-        self._tool_response_order = order
-        self._staged_tool_responses = {}
-        self._next_tool_response_index = 0
-
-    def _append_tool_response(self, call_id: str, message: LLMMessage) -> None:
-        """Append a tool-response message, in call order during a batch."""
-        order = self._tool_response_order
-        index = order.get(call_id) if order is not None else None
-        if index is None:
-            # No active batch (or a call outside it): append directly.
-            self.messages.append(message)
-            return
-        self._staged_tool_responses.setdefault(index, []).append(message)
-        while (
-            staged := self._staged_tool_responses.pop(
-                self._next_tool_response_index, None
-            )
-        ) is not None:
-            self.messages.extend(staged)
-            self._next_tool_response_index += 1
-
-    def _end_tool_response_ordering(self) -> None:
-        """Flush staged responses and close the ordering window.
-
-        A call aborted before producing any response leaves a gap here;
-        ``_fill_missing_tool_responses`` backfills it before the next
-        completion, exactly as it did before ordering existed.
-        """
-        order = self._tool_response_order
-        staged = self._staged_tool_responses
-        self._tool_response_order = None
-        self._staged_tool_responses = {}
-        self._next_tool_response_index = 0
-        if order is None:
-            return
-        for index in sorted(staged):
-            self.messages.extend(staged[index])
-
     def _completion_inputs(
         self,
         *,
@@ -3886,17 +2399,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         account_conversation: bool = True,
         purpose: UsagePurpose = UsagePurpose.CONVERSATION,
     ) -> CompletionInputs:
-        provider = self.config.get_provider_for_model(model)
-        return CompletionInputs(
+        return self._completion_coordinator.build_completion_inputs(
             model=model,
-            provider_name=provider.name,
-            emits_finish_reason=provider.emits_finish_reason,
-            messages=tuple(messages),
+            messages=messages,
             tools=tools,
             tool_choice=tool_choice,
-            extra_headers=self._get_extra_headers(provider),
-            metadata=self._build_backend_metadata(call_type),
-            max_tokens=self._max_tokens,
+            call_type=call_type,
             account_conversation=account_conversation,
             purpose=purpose,
         )
@@ -3904,37 +2412,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
     def _call_resources(
         self, backend: BackendLike, budget: RequestRetryBudget | None = None
     ) -> CallResources:
-        if budget is None:
-            budget = RequestRetryBudget(self.config.api_retry_max_elapsed_time)
-        owner = self.accounting_owner
-        sink = getattr(self, "_accounting_sink", None)
-        attribution = getattr(self, "_usage_attribution", None)
-        if owner is not None:
-            sink = owner.writer
-            model = self.config.get_active_model()
-            attribution = UsageAttribution(
-                root_session_id=owner.root_session_id,
-                session_id=self.session_id,
-                parent_session_id=self.parent_session_id,
-                agent_role="subagent" if self._is_subagent else "root",
-                agent_profile=self.launch_profile,
-                project_key=owner.project_key,
-                model=model.alias,
-                provider=model.provider,
-                wire_name=model.name,
-            )
-        # The gateway freezes the actual attempt's deployment, purpose and prices;
-        # this binding freezes session identity even if a later rebind replaces it.
-        return CallResources(
-            backend=backend,
-            stats=self.stats,
-            process_message=self.format_handler.process_api_response_message,
-            accounting_sink=sink,
-            usage_attribution=attribution,
-            retry_budget=budget,
-            on_retry=self.notice_retry,
-            admit_replay=self._admit_empty_replay,
-        )
+        return self._completion_coordinator.build_call_resources(backend, budget)
 
     def _admit_empty_replay(self) -> bool:
         if self._max_session_tokens is not None and (
@@ -3947,21 +2425,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         )
 
     def _append_transcript(self, outcome: TranscriptAppend) -> None:
-        message = outcome.message
-        if outcome.committed_model is not None:
-            message = message.model_copy(
-                update={"deployment_identity": outcome.committed_model.model_dump()}
-            )
-        if message.tool_calls:
-            self._execution_message = message
-            message = message.model_copy(
-                update={
-                    "tool_calls": [
-                        self._recorded_tool_call(tc) for tc in message.tool_calls
-                    ]
-                }
-            )
-        self.messages.append(message)
+        self._transcript_recorder.record_completion(outcome)
+
+    def _set_execution_message(self, message: LLMMessage) -> None:
+        """Retain the raw completion message for post-turn tool-call parsing."""
+        self._execution_message = message
+
+    def _note_transcript_prose(self, message: LLMMessage) -> None:
         if (
             self._active_turn is not None
             and message.role is Role.assistant
@@ -4028,102 +2498,55 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         *,
         call_type: str | None = None,
     ) -> tuple[EligibleDeployment, ...]:
-        config = self.config
-        snapshot = config.catalog_snapshot
-        committed = self.committed_model
-        if snapshot is None or committed is None:
-            return ()
-        result = eligible_deployments(
-            snapshot=snapshot,
-            committed=committed,
-            registry=self.config_orchestrator.availability_registry,
-            config=config,
-            history=reorder_for_tool_adjacency(select_model_context(messages)),
-            thinking=attempted_model.thinking,
-            compaction_base=config.compaction_model or None,
-            compaction_only=call_type == "secondary_call",
-            allowed_models=config.allowed_models,
+        # Compatibility delegate: candidate enumeration lives on the
+        # completion coordinator; test_failover_coordinator.py drives and
+        # patches this name (called :142/:146/:186/:270/:280/:332/:349/:762/
+        # :822, patched :1023).
+        return self._completion_coordinator.failover_candidates(
+            messages, attempted_model, call_type=call_type
         )
-        return tuple(result.candidates)
 
     def _backend_for_attempt(
         self, model: ModelConfig, budget: RequestRetryBudget
     ) -> BackendLike:
-        if self._injected_backend is not None:
-            return self._injected_backend
-        provider = self.config.get_provider_for_model(model)
-        return create_backend(
-            provider=provider,
-            on_retry=self.notice_retry,
-            timeout=self.config.api_timeout,
-            retry_max_elapsed_time=self.config.api_retry_max_elapsed_time,
-            retry_budget=budget,
-            connect_timeout=self.config.api_connect_timeout,
-            write_timeout=self.config.api_write_timeout,
-            pool_timeout=self.config.api_pool_timeout,
-            enable_system_trust_store=self.config.enable_system_trust_store,
-        )
+        # Compatibility delegate: attempt-backend construction lives on the
+        # completion coordinator; tests patch this name via MethodType
+        # (test_failover_coordinator.py:368/:428/:684/:926/:1113,
+        # test_usage_accounting.py:561/:665,
+        # test_model_catalog_system_boundaries.py:671).
+        return self._completion_coordinator.backend_for_attempt(model, budget)
 
     def _attempt_model(
         self, resolved: object, *, call_type: str | None, thinking: str | None = None
     ) -> ModelConfig:
-        """Materialize the completion model for a candidate provider.
-
-        A dedicated compaction base follows the selected conversation provider;
-        eligibility has already established that such a deployment exists.
-        """
-        from chartreux.core.model_catalog.resolver import ResolvedModel, resolver_for
-
-        assert isinstance(resolved, ResolvedModel)
-        config = self.config
-        target = resolved
-        if call_type == "secondary_call" and config.compaction_model:
-            base = resolver_for(config).canonicalize(config.compaction_model)
-            definition = config.catalog_snapshot.catalog.models[base]  # type: ignore[union-attr]
-            deployment = next(
-                item
-                for item in definition.deployments
-                if item.provider == resolved.deployment.provider and not item.disabled
-            )
-            target = ResolvedModel(
-                base,
-                definition,
-                deployment,
-                config.catalog_snapshot.catalog.providers[deployment.provider],  # type: ignore[union-attr]
-                config.catalog_snapshot.revision,  # type: ignore[union-attr]
-            )
-        return target.materialize(
-            auto_compact_threshold=config.auto_compact_threshold,
-            thinking=(
-                thinking
-                if thinking is not None
-                else config.thinking_overrides.get(target.base_model)
-            ),
+        # Compatibility delegate: candidate-model materialization lives on
+        # the completion coordinator; test_usage_accounting.py:544/:628 wraps
+        # and patches this name (:560/:664), test_failover_coordinator.py:762
+        # calls it.
+        return self._completion_coordinator.attempt_model(
+            resolved, call_type=call_type, thinking=thinking
         )
-
-    def _release_unattempted_probes(
-        self, candidates: Sequence[EligibleDeployment], attempted: set[str]
-    ) -> None:
-        registry = self.config_orchestrator.availability_registry
-        for candidate in candidates:
-            if (
-                candidate.recovery_probe
-                and candidate.resolved.deployment.provider not in attempted
-            ):
-                assert candidate.recovery_probe_token is not None
-                registry.release_probe(
-                    candidate.resolved.base_model,
-                    candidate.resolved.deployment.provider,
-                    candidate.recovery_probe_token,
-                )
 
     def _attempt_retry_budget(
         self, budget: RequestRetryBudget, *, has_alternative: bool
     ) -> RequestRetryBudget:
-        """Use the shared deadline for a lone deployment, otherwise fail over now."""
-        if not has_alternative:
-            return budget
-        return RequestRetryBudget(0.0)
+        # Compatibility delegate: per-attempt deadline selection lives on the
+        # completion coordinator; test_failover_coordinator.py:439/:778/:779
+        # calls this name directly.
+        return self._completion_coordinator.attempt_retry_budget(
+            budget, has_alternative=has_alternative
+        )
+
+    def _restore_committed_model(self, identity: CommittedModelIdentity | None) -> None:
+        """Restore the committed identity and reinstall launch metadata."""
+        self.committed_model = identity
+        self.config.attach_committed_model(identity)
+        self.install_launch_metadata()
+
+    def _commit_attempt_identity(self, identity: CommittedModelIdentity) -> None:
+        """Publish the attempt identity: committed model plus config attach."""
+        self.committed_model = identity
+        self.config.attach_committed_model(identity)
 
     def _rollback_attempt(
         self,
@@ -4131,31 +2554,16 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         previous_identity: CommittedModelIdentity | None,
         candidate: EligibleDeployment,
     ) -> None:
-        restored = publication.rollback()  # type: ignore[attr-defined]
-        try:
-            if restored:
-                self.committed_model = previous_identity
-                self.config.attach_committed_model(previous_identity)
-                self.install_launch_metadata()
-        finally:
-            if candidate.recovery_probe:
-                assert candidate.recovery_probe_token is not None
-                self.config_orchestrator.availability_registry.release_probe(
-                    candidate.resolved.base_model,
-                    candidate.resolved.deployment.provider,
-                    candidate.recovery_probe_token,
-                )
-
-    def _finalize_attempt(
-        self, publication: object, candidate: EligibleDeployment
-    ) -> None:
-        self.install_launch_metadata()
-        self.config_orchestrator.availability_registry.record_success(
-            candidate.resolved.base_model, candidate.resolved.deployment.provider
+        # Compatibility delegate: publication rollback lives on the
+        # completion coordinator; test_failover_coordinator.py:832 drives this
+        # name directly (with install_launch_metadata patched at :830), and
+        # the restore goes through the _restore_committed_model helper so the
+        # patched metadata install keeps intercepting.
+        self._completion_coordinator.rollback_attempt(
+            publication, previous_identity, candidate
         )
-        publication.finalize(whole_turn_active=True)  # type: ignore[attr-defined]
 
-    async def _attempt_completion(  # noqa: PLR0912, PLR0914, PLR0915
+    def _attempt_completion(
         self,
         *,
         messages: Sequence[LLMMessage],
@@ -4168,177 +2576,23 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         account_conversation: bool = True,
         purpose: UsagePurpose = UsagePurpose.CONVERSATION,
     ) -> AsyncGenerator[LLMChunk]:
-        """Run one shared preparation/publication/rollback attempt lifecycle."""
-        budget = RequestRetryBudget(self.config.api_retry_max_elapsed_time)
-        candidates = self._failover_candidates(
-            messages, fallback_model, call_type=call_type
+        # Compatibility delegate: the entire attempt generator (cleanup paths
+        # included) lives on the completion coordinator; the delegate returns
+        # the coordinator's iterator directly, with no per-chunk forwarding
+        # layer. test_failover_coordinator.py:1057 captures and patches this
+        # name, so the nonstreaming/streaming facades keep resolving it on
+        # the loop at call time.
+        return self._completion_coordinator.attempt(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            call_type=call_type,
+            transcript=transcript,
+            streaming=streaming,
+            fallback_model=fallback_model,
+            account_conversation=account_conversation,
+            purpose=purpose,
         )
-        if not candidates:  # noqa: PLR1702
-            inputs = self._completion_inputs(
-                model=fallback_model,
-                messages=messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                call_type=call_type,
-                account_conversation=account_conversation,
-                purpose=purpose,
-            )
-            provider_name = self.config.get_provider_for_model(fallback_model).name
-            try:
-                with self._backend_lifetime.borrow() as backend:
-                    resources = self._call_resources(backend, budget)
-                    if streaming:
-                        stream = self._llm_gateway.chat_streaming(
-                            inputs, resources, transcript=self._append_transcript
-                        )
-                        async with contextlib.aclosing(stream):
-                            async for chunk in stream:
-                                yield chunk
-                    elif transcript:
-                        yield await self._llm_gateway.chat(
-                            inputs, resources, transcript=self._append_transcript
-                        )
-                    else:
-                        yield await self._llm_gateway.complete(inputs, resources)
-            finally:
-                self._record_completion_providers((provider_name,))
-            return
-
-        registry = self.config_orchestrator.availability_registry
-        last_error: BaseException | None = None
-        attempted: set[str] = set()
-        providers_used: list[str] = []
-        try:  # noqa: PLR1702
-            for candidate_index, candidate in enumerate(candidates):
-                resolved = candidate.resolved
-                provider_name = resolved.deployment.provider
-                if provider_name in attempted:
-                    continue
-
-                replacement: BackendLike | None = None
-                try:
-                    model = self._attempt_model(
-                        resolved, call_type=call_type, thinking=fallback_model.thinking
-                    )
-                    attempt_budget = self._attempt_retry_budget(
-                        budget, has_alternative=candidate_index < len(candidates) - 1
-                    )
-                    replacement = self._backend_for_attempt(model, attempt_budget)
-                    inputs = self._completion_inputs(
-                        model=model,
-                        messages=messages,
-                        tools=tools,
-                        tool_choice=tool_choice,
-                        call_type=call_type,
-                        account_conversation=account_conversation,
-                        purpose=purpose,
-                    )
-                except BaseException:
-                    if replacement is not None:
-                        with contextlib.suppress(Exception):
-                            await replacement.__aexit__(None, None, None)
-                    raise
-
-                if replacement is None:
-                    raise AgentLoopLLMResponseError(
-                        "Backend preparation produced no backend for publication"
-                    )
-
-                previous_identity = self.committed_model
-                failover_identity = resolved.identity.model_copy(
-                    update={"thinking": self.config.get_active_model().thinking}
-                )
-
-                def transcript_sink(
-                    outcome: TranscriptAppend,
-                    identity: CommittedModelIdentity = failover_identity,
-                ) -> None:
-                    self._append_transcript(replace(outcome, committed_model=identity))
-
-                publication: BackendPublish | None = None
-                semantic_delta = False
-                try:
-                    publication = self._backend_lifetime.publish_reversible(replacement)
-                    attempted.add(provider_name)
-                    providers_used.append(provider_name)
-                    self.committed_model = failover_identity
-                    self.config.attach_committed_model(self.committed_model)
-                    with self._backend_lifetime.borrow() as backend:
-                        resources = self._call_resources(backend, budget)
-                        if streaming:
-                            stream = self._llm_gateway.chat_streaming(
-                                inputs, resources, transcript=transcript_sink
-                            )
-                            async with contextlib.aclosing(stream):
-                                async for chunk in stream:
-                                    message = chunk.message
-                                    semantic_delta = semantic_delta or bool(
-                                        message.content
-                                        or message.reasoning_content
-                                        or message.tool_calls
-                                    )
-                                    yield chunk
-                        elif transcript:
-                            yield await self._llm_gateway.chat(
-                                inputs, resources, transcript=transcript_sink
-                            )
-                        else:
-                            yield await self._llm_gateway.complete(inputs, resources)
-                    self._finalize_attempt(publication, candidate)
-                except (asyncio.CancelledError, GeneratorExit):
-                    if publication is not None:
-                        self._rollback_attempt(
-                            publication, previous_identity, candidate
-                        )
-                    raise
-                except Exception as error:
-                    if publication is not None:
-                        self._rollback_attempt(
-                            publication, previous_identity, candidate
-                        )
-                    last_error = error
-                    failure = classify(error)
-                    if failure.failover_eligible:
-                        registry.record_failure(
-                            resolved.base_model, provider_name, failure
-                        )
-                    self._backend_lifetime.drain(whole_turn_active=False)
-                    if (
-                        semantic_delta
-                        or not failure.failover_eligible
-                        or budget.exhausted
-                    ):
-                        raise
-                    continue
-                else:
-                    if (
-                        previous_identity is not None
-                        and previous_identity.provider != provider_name
-                    ):
-                        reason = (
-                            classify(last_error).category.value
-                            if last_error
-                            else "availability"
-                        )
-                        self._record_failover_switch(
-                            base_model=resolved.base_model,
-                            old_provider=previous_identity.provider,
-                            new_provider=provider_name,
-                            reason=reason,
-                        )
-                        logger.warning(
-                            "Model deployment switched base=%s old_provider=%s new_provider=%s reason=%s",
-                            resolved.base_model,
-                            previous_identity.provider,
-                            provider_name,
-                            reason,
-                        )
-                    return
-            assert last_error is not None
-            raise last_error
-        finally:
-            self._record_completion_providers(providers_used)
-            self._release_unattempted_probes(candidates, attempted)
 
     async def _attempt_nonstreaming(
         self,
@@ -4352,22 +2606,19 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         account_conversation: bool = True,
         purpose: UsagePurpose = UsagePurpose.CONVERSATION,
     ) -> LLMChunk:
-        result: LLMChunk | None = None
-        async for chunk in self._attempt_completion(
+        # Compatibility delegate: the nonstreaming facade lives on the
+        # completion coordinator; test_failover_coordinator.py:548 patches
+        # this name, so _complete/_chat keep resolving it on the loop.
+        return await self._completion_coordinator.complete(
             messages=messages,
             tools=tools,
             tool_choice=tool_choice,
             call_type=call_type,
             transcript=transcript,
-            streaming=False,
             fallback_model=fallback_model,
             account_conversation=account_conversation,
             purpose=purpose,
-        ):
-            result = chunk
-        if result is None:
-            raise AgentLoopLLMResponseError("Completion returned no result")
-        return result
+        )
 
     async def _complete(
         self,
@@ -4404,9 +2655,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             fallback_model=active_model,
         )
 
-    async def _chat_streaming(self) -> AsyncGenerator[LLMChunk]:
+    def _chat_streaming(self) -> AsyncGenerator[LLMChunk]:
+        # The streaming facade returns the attempt generator directly (no
+        # added per-chunk forwarding layer): closing the returned stream
+        # closes the attempt generator itself, preserving the outer-stream
+        # close contract (test_failover_coordinator.py:839), and the :1057
+        # rider keeps intercepting through the loop-resolved delegate.
         active_model = self.config.get_active_model()
-        stream = self._attempt_completion(
+        return self._attempt_completion(
             messages=self.messages,
             tools=self.format_handler.get_available_tools(self.tool_manager),
             tool_choice=self.format_handler.get_tool_choice(),
@@ -4415,9 +2671,6 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             streaming=True,
             fallback_model=active_model,
         )
-        async with contextlib.aclosing(stream):
-            async for chunk in stream:
-                yield chunk
 
     def _clean_message_history(self) -> None:
         ACCEPTABLE_HISTORY_SIZE = 2
@@ -4426,126 +2679,33 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._fill_missing_tool_responses()
 
     def _fill_missing_tool_responses(self) -> None:
-        i = 1
-        while i < len(self.messages):  # noqa: PLR1702
-            msg = self.messages[i]
-
-            if msg.role == "assistant" and msg.tool_calls:
-                expected_responses = len(msg.tool_calls)
-
-                if expected_responses > 0:
-                    responded_ids: set[str] = set()
-                    j = i + 1
-                    while j < len(self.messages) and self.messages[j].role == "tool":
-                        tool_call_id = self.messages[j].tool_call_id
-                        if tool_call_id is not None:
-                            responded_ids.add(tool_call_id)
-                        j += 1
-
-                    if len(responded_ids) < expected_responses:
-                        insertion_point = j
-
-                        for tool_call_data in msg.tool_calls:
-                            if (tool_call_data.id or "") in responded_ids:
-                                continue
-
-                            empty_response = LLMMessage(
-                                role=Role.tool,
-                                tool_call_id=tool_call_data.id or "",
-                                name=(
-                                    (tool_call_data.function.name or "")
-                                    if tool_call_data.function
-                                    else ""
-                                ),
-                                content=str(
-                                    get_user_cancellation_message(
-                                        CancellationReason.TOOL_NO_RESPONSE
-                                    )
-                                ),
-                            )
-
-                            if insertion_point < len(self.messages):
-                                # An interior insertion invalidates the cursor's
-                                # boundary proof, even if repeated records make the
-                                # shifted boundary slot look unchanged.
-                                self.session_logger.invalidate_transcript_cursor()
-                            self.messages.insert(insertion_point, empty_response)
-                            insertion_point += 1
-
-                    i = i + 1 + expected_responses
-                    continue
-
-            i += 1
+        self._transcript_recorder.repair_missing_responses()
 
     def _fence_rewind_transcript(self) -> None:
+        # The generation increment stays on the loop's transition fence; the
+        # recorder owns the transcript cursor invalidation.
         self._session_generation += 1
-        self.session_logger.invalidate_transcript_cursor()
+        self._transcript_recorder.fence_transcript()
 
     async def _reset_session(self, keep_parent: bool = True) -> None:
+        # Preparation (fresh identity, policy, prompt, accounting owner, and
+        # lease, with the lease released on any failure) lives on the
+        # session-transitions service; this synchronous commit stays on the
+        # loop, as does the job retirement that precedes it.
         await self.retire_background_jobs()
-        old_session_id = self.session_id
-        suffix = extract_suffix(self.session_id)
-        session_id = generate_session_id(suffix=suffix)
-        lease_root = (
-            self._session_lease.path.parent.parent
-            if self._session_lease is not None
-            else Path(self.config.session_logging.save_dir)
+        prepared = await self._session_transitions.prepare_reset(
+            keep_parent=keep_parent
         )
-        lease = (
-            await asyncio.to_thread(SessionLease(lease_root, session_id).acquire)
-            if self.config.session_logging.enabled
-            else None
-        )
-        parent_session_id = (
-            self.parent_session_id
-            if keep_parent and self._is_subagent
-            else old_session_id
-            if keep_parent
-            else None
-        )
-        try:
-            new_policy = self.bound_dispatch_policy
-            if not keep_parent and not self._is_subagent:
-                new_policy = bind_policy(self.config)
-            new_config = self.config.model_copy().attach_dispatch_policy(new_policy)
-            new_task_description = task_description_for_config(new_config)
-            new_prompt = self._render_system_prompt(
-                self.skill_manager, new_config, bound_policy=new_policy
-            )
-            owner = self.accounting_owner
-            if (
-                owner is not None
-                and not self._is_subagent
-                and owner.root_session_id != session_id
-            ):
-                if owner.owner_factory is None:
-                    raise ValueError(
-                        "Prepare accounting ownership before resetting a root"
-                    )
-                owner = owner.owner_factory(session_id, owner.project_key)
-            self.session_logger.reset_session(
-                session_id, parent_session_id=parent_session_id
-            )
-        except BaseException:
-            if lease is not None:
-                await asyncio.to_thread(lease.release)
-            raise
-        # Old invocation resources remain bound to the old process-owned writer.
-        # Retain cancelled title producers just as on resume/rebind.
-        title_task = self._auto_title_task
-        if self.accounting_owner is not None and title_task is not None:
-            self._detached_accounting_producers.add(title_task)
-            title_task.add_done_callback(self._detached_accounting_producers.discard)
-        self.accounting_owner = owner
+        self.accounting_owner = prepared.owner
         self._session_generation += 1
-        self.session_id = session_id
-        self.parent_session_id = parent_session_id
-        self.bound_dispatch_policy = new_policy
-        self.config_orchestrator.bound_dispatch_policy = new_policy
+        self.session_id = prepared.session_id
+        self.parent_session_id = prepared.parent_session_id
+        self.bound_dispatch_policy = prepared.new_policy
+        self.config_orchestrator.bound_dispatch_policy = prepared.new_policy
         self.install_launch_metadata()
-        self.tool_manager._install_task_description(new_task_description)
-        self._publish_system_prompt(new_prompt)
-        self.replace_session_lease(lease)
+        self.tool_manager._install_task_description(prepared.new_task_description)
+        self._publish_system_prompt(prepared.new_prompt)
+        self.replace_session_lease(prepared.lease)
         self._reset_title_state()
         # The reset starts a new session in place (a history clear or a
         # rewind fork): session grants, once permits, and refusal memory
@@ -4594,82 +2754,32 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         the loop untouched. A bug in any commit step would leave the loop
         half-rebound; callers should treat an unexpected raise as fatal.
         """
-        self.require_background_jobs_idle()
-        resumed_policy = resume_policy(
-            self.config,
-            session_metadata.dispatch_policy,
-            self.agent_manager.available_agents,
+        prepared = self._session_transitions.prepare_resume(
+            session_id,
+            session_metadata=session_metadata,
+            prepared_scratchpad=prepared_scratchpad,
+            accounting_owner=accounting_owner,
         )
-        replacement_jobs = (
-            BackgroundJobRegistry(
-                generation=self._job_lifetime_generation + 1,
-                event_sink=self._out_of_band_events.put_nowait,
-            )
-            if not self._is_subagent
-            else None
-        )
-        replacement_port = (
-            replacement_jobs.root_port()
-            if replacement_jobs is not None
-            else self.background_jobs.borrow()
-            if self.background_jobs is not None
-            else None
-        )
-        # Prepare without mutating the live loop. Enabled root accounting must
-        # have its replacement allocated by the runtime before this sync boundary.
-        owner = accounting_owner or self.accounting_owner
-        if owner is not None:
-            if not self._is_subagent and owner.root_session_id != session_id:
-                raise ValueError("Prepare accounting ownership before rebinding a root")
-            if (
-                self.accounting_owner is not None
-                and owner.root_session_id == self.accounting_owner.root_session_id
-            ):
-                owner = self.accounting_owner
-        previous_scratchpad = self.scratchpad_dir
-        scratchpad_dir = (
-            self.prepare_scratchpad_for_session(session_id)
-            if isinstance(prepared_scratchpad, _PrepareScratchpad)
-            else prepared_scratchpad
-        )
-
-        # A child borrows access through ToolManager, never directory ownership.
-        if self._is_subagent and scratchpad_dir is not None:
-            raise ValueError("Child sessions cannot own a prepared scratchpad")
-
-        resumed_config = self.config.model_copy().attach_dispatch_policy(resumed_policy)
-        resumed_task_description = task_description_for_config(resumed_config)
-        resumed_prompt = self._render_system_prompt(
-            self.skill_manager,
-            resumed_config,
-            bound_policy=resumed_policy,
-            scratchpad_dir=scratchpad_dir,
-        )
-
-        # Retain title work before reset drops its reference. Cancellation is not
-        # settlement: its frozen sink may still submit after this rebind. The old
-        # writer stays process-owned; retirement requires producer settlement.
-        title_task = self._auto_title_task
-        if self.accounting_owner is not None and title_task is not None:
-            self._detached_accounting_producers.add(title_task)
-            title_task.add_done_callback(self._detached_accounting_producers.discard)
-
         # Commit — assignments and in-place resets only, from here on infallible.
         if self._background_job_registry is not None:
             self._background_job_registry.retire()
-        self._background_job_registry = replacement_jobs
-        self.background_jobs = replacement_port
+        self._background_job_registry = prepared.replacement_jobs
+        self.background_jobs = prepared.replacement_port
         self._job_lifetime_generation += 1
-        self.accounting_owner = owner
+        self.accounting_owner = prepared.owner
         self._session_generation += 1
         self.session_id = session_id
         self.parent_session_id = parent_session_id
-        self.scratchpad_dir = scratchpad_dir
-        self.tool_manager.set_scratchpad_dir(scratchpad_dir)
-        self.bound_dispatch_policy = resumed_policy
-        self.config_orchestrator.bound_dispatch_policy = resumed_policy
-        session_metadata.dispatch_policy = resumed_policy.model_dump(mode="json")
-        session_metadata.dispatch_policy_notes = list(resumed_policy.diagnostics)
+        self.scratchpad_dir = prepared.scratchpad_dir
+        self.tool_manager.set_scratchpad_dir(prepared.scratchpad_dir)
+        self.bound_dispatch_policy = prepared.resumed_policy
+        self.config_orchestrator.bound_dispatch_policy = prepared.resumed_policy
+        session_metadata.dispatch_policy = prepared.resumed_policy.model_dump(
+            mode="json"
+        )
+        session_metadata.dispatch_policy_notes = list(
+            prepared.resumed_policy.diagnostics
+        )
         self.session_logger.apply_resumed_session(
             session_id, session_dir, session_metadata
         )
@@ -4681,44 +2791,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             self.stats = stats
         else:
             self.stats = AgentStats.create_fresh(self.stats)
-            self._apply_active_model_pricing()
+            self._session_transitions.apply_active_model_pricing()
         self._reset_session_scoped_state()
-        self._restore_todo_state(loaded_messages)
-        self._restore_file_state(loaded_messages)
-        self.tool_manager._install_task_description(resumed_task_description)
-        self._publish_system_prompt(resumed_prompt)
-        cleanup_scratchpad(previous_scratchpad)
-
-    def _restore_todo_state(self, messages: Sequence[LLMMessage]) -> None:
-        try:
-            todo = self.tool_manager.get("todo")
-        except NoSuchToolError:
-            return
-        todo.state = TodoState.replay(messages)
-
-    def _restore_file_state(self, messages: Sequence[LLMMessage]) -> None:
-        """Restore the working-set file state from the resumed transcript.
-
-        Structural replay across compaction, mirroring ``_restore_todo_state``:
-        the last compaction boundary's envelope wins, merged into the live
-        store (the registry breaks ties between the live and replayed views).
-        Fail-safe: a corrupt envelope degrades to the live state.
-        """
-        try:
-            self.file_state_context.merge_replayed(FileStateStore.replay(messages))
-        except Exception as exc:
-            logger.warning("File state restore failed error=%s", type(exc).__name__)
-
-    def _apply_active_model_pricing(self) -> None:
-        try:
-            active_model = self.config.get_active_model()
-        except ValueError:
-            return
-        self.stats.update_pricing(
-            active_model.input_price,
-            active_model.output_price,
-            active_model.cached_input_price,
-        )
+        self._session_transitions.restore_todo_state(loaded_messages)
+        self._session_transitions.restore_file_state(loaded_messages)
+        self.tool_manager._install_task_description(prepared.resumed_task_description)
+        self._publish_system_prompt(prepared.resumed_prompt)
+        cleanup_scratchpad(prepared.previous_scratchpad)
 
     def _reset_session_scoped_state(self) -> None:
         # Clear any duration the picker recorded so it doesn't leak into the
@@ -4744,25 +2823,17 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._dangerous_command_grants.clear_session_state()
         self.tool_manager._invalidate_dangerous_command_authority()
 
-    @requires_init
-    async def clear_history(self) -> None:
-        await self.session_logger.save_interaction(
-            self.messages, self.stats, self.config, self.tool_manager, None
-        )
-        # Prepare and commit the new root binding before clearing live history.
-        await self._reset_session(keep_parent=False)
-        self.messages.reset(self.messages[:1])
-
+    def _publish_fresh_stats(self) -> None:
         self.stats = AgentStats.create_fresh(self.stats)
         self.stats.trigger_listeners()
-        self._apply_active_model_pricing()
 
-        self.middleware_pipeline.reset()
-        self.tool_manager.reset_all()
-        # A history clear starts a fresh context: the working set is
-        # session-scoped state and does not survive it (the dispatcher-level
-        # revision registry does — it is tree truth, not session state).
-        self.file_state_context.reset()
+    @requires_init
+    async def clear_history(self) -> None:
+        # The clear orchestration (save, reset, trim, fresh stats, pricing,
+        # middleware/tool/file-state reset) lives on the session-transitions
+        # service; the loop keeps this name because tests capture and patch
+        # the instance attribute (tests/app_server/test_subagents.py:5854).
+        await self._session_transitions.clear_history()
 
     @requires_init
     async def compact(self, extra_instructions: str = "") -> str:
@@ -4807,149 +2878,28 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             AgentLoopStateError: Something is in flight, or *cwd* is not a
                 directory.
         """
-        if self._active_turn is not None:
-            raise AgentLoopStateError("Cannot relocate while a turn is active")
-        target = cwd.expanduser().resolve()
-        if target == self.cwd:
-            return
-        self.require_background_jobs_idle()
-        if not target.is_dir():
-            raise AgentLoopStateError(f"Not a directory: {target}")
-
-        # Taken before the first await, and held across both. Checking once and
-        # then awaiting would leave a window for an operation to start against a
-        # directory that is moving under it.
-        self._take_session("relocation")
-        try:
-            checkout = await asyncio.to_thread(self._destination_checkout, target)
-            if checkout is None:
-                raise AgentLoopStateError(
-                    f"Not a worktree of this session's repository: {target}"
-                )
-
-            previous_files = self.harness_files
-            previous_cwd = self.cwd
-            moved = self.harness_files.moved_to(target)
-            # The checkout rather than the position inside it. The project layer
-            # finds `.chartreux` by walking up from the working directory and asks
-            # whether the directory holding it is trusted, and trust resolves
-            # upward too - so a grant on a subdirectory never reaches the root
-            # the file sits at, and a subdirectory move would read no project
-            # config at all. That is the case re-rooting exists for.
-            #
-            # Safe only because of the check above. Session trust outranks an
-            # explicit untrust at the same path and reaches every descendant,
-            # so granting it for an arbitrary directory would hand the session
-            # a tree the user never opened. Restricted to a checkout of the
-            # repository it is already working in, it inherits authority rather
-            # than creating it.
-            moved.trust_store.trust_for_session(checkout)
-            try:
-                await self._bind_workspace(target, moved)
-            except BaseException:
-                moved.trust_store.revoke_session_trust(checkout)
-                await self._restore_workspace(previous_cwd, previous_files)
-                raise
-            # Release the grant a move took, and only that one. The trust store
-            # is process-wide and counts grants, so releasing the departure
-            # outright would take back one the session never made: at session
-            # start for this session, or for another session sitting there.
-            if self._trust_taken_by_move is not None:
-                moved.trust_store.revoke_session_trust(self._trust_taken_by_move)
-            self._trust_taken_by_move = checkout
-        finally:
-            self._release_session("relocation")
+        # The relocation transaction (reservation, destination validation,
+        # bind/restore, move-acquired trust tracking) lives on the workspace
+        # relocator; the loop keeps this name because the app server calls it
+        # and tests patch it (tests/app_server/test_relocate.py:192).
+        await self._workspace_relocator.relocate(cwd)
 
     def _destination_checkout(self, target: Path) -> Path | None:
-        """The checkout *target* sits in, or None when it is not one to move to.
+        # Kept for the instance patch seam (tests/agent_loop/
+        # test_background_jobs.py:44); the relocator resolves it late-bound.
+        return self._workspace_relocator.destination_checkout(target)
 
-        The precondition the rest of the move rests on, and it has to be exactly
-        this narrow. Anything wider grants trust over a tree the session never
-        occupied; anything narrower strands a session opened in a subdirectory,
-        since it moves into the matching subdirectory of the worktree and could
-        not name its way back.
-
-        So the destinations are the counterparts of the current position: the
-        same relative path in the main checkout, and in each linked worktree.
-        Not the parent checkout, which would widen a subdirectory session to the
-        whole repository, and not a sibling directory, which the session has no
-        claim on either.
-
-        The checkout comes back with the answer because trust is granted on it
-        rather than on the position: a `.chartreux` at the root is out of reach of a
-        grant made on a subdirectory below it.
-        """
-        try:
-            with WorktreeRepository.open(self.cwd) as repository:
-                for worktree in repository.linked():
-                    if worktree.path.resolve() == target:
-                        return worktree.root.resolve()
-                if repository.repository_counterpart == target:
-                    return repository.root
-        except GitError:
-            return None
-        return None
-
-    def _project_config_layer(self) -> ProjectConfigLayer | None:
-        """The live project config layer, or None when there is none to re-root.
-
-        Absent when the project source is disabled, and when the orchestrator
-        carries no layer stack at all, which is how the test doubles are built.
-        """
-        with contextlib.suppress(AttributeError, KeyError):
-            layer = self.config_orchestrator.get_layer(ProjectConfigLayer.NAME)
-            if isinstance(layer, ProjectConfigLayer):
-                return layer
-        return None
+    def _assign_workspace(self, cwd: Path, harness_files: HarnessFilesManager) -> None:
+        """Point the loop's workspace roots at *cwd* (the relocator's seam)."""
+        self.cwd = cwd
+        self.harness_files = harness_files
 
     async def _bind_workspace(
         self, cwd: Path, harness_files: HarnessFilesManager
     ) -> None:
-        """Point everything rooted in the working directory at *cwd*."""
-        self.cwd = cwd
-        self.harness_files = harness_files
-        # The logger holds its own copy and is what writes the directory into
-        # session metadata, so a move that skipped it would be recorded as
-        # never having happened.
-        self.session_logger.relocated_to(cwd)
-        if (layer := self._project_config_layer()) is not None:
-            await layer.reroot(cwd)
-            await self.config_orchestrator.reload()
-        self.agent_manager.rebind(harness_files)
-        # Rebuilds the tools, skills, prompt and hooks bound to the old
-        # directory. Preparing happens off-thread and the commit is synchronous,
-        # so that half is not observable partly applied. It runs last so those
-        # objects are built from the config the destination resolves to.
-        #
-        # It returns without committing, and without raising, when a newer
-        # reload supersedes it. The destination still wins: that newer reload
-        # prepares from the live self.cwd, which is already the new one. What is
-        # not guaranteed is that the rebuild has finished by the time relocate
-        # returns. Treating supersession as failure would be worse, since the
-        # rollback would then fight a reload that is legitimately in flight.
-        await self.reload_with_initial_messages(reload_hooks=True)
-
-    async def _restore_workspace(
-        self, cwd: Path, harness_files: HarnessFilesManager
-    ) -> None:
-        """Undo a partly applied move.
-
-        Failures are logged rather than raised. The caller is already unwinding
-        the exception that says why the move did not happen, and replacing it
-        with a second one would hide that.
-        """
-        self.cwd = cwd
-        self.harness_files = harness_files
-        self.session_logger.relocated_to(cwd)
-        try:
-            if (layer := self._project_config_layer()) is not None:
-                await layer.reroot(cwd)
-                await self.config_orchestrator.reload()
-            self.agent_manager.rebind(harness_files)
-        except Exception:
-            logger.exception(
-                "Failed to restore the workspace after a rejected move cwd=%s", cwd
-            )
+        # Kept for the instance patch seam (tests/agent_loop/
+        # test_background_jobs.py:141); the relocator resolves it late-bound.
+        await self._workspace_relocator.bind_workspace(cwd, harness_files)
 
     @requires_init
     async def reload_with_initial_messages(
@@ -4961,105 +2911,32 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         reload_config: bool = False,
         session_save_config: ChartreuxConfigSchema | None = None,
     ) -> None:
-        self._reload_generation += 1
-        generation = self._reload_generation
-
-        # Session switching may already have installed the target configuration
-        # while the messages and logger still belong to the departing session.
-        await self.session_logger.save_interaction(
-            self.messages,
-            self.stats,
-            session_save_config if session_save_config is not None else self.config,
-            self.tool_manager,
-            None,
+        await _config_transactions.reload_with_initial_messages(
+            self,
+            max_turns,
+            max_price,
+            reset_middleware,
+            reload_hooks,
+            reload_config,
+            session_save_config,
         )
-
-        # A newer reload superseded us while we were saving; don't mutate state.
-        if generation != self._reload_generation:
-            return
-
-        if max_turns is not None:
-            self._max_turns = max_turns
-        if max_price is not None:
-            self._max_price = max_price
-        self._ensure_remote_registries()
-
-        if reload_config:
-            # The orchestrator owns source reads and acceptance. Preparing runtime
-            # consumers must finish before its paired snapshot becomes visible.
-            prepared_reload: _PreparedReload | None = None
-
-            async def prepare(candidate: ChartreuxConfigSchema) -> None:
-                nonlocal prepared_reload
-                prepared_reload = await asyncio.to_thread(
-                    self._prepare_reload, candidate, reload_hooks
-                )
-                if generation != self._reload_generation:
-                    raise AgentLoopStateError("Configuration reload was superseded")
-                self._commit_reload(prepared_reload, reset_middleware)
-
-            await self._config_orchestrator.reload(preflight=prepare)
-            return
-
-        target_config = self.config
-
-        # Off-loop: skill discovery and system prompt I/O. reload() is awaited within a
-        # turn, so that turn is suspended here -- nothing mutates the shared state this
-        # reads, and the new objects are built locally before the commit below.
-        prepared = await asyncio.to_thread(
-            self._prepare_reload, target_config, reload_hooks
-        )
-
-        # A newer reload superseded us; let it own the commit.
-        if generation != self._reload_generation:
-            return
-
-        # Synchronous swap: no await, so an in-flight turn can't observe a partial
-        # update. Keep it that way -- don't make it async or move it off-thread.
-        self._commit_reload(prepared, reset_middleware)
 
     async def _prepare_policy_replacement(
         self, *, source: str, tools: dict[str, Any], expected_token: object
     ) -> _PreparedPolicyReplacement:
-        """Prepare local authority under the server's tree reservation."""
-        self._require_policy_idle()
-        previous_manager = self.tool_manager
-        session_generation = self._session_generation
-        staged = await self.config_orchestrator._stage_policy_replacement(
-            source=source, tools=tools, expected_token=expected_token
-        )
-        return self._prepare_policy_manager(
-            staged,
-            expected_token,
-            previous_manager,
-            session_generation,
-            self._inherited_restrictions,
+        return await _config_transactions._prepare_policy_replacement(
+            self, source=source, tools=tools, expected_token=expected_token
         )
 
     async def _prepare_root_replacement(
         self, *, source: str, roots: dict[str, list[str]], expected_token: object
     ) -> _PreparedPolicyReplacement:
-        self._require_policy_idle()
-        previous_manager = self.tool_manager
-        generation = self._session_generation
-        staged = await self.config_orchestrator._prepare_root_replacement(
-            source=source, roots=roots, expected_token=expected_token
-        )
-        return self._prepare_policy_manager(
-            staged,
-            expected_token,
-            previous_manager,
-            generation,
-            self._inherited_restrictions,
+        return await _config_transactions._prepare_root_replacement(
+            self, source=source, roots=roots, expected_token=expected_token
         )
 
     def _require_policy_idle(self) -> None:
-        if (
-            self._active_turn is not None
-            or self._tool_event_queue is not None
-            or self._holders
-        ):
-            raise AgentLoopStateError("Policy replacement requires an idle loop")
+        _config_transactions._require_policy_idle(self)
 
     async def _prepare_policy_refresh(
         self,
@@ -5069,24 +2946,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         expected_token: object,
         inherited_workspace: Workspace | None = None,
     ) -> _PreparedPolicyReplacement:
-        self._require_policy_idle()
-        previous_manager = self.tool_manager
-        session_generation = self._session_generation
-        inherited = tuple(
-            replacement if source.identity == previous.identity else source
-            for source in self._inherited_restrictions
-        )
-        if any(source.identity is None for source in inherited):
-            raise ValueError("Policy source provenance unavailable")
-        staged = await self.config_orchestrator._stage_policy_refresh(
-            previous=previous, replacement=replacement, expected_token=expected_token
-        )
-        return self._prepare_policy_manager(
-            staged,
-            expected_token,
-            previous_manager,
-            session_generation,
-            inherited,
+        return await _config_transactions._prepare_policy_refresh(
+            self,
+            previous=previous,
+            replacement=replacement,
+            expected_token=expected_token,
             inherited_workspace=inherited_workspace,
         )
 
@@ -5100,52 +2964,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         *,
         inherited_workspace: Workspace | None = None,
     ) -> _PreparedPolicyReplacement:
-        inherited_workspace = inherited_workspace or self._inherited_workspace
-        self._guard_job_policy(staged, inherited, inherited_workspace)
-
-        # During preparation use the candidate, after synchronous publication use
-        # live authority. Stale preparations are rejected, never installed.
-        def authority() -> ConfigOrchestrator[ChartreuxConfigSchema]:
-            return (
-                staged
-                if self.config_orchestrator.accepted_token is expected_token
-                else self.config_orchestrator
-            )
-
-        manager = ToolManager(
-            lambda: authority().config,
-            mcp_registry=self.mcp_registry,
-            defer_mcp=True,
-            discovery_source=previous_manager,
-            restriction_getter=lambda: authority().restrictions,
-            accepted_token_getter=lambda: authority().accepted_token,
-            inherited_restrictions=inherited,
-            inherited_workspace=inherited_workspace,
-            inherited_plan_write_scopes=self._inherited_plan_write_scopes,
-            parent_authority_getter=self._parent_authority_getter,
-            parent_authority_revision_getter=self._parent_authority_revision_getter,
-            cwd=self.cwd,
-            harness_files=self.harness_files,
-            scratchpad_dir=self.scratchpad_dir,
-            task_description=task_description_for_config(authority().config),
-            session_root_grants=self._session_root_grants,
-            dangerous_command_authority_provider=self._dangerous_command_grants,
-        )
-        manager.set_instruction_read_files(previous_manager._instruction_read_files)
-        for name in manager.registered_tools:
-            manager.get_tool_config(name)
-        for name in previous_manager._instances.keys() & manager.available_tools.keys():
-            manager.get(name)
-        self.config_orchestrator._check_policy_token(expected_token)
-        return _PreparedPolicyReplacement(
+        return _config_transactions._prepare_policy_manager(
             self,
-            session_generation,
-            expected_token,
             staged,
+            expected_token,
             previous_manager,
-            manager,
+            session_generation,
             inherited,
-            inherited_workspace,
+            inherited_workspace=inherited_workspace,
         )
 
     def _guard_job_policy(
@@ -5154,65 +2980,17 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         inherited: tuple[SourceRestrictions, ...],
         workspace: Workspace | None,
     ) -> None:
-        self._guard_job_authority_config(staged.config)
-
-        def shell_sources(sources: tuple[SourceRestrictions, ...]) -> list[object]:
-            return [
-                (
-                    source.identity,
-                    tuple(
-                        tool
-                        for tool in source.tools
-                        if tool.tool_name in {"bash", "bash_start"}
-                    ),
-                    source.authorized_roots,
-                )
-                for source in sources
-            ]
-
-        if (
-            shell_sources(
-                self.config_orchestrator.restrictions + self._inherited_restrictions
-            )
-            != shell_sources(staged.restrictions + inherited)
-            or workspace != self._inherited_workspace
-        ):
-            self.require_background_jobs_idle()
+        _config_transactions._guard_job_policy(self, staged, inherited, workspace)
 
     def _validate_policy_replacement(
         self, prepared: _PreparedPolicyReplacement
     ) -> None:
-        """Validate every participant before the tree performs any publication."""
-        if (
-            prepared.owner is not self
-            or prepared.session_generation != self._session_generation
-            or prepared.previous_manager is not self.tool_manager
-        ):
-            raise ValueError("Stale policy runtime preparation")
-        self._require_policy_idle()
-        self._guard_job_policy(
-            prepared.orchestrator,
-            prepared.inherited_restrictions,
-            prepared.inherited_workspace,
-        )
-        self.config_orchestrator._check_policy_commit(
-            prepared.expected_token, prepared.orchestrator
-        )
+        _config_transactions._validate_policy_replacement(self, prepared)
 
     def _commit_policy_replacement(
         self, prepared: _PreparedPolicyReplacement, *, retire: bool = True
     ) -> None:
-        self._validate_policy_replacement(prepared)
-        self.config_orchestrator._commit_policy_replacement(
-            prepared.orchestrator, expected_token=prepared.expected_token
-        )
-        self._inherited_restrictions = prepared.inherited_restrictions
-        self._execution_authority_config = self._job_authority_config(self.config)
-        self._inherited_workspace = prepared.inherited_workspace
-        if retire:
-            prepared.previous_manager._retire_authority()
-        self.tool_manager = prepared.tool_manager
-        self._authority_revision += 1
+        _config_transactions._commit_policy_replacement(self, prepared, retire=retire)
 
     def _prepare_reload(
         self,
@@ -5221,50 +2999,16 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         *,
         mcp_registry: MCPRegistry | None = None,
     ) -> _PreparedReload:
-        self._guard_job_authority_config(target_config)
-        # Preserve the retained deployment before constructing a replacement backend.
-        # An unchanged selection expression is provenance, not a request to resolve a
-        # different deployment for the same base model.
-        if (
-            self.committed_model is not None
-            and target_config.active_model == self._committed_selection
-        ):
-            from chartreux.core.model_catalog.resolver import resolver_for
-
-            resolved = resolver_for(target_config).resolve_committed(
-                self.committed_model, allowed_models=target_config.allowed_models
-            )
-            target_config.attach_committed_model(
-                resolved.identity.model_copy(
-                    update={
-                        "thinking": self._thinking_for_committed_reload(
-                            target_config, resolved.identity
-                        )
-                    }
-                )
-            )
-        # Load both configured prompts before any runtime mutation or client IO.
-        _ = target_config.system_prompt, target_config.compaction_prompt
-        # The candidate trust policy is carried by the backend being prepared.
-        return self._prepare_reload_consumers(
-            target_config, reload_hooks, mcp_registry=mcp_registry
+        return _config_transactions._prepare_reload(
+            self, target_config, reload_hooks, mcp_registry=mcp_registry
         )
 
     def _thinking_for_committed_reload(
         self, config: ChartreuxConfigSchema, identity: CommittedModelIdentity
     ) -> str:
-        override = config.thinking_overrides.get(identity.base_model)
-        if override is not None:
-            return override
-        if self._is_subagent and identity.thinking is not None:
-            return identity.thinking
-        catalog = config.catalog_snapshot.catalog
-        selection = config.active_model or "@orchestrator"
-        if selection.startswith("@"):
-            role = catalog.roles.get(selection[1:])
-            if role is not None and role.model == identity.base_model:
-                return role.thinking
-        return catalog.models[identity.base_model].thinking
+        return _config_transactions._thinking_for_committed_reload(
+            self, config, identity
+        )
 
     def _prepare_reload_consumers(
         self,
@@ -5275,188 +3019,15 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         discovery_source: ToolManager | None = None,
         reuse_backend: bool = False,
     ) -> _PreparedReload:
-        skills_adopted = self._skills_adopted
-        target_config.attach_dispatch_policy(self.bound_dispatch_policy)
-        config_source = _SwappableConfigSource(lambda: target_config)
-        tool_manager = ToolManager(
-            config_source.get,
-            mcp_registry=mcp_registry
-            if mcp_registry is not None
-            else self.mcp_registry,
-            defer_mcp=discovery_source is not None,
+        return _config_transactions._prepare_reload_consumers(
+            self,
+            target_config,
+            reload_hooks,
+            mcp_registry=mcp_registry,
             discovery_source=discovery_source,
-            restriction_getter=lambda: self.config_orchestrator.restrictions,
-            accepted_token_getter=lambda: (
-                self.config_orchestrator.accepted_token if config_source.live else None
-            ),
-            inherited_restrictions=self._inherited_restrictions,
-            inherited_workspace=self._inherited_workspace,
-            inherited_plan_write_scopes=self._inherited_plan_write_scopes,
-            parent_authority_getter=self._parent_authority_getter,
-            parent_authority_revision_getter=self._parent_authority_revision_getter,
-            cwd=self.cwd,
-            harness_files=self.harness_files,
-            scratchpad_dir=self.scratchpad_dir,
-            task_description=task_description_for_config(target_config),
-            session_root_grants=self._session_root_grants,
-            dangerous_command_authority_provider=self._dangerous_command_grants,
-        )
-        skill_manager = SkillManager(
-            config_source.get, harness_files=self.harness_files
-        )
-        candidate_orchestrator = self._config_orchestrator.copy(config=target_config)
-        agent_manager = AgentManager(
-            candidate_orchestrator, harness_files=self.harness_files
-        )
-        system_prompt = self._render_system_prompt(
-            skill_manager, target_config, tool_manager, agent_manager
-        )
-        hook_config_result = (
-            load_hooks_from_fs(harness_files=self.harness_files)
-            if reload_hooks
-            else self._hook_config_result
-        )
-        return _PreparedReload(
-            config=target_config,
-            backend=self.backend
-            if reuse_backend
-            else self.backend_factory(target_config),
-            agent_manager=agent_manager,
-            tool_manager=tool_manager,
-            skill_manager=skill_manager,
-            system_prompt=system_prompt,
-            config_source=config_source,
-            hook_config_result=hook_config_result,
-            skills_adopted=skills_adopted,
+            reuse_backend=reuse_backend,
+            hooks_loader=lambda: load_hooks_from_fs(harness_files=self.harness_files),
         )
 
-    def _commit_reload(  # noqa: PLR0915
-        self, prepared: _PreparedReload, reset_middleware: bool
-    ) -> None:
-        self._guard_job_authority_config(prepared.config)
-        # Resolve identity before publishing any candidate runtime state. A changed
-        # selection is an explicit reconfiguration; an unchanged expression is only
-        # provenance and must retain the already committed deployment.
-        from chartreux.core.model_catalog.resolver import resolver_for
-
-        resolver = resolver_for(prepared.config)
-        identity: CommittedModelIdentity | None
-        if (
-            self.committed_model is not None
-            and prepared.config.active_model == self._committed_selection
-        ):
-            identity = resolver.resolve_committed(
-                self.committed_model, allowed_models=prepared.config.allowed_models
-            ).identity.model_copy(
-                update={
-                    "thinking": self._thinking_for_committed_reload(
-                        prepared.config, self.committed_model
-                    )
-                }
-            )
-        elif (
-            self.committed_model is None
-            and self._model_choice_pending()
-            and not prepared.config.active_model
-        ):
-            # Committed-model recovery: an unrelated config write must not
-            # silently commit the default. Stay unpinned; only an explicit
-            # active_model selection (the branch below) opens the gate.
-            identity = None
-        else:
-            identity = resolver.resolve(
-                prepared.config.active_model or "@orchestrator",
-                allowed_models=prepared.config.allowed_models,
-            ).identity.model_copy(
-                update={"thinking": prepared.config.get_active_model().thinking}
-            )
-        prepared.config.attach_committed_model(identity)
-        # Finish fallible rendering and hook construction before retiring authority
-        # or replacing any runtime object. A failed candidate leaves the old loop live.
-        adopt_skills = prepared.skills_adopted == self._skills_adopted
-        system_prompt = (
-            prepared.system_prompt
-            if adopt_skills
-            else self._render_system_prompt(
-                self.skill_manager,
-                prepared.config,
-                prepared.tool_manager,
-                prepared.agent_manager,
-            )
-        )
-        hooks_manager = (
-            HooksManager(prepared.hook_config_result.hooks, cwd=self.cwd)
-            if prepared.hook_config_result is not None
-            else None
-        )
-        middleware = (
-            self._build_middleware_pipeline(prepared.config)
-            if reset_middleware
-            else self.middleware_pipeline
-        )
-        # The prepared backend owns its candidate trust policy; publishing it
-        # requires no process-global TLS mutation.
-        # Now that the profile is live, the prepared managers should track the live
-        # config so later refreshes (refresh_config) propagate to them.
-        prepared.config_source.point_to(lambda: self.config)
-        prepared.agent_manager._orchestrator = self._config_orchestrator
-        previous_identity = self.committed_model
-        previous_selection = self._committed_selection
-        publication = self._backend_lifetime.publish_reversible(prepared.backend)
-        try:
-            self.committed_model = identity
-            self._committed_selection = prepared.config.active_model
-            self.config.attach_committed_model(self.committed_model)
-            self.install_launch_metadata()
-        except BaseException:
-            publication.rollback()
-            self.committed_model = previous_identity
-            self._committed_selection = previous_selection
-            self.config.attach_committed_model(previous_identity)
-            with contextlib.suppress(Exception):
-                self.install_launch_metadata()
-            raise
-        publication.finalize(whole_turn_active=self._active_turn is not None)
-        self._retire_mcp_pool()
-        self.agent_manager = prepared.agent_manager
-        self.tool_manager._retire_authority()
-        self.tool_manager = prepared.tool_manager
-        self._authority_revision += 1
-        self.scrub_policy = secret_redaction.ScrubPolicy.from_config(prepared.config)
-        self._execution_authority_config = self._job_authority_config(prepared.config)
-        secret_redaction.register_session_policy(self, self.scrub_policy)
-        if prepared.config.mcp_servers:
-            self._mcp_pool = self._create_mcp_pool()
-        if adopt_skills:
-            self.skill_manager = prepared.skill_manager
-        self._publish_system_prompt(system_prompt)
-        self._hook_config_result = prepared.hook_config_result
-        self._hooks_manager = hooks_manager
-        self.hook_config_issues = (
-            prepared.hook_config_result.issues
-            if prepared.hook_config_result is not None
-            else []
-        )
-        self.hooks_count = (
-            len(prepared.hook_config_result.hooks)
-            if prepared.hook_config_result is not None
-            else 0
-        )
-
-        if len(self.messages) == 1:
-            self.stats.reset_context_state()
-
-        try:
-            active_model = prepared.config.get_active_model()
-            self.stats.update_pricing(
-                active_model.input_price,
-                active_model.output_price,
-                active_model.cached_input_price,
-            )
-        except ValueError:
-            pass
-
-        self.middleware_pipeline = middleware
-        # The value cache remains process-wide; reload invalidates stored/keyring
-        # values. Already inherited child environments require pool retirement.
-        secret_redaction.reset_cache()
+    def _commit_reload(self, prepared: _PreparedReload, reset_middleware: bool) -> None:
+        _config_transactions._commit_reload(self, prepared, reset_middleware)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import Mock
 from weakref import WeakKeyDictionary
 
@@ -21,7 +21,7 @@ from chartreux.app_server.models import (
     PublicTurn,
     PublicTurnStatus,
 )
-from chartreux.cli.textual_ui.app import ChartreuxApp
+from chartreux.cli.textual_ui.transcript_presenter import TranscriptPresenter
 from chartreux.cli.textual_ui.widgets.load_more import HistoryLoadMoreRequested
 from chartreux.cli.textual_ui.widgets.messages import AssistantMessage
 from chartreux.cli.textual_ui.widgets.tool_grouping import ToolGroupKey
@@ -241,25 +241,24 @@ async def test_under_budget_scroll_reuses_resident_geometry_without_scans(
 
         candidates = Mock(wraps=window.eviction_candidates)
         monkeypatch.setattr(window, "eviction_candidates", candidates)
-        target = SimpleNamespace(
+        presenter: Any = TranscriptPresenter(get_show_timestamps=lambda: False)
+        presenter._transcript = window
+        presenter._transcript_under_budget_key = None
+        presenter._history_widget_indices = WeakKeyDictionary()
+        presenter._selected_transcript_units = Mock(return_value=frozenset())
+        presenter._app = SimpleNamespace(
             _shutdown_started=False,
-            _transcript=window,
             _messages_area=stream,
             _chat_widget=SimpleNamespace(is_at_bottom=False, region=stream.region),
-            _transcript_under_budget_key=None,
-            _selected_transcript_units=Mock(return_value=frozenset()),
             event_handler=None,
             _rewind_highlighted_widget=None,
             _queue_selected_widget=None,
             _agent_transcript_focus_target=None,
-            _history_widget_indices=WeakKeyDictionary(),
             _active_turn_start=None,
         )
 
         def tick() -> None:
-            ChartreuxApp._request_transcript_reconcile(
-                cast("ChartreuxApp", target), scroll_driven=True
-            )
+            presenter.request_transcript_reconcile(scroll_driven=True)
 
         tick()
         assert candidates.call_count == 1

@@ -13,6 +13,9 @@ import chartreux.cli.textual_ui.app
 
 blocked = [
     "chartreux.cli.textual_ui.widgets.mcp_app",
+    "chartreux.cli.textual_ui.startup",
+    "chartreux.cli.textual_ui.word_selection",
+    "chartreux.setup.trusted_folders.trust_folder_dialog",
     "chartreux.core.agent_loop",
     "chartreux.core.tools.mcp.tools",
     "mcp",

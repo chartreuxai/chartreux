@@ -1,0 +1,1 @@
+this directory is not a readable config file

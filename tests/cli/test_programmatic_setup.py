@@ -640,11 +640,11 @@ def test_run_cli_passes_max_tokens_to_run_programmatic(
     assert options.session_options.max_session_tokens == 123
 
 
-def test_run_cli_forwards_experimental_harness_selection(
+def test_run_cli_forwards_add_dir_to_the_harness_workspace_roots(
     monkeypatch: pytest.MonkeyPatch,
     load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
 ) -> None:
-    args = _make_args(experimental_harness=True)
+    args = _make_args(add_dir=["/extra/one", "/extra/two"])
     call: dict[str, object] = {}
     config = build_test_vibe_config()
     orchestrator = load_orchestrator(config)
@@ -667,6 +667,7 @@ def test_run_cli_forwards_experimental_harness_selection(
     assert exc_info.value.code == 0
     options = call["harness_options"]
     assert isinstance(options, LocalHarnessOptions)
+    assert options.session_options.workspace_roots == ["/extra/one", "/extra/two"]
 
 
 def _patch_run_cli_for_config(

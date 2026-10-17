@@ -17,7 +17,7 @@ from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.presets import FULLY_CUSTOM
 from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.ui.providers.workbench import ProviderWorkbenchScreen
-from tests.ui.providers.test_workbench import Host, Services, snapshot
+from tests.ui.providers._workbench_support import Host, Services, snapshot
 
 Prepare = Callable[[Pilot], Awaitable[None]]
 ProviderFixture = tuple[str, str, Callable[[], App], Prepare | None, tuple[str, ...]]

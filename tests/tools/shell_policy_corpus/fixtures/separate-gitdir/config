@@ -1,0 +1,5 @@
+[core]
+	repositoryformatversion = 0
+	pager = ./pager
+[remote "origin"]
+	url = https://example.com/separate.git

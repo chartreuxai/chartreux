@@ -40,8 +40,8 @@ from chartreux.core.tools.mcp.authorization import (
     MCPAuthorizationSnapshot,
 )
 from chartreux.core.tools.remote import RemoteTool
+from tests.agent_loop.test_policy_replacement import make_loop, replace
 from tests.app_server.backend_contract.conftest import connect_backend_contract_host
-from tests.core.agent_loop.test_policy_replacement import make_loop, replace
 from tests.stubs.fake_backend import FakeBackend
 
 pytestmark = pytest.mark.asyncio

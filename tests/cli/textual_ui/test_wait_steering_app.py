@@ -17,7 +17,7 @@ from chartreux.core.llm_models import FunctionCall, Role, ToolCall
 from chartreux.core.subagents import TaskArgs, WaitStatus
 from chartreux.core.tools.base import InvokeContext
 from tests.agent_loop.test_agent_wait_steering import wait_call
-from tests.app_server.test_subagents import BlockingBackend, _background_result
+from tests.app_server._subagent_test_support import BlockingBackend, _background_result
 from tests.cli.textual_ui.test_message_queue_ui import _wait_until
 from tests.conftest import (
     build_test_agent_loop,

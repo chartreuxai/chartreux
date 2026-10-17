@@ -17,8 +17,8 @@ from chartreux.core.events import (
 from chartreux.core.llm_models import Role
 from chartreux.core.tools.base import ToolPermission
 from chartreux.core.tools.builtins.read_file import ReadFileArgs, ReadFileResult
+from tests.agent_loop.test_accepted_source_snapshot import make_orchestrator
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
-from tests.core.agent_loop.test_accepted_source_snapshot import make_orchestrator
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 

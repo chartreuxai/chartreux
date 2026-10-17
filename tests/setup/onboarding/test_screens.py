@@ -9,7 +9,7 @@ from chartreux.setup.onboarding import OnboardingApp
 from chartreux.setup.onboarding.base import OnboardingHost
 from chartreux.setup.onboarding.screens.welcome import WelcomeScreen
 from tests.conftest import build_test_vibe_config
-from tests.ui.providers.test_workbench import Host, setup
+from tests.ui.providers._workbench_support import Host, setup
 
 
 @pytest.mark.asyncio

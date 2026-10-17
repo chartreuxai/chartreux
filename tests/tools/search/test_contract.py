@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from dataclasses import dataclass
 import socket
 import ssl
 
@@ -8,6 +10,8 @@ import httpx
 import pytest
 import respx
 
+from chartreux.core.tools.search.brave import BraveSearchProvider
+from chartreux.core.tools.search.exa import ExaSearchProvider
 from chartreux.core.tools.search.models import (
     MAX_QUERY_LENGTH,
     MAX_RESULTS,
@@ -18,6 +22,7 @@ from chartreux.core.tools.search.models import (
     SearchSource,
 )
 from chartreux.core.tools.search.provider import (
+    SearchProvider,
     SearchProviderError,
     fetch_json,
     normalize_search_response,
@@ -408,3 +413,164 @@ async def test_fetch_json_ignores_unrelated_or_suppressed_context(
         str(caught.value) == "Search request failed: provider endpoint URL is invalid"
     )
     assert "secret" not in str(caught.value)
+
+
+# --- Provider adapter harness (W6a, stage 12c) ---
+#
+# The HTTP search providers (Brave, Exa) share the fetch_json transport seam;
+# their provider-level seam tests were duplicated across test_brave.py and
+# test_exa.py. The harness parameterizes each provider through a
+# SearchProviderAdapter and keeps exactly one seam case per behavior, run for
+# every migrated adapter. Provider-specific envelope/credential/query tests stay
+# in the provider modules.
+#
+# Stage 12c-i introduces the harness with zero migrations: the smoke case
+# proves the adapter machinery end to end for both adapters. 12c-ii migrates
+# the Brave seam twins (ADAPTERS = (BRAVE_ADAPTER,)); 12c-iii migrates the Exa
+# seam twins (ADAPTERS = (BRAVE_ADAPTER, EXA_ADAPTER)).
+
+
+@dataclass(frozen=True)
+class SearchProviderAdapter:
+    """One HTTP search provider wired into the shared transport seam."""
+
+    name: str
+    api_key: str
+    # The provider-specific string the sanitization cases must not leak.
+    secret: str
+    method: str
+    endpoint: str
+    credential_header: str
+    # A valid empty-envelope payload for the smoke case.
+    smoke_payload: dict[str, object]
+    make_provider: Callable[[], SearchProvider]
+
+
+def _mock_endpoint(
+    adapter: SearchProviderAdapter, url: str | None = None
+) -> respx.Route:
+    return respx.route(method=adapter.method, url=url or adapter.endpoint)
+
+
+BRAVE_ADAPTER = SearchProviderAdapter(
+    name="brave",
+    api_key="brave-secret",
+    secret="brave-secret response body",
+    method="GET",
+    endpoint="https://gateway.example/api/res/v1/web/search",
+    credential_header="X-Subscription-Token",
+    smoke_payload={"web": {"results": []}},
+    make_provider=lambda: BraveSearchProvider(
+        "brave-secret", base_url="https://gateway.example/api", timeout=4.5
+    ),
+)
+
+EXA_ADAPTER = SearchProviderAdapter(
+    name="exa",
+    api_key="exa-secret",
+    secret="exa-secret response body",
+    method="POST",
+    endpoint="https://gateway.example/api/search",
+    credential_header="x-api-key",
+    smoke_payload={"results": []},
+    make_provider=lambda: ExaSearchProvider(
+        "exa-secret", base_url="https://gateway.example/api", timeout=3.5
+    ),
+)
+
+# The migrated adapters: the seam cases below run once per adapter. Extended by
+# the 12c-ii (Brave) and 12c-iii (Exa) migration commits.
+ADAPTERS: tuple[SearchProviderAdapter, ...] = (BRAVE_ADAPTER, EXA_ADAPTER)
+
+# The smoke case runs for every adapter from the start, proving the harness
+# machinery before any migration.
+SMOKE_ADAPTERS: tuple[SearchProviderAdapter, ...] = (BRAVE_ADAPTER, EXA_ADAPTER)
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    "adapter", SMOKE_ADAPTERS, ids=[adapter.name for adapter in SMOKE_ADAPTERS]
+)
+async def test_adapter_harness_smoke_round_trip(adapter: SearchProviderAdapter) -> None:
+    route = _mock_endpoint(adapter).mock(
+        return_value=httpx.Response(200, json=adapter.smoke_payload)
+    )
+
+    result = await adapter.make_provider().search("find this", max_results=1)
+
+    assert result.sources == []
+    assert route.call_count == 1
+    request = route.calls[0].request
+    assert request.method == adapter.method
+    assert request.headers[adapter.credential_header] == adapter.api_key
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize("status", [401, 403, 429, 500])
+@pytest.mark.parametrize(
+    "adapter", ADAPTERS, ids=[adapter.name for adapter in ADAPTERS]
+)
+async def test_http_failures_are_sanitized(
+    adapter: SearchProviderAdapter, status: int
+) -> None:
+    _mock_endpoint(adapter).mock(
+        return_value=httpx.Response(status, text=adapter.secret)
+    )
+
+    with pytest.raises(SearchProviderError) as caught:
+        await adapter.make_provider().search("failure", max_results=1)
+
+    assert str(caught.value) == f"Search provider returned HTTP status {status}"
+    assert adapter.secret not in str(caught.value)
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    "adapter", ADAPTERS, ids=[adapter.name for adapter in ADAPTERS]
+)
+async def test_network_failure_is_sanitized(adapter: SearchProviderAdapter) -> None:
+    _mock_endpoint(adapter).mock(side_effect=httpx.ConnectError(adapter.api_key))
+
+    with pytest.raises(SearchProviderError, match="Search request failed"):
+        await adapter.make_provider().search("failure", max_results=1)
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    "adapter", ADAPTERS, ids=[adapter.name for adapter in ADAPTERS]
+)
+async def test_oversized_body_fails_at_transport_seam(
+    adapter: SearchProviderAdapter,
+) -> None:
+    _mock_endpoint(adapter).mock(
+        return_value=httpx.Response(200, content=b"{" + b"x" * MAX_UPSTREAM_JSON_BYTES)
+    )
+
+    with pytest.raises(SearchProviderError, match="size limit"):
+        await adapter.make_provider().search("large", max_results=1)
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    "adapter", ADAPTERS, ids=[adapter.name for adapter in ADAPTERS]
+)
+async def test_cross_origin_redirect_does_not_forward_credentials(
+    adapter: SearchProviderAdapter,
+) -> None:
+    _mock_endpoint(adapter).mock(
+        return_value=httpx.Response(
+            302, headers={"Location": "https://other.example/search"}
+        )
+    )
+    target = _mock_endpoint(adapter, "https://other.example/search").mock(
+        return_value=httpx.Response(200, json=adapter.smoke_payload)
+    )
+
+    with pytest.raises(SearchProviderError, match="not permitted"):
+        await adapter.make_provider().search("redirect", max_results=1)
+    assert target.call_count == 0

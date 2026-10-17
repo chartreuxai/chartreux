@@ -24,6 +24,14 @@ import pytest
 
 from chartreux.core.tools.base import BaseToolState, ToolPermission
 from chartreux.core.tools.builtins.bash import Bash, BashArgs, BashToolConfig
+from tests.tools._git_apply_matrix import (
+    GIT_APPLY_BENIGN_RESOLVER_COMMANDS,
+    GIT_APPLY_UNSAFE_PATHS_RESOLVER_COMMANDS,
+    GIT_C_RELOCATED_BENIGN_COMMANDS,
+    GIT_C_RELOCATED_DENIED_COMMANDS,
+    UNMODELED_FILE_BENIGN_COMMANDS,
+    UNMODELED_FILE_DENIED_COMMANDS,
+)
 
 
 @pytest.fixture
@@ -967,16 +975,7 @@ def test_git_apply_directory_outside_authority_is_denied(
     assert "outside" in (context.reason or ""), command
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        "git apply --unsafe-paths hook.diff",
-        "git apply --unsafe-paths --directory=.git/hooks hook.diff",
-        "git apply --directory=.git/hooks --unsafe-paths hook.diff",
-        "git apply -p0 --unsafe-paths hook.diff",
-        "git apply --unsafe-paths --directory=/tmp/evil hook.diff",
-    ],
-)
+@pytest.mark.parametrize("command", GIT_APPLY_UNSAFE_PATHS_RESOLVER_COMMANDS)
 def test_git_apply_unsafe_paths_is_a_hard_guard(bash_tool: Bash, command: str) -> None:
     # A hard guard: denied with no grantable proposal, so no answer can
     # authorize the call.
@@ -988,20 +987,7 @@ def test_git_apply_unsafe_paths_is_a_hard_guard(bash_tool: Bash, command: str) -
     assert "--unsafe-paths" in (context.reason or ""), command
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        "git apply fix.diff",
-        "git apply --directory=patches fix.diff",
-        "git apply --exclude=.git/* hook.diff",
-        "git apply --include=seed.txt hook.diff",
-        "git apply --build-fake-ancestor=.git/foo hook.diff",
-        # git am supports neither --unsafe-paths (git rejects the option)
-        # nor a metadata-reaching --directory (git rejects the path), so
-        # the spelling stays with git's own refusal.
-        "git am --directory=.git/hooks hook.diff",
-    ],
-)
+@pytest.mark.parametrize("command", GIT_APPLY_BENIGN_RESOLVER_COMMANDS)
 def test_git_apply_benign_forms_stay_permitted(bash_tool: Bash, command: str) -> None:
     assert_permitted(bash_tool, command)
 
@@ -1015,47 +1001,24 @@ def test_git_apply_benign_forms_stay_permitted(bash_tool: Bash, command: str) ->
 # cwds.
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        "git -C .git archive -o config HEAD",
-        "git -C .git archive --output=config HEAD",
-        "git -C .git archive -o hooks/pre-commit HEAD",
-        "git -C .git/hooks archive -o pre-commit HEAD",
-        "git -C .git archive -o index HEAD",
-        "git -C .git config --file=config user.name x",
-        "git -C .git config --file=hooks/pre-commit user.name x",
-        "git -C .git config -f config --unset user.name",
-        "git -C sub archive -o ../.git/config HEAD",
-        "git -C sub config --file=../.git/config user.name x",
-        "git -C g archive -o config HEAD",
-        "git -C . -C .git archive -o config HEAD",
-    ],
-)
+@pytest.mark.parametrize("command", GIT_C_RELOCATED_DENIED_COMMANDS)
 def test_git_c_relocated_write_operands_in_metadata_are_denied(
     bash_tool: Bash, git_repo: Path, command: str
 ) -> None:
     (git_repo / "g").symlink_to(git_repo / ".git", target_is_directory=True)
+    # The union matrix also exercises the policy suite twin's `subdir`
+    # spellings; the git_repo fixture provides `sub`.
+    (git_repo / "subdir").mkdir()
     assert_denied(bash_tool, command)
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        # Legitimate relocations: the write lands outside the metadata.
-        "git -C sub config --file=cfg user.name x",
-        "git -C sub config --file=../custom.cfg user.name x",
-        "git -C sub archive -o bundle.tar HEAD",
-        "git -C sub archive -o ../bundle.tar HEAD",
-        "git -C . -C . archive -o bundle.tar HEAD",
-        "git -C . status",
-        "git -C sub status",
-        "git -C sub log --oneline",
-    ],
-)
+@pytest.mark.parametrize("command", GIT_C_RELOCATED_BENIGN_COMMANDS)
 def test_git_c_relocated_benign_forms_stay_permitted(
     bash_tool: Bash, git_repo: Path, command: str
 ) -> None:
+    # The union matrix also exercises the policy suite twin's `subdir`
+    # spellings; the git_repo fixture provides `sub`.
+    (git_repo / "subdir").mkdir()
     assert_permitted(bash_tool, command)
 
 
@@ -1085,71 +1048,14 @@ def test_git_c_relocated_write_operands_to_scratchpad_stay_permitted(
 # metadata containment as every other command.
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        # cpio: the pass-through destination positional, the -D directory
-        # copy-in changes into before extracting, and the copy-out archive
-        # files are all write operands.
-        "cpio -p .git/hooks",
-        "cpio -p .git",
-        "cpio --pass-through .git/hooks",
-        "cpio -l .git/hooks",
-        "printf 'pre-commit\\n' | cpio -p .git/hooks",
-        "cpio -i -D .git",
-        "cpio -i --directory=.git",
-        "cpio -i -D .git/hooks",
-        "cpio -o -F .git/config",
-        "cpio -o --file=.git/config",
-        "cpio -o -O .git/config",
-        # shred and fallocate mutate their positional file in place.
-        "shred .git/config",
-        "shred -n 1 .git/config",
-        "shred -u .git/config",
-        "shred --remove .git/config",
-        "fallocate -l 100 .git/config",
-        "fallocate --length=100 .git/config",
-        "fallocate -p -l 100 .git/config",
-        # ar: the archive operand is created or replaced, and --output
-        # names the extraction destination.
-        "ar rcs .git/evil.a x.o",
-        "ar rcs .git/hooks/pre-commit x.o",
-        "ar x --output=.git lib.a",
-        "ar x --output .git lib.a",
-        # pax/bsdtar: tar-family archive operands and extraction
-        # destinations.
-        "pax -w -f .git/bundle.tar seed.txt",
-        "pax -wf .git/bundle.tar seed.txt",
-        "pax -r -f .git/config",
-        "bsdtar -cf .git/bundle.tar seed.txt",
-        "bsdtar -C .git -xf evil.tgz",
-        "bsdtar --directory=.git -xf evil.tgz",
-    ],
-)
+@pytest.mark.parametrize("command", UNMODELED_FILE_DENIED_COMMANDS)
 def test_unmodeled_file_command_metadata_writes_are_denied(
     bash_tool: Bash, command: str
 ) -> None:
     assert_denied(bash_tool, command)
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        "cpio -p outdir",
-        "cpio -i -D outdir",
-        "cpio -o -F out.cpio",
-        "cpio -t",
-        "shred seed.txt",
-        "shred -u seed.txt",
-        "fallocate -l 100 seed.txt",
-        "ar rcs lib.a x.o",
-        "ar t lib.a",
-        "pax -w -f out.tar seed.txt",
-        "pax -r -f out.tar",
-        "bsdtar -cf out.tar seed.txt",
-        "bsdtar -C outdir -xf good.tgz",
-    ],
-)
+@pytest.mark.parametrize("command", UNMODELED_FILE_BENIGN_COMMANDS)
 def test_unmodeled_file_command_benign_forms_stay_permitted(
     bash_tool: Bash, command: str
 ) -> None:

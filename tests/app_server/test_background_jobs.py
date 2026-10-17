@@ -31,9 +31,9 @@ from chartreux.core.background_jobs import (
 )
 from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.events import AssistantEvent, BackgroundJobsChangedEvent
+from tests.agent_loop.test_accepted_source_snapshot import make_orchestrator
 from tests.app_server.test_wait_steering import steer_params, until, waiting_runtime
 from tests.conftest import build_test_agent_loop
-from tests.core.agent_loop.test_accepted_source_snapshot import make_orchestrator
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.app_server import build_test_app_server, create_test_app_server_session
 from tests.stubs.fake_backend import FakeBackend

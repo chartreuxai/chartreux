@@ -210,6 +210,10 @@ async def test_ui_session_incremental_loader_load_more_batches_until_done(
             pilot.pause, lambda: len(app.query(UserMessage)) == total_messages
         )
 
+        # Done means the load-more control is gone, not merely that the
+        # message count reached the total.
+        assert len(app.query(HistoryLoadMoreMessage)) == 0
+
 
 @pytest.mark.asyncio
 async def test_ui_session_incremental_loader_pages_before_initial_snapshot(

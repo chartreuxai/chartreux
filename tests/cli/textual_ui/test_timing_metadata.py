@@ -21,8 +21,8 @@ from chartreux.app_server.models import (
     PublicEntryGenerationStatus,
     PublicReasoningEntry,
 )
-from chartreux.cli.textual_ui.app import ChartreuxApp
 from chartreux.cli.textual_ui.handlers.event_handler import EventHandler
+from chartreux.cli.textual_ui.transcript_presenter import TranscriptPresenter
 from chartreux.cli.textual_ui.widgets.collapsible import (
     DisclosureHeader,
     HeaderCollapsibleSection,
@@ -320,15 +320,17 @@ async def test_open_reasoning_tail_admits_preceding_prose_timing() -> None:
         text="thinking",
     )
     window = TranscriptWindow()
-    owner: Any = SimpleNamespace(
-        _transcript=window,
-        _messages_area=area,
+    presenter: Any = TranscriptPresenter(get_show_timestamps=lambda: False)
+    presenter._transcript = window
+    presenter._app = SimpleNamespace(
+        event_handler=None,
         app_server=SimpleNamespace(history=[entry, reasoning]),
         _request_transcript_reconcile=lambda: None,
+        _messages_area=area,
     )
 
     def mounted(entry_id: str):
-        ChartreuxApp._admit_live_history(owner)
+        presenter.admit_live_history()
         return window.mounted_entry_widgets(entry_id)
 
     async def mount(widget: Widget, *, container: Widget | None = None, after=None):
@@ -341,7 +343,7 @@ async def test_open_reasoning_tail_admits_preceding_prose_timing() -> None:
         mounted_entry_widgets=mounted,
         update_retained_entry=window.update_entry,
     )
-    owner.event_handler = handler
+    presenter._app.event_handler = handler
     async with app.run_test() as pilot:
         await app.mount(area)
         await handler._handle_entry_added(entry, None)
@@ -446,30 +448,32 @@ async def test_retry_shared_root_does_not_block_subsequent_admission() -> None:
     area = Vertical()
     window = TranscriptWindow()
     history = []
-    owner: Any = SimpleNamespace(
-        _transcript=window,
-        _messages_area=area,
+    presenter: Any = TranscriptPresenter(get_show_timestamps=lambda: False)
+    presenter._transcript = window
+    presenter._app = SimpleNamespace(
+        event_handler=None,
         app_server=SimpleNamespace(history=history),
         _request_transcript_reconcile=lambda: None,
+        _messages_area=area,
     )
     handler = EventHandler(area.mount, lambda: True)
-    owner.event_handler = handler
+    presenter._app.event_handler = handler
     async with app.run_test() as pilot:
         await app.mount(area)
         first, retry, following = _message(0), _message(1), _message(2)
         history.append(first)
         await handler._handle_entry_added(first, None)
-        ChartreuxApp._admit_live_history(owner)
+        presenter.admit_live_history()
         assert window.admitted_end_index == 1
         handler.offer_retry()
         assert handler.begin_retry()
         history.append(retry)
         await handler._handle_entry_added(retry, None)
-        ChartreuxApp._admit_live_history(owner)
+        presenter.admit_live_history()
         assert window.admitted_end_index == 2
         history.append(following)
         await handler._handle_entry_added(following, None)
-        ChartreuxApp._admit_live_history(owner)
+        presenter.admit_live_history()
         await pilot.pause()
         assert window.admitted_end_index == 3
         assert len(area.query(AssistantMessage)) == 2

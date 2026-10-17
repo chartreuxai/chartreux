@@ -1,0 +1,5 @@
+[core]
+	repositoryformatversion = 0
+	filemode = true
+[remote "origin"]
+	url = https://example.com/main.git

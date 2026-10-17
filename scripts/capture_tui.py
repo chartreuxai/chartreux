@@ -38,12 +38,12 @@ from chartreux.core.config.harness_files import (
     reset_harness_files_manager,
 )
 from chartreux.ui.settings_service import SettingsService
-from tests.cli.textual_ui.test_settings_app import FakeService
+from tests.cli.textual_ui._settings_app_support import FakeService
 from tests.snapshots.test_ui_snapshot_basic_conversation import (
     SnapshotTestAppWithConversation,
 )
 from tests.snapshots.test_ui_snapshot_session_picker import _LATEST_MESSAGES, _SESSIONS
-from tests.ui.providers.test_workbench import Host, setup
+from tests.ui.providers._workbench_support import Host, setup
 
 DEFAULT_SIZES = [(80, 24), (120, 36), (120, 72)]
 THEMES = ("textual-dark", "textual-light", "ansi-dark", "ansi-light")

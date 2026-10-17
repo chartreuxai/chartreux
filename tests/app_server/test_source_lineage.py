@@ -15,8 +15,8 @@ from chartreux.core.config._restrictions import (
 )
 from chartreux.core.config.layer import RawConfig
 from chartreux.core.config.patch import AddOperationPatch
-from tests.core.agent_loop.test_accepted_source_snapshot import make_orchestrator
-from tests.core.agent_loop.test_policy_replacement import replace as replace_policy
+from tests.agent_loop.test_accepted_source_snapshot import make_orchestrator
+from tests.agent_loop.test_policy_replacement import replace as replace_policy
 from tests.stubs.fake_backend import FakeBackend
 
 pytestmark = pytest.mark.asyncio

@@ -13,7 +13,7 @@ from chartreux.core.model_catalog.loader import load_catalog
 from chartreux.ui.providers.workbench import ProviderWorkbenchScreen, WorkbenchView
 from tests.snapshots.base_snapshot_test_app import BaseSnapshotTestApp
 from tests.snapshots.snap_compare import SnapCompare
-from tests.ui.providers.test_workbench import Services, setup
+from tests.ui.providers._workbench_support import Services, setup
 
 
 @pytest.fixture(autouse=True)

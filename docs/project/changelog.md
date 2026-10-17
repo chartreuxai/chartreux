@@ -2,6 +2,50 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.5.5 (2026-10-17)
+
+### Changed
+
+- Maintainability program: a twenty-stage decomposition of the largest
+  source and test modules, with public names, behavior, and the
+  collected-test ledger reconciled at every stage gate. Removed tests were
+  strengthened or survival-mapped; the ledger grew from 20,211 to 23,551
+  collected, the growth being added boundary, corpus, and identity
+  coverage.
+- Source decompositions: the app-server `protocol` module (2,342 lines)
+  became a thirteen-submodule package behind an identity re-export layer;
+  the shell command-policy facade shed its argv corpus (5,366 -> 4,206
+  lines) and its git-command family (4,206 -> 1,714); `app.py` shed startup
+  support leaves and five controllers - transcript_presenter,
+  bottom_panel, agent_browser, session_flow, turn_supervisor (7,316 ->
+  4,894); `settings.py` shed four controllers (2,638 -> 1,569); the agent
+  loop shed a leaf-types module and nine collaborators (5,462 -> 3,033);
+  the sessions registry shed records/authority/transcript extraction and
+  eight area modules (5,146 -> 2,091); the provider workbench screen became
+  a composition root with ten satellite modules (5,793 -> 1,420).
+- Test-tree work: mechanical-assertion cleanup (735 mechanical assertions
+  reduced to 23 genuinely weak, 25 strengthened, three dead-contract sites
+  disposed); twin-fixture and e2e consolidation behind shared harnesses with
+  `tests/e2e/SURVIVAL_MAP.md`; a grant-lifecycle harness unifying the
+  dynamic-grant and dangerous-command-lifecycle suites; ten oversized test
+  modules split per concern into concern modules with support seams,
+  node-count-neutral; and the test-tree reunification below.
+- Test-tree reunification moved test modules, changing the pytest node IDs
+  that downstream consumers (CI selectors, scripts, issue references) may
+  cite: `tests/core/agent_loop/` moved to `tests/agent_loop/` (18 modules,
+  347 collected nodes); the former `tests/session/` population nested under
+  `tests/session/persistence/` (15 modules, 245 nodes) while
+  `tests/core/session/` moved to `tests/session/` (12 modules, 119 nodes;
+  the merged root collects 364); and
+  `tests/agent_loop/test_dangerous_command_lifecycle.py` (45 defs, 56 nodes)
+  was split per concern into `test_dangerous_command_lifecycle_grants.py`
+  (41 nodes), `test_dangerous_command_lifecycle_prompts.py` (6 nodes),
+  `test_dangerous_command_lifecycle_reprompt.py` (4 nodes), and
+  `test_dangerous_command_lifecycle_session_boundaries.py` (5 nodes), with
+  the shared helpers in `_lifecycle_test_support.py`; the original module is
+  retired. Test names, counts, and behavior are unchanged - only the
+  node-ID paths moved.
+
 ## 0.5.4 (2026-10-12)
 
 ### Added

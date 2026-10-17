@@ -22,7 +22,7 @@ from chartreux.ui.providers.management_state import (
 )
 from chartreux.ui.providers.workbench import ProviderWorkbenchScreen
 from tests.conftest import build_test_vibe_config
-from tests.ui.providers.test_workbench import Host, setup
+from tests.ui.providers._workbench_support import Host, setup
 
 
 def eligible(state: GraduationState, **kwargs: object) -> bool:

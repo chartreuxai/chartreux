@@ -19,7 +19,7 @@ from chartreux.core.model_catalog.contracts import (
 )
 from chartreux.core.model_catalog.presets import FULLY_CUSTOM
 from chartreux.ui.providers.workbench import WorkbenchView
-from tests.ui.providers.test_workbench import Host, expand, press_option, setup
+from tests.ui.providers._workbench_support import Host, expand, press_option, setup
 
 
 async def click_hint(pilot, screen, key: str) -> None:

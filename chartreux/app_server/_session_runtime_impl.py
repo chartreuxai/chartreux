@@ -456,7 +456,7 @@ class SessionRuntimeControllerImpl:
                     previous, session_id, history_limit
                 )
             finally:
-                self._sessions._admission_closed = False
+                self._sessions.reopen_child_admission()
 
     async def _replace_root_admitted(
         self, previous: SessionBackendImpl, session_id: str, history_limit: int
@@ -510,7 +510,7 @@ class SessionRuntimeControllerImpl:
                 history_limit=history_limit,
             )
             self._sessions.begin_root_generation()
-            self._sessions._admission_closed = False
+            self._sessions.reopen_child_admission()
             return state
 
     async def _adopt_root(
@@ -581,7 +581,7 @@ class SessionRuntimeControllerImpl:
                 release_holder(pending_token)
             self._sessions.bind_root(previous.session)
             self._root = previous
-            self._sessions._admission_closed = False
+            self._sessions.reopen_child_admission()
             await close_agent_loop(replacement)
             raise
         replacement_backend = self._require_root()
@@ -599,7 +599,7 @@ class SessionRuntimeControllerImpl:
             # Failed attached replacements must leave the previous root serving.
             self._sessions.bind_root(previous.session)
             self._root = previous
-            self._sessions._admission_closed = False
+            self._sessions.reopen_child_admission()
             raise
         try:
             await previous.shutdown()
@@ -625,7 +625,7 @@ class SessionRuntimeControllerImpl:
                 history_limit=history_limit,
             )
         replacement_backend.adopt_state(state)
-        self._sessions._admission_closed = False
+        self._sessions.reopen_child_admission()
         return state
 
     async def _attach_opened_session(

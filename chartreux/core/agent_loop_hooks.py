@@ -4,17 +4,20 @@ Provides pre_tool, post_tool, and post_agent hook lifecycle
 methods. Extracted from the AgentLoop implementation module to keep it
 focused on the core conversation loop and tool execution flow.
 
-Implicit dependencies on the host class (AgentLoop):
+Explicit host seams (stage 14.3c): the mixin reads its host
+dependencies through late-bound callbacks wired by AgentLoop.__init__,
+never through host attributes directly, so post-construction
+reassignment (hook reload, session reset, relocation) and instance
+patches keep intercepting. The mixin stays a mixin; converting it to
+a standalone hook service is separate work.
 
-Attributes:
-    _hooks_manager   (HooksManager | None)
-    session_id       (str)
-    parent_session_id (str | None)
-    session_logger   (SessionLogger)
-    stats            (AgentStats)
-    messages         (MessageList)
+Callbacks:
+    _hooks_manager_getter() -> HooksManager | None
+    _hook_session_context() -> HookSessionContext
+    _stats_getter() -> AgentStats
+    _messages_getter() -> MessageList
 
-Methods:
+Methods (host seams, satisfied by AgentLoop):
     _handle_tool_response(tool_call, text, persisted_result, images)
     _serialize_tool_input(tool_call) -> dict[str, Any]
 """
@@ -22,10 +25,9 @@ Methods:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 import json
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from pydantic import ValidationError
@@ -33,7 +35,6 @@ from pydantic import ValidationError
 from chartreux.core.events import ToolResultEvent
 from chartreux.core.hooks.models import (
     HookEvent,
-    HookSessionContext,
     HookTextReplacement,
     HookToolDenial,
     HookToolInputRewrite,
@@ -57,9 +58,9 @@ from chartreux.utils.tool_presentation import ToolResultPresentation
 if TYPE_CHECKING:
     from chartreux.core.agent_loop import ToolDecision
     from chartreux.core.hooks.manager import HooksManager
+    from chartreux.core.hooks.models import HookSessionContext
     from chartreux.core.llm_models import LLMMessage
     from chartreux.core.message_list import MessageList
-    from chartreux.core.session.session_logger import SessionLogger
     from chartreux.core.session_types import AgentStats
 
 
@@ -94,14 +95,13 @@ class AgentLoopHooksMixin:
     See module docstring for the implicit contract with the host class.
     """
 
-    # Declared for type-checking only; set by AgentLoop.__init__.
-    _hooks_manager: HooksManager | None
-    session_id: str
-    parent_session_id: str | None
-    session_logger: SessionLogger
-    stats: AgentStats
-    messages: MessageList
-    cwd: Path
+    # Explicit host seams (stage 14.3c): wired by AgentLoop.__init__ as
+    # late-bound callbacks; set by AgentLoop.__init__, never read from host
+    # attributes directly.
+    _hooks_manager_getter: Callable[[], HooksManager | None]
+    _hook_session_context: Callable[[], HookSessionContext]
+    _stats_getter: Callable[[], AgentStats]
+    _messages_getter: Callable[[], MessageList]
 
     def _handle_tool_response(
         self,
@@ -115,38 +115,25 @@ class AgentLoopHooksMixin:
         return tool_call.validated_args.model_dump(mode="json", exclude_unset=True)
 
     # ------------------------------------------------------------------
-    # Session context
-    # ------------------------------------------------------------------
-
-    def _hook_session_context(self) -> HookSessionContext:
-        transcript = ""
-        if self.session_logger.enabled and self.session_logger.session_dir is not None:
-            transcript = str(self.session_logger.messages_filepath.resolve())
-        return HookSessionContext(
-            session_id=self.session_id,
-            transcript_path=transcript,
-            cwd=str(self.cwd),
-            parent_session_id=self.parent_session_id,
-        )
-
-    # ------------------------------------------------------------------
     # Hook runners
     # ------------------------------------------------------------------
 
     async def _run_post_agent_hooks(
         self,
     ) -> AsyncGenerator[HookEvent | HookUserMessage]:
-        if not self._hooks_manager:
+        manager = self._hooks_manager_getter()
+        if not manager:
             return
         invocation = PostAgentInvocation(**self._hook_session_context().model_dump())
-        async for ev in self._hooks_manager.run(invocation):
+        async for ev in manager.run(invocation):
             if isinstance(ev, (HookEvent, HookUserMessage)):
                 yield ev
 
     async def _run_pre_tool_hooks(
         self, tool_call: ResolvedToolCall, tool_input: dict[str, Any]
     ) -> AsyncGenerator[HookEvent | HookToolDenial | HookToolInputRewrite]:
-        if not self._hooks_manager:
+        manager = self._hooks_manager_getter()
+        if not manager:
             return
         invocation = PreToolInvocation(
             **self._hook_session_context().model_dump(),
@@ -154,7 +141,7 @@ class AgentLoopHooksMixin:
             tool_call_id=tool_call.call_id,
             tool_input=tool_input,
         )
-        async for ev in self._hooks_manager.run(invocation):
+        async for ev in manager.run(invocation):
             if isinstance(ev, (HookEvent, HookToolDenial, HookToolInputRewrite)):
                 yield ev
 
@@ -169,7 +156,8 @@ class AgentLoopHooksMixin:
         duration_ms: float = 0.0,
         initial_text: str = "",
     ) -> AsyncGenerator[HookEvent | HookTextReplacement]:
-        if not self._hooks_manager:
+        manager = self._hooks_manager_getter()
+        if not manager:
             return
         invocation = PostToolInvocation(
             **self._hook_session_context().model_dump(),
@@ -182,7 +170,7 @@ class AgentLoopHooksMixin:
             tool_error=tool_error,
             duration_ms=duration_ms,
         )
-        async for ev in self._hooks_manager.run(invocation):
+        async for ev in manager.run(invocation):
             if isinstance(ev, (HookEvent, HookTextReplacement)):
                 yield ev
 
@@ -330,7 +318,7 @@ class AgentLoopHooksMixin:
         if not call_id:
             return
         encoded = json.dumps(new_args)
-        for message in reversed(self.messages):
+        for message in reversed(self._messages_getter()):
             if not message.tool_calls:
                 continue
             for tc in message.tool_calls:
@@ -341,7 +329,7 @@ class AgentLoopHooksMixin:
     def _handle_pre_tool_denial(
         self, tool_call: ResolvedToolCall, denial: HookToolDenial
     ) -> ToolResultEvent:
-        self.stats.tool_calls_hook_denied += 1
+        self._stats_getter().tool_calls_hook_denied += 1
         denial_text = (
             f"<{TOOL_ERROR_TAG}>Tool '{tool_call.tool_name}' was denied by "
             f"hook '{denial.hook_name}': {denial.content}</{TOOL_ERROR_TAG}>"
@@ -363,7 +351,7 @@ class AgentLoopHooksMixin:
     async def _handle_tool_skip(
         self, tool_call: ResolvedToolCall, decision: ToolDecision
     ) -> AsyncGenerator[ToolResultEvent | HookEvent]:
-        self.stats.tool_calls_rejected += 1
+        self._stats_getter().tool_calls_rejected += 1
         skip_reason = decision.feedback or str(
             get_user_cancellation_message(
                 CancellationReason.TOOL_SKIPPED, tool_call.tool_name

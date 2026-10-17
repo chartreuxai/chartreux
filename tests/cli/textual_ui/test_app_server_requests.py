@@ -4,6 +4,8 @@ import asyncio
 from collections import deque
 from pathlib import Path
 import time
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -37,6 +39,7 @@ from chartreux.app_server.session import AppServerTurnError
 from chartreux.cli.textual_ui import startup
 from chartreux.cli.textual_ui.app import ChartreuxApp
 from chartreux.cli.textual_ui.screens.settings import SettingsScreen
+from chartreux.cli.textual_ui.turn_supervisor import TurnSupervisor
 from chartreux.cli.textual_ui.widgets.agent_transcript import AgentTranscriptViewer
 from chartreux.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
 from chartreux.cli.textual_ui.widgets.loading import (
@@ -97,6 +100,63 @@ def _turn_error(code: TurnErrorCode) -> AppServerTurnError:
     return AppServerTurnError(PublicError(message="Network error", code=code))
 
 
+class _CallbackQuestionStandIn:
+    """TurnSupervisor stand-in for the moved callback/question state (stage 10.5a).
+
+    The moved bodies own the callback/question state under public controller
+    names; this stand-in forwards them to the app's underscore attributes so
+    the MagicMock setup and assertions are unchanged, and exposes the app as
+    ``_app`` for the late-bound collaborator calls.
+    """
+
+    def __init__(self, app: MagicMock) -> None:
+        self._app = app
+
+    @property
+    def active_callback(self) -> Any:
+        return self._app._active_callback
+
+    @active_callback.setter
+    def active_callback(self, value: Any) -> None:
+        self._app._active_callback = value
+
+    @property
+    def pending_callbacks(self) -> Any:
+        return self._app._pending_callbacks
+
+    @pending_callbacks.setter
+    def pending_callbacks(self, value: Any) -> None:
+        self._app._pending_callbacks = value
+
+    @property
+    def pending_local_question(self) -> Any:
+        return self._app._pending_local_question
+
+    @pending_local_question.setter
+    def pending_local_question(self, value: Any) -> None:
+        self._app._pending_local_question = value
+
+    @property
+    def callback_submitting(self) -> Any:
+        return self._app._callback_submitting
+
+    @callback_submitting.setter
+    def callback_submitting(self, value: Any) -> None:
+        self._app._callback_submitting = value
+
+    @property
+    def callback_delivery_uncertain(self) -> Any:
+        return self._app._callback_delivery_uncertain
+
+    @callback_delivery_uncertain.setter
+    def callback_delivery_uncertain(self, value: Any) -> None:
+        self._app._callback_delivery_uncertain = value
+
+
+def _callback_stand_in(app: MagicMock) -> Any:
+    return _CallbackQuestionStandIn(app)
+
+
 async def _wait_for_retry_error(app: ChartreuxApp, pilot) -> None:
     await _wait_until(
         pilot,
@@ -119,7 +179,7 @@ async def test_question_callback_opens_from_public_protocol() -> None:
     app._switch_to_question_app = AsyncMock()
     callback = _question_callback("callback-1")
 
-    await ChartreuxApp._show_callback(app, callback)
+    await TurnSupervisor.show_callback(_callback_stand_in(app), callback)
 
     assert app._active_callback is callback
     app._switch_to_question_app.assert_awaited_once_with(callback.detail.request)
@@ -149,7 +209,7 @@ async def test_overlapping_callbacks_are_queued_until_the_active_one_resolves() 
     app._active_callback = first
     app._pending_callbacks = deque()
 
-    await ChartreuxApp._show_callback(app, second)
+    await TurnSupervisor.show_callback(_callback_stand_in(app), second)
 
     assert list(app._pending_callbacks) == [second]
 
@@ -183,9 +243,11 @@ async def test_callback_claim_is_atomic_during_typing_debounce() -> None:
     app._wait_for_typing_pause = AsyncMock(side_effect=release.wait)
     app._switch_to_question_app = AsyncMock()
 
-    first_task = asyncio.create_task(ChartreuxApp._show_callback(app, first))
+    first_task = asyncio.create_task(
+        TurnSupervisor.show_callback(_callback_stand_in(app), first)
+    )
     await asyncio.sleep(0)
-    await ChartreuxApp._show_callback(app, second)
+    await TurnSupervisor.show_callback(_callback_stand_in(app), second)
 
     assert app._active_callback is first
     assert list(app._pending_callbacks) == [second]
@@ -215,7 +277,7 @@ async def test_callback_waits_behind_local_question() -> None:
     app._pending_local_question = asyncio.get_running_loop().create_future()
     app._pending_callbacks = deque()
 
-    await ChartreuxApp._show_callback(app, callback)
+    await TurnSupervisor.show_callback(_callback_stand_in(app), callback)
 
     assert app._active_callback is None
     assert list(app._pending_callbacks) == [callback]
@@ -252,7 +314,7 @@ async def test_answering_active_callback_opens_the_next_queued_callback() -> Non
     output = UserInputCallbackOutput(
         result=UserQuestionResult(answers=[], cancelled=True)
     )
-    await ChartreuxApp._respond_to_active_callback(app, output)
+    await TurnSupervisor.respond_to_active_callback(_callback_stand_in(app), output)
 
     app.app_server.respond_to_callback.assert_awaited_once_with(
         first.callback_id, output
@@ -281,7 +343,9 @@ async def test_question_answer_responds_to_public_callback() -> None:
     app._respond_to_active_callback = AsyncMock()
     answer = UserAnswer(question="Ship it?", answer="Yes")
 
-    await ChartreuxApp.on_question_app_answered(app, QuestionApp.Answered([answer]))
+    await TurnSupervisor.question_answered(
+        _callback_stand_in(app), QuestionApp.Answered([answer])
+    )
 
     app._respond_to_active_callback.assert_awaited_once_with(
         UserInputCallbackOutput(
@@ -326,7 +390,9 @@ async def test_question_callback_replaces_loading_status_before_typing_pause() -
     app._wait_for_typing_pause = AsyncMock(side_effect=release_typing_pause.wait)
     app._switch_to_question_app = AsyncMock()
 
-    show = asyncio.create_task(ChartreuxApp._show_callback(app, callback))
+    show = asyncio.create_task(
+        TurnSupervisor.show_callback(_callback_stand_in(app), callback)
+    )
     await asyncio.sleep(0)
 
     assert loading.base_status == "Input required"
@@ -354,7 +420,7 @@ async def test_answering_final_callback_restores_loading_progress() -> None:
         result=UserQuestionResult(answers=[], cancelled=True)
     )
 
-    await ChartreuxApp._respond_to_active_callback(app, output)
+    await TurnSupervisor.respond_to_active_callback(_callback_stand_in(app), output)
 
     assert loading.base_status == "Running command"
     assert loading._pause_start is None
@@ -651,10 +717,11 @@ def test_invalid_api_key_does_not_offer_retry() -> None:
     app._tools_collapsed = False
     app._mount_and_scroll = AsyncMock()
     app.event_handler = MagicMock()
+    supervisor = cast(Any, SimpleNamespace(_app=app))
 
     asyncio.run(
-        ChartreuxApp._mount_turn_error(
-            app, _turn_error(TurnErrorCode.INVALID_API_KEY), "Invalid API key"
+        TurnSupervisor._mount_turn_error(
+            supervisor, _turn_error(TurnErrorCode.INVALID_API_KEY), "Invalid API key"
         )
     )
 
@@ -666,10 +733,11 @@ def test_rate_limit_error_still_offers_retry() -> None:
     app._tools_collapsed = False
     app._mount_and_scroll = AsyncMock()
     app.event_handler = MagicMock()
+    supervisor = cast(Any, SimpleNamespace(_app=app))
 
     asyncio.run(
-        ChartreuxApp._mount_turn_error(
-            app, _turn_error(TurnErrorCode.RATE_LIMIT), "Rate limited"
+        TurnSupervisor._mount_turn_error(
+            supervisor, _turn_error(TurnErrorCode.RATE_LIMIT), "Rate limited"
         )
     )
 
@@ -681,10 +749,11 @@ def test_invalid_api_key_clears_stale_retry_state() -> None:
     app._tools_collapsed = False
     app._mount_and_scroll = AsyncMock()
     app.event_handler = MagicMock()
+    supervisor = cast(Any, SimpleNamespace(_app=app))
 
     asyncio.run(
-        ChartreuxApp._mount_turn_error(
-            app, _turn_error(TurnErrorCode.INVALID_API_KEY), "Invalid API key"
+        TurnSupervisor._mount_turn_error(
+            supervisor, _turn_error(TurnErrorCode.INVALID_API_KEY), "Invalid API key"
         )
     )
 
@@ -693,9 +762,9 @@ def test_invalid_api_key_clears_stale_retry_state() -> None:
 
 def test_backend_error_message_hints_at_retry() -> None:
     app = MagicMock()
-    app._retry_hint = ChartreuxApp._retry_hint
+    app._retry_hint = TurnSupervisor._retry_hint
 
-    message = ChartreuxApp._resolve_turn_error_message(
+    message = TurnSupervisor._resolve_turn_error_message(
         app, _turn_error(TurnErrorCode.BACKEND_ERROR)
     )
 
@@ -706,7 +775,7 @@ def test_backend_error_message_hints_at_retry() -> None:
 def test_internal_error_message_does_not_hint_at_retry() -> None:
     app = MagicMock()
 
-    message = ChartreuxApp._resolve_turn_error_message(
+    message = TurnSupervisor._resolve_turn_error_message(
         app, _turn_error(TurnErrorCode.INTERNAL_ERROR)
     )
 
@@ -832,6 +901,10 @@ async def test_interrupting_auto_retry_keeps_event_listener_alive() -> None:
                     for message in app.query(AssistantMessage)
                 ),
             )
+
+            # The interrupted retry left no error behind: the event listener
+            # stayed alive and the post-cancel turn rendered cleanly.
+            assert len(app.query(ErrorMessage)) == 0
     finally:
         retry_gate.set()
 
@@ -1292,7 +1365,7 @@ def test_retry_and_empty_mcp_copy_and_availability() -> None:
     registry.refresh(CommandContext(retry_available=True))
     assert registry.has_command("retry")
     assert "new turn" in registry.get_help_text()
-    assert "new turn" in ChartreuxApp._retry_hint()
+    assert "new turn" in TurnSupervisor._retry_hint()
     assert "may repeat" in build_retry_prompt("")
 
 

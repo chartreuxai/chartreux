@@ -17,7 +17,7 @@ from chartreux.cli.textual_ui.screens.status_line_settings import (
 )
 from chartreux.ui.settings_service import SettingsService
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
-from tests.cli.textual_ui.test_settings_app import FakeService
+from tests.cli.textual_ui._settings_app_support import FakeService
 from tests.snapshots.base_snapshot_test_app import BaseSnapshotTestApp
 from tests.snapshots.snap_compare import SnapCompare
 
@@ -50,7 +50,7 @@ def test_settings_browser(snap_compare: SnapCompare) -> None:
 
 def test_settings_list_draft(snap_compare: SnapCompare) -> None:
     async def before(pilot: Pilot) -> None:
-        from tests.cli.textual_ui.test_settings_app import focus_action
+        from tests.cli.textual_ui._settings_app_support import focus_action
 
         await pilot.press(*"agent_paths", "enter")
         screen = cast(SettingsScreen, pilot.app.screen)

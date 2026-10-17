@@ -1,0 +1,53 @@
+"""Collected host for the shared grant-config twins harness (W6a, stage 12a).
+
+The parametrized suite lives in ``_grant_config_harness.py``; this module
+re-exports its cases so pytest collects them under stable node IDs of the form
+``tests/core/config/test_grant_config_harness.py::<case>[<feature>-...]``. Each
+migration commit (12a-ii persistence, 12a-iii authority, 12a-iv
+source-integration) adds the cases it migrates and deletes the twin tests they
+replace; the per-deletion survival mapping is recorded in the stage-12 report.
+"""
+
+from __future__ import annotations
+
+from tests.core.config._grant_config_harness import (
+    test_absent_user_config_file_is_created as test_absent_user_config_file_is_created,
+    test_bad_reload_or_preview_preserves_accepted_snapshot as test_bad_reload_or_preview_preserves_accepted_snapshot,
+    test_builder_accepts_real_user_authority as test_builder_accepts_real_user_authority,
+    test_cancelled_save_reports_without_publishing as test_cancelled_save_reports_without_publishing,
+    test_child_orchestrator_rejected as test_child_orchestrator_rejected,
+    test_colliding_canonical_project_keys_rejected as test_colliding_canonical_project_keys_rejected,
+    test_concurrent_saves_serialize_under_the_lock as test_concurrent_saves_serialize_under_the_lock,
+    test_durability_uncertainty_reported_without_publishing as test_durability_uncertainty_reported_without_publishing,
+    test_empty_unattributed_assertions_fail_closed as test_empty_unattributed_assertions_fail_closed,
+    test_environment_field_rejected_before_decode as test_environment_field_rejected_before_decode,
+    test_forbidden_sources_fail_before_shadow_and_cache as test_forbidden_sources_fail_before_shadow_and_cache,
+    test_generic_field_rejection_preserved as test_generic_field_rejection_preserved,
+    test_harness_smoke_user_orchestrator_round_trip as test_harness_smoke_user_orchestrator_round_trip,
+    test_intervening_write_between_revision_read_and_replace_conflicts as test_intervening_write_between_revision_read_and_replace_conflicts,
+    test_invalid_definitions_are_sanitized as test_invalid_definitions_are_sanitized,
+    test_malformed_disk_source_is_typed_error as test_malformed_disk_source_is_typed_error,
+    test_malformed_real_user_cannot_be_hidden_by_override as test_malformed_real_user_cannot_be_hidden_by_override,
+    test_names_never_authorize_authority as test_names_never_authorize_authority,
+    test_only_empty_actual_default_is_tolerated as test_only_empty_actual_default_is_tolerated,
+    test_ordinary_user_patch_cannot_change_authority as test_ordinary_user_patch_cannot_change_authority,
+    test_project_layer_is_not_a_user_target as test_project_layer_is_not_a_user_target,
+    test_projection_canonical_immutable_and_separate_from_merge as test_projection_canonical_immutable_and_separate_from_merge,
+    test_read_does_not_leak_other_projects as test_read_does_not_leak_other_projects,
+    test_read_missing_file_is_empty_not_unavailable as test_read_missing_file_is_empty_not_unavailable,
+    test_read_needs_no_lock_and_publishes_nothing as test_read_needs_no_lock_and_publishes_nothing,
+    test_read_reflects_a_freshly_saved_grant as test_read_reflects_a_freshly_saved_grant,
+    test_read_reflects_disk_after_an_external_write as test_read_reflects_disk_after_an_external_write,
+    test_read_relative_project_is_rejected as test_read_relative_project_is_rejected,
+    test_read_unreadable_source_is_unavailable_not_empty as test_read_unreadable_source_is_unavailable_not_empty,
+    test_read_without_actual_user_layer_is_unavailable as test_read_without_actual_user_layer_is_unavailable,
+    test_real_user_authority_is_accepted_and_immutable as test_real_user_authority_is_accepted_and_immutable,
+    test_saved_values_reload_through_user_layer as test_saved_values_reload_through_user_layer,
+    test_saves_accumulate_and_deduplicate_canonical_values as test_saves_accumulate_and_deduplicate_canonical_values,
+    test_saves_grant_preserving_disk_content_without_publishing as test_saves_grant_preserving_disk_content_without_publishing,
+    test_stale_expected_revision_fails_cleanly as test_stale_expected_revision_fails_cleanly,
+    test_subclass_cannot_claim_user_authority as test_subclass_cannot_claim_user_authority,
+    test_subclass_cannot_persist_authority as test_subclass_cannot_persist_authority,
+    test_unverified_contribution_fails_closed as test_unverified_contribution_fails_closed,
+    test_write_failure_reports_write_error as test_write_failure_reports_write_error,
+)

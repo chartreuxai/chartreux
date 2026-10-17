@@ -46,7 +46,8 @@ def test_non_default_unsupported_agent_config_is_rejected(config: AgentConfig) -
 def test_default_or_omitted_agent_config_is_accepted(
     config: AgentConfig | None,
 ) -> None:
-    AppServer._validate_agent_config(config)
+    # Accepted means: no rejection raised, and the validation returns None.
+    assert AppServer._validate_agent_config(config) is None
 
 
 @pytest.mark.asyncio

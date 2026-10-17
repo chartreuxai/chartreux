@@ -797,7 +797,10 @@ def test_release_keeps_a_worktree_claimed_while_it_was_inspected(
 
 
 def test_sweep_ignores_a_non_git_path(tmp_path: Path) -> None:
-    WorktreeRepository.sweep_claims(tmp_path, in_use=[])
+    result = WorktreeRepository.sweep_claims(tmp_path, in_use=[])
+
+    assert result == worktree_module.SweepResult()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_remove_worktree_does_not_change_the_process_directory(

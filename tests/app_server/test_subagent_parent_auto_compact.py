@@ -18,7 +18,7 @@ from chartreux.app_server.server import AppServer
 from chartreux.core.file_revision import FileRevision
 from chartreux.core.llm_models import Role
 from chartreux.core.subagents import WaitStatus
-from tests.app_server.test_subagents import (
+from tests.app_server._subagent_test_support import (
     GatedSequenceBackend,
     _config,
     _consume,

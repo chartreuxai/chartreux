@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
 import json
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -15,6 +15,7 @@ from chartreux.core.events import (
     BaseEvent,
     ToolCallEvent,
     ToolResultEvent,
+    ToolStreamEvent,
     UserInputRequestEvent,
     UserMessageEvent,
 )
@@ -26,14 +27,16 @@ from chartreux.core.session.session_logger import SessionLogger
 from chartreux.core.skills.models import ParsedSkillCommand, SkillInfo
 from chartreux.core.subagents import TaskArgs
 from chartreux.core.timing import InvocationTiming, use_elapsed_clock
-from chartreux.core.tools.base import ToolPermission
+from chartreux.core.tools.base import InvokeContext, ToolPermission
 from chartreux.core.tools.builtins.task import Task
 from chartreux.core.tools.builtins.todo import TodoItem
+from chartreux.core.tools.manager import NoSuchToolError
+from chartreux.core.tools.permissions import PermissionContext
 from chartreux.questions import UserAnswer, UserQuestionResult
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
-from tests.stubs.fake_tool import FakeTool
+from tests.stubs.fake_tool import FakeTool, FakeToolArgs, FakeToolResult
 
 type QuestionHandler = Callable[[UserInputRequestEvent], Awaitable[UserQuestionResult]]
 
@@ -1127,3 +1130,340 @@ async def test_pending_injected_message_continues_loop_after_tool_result() -> No
         m for m in reversed(agent_loop.messages) if m.role == Role.assistant
     )
     assert "Acting on the injected guidance" in (last_assistant.content or "")
+
+
+# ----------------------------------------------------------------------
+# Executor failure-boundary characterization (stage 14.3a-i).
+#
+# One test per _process_one_tool_call/_invoke_tool exception boundary not
+# already pinned above: lookup, serialization, pre-hook, decision,
+# snapshot, invocation, post-hook. These pin the CURRENT behavior of the
+# unsplit executor; they gate the 14.3a-ii move and must not motivate
+# "fixes" — existing scheduling points are preserved.
+# ----------------------------------------------------------------------
+
+
+class _ExplodingHooksManager:
+    """Recorder that raises an ordinary exception on one named hook event."""
+
+    def __init__(self, explode_on: str, message: str) -> None:
+        self.explode_on = explode_on
+        self.message = message
+        self.invoked: list[str] = []
+
+    def reset_retry_count(self) -> None:
+        return
+
+    def _matching_hooks(self, handler: object, invocation: object) -> list[object]:
+        # This fixture records every invocation, regardless of hook type.
+        return [self]
+
+    async def run(self, invocation: object) -> AsyncGenerator[object, None]:
+        name = str(getattr(invocation, "hook_event_name", ""))
+        self.invoked.append(name)
+        if name == self.explode_on:
+            raise RuntimeError(self.message)
+        return
+        yield
+
+
+class _StreamOnlyTool(FakeTool):
+    """A tool whose invocation streams but never yields a result model."""
+
+    async def run(
+        self, args: FakeToolArgs, ctx: InvokeContext | None = None
+    ) -> AsyncGenerator[ToolStreamEvent | FakeToolResult, None]:
+        yield ToolStreamEvent(
+            tool_name="stub_tool",
+            message="stream only",
+            tool_call_id=ctx.tool_call_id if ctx is not None else "",
+        )
+
+
+def _stub_call(call_id: str) -> ToolCall:
+    return ToolCall(
+        id=call_id, index=0, function=FunctionCall(name="stub_tool", arguments="{}")
+    )
+
+
+def _stub_loop(call_id: str) -> AgentLoop:
+    loop = build_test_agent_loop(
+        config=build_test_vibe_config(enabled_tools=["stub_tool"]),
+        backend=FakeBackend([
+            [mock_llm_chunk(content="Calling.", tool_calls=[_stub_call(call_id)])],
+            [mock_llm_chunk(content="Done.")],
+        ]),
+    )
+    loop.tool_manager._all_tools["stub_tool"] = FakeTool
+    return loop
+
+
+def _result_events(events: list[BaseEvent]) -> list[ToolResultEvent]:
+    return [event for event in events if isinstance(event, ToolResultEvent)]
+
+
+def _assistant_count(events: list[BaseEvent]) -> int:
+    return len([event for event in events if isinstance(event, AssistantEvent)])
+
+
+@pytest.mark.asyncio
+async def test_tool_lookup_failure_yields_unwrapped_failure_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lookup boundary: tool_manager.get raising yields a plain failure event.
+
+    The lookup except branch touches no counters, wraps no error tag, runs
+    no pre-tool or post-tool hook, records the failure in the transcript,
+    and lets the turn continue — unlike the serialization branch below.
+    """
+    loop = _stub_loop("lookup")
+    recorder = _install_recording_hooks(loop)
+
+    def missing_get(name: str) -> FakeTool:
+        raise NoSuchToolError(f"No tool named {name!r}")
+
+    monkeypatch.setattr(loop.tool_manager, "get", missing_get)
+    events = await act_and_collect_events(loop, "Execute tool")
+
+    results = _result_events(events)
+    assert len(results) == 1
+    result = results[0]
+    assert result.error is not None
+    assert result.error.startswith("Error getting tool 'stub_tool':")
+    assert not result.skipped
+    assert result.cancelled is False
+    # The lookup boundary changes no counters.
+    assert loop.stats.tool_calls_agreed == 0
+    assert loop.stats.tool_calls_failed == 0
+    assert loop.stats.tool_calls_succeeded == 0
+    # The failure is recorded through the single response choke point.
+    message = next(m for m in loop.messages if m.tool_call_id == "lookup")
+    assert "Error getting tool 'stub_tool'" in (message.content or "")
+    assert message.tool_result is None
+    # No tool hook runs, and the conversation continues.
+    assert "pre_tool" not in recorder.invoked
+    assert "post_tool" not in recorder.invoked
+    assert _assistant_count(events) == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_input_serialization_failure_is_counted_and_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Serialization boundary: a serializer exception is counted and tagged.
+
+    The serialization except branch increments tool_calls_failed, wraps the
+    error in the tool error tag, records the failure, runs no pre-tool or
+    post-tool hook, and lets the turn continue.
+    """
+    loop = _stub_loop("serialize")
+    recorder = _install_recording_hooks(loop)
+
+    def unserializable(tool_call: ResolvedToolCall) -> dict[str, Any]:
+        raise RuntimeError("cannot serialize")
+
+    monkeypatch.setattr(loop, "_serialize_tool_input", unserializable)
+    events = await act_and_collect_events(loop, "Execute tool")
+
+    results = _result_events(events)
+    assert len(results) == 1
+    result = results[0]
+    assert result.error is not None
+    assert "Failed to serialize tool input for 'stub_tool': cannot serialize" in (
+        result.error
+    )
+    assert not result.skipped
+    assert loop.stats.tool_calls_failed == 1
+    assert loop.stats.tool_calls_agreed == 0
+    assert loop.stats.tool_calls_succeeded == 0
+    message = next(m for m in loop.messages if m.tool_call_id == "serialize")
+    assert "Failed to serialize tool input" in (message.content or "")
+    assert message.tool_result is None
+    assert "pre_tool" not in recorder.invoked
+    assert "post_tool" not in recorder.invoked
+    assert _assistant_count(events) == 2
+
+
+@pytest.mark.asyncio
+async def test_pre_tool_hook_exception_is_reported_by_the_batch_monitor() -> None:
+    """Pre-hook boundary: a raising pre-tool hook escapes the per-call envelope.
+
+    The pre-tool pipeline lies outside the decision/invocation catch, so an
+    ordinary hook exception fails the tool task; the batch monitor then
+    reports it as a pre-tool-processing failure and counts it, with no
+    per-call result event and no post-tool hook.
+    """
+    loop = _stub_loop("prehook")
+    recorder = _ExplodingHooksManager("pre_tool", "pre-hook boom")
+    loop._hooks_manager = cast(HooksManager, recorder)
+
+    events = await act_and_collect_events(loop, "Execute tool")
+
+    results = _result_events(events)
+    assert len(results) == 1
+    result = results[0]
+    assert result.error is not None
+    assert "stub_tool failed during pre-tool processing: pre-hook boom" in result.error
+    assert not result.skipped
+    assert loop.stats.tool_calls_failed == 1
+    assert loop.stats.tool_calls_agreed == 0
+    assert loop.stats.tool_calls_succeeded == 0
+    assert "pre_tool" in recorder.invoked
+    assert "post_tool" not in recorder.invoked
+    assert _assistant_count(events) == 2
+
+
+@pytest.mark.asyncio
+async def test_decision_exception_runs_the_failure_envelope_without_agreed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decision boundary: a decision-time exception enters the failure envelope.
+
+    The exception is caught by the invocation try's except, so the failure
+    event carries the tool-name prefix and no display, the timing never
+    started (no duration, no persisted result), post-tool finalization
+    still runs, and the agreed counter never moved because _invoke_tool
+    never began.
+    """
+    loop = _stub_loop("decision")
+    recorder = _install_recording_hooks(loop)
+    tool = loop.tool_manager.get("stub_tool")
+    assert isinstance(tool, FakeTool)
+
+    def exploding_resolve(args: FakeToolArgs) -> PermissionContext | None:
+        raise RuntimeError("decision boom")
+
+    monkeypatch.setattr(tool, "resolve_permission", exploding_resolve)
+    events = await act_and_collect_events(loop, "Execute tool")
+
+    results = _result_events(events)
+    assert len(results) == 1
+    result = results[0]
+    assert result.error is not None
+    assert "stub_tool failed: decision boom" in result.error
+    assert result.error_display is None
+    assert result.duration is None
+    assert loop.stats.tool_calls_agreed == 0
+    assert loop.stats.tool_calls_failed == 1
+    assert loop.stats.tool_calls_succeeded == 0
+    assert "pre_tool" in recorder.invoked
+    assert "post_tool" in recorder.invoked
+    message = next(m for m in loop.messages if m.tool_call_id == "decision")
+    assert message.tool_result is None
+    assert _assistant_count(events) == 2
+
+
+@pytest.mark.asyncio
+async def test_snapshot_exception_runs_the_failure_envelope_with_agreed_and_no_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Snapshot boundary: a snapshot exception fails after the invocation began.
+
+    The snapshot await sits inside _invoke_tool after the agreed counter
+    moved but before timing.start(), so the failure event has an agreed
+    count of one and no duration — the distinguishing shape against the
+    decision boundary above and the invocation boundary below.
+    """
+    loop = _stub_loop("snapshot-fail")
+    recorder = _install_recording_hooks(loop)
+
+    def exploding_snapshot(*_args: object) -> None:
+        raise RuntimeError("snapshot boom")
+
+    monkeypatch.setattr(FakeTool, "get_file_snapshot", exploding_snapshot)
+    events = await act_and_collect_events(loop, "Execute tool")
+
+    results = _result_events(events)
+    assert len(results) == 1
+    result = results[0]
+    assert result.error is not None
+    assert "stub_tool failed: snapshot boom" in result.error
+    assert result.duration is None
+    assert loop.stats.tool_calls_agreed == 1
+    assert loop.stats.tool_calls_failed == 1
+    assert loop.stats.tool_calls_succeeded == 0
+    assert "pre_tool" in recorder.invoked
+    assert "post_tool" in recorder.invoked
+    message = next(m for m in loop.messages if m.tool_call_id == "snapshot-fail")
+    assert message.tool_result is None
+    assert _assistant_count(events) == 2
+
+
+@pytest.mark.asyncio
+async def test_invocation_without_result_model_fails_with_tool_error() -> None:
+    """Invocation boundary: a result-less invocation raises into the envelope.
+
+    A tool that streams but never yields a result model raises ToolError at
+    the invocation span; the failure event carries the ToolError display,
+    a frozen duration (timing started before invoke), an empty persisted
+    output, and the post-tool finalization still runs.
+    """
+    loop = _stub_loop("no-result")
+    loop.tool_manager._all_tools["stub_tool"] = _StreamOnlyTool
+    recorder = _install_recording_hooks(loop)
+
+    events = await act_and_collect_events(loop, "Execute tool")
+
+    # The stream event streams through before the failure.
+    assert any(isinstance(event, ToolStreamEvent) for event in events)
+    results = _result_events(events)
+    assert len(results) == 1
+    result = results[0]
+    assert result.error is not None
+    assert "Tool did not yield a result" in result.error
+    assert result.error_display is not None
+    assert "Tool did not yield a result" in result.error_display
+    assert result.duration is not None
+    assert loop.stats.tool_calls_agreed == 1
+    assert loop.stats.tool_calls_failed == 1
+    assert loop.stats.tool_calls_succeeded == 0
+    assert "pre_tool" in recorder.invoked
+    assert "post_tool" in recorder.invoked
+    message = next(m for m in loop.messages if m.tool_call_id == "no-result")
+    assert message.tool_result is not None
+    assert message.tool_result.output == {}
+    assert _assistant_count(events) == 2
+
+
+@pytest.mark.asyncio
+async def test_post_tool_hook_exception_suppresses_success_accounting() -> None:
+    """Post-hook boundary: a raising post-tool hook suppresses success accounting.
+
+    Observation intake and success accounting sit after post-tool
+    finalization, so a post-tool hook exception leaves the success event
+    already streamed but the accounting never runs: the failure envelope
+    re-runs post-tool hooks (which raise again and escape), and the batch
+    monitor reports the escaped exception as a pre-tool-processing failure.
+    """
+    loop = _stub_loop("posthook")
+    recorder = _ExplodingHooksManager("post_tool", "post-hook boom")
+    loop._hooks_manager = cast(HooksManager, recorder)
+
+    events = await act_and_collect_events(loop, "Execute tool")
+
+    results = _result_events(events)
+    # The success event streams before the post-tool hook runs...
+    assert len(results) == 3
+    assert results[0].result is not None
+    assert results[0].error is None
+    # ...then the failure envelope reports the hook exception...
+    assert results[1].error is not None
+    assert "stub_tool failed: post-hook boom" in results[1].error
+    # ...and the re-run post-tool hook escapes to the batch monitor.
+    assert results[2].error is not None
+    assert "stub_tool failed during pre-tool processing: post-hook boom" in (
+        results[2].error
+    )
+    # Success accounting never ran: it sits after post-tool finalization.
+    assert loop.stats.tool_calls_agreed == 1
+    assert loop.stats.tool_calls_succeeded == 0
+    assert loop.stats.tool_calls_failed == 2
+    assert "pre_tool" in recorder.invoked
+    # The failure envelope re-runs post-tool finalization, so the hook
+    # fires once for the success path and once more before it escapes.
+    assert recorder.invoked.count("post_tool") == 2
+    # Only the monitor's failure reached the transcript.
+    tool_messages = [m for m in loop.messages if m.tool_call_id == "posthook"]
+    assert len(tool_messages) == 1
+    assert "failed during pre-tool processing" in (tool_messages[0].content or "")
+    assert _assistant_count(events) == 2

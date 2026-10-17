@@ -1,0 +1,625 @@
+"""Completion-coordination collaborator for AgentLoop (ALL cluster: attempts).
+
+Owns the completion input/header/resource assembly, the failover candidate
+and attempt helpers, the synchronous attempt publication/rollback helpers,
+the entire attempt generator (with its cleanup paths), and the
+nonstreaming completion facade, all extracted from _loop.py. The loop
+keeps a compatibility delegate for the attempt generator that returns the
+coordinator's iterator directly (no per-chunk forwarding layer), a thin
+delegate for the nonstreaming facade, and the streaming facade returning
+the delegate's iterator directly (no added generator forwarding layers).
+
+Live loop values (config, committed model, stats, session identity, format
+handler, accounting owner/sink/attribution, injected backend, max tokens)
+are read through getters, so session reset, rebind and reconfiguration stay
+visible. The config orchestrator, the backend lifetime and the LLM gateway
+are borrowed: they are assigned once at loop construction and never
+replaced, so backend borrowing, publication, drain and the gateway handoff
+behave exactly as before. The patched module-level ``create_backend``
+surface is resolved at invocation time through a facade callback, so test
+patches of the _loop global keep intercepting. Launch-metadata installation,
+backend-metadata assembly and replay admission are late-bound callbacks, so
+instance patches keep intercepting, and the committed-model restoration
+collapses the three-statement identity restore (committed model, config
+attach, metadata install) into one late-bound helper call. The attempt
+generator resolves every rider-referenced helper (candidates, inputs,
+resources, model, budget, backend, rollback) and every loop-owned seam
+(transcript append, provider/switch recording, identity publication)
+through late-bound callbacks, so instance patches keep intercepting exactly
+as when the generator lived on the loop. Usage accounting settlement stays
+in the gateway's CallFinalizer: the coordinator only binds the resources.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncGenerator, Callable, Sequence
+import contextlib
+from dataclasses import replace
+
+from chartreux.core.agent_loop._loop_types import RootAccountingOwner
+from chartreux.core.agent_loop.backend_lifetime import BackendLifetime, BackendPublish
+from chartreux.core.agent_loop.errors import AgentLoopLLMResponseError
+from chartreux.core.agent_loop.llm_gateway import (
+    CallResources,
+    CompletionInputs,
+    LLMGateway,
+    TranscriptAppend,
+)
+from chartreux.core.compaction import reorder_for_tool_adjacency
+from chartreux.core.compaction.context import select_model_context
+from chartreux.core.config import ChartreuxConfigSchema, ModelConfig, ProviderConfig
+from chartreux.core.config.orchestrator import ConfigOrchestrator
+from chartreux.core.llm.failures import RequestRetryBudget, classify
+from chartreux.core.llm.format import APIToolFormatHandler
+from chartreux.core.llm.types import BackendLike
+from chartreux.core.llm_models import AvailableTool, LLMChunk, LLMMessage, StrToolChoice
+from chartreux.core.model_catalog.availability import (
+    EligibleDeployment,
+    eligible_deployments,
+)
+from chartreux.core.session_types import AgentStats, CommittedModelIdentity
+from chartreux.core.usage import AccountingSink, UsageAttribution, UsagePurpose
+from chartreux.core.utils import RetryObserver
+from chartreux.observability.logging import logger
+from chartreux.utils.http import get_user_agent
+
+
+class CompletionCoordinator:
+    """Own completion input/resource assembly, the attempt helpers, and the
+    attempt generator.
+
+    ``build_completion_inputs`` assembles the frozen CompletionInputs, with
+    the header assembly in ``_extra_headers``; ``build_call_resources``
+    binds the live stats, accounting sink and usage attribution to a backend.
+    ``failover_candidates`` enumerates eligible deployments;
+    ``backend_for_attempt`` materializes the attempt backend through the
+    patched ``create_backend`` facade; ``attempt_model`` resolves the
+    candidate's model; ``attempt_retry_budget`` picks the per-attempt
+    deadline. ``rollback_attempt``/``finalize_attempt`` are the synchronous
+    publication restoration/publication helpers; ``release_unattempted_probes``
+    releases the recovery probes of candidates that never ran.
+    ``attempt`` is the whole attempt generator, cleanup paths included: the
+    semantic-delta cutoff, the cancellation/GeneratorExit rollback, the
+    probe release in the outer ``finally``, the backend borrowing, and the
+    ``aclosing`` boundaries around the gateway streams. ``complete`` is the
+    nonstreaming facade: it drains the attempt stream (resolved through the
+    loop, so the loop's patched ``_attempt_completion`` keeps intercepting)
+    and returns the single chunk, raising ``AgentLoopLLMResponseError`` when
+    the generator produced none.
+    """
+
+    def __init__(  # noqa: PLR0913
+        self,
+        *,
+        config_getter: Callable[[], ChartreuxConfigSchema],
+        config_orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
+        backend_lifetime: BackendLifetime,
+        llm_gateway: LLMGateway,
+        committed_model_getter: Callable[[], CommittedModelIdentity | None],
+        stats_getter: Callable[[], AgentStats],
+        format_handler_getter: Callable[[], APIToolFormatHandler],
+        session_id_getter: Callable[[], str],
+        parent_session_id_getter: Callable[[], str | None],
+        is_subagent_getter: Callable[[], bool],
+        launch_profile_getter: Callable[[], str | None],
+        accounting_owner_getter: Callable[[], RootAccountingOwner | None],
+        accounting_sink_getter: Callable[[], AccountingSink | None],
+        usage_attribution_getter: Callable[[], UsageAttribution | None],
+        injected_backend_getter: Callable[[], BackendLike | None],
+        max_tokens_getter: Callable[[], int | None],
+        notice_retry: RetryObserver,
+        admit_replay_getter: Callable[[], Callable[[], bool]],
+        create_backend: Callable[..., BackendLike],
+        restore_committed_model: Callable[[CommittedModelIdentity | None], None],
+        install_launch_metadata: Callable[[], None],
+        backend_metadata: Callable[[str | None], dict[str, str]],
+        enumerate_candidates: Callable[..., tuple[EligibleDeployment, ...]],
+        prepare_inputs: Callable[..., CompletionInputs],
+        bind_resources: Callable[
+            [BackendLike, RequestRetryBudget | None], CallResources
+        ],
+        materialize_model: Callable[..., ModelConfig],
+        select_budget: Callable[..., RequestRetryBudget],
+        backend_for_candidate: Callable[[ModelConfig, RequestRetryBudget], BackendLike],
+        rollback_publication: Callable[
+            [object, CommittedModelIdentity | None, EligibleDeployment], None
+        ],
+        append_transcript: Callable[[TranscriptAppend], None],
+        record_providers: Callable[[Sequence[str]], None],
+        record_switch: Callable[..., None],
+        commit_identity: Callable[[CommittedModelIdentity], None],
+        attempt_stream: Callable[..., AsyncGenerator[LLMChunk]],
+    ) -> None:
+        # Borrowed shared ownership: the config orchestrator, the backend
+        # lifetime and the LLM gateway are assigned once at loop construction
+        # and never replaced.
+        self._config_orchestrator = config_orchestrator
+        self._backend_lifetime = backend_lifetime
+        self._llm_gateway = llm_gateway
+        # Live getters: config, committed model, stats, session identity,
+        # format handler, accounting binding, injected backend and max tokens
+        # are replaced by session reset/rebind or reconfiguration, so they
+        # are read at operation time.
+        self._config_getter = config_getter
+        self._committed_model_getter = committed_model_getter
+        self._stats_getter = stats_getter
+        self._format_handler_getter = format_handler_getter
+        self._session_id_getter = session_id_getter
+        self._parent_session_id_getter = parent_session_id_getter
+        self._is_subagent_getter = is_subagent_getter
+        self._launch_profile_getter = launch_profile_getter
+        self._accounting_owner_getter = accounting_owner_getter
+        self._accounting_sink_getter = accounting_sink_getter
+        self._usage_attribution_getter = usage_attribution_getter
+        self._injected_backend_getter = injected_backend_getter
+        self._max_tokens_getter = max_tokens_getter
+        # Stable retry notifier: a loop method, never reassigned.
+        self._notice_retry = notice_retry
+        # Replay admission resolves the loop's bound method at bind time, so
+        # instance patches of the loop's admission method keep intercepting.
+        self._admit_replay_getter = admit_replay_getter
+        # Facade callback: the patched module-level create_backend surface
+        # resolves through the _loop global at invocation time.
+        self._create_backend = create_backend
+        # Late-bound identity restoration: the loop helper performs the
+        # three-statement restore (committed model, config attach, metadata
+        # install), so instance patches of the metadata install keep
+        # intercepting.
+        self._restore_committed_model = restore_committed_model
+        # Late-bound metadata installation and backend metadata assembly:
+        # instance patches of the loop's methods keep intercepting.
+        self._install_launch_metadata = install_launch_metadata
+        self._backend_metadata = backend_metadata
+        # Late-bound attempt-generator seams: every rider-referenced helper
+        # and every loop-owned operation resolves through the loop at call
+        # time, so instance patches keep intercepting exactly as when the
+        # generator lived on the loop (test_failover_coordinator.py patches
+        # _failover_candidates :1023, _completion_inputs :526/:909/:1177,
+        # _backend_for_attempt :926/:1113, and _append_transcript :642;
+        # test_usage_accounting.py wraps _call_resources :189 and
+        # _attempt_model :560/:664).
+        self._enumerate_candidates = enumerate_candidates
+        self._prepare_inputs = prepare_inputs
+        self._bind_resources = bind_resources
+        self._materialize_model = materialize_model
+        self._select_budget = select_budget
+        self._backend_for_candidate = backend_for_candidate
+        self._rollback_publication = rollback_publication
+        self._append_transcript = append_transcript
+        self._record_providers = record_providers
+        self._record_switch = record_switch
+        # Late-bound identity publication: the loop owns the committed-model
+        # attribute and the config attach (the mirror of the restoration
+        # helper above).
+        self._commit_identity = commit_identity
+        # Late-bound attempt stream: the nonstreaming facade iterates the
+        # loop-resolved _attempt_completion delegate, so the
+        # test_failover_coordinator.py:1057 patch keeps intercepting.
+        self._attempt_stream = attempt_stream
+
+    def _extra_headers(self, provider: ProviderConfig | None = None) -> dict[str, str]:
+        provider = (
+            self._config_getter().get_active_provider()
+            if provider is None
+            else provider
+        )
+        headers: dict[str, str] = {}
+        headers["user-agent"] = get_user_agent(provider.backend)
+        headers["x-affinity"] = self._session_id_getter()
+        return headers
+
+    def build_completion_inputs(
+        self,
+        *,
+        model: ModelConfig,
+        messages: Sequence[LLMMessage],
+        tools: list[AvailableTool] | None,
+        tool_choice: StrToolChoice | AvailableTool | None,
+        call_type: str | None = None,
+        account_conversation: bool = True,
+        purpose: UsagePurpose = UsagePurpose.CONVERSATION,
+    ) -> CompletionInputs:
+        provider = self._config_getter().get_provider_for_model(model)
+        return CompletionInputs(
+            model=model,
+            provider_name=provider.name,
+            emits_finish_reason=provider.emits_finish_reason,
+            messages=tuple(messages),
+            tools=tools,
+            tool_choice=tool_choice,
+            extra_headers=self._extra_headers(provider),
+            metadata=self._backend_metadata(call_type),
+            max_tokens=self._max_tokens_getter(),
+            account_conversation=account_conversation,
+            purpose=purpose,
+        )
+
+    def build_call_resources(
+        self, backend: BackendLike, budget: RequestRetryBudget | None = None
+    ) -> CallResources:
+        if budget is None:
+            budget = RequestRetryBudget(
+                self._config_getter().api_retry_max_elapsed_time
+            )
+        owner = self._accounting_owner_getter()
+        sink = self._accounting_sink_getter()
+        attribution = self._usage_attribution_getter()
+        if owner is not None:
+            sink = owner.writer
+            model = self._config_getter().get_active_model()
+            attribution = UsageAttribution(
+                root_session_id=owner.root_session_id,
+                session_id=self._session_id_getter(),
+                parent_session_id=self._parent_session_id_getter(),
+                agent_role="subagent" if self._is_subagent_getter() else "root",
+                agent_profile=self._launch_profile_getter(),
+                project_key=owner.project_key,
+                model=model.alias,
+                provider=model.provider,
+                wire_name=model.name,
+            )
+        # The gateway freezes the actual attempt's deployment, purpose and prices;
+        # this binding freezes session identity even if a later rebind replaces it.
+        return CallResources(
+            backend=backend,
+            stats=self._stats_getter(),
+            process_message=self._format_handler_getter().process_api_response_message,
+            accounting_sink=sink,
+            usage_attribution=attribution,
+            retry_budget=budget,
+            on_retry=self._notice_retry,
+            admit_replay=self._admit_replay_getter(),
+        )
+
+    def failover_candidates(
+        self,
+        messages: Sequence[LLMMessage],
+        attempted_model: ModelConfig,
+        *,
+        call_type: str | None = None,
+    ) -> tuple[EligibleDeployment, ...]:
+        config = self._config_getter()
+        snapshot = config.catalog_snapshot
+        committed = self._committed_model_getter()
+        if snapshot is None or committed is None:
+            return ()
+        result = eligible_deployments(
+            snapshot=snapshot,
+            committed=committed,
+            registry=self._config_orchestrator.availability_registry,
+            config=config,
+            history=reorder_for_tool_adjacency(select_model_context(messages)),
+            thinking=attempted_model.thinking,
+            compaction_base=config.compaction_model or None,
+            compaction_only=call_type == "secondary_call",
+            allowed_models=config.allowed_models,
+        )
+        return tuple(result.candidates)
+
+    def backend_for_attempt(
+        self, model: ModelConfig, budget: RequestRetryBudget
+    ) -> BackendLike:
+        injected = self._injected_backend_getter()
+        if injected is not None:
+            return injected
+        provider = self._config_getter().get_provider_for_model(model)
+        return self._create_backend(
+            provider=provider,
+            on_retry=self._notice_retry,
+            timeout=self._config_getter().api_timeout,
+            retry_max_elapsed_time=self._config_getter().api_retry_max_elapsed_time,
+            retry_budget=budget,
+            connect_timeout=self._config_getter().api_connect_timeout,
+            write_timeout=self._config_getter().api_write_timeout,
+            pool_timeout=self._config_getter().api_pool_timeout,
+            enable_system_trust_store=self._config_getter().enable_system_trust_store,
+        )
+
+    def attempt_model(
+        self, resolved: object, *, call_type: str | None, thinking: str | None = None
+    ) -> ModelConfig:
+        """Materialize the completion model for a candidate provider.
+
+        A dedicated compaction base follows the selected conversation provider;
+        eligibility has already established that such a deployment exists.
+        """
+        from chartreux.core.model_catalog.resolver import ResolvedModel, resolver_for
+
+        assert isinstance(resolved, ResolvedModel)
+        config = self._config_getter()
+        target = resolved
+        if call_type == "secondary_call" and config.compaction_model:
+            base = resolver_for(config).canonicalize(config.compaction_model)
+            definition = config.catalog_snapshot.catalog.models[base]  # type: ignore[union-attr]
+            deployment = next(
+                item
+                for item in definition.deployments
+                if item.provider == resolved.deployment.provider and not item.disabled
+            )
+            target = ResolvedModel(
+                base,
+                definition,
+                deployment,
+                config.catalog_snapshot.catalog.providers[deployment.provider],  # type: ignore[union-attr]
+                config.catalog_snapshot.revision,  # type: ignore[union-attr]
+            )
+        return target.materialize(
+            auto_compact_threshold=config.auto_compact_threshold,
+            thinking=(
+                thinking
+                if thinking is not None
+                else config.thinking_overrides.get(target.base_model)
+            ),
+        )
+
+    def attempt_retry_budget(
+        self, budget: RequestRetryBudget, *, has_alternative: bool
+    ) -> RequestRetryBudget:
+        """Use the shared deadline for a lone deployment, otherwise fail over now."""
+        if not has_alternative:
+            return budget
+        return RequestRetryBudget(0.0)
+
+    def release_unattempted_probes(
+        self, candidates: Sequence[EligibleDeployment], attempted: set[str]
+    ) -> None:
+        registry = self._config_orchestrator.availability_registry
+        for candidate in candidates:
+            if (
+                candidate.recovery_probe
+                and candidate.resolved.deployment.provider not in attempted
+            ):
+                assert candidate.recovery_probe_token is not None
+                registry.release_probe(
+                    candidate.resolved.base_model,
+                    candidate.resolved.deployment.provider,
+                    candidate.recovery_probe_token,
+                )
+
+    def rollback_attempt(
+        self,
+        publication: object,
+        previous_identity: CommittedModelIdentity | None,
+        candidate: EligibleDeployment,
+    ) -> None:
+        restored = publication.rollback()  # type: ignore[attr-defined]
+        try:
+            if restored:
+                self._restore_committed_model(previous_identity)
+        finally:
+            if candidate.recovery_probe:
+                assert candidate.recovery_probe_token is not None
+                self._config_orchestrator.availability_registry.release_probe(
+                    candidate.resolved.base_model,
+                    candidate.resolved.deployment.provider,
+                    candidate.recovery_probe_token,
+                )
+
+    def finalize_attempt(
+        self, publication: object, candidate: EligibleDeployment
+    ) -> None:
+        self._install_launch_metadata()
+        self._config_orchestrator.availability_registry.record_success(
+            candidate.resolved.base_model, candidate.resolved.deployment.provider
+        )
+        publication.finalize(whole_turn_active=True)  # type: ignore[attr-defined]
+
+    async def attempt(  # noqa: PLR0912, PLR0914, PLR0915
+        self,
+        *,
+        messages: Sequence[LLMMessage],
+        tools: list[AvailableTool] | None,
+        tool_choice: StrToolChoice | AvailableTool | None,
+        call_type: str | None,
+        transcript: bool,
+        streaming: bool,
+        fallback_model: ModelConfig,
+        account_conversation: bool = True,
+        purpose: UsagePurpose = UsagePurpose.CONVERSATION,
+    ) -> AsyncGenerator[LLMChunk]:
+        """Run one shared preparation/publication/rollback attempt lifecycle."""
+        budget = RequestRetryBudget(self._config_getter().api_retry_max_elapsed_time)
+        candidates = self._enumerate_candidates(
+            messages, fallback_model, call_type=call_type
+        )
+        if not candidates:  # noqa: PLR1702
+            inputs = self._prepare_inputs(
+                model=fallback_model,
+                messages=messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                call_type=call_type,
+                account_conversation=account_conversation,
+                purpose=purpose,
+            )
+            provider_name = (
+                self._config_getter().get_provider_for_model(fallback_model).name
+            )
+            try:
+                with self._backend_lifetime.borrow() as backend:
+                    resources = self._bind_resources(backend, budget)
+                    if streaming:
+                        stream = self._llm_gateway.chat_streaming(
+                            inputs, resources, transcript=self._append_transcript
+                        )
+                        async with contextlib.aclosing(stream):
+                            async for chunk in stream:
+                                yield chunk
+                    elif transcript:
+                        yield await self._llm_gateway.chat(
+                            inputs, resources, transcript=self._append_transcript
+                        )
+                    else:
+                        yield await self._llm_gateway.complete(inputs, resources)
+            finally:
+                self._record_providers((provider_name,))
+            return
+
+        registry = self._config_orchestrator.availability_registry
+        last_error: BaseException | None = None
+        attempted: set[str] = set()
+        providers_used: list[str] = []
+        try:  # noqa: PLR1702
+            for candidate_index, candidate in enumerate(candidates):
+                resolved = candidate.resolved
+                provider_name = resolved.deployment.provider
+                if provider_name in attempted:
+                    continue
+
+                replacement: BackendLike | None = None
+                try:
+                    model = self._materialize_model(
+                        resolved, call_type=call_type, thinking=fallback_model.thinking
+                    )
+                    attempt_budget = self._select_budget(
+                        budget, has_alternative=candidate_index < len(candidates) - 1
+                    )
+                    replacement = self._backend_for_candidate(model, attempt_budget)
+                    inputs = self._prepare_inputs(
+                        model=model,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        call_type=call_type,
+                        account_conversation=account_conversation,
+                        purpose=purpose,
+                    )
+                except BaseException:
+                    if replacement is not None:
+                        with contextlib.suppress(Exception):
+                            await replacement.__aexit__(None, None, None)
+                    raise
+
+                if replacement is None:
+                    raise AgentLoopLLMResponseError(
+                        "Backend preparation produced no backend for publication"
+                    )
+
+                previous_identity = self._committed_model_getter()
+                failover_identity = resolved.identity.model_copy(
+                    update={
+                        "thinking": self._config_getter().get_active_model().thinking
+                    }
+                )
+
+                def transcript_sink(
+                    outcome: TranscriptAppend,
+                    identity: CommittedModelIdentity = failover_identity,
+                ) -> None:
+                    self._append_transcript(replace(outcome, committed_model=identity))
+
+                publication: BackendPublish | None = None
+                semantic_delta = False
+                try:
+                    publication = self._backend_lifetime.publish_reversible(replacement)
+                    attempted.add(provider_name)
+                    providers_used.append(provider_name)
+                    self._commit_identity(failover_identity)
+                    with self._backend_lifetime.borrow() as backend:
+                        resources = self._bind_resources(backend, budget)
+                        if streaming:
+                            stream = self._llm_gateway.chat_streaming(
+                                inputs, resources, transcript=transcript_sink
+                            )
+                            async with contextlib.aclosing(stream):
+                                async for chunk in stream:
+                                    message = chunk.message
+                                    semantic_delta = semantic_delta or bool(
+                                        message.content
+                                        or message.reasoning_content
+                                        or message.tool_calls
+                                    )
+                                    yield chunk
+                        elif transcript:
+                            yield await self._llm_gateway.chat(
+                                inputs, resources, transcript=transcript_sink
+                            )
+                        else:
+                            yield await self._llm_gateway.complete(inputs, resources)
+                    self.finalize_attempt(publication, candidate)
+                except (asyncio.CancelledError, GeneratorExit):
+                    if publication is not None:
+                        self._rollback_publication(
+                            publication, previous_identity, candidate
+                        )
+                    raise
+                except Exception as error:
+                    if publication is not None:
+                        self._rollback_publication(
+                            publication, previous_identity, candidate
+                        )
+                    last_error = error
+                    failure = classify(error)
+                    if failure.failover_eligible:
+                        registry.record_failure(
+                            resolved.base_model, provider_name, failure
+                        )
+                    self._backend_lifetime.drain(whole_turn_active=False)
+                    if (
+                        semantic_delta
+                        or not failure.failover_eligible
+                        or budget.exhausted
+                    ):
+                        raise
+                    continue
+                else:
+                    if (
+                        previous_identity is not None
+                        and previous_identity.provider != provider_name
+                    ):
+                        reason = (
+                            classify(last_error).category.value
+                            if last_error
+                            else "availability"
+                        )
+                        self._record_switch(
+                            base_model=resolved.base_model,
+                            old_provider=previous_identity.provider,
+                            new_provider=provider_name,
+                            reason=reason,
+                        )
+                        logger.warning(
+                            "Model deployment switched base=%s old_provider=%s new_provider=%s reason=%s",
+                            resolved.base_model,
+                            previous_identity.provider,
+                            provider_name,
+                            reason,
+                        )
+                    return
+            assert last_error is not None
+            raise last_error
+        finally:
+            self._record_providers(providers_used)
+            self.release_unattempted_probes(candidates, attempted)
+
+    async def complete(
+        self,
+        *,
+        messages: Sequence[LLMMessage],
+        tools: list[AvailableTool] | None,
+        tool_choice: StrToolChoice | AvailableTool | None,
+        call_type: str | None,
+        transcript: bool,
+        fallback_model: ModelConfig,
+        account_conversation: bool = True,
+        purpose: UsagePurpose = UsagePurpose.CONVERSATION,
+    ) -> LLMChunk:
+        # Drain the attempt generator and return its single nonstreaming
+        # chunk (raises AgentLoopLLMResponseError when it produced none).
+        result: LLMChunk | None = None
+        async for chunk in self._attempt_stream(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            call_type=call_type,
+            transcript=transcript,
+            streaming=False,
+            fallback_model=fallback_model,
+            account_conversation=account_conversation,
+            purpose=purpose,
+        ):
+            result = chunk
+        if result is None:
+            raise AgentLoopLLMResponseError("Completion returned no result")
+        return result

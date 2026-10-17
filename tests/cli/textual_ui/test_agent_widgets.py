@@ -53,6 +53,7 @@ async def test_snapshot_receipt_precedes_delayed_close_and_reactive_render(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from chartreux.app_server.events import AgentsUpdate
+    from chartreux.cli.textual_ui.agent_browser import AgentBrowserController
     from chartreux.cli.textual_ui.app import ChartreuxApp
 
     now = [100.0]
@@ -65,20 +66,30 @@ async def test_snapshot_receipt_precedes_delayed_close_and_reactive_render(
         async def close(**_: Any) -> None:
             now[0] += 10
 
+        # Controller stand-in: top-level controller state plus a nested _app
+        # namespace for the late-bound host calls. _refresh_status_for_event
+        # stays top-level for _handle_turn_event, which remains on
+        # ChartreuxApp; _track_turn_outcome moved to the turn supervisor.
         target = SimpleNamespace(
-            _track_turn_outcome=Mock(),
+            _turn_supervisor=SimpleNamespace(_track_turn_outcome=Mock()),
             _refresh_status_for_event=Mock(),
-            _agent_transcript_viewer=None,
-            _agent_selection_target="removed",
-            _agent_summaries=[],
-            _request_agent_transcript_close=AsyncMock(side_effect=close),
-            _mount_and_scroll=AsyncMock(),
-            _turn_outcome_notice=SimpleNamespace(display=False),
+            agent_transcript_viewer=None,
+            selection_target="removed",
+            agent_summaries=[],
             _agent_evictions={},
-            _agent_bar=app.bar,
+            _app=SimpleNamespace(
+                _request_agent_transcript_close=AsyncMock(side_effect=close),
+                _mount_and_scroll=AsyncMock(),
+                _turn_outcome_notice=SimpleNamespace(display=False),
+                _agent_bar=app.bar,
+                _show_no_output_outcome=Mock(),
+                _agent_is_active=Mock(return_value=True),
+            ),
         )
         target._handle_agents_update = lambda event, received_at: (  # type: ignore[attr-defined]
-            ChartreuxApp._handle_agents_update(cast(Any, target), event, received_at)
+            AgentBrowserController.handle_agents_update(
+                cast(Any, target), event, received_at
+            )
         )
         agent = _agent(
             availability="running", run_elapsed_seconds=252, current_run_id="r1"
@@ -1580,23 +1591,33 @@ async def test_disappearance_explanation_renders_markup_name_literally() -> None
     from markdown_it import MarkdownIt
 
     from chartreux.app_server.events import AgentsUpdate
-    from chartreux.cli.textual_ui.app import ChartreuxApp
+    from chartreux.cli.textual_ui.agent_browser import AgentBrowserController
     from chartreux.cli.textual_ui.widgets.messages import UserCommandMessage
 
     marked = _agent("one", name="worker-[bold]*evil*[/bold]-1")
+    # Controller stand-in: top-level controller state plus a nested _app
+    # namespace for the late-bound host calls.
     target = SimpleNamespace(
-        _agent_transcript_viewer=None,
-        _agent_selection_target="one",
-        _agent_summaries=(marked,),
-        _request_agent_transcript_close=AsyncMock(),
-        _mount_and_scroll=AsyncMock(),
-        _turn_outcome_notice=SimpleNamespace(display=False),
+        agent_transcript_viewer=None,
+        selection_target="one",
+        agent_summaries=(marked,),
         _agent_evictions={},
-        _agent_bar=None,
+        _app=SimpleNamespace(
+            _request_agent_transcript_close=AsyncMock(),
+            _mount_and_scroll=AsyncMock(),
+            _turn_outcome_notice=SimpleNamespace(display=False),
+            _agent_bar=None,
+            _show_no_output_outcome=Mock(),
+            _agent_is_active=Mock(return_value=True),
+        ),
     )
-    await ChartreuxApp._handle_agents_update(cast(Any, target), AgentsUpdate([]), 0.0)
-    target._request_agent_transcript_close.assert_awaited_once_with(restore_focus=True)
-    message = target._mount_and_scroll.await_args.args[0]
+    await AgentBrowserController.handle_agents_update(
+        cast(Any, target), AgentsUpdate([]), 0.0
+    )
+    target._app._request_agent_transcript_close.assert_awaited_once_with(
+        restore_focus=True
+    )
+    message = target._app._mount_and_scroll.await_args.args[0]
     assert isinstance(message, UserCommandMessage)
     # UserCommandMessage renders through a Markdown widget: the derived name
     # must survive rendering literally, never as markup.

@@ -13,7 +13,7 @@ from textual.widgets.selection_list import Selection
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.ui.providers.workbench import WorkbenchView
-from tests.ui.providers.test_workbench import (
+from tests.ui.providers._workbench_support import (
     MISTRAL,
     Host,
     add_preset,
@@ -218,7 +218,7 @@ async def test_collision_keep_editing_opens_separate_editor_and_restores_operati
 async def test_composite_tab_remembers_identity_scroll_and_skips_disabled_groups(
     view,
 ) -> None:
-    from tests.ui.providers.test_workbench import FULLY_CUSTOM, open_split_view
+    from tests.ui.providers._workbench_support import FULLY_CUSTOM, open_split_view
 
     screen, services = setup()
     discovery = AsyncMock(wraps=screen.discovery_service)

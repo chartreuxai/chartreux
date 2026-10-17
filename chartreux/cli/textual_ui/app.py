@@ -2,17 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import (
-    AsyncGenerator,
-    Awaitable,
-    Callable,
-    Coroutine,
-    Mapping,
-    Sequence,
-)
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import aclosing, suppress
 from dataclasses import dataclass, replace
-from enum import StrEnum, auto
 from functools import partial
 import gc
 from importlib import import_module
@@ -22,8 +14,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING, Any, ClassVar, cast
-from uuid import uuid4
+from typing import TYPE_CHECKING, Any, ClassVar
 from weakref import WeakKeyDictionary
 import webbrowser
 
@@ -45,11 +36,11 @@ from textual.events import (
 from textual.screen import Screen
 from textual.timer import Timer
 from textual.widget import Widget
-from textual.widgets import OptionList, Static
+from textual.widgets import Static
 from textual.worker import Worker, WorkerError, WorkerFailed, WorkerState
 
 from chartreux import __version__ as CORE_VERSION
-from chartreux.app_server.config import THINKING_LEVELS, ConfigView, ThinkingLevel
+from chartreux.app_server.config import ConfigView, ThinkingLevel
 from chartreux.app_server.events import (
     AgentsUpdate,
     AppServerEvent,
@@ -69,7 +60,6 @@ from chartreux.app_server.events import (
     TurnUpdated,
 )
 from chartreux.app_server.models import (
-    COMMITTED_MODEL_RECOVERY_ISSUE_FILE,
     ConfigIssue,
     ImageAttachment,
     PreparedPrompt,
@@ -77,16 +67,13 @@ from chartreux.app_server.models import (
     PublicCheckpointEntry,
     PublicEffectEntry,
     PublicEntryGenerationStatus,
-    PublicError,
     PublicHistoryEntry,
     PublicMessageEntry,
     PublicNoticeEntry,
     PublicQueuedTurn,
     PublicReasoningEntry,
-    PublicSession,
     PublicTurnStatus,
     TokenUsage,
-    TurnErrorCode,
     UsageWindow,
     UsageWindowSummaries,
     UserInputCallbackOutput,
@@ -95,20 +82,26 @@ from chartreux.app_server.models import (
     WaitingForInputNoticeDetail,
 )
 from chartreux.app_server.protocol import (
-    AgentEvictionModel,
     AgentSummaryModel,
     AppServerResponseError,
-    CancelOutcome,
     ConfigReadResponse,
     ConfigWriteOpWire,
     ProtocolError,
     ProtocolErrorCode,
-    ReleaseOutcome,
     UsageReadResponse,
     UsageUpdatedParams,
 )
 from chartreux.cli.commands import Command, CommandContext, CommandRegistry
 from chartreux.cli.process_start import PROCESS_START_WALLCLOCK
+from chartreux.cli.textual_ui.agent_browser import (
+    AgentBrowserController,
+    _AgentTranscriptSource as _AgentTranscriptSource,
+)
+from chartreux.cli.textual_ui.bottom_panel import (
+    DOUBLE_ESC_DELAY as DOUBLE_ESC_DELAY,
+    BottomApp,
+    BottomPanelController,
+)
 from chartreux.cli.textual_ui.external_editor import ExternalEditor
 from chartreux.cli.textual_ui.handlers.event_handler import EventHandler
 from chartreux.cli.textual_ui.mcp_commands import (
@@ -123,20 +116,45 @@ from chartreux.cli.textual_ui.message_queue import (
     SideChannelController,
     SideChannelPorts,
 )
-from chartreux.cli.textual_ui.notifications import (
-    NotificationContext,
-    TextualNotificationAdapter,
+from chartreux.cli.textual_ui.notifications import TextualNotificationAdapter
+from chartreux.cli.textual_ui.provider_services import (
+    _ProviderConfigService,
+    _ProviderCredentials,
+    persist_api_key_for_provider as persist_api_key_for_provider,
 )
-from chartreux.cli.textual_ui.quit_manager import (
-    ExitConsequencesScreen,
-    QuitConfirmKey,
-    QuitManager,
-)
+from chartreux.cli.textual_ui.quit_manager import QuitConfirmKey, QuitManager
 from chartreux.cli.textual_ui.scheduled_loop_runner import ScheduledLoopCommands
+from chartreux.cli.textual_ui.session_flow import (
+    SessionFlowController,
+    _PickerState as _PickerState,
+)
+from chartreux.cli.textual_ui.startup_types import (
+    AppServerBootstrap,
+    AppServerSource,
+    AppServerStarter,
+)
+from chartreux.cli.textual_ui.transcript_presenter import (
+    _TRANSCRIPT_HIGH_MARK as _TRANSCRIPT_HIGH_MARK,
+    TranscriptPresenter,
+    _SessionTranscriptWindow,
+)
+from chartreux.cli.textual_ui.turn_supervisor import (
+    _BENIGN_TURN_ERROR_CODES as _BENIGN_TURN_ERROR_CODES,
+    _INTERRUPT_SETTLE_TIMEOUT as _INTERRUPT_SETTLE_TIMEOUT,
+    _INTERRUPT_STILL_STOPPING_WARNING as _INTERRUPT_STILL_STOPPING_WARNING,
+    _INTERRUPT_WAIT_TIMEOUT as _INTERRUPT_WAIT_TIMEOUT,
+    _MAX_INCOMPLETE_STREAM_RETRIES as _MAX_INCOMPLETE_STREAM_RETRIES,
+    _RETRYABLE_TURN_ERROR_CODES as _RETRYABLE_TURN_ERROR_CODES,
+    TurnSupervisor,
+    _public_entry as _public_entry,
+)
+from chartreux.cli.textual_ui.usage_controller import (
+    _USAGE_POLL_INTERVAL_SECONDS,
+    UsageController,
+)
 from chartreux.cli.textual_ui.widgets.agent_bar import AgentBar, agent_is_active
 from chartreux.cli.textual_ui.widgets.agent_transcript import AgentTranscriptViewer
 from chartreux.cli.textual_ui.widgets.banner.banner import Banner
-from chartreux.cli.textual_ui.widgets.branch_created_message import BranchCreatedMessage
 from chartreux.cli.textual_ui.widgets.chat_input import (
     ChatInputBody,
     ChatInputContainer,
@@ -150,7 +168,6 @@ from chartreux.cli.textual_ui.widgets.chat_input.input_kinds import (
     classify,
 )
 from chartreux.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
-from chartreux.cli.textual_ui.widgets.collapsible import CollapsibleSection
 from chartreux.cli.textual_ui.widgets.compact import CompactMessage
 from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
 from chartreux.cli.textual_ui.widgets.inline_notice import InlineNotice
@@ -159,15 +176,12 @@ from chartreux.cli.textual_ui.widgets.load_more import HistoryLoadMoreRequested
 from chartreux.cli.textual_ui.widgets.loading import (
     DEFAULT_LOADING_STATUS,
     INITIALIZING_LOADING_STATUS,
-    INTERRUPTING_LOADING_STATUS,
     LoadingWidget,
-    paused_timer,
 )
 from chartreux.cli.textual_ui.widgets.messages import (
     AssistantMessage,
     CustomToolsDeprecationMessage,
     ErrorMessage,
-    InterruptMessage,
     PlanFileMessage,
     ReasoningMessage,
     SlashCommandMessage,
@@ -178,36 +192,19 @@ from chartreux.cli.textual_ui.widgets.messages import (
     WhatsNewMessage,
 )
 from chartreux.cli.textual_ui.widgets.reload_message import ReloadConfigMessage
-from chartreux.cli.textual_ui.widgets.rewind_fork_message import RewindForkMessage
 from chartreux.cli.textual_ui.widgets.session_status_line import (
     SessionStatusLine,
     SessionStatusState,
 )
-from chartreux.cli.textual_ui.widgets.tool_grouping import (
-    ToolGroupExpansionState,
-    entry_keeps_tool_group,
-)
+from chartreux.cli.textual_ui.widgets.tool_grouping import ToolGroupExpansionState
 from chartreux.cli.textual_ui.widgets.tool_widgets import EditResultWidget
 from chartreux.cli.textual_ui.widgets.tools import (
     ToolCallMessage,
     ToolGroup,
     ToolResultMessage,
 )
-from chartreux.cli.textual_ui.windowing import (
-    HISTORY_RESUME_TAIL_MESSAGES,
-    LOAD_MORE_BATCH_SIZE,
-    HistoryLoadMoreManager,
-    SessionWindowing,
-    create_resume_plan,
-    shift_history_widget_indices,
-    should_resume_history,
-    sync_backfill_state,
-)
-from chartreux.cli.textual_ui.windowing.history import build_history_widgets
-from chartreux.cli.textual_ui.windowing.transcript import (
-    TranscriptAnchor,
-    TranscriptWindow,
-)
+from chartreux.cli.textual_ui.windowing import HistoryLoadMoreManager, SessionWindowing
+from chartreux.cli.textual_ui.windowing.transcript import TranscriptAnchor
 from chartreux.config_values import FALLBACK_THEME
 from chartreux.observability.logging import (
     get_effective_log_level,
@@ -216,7 +213,6 @@ from chartreux.observability.logging import (
     set_config_log_level,
     set_session_override,
 )
-from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.clipboard import (
     NATIVE_COPY_HINT,
     ClipboardCopyResult,
@@ -227,61 +223,17 @@ from chartreux.ui.providers.graduation import GraduationStore
 from chartreux.ui.theme import resolve_auto_theme, resolve_theme, resolve_theme_name
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.utils.paths import get_chartreux_home, is_dangerous_directory
-from chartreux.utils.retry_prompt import build_retry_prompt
 from chartreux.utils.session_id import shorten_session_id
 
-
-class _SessionTranscriptWindow(TranscriptWindow):
-    """Apply current interface preferences even to rematerialized history units."""
-
-    def __init__(self, get_show_timestamps: Callable[[], bool], **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._get_show_timestamps = get_show_timestamps
-
-    def build_unit(
-        self, unit_id: str, history_widget_indices: WeakKeyDictionary[Widget, int]
-    ) -> list[Widget]:
-        unit = self.units[unit_id]
-        return build_history_widgets(
-            unit.entries,
-            start_index=unit.start_index,
-            history_widget_indices=history_widget_indices,
-            tools_collapsed=self.tools_collapsed,
-            expansion_state=self.expansion_state,
-            entry_expansion_state=self.entry_expansion_state,
-            show_message_timestamps=self._get_show_timestamps(),
-        )
-
-
-# Expected turn outcomes with bespoke user messages; not worth reporting to Sentry.
-_BENIGN_TURN_ERROR_CODES = {
-    TurnErrorCode.RATE_LIMIT,
-    TurnErrorCode.CONTEXT_TOO_LONG,
-    TurnErrorCode.RESPONSE_TOO_LONG,
-    TurnErrorCode.REFUSAL,
-    TurnErrorCode.INCOMPLETE_STREAM,
-    TurnErrorCode.INVALID_MODEL,
-    TurnErrorCode.INVALID_API_KEY,
-}
-
-_RETRYABLE_TURN_ERROR_CODES = {
-    TurnErrorCode.BACKEND_ERROR,
-    TurnErrorCode.RATE_LIMIT,
-    TurnErrorCode.RESPONSE_TOO_LONG,
-    TurnErrorCode.INCOMPLETE_STREAM,
-}
-
-_MAX_INCOMPLETE_STREAM_RETRIES = 2
-_INTERRUPT_WAIT_TIMEOUT = 2.0
-_INTERRUPT_SETTLE_TIMEOUT = 30.0
+# The turn error/retry/interrupt constants moved to turn_supervisor.py (10.1a);
+# app.py re-exports them, so the module-global seams (tests patch
+# ``chartreux.cli.textual_ui.app._INTERRUPT_WAIT_TIMEOUT`` /
+# ``_INTERRUPT_SETTLE_TIMEOUT``) keep resolving through this module.
 _DIAGNOSTIC_HEARTBEAT_DRIFT_WARNING_SECONDS = 0.25
-_INTERRUPT_STILL_STOPPING_WARNING = (
-    "The turn is still stopping. New turns will wait until it has fully stopped."
-)
 
 if TYPE_CHECKING:
-    from chartreux.app_server.host import AppServerHost
     from chartreux.app_server.session import AppServerSession, SessionExitSummary
+    from chartreux.cli.textual_ui.quit_manager import ExitConsequencesScreen
     from chartreux.cli.textual_ui.screens.settings import SettingsScreen
     from chartreux.cli.textual_ui.widgets.debug_console import DebugConsole
     from chartreux.cli.textual_ui.widgets.log_level_picker import LogLevelPickerApp
@@ -293,6 +245,7 @@ if TYPE_CHECKING:
     from chartreux.cli.textual_ui.widgets.rewind_app import RewindApp
     from chartreux.cli.textual_ui.widgets.session_picker import SessionPickerApp
     from chartreux.cli.textual_ui.widgets.thinking_picker import ThinkingPickerApp
+    from chartreux.cli.textual_ui.word_selection import WordSelectScreen
     from chartreux.ui.web_search import WebSearchScreen
     from chartreux.ui.widgets.theme_picker import ThemePickerApp
 
@@ -369,12 +322,16 @@ def _get_rewind_app_class() -> type[RewindApp]:
     return RewindApp
 
 
-def _public_entry(event: AppServerEvent) -> PublicHistoryEntry | None:
-    match event:
-        case HistoryEntryAdded(entry=entry) | HistoryEntryUpdated(entry=entry):
-            return entry
-        case _:
-            return None
+def _get_exit_consequences_screen_class() -> type[ExitConsequencesScreen]:
+    from chartreux.cli.textual_ui.quit_manager import ExitConsequencesScreen
+
+    return ExitConsequencesScreen
+
+
+def _get_word_select_screen_class() -> type[WordSelectScreen]:
+    from chartreux.cli.textual_ui.word_selection import WordSelectScreen
+
+    return WordSelectScreen
 
 
 def is_progress_event(event: AppServerEvent) -> bool:
@@ -382,130 +339,6 @@ def is_progress_event(event: AppServerEvent) -> bool:
     return isinstance(
         entry, (PublicMessageEntry, PublicReasoningEntry, PublicEffectEntry)
     )
-
-
-_MARKDOWN_INLINE_MARKUP = "\\`*_[]<&~"
-"""Characters that can open inline markup, entity or autolink sequences."""
-
-_MARKDOWN_ESCAPE_TABLE = str.maketrans({
-    char: f"\\{char}" for char in _MARKDOWN_INLINE_MARKUP
-})
-
-
-def _markdown_literal(text: str) -> str:
-    """Escape inline-Markdown-active characters so ``text`` renders literally.
-
-    ``UserCommandMessage`` renders its content through a Markdown widget, so
-    an interpolated derived agent name must not carry markup-active
-    characters (unlike toast notices, which render with markup disabled).
-    Only characters that can open emphasis, code, link, autolink, entity or
-    strikethrough sequences mid-text are escaped; plain names pass through
-    unchanged.
-    """
-    return text.translate(_MARKDOWN_ESCAPE_TABLE)
-
-
-class _ProviderCredentials:
-    """Adapt provider credential persistence to the host-neutral flow contract."""
-
-    def resolve_key(self, env_var: str) -> str | None:
-        resolve_api_key = import_module("chartreux.utils.api_keys").resolve_api_key
-        return resolve_api_key(env_var)
-
-    def save_key(self, env_var: str, key: str) -> Any:
-        outcome = persist_api_key_for_provider(env_var, key)
-        credential_save_result = import_module(
-            "chartreux.core.model_catalog.contracts"
-        ).CredentialSaveResult
-        if outcome == "completed":
-            return credential_save_result("saved")
-        if outcome.startswith("env_var_error"):
-            return credential_save_result(
-                "invalid_env_var", "Credential variable is invalid."
-            )
-        return credential_save_result(
-            "session_only",
-            "Could not save the key to disk; it remains available for this session.",
-        )
-
-
-class _ProviderConfigService:
-    """Reload and persist provider settings without resetting the conversation UI."""
-
-    def __init__(self, app: ChartreuxApp) -> None:
-        self._app = app
-
-    async def persist_theme(self, theme: str) -> Any:
-        config_persist_result = import_module(
-            "chartreux.core.model_catalog.contracts"
-        ).ConfigPersistResult
-        try:
-            await self._app.app_server.resources.config.update({"theme": theme})
-            await self._app._apply_config_to_ui()
-        except Exception:
-            logger.warning("Provider theme persistence failed", exc_info=True)
-            return config_persist_result(False, "Could not save the theme.")
-        return config_persist_result(True)
-
-    async def reload_catalog_and_config(self) -> Any:
-        contracts = import_module("chartreux.core.model_catalog.contracts")
-        config_reload_result = contracts.ConfigReloadResult
-        load_catalog = import_module("chartreux.core.model_catalog.loader").load_catalog
-        try:
-            await self._app.app_server.resources.config.reload(reload_runtime=True)
-            snapshot = load_catalog()
-            await self._app._apply_config_to_ui()
-        except Exception:
-            logger.warning("Provider catalog reload failed", exc_info=True)
-            return config_reload_result(
-                None, "Could not reload the provider catalog. Retry."
-            )
-        return config_reload_result(snapshot)
-
-    async def persist_active_model(self, expression: str) -> Any:
-        config_persist_result = import_module(
-            "chartreux.core.model_catalog.contracts"
-        ).ConfigPersistResult
-        try:
-            await self._app.app_server.resources.config.update({
-                "active_model": expression
-            })
-            await self._app._apply_config_to_ui()
-        except Exception:
-            logger.warning("Provider active-model persistence failed", exc_info=True)
-            return config_persist_result(False, "Could not save the active model.")
-        return config_persist_result(True)
-
-    def validate_active_selection(self, expression: str | None) -> str | None:
-        """Return an actionable error unless the selection is usable at runtime."""
-        try:
-            load_catalog = import_module(
-                "chartreux.core.model_catalog.loader"
-            ).load_catalog
-            model_resolver = import_module(
-                "chartreux.core.model_catalog.resolver"
-            ).ModelResolver
-            resolve_api_key = import_module("chartreux.utils.api_keys").resolve_api_key
-            missing_api_key_error = import_module(
-                "chartreux.core.config.models"
-            ).MissingAPIKeyError
-            selected = (
-                expression
-                if expression is not None
-                else self._app.config.active_model_expression
-            ) or self._app.config.default_model_alias
-            resolved = model_resolver(load_catalog()).resolve(
-                selected, allowed_models=self._app.config.allowed_models
-            )
-            if resolved.provider.api_key_env_var and not resolve_api_key(
-                resolved.provider.api_key_env_var
-            ):
-                raise missing_api_key_error(
-                    resolved.provider.api_key_env_var, resolved.deployment.provider
-                )
-        except (RuntimeError, ValueError) as error:
-            return str(error)
-        return None
 
 
 async def _session_selection_restrictions(
@@ -534,49 +367,35 @@ async def _session_selection_restrictions(
     return allowed_models, overrides
 
 
-def persist_api_key_for_provider(env_var: str, key: str) -> str:
-    """Persist an explicit provider key while retaining session-only fallback."""
-    provider_config = import_module("chartreux.core.config").ProviderConfig
-    persist_api_key = import_module(
-        "chartreux.setup.auth.api_key_persistence"
-    ).persist_api_key
-
-    return persist_api_key(
-        provider_config(
-            name="provider", api_base="https://localhost", api_key_env_var=env_var
-        ),
-        key,
-    )
-
-
-class BottomApp(StrEnum):
-    """Bottom panel app types.
-
-    Convention: Each value must match the widget class name with "App" suffix removed.
-    E.g., QuestionApp -> Question.
-    This allows dynamic lookup via: BottomApp[type(widget).__name__.removesuffix("App")]
-    """
-
-    Input = auto()
-    LogLevelPicker = auto()
-    MCP = auto()
-    MCPOAuth = auto()
-    ModelPicker = auto()
-    ProxySetup = auto()
-    Question = auto()
-    ThemePicker = auto()
-    ThinkingPicker = auto()
-    Rewind = auto()
-    SessionPicker = auto()
-
-
 # Smooth per-notch wheel scroll duration. Kept short so consecutive notches chain
 # into continuous motion at the same average speed as an instant jump.
 WHEEL_SCROLL_DURATION = 0.1
 
 
 class ChatScroll(VerticalScroll):
-    """Optimized scroll container that skips cascading style recalculations."""
+    """Optimized scroll container that skips cascading style recalculations.
+
+    Host reactions are injected as explicit callbacks instead of back-references
+    into the app: ``on_scroll_activity`` fires whenever ``scroll_y`` changes and
+    ``on_user_scroll`` fires when the user wheels the container. Both default to
+    None, which makes the widget inert outside a host that provides them.
+    """
+
+    def __init__(
+        self,
+        *children: Widget,
+        name: str | None = None,
+        id: str | None = None,
+        classes: str | None = None,
+        disabled: bool = False,
+        on_scroll_activity: Callable[[ChatScroll, float], None] | None = None,
+        on_user_scroll: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(
+            *children, name=name, id=id, classes=classes, disabled=disabled
+        )
+        self._on_scroll_activity = on_scroll_activity
+        self._on_user_scroll = on_user_scroll
 
     @property
     def is_at_bottom(self) -> bool:
@@ -608,23 +427,8 @@ class ChatScroll(VerticalScroll):
             self._anchor_released = True
         super().watch_scroll_y(old_value, new_value)
         self._scrolling_down = new_value >= old_value
-        if isinstance(self.app, ChartreuxApp):
-            engine = self.app._transcript
-            engine_scroll = getattr(self, "_transcript_engine_scroll", False)
-            layout_clamp = (
-                getattr(self, "_transcript_layout_change", False)
-                and new_value != self.scroll_target_y
-                and not self.app.animator.is_being_animated(self, "scroll_y")
-            )
-            if not (engine_scroll or layout_clamp):
-                engine._scroll_revision += 1
-                if (
-                    not self.app._picker.previewing
-                    and not self.app._picker_origin_restoring
-                ):
-                    self.app._transcript_following = self.scroll_y >= self.max_scroll_y
-                    self.call_after_refresh(self.app._remember_transcript_anchor)
-            self.app._request_transcript_reconcile(scroll_driven=True)
+        if self._on_scroll_activity is not None:
+            self._on_scroll_activity(self, new_value)
 
     def release_anchor(self) -> None:
         super().release_anchor()
@@ -666,14 +470,16 @@ class ChatScroll(VerticalScroll):
         # instead of jumping the full sensitivity in a single frame. prevent_default
         # breaks the MRO loop so the base handler's instant jump never runs on top.
         event.prevent_default()
-        if isinstance(self.app, ChartreuxApp):
-            self.app._request_transcript_reconcile(scroll_driven=True)
+        if self._on_user_scroll is not None:
+            self._on_user_scroll()
         if scroller(animate=True, duration=WHEEL_SCROLL_DURATION, easing="linear"):
             event.stop()
 
 
-DOUBLE_ESC_DELAY = 0.2
-_TRANSCRIPT_HIGH_MARK = 1500
+def _monotonic_clock() -> float:
+    """Monotonic clock seam injected into controllers (ALC §1.4)."""
+    return time.monotonic()
+
 
 _TEXTUAL_THEME_MAP = {"auto": None, "light": "ansi-light", "dark": "ansi-dark"}
 
@@ -704,37 +510,6 @@ class StartupOptions:
     continue_latest: bool = False
 
 
-@dataclass(slots=True)
-class _PickerState:
-    """Mutable state owned by the in-app session picker.
-
-    ``previewing`` is True while a session's history is displayed in the
-    transcript area instead of the live session's history. ``preview_session_id``
-    is the session whose history is currently shown (None when not previewing).
-    """
-
-    previewing: bool = False
-    preview_session_id: str | None = None
-
-    def preview_is_current(self, session_id: str) -> bool:
-        return self.preview_session_id == session_id
-
-    def clear_preview(self) -> None:
-        self.preview_session_id = None
-
-    def exit_preview(self) -> bool:
-        """Clear preview state; returns True if a preview was active."""
-        was_previewing = self.previewing
-        self.previewing = False
-        self.preview_session_id = None
-        return was_previewing
-
-
-type AppServerStarter = Callable[[], Awaitable[AppServerSession]]
-type AppServerSource = AppServerSession | AppServerStarter
-type AppServerBootstrap = Callable[[], Awaitable[AppServerHost | AppServerSession]]
-
-
 def _split_app_server_source(
     source: AppServerSource,
 ) -> tuple[AppServerSession | None, AppServerStarter | None]:
@@ -749,34 +524,33 @@ _REJECT_HINT_BUSY = "wait for the current job to finish."
 _REJECT_HINT_PAUSED = "clear the queue first or remove this input."
 
 _UNTRUSTED_CONFIG_WARNING_SECTION = "untrusted_config_warning"
-_USAGE_POLL_INTERVAL_SECONDS = 60
 
 
-class _AgentTranscriptSource:
-    """Bind transcript reads to the viewer's parent-session attachment."""
+def _usage_poll_interval_seconds() -> float:
+    """Late-bound read of the re-exported usage poll-interval seam.
 
-    def __init__(
-        self, app: ChartreuxApp, resources: Any, epoch: int, parent_id: str | None
-    ) -> None:
-        self._app = app
-        self._resources = resources
-        self._epoch = epoch
-        self._parent_id = parent_id
+    Tests patch ``chartreux.cli.textual_ui.app._USAGE_POLL_INTERVAL_SECONDS``;
+    reading the module global at call time keeps that patch effective.
+    """
+    return _USAGE_POLL_INTERVAL_SECONDS
 
-    async def read_agent_transcript(
-        self, agent_id: str, *, before: str | None = None, limit: int = 50
-    ) -> Any:
-        response = await self._resources.read_agent_transcript(
-            agent_id, before=before, limit=limit
-        )
-        if (
-            self._app._agent_transcript_epoch != self._epoch
-            or self._app._agent_transcript_parent_id != self._parent_id
-            or self._app._app_server is None
-            or self._app.app_server.session_id != self._parent_id
-        ):
-            raise RuntimeError("Transcript viewer attachment changed")
-        return response
+
+def _interrupt_wait_timeout() -> float:
+    """Late-bound read of the re-exported interrupt wait-timeout seam.
+
+    Tests patch ``chartreux.cli.textual_ui.app._INTERRUPT_WAIT_TIMEOUT``;
+    reading the module global at call time keeps that patch effective.
+    """
+    return _INTERRUPT_WAIT_TIMEOUT
+
+
+def _interrupt_settle_timeout() -> float:
+    """Late-bound read of the re-exported interrupt settle-timeout seam.
+
+    Tests patch ``chartreux.cli.textual_ui.app._INTERRUPT_SETTLE_TIMEOUT``;
+    reading the module global at call time keeps that patch effective.
+    """
+    return _INTERRUPT_SETTLE_TIMEOUT
 
 
 class ChartreuxApp(App):  # noqa: PLR0904
@@ -806,12 +580,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         ),
     ]
 
-    _turn_ui_generation: int = 0
-    _turn_ui_mutex: asyncio.Lock | None = None
     _main_ui_mounted: bool = False
     _mount_first: bool = False
     _initial_config_response: ConfigReadResponse | None = None
-    _transcript_under_budget_key: tuple[int, int, int] | None = None
 
     def get_driver_class(self) -> type[Driver]:
         """Patch the platform driver to strip malformed terminal reports from input."""
@@ -828,7 +599,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         """
         super().open_url(normalize_url(url), new_tab=new_tab)
 
-    def __init__(  # noqa: PLR0915
+    def __init__(
         self,
         history_file: Path,
         app_server: AppServerSource,
@@ -851,103 +622,82 @@ class ChartreuxApp(App):  # noqa: PLR0904
             ),
             default_title="Chartreux",
         )
-        self._interrupt_requested = False
-        # A locally submitted turn is "in flight" from the moment the user hits
-        # Enter until the server confirms it started (TurnStarted). The unified
-        # backend runs turns server-side (enqueue -> promote -> TurnStarted), so
-        # unlike the legacy local `_agent_task` there is a gap where nothing looks
-        # active. This flag bridges that gap so the spinner, busy-routing, and
-        # interruptibility all derive from one "turn in flight" notion; the event
-        # lets an interrupt fired during the gap wait for the turn to surface.
-        self._pending_turn = False
-        self._turn_started_event = asyncio.Event()
-        # An interrupt settles asynchronously: the server pauses the queue and
-        # completes the turn out-of-band, so a submit fired right after Escape
-        # would otherwise race that propagation and read stale queue state.
-        self._interrupt_pending = False
-        self._interrupt_settled = asyncio.Event()
-        self._interrupt_settled.set()
-        # Owns a timed-out cancellation/interrupt until it actually completes.
-        # Keeping this separate from turn activity closes the interval where the
-        # server reports idle before the interrupt request itself has returned.
-        self._interrupt_operation: asyncio.Task[None] | None = None
+        # The turn/interrupt/retry state moved to the turn supervisor (10.2a);
+        # the app forwards every field through the properties defined below.
         # Rebinding replaces the attached session and all presentation derived
         # from it. Hold newly delivered events until that presentation reset is
         # complete so the replacement session cannot render into the old UI.
         self._resume_ui_ready = asyncio.Event()
         self._resume_ui_ready.set()
-        # Deferred submits (those that waited out an interrupt) run in workers;
-        # this lock keeps them ordered so a fast double-Enter stays FIFO, and the
-        # counter routes later submits through the same lock until they drain.
-        self._deferred_submit_lock = asyncio.Lock()
-        self._deferred_submits = 0
-        self._agent_task: asyncio.Task | None = None
         self._bash_task: asyncio.Task | None = None
         self._app_server_events_worker: Worker[None] | None = None
         self._settings_worker: Worker[None] | None = None
-        self._settings_return_bottom_app: BottomApp | None = None
-        self._settings_return_providers = False
-        self._settings_return_web_search = False
-        self._settings_return_state: tuple[str, str | None, int, str | None] | None = (
-            None
-        )
         self._provider_management_worker: Worker[None] | None = None
         self._web_search_worker: Worker[None] | None = None
         self._shutdown_started = False
         # Global spend outlives the attached session and its presentation resets.
         self._usage_summaries: UsageWindowSummaries | None = None
-        self._usage_binding: tuple[AppServerSession, str] | None = None
-        self._usage_unsubscribe: Callable[[], None] | None = None
-        self._usage_initial_task: asyncio.Task[None] | None = None
-        self._usage_poll_task: asyncio.Task[None] | None = None
+        self._usage_controller = UsageController(
+            current_binding=self._usage_sync_binding,
+            is_binding_current=self._is_usage_binding_current,
+            status_line_segments=lambda: self.config.status_line.segments,
+            on_updated=self._on_usage_updated,
+            poll_interval=_usage_poll_interval_seconds,
+        )
         self._usage_worker: Worker[None] | None = None
-        self._usage_tasks: set[asyncio.Task[None]] = set()
-        self._resume_adopted = False
         self._app_server_event_handler_lock = asyncio.Lock()
         self._init_controllers()
 
         self._loading_widget: LoadingWidget | None = None
-        self._active_callback: PublicCallbackEntry | None = None
-        self._pending_callbacks: deque[PublicCallbackEntry] = deque()
-        self._callback_submitting = False
-        self._callback_delivery_uncertain = False
-        self._pending_local_question: asyncio.Future[UserQuestionResult] | None = None
         self._secondary_returned = asyncio.Event()
         self._secondary_returned.set()
 
         self.event_handler: EventHandler | None = None
 
         self._chat_input_container: ChatInputContainer | None = None
-        self._current_bottom_app: BottomApp = BottomApp.Input
+
+        # The bottom panel controller owns the bottom-app surface arbitration
+        # (including the current bottom app and the escape-ladder timing); the
+        # app binds itself late (never constructor-captured) and injects the
+        # monotonic clock through the app.py wrapper seam.
+        self._bottom_panel = BottomPanelController(clock=_monotonic_clock)
+        self._bottom_panel._bind_app(self)
 
         self.history_file = history_file
 
-        self._tools_collapsed = True
-        self._tool_group_expansion_state = ToolGroupExpansionState()
-        self._preview_tool_group_expansion_state = ToolGroupExpansionState()
-        self._entry_expansion_state = EntryExpansionState()
-        self._preview_entry_expansion_state = EntryExpansionState()
-        self._windowing = SessionWindowing(load_more_batch_size=LOAD_MORE_BATCH_SIZE)
-        self._transcript = _SessionTranscriptWindow(
-            lambda: self.config.show_message_timestamps,
-            expansion_state=self._tool_group_expansion_state,
-            entry_expansion_state=self._entry_expansion_state,
+        # The transcript presenter owns the windowing state; the app binds
+        # itself late (never constructor-captured) and forwards every field
+        # through the properties defined next to _chat_widget below.
+        self._transcript_presenter = TranscriptPresenter(
+            get_show_timestamps=lambda: self.config.show_message_timestamps
         )
-        self._active_turn_start: int | None = None
-        self._turn_has_final_prose = False
+        self._transcript_presenter._bind_app(self)
+        # The agent browser controller owns the viewer/selection state; the
+        # app binds itself late (never constructor-captured) and forwards
+        # every moved field through the properties defined below.
+        self._agent_browser = AgentBrowserController()
+        self._agent_browser._bind_app(self)
+        # The session flow controller owns the picker preview/origin state and
+        # the resume flow; the app binds itself late (never constructor-captured)
+        # and forwards every moved field through the properties defined below.
+        self._session_flow = SessionFlowController()
+        self._session_flow._bind_app(self)
+        # The turn supervisor owns the turn/interrupt/retry state and flow; the
+        # app binds itself late (never constructor-captured) and forwards every
+        # moved field through the properties defined below.
+        self._turn_supervisor = TurnSupervisor(
+            interrupt_wait_timeout=_interrupt_wait_timeout,
+            interrupt_settle_timeout=_interrupt_settle_timeout,
+        )
+        self._turn_supervisor._bind_app(self)
         self._recovery_issues: dict[str, tuple[str, str]] = {}
         self._startup_issue_resolved = False
         self._pending_theme_selection: str | None = None
         self._pending_picker_reload: tuple[str, str] | None = None
         self._picker_update_pending = False
         self._proxy_save_pending = False
-        self._load_more = HistoryLoadMoreManager()
-        self._history_widget_indices: WeakKeyDictionary[Widget, int] = (
-            WeakKeyDictionary()
-        )
         self._current_version = current_version
         self._configure_startup_options(startup)
-        self._last_escape_time: float | None = None
         self._quit_manager = QuitManager(self)
         self._init_cached_widgets()
         if self._app_server is not None:
@@ -964,31 +714,16 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._branch_generation = 0
         self._root_compacting = False
         self._root_context_unknown = False
-        self._agent_browser_opener: Widget | None = None
-        self._last_conversation_focus: Widget | None = None
-        self._agent_browser_anchor: TranscriptAnchor | None = None
         self._agent_bar: AgentBar | None = None
         self._graduation = GraduationStore()
         self._graduation_notice: InlineNotice | None = None
         self._graduation_live_attempts: dict[str, str] = {}
         self._session_only_credential_envs: set[str] = set()
-        self._agent_summaries: list[AgentSummaryModel] = []
-        self._agent_evictions: dict[str, AgentEvictionModel] = {}
-        self._agent_transcript_viewer: AgentTranscriptViewer | None = None
-        self._agent_transcript_focus_target: Widget | None = None
-        self._agent_transcript_epoch = 0
-        self._agent_selection_target: str | None = None
-        self._agent_selection_generation = 0
-        self._agent_transition_task: asyncio.Task[None] | None = None
-        self._agent_close_restore_focus = True
         self._diagnostic_heartbeat_timer: Timer | None = None
         self._diagnostic_last_heartbeat = 0.0
         self._diagnostic_max_heartbeat_drift = 0.0
-        self._agent_transcript_parent_id: str | None = None
         self._debug_console: DebugConsole | None = None
         self._debug_console_focus_target: Widget | None = None
-        self._rewind_mode = False
-        self._rewind_highlighted_widget: UserMessage | None = None
         self._queue_selected_widget: Widget | None = None
         self._fatal_init_error = False
         self._force_quit_task: asyncio.Task[None] | None = None
@@ -1060,14 +795,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
         # input box before app_server exists, so a submit awaits this instead of
         # crashing on the unbound property.
         self._session_ready = asyncio.Event()
-        self._picker = _PickerState()
-        self._transcript_following = True
-        self._resize_anchor_task: asyncio.Task[None] | None = None
-        self._last_transcript_anchor: TranscriptAnchor | None = None
-        self._picker_origin_anchor: TranscriptAnchor | None = None
-        self._picker_origin_restoring = False
-        self._picker_origin_range: tuple[int, int] | None = None
-        self._picker_origin_focus: Widget | None = None
         # Guards against double-display of MCP/startup notices across the
         # readiness-watch and finish-resume-notices race; unrelated to picker preview.
         self._post_init_notices_shown: bool = False
@@ -1111,31 +838,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
         )
 
     def _agent_job_active(self) -> bool:
-        if self._pending_turn:
-            return True
-        if (
-            self._interrupt_operation is not None
-            and not self._interrupt_operation.done()
-        ):
-            return True
-        if self._app_server is not None and self._app_server.turn_active:
-            return True
-        return self._agent_task is not None and not self._agent_task.done()
+        return self._turn_supervisor.agent_job_active()
 
     def _begin_pending_turn(self) -> None:
-        """Enter the 'turn in flight' state for a just-submitted idle prompt."""
-        self._pending_turn = True
-        self._turn_has_final_prose = False
-        if hasattr(self, "_turn_outcome_notice"):
-            self._turn_outcome_notice.hide()
-        if self._active_turn_start is None:
-            self._active_turn_start = self._transcript.admitted_end_index
-        self._turn_started_event.clear()
-
-    def _clear_pending_turn(self) -> None:
-        """Leave the in-flight state and wake anything waiting for turn start."""
-        self._pending_turn = False
-        self._turn_started_event.set()
+        self._turn_supervisor.begin_pending_turn()
 
     def _clear_active_turn_pins(self) -> None:
         self._active_turn_start = None
@@ -1250,9 +956,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._refresh_command_registry()
 
     def get_default_screen(self) -> Screen:
-        from chartreux.cli.textual_ui.word_selection import WordSelectScreen
-
-        return WordSelectScreen(id="_default")
+        return _get_word_select_screen_class()(id="_default")
 
     def compose(self) -> ComposeResult:
         yield from self._compose_main_ui()
@@ -1260,7 +964,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
     def _compose_main_ui(self) -> ComposeResult:
         has_session = self._app_server is not None
         init = self._initial_config_response
-        with ChatScroll(id="chat"):
+        with ChatScroll(
+            id="chat",
+            on_scroll_activity=self._on_chat_scroll_activity,
+            on_user_scroll=self._request_scroll_driven_reconcile,
+        ):
             self._banner = Banner(
                 config=self.config if has_session else (init.config if init else None),
                 skills_count=(
@@ -1347,6 +1055,394 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if self._cached_chat is None:
             self._cached_chat = self.query_one("#chat", ChatScroll)
         return self._cached_chat
+
+    # -- Transcript presenter forwarding properties ---------------------------
+    # TranscriptPresenter owns this state; each field forwards so
+    # direct-attribute consumers (including tests) see no change. A setter
+    # exists exactly where app code assigns the field.
+
+    @property
+    def _transcript(self) -> _SessionTranscriptWindow:
+        return self._transcript_presenter._transcript
+
+    @property
+    def _windowing(self) -> SessionWindowing:
+        return self._transcript_presenter._windowing
+
+    @property
+    def _load_more(self) -> HistoryLoadMoreManager:
+        return self._transcript_presenter._load_more
+
+    @_load_more.setter
+    def _load_more(self, value: HistoryLoadMoreManager) -> None:
+        self._transcript_presenter._load_more = value
+
+    @property
+    def _history_widget_indices(self) -> WeakKeyDictionary[Widget, int]:
+        return self._transcript_presenter._history_widget_indices
+
+    @_history_widget_indices.setter
+    def _history_widget_indices(self, value: WeakKeyDictionary[Widget, int]) -> None:
+        self._transcript_presenter._history_widget_indices = value
+
+    @property
+    def _tools_collapsed(self) -> bool:
+        return self._transcript_presenter._tools_collapsed
+
+    @_tools_collapsed.setter
+    def _tools_collapsed(self, value: bool) -> None:
+        self._transcript_presenter._tools_collapsed = value
+
+    @property
+    def _tool_group_expansion_state(self) -> ToolGroupExpansionState:
+        return self._transcript_presenter._tool_group_expansion_state
+
+    @property
+    def _preview_tool_group_expansion_state(self) -> ToolGroupExpansionState:
+        return self._transcript_presenter._preview_tool_group_expansion_state
+
+    @_preview_tool_group_expansion_state.setter
+    def _preview_tool_group_expansion_state(
+        self, value: ToolGroupExpansionState
+    ) -> None:
+        self._transcript_presenter._preview_tool_group_expansion_state = value
+
+    @property
+    def _entry_expansion_state(self) -> EntryExpansionState:
+        return self._transcript_presenter._entry_expansion_state
+
+    @property
+    def _preview_entry_expansion_state(self) -> EntryExpansionState:
+        return self._transcript_presenter._preview_entry_expansion_state
+
+    @_preview_entry_expansion_state.setter
+    def _preview_entry_expansion_state(self, value: EntryExpansionState) -> None:
+        self._transcript_presenter._preview_entry_expansion_state = value
+
+    @property
+    def _transcript_under_budget_key(self) -> tuple[int, int, int] | None:
+        return self._transcript_presenter._transcript_under_budget_key
+
+    @_transcript_under_budget_key.setter
+    def _transcript_under_budget_key(self, value: tuple[int, int, int] | None) -> None:
+        self._transcript_presenter._transcript_under_budget_key = value
+
+    @property
+    def _transcript_following(self) -> bool:
+        return self._transcript_presenter._transcript_following
+
+    @_transcript_following.setter
+    def _transcript_following(self, value: bool) -> None:
+        self._transcript_presenter._transcript_following = value
+
+    @property
+    def _resize_anchor_task(self) -> asyncio.Task[None] | None:
+        return self._transcript_presenter._resize_anchor_task
+
+    @_resize_anchor_task.setter
+    def _resize_anchor_task(self, value: asyncio.Task[None] | None) -> None:
+        self._transcript_presenter._resize_anchor_task = value
+
+    @property
+    def _last_transcript_anchor(self) -> TranscriptAnchor | None:
+        return self._transcript_presenter._last_transcript_anchor
+
+    @_last_transcript_anchor.setter
+    def _last_transcript_anchor(self, value: TranscriptAnchor | None) -> None:
+        self._transcript_presenter._last_transcript_anchor = value
+
+    @property
+    def _has_older_history(self) -> bool:
+        return self._transcript_presenter.has_older_history
+
+    @property
+    def _history_backfill_remaining(self) -> int | None:
+        return self._transcript_presenter.history_backfill_remaining
+
+    # -- Bottom panel controller forwarding properties ------------------------
+    # BottomPanelController owns the current bottom app; the property forwards
+    # so direct-attribute consumers (including tests) see no change. The setter
+    # exists because app code assigns the field (rewind mode entry).
+
+    @property
+    def _current_bottom_app(self) -> BottomApp:
+        return self._bottom_panel.current_app
+
+    @_current_bottom_app.setter
+    def _current_bottom_app(self, value: BottomApp) -> None:
+        self._bottom_panel.current_app = value
+
+    # The settings-return routing state moved to the controller (7.3b); the
+    # app's worker finally-blocks and _wait_for_settings read/write it directly.
+
+    @property
+    def _settings_return_bottom_app(self) -> BottomApp | None:
+        return self._bottom_panel.settings_return_bottom_app
+
+    @_settings_return_bottom_app.setter
+    def _settings_return_bottom_app(self, value: BottomApp | None) -> None:
+        self._bottom_panel.settings_return_bottom_app = value
+
+    @property
+    def _settings_return_providers(self) -> bool:
+        return self._bottom_panel.settings_return_providers
+
+    @_settings_return_providers.setter
+    def _settings_return_providers(self, value: bool) -> None:
+        self._bottom_panel.settings_return_providers = value
+
+    @property
+    def _settings_return_web_search(self) -> bool:
+        return self._bottom_panel.settings_return_web_search
+
+    @_settings_return_web_search.setter
+    def _settings_return_web_search(self, value: bool) -> None:
+        self._bottom_panel.settings_return_web_search = value
+
+    @property
+    def _settings_return_state(self) -> tuple[str, str | None, int, str | None] | None:
+        return self._bottom_panel.settings_return_state
+
+    @_settings_return_state.setter
+    def _settings_return_state(
+        self, value: tuple[str, str | None, int, str | None] | None
+    ) -> None:
+        self._bottom_panel.settings_return_state = value
+
+    # The escape-ladder timing state moved to the controller (7.4a); staying
+    # app code (no-job steps, action_interrupt) and tests write/read it.
+
+    @property
+    def _last_escape_time(self) -> float | None:
+        return self._bottom_panel.last_escape_time
+
+    @_last_escape_time.setter
+    def _last_escape_time(self, value: float | None) -> None:
+        self._bottom_panel.last_escape_time = value
+
+    # The agent browser controller owns the viewer/selection state (8.2a);
+    # staying app code (heartbeat log, _show_no_output_outcome, config
+    # propagation, check_action/action_interrupt), the bottom-panel
+    # controller, the transcript presenter's retained set, and tests
+    # read/write these fields through the forwarders.
+
+    @property
+    def _agent_summaries(self) -> list[AgentSummaryModel]:
+        return self._agent_browser.agent_summaries
+
+    @_agent_summaries.setter
+    def _agent_summaries(self, value: list[AgentSummaryModel]) -> None:
+        self._agent_browser.agent_summaries = value
+
+    @property
+    def _agent_transcript_viewer(self) -> AgentTranscriptViewer | None:
+        return self._agent_browser.agent_transcript_viewer
+
+    @property
+    def _agent_transcript_focus_target(self) -> Widget | None:
+        return self._agent_browser.agent_transcript_focus_target
+
+    @property
+    def _agent_selection_target(self) -> str | None:
+        return self._agent_browser.selection_target
+
+    @property
+    def _agent_selection_generation(self) -> int:
+        return self._agent_browser.selection_generation
+
+    @property
+    def _agent_transition_task(self) -> asyncio.Task[None] | None:
+        return self._agent_browser.transition_task
+
+    # -- Session flow controller forwarding properties ------------------------
+    # SessionFlowController owns the picker preview/origin state (9.1a), the
+    # resume flow (9.3a), the adoption + recovery notices (9.3b), and the
+    # rewind mode state (9.5a). The app keeps the app._picker alias plus
+    # origin-field forwarders: tests mutate app._picker fields and the
+    # transcript presenter reads the preview flag and the origin
+    # range/restoring flag. No app code assigns any picker field any more (the
+    # controller's show_session_picker writes the origin fields internally
+    # since 9.3a), so the origin forwarders are get-only; _picker itself is
+    # never rebound, so it is get-only too. The _resume_adopted forwarder
+    # (9.3b) keeps the app-visible adoption flag reachable; the controller
+    # reads and writes it internally. The rewind forwarders (9.5a) are get-only
+    # as well: the presenter and the tests only ever read the rewind mode and
+    # the highlighted widget, and the controller's rewind helpers write the
+    # state internally.
+
+    @property
+    def _picker(self) -> _PickerState:
+        return self._session_flow.picker
+
+    @property
+    def _picker_origin_anchor(self) -> TranscriptAnchor | None:
+        return self._session_flow.picker_origin_anchor
+
+    @property
+    def _picker_origin_restoring(self) -> bool:
+        return self._session_flow.picker_origin_restoring
+
+    @property
+    def _picker_origin_range(self) -> tuple[int, int] | None:
+        return self._session_flow.picker_origin_range
+
+    @property
+    def _picker_origin_focus(self) -> Widget | None:
+        return self._session_flow.picker_origin_focus
+
+    @property
+    def _resume_adopted(self) -> bool:
+        return self._session_flow.resume_adopted
+
+    @_resume_adopted.setter
+    def _resume_adopted(self, value: bool) -> None:
+        self._session_flow.resume_adopted = value
+
+    @property
+    def _rewind_mode(self) -> bool:
+        return self._session_flow.rewind_mode
+
+    @property
+    def _rewind_highlighted_widget(self) -> UserMessage | None:
+        return self._session_flow.rewind_highlighted_widget
+
+    # -- Turn supervisor forwarding properties --------------------------------
+    # TurnSupervisor owns the turn/interrupt/retry state (10.2a). The app keeps
+    # underscore-named forwarding properties so direct-attribute consumers
+    # (staying app code, the other controllers, tests) see no change. A setter
+    # exists exactly where app code or tests assign the field; the four
+    # get-only forwarders are never rebound (the owning objects are created
+    # once in the controller's __init__ and only mutated in place).
+
+    @property
+    def _pending_turn(self) -> bool:
+        return self._turn_supervisor.pending_turn
+
+    @_pending_turn.setter
+    def _pending_turn(self, value: bool) -> None:
+        self._turn_supervisor.pending_turn = value
+
+    @property
+    def _turn_started_event(self) -> asyncio.Event:
+        return self._turn_supervisor.turn_started_event
+
+    @property
+    def _interrupt_requested(self) -> bool:
+        return self._turn_supervisor.interrupt_requested
+
+    @_interrupt_requested.setter
+    def _interrupt_requested(self, value: bool) -> None:
+        self._turn_supervisor.interrupt_requested = value
+
+    @property
+    def _interrupt_pending(self) -> bool:
+        return self._turn_supervisor.interrupt_pending
+
+    @_interrupt_pending.setter
+    def _interrupt_pending(self, value: bool) -> None:
+        self._turn_supervisor.interrupt_pending = value
+
+    @property
+    def _interrupt_settled(self) -> asyncio.Event:
+        return self._turn_supervisor.interrupt_settled
+
+    @property
+    def _interrupt_operation(self) -> asyncio.Task[None] | None:
+        return self._turn_supervisor.interrupt_operation
+
+    @_interrupt_operation.setter
+    def _interrupt_operation(self, value: asyncio.Task[None] | None) -> None:
+        self._turn_supervisor.interrupt_operation = value
+
+    @property
+    def _deferred_submit_lock(self) -> asyncio.Lock:
+        return self._turn_supervisor.deferred_submit_lock
+
+    @property
+    def _deferred_submits(self) -> int:
+        return self._turn_supervisor.deferred_submits
+
+    @_deferred_submits.setter
+    def _deferred_submits(self, value: int) -> None:
+        self._turn_supervisor.deferred_submits = value
+
+    @property
+    def _agent_task(self) -> asyncio.Task | None:
+        return self._turn_supervisor.agent_task
+
+    @_agent_task.setter
+    def _agent_task(self, value: asyncio.Task | None) -> None:
+        self._turn_supervisor.agent_task = value
+
+    @property
+    def _turn_ui_generation(self) -> int:
+        return self._turn_supervisor.turn_ui_generation
+
+    @_turn_ui_generation.setter
+    def _turn_ui_generation(self, value: int) -> None:
+        self._turn_supervisor.turn_ui_generation = value
+
+    @property
+    def _turn_ui_mutex(self) -> asyncio.Lock | None:
+        return self._turn_supervisor.turn_ui_mutex
+
+    @_turn_ui_mutex.setter
+    def _turn_ui_mutex(self, value: asyncio.Lock | None) -> None:
+        self._turn_supervisor.turn_ui_mutex = value
+
+    @property
+    def _turn_has_final_prose(self) -> bool:
+        return self._turn_supervisor.turn_has_final_prose
+
+    @_turn_has_final_prose.setter
+    def _turn_has_final_prose(self, value: bool) -> None:
+        self._turn_supervisor.turn_has_final_prose = value
+
+    @property
+    def _active_callback(self) -> PublicCallbackEntry | None:
+        return self._turn_supervisor.active_callback
+
+    @_active_callback.setter
+    def _active_callback(self, value: PublicCallbackEntry | None) -> None:
+        self._turn_supervisor.active_callback = value
+
+    @property
+    def _pending_callbacks(self) -> deque[PublicCallbackEntry]:
+        return self._turn_supervisor.pending_callbacks
+
+    @property
+    def _callback_submitting(self) -> bool:
+        return self._turn_supervisor.callback_submitting
+
+    @_callback_submitting.setter
+    def _callback_submitting(self, value: bool) -> None:
+        self._turn_supervisor.callback_submitting = value
+
+    @property
+    def _callback_delivery_uncertain(self) -> bool:
+        return self._turn_supervisor.callback_delivery_uncertain
+
+    @_callback_delivery_uncertain.setter
+    def _callback_delivery_uncertain(self, value: bool) -> None:
+        self._turn_supervisor.callback_delivery_uncertain = value
+
+    @property
+    def _pending_local_question(self) -> asyncio.Future[UserQuestionResult] | None:
+        return self._turn_supervisor.pending_local_question
+
+    @_pending_local_question.setter
+    def _pending_local_question(
+        self, value: asyncio.Future[UserQuestionResult] | None
+    ) -> None:
+        self._turn_supervisor.pending_local_question = value
+
+    @property
+    def _active_turn_start(self) -> int | None:
+        return self._turn_supervisor.active_turn_start
+
+    @_active_turn_start.setter
+    def _active_turn_start(self, value: int | None) -> None:
+        self._turn_supervisor.active_turn_start = value
 
     @property
     def _loading_area(self) -> Widget:
@@ -1474,10 +1570,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 config.show_message_timestamps
             )
 
-    def _mounted_timing_widgets(self, entry_id: str) -> list[Widget]:
-        self._admit_live_history()
-        return self._transcript.mounted_entry_widgets(entry_id)
-
     async def _complete_mount(self) -> None:
         self.event_handler = EventHandler(
             mount_callback=self._mount_and_scroll,
@@ -1485,7 +1577,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             get_show_thinking=lambda: self.config.show_thinking_nodes,
             get_show_message_timestamps=lambda: self.config.show_message_timestamps,
             on_user_message=self._queue.reconcile_history_entry,
-            mounted_entry_widgets=self._mounted_timing_widgets,
+            mounted_entry_widgets=self._transcript_presenter.mounted_timing_widgets,
             update_retained_entry=self._transcript.update_entry,
             on_context_cleared=self._on_context_cleared,
             on_session_title_changed=self._on_session_title_changed,
@@ -1755,26 +1847,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         await self._submit_or_defer(event.value)
 
     async def _submit_or_defer(self, raw_value: str) -> None:
-        # A submit fired right after Escape must see the settled post-interrupt
-        # queue state (paused/idle), not the transient state mid-interrupt, so
-        # it resumes or starts a turn instead of being dropped or trapped. The
-        # settle path completes turn/queue UI on the message pump, so a pending
-        # interrupt is drained in a worker to keep this handler from blocking it.
-        # While any deferred submit is still draining, later submits take the
-        # same ordered path so a fast double-Enter cannot reorder ahead of it.
-        if self._interrupt_pending or self._deferred_submits:
-            self._deferred_submits += 1
-            self.run_worker(self._deferred_dispatch(raw_value), exclusive=False)
-            return
-        await self._dispatch_submitted_value(raw_value)
-
-    async def _deferred_dispatch(self, raw_value: str) -> None:
-        try:
-            async with self._deferred_submit_lock:
-                await self._await_interrupt_settled()
-                await self._dispatch_submitted_value(raw_value)
-        finally:
-            self._deferred_submits -= 1
+        await self._turn_supervisor.submit_or_defer(raw_value)
 
     async def _dispatch_submitted_value(self, raw_value: str) -> None:
         value = raw_value.strip()
@@ -2088,28 +2161,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
         )
 
     async def on_question_app_answered(self, message: QuestionApp.Answered) -> None:
-        result = UserQuestionResult(answers=message.answers, cancelled=False)
-        if self._active_callback is not None:
-            await self._respond_to_active_callback(
-                UserInputCallbackOutput(result=result)
-            )
-            return
-        if self._pending_local_question and not self._pending_local_question.done():
-            self._pending_local_question.set_result(result)
+        await self._turn_supervisor.question_answered(message)
 
     async def on_question_app_cancelled(self, message: QuestionApp.Cancelled) -> None:
-        if self._active_callback is not None and (
-            self._callback_submitting or self._callback_delivery_uncertain
-        ):
-            return
-        result = UserQuestionResult(answers=[], cancelled=True)
-        if self._active_callback is not None:
-            await self._respond_to_active_callback(
-                UserInputCallbackOutput(result=result)
-            )
-            return
-        if self._pending_local_question and not self._pending_local_question.done():
-            self._pending_local_question.set_result(result)
+        await self._turn_supervisor.question_cancelled(message)
 
     async def _remove_loading_widget(self) -> None:
         if self._loading_widget and self._loading_widget.parent:
@@ -2687,12 +2742,12 @@ class ChartreuxApp(App):  # noqa: PLR0904
             ):
                 return
         except BaseException:
-            self._clear_pending_turn()
+            self._turn_supervisor._clear_pending_turn()
             self._clear_active_turn_pins()
             raise
         # Enqueue was rejected (e.g. prompt prep aborted): leave the in-flight
         # state so the UI returns to idle instead of a stuck spinner.
-        self._clear_pending_turn()
+        self._turn_supervisor._clear_pending_turn()
         self._clear_active_turn_pins()
         await self._remove_loading_widget()
         input_widget = self.query_one(ChatInputContainer)
@@ -2700,51 +2755,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
             input_widget.value = message
 
     def _reset_ui_state(self) -> None:
-        self._last_transcript_anchor = None
-        self._windowing.reset()
-        self._transcript.reset()
-        self._active_turn_start = None
-        self._history_widget_indices = WeakKeyDictionary()
-        if self.event_handler is not None:
-            self.event_handler._finalize_tool_group()
-            self.event_handler._handle_stop_plan_review()
-            self.event_handler.cancel_retry_presentation()
+        self._transcript_presenter.reset_ui_state()
 
     async def _rebuild_transcript_from_current_session(self) -> None:
-        # batch_update coalesces the teardown and re-mount into one refresh, so the
-        # message area doesn't flash empty mid-rebuild.
-        async with self._custom_tools_deprecation_message_lock:
-            self._reset_ui_state()
-            with self.batch_update():
-                await self._load_more.hide()
-                await self._messages_area.remove_children()
-                await self._resume_history_from_messages()
-            self._custom_tools_deprecation_message = None
-        await self._show_custom_tools_deprecation_warning()
-
-    async def _restore_picker_history_range(self) -> None:
-        """Re-admit the origin's inspected pages before restoring its viewport."""
-        if self._picker_origin_range is None or not self._transcript.unit_ids:
-            return
-        start, _ = self._picker_origin_range
-        current = self._transcript.admitted_start_index
-        if start >= current:
-            return
-        history = self.app_server.history
-        # The timeline may have changed during preview; admit only available rows.
-        prefix = history[max(0, start) : min(current, len(history))]
-        if prefix:
-            await self._mount_history_batch(
-                prefix, self._messages_area, start_index=max(0, start), before=0
-            )
-            self._windowing.recompute_backfill(
-                history, admitted_start_index=self._transcript.admitted_start_index
-            )
-            await self._load_more.set_visible(
-                self._messages_area,
-                visible=self._has_older_history,
-                remaining=self._history_backfill_remaining,
-            )
+        await self._transcript_presenter.rebuild_transcript_from_current_session()
 
     async def _deferred_resume_and_start(self) -> None:
         logger.debug("Startup resume stage=initial-history-started")
@@ -2761,28 +2775,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         )
 
     async def _resume_history_from_messages(self) -> None:
-        messages_area = self._messages_area
-        if self._transcript.admitted_end_index or not should_resume_history(
-            list(messages_area.children)
-        ):
-            return
-
-        if (
-            plan := create_resume_plan(
-                self.app_server.history, HISTORY_RESUME_TAIL_MESSAGES
-            )
-        ) is None:
-            return
-        await self._mount_history_batch(
-            plan.tail_entries, messages_area, start_index=plan.tail_start_index
-        )
-        self.call_after_refresh(self._chat_widget.anchor)
-        self._windowing.set_backfill(plan.backfill_entries)
-        await self._load_more.set_visible(
-            messages_area,
-            visible=self._has_older_history,
-            remaining=self._history_backfill_remaining,
-        )
+        await self._transcript_presenter.resume_history_from_messages()
 
     async def _mount_history_batch(
         self,
@@ -2793,569 +2786,72 @@ class ChartreuxApp(App):  # noqa: PLR0904
         before: Widget | int | None = None,
         after: Widget | None = None,
     ) -> None:
-        reading_anchor = (
-            self._transcript._reading_anchor(messages_area)
-            if (before is not None or after is not None)
-            and not self._chat_widget.is_at_bottom
-            else None
+        await self._transcript_presenter.mount_history_batch(
+            batch, messages_area, start_index=start_index, before=before, after=after
         )
-        self._transcript.tools_collapsed = self._tools_collapsed
-        self._transcript.expansion_state = (
-            self._preview_tool_group_expansion_state
-            if self._picker.previewing
-            else self._tool_group_expansion_state
-        )
-        self._transcript.entry_expansion_state = (
-            self._preview_entry_expansion_state
-            if self._picker.previewing
-            else self._entry_expansion_state
-        )
-        previous = set(self._transcript.unit_ids)
-        self._transcript.admit(
-            batch, start_index=start_index, geometry_width=messages_area.size.width
-        )
-        new_ids = [key for key in self._transcript.unit_ids if key not in previous]
-        widgets_by_unit = [
-            (key, self._transcript.build_unit(key, self._history_widget_indices))
-            for key in new_ids
-        ]
-        widgets = [widget for _, roots in widgets_by_unit for widget in roots]
-
-        with self.batch_update():
-            if not widgets:
-                return
-            if before is not None:
-                await messages_area.mount_all(widgets, before=before)
-            elif after is not None:
-                await messages_area.mount_all(widgets, after=after)
-            else:
-                await messages_area.mount_all(widgets)
-
-        for widget in widgets:
-            if isinstance(widget, StreamingMessageBase):
-                await widget.write_initial_content()
-        for key, roots in widgets_by_unit:
-            self._transcript.register_mounted(key, roots)
-        if reading_anchor is not None:
-            await self._restore_reading_anchor(reading_anchor, messages_area)
-        self._request_transcript_reconcile()
 
     async def _restore_reading_anchor(
         self, reading_anchor: tuple[str, int, int], messages_area: Widget
     ) -> None:
-        """Scroll the viewport so a recorded reading anchor stays on its row."""
-        anchor_id, row_offset, screen_row = reading_anchor
-        unit = self._transcript.units.get(anchor_id)
-        placement = self._transcript._placement(unit) if unit else None
-        if placement is None:
-            return
-        for _ in range(3):
-            await self._transcript._layout_pass(messages_area)
-            delta = placement.region.y + row_offset - screen_row
-            if delta:
-                self._transcript._set_scroll_flag(
-                    self._chat_widget, "_transcript_engine_scroll", True
-                )
-                try:
-                    self._chat_widget.scroll_to(
-                        y=self._chat_widget.scroll_offset.y + delta,
-                        animate=False,
-                        immediate=True,
-                    )
-                finally:
-                    self._transcript._set_scroll_flag(
-                        self._chat_widget, "_transcript_engine_scroll", False
-                    )
+        await self._transcript_presenter.restore_reading_anchor(
+            reading_anchor, messages_area
+        )
 
     def _admit_live_history(self) -> None:
-        open_group = (
-            self.event_handler.current_tool_group if self.event_handler else None
-        )
-        history = self.app_server.history
-        start = self._transcript.admitted_end_index
-        while start < len(history) and self.event_handler is not None:
-            entry = history[start]
-            if not isinstance(entry, PublicMessageEntry) or entry.role != "assistant":
-                break
-            root = self.event_handler.assistant_entry_widgets.get(entry.id)
-            if root is None or not self._transcript.admit_reused_root(
-                entry, root, index=start
-            ):
-                break
-            start += 1
-            self._request_transcript_reconcile()
-        if start >= len(history):
-            return
-        batch = history[start:]
-        if open_group is not None:
-            # Admit completed roots preceding the still-growing group, but leave
-            # the group's membership open until its finalization.
-            end = len(batch)
-            while end and entry_keeps_tool_group(batch[end - 1]):
-                end -= 1
-            batch = batch[:end]
-            if not batch:
-                return
-        if self._transcript.unit_ids and all(
-            entry_keeps_tool_group(entry) for entry in batch
-        ):
-            # Defensive for callers that admit while a finalized group is still
-            # held; normal turn finalization has no partial group to extend here.
-            last = self._transcript.units[self._transcript.unit_ids[-1]]
-            if (
-                last.group_key is not None
-                and last.mounted_roots
-                and self.event_handler is not None
-                and self.event_handler._finalized_tool_group is last.mounted_roots[0]
-            ):
-                self._transcript.admit(
-                    batch,
-                    start_index=start,
-                    geometry_width=self._messages_area.size.width,
-                    extend_group=True,
-                )
-                self._request_transcript_reconcile()
-                return
-        preview = TranscriptWindow()
-        preview.admit(batch, start_index=start)
-        mounted = {
-            root
-            for unit in self._transcript.units.values()
-            for root in unit.mounted_roots
-        }
-        candidates = [
-            child
-            for child in self._messages_area.children
-            if child not in mounted
-            and child is not open_group
-            and type(child)
-            in {
-                UserMessage,
-                AssistantMessage,
-                ReasoningMessage,
-                ToolCallMessage,
-                ToolResultMessage,
-                ToolGroup,
-                CompactMessage,
-            }
-        ]
-        counts = [
-            2
-            if unit.group_key is None
-            and len(unit.entries) == 1
-            and isinstance(unit.entries[0], PublicEffectEntry)
-            else 1
-            for unit in (preview.units[key] for key in preview.unit_ids)
-        ]
-        if sum(counts) != len(candidates):
-            return
-        self._transcript.admit(
-            batch, start_index=start, geometry_width=self._messages_area.size.width
-        )
-        offset = 0
-        for key, count in zip(preview.unit_ids, counts, strict=True):
-            roots = candidates[offset : offset + count]
-            self._transcript.register_mounted(key, roots)
-            offset += count
-        self._request_transcript_reconcile()
+        self._transcript_presenter.admit_live_history()
+
+    def _on_chat_scroll_activity(self, chat: ChatScroll, new_value: float) -> None:
+        """Host reaction to ChatScroll scroll activity (injected into the widget)."""
+        self._transcript_presenter.on_chat_scroll_activity(chat, new_value)
 
     def _request_transcript_reconcile(self, *, scroll_driven: bool = False) -> None:
-        if self._shutdown_started or not self._transcript.unit_ids:
-            return
-        chat = self._chat_widget
-        transcript = self._transcript
-        messages = self._messages_area
-        idle = transcript._reconcile_task is None or transcript._reconcile_task.done()
-        budget_key = (
-            transcript.geometry_version,
-            messages.virtual_size.height,
-            messages.size.width,
-        )
-        if scroll_driven and idle and budget_key == self._transcript_under_budget_key:
-            # Eviction/restoration bumps geometry_version; no resident scan is
-            # needed on scroll ticks while the measured placement is unchanged.
-            return
-        if not scroll_driven:
-            self._transcript_under_budget_key = None
-        has_placeholders = any(unit.placeholders for unit in transcript.units.values())
-        needs_protection = has_placeholders or bool(
-            transcript.eviction_candidates(chat.region.y, chat.region.height)
-        )
-        if scroll_driven and idle and not needs_protection:
-            # Only cache the genuine under-budget case: a temporarily protected
-            # over-budget unit must be reconsidered on the next scroll.
-            budgeted_rows = sum(
-                unit.mounted_roots[-1].region.bottom - unit.mounted_roots[0].region.y
-                for unit in transcript.units.values()
-                if unit.mounted_roots
-                and not unit.pin_reasons
-                and unit.mounted_roots[-1].region.bottom
-                - unit.mounted_roots[0].region.y
-                <= _TRANSCRIPT_HIGH_MARK
-            )
-            if budgeted_rows <= _TRANSCRIPT_HIGH_MARK:
-                self._transcript_under_budget_key = budget_key
-            return
-        selected = (
-            self._selected_transcript_units() if needs_protection else frozenset()
-        )
-        retained = (
-            self.event_handler.retained_widgets() if self.event_handler else set()
-        )
-        for widget in (
-            self._rewind_highlighted_widget,
-            self._queue_selected_widget,
-            self._agent_transcript_focus_target,
-        ):
-            if widget is not None:
-                retained.add(widget)
-        live: set[str] = set()
-        neighbors: set[str] = set()
-        for key in self._transcript.unit_ids:
-            unit = self._transcript.units[key]
-            if (
-                self._active_turn_start is not None
-                and unit.start_index >= self._active_turn_start
-            ):
-                unit.pin_reasons.add("active-turn")
-            if needs_protection and any(
-                node in retained
-                or getattr(node, "_is_spinning", False)
-                or getattr(node, "_stream_write_timer", None) is not None
-                or getattr(node, "_stream_message_buffer", None)
-                or getattr(node, "_write_timer", None) is not None
-                or getattr(node, "_to_write_buffer", None)
-                for root in unit.mounted_roots
-                for node in (root, *root.walk_children())
-            ):
-                live.add(key)
-        for index, key in enumerate(self._transcript.unit_ids):
-            unit = self._transcript.units[key]
-            if not any(
-                isinstance(entry, PublicCheckpointEntry) for entry in unit.entries
-            ):
-                continue
-            adjacent = self._transcript.unit_ids[max(index - 1, 0) : index + 2]
-            if any(
-                self._transcript.units[item].mounted_roots
-                for item in adjacent
-                if item != key
-            ):
-                neighbors.add(key)
-        self._transcript.request_reconcile(
-            self._messages_area,
-            self._history_widget_indices,
-            follow_bottom=chat.is_at_bottom,
-            selected=selected,
-            live=frozenset(live),
-            compaction_neighbors=frozenset(neighbors),
+        self._transcript_presenter.request_transcript_reconcile(
+            scroll_driven=scroll_driven
         )
 
-    def _selected_transcript_units(self) -> frozenset[str]:
-        selected: set[str] = set()
-        for key, unit in self._transcript.units.items():
-            for root in unit.mounted_roots:
-                if any(
-                    getattr(node, "text_selection", None)
-                    for node in (root, *root.walk_children())
-                ):
-                    selected.add(key)
-        return frozenset(selected)
+    def _request_scroll_driven_reconcile(self) -> None:
+        """Kick a scroll-driven reconcile tick (injected into ChatScroll)."""
+        self._transcript_presenter.request_scroll_driven_reconcile()
 
     def _remember_transcript_anchor(self) -> None:
-        if not self._picker.previewing and (
-            self._resize_anchor_task is None or self._resize_anchor_task.done()
-        ):
-            self._last_transcript_anchor = self._transcript.capture_anchor(
-                self._messages_area, following=self._transcript_following
-            )
+        self._transcript_presenter.remember_transcript_anchor()
 
     def on_resize(self) -> None:
-        if (
-            self._transcript.unit_ids
-            and not self._picker.previewing
-            and (self._resize_anchor_task is None or self._resize_anchor_task.done())
-        ):
-            anchor = self._last_transcript_anchor or self._transcript.capture_anchor(
-                self._messages_area, following=self._transcript_following
-            )
-            if anchor is not None:
-                anchor = replace(
-                    anchor, scroll_revision=self._transcript._scroll_revision
-                )
-
-                async def restore_after_reflow() -> None:
-                    # App resize precedes the screen's resize message. Wait for
-                    # the chat viewport to adopt the new width before restoring
-                    # a wrapped-message anchor against its reflowed geometry.
-                    for _ in range(100):
-                        if (
-                            not self.is_running
-                            or not self._chat_widget.display
-                            or self._chat_widget.region.width == self.size.width
-                        ):
-                            break
-                        await asyncio.sleep(0.01)
-                    # Restore against the available geometry if reflow never settles.
-                    self._messages_area.refresh(layout=True)
-                    await self._transcript._layout_pass(self._messages_area)
-                    await self._transcript.restore_anchor(self._messages_area, anchor)
-                    self._request_transcript_reconcile()
-
-                self._resize_anchor_task = asyncio.create_task(restore_after_reflow())
-                self._resize_anchor_task.add_done_callback(
-                    lambda _: self.call_after_refresh(self._remember_transcript_anchor)
-                )
-        self._request_transcript_reconcile()
+        self._transcript_presenter.handle_resize()
 
     def _is_tool_enabled_in_main_agent(self, tool: str) -> bool:
         return self.app_server.resources.runtime.has_tool(tool)
 
     async def _wait_for_typing_pause(self) -> None:
-        try:
-            text_area = self.query_one(ChatTextArea)
-        except Exception:
-            return
-
-        debounce_s = _resolve_typing_debounce_s()
-        if text_area.time_since_last_keystroke() >= debounce_s:
-            return
-
-        if self._loading_widget:
-            self._loading_widget.show_debounce_hint()
-
-        try:
-            while True:
-                elapsed = text_area.time_since_last_keystroke()
-                if elapsed >= debounce_s:
-                    return
-                await asyncio.sleep(debounce_s - elapsed)
-        finally:
-            if self._loading_widget:
-                self._loading_widget.hide_debounce_hint()
+        await self._turn_supervisor.wait_for_typing_pause()
 
     async def _request_local_user_input(
         self, request: UserQuestionRequest
     ) -> UserQuestionResult:
-        if self._active_callback is not None:
-            raise RuntimeError("Cannot open local input while a callback is active")
-        self._pending_local_question = asyncio.get_running_loop().create_future()
-        opened = False
-        try:
-            await self._wait_for_typing_pause()
-            if self._secondary_surface_active():
-                self._secondary_returned.clear()
-                self._indicate_pending_action()
-                await self._secondary_returned.wait()
-            self._terminal_notifier.notify(NotificationContext.ACTION_REQUIRED)
-            with paused_timer(self._loading_widget):
-                await self._switch_to_question_app(request)
-                opened = True
-                return await self._pending_local_question
-        finally:
-            self._pending_local_question = None
-            if opened:
-                if self._pending_callbacks and self._active_callback is None:
-                    await self._show_callback(self._pending_callbacks.popleft())
-                else:
-                    await self._switch_to_input_app()
+        return await self._turn_supervisor.request_local_user_input(request)
 
     def _secondary_surface_active(self) -> bool:
-        return (
-            self._agent_transcript_viewer is not None
-            or self._agent_selection_target is not None
-            or self._current_bottom_app not in {BottomApp.Input, BottomApp.Question}
-            or any(
-                screen.id
-                in {
-                    "settings-screen",
-                    "usage-screen",
-                    "status-line-settings-screen",
-                    "shell-permissions-screen",
-                    "websearch-screen",
-                }
-                or screen.__class__.__name__ == "ProviderWorkbenchScreen"
-                for screen in self.screen_stack
-            )
-        )
+        return self._bottom_panel.secondary_surface_active()
 
     def _indicate_pending_action(self) -> None:
-        pending = bool(self._pending_callbacks or self._pending_local_question)
-        for indication in (
-            "#settings-pending-action",
-            "#status-line-settings-pending-action",
-            "#shell-permissions-pending-action",
-            "#wb-pending-action",
-            "#agent-transcript-pending-action",
-        ):
-            for screen in self.screen_stack:
-                for widget in screen.query(indication):
-                    widget.display = pending
-        # The transcript viewer is mounted directly on the app, not on a screen.
-        for widget in self.query("#agent-transcript-pending-action"):
-            widget.display = pending
-        for widget in self.query("#bottom-pending-action"):
-            widget.display = pending and self._current_bottom_app not in {
-                BottomApp.Input,
-                BottomApp.Question,
-            }
+        self._bottom_panel.indicate_pending_action()
 
     async def _present_pending_callback(self) -> None:
-        if self._secondary_surface_active():
-            self._indicate_pending_action()
-            return
-        self._secondary_returned.set()
-        if (
-            self._pending_callbacks
-            and self._active_callback is None
-            and self._pending_local_question is None
-        ):
-            await self._show_callback(self._pending_callbacks.popleft())
-        self._indicate_pending_action()
+        await self._turn_supervisor.present_pending_callback()
 
     async def _show_callback(self, callback: PublicCallbackEntry) -> None:
-        if (
-            self._active_callback is not None
-            and self._active_callback.callback_id == callback.callback_id
-        ) or any(
-            pending.callback_id == callback.callback_id
-            for pending in self._pending_callbacks
-        ):
-            return
-        if self._secondary_surface_active() or (
-            self._active_callback is not None
-            or self._pending_local_question is not None
-        ):
-            self._pending_callbacks.append(callback)
-            self._indicate_pending_action()
-            return
-        self._active_callback = callback
-        try:
-            loading = self._loading_widget
-            if loading is None or loading.parent is None:
-                await self._ensure_loading_widget()
-                loading = self._loading_widget
-            if loading is not None:
-                loading.begin_action_required(callback.title)
-            await self._wait_for_typing_pause()
-            if self._secondary_surface_active():
-                self._active_callback = None
-                self._pending_callbacks.appendleft(callback)
-                self._indicate_pending_action()
-                return
-            self._terminal_notifier.notify(NotificationContext.ACTION_REQUIRED)
-            await self._switch_to_question_app(callback.detail.request)
-        except BaseException:
-            if self._active_callback is callback:
-                self._active_callback = None
-            raise
+        await self._turn_supervisor.show_callback(callback)
 
     async def _respond_to_active_callback(
         self, output: UserInputCallbackOutput
     ) -> None:
-        from chartreux.app_server import AppServerConnectionClosed
-
-        callback = self._active_callback
-        if (
-            callback is None
-            or self._callback_submitting
-            or self._callback_delivery_uncertain
-        ):
-            return
-        self._callback_submitting = True
-        question = self.query_one(_get_question_app_class())
-        question.set_submission_status("Running: Sending answer")
-        try:
-            await self.app_server.respond_to_callback(callback.callback_id, output)
-        except AppServerResponseError as exc:
-            # A protocol rejection is definite: the same draft may be corrected
-            # and submitted again without guessing whether the server accepted it.
-            question.set_submission_status(
-                f"Failed: Answer rejected ({exc}). Draft kept; edit and submit again, or Esc to cancel."
-            )
-            return
-        except (AppServerConnectionClosed, OSError, TimeoutError) as exc:
-            self._callback_delivery_uncertain = True
-            question.set_submission_status(
-                "Warning: Answer delivery is uncertain. Draft kept; do not resend. "
-                "Ctrl+D exits; inspect the session before deciding what to do next. "
-                f"({exc})"
-            )
-            return
-        except Exception as exc:
-            self._callback_delivery_uncertain = True
-            logger.warning("Callback delivery outcome unknown", exc_info=exc)
-            question.set_submission_status(
-                "Warning: Answer delivery is uncertain. Draft kept; do not resend. "
-                "Ctrl+D exits; inspect the session before deciding what to do next."
-            )
-            return
-        finally:
-            self._callback_submitting = False
-        if self._active_callback is callback:
-            question.disabled = True
-            self._active_callback = None
-            self._callback_delivery_uncertain = False
-            if self._pending_callbacks:
-                await self._show_callback(self._pending_callbacks.popleft())
-                return
-            if self._loading_widget is not None:
-                self._loading_widget.end_action_required()
-            await self._switch_to_input_app()
-
-    async def _handle_turn_error(self, *, cancelled: bool = False) -> None:
-        if self._loading_widget and self._loading_widget.parent:
-            await self._loading_widget.remove()
-        if self.event_handler:
-            self.event_handler.stop_current_tool_call(
-                success=False, cancelled=cancelled
-            )
+        await self._turn_supervisor.respond_to_active_callback(output)
 
     async def _ensure_runtime_ready(self) -> None:
-        # Must precede any app_server access — the session may still be unbound
-        # when a turn is dispatched (only _handle_turn reaches here).
-        await self._session_ready.wait()
-        show_init_spinner = not self.app_server.resources.runtime.ready
-        if show_init_spinner:
-            await self._ensure_loading_widget("Initializing", show_hint=False)
-        await self.app_server.resources.runtime.wait_until_ready()
-        if show_init_spinner:
-            await self._remove_loading_widget()
-            self._refresh_banner()
-
-    async def _handle_turn_events(
-        self, events: AsyncGenerator[AppServerEvent, None]
-    ) -> None:
-        async for event in events:
-            await self._handle_turn_event(event)
+        await self._turn_supervisor.ensure_runtime_ready()
 
     def _show_no_output_outcome(self) -> None:
-        agents_running = any(agent_is_active(agent) for agent in self._agent_summaries)
-        self._turn_outcome_notice.show(
-            "Info: Main turn completed without a final response; "
-            + (
-                "background agents are still running."
-                if agents_running
-                else "ready for another prompt."
-            ),
-            timeout=None,
-        )
-
-    def _track_turn_outcome(self, event: AppServerEvent) -> None:
-        if isinstance(event, TurnStarted):
-            self._turn_has_final_prose = False
-            self._turn_outcome_notice.hide()
-        elif isinstance(event, (HistoryEntryAdded, HistoryEntryUpdated)):
-            entry = _public_entry(event)
-            if isinstance(entry, PublicMessageEntry) and entry.role == "assistant":
-                self._turn_has_final_prose |= bool(entry.text.strip())
-        elif isinstance(event, TurnCompleted):
-            if (
-                event.turn.next_turn_id is None
-                and event.turn.status is PublicTurnStatus.COMPLETED
-                and not self._turn_has_final_prose
-            ):
-                self._show_no_output_outcome()
+        self._turn_supervisor.show_no_output_outcome()
 
     def _refresh_status_for_event(self, event: AppServerEvent) -> None:
         if isinstance(event, AgentsUpdate):
@@ -3402,68 +2898,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def _handle_agents_update(
         self, event: AgentsUpdate, received_at: float
     ) -> None:
-        """Consume the authoritative inventory: browser, viewer, chrome."""
-        viewer = self._agent_transcript_viewer
-        selected_id = self._agent_selection_target or (
-            viewer.agent_id if viewer is not None else None
-        )
-        if selected_id is not None and not any(
-            agent.agent_id == selected_id for agent in event.agents
-        ):
-            # Releases and metadata expiry remove the agent from published
-            # summaries; evictions and closures remain tombstones in that
-            # list and stay browsable. Close the viewer, return to Main.
-            label = selected_id
-            for agent in self._agent_summaries:
-                if agent.agent_id == selected_id:
-                    label = agent.name or agent.agent_id
-                    break
-            await self._request_agent_transcript_close(restore_focus=True)
-            await self._mount_and_scroll(
-                UserCommandMessage(
-                    f"Background agent {_markdown_literal(label)} is no longer "
-                    "available; returned to the main conversation."
-                )
-            )
-        self._agent_summaries = event.agents
-        if self._turn_outcome_notice.display:
-            self._show_no_output_outcome()
-        self._agent_evictions.update({
-            eviction.agent_id: eviction for eviction in event.evictions
-        })
-        evicted_agent_ids = {
-            agent.agent_id
-            for agent in event.agents
-            if agent.availability.lower() == "evicted"
-        }
-        self._agent_evictions = {
-            agent_id: eviction
-            for agent_id, eviction in self._agent_evictions.items()
-            if agent_id in evicted_agent_ids
-        }
-        if self._agent_bar is not None:
-            self._agent_bar.update_agents(
-                event.agents,
-                tuple(self._agent_evictions.values()),
-                received_at=received_at,
-            )
-        viewer = self._agent_transcript_viewer
-        if viewer is None:
-            return
-        selected = next(
-            (agent for agent in event.agents if agent.agent_id == viewer.agent_id), None
-        )
-        viewer.set_live(selected is not None and agent_is_active(selected))
-        if selected is not None:
-            # The viewer is reused per agent: refresh its header in place
-            # when the selected handle re-tasks.
-            viewer.set_header(selected.name, selected.profile)
-            if self._agent_bar is not None:
-                viewer.set_metadata(self._agent_bar.full_metadata(selected))
+        await self._agent_browser.handle_agents_update(event, received_at)
 
     async def _handle_turn_event(self, event: AppServerEvent) -> None:
         received_at = time.monotonic()
-        self._track_turn_outcome(event)
+        self._turn_supervisor._track_turn_outcome(event)
         self._refresh_status_for_event(event)
         if (
             isinstance(event, (TurnStarted, TurnUpdated, TurnCompleted))
@@ -3543,12 +2982,14 @@ class ChartreuxApp(App):  # noqa: PLR0904
                             # current task; it must not change inspection or focus.
                             # The in-flight turn surfaced: leave the pending state and
                             # wake any interrupt waiting for it.
-                            self._clear_pending_turn()
+                            self._turn_supervisor._clear_pending_turn()
                             await self._queue.turn_started(event.turn.queue_item_id)
-                            await self._begin_unsolicited_turn()
+                            await self._turn_supervisor._begin_unsolicited_turn()
                         await self._handle_turn_event(event)
                         if isinstance(event, TurnCompleted):
-                            await self._complete_unsolicited_turn(event)
+                            await self._turn_supervisor._complete_unsolicited_turn(
+                                event
+                            )
                         self._maybe_settle_interrupt()
         except AppServerConnectionClosed:
             if not self._shutdown_started:
@@ -3558,53 +2999,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if self._turn_ui_mutex is None:
             self._turn_ui_mutex = asyncio.Lock()
         return self._turn_ui_mutex
-
-    async def _begin_unsolicited_turn(self) -> None:
-        async with self._turn_ui_lock():
-            self._turn_ui_generation += 1
-            if self.event_handler:
-                await self.event_handler.finalize_streaming()
-                self.event_handler.escalate_unresolved_errors()
-            await self._remove_loading_widget()
-            # If Escape landed during the enqueue -> promote -> TurnStarted gap,
-            # an interrupt is already in flight; mount the fresh spinner as
-            # "Interrupting" so surfacing the turn does not clobber that feedback
-            # back to "Generating" (the remount races _interrupt_turn's own label).
-            await self._ensure_loading_widget(
-                INTERRUPTING_LOADING_STATUS
-                if self._interrupt_requested
-                else DEFAULT_LOADING_STATUS
-            )
-            self._queue.notify_busy_changed()
-
-    async def _complete_unsolicited_turn(self, event: TurnCompleted) -> None:
-        from chartreux.app_server.session import AppServerTurnError
-
-        if event.turn.next_turn_id is not None:
-            return
-        retry_incomplete_stream = False
-        if event.turn.status is PublicTurnStatus.FAILED:
-            error = AppServerTurnError(event.turn.error)
-            await self._handle_turn_error()
-            retry_incomplete_stream = (
-                error.error.code == TurnErrorCode.INCOMPLETE_STREAM
-                and not self._queue.has_server_work
-            )
-            if retry_incomplete_stream:
-                if self.event_handler is not None:
-                    self.event_handler.offer_retry()
-            else:
-                message = self._resolve_turn_error_message(error)
-                await self._mount_turn_error(error, message)
-        elif event.turn.status is PublicTurnStatus.INTERRUPTED:
-            await self._handle_turn_error(cancelled=True)
-        await self._finalize_turn_ui(notify_complete=not retry_incomplete_stream)
-        if retry_incomplete_stream:
-            # Do not publish a retry blocked on the interrupt gate as the active
-            # agent task: the interrupt supervisor must be able to observe idle
-            # turn ownership and settle that same gate. The retry claims
-            # ``_agent_task`` itself immediately after admission.
-            asyncio.create_task(self._auto_retry_incomplete_stream(1))
 
     async def _handle_turn(
         self,
@@ -3616,120 +3010,21 @@ class ChartreuxApp(App):  # noqa: PLR0904
         user_initiated_retry: bool = False,
         incomplete_stream_retries: int = 0,
     ) -> None:
-        from chartreux.app_server.session import AppServerTurnError
-
-        turn_ui_generation = self._turn_ui_generation
-        if self._active_turn_start is None:
-            self._active_turn_start = self._transcript.admitted_end_index
-        await self._remove_loading_widget()
-        retry_incomplete_stream = False
-
-        try:
-            await self._ensure_runtime_ready()
-            await self._ensure_loading_widget(
-                "Retrying" if incomplete_stream_retries else DEFAULT_LOADING_STATUS
-            )
-            if injected:
-                prompt_text = prompt
-                auto_title = None
-                images = None
-                mentions = None
-            else:
-                prepared = prepared_prompt or await self._prepare_prompt_or_abort(
-                    prompt
-                )
-                if prepared is None:
-                    return
-                prompt_text = prepared.prompt_text
-                auto_title = prepared.auto_title
-                images = prepared.images or None
-                mentions = prepared.mentions
-            message_id = None if injected else client_message_id or str(uuid4())
-            async with aclosing(
-                self.app_server.act(
-                    prompt_text,
-                    client_message_id=message_id,
-                    auto_title=auto_title,
-                    images=images,
-                    mention_stats=mentions,
-                    injected=injected,
-                    user_initiated_retry=user_initiated_retry,
-                )
-            ) as events:
-                await self._handle_turn_events(events)
-        except asyncio.CancelledError:
-            await self._handle_turn_error(cancelled=True)
-            raise
-        except Exception as e:
-            await self._handle_turn_error()
-
-            # _watch_init_completion already rendered the fatal startup error
-            # and told the user to exit -- don't duplicate the message.
-            if self._fatal_init_error:
-                return
-
-            retry_incomplete_stream = (
-                isinstance(e, AppServerTurnError)
-                and e.error.code == TurnErrorCode.INCOMPLETE_STREAM
-                and incomplete_stream_retries < _MAX_INCOMPLETE_STREAM_RETRIES
-                and not self._queue.has_server_work
-            )
-            if retry_incomplete_stream:
-                # Auto-retry silently: don't surface the error while we retry.
-                # Arm the retry presentation (without an error widget) so the
-                # partial assistant message is reused when the retry streams in.
-                if self.event_handler is not None:
-                    self.event_handler.offer_retry()
-            else:
-                logger.exception("App server turn failed")
-
-                message = self._resolve_turn_error_message(e)
-
-                await self._mount_turn_error(e, message)
-        finally:
-            await self._finalize_turn_ui(
-                notify_complete=not retry_incomplete_stream,
-                turn_ui_generation=turn_ui_generation,
-            )
-
-        if retry_incomplete_stream:
-            await self._auto_retry_incomplete_stream(incomplete_stream_retries + 1)
+        await self._turn_supervisor.handle_turn(
+            prompt,
+            prepared_prompt=prepared_prompt,
+            client_message_id=client_message_id,
+            injected=injected,
+            user_initiated_retry=user_initiated_retry,
+            incomplete_stream_retries=incomplete_stream_retries,
+        )
 
     async def _auto_retry_incomplete_stream(
         self, incomplete_stream_retries: int
     ) -> None:
-        # Automatic retries are new turns too. Keep them behind the same
-        # interrupt admission gate as submitted prompts so late interrupt
-        # finalization cannot mutate the replacement turn's presentation.
-        await self._await_interrupt_settled()
-        if self.event_handler is None or not self.event_handler.begin_retry():
-            return
-        self._agent_task = asyncio.current_task()
-        self._queue.notify_busy_changed()
-        await self._handle_turn(
-            build_retry_prompt(""),
-            injected=True,
-            incomplete_stream_retries=incomplete_stream_retries,
+        await self._turn_supervisor.auto_retry_incomplete_stream(
+            incomplete_stream_retries
         )
-
-    async def _mount_turn_error(self, error: Exception, message: str) -> None:
-        from chartreux.app_server.session import AppServerTurnError
-
-        if (
-            self.event_handler is not None
-            and isinstance(error, AppServerTurnError)
-            and error.error.code == TurnErrorCode.INVALID_API_KEY
-        ):
-            self.event_handler.cancel_retry_presentation()
-        widget = ErrorMessage(message, collapsed=self._tools_collapsed)
-        await self._mount_and_scroll(widget)
-        if (
-            self.event_handler is not None
-            and isinstance(error, AppServerTurnError)
-            and error.error.code in _RETRYABLE_TURN_ERROR_CODES
-        ):
-            self.event_handler.offer_retry(widget)
-            self._refresh_command_registry()
 
     async def _retry(
         self,
@@ -3738,263 +3033,25 @@ class ChartreuxApp(App):  # noqa: PLR0904
         incomplete_stream_retries: int = 0,
         **_kwargs: Any,
     ) -> None:
-        if self._agent_job_active():
-            return
-        if self.event_handler is None or not self.event_handler.begin_retry(
-            command_message
-        ):
-            return
-        self._refresh_command_registry()
-        self._agent_task = asyncio.create_task(
-            self._handle_turn(
-                build_retry_prompt(cmd_args),
-                injected=True,
-                user_initiated_retry=True,
-                incomplete_stream_retries=incomplete_stream_retries,
-            )
+        await self._turn_supervisor.retry(
+            cmd_args,
+            command_message=command_message,
+            incomplete_stream_retries=incomplete_stream_retries,
+            **_kwargs,
         )
-        self._queue.notify_busy_changed()
 
     async def _finalize_turn_ui(
         self, *, notify_complete: bool = True, turn_ui_generation: int | None = None
     ) -> None:
-        async with self._turn_ui_lock():
-            if (
-                turn_ui_generation is not None
-                and turn_ui_generation != self._turn_ui_generation
-            ):
-                self._interrupt_requested = False
-                self._agent_task = None
-                self._clear_pending_turn()
-                self._queue.notify_busy_changed()
-                self._maybe_settle_interrupt()
-                return
-            self._interrupt_requested = False
-            self._agent_task = None
-            self._clear_pending_turn()
-            self._maybe_settle_interrupt()
-            if self._loading_widget:
-                await self._loading_widget.remove()
-            self._loading_widget = None
-            if self.event_handler:
-                await self.event_handler.finalize_streaming()
-                self.event_handler.escalate_unresolved_errors()
-            self._queue.notify_busy_changed()
-            if not notify_complete:
-                self._sync_retry_command_availability()
-                return
-            if self.event_handler:
-                self.event_handler.clear_tool_call_anchors()
-            try:
-                self._admit_live_history()
-            except Exception:
-                logger.exception("Failed to admit live history while finalizing turn")
-            if self.event_handler:
-                self.event_handler.settle_turn()
-            self._sync_retry_command_availability()
-            await self._refresh_windowing_from_history()
-            self._clear_active_turn_pins()
-            self._request_transcript_reconcile()
-            self._terminal_notifier.notify(NotificationContext.COMPLETE)
-            self.call_after_refresh(self._maybe_show_graduation)
-
-    def _resolve_turn_error_message(self, e: Exception) -> str:
-        from chartreux.app_server.session import AppServerTurnError
-
-        if not isinstance(e, AppServerTurnError):
-            return str(e)
-        code = e.error.code
-        match code:
-            case TurnErrorCode.RATE_LIMIT:
-                base = self._rate_limit_message()
-            case TurnErrorCode.CONTEXT_TOO_LONG:
-                return self._context_too_long_message()
-            case TurnErrorCode.REFUSAL:
-                return self._refusal_message(e.error)
-            case _:
-                base = str(e)
-        if code in _RETRYABLE_TURN_ERROR_CODES:
-            return f"{base}{self._retry_hint()}"
-        return base
-
-    @staticmethod
-    def _retry_hint() -> str:
-        return (
-            "\n\nRun /retry [additional instructions] to start a new turn. "
-            "Completed tool results are kept; recent actions may repeat."
+        await self._turn_supervisor.finalize_turn_ui(
+            notify_complete=notify_complete, turn_ui_generation=turn_ui_generation
         )
-
-    def _rate_limit_message(self) -> str:
-        return "Rate limits exceeded. Please wait a moment before trying again."
-
-    def _context_too_long_message(self) -> str:
-        return (
-            "The conversation context exceeds the model's maximum limit. "
-            "The last messages and output of agent actions went above the allowed size.\n\n"
-            "To recover:\n"
-            "1. Use /rewind to undo recent messages and tool outputs\n"
-            "2. Then use /compact to summarize the remaining conversation\n\n"
-            "This will free up context space so you can continue working."
-        )
-
-    def _refusal_message(self, error: PublicError) -> str:
-        details = error.details if isinstance(error.details, dict) else {}
-        category = details.get("category")
-        explanation = details.get("explanation")
-        lead = "The model declined to respond and stopped early (refusal)."
-        if isinstance(category, str):
-            lead += f"\nCategory: {category}."
-        detail = (
-            explanation
-            if isinstance(explanation, str)
-            else (
-                "This can happen with certain prompts or content. "
-                "Try rephrasing your request or starting a new conversation."
-            )
-        )
-        return f"{lead}\n\n{detail}"
 
     async def _interrupt_turn(self) -> None:
-        if (
-            self._interrupt_operation is not None
-            and not self._interrupt_operation.done()
-        ):
-            return
-        if self._interrupt_requested:
-            return
-        if not self._agent_job_active():
-            # The turn finished before this worker ran, so there is nothing to
-            # interrupt. The Escape handler already opened the settle window via
-            # _begin_interrupt_settle; close it here (no turn/finalize event is
-            # coming to do it) so a racing submit resumes on current state
-            # instead of waiting out the full _await_interrupt_settled timeout.
-            # Settle unconditionally rather than via _maybe_settle_interrupt:
-            # this path never issues interrupt(), so no queue pause is coming,
-            # and _maybe_settle_interrupt would keep the window open while
-            # accepted-but-unpaused items exist -- waiting on a pause that a
-            # real interrupt would emit but this no-op never will.
-            self._clear_active_turn_pins()
-            self._settle_interrupt()
-            return
-
-        self._interrupt_requested = True
-
-        # Acknowledge the keypress immediately: the cancel below blocks until the
-        # in-flight turn unwinds (LLM stream, tool call, server ack), and only
-        # then does the spinner tear down. Flipping the status now, on the message
-        # pump, gives instant feedback instead of a spinner that keeps running.
-        if self._loading_widget is not None:
-            self._loading_widget.set_status(INTERRUPTING_LOADING_STATUS)
-
-        self._active_callback = None
-        self._callback_delivery_uncertain = False
-        self._pending_callbacks.clear()
-        self._indicate_pending_action()
-        if self._pending_local_question and not self._pending_local_question.done():
-            self._pending_local_question.set_result(
-                UserQuestionResult(answers=[], cancelled=True)
-            )
-
-        # A just-submitted idle turn may still be promoting (enqueued, no
-        # TurnStarted yet). Wait briefly for it to surface so we interrupt the
-        # real turn instead of no-opping; _clear_pending_turn on TurnStarted or
-        # finalize wakes this. Bounded so a turn that never starts can't hang.
-        if (
-            self._pending_turn
-            and not self.app_server.turn_active
-            and (self._agent_task is None or self._agent_task.done())
-        ):
-            with suppress(TimeoutError):
-                await asyncio.wait_for(self._turn_started_event.wait(), timeout=30.0)
-            # The turn surfacing remounts the loading widget as "Generating";
-            # re-apply the interrupting label to the fresh one.
-            if self._loading_widget is not None:
-                self._loading_widget.set_status(INTERRUPTING_LOADING_STATUS)
-        self._clear_pending_turn()
-
-        # Invariant: a turn is driven EITHER by a client task (``_agent_task``,
-        # used for retry/auto-retry) OR by the server promoting an enqueued turn
-        # (``turn_active`` with no client task, the normal path for both the
-        # legacy and unified backends) -- never both at once. The two branches
-        # are therefore mutually exclusive by design. If that ever breaks (a turn
-        # live locally AND server-side), the server turn would not be interrupted
-        # here and the settle would wait out its full timeout; keep this an elif
-        # rather than two ifs so a late interrupt() cannot cancel a replacement
-        # turn a deferred submit promoted during the cancel await.
-        interrupt: Awaitable[None] | None = None
-        if self._agent_task and not self._agent_task.done():
-            # Cancelling the client task tears down its act() stream, which
-            # interrupts the server turn -- no explicit interrupt() needed.
-            self._agent_task.cancel()
-            interrupt = self._agent_task
-        elif self.app_server.turn_active:
-            interrupt = self.app_server.interrupt()
-
-        if interrupt is None:
-            self._clear_active_turn_pins()
-            self._settle_interrupt()
-            return
-
-        self._interrupt_operation = asyncio.create_task(
-            self._finish_interrupt(interrupt)
-        )
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(self._interrupt_operation),
-                timeout=_INTERRUPT_WAIT_TIMEOUT,
-            )
-        except TimeoutError:
-            self.notify(
-                _INTERRUPT_STILL_STOPPING_WARNING,
-                severity="warning",
-                markup=False,
-                timeout=10,
-            )
+        await self._turn_supervisor.interrupt_turn()
 
     async def _finish_interrupt(self, interrupt: Awaitable[None]) -> None:
-        """Consume an interrupt operation and finalize only after it really settles."""
-        succeeded = False
-        try:
-            try:
-                await interrupt
-                succeeded = True
-            except asyncio.CancelledError:
-                # Cancellation is the expected completion for a client-owned turn.
-                # A cancellation of this supervisor itself is shutdown, however,
-                # and must propagate after the ownership state is settled below.
-                if (task := asyncio.current_task()) is not None and task.cancelling():
-                    raise
-                succeeded = True
-            except Exception as exc:
-                logger.warning("Interrupt failed", exc_info=exc)
-                self.notify(
-                    f"Failed to stop the turn: {exc}",
-                    severity="warning",
-                    markup=False,
-                    timeout=10,
-                )
-
-            if succeeded:
-                if self.event_handler:
-                    self.event_handler.stop_current_tool_call(cancelled=True)
-                    self.event_handler.stop_current_compact()
-                    await self.event_handler.finalize_streaming()
-
-                await self._loading_area.remove_children()
-                self._loading_widget = None
-                await self._mount_and_scroll(InterruptMessage())
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # The supervisor owns UI finalization as well as the transport
-            # operation. Consume late DOM errors so timed-out supervisors cannot
-            # become unobserved task failures.
-            logger.warning("Interrupt finalization failed", exc_info=exc)
-        finally:
-            self._interrupt_requested = False
-            self._interrupt_operation = None
-            self._queue.notify_busy_changed()
-            self._maybe_settle_interrupt()
+        await self._turn_supervisor.finish_interrupt(interrupt)
 
     async def action_show_help(self) -> None:
         await self._show_help()
@@ -4531,553 +3588,74 @@ class ChartreuxApp(App):  # noqa: PLR0904
                 UserCommandMessage("Provider Settings closed.")
             )
 
-    async def _rename_session(self, cmd_args: str = "", **kwargs: Any) -> None:
-        title = cmd_args.strip()
-        if not title:
-            await self._mount_and_scroll(
-                ErrorMessage("Usage: /rename <title>", collapsed=self._tools_collapsed)
-            )
-            return
-
-        try:
-            renamed_title = await self.app_server.resources.sessions.rename(title)
-        except Exception as e:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    f"Failed to rename session: {e}", collapsed=self._tools_collapsed
-                )
-            )
-            return
-
-        self._on_session_title_changed(renamed_title)
-        await self._mount_and_scroll(
-            UserCommandMessage(f'Session renamed to "{renamed_title}".')
-        )
-
-    async def _branch_session(self, cmd_args: str = "", **kwargs: Any) -> None:
-        old_session_id = self.app_server.session_id
-        try:
-            response = await self.app_server.resources.sessions.fork(
-                entry_id=None, attach=False
-            )
-        except Exception as e:
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    f"Failed to branch session: {e}", collapsed=self._tools_collapsed
-                )
-            )
-            return
-
-        await self._mount_and_scroll(
-            BranchCreatedMessage(
-                old_session_id=old_session_id, new_session_id=response.state.session.id
-            )
-        )
-
     async def _log_level_command(self, **kwargs: Any) -> None:
         await self._switch_to_log_level_picker_app()
-
-    def _build_picker(
-        self, sessions: list[PublicSession], *, loading: bool = False
-    ) -> SessionPickerApp:
-        sessions = sorted(sessions, key=lambda s: s.updated_at, reverse=True)
-        return _get_session_picker_app_class()(
-            sessions=sessions,
-            latest_messages={
-                session.id: session.title or session.preview for session in sessions
-            },
-            current_session_id=self.app_server.session_id,
-            cwd=self.app_server.cwd,
-            loading=loading,
-        )
 
     async def _show_session_picker(
         self, command_message: SlashCommandMessage | None = None, **kwargs: Any
     ) -> None:
-        # Mount the picker and erase the slash command message in one repaint so
-        # the transition from command menu → picker is visually instant.
-        picker = self._build_picker([], loading=True)
-        self._picker_origin_anchor = self._transcript.capture_anchor(
-            self._messages_area,
-            following=self._transcript_following
-            and self._chat_widget.scroll_y >= self._chat_widget.max_scroll_y,
-        )
-        self._picker_origin_range = (
-            (self._transcript.admitted_start_index, self._transcript.admitted_end_index)
-            if self._transcript.unit_ids
-            else None
-        )
-        self._picker_origin_focus = self.screen.focused
-        with self.batch_update():
-            if command_message is not None:
-                await command_message.remove()
-            await self._switch_from_input(picker)
-
-        try:
-            local_sessions = await self.app_server.resources.sessions.list(
-                self.app_server.cwd
-            )
-        except Exception as e:
-            logger.exception("Failed to discover saved sessions")
-            picker.set_loading(False, error=str(e))
-            return
-
-        if not picker.is_mounted:
-            # The picker was closed while sessions were loading.
-            return
-        picker.load_sessions(
-            local_sessions
-            if self.app_server.resources.runtime.session_log.enabled
-            else [],
-            {
-                session.id: session.title or session.preview
-                for session in local_sessions
-            },
-        )
+        await self._session_flow.show_session_picker(command_message, **kwargs)
 
     async def on_session_picker_app_session_highlighted(
         self, event: SessionPickerApp.SessionHighlighted
     ) -> None:
-        session_id = event.session_id
-        if session_id is None:
-            return
-        # Current session is already displayed — don't reload unless we navigated
-        # away first (in which case picker.previewing is True).
-        if session_id == self.app_server.session_id and not self._picker.previewing:
-            return
-        # Record the intended preview target so a slower earlier request can't
-        # overwrite the screen after the highlight moved on or resume started.
-        self._picker.preview_session_id = session_id
-        self._picker.previewing = True
-        self._reset_ui_state()
-        with self.batch_update():
-            await self._load_more.hide()
-            await self._messages_area.remove_children()
-            await self._messages_area.mount(
-                UserCommandMessage(f"Preview `{session_id[:8]}` loading (not active)…")
-            )
-        try:
-            history = await self.app_server.resources.sessions.get_session_history(
-                session_id
-            )
-        except Exception as exc:
-            logger.exception("get_session_history failed for %s", session_id)
-            if self._picker.preview_is_current(session_id):
-                self._picker.previewing = True
-                self._reset_ui_state()
-                with self.batch_update():
-                    await self._load_more.hide()
-                    await self._messages_area.remove_children()
-                    await self._messages_area.mount(
-                        ErrorMessage(
-                            f"Preview `{session_id[:8]}` failed to load: {exc}. "
-                            "No history is shown; choose another session or cancel."
-                        )
-                    )
-            return
-        if not self._picker.preview_is_current(session_id):
-            return
-        await self._apply_picker_preview(session_id, history)
+        await self._session_flow.on_session_picker_app_session_highlighted(event)
 
     async def _apply_picker_preview(
         self, session_id: str, history: list[PublicHistoryEntry]
     ) -> None:
-        self._picker.previewing = True
-        self._preview_tool_group_expansion_state = ToolGroupExpansionState(
-            default_collapsed=self._tools_collapsed
-        )
-        self._preview_entry_expansion_state = EntryExpansionState(
-            default_collapsed=self._tools_collapsed
-        )
-        self._reset_ui_state()
-        plan = create_resume_plan(history, HISTORY_RESUME_TAIL_MESSAGES)
-        with self.batch_update():
-            await self._load_more.hide()
-            await self._messages_area.remove_children()
-            if not self._picker.preview_is_current(session_id):
-                return
-            await self._messages_area.mount(
-                UserCommandMessage(
-                    f"Preview `{session_id[:8]}` (not active): "
-                    + ("history loaded" if history else "empty history")
-                )
-            )
-            if plan is not None:
-                await self._mount_history_batch(
-                    plan.tail_entries,
-                    self._messages_area,
-                    start_index=plan.tail_start_index,
-                )
-        if not self._picker.preview_is_current(session_id):
-            return
-        if plan is not None:
-            self.call_after_refresh(self._chat_widget.anchor)
-            self._windowing.set_backfill(plan.backfill_entries)
-            await self._load_more.set_visible(
-                self._messages_area,
-                visible=self._has_older_history,
-                remaining=self._history_backfill_remaining,
-            )
+        await self._session_flow.apply_picker_preview(session_id, history)
 
     def _exit_picker_preview(self) -> bool:
-        was_previewing = self._picker.exit_preview()
-        if was_previewing:
-            self._tools_collapsed = self._entry_expansion_state.default_collapsed
-        return was_previewing
+        return self._session_flow.exit_picker_preview()
 
     async def on_session_picker_app_session_selected(
         self, event: SessionPickerApp.SessionSelected
     ) -> None:
-        was_previewing = self._exit_picker_preview()
-        await self._switch_to_input_app()
-        # Mark ready in the finally (covers both the failure return and success),
-        # but only after _resume_local_session so a turn can't dispatch mid-rebind.
-        try:
-            await self._resume_local_session(event.session_id)
-        except Exception as e:
-            logger.exception("Failed to resume session %s", event.session_id)
-            if self._show_resume_picker:
-                self._show_resume_picker = False
-                self._startup_prompt_processed = True
-            if not self._resume_adopted and was_previewing:
-                try:
-                    await self._rebuild_transcript_from_current_session()
-                except Exception:
-                    logger.exception(
-                        "Failed to rebuild transcript after resume failure"
-                    )
-            if self._resume_adopted:
-                # Recovery is installed by _resume_local_session, not the old preview.
-                return
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    f"Session not changed; failed to load `{event.session_id[:8]}`: {e}",
-                    collapsed=self._tools_collapsed,
-                )
-            )
-            return
-        else:
-            if self._show_resume_picker:
-                self._show_resume_picker = False
-                await self._process_startup_prompt_when_available()
-        finally:
-            self._mark_session_ready()
+        await self._session_flow.on_session_picker_app_session_selected(event)
 
     async def on_session_picker_app_session_delete_requested(
         self, event: SessionPickerApp.SessionDeleteRequested
     ) -> None:
-        if event.session_id == self.app_server.session_id:
-            self._clear_pending_session_delete(event.option_id)
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    "Deleting the current session is not supported.",
-                    collapsed=self._tools_collapsed,
-                )
-            )
-            return
-
-        try:
-            await self.app_server.resources.sessions.delete(event.session_id)
-        except Exception as e:
-            self._clear_pending_session_delete(event.option_id)
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    f"Failed to delete session: {e}", collapsed=self._tools_collapsed
-                )
-            )
-            return
-
-        try:
-            picker = self.query_one(_get_session_picker_app_class())
-        except Exception:
-            picker = None
-
-        if picker is not None:
-            picker.remove_session(event.option_id)
-
-        await self._mount_and_scroll(
-            UserCommandMessage(f"Deleted session `{event.session_id[:8]}`.")
-        )
-
-        if picker is not None and not picker.has_sessions:
-            await self._exit_picker_to_input()
-            await self._mount_and_scroll(
-                UserCommandMessage("No saved sessions left for this directory.")
-            )
-
-    def _clear_pending_session_delete(self, option_id: str) -> None:
-        try:
-            self.query_one(_get_session_picker_app_class()).clear_pending_delete(
-                option_id
-            )
-        except Exception:
-            pass
+        await self._session_flow.on_session_picker_app_session_delete_requested(event)
 
     async def _exit_picker_to_input(self) -> None:
-        await self._switch_to_input_app()
-        # Both exits (cancel, delete-last) return to the live input.
-        self._mark_session_ready()
-        if self._show_resume_picker:
-            self._show_resume_picker = False
-            self._startup_prompt_processed = True
-        if self._exit_picker_preview():
-            await self._rebuild_transcript_from_current_session()
-            await self._restore_picker_history_range()
-            return
-        self.run_worker(
-            self._show_custom_tools_deprecation_warning_after_initial_history(),
-            exclusive=False,
-        )
+        await self._session_flow.exit_picker_to_input()
 
     async def on_session_picker_app_cancelled(
         self, event: SessionPickerApp.Cancelled
     ) -> None:
-        self._picker_origin_restoring = True
-        try:
-            await self._exit_picker_to_input()
-            await self._mount_and_scroll(UserCommandMessage("Resume cancelled."))
-            await self._restore_picker_origin()
-        finally:
-            self.call_after_refresh(self._finish_picker_origin_restore)
-
-    def _finish_picker_origin_restore(self) -> None:
-        self._picker_origin_restoring = False
-        self._remember_transcript_anchor()
-
-    async def _restore_picker_origin(self) -> None:
-        anchor = self._picker_origin_anchor
-        self._picker_origin_anchor = None
-        self._picker_origin_range = None
-        if anchor is not None:
-            self._transcript_following = anchor.following
-            await self._transcript.restore_anchor(
-                self._messages_area, anchor, check_revision=False
-            )
-        target = self._picker_origin_focus
-        self._picker_origin_focus = None
-        if target is not None and target.is_mounted and target.display:
-            target.focus()
+        await self._session_flow.on_session_picker_app_cancelled(event)
 
     async def _resume_local_session(self, session_id: str) -> None:
-        self._exit_picker_preview()
-        await self._request_agent_transcript_close(restore_focus=False)
-        self._resume_adopted = False
-        self._resume_ui_ready.clear()
-        self._stop_usage_subscription()
-        try:
-            await self.app_server.resume(
-                session_id, on_adopt=lambda: setattr(self, "_resume_adopted", True)
-            )
-            logger.debug("Resume stage=rpc-returned session_id=%s", session_id)
-            await self._reset_presentation_after_resume()
-            logger.debug("Resume stage=presentation-reset session_id=%s", session_id)
-            if self._chat_input_container:
-                self._chat_input_container.set_custom_border(None)
-            self._refresh_banner()
-            self._refresh_context_progress()
-            await self._rebuild_transcript_from_current_session()
-            logger.debug("Resume stage=transcript-rebuilt session_id=%s", session_id)
-            await self._queue.sync_server_queue(self.app_server.turn_queue)
-            logger.debug("Resume stage=queue-synced session_id=%s", session_id)
-            await self._mount_and_scroll(
-                UserCommandMessage(f"Resumed session `{session_id[:8]}`")
-            )
-            await self._surface_committed_model_recovery()
-            self.run_worker(self._finish_resume_notices(), exclusive=False)
-        except BaseException as exc:
-            if self._resume_adopted:
-                # Adoption is not reversible. Remove old-session presentation even
-                # when resource refresh, rebuild, queue sync or cancellation fails.
-                try:
-                    await self._show_adopted_resume_recovery(exc)
-                except Exception:
-                    logger.exception("Failed to display adopted-session recovery")
-            raise
-        finally:
-            self._resume_ui_ready.set()
-            self._sync_usage_subscription()
-
-    async def _show_adopted_resume_recovery(self, exc: BaseException) -> None:
-        self._active_callback = None
-        self._pending_callbacks.clear()
-        self._indicate_pending_action()
-        try:
-            await self._queue.clear_server_queue()
-        except Exception:
-            logger.exception("Failed to clear old-session queue presentation")
-        self._reset_ui_state()
-        with self.batch_update():
-            await self._load_more.hide()
-            await self._messages_area.remove_children()
-            await self._messages_area.mount(
-                ErrorMessage(
-                    f"Session `{self.app_server.session_id[:8]}` is active, but its "
-                    f"presentation did not finish loading: {exc}. "
-                    "Do not rely on old content. Reopen /sessions to retry loading "
-                    "or restart to recover this session."
-                )
-            )
-        self._refresh_banner()
-
-    async def _surface_committed_model_recovery(self) -> None:
-        """Surface a resumed session whose committed model left the catalog.
-
-        The transcript is already loaded; the runtime issue reported by the
-        server routes the user to the model picker so the next turn runs on an
-        explicitly chosen model instead of a silent default.
-
-        The resume has already succeeded at this point, so a failure while
-        surfacing (refresh, notice, or picker) must not abort the mount path:
-        log it and leave the session usable.
-        """
-        try:
-            runtime = self.app_server.resources.runtime
-            # The resume response carries no runtime snapshot, so read one before
-            # inspecting issues; runtime/updated may still be in flight.
-            await runtime.refresh()
-            issue = next(
-                (
-                    issue
-                    for issue in runtime.issues
-                    if issue.file == COMMITTED_MODEL_RECOVERY_ISSUE_FILE
-                ),
-                None,
-            )
-            if issue is None:
-                return
-            await self._mount_and_scroll(
-                ErrorMessage(issue.message, collapsed=self._tools_collapsed)
-            )
-            await self._switch_to_model_picker_app()
-        except Exception:
-            logger.exception("Failed to surface the committed-model recovery notice")
+        await self._session_flow.resume_local_session(session_id)
 
     async def _reset_presentation_after_resume(self) -> None:
-        """Discard presentation state owned by the previously attached session."""
-        self._entry_expansion_state.reset(default_collapsed=self._tools_collapsed)
-        self._tool_group_expansion_state.reset(default_collapsed=self._tools_collapsed)
-        async with self._turn_ui_lock():
-            self._turn_ui_generation += 1
-            self._interrupt_requested = False
-            self._settle_interrupt()
-            self._clear_pending_turn()
-
-            self._active_callback = None
-            self._callback_delivery_uncertain = False
-            self._pending_callbacks.clear()
-            self._indicate_pending_action()
-            if (
-                self._pending_local_question is not None
-                and not self._pending_local_question.done()
-            ):
-                self._pending_local_question.set_result(
-                    UserQuestionResult(answers=[], cancelled=True)
-                )
-
-            if self.event_handler is not None:
-                await self.event_handler.finalize_streaming()
-                self.event_handler.stop_current_tool_call(cancelled=True)
-                self.event_handler.stop_current_compact()
-
-            await self._remove_loading_widget()
-            self._loading_widget = None
-            await self._queue.clear_server_queue()
-            self._queue.notify_busy_changed()
+        await self._session_flow.reset_presentation_after_resume()
 
     async def _finish_resume_notices(self) -> None:
-        """Wait for a resumed session's deferred init to settle, then show
-        post-init notices — and surface a late init failure.
-
-        Fast resume returns from ``session/resume`` before MCP init
-        completes; the server finishes it in ``finish_resume_root`` and then
-        emits ``runtime/updated``. Showing notices right after the RPC would
-        race that init and read incomplete runtime state, and a background
-        failure would go unsurfaced. Re-arm readiness against the now-resumed
-        runtime so notices reflect the settled state and failures reach the UI.
-        """
-        if self._post_init_notices_shown:
-            return
-        try:
-            await self.app_server.resources.runtime.wait_until_ready()
-        except Exception as e:
-            if isinstance(e, AppServerResponseError) and e.error.code in {
-                ProtocolErrorCode.CONFLICT,
-                ProtocolErrorCode.NOT_FOUND,
-            }:
-                # A newer resume replaced the root and now owns readiness/UI;
-                # its own watcher will surface notices for the resumed runtime.
-                logger.info("Resume readiness watch superseded by a newer resume")
-                return
-            logger.exception("Background initialization failed after resume")
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    f"Background initialization failed: {e}",
-                    collapsed=self._tools_collapsed,
-                )
-            )
-            self._refresh_banner()
-            return
-        await self._show_post_init_notices_once()
-        self._refresh_banner()
+        await self._session_flow.finish_resume_notices()
 
     async def _auto_resume_on_startup(self) -> None:
-        await self._mount_and_scroll(
-            UserCommandMessage(f"Resuming session{chrome_glyph('truncation')}")
-        )
-        session_id: str | None = None
-        try:
-            session_id = self._resume_session_id
-            if session_id is None:
-                # --continue: resolve server-side so the tty-scoped last-session
-                # pointer is preferred over the most recently updated session,
-                # matching the pre-fast-resume _find_session_to_continue behavior.
-                session_id = (
-                    await self.app_server.resources.sessions.resolve_continue_session(
-                        self.app_server.cwd
-                    )
-                )
-                if session_id is None:
-                    await self._mount_and_scroll(
-                        UserCommandMessage("No previous sessions found.")
-                    )
-                    await self._show_custom_tools_deprecation_warning_after_initial_history()
-                    await self._process_startup_prompt_when_available()
-                    return
-            await self._resume_local_session(session_id)
-        except Exception as e:
-            logger.exception(
-                "Failed to auto-resume session %s", session_id or "<unknown>"
-            )
-            if not self._resume_adopted:
-                try:
-                    await self._rebuild_transcript_from_current_session()
-                except Exception:
-                    logger.exception(
-                        "Failed to rebuild transcript after resume failure"
-                    )
-            await self._mount_and_scroll(
-                ErrorMessage(
-                    (
-                        f"Session `{self.app_server.session_id[:8]}` is active but "
-                        f"presentation is incomplete: {e}"
-                        if self._resume_adopted
-                        else f"Session not changed; failed to resume: {e}"
-                    ),
-                    collapsed=self._tools_collapsed,
-                )
-            )
-        finally:
-            self._resume_session_id = None
-            self._continue_latest = False
-            # Covers --resume, --continue, and no-sessions-found (all flow here).
-            # Must run before _process_startup_prompt so an injected prompt can
-            # dispatch.
-            self._mark_session_ready()
-            # _resume_local_session spawns _finish_resume_notices as a worker,
-            # but the startup prompt must fire regardless of whether notices
-            # have settled — _process_startup_prompt_when_available guards on
-            # the two flags cleared above, so the sequence is safe.
-            await self._process_startup_prompt_when_available()
+        await self._session_flow.auto_resume_on_startup()
+
+    async def _rename_session(self, cmd_args: str = "", **kwargs: Any) -> None:
+        await self._session_flow.rename_session(cmd_args, **kwargs)
+
+    async def _branch_session(self, cmd_args: str = "", **kwargs: Any) -> None:
+        await self._session_flow.branch_session(cmd_args, **kwargs)
+
+    def _start_rewind_mode(self, **kwargs: Any) -> None:
+        # The old body was a one-line alias for action_rewind_prev; the delegate
+        # forwards straight to the controller's rewind_prev (PLR0904 keeps the
+        # controller at the public-method cap, so no alias layer is kept).
+        self._session_flow.rewind_prev()
+
+    def action_rewind_prev(self) -> None:
+        self._session_flow.rewind_prev()
+
+    def action_rewind_next(self) -> None:
+        self._session_flow.rewind_next()
 
     async def _apply_config_to_ui(self) -> None:
         await self._apply_theme(self.config.theme)
@@ -5417,11 +3995,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
         consequential, consequences = self._exit_consequences()
         if consequential and self.is_running:
             if not any(
-                isinstance(screen, ExitConsequencesScreen)
+                isinstance(screen, _get_exit_consequences_screen_class())
                 for screen in self.screen_stack
             ):
                 self.push_screen(
-                    ExitConsequencesScreen(consequences),
+                    _get_exit_consequences_screen_class()(consequences),
                     callback=lambda confirmed: (
                         self._force_quit() if confirmed else None
                     ),
@@ -5441,78 +4019,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._force_quit()
 
     async def _switch_from_input(self, widget: Widget, scroll: bool = False) -> None:
-        bottom_container = self.query_one("#bottom-app-container")
-        chat = self._chat_widget
-        should_scroll = scroll and chat.is_at_bottom
-        stale_bottom_apps = self._mounted_non_input_bottom_apps()
-
-        with self.batch_update():
-            if self._chat_input_container:
-                self._chat_input_container.display = False
-                self._chat_input_container.disabled = True
-
-            for stale in stale_bottom_apps:
-                await stale.remove()
-
-            self._current_bottom_app = BottomApp[
-                type(widget).__name__.removesuffix("App")
-            ]
-            await bottom_container.mount(widget)
-
-        if self._loading_widget is not None:
-            self._loading_widget.set_hint_suppressed(
-                self._current_bottom_app == BottomApp.Question
-            )
-
-        self._indicate_pending_action()
-        self.call_after_refresh(widget.focus)
-        if should_scroll:
-            self.call_after_refresh(chat.anchor)
-
-    def _mounted_non_input_bottom_apps(self) -> list[Widget]:
-        mounted: list[Widget] = []
-        for app in BottomApp:
-            if app == BottomApp.Input:
-                continue
-            try:
-                mounted.append(self.query_one(f"#{app.value}-app"))
-            except Exception:
-                pass
-        return mounted
+        await self._bottom_panel.switch_from_input(widget, scroll)
 
     async def _replace_bottom_app(self, widget: Widget, scroll: bool = False) -> None:
-        bottom_container = self.query_one("#bottom-app-container")
-        chat = self._chat_widget
-        should_anchor = chat.is_at_bottom
-        old_widgets: list[Widget] = []
-        for app in BottomApp:
-            if app == BottomApp.Input:
-                continue
-            try:
-                old_widgets.append(self.query_one(f"#{app.value}-app"))
-            except Exception:
-                pass
-
-        with self.batch_update():
-            if self._chat_input_container:
-                self._chat_input_container.display = False
-                self._chat_input_container.disabled = True
-
-            self._current_bottom_app = BottomApp[
-                type(widget).__name__.removesuffix("App")
-            ]
-            await bottom_container.mount(widget)
-            for old_widget in old_widgets:
-                await old_widget.remove()
-
-        if self._loading_widget is not None:
-            self._loading_widget.set_hint_suppressed(
-                self._current_bottom_app == BottomApp.Question
-            )
-
-        self.call_after_refresh(widget.focus)
-        if should_anchor or scroll:
-            self.call_after_refresh(chat.anchor)
+        await self._bottom_panel.replace_bottom_app(widget, scroll)
 
     async def _is_active_model_enforced(self) -> bool:
         response = await self.app_server.resources.config.read_fields()
@@ -5520,60 +4030,16 @@ class ChartreuxApp(App):  # noqa: PLR0904
         return field is not None and field.origin == "admin"
 
     async def _switch_to_model_picker_app(self) -> None:
-        if self._current_bottom_app == BottomApp.ModelPicker:
-            return
-
-        self._pending_picker_reload = None
-
-        from chartreux.cli.textual_ui.widgets.model_picker import ModelOption
-
-        models = [
-            ModelOption(alias=model.alias, display_name=model.display_name)
-            for model in self.config.models
-        ]
-        await self._switch_from_input(
-            _get_model_picker_app_class()(
-                models=models,
-                current_model=self.config.active_model.alias,
-                is_pinned=self.config.active_model_pinned,
-                default_display_name=self.config.default_model_display_name,
-            )
-        )
+        await self._bottom_panel.switch_to_model_picker_app()
 
     async def _switch_to_thinking_picker_app(self) -> None:
-        if self._current_bottom_app == BottomApp.ThinkingPicker:
-            return
-
-        self._pending_picker_reload = None
-
-        await self._switch_from_input(
-            _get_thinking_picker_app_class()(
-                thinking_levels=THINKING_LEVELS,
-                current_thinking=self.config.active_model.thinking,
-            )
-        )
+        await self._bottom_panel.switch_to_thinking_picker_app()
 
     async def _switch_to_log_level_picker_app(self) -> None:
-        if self._current_bottom_app == BottomApp.LogLevelPicker:
-            return
-        await self._switch_from_input(
-            _get_log_level_picker_app_class()(chain=get_log_level_chain())
-        )
+        await self._bottom_panel.switch_to_log_level_picker_app()
 
     async def _switch_to_theme_picker_app(self) -> None:
-        if self._current_bottom_app == BottomApp.ThemePicker:
-            return
-
-        from chartreux.ui.widgets.theme_picker import sorted_theme_names
-
-        picker = _get_theme_picker_app_class()(
-            theme_names=sorted_theme_names(), current_theme=self.config.theme
-        )
-        await self._switch_from_input(picker)
-        if self._pending_theme_selection in sorted_theme_names():
-            picker.query_one(OptionList).highlighted = sorted_theme_names().index(
-                self._pending_theme_selection
-            )
+        await self._bottom_panel.switch_to_theme_picker_app()
 
     async def _apply_theme(self, theme: str) -> None:
         resolved_theme = resolve_theme(resolve_theme_name(theme))
@@ -5618,316 +4084,34 @@ class ChartreuxApp(App):  # noqa: PLR0904
             command = self.commands.parse_command(command_name)
             if command is not None:
                 name, resolved, args = command
-                bottom_targets = {
-                    "theme": BottomApp.ThemePicker,
-                    "log-level": BottomApp.LogLevelPicker,
-                    "mcp": BottomApp.MCP,
-                    "proxy-setup": BottomApp.ProxySetup,
-                }
-                self._settings_return_bottom_app = bottom_targets.get(name)
-                self._settings_return_providers = name == "providers"
-                self._settings_return_web_search = name == "web-search"
-                await self._invoke_resolved_command(name, resolved, args, name)
-                if (
-                    name in bottom_targets
-                    and self._current_bottom_app == BottomApp.Input
-                ):
-                    self._settings_return_bottom_app = None
-                    await self._show_settings()
-                elif name == "providers" and (
-                    self._provider_management_worker is None
-                    or self._provider_management_worker.is_finished
-                ):
-                    self._settings_return_providers = False
-                    await self._show_settings()
-                elif name == "web-search" and (
-                    self._web_search_worker is None
-                    or self._web_search_worker.is_finished
-                ):
-                    self._settings_return_web_search = False
-                    await self._show_settings()
+                await self._bottom_panel.record_settings_return(name, resolved, args)
         else:
             await self._present_pending_callback()
 
     async def _switch_to_proxy_setup_app(self) -> None:
-        if self._current_bottom_app == BottomApp.ProxySetup:
-            return
-
-        try:
-            settings = await self.app_server.resources.config.read_proxy()
-        except Exception as exc:
-            await self._mount_and_scroll(
-                ErrorMessage(f"Failed to read proxy settings: {exc}")
-            )
-            return
-        await self._mount_and_scroll(UserCommandMessage("Proxy setup opened..."))
-        self._proxy_save_pending = False
-        await self._switch_from_input(_get_proxy_setup_app_class()(settings))
+        await self._bottom_panel.switch_to_proxy_setup_app()
 
     async def _switch_to_question_app(self, args: UserQuestionRequest) -> None:
-        await self._switch_from_input(_get_question_app_class()(args=args), scroll=True)
+        await self._bottom_panel.switch_to_question_app(args)
 
     async def _switch_to_input_app(self, *, return_to_settings: bool = True) -> None:
-        previous = self._current_bottom_app
-        if previous == BottomApp.MCP:
-            self._show_mcp_discovery_failures()
-        if return_to_settings and previous == self._settings_return_bottom_app:
-            self._settings_return_bottom_app = None
-            reopen_settings = True
-        else:
-            reopen_settings = False
-        if self._chat_input_container:
-            self._chat_input_container.disabled = False
-            self._chat_input_container.display = True
-            self._current_bottom_app = BottomApp.Input
-        if self._loading_widget is not None:
-            self._loading_widget.set_hint_suppressed(False)
-
-        for app in BottomApp:
-            if app != BottomApp.Input:
-                try:
-                    await self.query_one(f"#{app.value}-app").remove()
-                except Exception:
-                    pass
-
-        if self._chat_input_container:
-            self.call_after_refresh(self._chat_input_container.focus_input)
-            if self._chat_widget.is_at_bottom:
-                self.call_after_refresh(self._chat_widget.anchor)
-        if reopen_settings:
-            await self._show_settings()
-        else:
-            await self._present_pending_callback()
+        await self._bottom_panel.switch_to_input_app(
+            return_to_settings=return_to_settings
+        )
 
     def _focus_current_bottom_app(self) -> None:
-        focus_widget_by_app: dict[BottomApp, type[Widget]] = {
-            BottomApp.LogLevelPicker: _get_log_level_picker_app_class(),
-            BottomApp.ModelPicker: _get_model_picker_app_class(),
-            BottomApp.ThemePicker: _get_theme_picker_app_class(),
-            BottomApp.ThinkingPicker: _get_thinking_picker_app_class(),
-            BottomApp.ProxySetup: _get_proxy_setup_app_class(),
-            BottomApp.Question: _get_question_app_class(),
-            BottomApp.SessionPicker: _get_session_picker_app_class(),
-            BottomApp.MCP: _get_mcp_app_class(),
-            BottomApp.MCPOAuth: _get_mcp_oauth_app_class(),
-            BottomApp.Rewind: _get_rewind_app_class(),
-        }
-        try:
-            if self._current_bottom_app == BottomApp.Input:
-                self.query_one(ChatInputContainer).focus_input()
-                return
-            self.query_one(focus_widget_by_app[self._current_bottom_app]).focus()
-        except Exception:
-            pass
+        self._bottom_panel.focus_current_bottom_app()
 
-    def _handle_question_app_escape(self) -> None:
-        try:
-            question_app = self.query_one(_get_question_app_class())
-            if not question_app.is_within_grace_period():
-                question_app.action_cancel()
-        except Exception:
-            pass
-        self._last_escape_time = None
+    def _try_interrupt_bottom_app_escape(self) -> bool:
+        return self._bottom_panel.try_interrupt_bottom_app_escape()
 
-    def _handle_log_level_picker_app_escape(self) -> None:
-        try:
-            log_level_picker = self.query_one(_get_log_level_picker_app_class())
-            log_level_picker.action_cancel()
-        except Exception:
-            pass
-        self._last_escape_time = None
+    def _try_interrupt(self) -> bool:
+        return self._bottom_panel.try_interrupt()
 
-    def _handle_model_picker_app_escape(self) -> None:
-        try:
-            model_picker = self.query_one(_get_model_picker_app_class())
-            model_picker.post_message(_get_model_picker_app_class().Cancelled())
-        except Exception:
-            pass
-        self._last_escape_time = None
-
-    def _handle_theme_picker_app_escape(self) -> None:
-        try:
-            theme_picker = self.query_one(_get_theme_picker_app_class())
-            theme_picker.post_message(
-                _get_theme_picker_app_class().Cancelled(
-                    original_theme=self.config.theme
-                )
-            )
-        except Exception:
-            pass
-        self._last_escape_time = None
-
-    def _handle_thinking_picker_app_escape(self) -> None:
-        try:
-            thinking_picker = self.query_one(_get_thinking_picker_app_class())
-            thinking_picker.post_message(_get_thinking_picker_app_class().Cancelled())
-        except Exception:
-            pass
-        self._last_escape_time = None
-
-    def _handle_session_picker_app_escape(self) -> None:
-        try:
-            session_picker = self.query_one(_get_session_picker_app_class())
-            session_picker.action_cancel()
-        except Exception:
-            pass
-        self._last_escape_time = None
+    def _handle_input_double_escape(self) -> None:
+        self._bottom_panel.handle_input_double_escape()
 
     # --- Rewind mode ---
-
-    def _get_user_message_widgets(self) -> list[UserMessage]:
-        """Return all UserMessage widgets currently visible in #messages.
-
-        Only includes completed messages with a public history id (i.e. real
-        user messages, not queued prompts or slash-command echo messages).
-        """
-        return [
-            child
-            for child in self._messages_area.children
-            if (
-                isinstance(child, UserMessage)
-                and child.history_entry_id is not None
-                and not child.pending
-            )
-        ]
-
-    def _start_rewind_mode(self, **kwargs: Any) -> None:
-        self.action_rewind_prev()
-
-    def action_rewind_prev(self) -> None:
-        if self._agent_job_active():
-            return
-
-        user_widgets = self._get_user_message_widgets()
-        if not user_widgets:
-            return
-
-        if not self._rewind_mode:
-            self._rewind_mode = True
-            target = user_widgets[-1]
-        elif self._rewind_highlighted_widget is not None:
-            try:
-                idx = user_widgets.index(self._rewind_highlighted_widget)
-            except ValueError:
-                idx = len(user_widgets)
-            if idx <= 0:
-                self.run_worker(
-                    self._rewind_prev_at_top(), group="rewind", exclusive=False
-                )
-                return
-            target = user_widgets[idx - 1]
-        else:
-            target = user_widgets[-1]
-
-        self.run_worker(
-            self._select_rewind_widget(target), group="rewind", exclusive=False
-        )
-
-    async def _rewind_prev_at_top(self) -> None:
-        """Handle navigating past the topmost visible user message."""
-        if self._load_more.widget is not None and self._has_older_history:
-            await self.on_history_load_more_requested(HistoryLoadMoreRequested())
-            user_widgets = self._get_user_message_widgets()
-            if user_widgets and self._rewind_highlighted_widget is not None:
-                # Find the current highlighted widget in the refreshed list
-                # and select the one above it
-                try:
-                    idx = user_widgets.index(self._rewind_highlighted_widget)
-                except ValueError:
-                    idx = 0
-                if idx > 0:
-                    await self._select_rewind_widget(user_widgets[idx - 1])
-                    return
-        # No load more or already first message: scroll to top
-        self.call_after_refresh(self._chat_widget.scroll_home, animate=False)
-
-    def action_rewind_next(self) -> None:
-        if not self._rewind_mode:
-            return
-
-        if self._rewind_highlighted_widget is None:
-            return
-
-        user_widgets = self._get_user_message_widgets()
-        try:
-            idx = user_widgets.index(self._rewind_highlighted_widget)
-        except ValueError:
-            return
-        if idx >= len(user_widgets) - 1:
-            return
-
-        self.run_worker(
-            self._select_rewind_widget(user_widgets[idx + 1]),
-            group="rewind",
-            exclusive=False,
-        )
-
-    async def _select_rewind_widget(self, widget: UserMessage) -> None:
-        """Highlight the given user message widget and show the rewind panel."""
-        entry_id = widget.history_entry_id
-        if entry_id is None or widget.pending:
-            return
-        try:
-            has_file_changes = await (
-                self.app_server.resources.sessions.rewind_has_file_changes(entry_id)
-            )
-        except AppServerResponseError as exc:
-            self.notify(exc.error.message, severity="error")
-            if self._rewind_highlighted_widget is None:
-                self._rewind_mode = False
-            return
-
-        if self._rewind_highlighted_widget is not None:
-            self._rewind_highlighted_widget.remove_class("rewind-selected")
-
-        widget.add_class("rewind-selected")
-        self._rewind_highlighted_widget = widget
-
-        await self._switch_to_rewind_app(
-            widget.get_content(), has_file_changes=has_file_changes
-        )
-
-        chat = self._chat_widget
-        self.call_after_refresh(chat.scroll_to_widget, widget, animate=False, top=True)
-
-    async def _switch_to_rewind_app(
-        self, message_preview: str, *, has_file_changes: bool
-    ) -> None:
-        """Show the rewind action panel at the bottom."""
-        if self._current_bottom_app == BottomApp.Rewind:
-            # Reuse existing widget if the option set hasn't changed
-            try:
-                existing = self.query_one(_get_rewind_app_class())
-                if existing.has_file_changes == has_file_changes:
-                    existing.update_preview(message_preview)
-                    return
-                await existing.remove()
-            except Exception:
-                pass
-
-            rewind_app = _get_rewind_app_class()(
-                message_preview=message_preview, has_file_changes=has_file_changes
-            )
-            bottom_container = self.query_one("#bottom-app-container")
-            self._current_bottom_app = BottomApp.Rewind
-            await bottom_container.mount(rewind_app)
-            self.call_after_refresh(rewind_app.focus)
-        else:
-            rewind_app = _get_rewind_app_class()(
-                message_preview=message_preview, has_file_changes=has_file_changes
-            )
-            await self._switch_from_input(rewind_app)
-
-    def _clear_rewind_state(self) -> None:
-        if self._rewind_highlighted_widget is not None:
-            self._rewind_highlighted_widget.remove_class("rewind-selected")
-            self._rewind_highlighted_widget = None
-        self._rewind_mode = False
-
-    async def _exit_rewind_mode(self) -> None:
-        """Exit rewind mode and restore the input panel."""
-        self._clear_rewind_state()
-        await self._switch_to_input_app()
 
     def _handle_rewind_app_escape(self) -> None:
         try:
@@ -5941,59 +4125,18 @@ class ChartreuxApp(App):  # noqa: PLR0904
     async def on_rewind_app_rewind_confirmed(
         self, message: RewindApp.RewindConfirmed
     ) -> None:
-        await self._execute_rewind(
+        await self._session_flow.execute_rewind(
             restore_files=message.restore_files, inplace=message.inplace
         )
 
     def on_rewind_app_edit_prev(self, message: RewindApp.EditPrev) -> None:
-        self.action_rewind_prev()
+        self._session_flow.rewind_prev()
 
     def on_rewind_app_edit_next(self, message: RewindApp.EditNext) -> None:
-        self.action_rewind_next()
+        self._session_flow.rewind_next()
 
     async def on_rewind_app_quit(self, message: RewindApp.Quit) -> None:
-        await self._exit_rewind_mode()
-
-    async def _execute_rewind(self, *, restore_files: bool, inplace: bool) -> None:
-        if not self._rewind_mode or self._rewind_highlighted_widget is None:
-            return
-
-        target_widget = self._rewind_highlighted_widget
-        entry_id = target_widget.history_entry_id
-        if entry_id is None:
-            return
-
-        old_session_id = self.app_server.session_id
-        await self._request_agent_transcript_close(restore_focus=False)
-        try:
-            result = await self.app_server.resources.sessions.rewind(
-                entry_id, restore_files=restore_files, inplace=inplace
-            )
-            await self._queue.clear_server_queue()
-            await self.app_server.resources.refresh()
-        except AppServerResponseError as exc:
-            self.notify(exc.error.message, severity="error")
-            return
-
-        message_content = result.message
-        restore_errors = result.restore_errors
-
-        for error in restore_errors:
-            self.notify(error, severity="warning")
-
-        self._clear_rewind_state()
-        await self._switch_to_input_app()
-        await self._reset_message_widgets()
-        await self._resume_history_from_messages()
-        if not inplace:
-            await self._mount_and_scroll(
-                RewindForkMessage(
-                    old_session_id=old_session_id,
-                    new_session_id=self.app_server.session_id,
-                )
-            )
-        if self._chat_input_container:
-            self._chat_input_container.value = message_content
+        await self._session_flow.exit_rewind_mode()
 
     # --- End rewind mode ---
 
@@ -6004,109 +4147,20 @@ class ChartreuxApp(App):  # noqa: PLR0904
         except Exception:
             pass
 
-    def _handle_input_double_escape(self) -> None:
-        """Clear the input when it has content, otherwise enter rewind mode."""
-        self._last_escape_time = None
-        if self._chat_input_container and self._chat_input_container.value:
-            self._clear_input()
-        else:
-            self._start_rewind_mode()
-
     def _handle_agent_running_escape(self) -> None:
-        self._begin_interrupt_settle()
-        self.run_worker(self._interrupt_turn(), exclusive=False)
+        self._turn_supervisor.handle_agent_running_escape()
 
     def _begin_interrupt_settle(self) -> None:
-        """Open the interrupt window so a racing submit waits for fresh state.
-
-        A submit that lands before the server pauses the queue and completes the
-        turn would branch on stale ``paused``/``turn_active`` values, losing the
-        prompt or flashing it as queued. ``_maybe_settle_interrupt`` closes the
-        window once the queue reflects the interrupt.
-        """
-        if self._interrupt_pending:
-            return
-        self._interrupt_pending = True
-        self._interrupt_settled.clear()
+        self._turn_supervisor.begin_interrupt_settle()
 
     def _settle_interrupt(self) -> None:
-        """Close the interrupt window, waking any submit deferred behind it."""
-        self._interrupt_pending = False
-        self._interrupt_settled.set()
+        self._turn_supervisor.settle_interrupt()
 
     def _maybe_settle_interrupt(self) -> None:
-        if not self._interrupt_pending:
-            return
-        if self._agent_job_active():
-            return
-        # Accepted server items that are not yet paused mean the interrupt's
-        # queue transition is still in flight: wait so a submit resumes cleanly
-        # instead of enqueuing into a queue that is about to pause. An empty
-        # queue (or one already paused) emits nothing more, so this settles.
-        # Reading the live queue rather than a snapshot avoids stalling when the
-        # server never pauses (e.g. in-flight enqueues or a turn that raced to a
-        # natural completion): those leave no accepted items to wait on.
-        if self._queue.has_removable and not self._queue.paused:
-            return
-        self._settle_interrupt()
+        self._turn_supervisor.maybe_settle_interrupt()
 
     async def _await_interrupt_settled(self) -> None:
-        if not self._interrupt_pending:
-            return
-        try:
-            await asyncio.wait_for(
-                self._interrupt_settled.wait(), timeout=_INTERRUPT_SETTLE_TIMEOUT
-            )
-        except TimeoutError:
-            # The settle window is only a stale-state guard when no interrupt
-            # request remains owned. A timed-out request must keep submissions
-            # deferred until its supervisor consumes the eventual outcome.
-            operation = self._interrupt_operation
-            if operation is not None and not operation.done():
-                await self._interrupt_settled.wait()
-            else:
-                self._settle_interrupt()
-
-    def _handle_bottom_app_close_escape(self, widget_type: type[Widget]) -> None:
-        try:
-            cast(Any, self.query_one(widget_type)).action_close()
-        except Exception:
-            pass
-        self._last_escape_time = None
-
-    def _try_interrupt_bottom_app_escape(self) -> bool:
-        handlers = {
-            BottomApp.MCP: lambda: self._handle_bottom_app_close_escape(
-                _get_mcp_app_class()
-            ),
-            BottomApp.MCPOAuth: lambda: self._handle_bottom_app_close_escape(
-                _get_mcp_oauth_app_class()
-            ),
-            BottomApp.ProxySetup: lambda: self._handle_bottom_app_close_escape(
-                _get_proxy_setup_app_class()
-            ),
-            BottomApp.Question: self._handle_question_app_escape,
-            BottomApp.LogLevelPicker: self._handle_log_level_picker_app_escape,
-            BottomApp.ModelPicker: self._handle_model_picker_app_escape,
-            BottomApp.ThemePicker: self._handle_theme_picker_app_escape,
-            BottomApp.ThinkingPicker: self._handle_thinking_picker_app_escape,
-            BottomApp.SessionPicker: self._handle_session_picker_app_escape,
-        }
-
-        if handler := handlers.get(self._current_bottom_app):
-            handler()
-        elif self._current_bottom_app == BottomApp.Rewind:
-            self._handle_rewind_app_escape()
-            self._last_escape_time = None
-        elif (
-            self._current_bottom_app == BottomApp.Input
-            and self._last_escape_time is not None
-            and (time.monotonic() - self._last_escape_time) < DOUBLE_ESC_DELAY
-        ):
-            self._handle_input_double_escape()
-        else:
-            return False
-        return True
+        await self._turn_supervisor.await_interrupt_settled()
 
     def _try_interrupt_no_job_steps(self) -> bool:
         if self._chat_input_container:
@@ -6135,18 +4189,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
             interrupted = True
         return interrupted
 
-    def _try_interrupt(self) -> bool:
-        if self._try_interrupt_no_job_steps():
-            return True
-
-        interrupted = self._try_interrupt_running_job()
-
-        self._last_escape_time = time.monotonic()
-        if self._chat_widget.is_at_bottom:
-            self.call_after_refresh(self._chat_widget.anchor)
-        self._focus_current_bottom_app()
-        return interrupted
-
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Let Escape fall through while the input queue selection is active."""
         if action != "interrupt":
@@ -6164,7 +4206,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         ):
             return False
         if (
-            isinstance(self.screen, ExitConsequencesScreen)
+            isinstance(self.screen, _get_exit_consequences_screen_class())
             or self._agent_transcript_viewer is not None
             or (
                 self._debug_console is not None and self._debug_console.owns_interaction
@@ -6182,7 +4224,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         return True
 
     def action_interrupt(self) -> None:
-        if self.is_running and isinstance(self.screen, ExitConsequencesScreen):
+        if self.is_running and isinstance(
+            self.screen, _get_exit_consequences_screen_class()
+        ):
             self.screen.action_cancel()
             return
         if viewer := self._agent_transcript_viewer:
@@ -6202,123 +4246,45 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._try_interrupt()
 
     async def on_history_load_more_requested(self, _: HistoryLoadMoreRequested) -> None:
-        self._load_more.set_enabled(False)
-        try:
-            if not self._windowing.has_backfill:
-                if not await self._load_older_history_page():
-                    messages_area = self._messages_area
-                    # A failed/empty older-page fetch hides the button the user
-                    # scrolled up to click; keep the reading anchor's row.
-                    hiding_load_more = self._load_more.widget is not None
-                    reading_anchor = None
-                    if hiding_load_more and not self._chat_widget.is_at_bottom:
-                        await self._transcript._layout_pass(messages_area)
-                        reading_anchor = self._transcript._reading_anchor(messages_area)
-                    await self._load_more.hide()
-                    if reading_anchor is not None:
-                        await self._restore_reading_anchor(
-                            reading_anchor, messages_area
-                        )
-                    return
-            if (batch := self._windowing.next_load_more_batch()) is None:
-                await self._load_more.hide()
-                return
-            messages_area = self._messages_area
-            if self._load_more.widget:
-                before: Widget | int | None = None
-                after: Widget | None = self._load_more.widget
-            else:
-                before = 0
-                after = None
-            await self._mount_history_batch(
-                batch.entries,
-                messages_area,
-                start_index=batch.start_index,
-                before=before,
-                after=after,
-            )
-            # Removing an exhausted Load More button shrinks the content above the
-            # reading anchor; record the anchor first and restore its row after
-            # the removal so the view does not jump.
-            hiding_load_more = (
-                not self._has_older_history and self._load_more.widget is not None
-            )
-            reading_anchor = None
-            if hiding_load_more and not self._chat_widget.is_at_bottom:
-                # The prepend compensation's final scroll must be laid out before
-                # placement regions describe the settled reading anchor.
-                await self._transcript._layout_pass(messages_area)
-                reading_anchor = self._transcript._reading_anchor(messages_area)
-            await self._load_more.set_visible(
-                messages_area,
-                visible=self._has_older_history,
-                remaining=self._history_backfill_remaining,
-            )
-            if reading_anchor is not None:
-                await self._restore_reading_anchor(reading_anchor, messages_area)
-        finally:
-            self._load_more.set_enabled(True)
-
-    @property
-    def _has_older_history(self) -> bool:
-        if self._windowing.has_backfill:
-            return True
-        # During picker preview the live session's server-side cursor is irrelevant:
-        # the preview history was fetched in full via session/history/get, so only
-        # the local windowing backfill determines whether Load More is available.
-        if self._picker.previewing:
-            return False
-        return self.app_server.resources.sessions.history_before_cursor is not None
-
-    @property
-    def _history_backfill_remaining(self) -> int | None:
-        if self._picker.previewing:
-            return self._windowing.remaining or None
-        if self.app_server.resources.sessions.history_before_cursor is not None:
-            return None
-        return self._windowing.remaining or None
-
-    async def _load_older_history_page(self) -> bool:
-        before = self.app_server.resources.sessions.history_before_cursor
-        if before is None:
-            return False
-        page = await self.app_server.resources.sessions.load_before(
-            before, LOAD_MORE_BATCH_SIZE
-        )
-        if not page.data:
-            return False
-        shift_history_widget_indices(self._history_widget_indices, len(page.data))
-        self._windowing.set_backfill(page.data)
-        return True
+        await self._transcript_presenter.on_load_more_requested(_)
 
     async def action_toggle_tool(self) -> None:
-        groups = list(self.query(ToolGroup))
-        sections = list(self.query(CollapsibleSection))
-        reasoning = list(self.query(ReasoningMessage))
-        group_state = (
-            self._preview_tool_group_expansion_state
-            if self._picker.previewing
-            else self._tool_group_expansion_state
+        await self._transcript_presenter.toggle_tool()
+
+    def _usage_sync_binding(self) -> tuple[AppServerSession, str] | None:
+        """Current usage subscription binding, or None while sync must not run."""
+        if (
+            self._shutdown_started
+            or self._app_server is None
+            or not self._session_ready.is_set()
+            or not self._resume_ui_ready.is_set()
+        ):
+            return None
+        session = self.app_server
+        return (session, session.session_id)
+
+    def _is_usage_binding_current(self, binding: tuple[AppServerSession, str]) -> bool:
+        """Whether a subscription binding still matches the live session."""
+        session = binding[0]
+        return (
+            self._app_server is session
+            and session.session_id == binding[1]
+            and not self._shutdown_started
         )
-        entry_state = (
-            self._preview_entry_expansion_state
-            if self._picker.previewing
-            else self._entry_expansion_state
-        )
-        expanded = [not group_state.is_collapsed(key) for key in group_state.keys]
-        expanded.extend(
-            not group.is_collapsed for group in groups if group._key is None
-        )
-        self._tools_collapsed = all(expanded) if expanded else not self._tools_collapsed
-        group_state.set_all_collapsed(self._tools_collapsed)
-        entry_state.set_all_collapsed(self._tools_collapsed)
-        for group in groups:
-            group.set_collapsed(self._tools_collapsed)
-        for section in sections:
-            section.set_collapsed(self._tools_collapsed)
-        for node in reasoning:
-            await node.set_collapsed(self._tools_collapsed)
-        self._request_transcript_reconcile()
+
+    @property
+    def _usage_poll_task(self) -> asyncio.Task[None] | None:
+        return self._usage_controller.poll_task
+
+    @property
+    def _usage_tasks(self) -> set[asyncio.Task[None]]:
+        return self._usage_controller.tasks
+
+    def _sync_usage_subscription(self) -> None:
+        self._usage_controller.sync()
+
+    def _stop_usage_subscription(self) -> None:
+        self._usage_controller.stop()
 
     def _usage_screen_providers(
         self,
@@ -6329,76 +4295,6 @@ class ChartreuxApp(App):  # noqa: PLR0904
         """Resource-backed constructor arguments for UsageScreen, without opening it."""
         usage = self.app_server.resources.usage
         return usage.read, usage.subscribe
-
-    def _track_usage_task(
-        self, coroutine: Coroutine[Any, Any, None]
-    ) -> asyncio.Task[None]:
-        task = asyncio.create_task(coroutine)
-        self._usage_tasks.add(task)
-        task.add_done_callback(self._usage_tasks.discard)
-        return task
-
-    def _stop_usage_subscription(self) -> None:
-        self._usage_binding = None
-        if self._usage_unsubscribe is not None:
-            self._usage_unsubscribe()
-            self._usage_unsubscribe = None
-        for task in (self._usage_initial_task, self._usage_poll_task):
-            if task is not None:
-                task.cancel()
-        self._usage_initial_task = None
-        self._usage_poll_task = None
-
-    def _sync_usage_subscription(self) -> None:
-        if (
-            self._shutdown_started
-            or self._app_server is None
-            or not self._session_ready.is_set()
-            or not self._resume_ui_ready.is_set()
-        ):
-            return
-        session = self.app_server
-        binding = (session, session.session_id)
-        if binding != self._usage_binding:
-            self._stop_usage_subscription()
-            self._usage_binding = binding
-            usage = session.resources.usage
-
-            def updated(snapshot: UsageUpdatedParams) -> None:
-                if (
-                    self._usage_binding == binding
-                    and self._app_server is session
-                    and session.session_id == binding[1]
-                    and not self._shutdown_started
-                ):
-                    self._on_usage_updated(snapshot)
-
-            self._usage_unsubscribe = usage.subscribe(updated)
-            if usage.current is not None:
-                updated(usage.current)
-            # No usage RPC is awaited on the mount/readiness path.
-            self._usage_initial_task = self._track_usage_task(self._read_usage(session))
-        enabled = any(
-            segment in {"spend-today", "spend-week", "spend-month"}
-            for segment in self.config.status_line.segments
-        )
-        if enabled and self._usage_poll_task is None:
-            self._usage_poll_task = self._track_usage_task(self._poll_usage(session))
-        elif not enabled and self._usage_poll_task is not None:
-            self._usage_poll_task.cancel()
-            self._usage_poll_task = None
-
-    async def _read_usage(self, session: AppServerSession) -> None:
-        try:
-            # The resource publishes reconciled global summaries to subscribers.
-            await session.resources.usage.read()
-        except Exception as exc:
-            logger.debug("Usage refresh failed", exc_info=exc)
-
-    async def _poll_usage(self, session: AppServerSession) -> None:
-        while True:
-            await asyncio.sleep(_USAGE_POLL_INTERVAL_SECONDS)
-            await self._read_usage(session)
 
     def _on_usage_updated(self, snapshot: UsageUpdatedParams) -> None:
         self._usage_summaries = snapshot.summaries
@@ -6518,355 +4414,56 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
 
     def on_descendant_focus(self, event: DescendantFocus) -> None:
-        if self._agent_transcript_viewer is not None:
-            return
-        if event.widget is self._agent_bar:
-            if self._agent_browser_opener is None:
-                self._capture_agent_browser_origin(self._last_conversation_focus)
-        elif self._agent_bar is None or not self._agent_bar.expanded:
-            self._last_conversation_focus = event.widget
-
-    def _capture_agent_browser_origin(self, opener: Widget | None) -> None:
-        self._agent_browser_opener = opener
-        self._agent_browser_anchor = self._transcript.capture_anchor(
-            self._messages_area, following=self._transcript_following
-        )
+        self._agent_browser.on_descendant_focus(event)
 
     async def on_agent_bar_closed(self, message: AgentBar.Closed) -> None:
-        message.stop()
-        anchor = self._agent_browser_anchor
-        self._agent_browser_anchor = None
-        if anchor is not None:
-            await self._transcript.restore_anchor(self._messages_area, anchor)
-        opener = self._agent_browser_opener
-        self._agent_browser_opener = None
-        if opener is not None and opener.is_mounted:
-            self.call_after_refresh(lambda: opener.focus(scroll_visible=False))
+        await self._agent_browser.on_agent_bar_closed(message)
 
     async def action_toggle_agent_browser(self, **kwargs: Any) -> None:
-        if self._agent_bar is None:
-            return
-        if self._current_bottom_app == BottomApp.Question:
-            await self._mount_and_scroll(
-                UserCommandMessage("Finish or cancel this question first.")
-            )
-            return
-        # The expanded browser is independent of the collapsed segment: it is
-        # always reachable, even while the inventory is empty (design §8).
-        if not self._agent_bar.expanded:
-            self._capture_agent_browser_origin(self.screen.focused)
-            self._refresh_main_agent_details()
-            self._agent_bar.open_browser()
-        else:
-            self._agent_bar.close_browser()
-            await self.on_agent_bar_closed(AgentBar.Closed())
+        await self._agent_browser.toggle_agent_browser(**kwargs)
 
     def on_agent_bar_stop_requested(self, message: AgentBar.StopRequested) -> None:
-        message.stop()
-        # Do not block agents/update processing while the RPC is outstanding.
-        self.run_worker(
-            self._cancel_agent_run(message.agent_id, message.run_id), exclusive=False
-        )
+        self._agent_browser.on_agent_bar_stop_requested(message)
 
     def on_agent_bar_release_requested(
         self, message: AgentBar.ReleaseRequested
     ) -> None:
-        message.stop()
-        # Do not block agents/update processing while the RPC is outstanding.
-        self.run_worker(
-            self._release_agent(message.agent_id, message.expected_run_id),
-            exclusive=False,
-        )
-
-    async def _release_agent(self, agent_id: str, expected_run_id: str | None) -> None:
-        try:
-            response = await self.app_server.release_agent(agent_id, expected_run_id)
-        except Exception as exc:
-            # The registry purges records and results before awaiting runtime
-            # teardown, so a lost RPC response does not prove the release did
-            # not commit: keep the outcome uncertain instead of claiming the
-            # agent is unchanged.
-            self.notify(
-                f"Failed to release {agent_id}: {exc}. "
-                "Release may or may not have completed; "
-                "check the agents browser or check_agents before retrying.",
-                severity="error",
-                markup=False,
-            )
-            return
-        # The outcome never encodes the tombstone reason; conflict and unknown
-        # mean nothing was stopped or purged, so a stale reply cannot affect a
-        # replacement run's state.
-        if response.outcome is ReleaseOutcome.CONFLICT:
-            self.notify(
-                f"Release conflict for {agent_id}: "
-                f"{response.reason or 'the agent changed state'}. "
-                "Nothing was released; the agent may have started a new run.",
-                severity="warning",
-                markup=False,
-            )
-        elif response.outcome is ReleaseOutcome.UNKNOWN:
-            self.notify(
-                f"{agent_id} is no longer known to the server; nothing was released.",
-                severity="warning",
-                markup=False,
-            )
-
-    async def _cancel_agent_run(self, agent_id: str, run_id: str) -> None:
-        bar = self._agent_bar
-        if bar is None or not bar.stop_is_pending(agent_id, run_id):
-            return
-        try:
-            response = await self.app_server.cancel_agent(agent_id, run_id)
-        except Exception as exc:
-            bar.settle_stop(agent_id, run_id, None)
-            self.notify(
-                f"Failed to stop {agent_id}, run {run_id}: {exc}. "
-                "Retained output remains inspectable; retry or close the browser.",
-                severity="error",
-                markup=False,
-            )
-            return
-        bar.settle_stop(agent_id, run_id, response)
-        if response.outcome is CancelOutcome.FORBIDDEN:
-            self.notify(
-                f"Stop forbidden for {agent_id}, run {run_id}. "
-                "Retained output remains inspectable; close the browser.",
-                severity="error",
-                markup=False,
-            )
+        self._agent_browser.on_agent_bar_release_requested(message)
 
     def on_agent_bar_selection_requested(
         self, message: AgentBar.SelectionRequested
     ) -> None:
-        self._submit_agent_selection(message.agent_id)
+        self._agent_browser.on_agent_bar_selection_requested(message)
+
+    def _agent_is_active(self, agent: AgentSummaryModel) -> bool:
+        """Late-bound read of the agent_is_active seam.
+
+        Tests patch ``chartreux.cli.textual_ui.app.agent_is_active``; reading
+        the module global at call time keeps that patch effective.
+        """
+        return agent_is_active(agent)
 
     def _submit_agent_selection(self, agent_id: str | None) -> None:
-        if agent_id is not None and self._current_bottom_app == BottomApp.Question:
-            self.notify("Finish or cancel this question first", severity="warning")
-            return
-        self._agent_selection_generation += 1
-        self._agent_selection_target = agent_id
-        logger.debug(
-            "Agent selection phase=submitted generation=%d target=%s",
-            self._agent_selection_generation,
-            agent_id,
-        )
-        self._ensure_agent_transition()
-
-    def _ensure_agent_transition(self) -> None:
-        if self._agent_transition_task is None or self._agent_transition_task.done():
-            self._agent_transition_task = asyncio.create_task(
-                self._converge_agent_selection()
-            )
-
-    async def _converge_agent_selection(self) -> None:  # noqa: PLR0915
-        while True:
-            generation = self._agent_selection_generation
-            target = self._agent_selection_target
-            logger.debug(
-                "Agent selection phase=transition-start generation=%d target=%s",
-                generation,
-                target,
-            )
-            try:
-                if target is None:
-                    await self._close_agent_transcript_viewer(
-                        restore_focus=self._agent_close_restore_focus, show_chat=True
-                    )
-                    if generation != self._agent_selection_generation:
-                        continue
-                    logger.debug(
-                        "Agent selection phase=closed generation=%d", generation
-                    )
-                    return
-                if self._app_server is None or not self.is_running:
-                    return
-                current = self._agent_transcript_viewer
-                if (
-                    current is not None
-                    and current.agent_id == target
-                    and current.is_mounted
-                ):
-                    break
-                agent = next(
-                    (item for item in self._agent_summaries if item.agent_id == target),
-                    None,
-                )
-                if agent is None:
-                    return
-                debug_timings = get_effective_log_level() == "DEBUG"
-                await self._close_agent_transcript_viewer(
-                    restore_focus=False, show_chat=False
-                )
-                if (
-                    generation != self._agent_selection_generation
-                    or not self.is_running
-                ):
-                    continue
-                self._agent_transcript_focus_target = self.screen.focused
-                self._agent_transcript_epoch += 1
-                self._agent_transcript_parent_id = self.app_server.session_id
-                viewer = AgentTranscriptViewer(
-                    _AgentTranscriptSource(
-                        self,
-                        self.app_server.resources.sessions,
-                        self._agent_transcript_epoch,
-                        self._agent_transcript_parent_id,
-                    ),
-                    agent.agent_id,
-                    profile=agent.profile,
-                    name=agent.name,
-                    metadata=(
-                        self._agent_bar.full_metadata(agent)
-                        if self._agent_bar is not None
-                        else ""
-                    ),
-                    live=agent_is_active(agent),
-                    show_message_timestamps=self.config.show_message_timestamps,
-                )
-                self._agent_transcript_viewer = viewer
-                self._chat_widget.display = False
-                self._hide_conversation_chrome()
-                self._indicate_pending_action()
-                try:
-                    logger.debug(
-                        "Agent selection phase=mount-start generation=%d target=%s",
-                        generation,
-                        target,
-                    )
-                    mount_start = time.perf_counter() if debug_timings else 0.0
-                    await self.mount(viewer, before="#chat")
-                    self._indicate_pending_action()
-                    if debug_timings:
-                        logger.debug(
-                            "Agent transcript mount took %.3fs generation=%d target=%s",
-                            time.perf_counter() - mount_start,
-                            generation,
-                            target,
-                        )
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to mount agent transcript viewer", exc_info=exc
-                    )
-                    self._agent_transcript_viewer = None
-                    self._agent_transcript_epoch += 1
-                    self._agent_transcript_parent_id = None
-                    self._recover_agent_mount_failure()
-                    if generation != self._agent_selection_generation:
-                        continue
-                    return
-                await asyncio.sleep(0)
-                if generation != self._agent_selection_generation:
-                    continue
-                viewer.focus()
-                logger.debug(
-                    "Agent selection phase=ready generation=%d target=%s",
-                    generation,
-                    target,
-                )
-                return
-            except Exception as exc:
-                logger.warning("Agent selection transition failed", exc_info=exc)
-                if generation != self._agent_selection_generation:
-                    continue
-                return
+        self._agent_browser.submit_agent_selection(agent_id)
 
     async def _request_agent_transcript_close(
         self, *, restore_focus: bool = True
     ) -> None:
-        self._agent_selection_generation += 1
-        self._agent_selection_target = None
-        logger.debug(
-            "Agent selection phase=close-requested generation=%d",
-            self._agent_selection_generation,
+        await self._agent_browser.request_agent_transcript_close(
+            restore_focus=restore_focus
         )
-        self._agent_close_restore_focus = restore_focus
-        self._ensure_agent_transition()
-        task = self._agent_transition_task
-        if task is not None and task is not asyncio.current_task():
-            await task
 
     async def on_agent_transcript_viewer_closed(
         self, message: AgentTranscriptViewer.Closed
     ) -> None:
-        if message.viewer is self._agent_transcript_viewer:
-            await self._request_agent_transcript_close(restore_focus=True)
+        await self._agent_browser.on_agent_transcript_viewer_closed(message)
 
     async def _close_agent_transcript_viewer(
         self, *, restore_focus: bool, show_chat: bool = True
     ) -> None:
-        viewer = self._agent_transcript_viewer
-        self._agent_transcript_epoch += 1
-        self._agent_transcript_viewer = None
-        self._agent_transcript_parent_id = None
-        if viewer is not None and viewer.is_mounted:
-            debug = get_effective_log_level() == "DEBUG"
-            start = time.perf_counter() if debug else 0.0
-            if debug:
-                logger.debug(
-                    "Agent transcript teardown phase=start generation=%d agent=%s",
-                    self._agent_selection_generation,
-                    viewer.agent_id,
-                )
-            try:
-                await viewer.dispose()
-                if viewer.is_mounted:
-                    await viewer.remove()
-            finally:
-                if debug:
-                    logger.debug(
-                        "Agent transcript teardown took %.3fs generation=%d agent=%s",
-                        time.perf_counter() - start,
-                        self._agent_selection_generation,
-                        viewer.agent_id,
-                    )
-        if show_chat:
-            if self._cached_chat is not None:
-                self._cached_chat.display = True
-            self._restore_conversation_chrome()
-            if self._agent_browser_anchor is not None:
-                await self._transcript.restore_anchor(
-                    self._messages_area, self._agent_browser_anchor
-                )
-        if not restore_focus:
-            self._agent_transcript_focus_target = None
-            return
-        target = self._agent_transcript_focus_target
-        self._agent_transcript_focus_target = None
-        if self._agent_bar is not None and self._agent_bar.expanded:
-            self.call_after_refresh(self._agent_bar.focus)
-        elif target is not None and target.is_mounted:
-            self.call_after_refresh(lambda: target.focus(scroll_visible=False))
-        elif self._chat_input_container is not None:
-            if input_widget := self._chat_input_container.input_widget:
-                input_widget.set_app_focus(True)
-            self.call_after_refresh(self._chat_input_container.focus_input)
-        if show_chat and self._agent_selection_target is None:
-            await self._present_pending_callback()
-
-    def _recover_agent_mount_failure(self) -> None:
-        if self._cached_chat is not None:
-            self._cached_chat.display = True
-        self._restore_conversation_chrome()
-
-    def _hide_conversation_chrome(self) -> None:
-        for chrome_id in (
-            "loading-area",
-            "agent-bar",
-            "bottom-app-container",
-            "bottom-bar",
-        ):
-            self.query_one(f"#{chrome_id}").display = False
-
-    def _restore_conversation_chrome(self) -> None:
-        for chrome_id in ("loading-area", "bottom-app-container", "bottom-bar"):
-            self.query_one(f"#{chrome_id}").display = True
-        if self._agent_bar is not None:
-            # The expanded browser stays visible even with an empty inventory.
-            self._agent_bar.display = (
-                bool(self._agent_bar.agents) or self._agent_bar.expanded
-            )
+        await self._agent_browser.close_agent_transcript_viewer(
+            restore_focus=restore_focus, show_chat=show_chat
+        )
 
     async def on_debug_console_closed(self, _message: DebugConsole.Closed) -> None:
         await self._close_debug_console()
@@ -6912,7 +4509,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         return None
 
     def action_interrupt_or_quit(self) -> None:  # noqa: PLR0911
-        if self.is_running and isinstance(self.screen, ExitConsequencesScreen):
+        if self.is_running and isinstance(
+            self.screen, _get_exit_consequences_screen_class()
+        ):
             return
         # Ctrl+C priority ladder: clear input → second-press quit → bottom-app/etc
         # no-op steps → pop last queued item (LIFO) → cancel running job → request quit.
@@ -6935,7 +4534,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._request_intentional_exit("Ctrl+C")
 
     def action_delete_right_or_quit(self) -> None:
-        if self.is_running and isinstance(self.screen, ExitConsequencesScreen):
+        if self.is_running and isinstance(
+            self.screen, _get_exit_consequences_screen_class()
+        ):
             return
         if self._app_server is None:
             self._request_intentional_exit("Ctrl+D")
@@ -7114,30 +4715,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._chat_widget.anchor()
 
     async def _refresh_windowing_from_history(self) -> None:
-        if self._load_more.widget is None:
-            return
-        messages_area = self._messages_area
-        has_backfill = sync_backfill_state(
-            history=self.app_server.history,
-            transcript=self._transcript,
-            windowing=self._windowing,
-        )
-        visible = (
-            has_backfill
-            or self.app_server.resources.sessions.history_before_cursor is not None
-        )
-        # Hiding a live transcript's Load More button shrinks the content above
-        # the reading anchor; keep its row. Fresh mounts and rebuilds never get
-        # here because they have no button to hide.
-        reading_anchor = None
-        if not visible and not self._chat_widget.is_at_bottom:
-            await self._transcript._layout_pass(messages_area)
-            reading_anchor = self._transcript._reading_anchor(messages_area)
-        await self._load_more.set_visible(
-            messages_area, visible=visible, remaining=self._history_backfill_remaining
-        )
-        if reading_anchor is not None:
-            await self._restore_reading_anchor(reading_anchor, messages_area)
+        await self._transcript_presenter.refresh_windowing_from_history()
 
     def _clipboard_notice_message(self, copy_result: ClipboardCopyResult) -> str:
         if copy_result.verified:

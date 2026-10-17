@@ -77,7 +77,7 @@ from chartreux.core.tools.builtins.wait_for_agent import (
     WaitForAgentArgs,
     WaitForAgentConfig,
 )
-from tests.app_server.test_subagents import (
+from tests.app_server._subagent_test_support import (
     BlockingBackend,
     _background_result,
     _config,

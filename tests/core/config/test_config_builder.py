@@ -532,8 +532,18 @@ async def test_fragment_deep_merge_field_rejects_a_list() -> None:
 
 def test_validate_merge_value_tolerates_none_and_empty_dict() -> None:
     builder = ConfigBuilder(SampleSchema)
-    builder._validate_merge_value("inner.items", "user", MergeStrategy.CONCAT, None)
-    builder._validate_merge_value("inner.items", "user", MergeStrategy.UNION, {})
-    builder._validate_merge_value(
-        "inner.settings", "user", MergeStrategy.DEEP_MERGE, None
+    # Tolerated means: no ConfigMergeError raised, and the call returns None.
+    assert (
+        builder._validate_merge_value("inner.items", "user", MergeStrategy.CONCAT, None)
+        is None
+    )
+    assert (
+        builder._validate_merge_value("inner.items", "user", MergeStrategy.UNION, {})
+        is None
+    )
+    assert (
+        builder._validate_merge_value(
+            "inner.settings", "user", MergeStrategy.DEEP_MERGE, None
+        )
+        is None
     )

@@ -1,0 +1,4 @@
+[core]
+	repositoryformatversion = 0
+[pager "diff"]
+	diff = less -R

@@ -151,6 +151,9 @@ def test_delete_record_keeps_a_bucket_with_other_claims(tmp_path: Path) -> None:
 def test_delete_record_is_idempotent() -> None:
     _claim("never-written").delete()
 
+    assert not _claim("never-written").directory.exists()
+    assert not (_claims_root() / _BUCKET).exists()
+
 
 @pytest.mark.parametrize(
     "session_id",

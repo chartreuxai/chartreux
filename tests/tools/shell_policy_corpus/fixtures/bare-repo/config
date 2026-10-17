@@ -1,0 +1,5 @@
+[core]
+	repositoryformatversion = 0
+	bare = true
+[remote "upstream"]
+	url = https://example.com/bare.git

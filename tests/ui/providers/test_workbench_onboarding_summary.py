@@ -16,7 +16,7 @@ from chartreux.core.model_catalog.loader import load_catalog
 from chartreux.core.model_catalog.resolver import ModelResolver
 from chartreux.ui.providers.management_state import ManagementState
 from tests.integration.test_provider_workbench_boundaries import Services, add_provider
-from tests.ui.providers.test_workbench import Host, press_option, wait_until
+from tests.ui.providers._workbench_support import Host, press_option, wait_until
 
 
 @pytest.mark.asyncio
