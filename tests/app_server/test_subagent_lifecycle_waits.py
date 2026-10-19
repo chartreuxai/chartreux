@@ -280,8 +280,16 @@ async def test_snapshot_retain_agents_is_the_default(
 async def test_reuse_inherits_committed_retention_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # One stream per run so the reuse below completes: this test pins the
+    # retention-policy inheritance, not failure-state semantics (a failed
+    # run suspends warm under WP2 — pinned in tests/recovery/).
     registry, parent, _ = await _zero_retention_registry(
-        monkeypatch, FakeBackend([mock_llm_chunk(content="done")]), zero_limits=False
+        monkeypatch,
+        FakeBackend([
+            [mock_llm_chunk(content="done")],
+            [mock_llm_chunk(content="done")],
+        ]),
+        zero_limits=False,
     )
     try:
         launch = await _background_result(
@@ -319,8 +327,16 @@ async def test_reuse_inherits_committed_retention_policy(
 async def test_explicit_retain_false_reuse_is_final_continuation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # One stream per run so the final continuation below completes:
+    # retain=False makes the next completion final (a failed run would
+    # suspend warm under WP2 — pinned in tests/recovery/).
     registry, parent, _ = await _zero_retention_registry(
-        monkeypatch, FakeBackend([mock_llm_chunk(content="done")]), zero_limits=False
+        monkeypatch,
+        FakeBackend([
+            [mock_llm_chunk(content="done")],
+            [mock_llm_chunk(content="done")],
+        ]),
+        zero_limits=False,
     )
     try:
         launch = await _background_result(

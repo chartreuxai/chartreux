@@ -30,11 +30,12 @@ from textual.containers import Horizontal, Vertical
 from textual.content import Content
 from textual.css.query import NoMatches
 from textual.geometry import Size
+from textual.message import Message
 from textual.reactive import reactive
 from textual.strip import Strip
 from textual.visual import Visual
 from textual.widget import Widget
-from textual.widgets import Link, Static
+from textual.widgets import Button, Link, Static
 
 from chartreux.cli.textual_ui.widgets.collapsible import (
     ClickWithoutDragMixin,
@@ -610,16 +611,33 @@ class InterruptMessage(Static):
             )
 
 
+class ErrorRetryRequested(Message):
+    """The retry affordance was activated (pointer click or keyboard).
+
+    R1 (plan v0.5.6-recovery): posted by the "Retry — new turn" button on a
+    terminal retryable error widget. The app routes it to the EXISTING retry
+    operation — one injected new turn with the user-initiated cooldown reset —
+    never resume_agent, never an automatic continuation.
+    """
+
+
 class ErrorMessage(Static):
     def __init__(
-        self, error: str | Content, collapsed: bool = False, show_border: bool = True
+        self,
+        error: str | Content,
+        collapsed: bool = False,
+        show_border: bool = True,
+        retryable: bool = False,
     ) -> None:
         super().__init__()
         self.add_class("error-message")
         self._error = error
         self.collapsed = collapsed
         self._show_border = show_border
+        self._retryable = retryable
+        self._retry_activated = False
         self._content_widget: Static | None = None
+        self._retry_button: Button | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(classes="error-container"):
@@ -632,7 +650,32 @@ class ErrorMessage(Static):
             )
             text = Content("Error: ") + error if self._show_border else error
             self._content_widget = NoMarkupStatic(text, classes="error-content")
-            yield self._content_widget
+            if self._retryable:
+                # R1: the keyboard-accessible "Retry — new turn" affordance.
+                # A Button is focusable and activates with Enter/Space; the
+                # warning text above it (kept by the turn supervisor's hint)
+                # states that completed actions may repeat.
+                with Vertical(classes="error-body"):
+                    yield self._content_widget
+                    self._retry_button = Button(
+                        "Retry — new turn",
+                        classes="error-retry-button",
+                        variant="primary",
+                    )
+                    yield self._retry_button
+            else:
+                yield self._content_widget
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button is not self._retry_button:
+            return
+        event.stop()
+        if self._retry_activated:
+            # Double activation starts at most one turn (R1).
+            return
+        self._retry_activated = True
+        event.button.disabled = True
+        self.post_message(ErrorRetryRequested())
 
     def set_collapsed(self, collapsed: bool) -> None:
         pass

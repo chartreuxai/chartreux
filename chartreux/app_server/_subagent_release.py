@@ -82,6 +82,8 @@ class ReleaseStateView(Protocol):
         self, agent_id: str, now: float
     ) -> _AgentTombstone | None: ...
 
+    def _suspension_discard_locked(self, agent_id: str) -> None: ...
+
     def _prepare_release_locked(
         self, agent_id: str
     ) -> tuple[asyncio.Task[None], ReleaseAgentOutcome]: ...
@@ -215,6 +217,10 @@ class AgentRelease:
         """
         self._view._acquire_notification_suppression(agent_id)
         record = self._view._agent_records.pop(agent_id, None)
+        # WP3: release forfeits the record's suspension storage-seam state
+        # (a released agent's pending recovery — including a suspended
+        # barrier or an in-flight admission — is invalidated with the record).
+        self._view._suspension_discard_locked(agent_id)
         if record is not None and record.reserved_for_replacement:
             self._view._clear_replacement_locked(record)
         known_evicted = self._view._evicted_agents.pop(agent_id, None) is not None

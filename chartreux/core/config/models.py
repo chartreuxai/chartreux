@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from enum import StrEnum
+from itertools import pairwise
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -12,6 +15,7 @@ from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     HttpUrl,
@@ -22,6 +26,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from chartreux.config_values import THINKING_LEVELS as THINKING_LEVELS, ThinkingLevel
 from chartreux.core.config._defaults import DEFAULT_AUTO_COMPACT_THRESHOLD
+from chartreux.core.config.schema import WithDeepMerge
 from chartreux.core.dangerous_commands import OPERATION_REGISTRY
 from chartreux.core.llm_models import Backend
 from chartreux.core.paths import SESSION_LOG_DIR
@@ -138,6 +143,302 @@ class SubagentsConfig(BaseModel):
     tombstone_ttl_seconds: int = Field(default=900, ge=0, strict=True)
     max_tombstones: int = Field(default=32, ge=1, strict=True)
     max_running_subagents: int = Field(default=16, ge=1, strict=True)
+
+
+class RecoveryEligibleClass(StrEnum):
+    """Failure classes the recovery layer may act on (plan WP1b).
+
+    This is the ONE authoritative recovery-layer allowlist (state.md R0
+    eligibility note): the transient FailureInfo classes connection, timeout,
+    server_error, overload, and rate_limit, plus the WP1 typed transient
+    dispositions incomplete_stream and empty_response, plus the transient
+    form of launch_failure. The low-level classes conflict and too_early are
+    deliberately ABSENT — they stay transport-retry-eligible only, and their
+    recovery-layer eligibility is decided explicitly here, by exclusion.
+    """
+
+    CONNECTION = "connection"
+    TIMEOUT = "timeout"
+    SERVER_ERROR = "server_error"
+    OVERLOAD = "overload"
+    RATE_LIMIT = "rate_limit"
+    LAUNCH_FAILURE = "launch_failure"
+    INCOMPLETE_STREAM = "incomplete_stream"
+    EMPTY_RESPONSE = "empty_response"
+
+
+class RecoveryConfig(BaseModel):
+    """Validated child-subagent recovery policy (plan WP1b/WP4; handoff §2.3).
+
+    This is the ``[recovery.subagents]`` section: the bounded AUTOMATIC
+    recovery controller for child subagents (WP4). It declares counts,
+    delays, jitter, correlation thresholds, deadlines, eligible classes,
+    suspension limits, recovery concurrency, and eligible fallback
+    constraints. AUTOMATIC RECOVERY IS ENABLED by default since v0.5.6
+    (promoted at WP6 per OD5 once WP4's acceptance matrix passed;
+    ``enabled`` defaults to True). Every deadline here is an ADVISORY
+    scheduling/admission bound (Q2/F3: no hard in-flight kill exists —
+    the retry budget is consulted only between attempts), and safety
+    exclusions are code invariants, never config escape hatches.
+
+    The section lives inside the ``[recovery]`` container
+    (:class:`RecoverySectionConfig`); the root-turn controller's
+    ``[recovery.root]`` section is added by R2.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(default=True, strict=True)
+    auto_retries_max: int = Field(default=2, ge=0, le=10, strict=True)
+    same_agent_resumes_max: int = Field(default=2, ge=0, strict=True)
+    cooldowns_seconds: list[float] = Field(default_factory=lambda: [30.0, 120.0])
+    jitter_fraction: float = Field(default=0.2, ge=0.0, le=1.0, allow_inf_nan=False)
+    # Advisory aggregate episode bound (handoff §2.3: ~40 minutes including
+    # the initial failed call); never an in-flight kill.
+    episode_deadline_seconds: float = Field(default=2400.0, gt=0.0, allow_inf_nan=False)
+    endpoint_correlation_window_seconds: float = Field(
+        default=300.0, gt=0.0, allow_inf_nan=False
+    )
+    endpoint_correlation_min_events: int = Field(default=2, ge=2, strict=True)
+    endpoint_correlation_min_models: int = Field(default=2, ge=2, strict=True)
+    endpoint_cooldown_seconds: float = Field(default=30.0, ge=0.0, allow_inf_nan=False)
+    eligible_classes: list[RecoveryEligibleClass] = Field(
+        default_factory=lambda: list(RecoveryEligibleClass)
+    )
+    # Warm-suspension limits (handoff §1.5: SEPARATE suspension TTL/count/byte
+    # limits from idle retention and tombstones). ``suspension_ttl_seconds`` is
+    # the per-record warm window wired by WP3: 0 disables warm suspension
+    # entirely (a recoverable failure closes/idles through the normal path).
+    # ``max_suspended_agents`` bounds how many records may hold a suspended
+    # warm conversation (0 disables suspension). ``max_suspended_bytes`` bounds
+    # the TOTAL deterministic warm-conversation byte accounting across
+    # suspended records (WP3; 0 disables byte accounting); when admitting a new
+    # suspension would exceed the cap, the OLDEST suspended records expire
+    # first (deterministic selection), and a record whose conversation alone
+    # exceeds the cap is never suspended. All three caps are enforced in code,
+    # never prose.
+    suspension_ttl_seconds: float = Field(default=1800.0, ge=0.0, allow_inf_nan=False)
+    max_suspended_agents: int = Field(default=8, ge=0, strict=True)
+    max_suspended_bytes: int = Field(default=67108864, ge=0, strict=True)
+    recovery_concurrency: int = Field(default=2, ge=1, strict=True)
+    # Eligible fallback constraints (handoff §2.2/Q8; WP5 failure-time
+    # replacement policy): a fallback must not share the ATTEMPTED failed
+    # endpoint; an empty allowlist adds no base-model restriction beyond
+    # these constraints and the price cap. Endpoint independence is enforced
+    # as a code invariant by the policy layer; the flag only records the
+    # operator's declared constraint. ``fallback_replacements_max_per_package``
+    # bounds cross-model replacements per work package — the counter spans the
+    # package lineage (a replacement cannot reset it), and exhaustion parks the
+    # package (park-and-continue).
+    fallback_require_endpoint_independence: bool = Field(default=True, strict=True)
+    fallback_allowed_base_models: list[str] = Field(default_factory=list)
+    fallback_max_output_price_per_million: float | None = Field(
+        default=None, gt=0.0, allow_inf_nan=False
+    )
+    fallback_replacements_max_per_package: int = Field(default=2, ge=0, strict=True)
+
+    @field_validator("cooldowns_seconds")
+    @classmethod
+    def validate_cooldowns(cls, value: list[float]) -> list[float]:
+        for entry in value:
+            if not math.isfinite(entry) or entry < 0:
+                raise ValueError(
+                    "cooldowns_seconds entries must be finite, nonnegative durations"
+                )
+        return value
+
+    @field_validator("fallback_allowed_base_models")
+    @classmethod
+    def validate_fallback_allowed_base_models(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            if not entry.strip():
+                raise ValueError(
+                    "fallback_allowed_base_models entries must be non-empty "
+                    "canonical model names"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def validate_recovery_policy(self) -> RecoveryConfig:
+        if self.enabled and self.auto_retries_max == 0:
+            raise ValueError(
+                "recovery.enabled requires auto_retries_max >= 1: an enabled "
+                "controller with no automatic retries is a contradiction"
+            )
+        cooldowns = self.cooldowns_seconds
+        if any(later < earlier for earlier, later in pairwise(cooldowns)):
+            raise ValueError("cooldowns_seconds must be nondecreasing")
+        if self.auto_retries_max > 0 and len(cooldowns) < self.auto_retries_max:
+            raise ValueError(
+                "cooldowns_seconds needs at least auto_retries_max entries "
+                "(one delay per automatic retry)"
+            )
+        return self
+
+
+def _reject_bool_duration(value: Any) -> Any:
+    """Reject boolean-as-number for duration fields (plan U/R2).
+
+    Pydantic's lax float coercion accepts ``True`` as ``1.0``; a boolean is
+    never a valid duration, so it is rejected before the float validators
+    run.
+    """
+    if isinstance(value, bool):
+        raise ValueError("durations must be numbers, not booleans")
+    return value
+
+
+class RootRecoveryConfig(BaseModel):
+    """Validated root-turn automatic recovery policy (plan R2/OD3; handoff §2.3).
+
+    This is the ``[recovery.root]`` section: the bounded AUTOMATIC recovery
+    controller for terminal root model-call failures. When enabled, the
+    harness schedules the continuation turn itself — an injected new turn
+    carrying the retry prompt, ``user_initiated_retry=False`` (an automatic
+    continuation NEVER clears shared availability cooldowns; only a genuine
+    user-initiated /retry does) — bounded by one shared episode budget that
+    MERGES the legacy incomplete-stream continuation, cooldown-aware through
+    the shared availability registry, with the manual ``/retry`` affordance
+    (R1) as the fallback on exhaustion.
+
+    REMOVAL-BY-DEFAULT (OD4a, user-confirmed): when ``enabled`` is False, NO
+    root automatic continuation runs AT ALL — including the migrated
+    incomplete-stream path. One controller, no hidden second scheduler; the
+    breaking change is documented in the release notes. AUTOMATIC RECOVERY
+    IS ENABLED by default since v0.5.6 (promoted at WP6 per OD4b once R2's
+    acceptance matrix passed; ``enabled`` defaults to True) — set it to False
+    to return to manual-retry-only recovery. The aggregate
+    ``deadline_seconds`` is an ADVISORY scheduling/admission bound (Q2
+    negative: no hard in-flight kill exists), and the safety exclusions
+    (never auto-retry preflight, permission/authorization, budget stop,
+    cancellation, task blocker, permanent config/auth/billing/quota/
+    context-size, unknown-internal; never clear cooldowns) are CODE
+    invariants, never config escape hatches. Episode policy is snapshotted
+    at episode creation — a config reload never extends an active episode
+    or replenishes its count.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(default=True, strict=True)
+    # ONE shared automatic-turn budget per user-turn episode, merging the
+    # legacy incomplete-stream continuation (limit 2) into this controller.
+    auto_retries_max: int = Field(default=2, ge=0, le=10, strict=True)
+    # Advisory aggregate episode bound: no new admission after it, never an
+    # in-flight kill (Q2/F3 negative honored).
+    deadline_seconds: Annotated[float, BeforeValidator(_reject_bool_duration)] = Field(
+        default=2400.0, ge=1.0, le=86400.0, allow_inf_nan=False
+    )
+    # Per-retry backoff before the cooldown-aware admission; entry i serves
+    # the i-th admitted continuation.
+    cooldowns_seconds: list[float] = Field(default_factory=lambda: [30.0, 120.0])
+    jitter_fraction: Annotated[float, BeforeValidator(_reject_bool_duration)] = Field(
+        default=0.2, ge=0.0, le=1.0, allow_inf_nan=False
+    )
+    # Floor for read-only availability re-checks while waiting out a
+    # temporary exclusion (a probe in flight, a cooldown gap): waiting never
+    # consumes a retry.
+    availability_recheck_seconds: Annotated[
+        float, BeforeValidator(_reject_bool_duration)
+    ] = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    # The recovery-layer eligible classes (the ONE authoritative WP1b
+    # allowlist of transient forms). Restricted by type to that allowlist.
+    eligible_classes: list[RecoveryEligibleClass] = Field(
+        default_factory=lambda: list(RecoveryEligibleClass)
+    )
+
+    @field_validator("cooldowns_seconds")
+    @classmethod
+    def validate_cooldowns(cls, value: list[float]) -> list[float]:
+        for entry in value:
+            if not math.isfinite(entry) or entry < 0:
+                raise ValueError(
+                    "cooldowns_seconds entries must be finite, nonnegative durations"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def validate_root_recovery_policy(self) -> RootRecoveryConfig:
+        if self.enabled and self.auto_retries_max == 0:
+            raise ValueError(
+                "recovery.root.enabled requires auto_retries_max >= 1: an "
+                "enabled controller with no automatic retries is a contradiction"
+            )
+        if self.enabled and not self.eligible_classes:
+            raise ValueError(
+                "recovery.root.enabled requires at least one eligible class: an "
+                "enabled controller that may never act is a contradiction"
+            )
+        cooldowns = self.cooldowns_seconds
+        if any(later < earlier for earlier, later in pairwise(cooldowns)):
+            raise ValueError("cooldowns_seconds must be nondecreasing")
+        if self.auto_retries_max > 0 and len(cooldowns) < self.auto_retries_max:
+            raise ValueError(
+                "cooldowns_seconds needs at least auto_retries_max entries "
+                "(one delay per automatic retry)"
+            )
+        if self.availability_recheck_seconds > self.deadline_seconds:
+            raise ValueError(
+                "availability_recheck_seconds must not exceed deadline_seconds"
+            )
+        return self
+
+
+class RecoverySectionConfig(BaseModel):
+    """The ``[recovery]`` config section: one subsection per controller.
+
+    WP4 (plan round-3 symmetry amendment): the child subagent automatic
+    recovery controller's policy is ``[recovery.subagents]``
+    (:class:`RecoveryConfig`); the root-turn controller's ``[recovery.root]``
+    section (:class:`RootRecoveryConfig`, R2) sits beside it, symmetric with
+    ``[user_questions]``. Both subsections keep deep-merge semantics across
+    sparse layers, so a layer setting only ``[recovery.root] enabled``
+    preserves every other typed default. AUTOMATIC RECOVERY IS ENABLED by
+    default in every subsection since v0.5.6 (promoted at WP6 per OD4b/OD5).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    subagents: Annotated[RecoveryConfig, WithDeepMerge()] = Field(
+        default_factory=RecoveryConfig
+    )
+    root: Annotated[RootRecoveryConfig, WithDeepMerge()] = Field(
+        default_factory=RootRecoveryConfig
+    )
+
+
+class UserQuestionsConfig(BaseModel):
+    """The ``[user_questions]`` section: unattended question expiry (plan U/OD1).
+
+    Controls the server-owned unattended-expiry timer for eligible
+    ``ask_user_question`` calls: explicit per-question opt-in only (``kind`` +
+    ``unattended_default``), never a blanket timeout. EXPIRY IS ENABLED by
+    default since v0.5.6 (promoted at WP6 per OD4b once U's acceptance
+    matrix passed; the per-question opt-in marker remains the primary
+    safety gate regardless). Config changes apply to newly opened
+    questions only — the effective policy is snapshotted at callback open.
+    Configuration can never force protected questions (``requires_user``,
+    missing default, runtime approval provenance) to expire.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    unattended_timeout_enabled: bool = Field(default=True, strict=True)
+    default_timeout_seconds: Annotated[
+        float, BeforeValidator(_reject_bool_duration)
+    ] = Field(default=300.0, ge=60.0, le=3600.0, allow_inf_nan=False)
+    max_timeout_seconds: Annotated[float, BeforeValidator(_reject_bool_duration)] = (
+        Field(default=3600.0, ge=60.0, le=3600.0, allow_inf_nan=False)
+    )
+
+    @model_validator(mode="after")
+    def validate_timeout_range(self) -> UserQuestionsConfig:
+        if self.default_timeout_seconds > self.max_timeout_seconds:
+            raise ValueError(
+                "user_questions.default_timeout_seconds must not exceed "
+                "max_timeout_seconds"
+            )
+        return self
 
 
 type StatusLineSegment = Literal[

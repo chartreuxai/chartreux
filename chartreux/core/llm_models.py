@@ -8,7 +8,7 @@ import copy
 from datetime import UTC, datetime
 from enum import StrEnum, auto
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Final, Literal
 from uuid import uuid4
 
 from pydantic import (
@@ -17,6 +17,7 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    PrivateAttr,
     model_validator,
 )
 
@@ -154,6 +155,19 @@ def use_posting_clock(clock: Callable[[], datetime]) -> Iterator[None]:
         _posting_clock.reset(token)
 
 
+#: The origin marker the context injector stamps on the assistant message of
+#: its settled skill/mention tool pair (round-5 Y: provenance-based live
+#: nesting). Only ``ContextInjector`` originates this marker in production;
+#: the session transcript persists it under ``CONTEXT_INJECTION_ORIGIN_KEY``.
+CONTEXT_INJECTION_TOOL_PAIR_V1: Final[Literal["context_injector.tool_pair.v1"]] = (
+    "context_injector.tool_pair.v1"
+)
+
+#: The session-transcript record key under which the recognized origin marker
+#: travels atomically with its owning assistant message in ``messages.jsonl``.
+CONTEXT_INJECTION_ORIGIN_KEY: Final[str] = "context_injection_origin"
+
+
 class LLMMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -178,6 +192,18 @@ class LLMMessage(BaseModel):
     manual_shell: ManualShellContext | None = None
     context_boundary: Literal["compaction"] | None = None
     deployment_identity: dict[str, str] | None = None
+    # Private, per-assistant-message ORIGIN marker (round-5 Y): "this
+    # assistant call block originated in ContextInjector". NOT a model field:
+    # ordinary validation (provider dictionaries, programmatic construction)
+    # never hydrates it — only the injector sets it in production, and only
+    # the trusted session loader restores it from Chartreux's owned session
+    # transcript. It is not "this call completed successfully"; the walker's
+    # answered/staged checks establish settlement. Private attributes are
+    # absent from ``model_dump`` without adding an exclusion, so the marker
+    # never leaks to a provider wire payload.
+    _context_injection_origin: Literal["context_injector.tool_pair.v1"] | None = (
+        PrivateAttr(default=None)
+    )
 
     @model_validator(mode="before")
     @classmethod

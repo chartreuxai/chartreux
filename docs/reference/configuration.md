@@ -100,6 +100,48 @@ The `[subagents]` lifecycle settings come in two classes. Resident-runtime limit
 
 The active-work cap counts foreground and background runs, including reuse and pending child creation, but not idle retained agents. The root session's effective configuration controls admission; child configuration does not. Accepted configuration changes affect later admissions without stopping existing work. Completion, cancellation, release, or failed creation frees capacity. Busy `task(..., replace_run=True)` transfers the existing allocation rather than allocating another; the handoff holds capacity until replacement admission or unwind. `replace_run` is a call argument (default `false`), not configuration. Busy replacement requires `agent_id` and background mode and rejects launch `config` or profile changes before stopping; idle reuse still accepts its usual overrides. Configure `cancel_agent` through `[tools.cancel_agent]` and ordinary tool filters; it has no extra settings.
 
+### Recovery and unattended questions
+
+The `[recovery]` container holds one subsection per automatic-recovery
+controller, and `[user_questions]` holds the unattended-expiry timer. All
+three features are enabled by default since v0.5.6; see the
+[configuration guide](../guides/configuration.md) for behavior and the
+[subagents guide](../guides/subagents.md#failure-recovery-suspension-and-resume)
+for the suspension/resume lifecycle. Unknown fields and invalid values are
+rejected. Both subsections keep deep-merge semantics across sparse layers.
+
+| Key | Default | Accepted value |
+| --- | --- | --- |
+| `[user_questions].unattended_timeout_enabled` | `true` | Strict boolean. Enables the server-owned unattended-expiry timer for eligible `ask_user_question` calls; only questions that declare an `unattended_default` can ever expire, and runtime approvals (dangerous-command, root access) are permanently ineligible. |
+| `[user_questions].default_timeout_seconds` | `300.0` | Finite seconds, 60–3600. Default expiry timeout, snapshotted at callback open. |
+| `[user_questions].max_timeout_seconds` | `3600.0` | Finite seconds, 60–3600; must be at least the default. Ceiling for per-request `timeout_seconds` overrides (rejected, not clamped). |
+| `[recovery.subagents].enabled` | `true` | Strict boolean. The bounded automatic recovery controller for child subagents; when false it is inert (suspension and the explicit resume/reconcile ports are untouched). Requires `auto_retries_max >= 1` when enabled. |
+| `[recovery.subagents].auto_retries_max` | `2` | Integer 0–10. Automatic resumes per recovery chain. |
+| `[recovery.subagents].same_agent_resumes_max` | `2` | Integer, at least 0. Explicit plus automatic resumes per chain. |
+| `[recovery.subagents].cooldowns_seconds` | `[30.0, 120.0]` | Finite, non-negative, non-decreasing durations; at least `auto_retries_max` entries. |
+| `[recovery.subagents].jitter_fraction` | `0.2` | Number 0–1 of bounded jitter on the backoff. |
+| `[recovery.subagents].episode_deadline_seconds` | `2400.0` | Positive finite seconds. Advisory aggregate bound anchored to the first failure: no new admission after it, never an in-flight kill. |
+| `[recovery.subagents].endpoint_correlation_window_seconds` | `300.0` | Positive finite seconds. Window for endpoint-correlated rate-limit detection. |
+| `[recovery.subagents].endpoint_correlation_min_events` | `2` | Integer, at least 2. Correlated events required within the window. |
+| `[recovery.subagents].endpoint_correlation_min_models` | `2` | Integer, at least 2. Distinct base models required for endpoint correlation. |
+| `[recovery.subagents].endpoint_cooldown_seconds` | `30.0` | Non-negative finite seconds. Cooldown armed on the endpoint when correlation fires. |
+| `[recovery.subagents].eligible_classes` | all eight | Restricted to the transient allowlist `connection`, `timeout`, `server_error`, `overload`, `rate_limit`, `launch_failure`, `incomplete_stream`, `empty_response`. |
+| `[recovery.subagents].suspension_ttl_seconds` | `1800.0` | Non-negative finite seconds. Warm-suspension TTL; 0 disables warm suspension. |
+| `[recovery.subagents].max_suspended_agents` | `8` | Integer, at least 0. Suspended-record count cap; 0 disables suspension. |
+| `[recovery.subagents].max_suspended_bytes` | `67108864` | Integer, at least 0. Total warm-conversation byte cap (oldest-first expiry); 0 disables byte accounting. |
+| `[recovery.subagents].recovery_concurrency` | `2` | Integer, at least 1. Concurrent automatic recoveries. |
+| `[recovery.subagents].fallback_require_endpoint_independence` | `true` | Strict boolean. Declared constraint for failure-time replacement candidates (enforced as a code invariant by the policy layer). |
+| `[recovery.subagents].fallback_allowed_base_models` | `[]` | Canonical model names; empty adds no base-model restriction beyond the other constraints. |
+| `[recovery.subagents].fallback_max_output_price_per_million` | unset | Positive finite price; bounds replacement candidates by output price. |
+| `[recovery.subagents].fallback_replacements_max_per_package` | `2` | Integer, at least 0. Cross-model replacements per work package; the counter spans the package lineage. |
+| `[recovery.root].enabled` | `true` | Strict boolean. The bounded automatic root-turn recovery controller; when false NO root automatic continuation runs at all (including the interrupted-stream path) and the manual retry is the only recovery. Requires `auto_retries_max >= 1` and a non-empty `eligible_classes` when enabled. |
+| `[recovery.root].auto_retries_max` | `2` | Integer 0–10. ONE shared automatic-turn budget per user-turn episode, merging the interrupted-stream continuation. |
+| `[recovery.root].deadline_seconds` | `2400.0` | Finite seconds, 1–86400. Advisory scheduling/admission bound anchored to the first failed logical call; never an in-flight kill. |
+| `[recovery.root].cooldowns_seconds` | `[30.0, 120.0]` | Finite, non-negative, non-decreasing durations; at least `auto_retries_max` entries. |
+| `[recovery.root].jitter_fraction` | `0.2` | Number 0–1 of bounded jitter on the backoff. |
+| `[recovery.root].availability_recheck_seconds` | `1.0` | Positive finite seconds, at most `deadline_seconds`. Floor for read-only availability rechecks while waiting out a temporary exclusion. |
+| `[recovery.root].eligible_classes` | all eight | Restricted to the transient allowlist (same eight values as `[recovery.subagents]`). |
+
 ### Interface, prompts, and project context
 
 | Key | Default | Accepted value |

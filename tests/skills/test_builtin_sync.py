@@ -63,8 +63,8 @@ class TestBuiltinSkills:
         ).read_text()
 
         assert (
-            "Availability is `running`, `finalizing`, `idle`, `evicted`, or `closed`."
-            in prompt
+            "Availability is `running`, `finalizing`, `idle`, `suspended`, "
+            "`restoring`, `evicted`, or `closed`." in prompt
         )
         assert "cannot yet be reused" in prompt
         # Closed (completed without retention) and evicted (retained, then

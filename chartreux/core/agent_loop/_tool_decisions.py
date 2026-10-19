@@ -57,6 +57,7 @@ from chartreux.core.dangerous_commands import (
     GrantChoice,
     RepositoryScope,
 )
+from chartreux.core.events import UserInputOrigin
 from chartreux.core.root_grants import RootGrantPort
 from chartreux.core.tools.base import BaseTool, ToolPermission
 from chartreux.core.tools.manager import ToolManager
@@ -277,7 +278,11 @@ class ToolDecisionCoordinator:
         """
         try:
             answer = await self._request_broker.request_user_input(
-                dangerous_command_request(proposal), tool_call_id or ""
+                dangerous_command_request(proposal),
+                tool_call_id or "",
+                # Runtime approval, never a model question: permanently
+                # ineligible for unattended expiry (plan U/OD1).
+                origin=UserInputOrigin.RUNTIME_APPROVAL,
             )
             return parse_dangerous_command_result(answer, proposal.operations)
         except Exception:
@@ -597,7 +602,11 @@ class ToolDecisionCoordinator:
         """Own the single user-input request behind a shared root decision."""
         try:
             answer = await self._request_broker.request_user_input(
-                root_grant_request(root), tool_call_id or ""
+                root_grant_request(root),
+                tool_call_id or "",
+                # Runtime approval, never a model question: permanently
+                # ineligible for unattended expiry (plan U/OD1).
+                origin=UserInputOrigin.RUNTIME_APPROVAL,
             )
             decision = parse_root_grant_result(answer)
         except asyncio.CancelledError:

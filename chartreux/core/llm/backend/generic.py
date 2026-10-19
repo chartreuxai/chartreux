@@ -39,6 +39,7 @@ from chartreux.core.llm.thinking_levels import (
     get_thinking_levels,
 )
 from chartreux.core.llm_models import (
+    CONTEXT_INJECTION_ORIGIN_KEY,
     AvailableTool,
     LLMChunk,
     LLMMessage,
@@ -91,8 +92,27 @@ class OpenAIAdapter(APIAdapter):
     def _reasoning_from_api(
         self, msg_dict: dict[str, Any], field_name: str
     ) -> dict[str, Any]:
+        # Round-5 Y provider-ingress hardening. OpenAI Chat validates whole
+        # provider message/delta dictionaries, so a provider payload could
+        # otherwise reach ``LLMMessage.model_validate`` with provenance
+        # spellings or an ``injected`` flag: work on a FRESH copy (the
+        # provider's dictionary is never mutated), perform the existing
+        # reasoning-field normalization, strip BOTH provenance spellings
+        # (the private attribute is not a model field, so neither hydrates
+        # it — this is defense in depth for the whole-dictionary path), and
+        # reset a provider-supplied ``injected`` flag. The reset is necessary
+        # because the transcript-integrity walk skips injected messages
+        # before considering provenance, so provider-controlled
+        # ``injected=True`` would retain an alternative bypass. This affects
+        # only provider ingestion; legitimate locally created ``injected=True``
+        # messages are unchanged. All four ``_parse_message`` envelope
+        # branches pass through this helper.
+        msg_dict = dict(msg_dict)
         if field_name != "reasoning_content" and field_name in msg_dict:
             msg_dict["reasoning_content"] = msg_dict.pop(field_name)
+        msg_dict.pop(CONTEXT_INJECTION_ORIGIN_KEY, None)
+        msg_dict.pop("_context_injection_origin", None)
+        msg_dict["injected"] = False
         return msg_dict
 
     def _user_with_images_to_parts(
@@ -342,6 +362,9 @@ class GenericBackend:
         self._retry_max_elapsed_time = retry_max_elapsed_time
         self._pacer = pacer if pacer is not None else AdaptivePacer()
         self._user_on_retry = on_retry
+        # Measured transport starts (WP1): every attempt through the retry
+        # wrappers is one real transport start, counted for failure evidence.
+        self._transport_attempts = 0
 
         async def paced_on_retry(reason: RetryReason) -> None:
             if reason.category is RetryCategory.RATE_LIMITED:
@@ -357,6 +380,7 @@ class GenericBackend:
             max_elapsed_time=retry_max_elapsed_time if retry_budget is None else None,
             budget=retry_budget,
             on_retry=paced_on_retry,
+            on_attempt=self._record_transport_attempt,
         )(self._send_request)
         self._make_request = self._pace(retried)
         retried_stream = async_generator_retry(
@@ -364,8 +388,18 @@ class GenericBackend:
             max_elapsed_time=retry_max_elapsed_time if retry_budget is None else None,
             budget=retry_budget,
             on_retry=paced_on_retry,
+            on_attempt=self._record_transport_attempt,
         )(self._send_parsed_streaming_request)
         self._make_streaming_request = self._pace_stream(retried_stream)
+
+    def _record_transport_attempt(self, _attempt: int) -> None:
+        """Count one measured transport start (WP1 failure evidence)."""
+        self._transport_attempts += 1
+
+    @property
+    def transport_attempts(self) -> int:
+        """Total measured transport starts on this backend instance."""
+        return self._transport_attempts
 
     def _pace(self, fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
         @functools.wraps(fn)

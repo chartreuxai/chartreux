@@ -308,9 +308,21 @@ async def test_shell_source_sanitized_in_all_tool_summaries(tmp_path, command):
                 tools.get("bash_start"), BashStartArgs(command=command), ctx
             )
             job_id = start.job.job_id
-            read = await run(
+            # Wait for the captured output to complete so the read below covers
+            # the entire output window instead of a timing-dependent prefix of
+            # it. Reading from the end cursor blocks until the job settles.
+            probe = await run(
                 tools.get("bash_read"), BashReadArgs(job_id=job_id, wait_seconds=2), ctx
             )
+            while not probe.job.output_complete:
+                probe = await run(
+                    tools.get("bash_read"),
+                    BashReadArgs(
+                        job_id=job_id, cursor=probe.end_cursor, wait_seconds=2
+                    ),
+                    ctx,
+                )
+            read = await run(tools.get("bash_read"), BashReadArgs(job_id=job_id), ctx)
             stop = await run(tools.get("bash_stop"), BashStopArgs(job_id=job_id), ctx)
             listed = await run(
                 tools.get("bash_list"), BashListArgs(include_finished=True), ctx

@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from chartreux.core.config.models import ThinkingLevel
+from chartreux.core.recovery_models import PackageTier
 from chartreux.core.tools.models import ToolPermission
 
 
@@ -38,6 +39,33 @@ class LaunchConfig(BaseModel):
     enabled_tools: list[str] | None = None
     disabled_tools: list[str] | None = None
     tools: dict[str, LaunchToolOverride] | None = None
+    # WP5 failure-time replacement claim (handoff §2.2/Q8; package-specific
+    # fallback constraints in dispatch metadata). A cross-model replacement
+    # gets a NEW agent_id carrying the predecessor/package lineage; the claim
+    # is validated at launch admission by the replacement policy.
+    work_package_id: str | None = Field(
+        default=None,
+        description=(
+            "Orchestrator work-package lineage for this launch; carried into "
+            "the run's failure envelope so recovery counters span replacements."
+        ),
+    )
+    predecessor_agent_id: str | None = Field(
+        default=None,
+        description=(
+            "The failed agent this launch replaces. A replacement launch gets "
+            "a NEW agent_id; the predecessor's recovery is disabled before "
+            "the handoff transfers package write ownership."
+        ),
+    )
+    package_tier: PackageTier | None = Field(
+        default=None,
+        description=(
+            "The work package's tier for the failure-time replacement policy: "
+            "mechanical-tier models are rejected as replacements for "
+            "substantive packages."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod

@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import aclosing, asynccontextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from http import HTTPStatus
 import time
-from typing import Literal, Protocol
+from typing import ClassVar, Literal, Protocol
 from uuid import uuid4
 
+from chartreux.core.agent_loop._transcript_integrity import (
+    TranscriptIntegrityError,
+    validate_transcript,
+)
 from chartreux.core.agent_loop.errors import (
     AgentLoopLLMResponseError,
     EmptyLLMResponseError,
@@ -28,7 +32,7 @@ from chartreux.core.errors import (
 )
 from chartreux.core.llm.backend.factory import create_backend
 from chartreux.core.llm.exceptions import BackendError, IncompleteStreamError
-from chartreux.core.llm.failures import RequestRetryBudget
+from chartreux.core.llm.failures import FailureCategory, RequestRetryBudget
 from chartreux.core.llm.types import BackendLike
 from chartreux.core.llm_models import (
     AvailableTool,
@@ -39,6 +43,7 @@ from chartreux.core.llm_models import (
     StrToolChoice,
     posting_time,
 )
+from chartreux.core.recovery_models import CallEvidence, attach_call_evidence
 from chartreux.core.session_types import AgentStats, CommittedModelIdentity
 from chartreux.core.usage import (
     AccountingSink,
@@ -89,6 +94,9 @@ class CallResources:
     retry_budget: RequestRetryBudget | None = None
     on_retry: RetryObserver | None = None
     admit_replay: Callable[[], bool] | None = None
+    # Measured per-logical-call evidence (WP1); minted by the gateway facade
+    # and shared across the bounded in-call empty replay.
+    call_evidence: CallEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -126,8 +134,46 @@ def select_backend(
 def messages_for_backend(
     messages: Sequence[LLMMessage], active_model: ModelConfig
 ) -> Sequence[LLMMessage]:
-    """Project durable history into provider-safe model context."""
-    messages = reorder_for_tool_adjacency(select_model_context(messages))
+    """Project durable history into provider-safe model context.
+
+    PI1/T (S3 request-build admission): the projection runs the shared
+    transcript-integrity validator — single-pass O(n). Duplicate results
+    dedupe (the reorder keeps the genuine structured result, drops the
+    synthetic TOOL_NO_RESPONSE placeholder; the predicate is content +
+    missing structured result, never the cancellation tag), the
+    provider-safe order is verified AFTER reordering, and an unrepairable
+    order raises the typed transcript-integrity diagnostic BEFORE any
+    provider call — the PI1 six-failed-resume loop becomes one typed local
+    failure with repair guidance. The live tail stays exempt: a dangling
+    call mid-turn (an aborted batch call, or a sideband completion over a
+    never-executed tool call) is the designed backfill's job — it is repaired
+    at the next act() boundary, not by refusing the request. A call whose
+    genuine result IS recorded but was not delivered to it in the projected
+    order (the round-1 S1 stranded-call shape) is never exempt: the request
+    fails closed with the typed diagnostic before any provider call. The
+    diagnostic itself surfaces as itself through the gateway's error mapper
+    (the ``_map_call_error`` pass-through, round-1 S2) — never re-wrapped
+    into a provider-shaped ``RuntimeError``.
+
+    Round-3 W1: the composite validation runs against the RAW transcript
+    (after compaction-context selection, BEFORE the reorder). The reorder is
+    only for the wire — it can move a genuine result up to an EARLIER owner
+    block reusing the call id, and validating the projected order would
+    then read the later owner's unanswered call as a legitimate live-tail
+    in-flight call and dispatch the PI1 400 poison shape (a ``tool_use``
+    with no ``tool_result``) to the provider. The raw order preserves the
+    ownership evidence the stranded-call detection needs (the genuine
+    result's forward-scan owner and the live-tail region); the
+    provider-ready sub-check still validates the exact projection emitted
+    below, because it projects its input internally.
+    """
+    context = select_model_context(messages)
+    violations = validate_transcript(context, live_tail_exempt=True)
+    if violations:
+        raise TranscriptIntegrityError(
+            violations, context="request build rejected an unsafe transcript"
+        )
+    messages = reorder_for_tool_adjacency(context)
     if active_model.supports_images or not any(message.images for message in messages):
         return messages
     raise ImagesNotSupportedError(active_model.alias)
@@ -304,15 +350,35 @@ class LLMGateway:
         self, inputs: CompletionInputs, resources: CallResources
     ) -> LLMChunk:
         """Reject empty attempts before replaying the identical request once."""
+        evidence = CallEvidence.start(
+            resources.backend,
+            resources.retry_budget.max_elapsed_time
+            if resources.retry_budget is not None
+            else None,
+        )
+        resources = replace(resources, call_evidence=evidence)
         call = async_retry(
             tries=2,
             budget=resources.retry_budget,
             is_retryable=lambda error: _admit_empty_replay(error, resources),
             on_retry=_empty_retry_observer(resources),
         )(self._complete_attempt)
-        return await call(inputs, resources)
+        try:
+            return await call(inputs, resources)
+        except BaseException as error:
+            # ONE measured evidence per logical call: the empty replay shares
+            # it, so the exhausted-logical-call event stays one event.
+            evidence.finish(
+                budget_exhausted=(
+                    resources.retry_budget.exhausted
+                    if resources.retry_budget is not None
+                    else None
+                )
+            )
+            attach_call_evidence(error, evidence)
+            raise
 
-    async def _complete_attempt(
+    async def _complete_attempt(  # noqa: PLR0915 -- explicit attempt exit paths
         self, inputs: CompletionInputs, resources: CallResources
     ) -> LLMChunk:
         from chartreux.core.llm.backend.generic import request_start_observer
@@ -321,6 +387,7 @@ class LLMGateway:
         finalizer = CallFinalizer(inputs, resources)
         observer_token = request_start_observer.set(finalizer.start)
         original_error: BaseException | None = None
+        response_received = False
         try:
             backend_messages = messages_for_backend(inputs.messages, inputs.model)
             logger.debug(
@@ -346,6 +413,7 @@ class LLMGateway:
                     max_tokens=inputs.max_tokens,
                     metadata=inputs.metadata,
                 )
+            response_received = True
             # Preserve raw usage before response processing can fail.
             finalizer.usage = result.usage
             finalizer.outcome = (
@@ -404,11 +472,21 @@ class LLMGateway:
             original_error = error
             finalizer.outcome = UsageOutcome.INTERRUPTED
             finalizer.capture_error_usage(error)
+            _mark_call_evidence(
+                resources,
+                response_started=response_received,
+                semantic_output_published=False,
+            )
             raise
         except Exception as error:
             original_error = error
             finalizer.outcome = UsageOutcome.FAILED
             finalizer.capture_error_usage(error)
+            _mark_call_evidence(
+                resources,
+                response_started=response_received,
+                semantic_output_published=False,
+            )
             _log_model_call_failure(
                 inputs.model.alias,
                 inputs.provider_name,
@@ -448,13 +526,46 @@ class LLMGateway:
         transcript: TranscriptSink,
     ) -> AsyncGenerator[LLMChunk, None]:
         """Stream, aggregate, validate, account, append, check refusal, and log."""
+        evidence = CallEvidence.start(
+            resources.backend,
+            resources.retry_budget.max_elapsed_time
+            if resources.retry_budget is not None
+            else None,
+        )
+        resources = replace(resources, call_evidence=evidence)
         stream = async_generator_retry(
             tries=2,
             budget=resources.retry_budget,
             is_retryable=lambda error: _admit_empty_replay(error, resources),
             on_retry=_empty_retry_observer(resources),
         )(self._stream)
-        return stream(inputs, resources, transcript=transcript)
+        return self._evidenced_stream(
+            stream(inputs, resources, transcript=transcript), evidence, resources
+        )
+
+    async def _evidenced_stream(
+        self,
+        stream: AsyncGenerator[LLMChunk, None],
+        evidence: CallEvidence,
+        resources: CallResources,
+    ) -> AsyncGenerator[LLMChunk, None]:
+        """Attach the logical call's measured evidence to any exit failure."""
+        try:
+            async with aclosing(stream) as chunks:
+                async for chunk in chunks:
+                    yield chunk
+        except BaseException as error:
+            # ONE measured evidence per logical call: the empty replay shares
+            # it, so the exhausted-logical-call event stays one event.
+            evidence.finish(
+                budget_exhausted=(
+                    resources.retry_budget.exhausted
+                    if resources.retry_budget is not None
+                    else None
+                )
+            )
+            attach_call_evidence(error, evidence)
+            raise
 
     async def _stream(  # noqa: PLR0912, PLR0915 -- explicit stream exit/settlement paths
         self,
@@ -584,6 +695,11 @@ class LLMGateway:
             original_error = error
             finalizer.outcome = UsageOutcome.INTERRUPTED
             finalizer.capture_error_usage(error)
+            _mark_call_evidence(
+                resources,
+                response_started=chunk_agg is not None,
+                semantic_output_published=published,
+            )
             if not usage_accounted:
                 _apply_interrupted_usage(
                     resources.stats,
@@ -598,6 +714,11 @@ class LLMGateway:
         except GeneratorExit as error:
             original_error = error
             finalizer.outcome = UsageOutcome.INTERRUPTED
+            _mark_call_evidence(
+                resources,
+                response_started=chunk_agg is not None,
+                semantic_output_published=published,
+            )
             if not usage_accounted:
                 _apply_interrupted_usage(
                     resources.stats,
@@ -617,6 +738,11 @@ class LLMGateway:
                 else UsageOutcome.FAILED
             )
             finalizer.capture_error_usage(error)
+            _mark_call_evidence(
+                resources,
+                response_started=chunk_agg is not None,
+                semantic_output_published=published,
+            )
             _log_model_call_failure(
                 inputs.model.alias,
                 inputs.provider_name,
@@ -643,7 +769,33 @@ class LLMGateway:
 
 
 class IncompleteLLMResponseError(AgentLoopLLMResponseError):
-    """A provider explicitly marked its terminal response incomplete."""
+    """A provider explicitly marked its terminal response incomplete.
+
+    Typed transient (WP1): the provider's own incomplete-reason disposition
+    is measured at the final-chunk boundary; the classifier reads the marker
+    so the recovery layer can accept the provider-marked-incomplete path
+    alongside the legacy incomplete-stream continuation.
+    """
+
+    failure_category: ClassVar[FailureCategory] = FailureCategory.INCOMPLETE_STREAM
+
+
+def _mark_call_evidence(
+    resources: CallResources, *, response_started: bool, semantic_output_published: bool
+) -> None:
+    """Record the response-boundary facts on the logical call's evidence (WP1).
+
+    First measurement wins, so the bounded in-call empty replay cannot
+    overwrite an earlier boundary fact of the same logical call. A missing
+    evidence carrier is a no-op (measurement is additive, never required).
+    """
+    evidence = resources.call_evidence
+    if evidence is None:
+        return
+    if evidence.response_started is None:
+        evidence.response_started = response_started
+    if evidence.semantic_output_published is None:
+        evidence.semantic_output_published = semantic_output_published
 
 
 def _valid_final_output(message: LLMMessage) -> bool:
@@ -766,6 +918,10 @@ def _refusal_error(provider: str, model: str, chunk: LLMChunk) -> RefusalError:
 
 
 def _map_call_error(error: Exception, inputs: CompletionInputs) -> Exception:
+    # Pass-through: typed LOCAL diagnostics keep their identity — never
+    # re-wrapped into a provider-shaped error. TranscriptIntegrityError is a
+    # LOCAL transcript defect, not a provider failure (round-1 S2); its
+    # classification/category handling already rides the cause chain.
     if isinstance(
         error,
         (
@@ -775,6 +931,7 @@ def _map_call_error(error: Exception, inputs: CompletionInputs) -> Exception:
             ImagesNotSupportedError,
             RefusalError,
             IncompleteStreamError,
+            TranscriptIntegrityError,
         ),
     ):
         return error

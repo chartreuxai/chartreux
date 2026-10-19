@@ -110,6 +110,7 @@ from chartreux.core.config.harness_files import (
 )
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.dangerous_command_grants import DangerousCommandGrantPersistencePort
+from chartreux.core.deferred_questions import DeferredQuestionStore
 from chartreux.core.dispatch.renderer import task_description_for_config
 from chartreux.core.dispatch.session import BoundDispatchPolicy, bind_policy
 from chartreux.core.errors import ContextTooLongError
@@ -386,6 +387,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._plan_attrs_task: asyncio.Task[None] | None = None
         self._reload_generation: int = 0
         self._session_generation: int = 0
+        # Bounded deferred-question records for unattended question expiry
+        # (plan U/OD1): the app server records on expiry; compaction carries
+        # the records across the structural boundary.
+        self.deferred_questions = DeferredQuestionStore()
         self._init_duration_pending: bool = defer_heavy_init
         self._last_init_duration_ms: int | None = None
         # Title and managed-job state results land here. The app-server's one
@@ -692,6 +697,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 )
             ),
             messages=self.messages,
+            deferred_questions=self.deferred_questions,
             session_id_getter=lambda: self.session_id,
             parent_session_id_getter=lambda: self.parent_session_id,
             session_lease_getter=lambda: self._session_lease,
@@ -867,6 +873,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             tool_choice=self.format_handler.get_tool_choice,
             save=self._save_messages,
             file_state_getter=lambda: self.file_state_context.store,
+            deferred_questions_getter=lambda: self.deferred_questions,
         )
 
         if defer_heavy_init:
@@ -1159,6 +1166,21 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
     async def refresh_config(self) -> None:
         await _config_transactions.refresh_config(self)
+
+    @property
+    def is_subagent(self) -> bool:
+        """Whether this loop runs as a subagent (no own interactive turn)."""
+        return self._is_subagent
+
+    @property
+    def user_input_capability(self) -> bool:
+        """Whether this loop may ask the user questions interactively."""
+        return self._user_input_capability
+
+    @property
+    def session_generation(self) -> int:
+        """Monotonic session generation, bumped on transcript rewind/rebind."""
+        return self._session_generation
 
     def resolve_user_input_request(self, request_id: str, result: BaseModel) -> None:
         self._request_broker.resolve_user_input(request_id, result)
@@ -1518,6 +1540,25 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         return select_backend(
             config or self.config, on_retry=self.notice_retry, factory=create_backend
         )
+
+    def refresh_backend_for_resume(self) -> None:
+        """Retire this loop's failed backend and install a fresh one (WP2).
+
+        Resume-time backend refresh (handoff §1.4 item 6): ONLY this loop's
+        active backend is retired, through its ownership-aware
+        ``BackendLifetime`` — it closes once no turn or borrow protects it.
+        Sibling agents own separate backend lifetimes and are never touched,
+        and no global client reset occurs (F3 borrowed-backend semantics).
+        The replacement is created through the normal backend factory, so
+        provider configuration and the shared availability registry apply.
+        Never callable while a turn is active: the failed run's tasks are
+        joined before the resume admission reaches this point.
+        """
+        if self._active_turn is not None:
+            raise AgentLoopStateError(
+                "Cannot refresh the backend while a turn is active"
+            )
+        self._backend_lifetime.replace(self._select_backend(), whole_turn_active=False)
 
     async def _save_messages(self, *, allow_empty: bool = False) -> None:
         await self.session_logger.save_interaction(
@@ -1953,6 +1994,20 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if self._hooks_manager:
             self._hooks_manager.reset_retry_count()
 
+    def _has_unanswered_user_message(self) -> bool:
+        """Whether the live tail ends in a user message no assistant answers.
+
+        PI1/T (S5): with anchored result placement the settled tool result
+        lands after its owning assistant message, BEFORE the steered user
+        message, so a steer can be the LAST message while its turn is still
+        in flight. The conversation loop must not break on role alone there —
+        it would strand the steer unprocessed. A trailing user message has no
+        assistant reply after it by construction.
+        """
+        if not self.messages:
+            return False
+        return self.messages[-1].role == Role.user
+
     async def _conversation_loop(  # noqa: PLR0912 - conversation lifecycle
         self,
         user_msg: str | None,
@@ -2033,7 +2088,14 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 await self._settle_steering_injections()
                 last_message = self.messages[-1]
                 drained = self._context_injector.drain_pending()
-                should_break_loop = last_message.role != Role.tool and not drained
+                # PI1/T (S5): anchored result placement can leave a steered
+                # user message as the last message of an in-flight turn; the
+                # loop continues so the steer is processed, not stranded.
+                should_break_loop = (
+                    last_message.role != Role.tool
+                    and not drained
+                    and not self._has_unanswered_user_message()
+                )
 
                 if user_cancelled:
                     return
@@ -2795,6 +2857,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._reset_session_scoped_state()
         self._session_transitions.restore_todo_state(loaded_messages)
         self._session_transitions.restore_file_state(loaded_messages)
+        self._session_transitions.restore_deferred_questions(loaded_messages)
         self.tool_manager._install_task_description(prepared.resumed_task_description)
         self._publish_system_prompt(prepared.resumed_prompt)
         cleanup_scratchpad(prepared.previous_scratchpad)

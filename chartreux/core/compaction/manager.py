@@ -15,6 +15,7 @@ from chartreux.core.compaction.context import (
     render_compaction_context,
     select_model_context,
 )
+from chartreux.core.deferred_questions import DeferredQuestionStore
 from chartreux.core.errors import ContextTooLongError
 from chartreux.core.file_state import FileStateStore
 from chartreux.core.llm.thinking_levels import get_thinking_levels
@@ -79,6 +80,7 @@ class CompactionManager:
         tool_choice: Callable[[], StrToolChoice | AvailableTool],
         save: Callable[[], Awaitable[None]],
         file_state_getter: Callable[[], FileStateStore] | None = None,
+        deferred_questions_getter: Callable[[], DeferredQuestionStore] | None = None,
     ) -> None:
         self._messages = messages
         self._stats = stats_getter
@@ -88,6 +90,7 @@ class CompactionManager:
         self._tool_choice = tool_choice
         self._save = save
         self._file_state_getter = file_state_getter
+        self._deferred_questions_getter = deferred_questions_getter
 
     async def compact(self, extra_instructions: str = "") -> str:
         summary_prefix = UtilityPrompt.COMPACT_SUMMARY_PREFIX.read()
@@ -115,6 +118,11 @@ class CompactionManager:
             # outlines — is therefore rendered into the boundary CONTENT once,
             # at this boundary.
             file_state_section = render_file_state_compaction_summary(file_store)
+        if self._deferred_questions_getter is not None:
+            # Deferred-question records (unattended question expiry, plan U)
+            # ride the envelope exactly like the todo and file state, so a
+            # reload can restore them; bounding never silently drops items.
+            output.update(self._deferred_questions_getter().to_envelope())
 
         envelope = LLMMessage(
             role=Role.user,

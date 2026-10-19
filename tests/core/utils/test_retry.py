@@ -21,6 +21,7 @@ from chartreux.core.utils.retry import (
     async_generator_retry,
     async_retry,
     bind_retry_budget,
+    jittered_backoff,
 )
 
 
@@ -754,6 +755,57 @@ class TestParseRetryAfter:
 
     def test_non_http_status_error_returns_none(self) -> None:
         assert _parse_retry_after(RuntimeError("boom")) is None
+
+    def test_non_finite_attribute_returns_none(self) -> None:
+        # WP4: an infinite Retry-After must never arm an unbounded cooldown.
+        for value in (float("inf"), float("-inf"), float("nan")):
+            error = RuntimeError("boom")
+            error.retry_after = value  # type: ignore[attr-defined]
+            assert _parse_retry_after(error) is None
+
+    def test_negative_attribute_returns_none(self) -> None:
+        error = RuntimeError("boom")
+        error.retry_after = -5.0  # type: ignore[attr-defined]
+        assert _parse_retry_after(error) is None
+
+    def test_bool_attribute_returns_none(self) -> None:
+        error = RuntimeError("boom")
+        error.retry_after = True  # type: ignore[attr-defined]
+        assert _parse_retry_after(error) is None
+
+    def test_overflowing_delta_seconds_returns_none(self) -> None:
+        # A delta-seconds header too large for float() is not a usable delay.
+        error = _make_http_status_error(503, {"Retry-After": "9" * 400})
+        assert _parse_retry_after(error) is None
+
+
+class TestJitteredBackoff:
+    """WP4: the recovery controller's cooldown/jitter schedule helper."""
+
+    def test_zero_jitter_returns_base(self) -> None:
+        assert jittered_backoff(30.0, 0.0, draw=lambda: 0.99) == 30.0
+
+    def test_midpoint_draw_returns_base(self) -> None:
+        assert jittered_backoff(30.0, 0.2, draw=lambda: 0.5) == 30.0
+
+    def test_draw_bounds_scale_symmetrically(self) -> None:
+        assert jittered_backoff(30.0, 0.2, draw=lambda: 0.0) == pytest.approx(24.0)
+        assert jittered_backoff(30.0, 0.2, draw=lambda: 1.0) == pytest.approx(36.0)
+
+    def test_out_of_range_draws_are_clamped(self) -> None:
+        assert jittered_backoff(30.0, 0.2, draw=lambda: -3.0) == pytest.approx(24.0)
+        assert jittered_backoff(30.0, 0.2, draw=lambda: 7.0) == pytest.approx(36.0)
+
+    def test_nonpositive_base_yields_zero(self) -> None:
+        assert jittered_backoff(0.0, 0.2, draw=lambda: 0.0) == 0.0
+        assert jittered_backoff(-5.0, 0.2, draw=lambda: 1.0) == 0.0
+
+    def test_default_draw_is_random(self) -> None:
+        # The production draw is random.random; the result stays within the
+        # symmetric jitter band and is never negative.
+        for _ in range(64):
+            value = jittered_backoff(30.0, 0.2)
+            assert 24.0 <= value <= 36.0
 
 
 class TestAdaptiveBackoff:

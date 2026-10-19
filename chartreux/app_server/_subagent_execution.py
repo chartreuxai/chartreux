@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
@@ -14,12 +14,27 @@ from chartreux.app_server._subagent_records import (
     _AgentState,
     _AgentTombstone,
     _ReplacementClaim,
+    _ResumeAdmission,
 )
 from chartreux.app_server.models import PublicTurn, PublicTurnStatus, TextContentBlock
 from chartreux.app_server.protocol import TurnInterruptParams, TurnStartParams
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.events import BaseEvent, ToolStreamEvent
 from chartreux.core.llm_models import LLMMessage, Role
+from chartreux.core.recovery_models import (
+    FailureEnvelope,
+    RecoveryReference,
+    build_failure_envelope,
+    canonical_endpoint_identity,
+)
+from chartreux.core.recovery_observation import (
+    FailureObservation,
+    observe_exception,
+    preserve_run_observation,
+    record_observation,
+    turn_observation,
+)
+from chartreux.core.recovery_policy import ReplacementDecision
 from chartreux.core.subagents import (
     AgentBusyError,
     AgentClosedError,
@@ -50,10 +65,90 @@ if TYPE_CHECKING:
     from chartreux.core.agent_loop.backend_lifetime import BackendPublish
     from chartreux.core.agents.launch import LaunchCandidate
     from chartreux.core.agents.models import AgentProfile
+    from chartreux.core.session_types import AgentStats
     from chartreux.core.tools.base import InvokeContext
 
 _BACKGROUND_PROGRESS_LIMIT = 32
 _MAX_RUN_HISTORY = 32
+
+
+def _tool_call_effect_sets(messages: Sequence[LLMMessage]) -> tuple[set[str], set[str]]:
+    """Transcript-visible tool-call id sets: (requested, settled).
+
+    Assistant ``tool_calls`` request effects; ``Role.tool`` messages settle
+    them by ``tool_call_id``.
+    """
+    requested: set[str] = set()
+    settled: set[str] = set()
+    for message in messages:
+        if message.role is Role.assistant:
+            for call in message.tool_calls or ():
+                if call.id:
+                    requested.add(call.id)
+        elif message.role is Role.tool and message.tool_call_id:
+            settled.add(message.tool_call_id)
+    return requested, settled
+
+
+def _tool_effect_inputs(messages: Sequence[LLMMessage]) -> tuple[bool, bool]:
+    """Transcript-visible tool-effect evidence: (requested, pending).
+
+    Assistant ``tool_calls`` request effects; ``Role.tool`` messages settle
+    them by ``tool_call_id``. This is transcript evidence only — hooks,
+    jobs, and child launches are not transcript-visible, so the envelope's
+    tool_effects derivation treats absence of tool calls as unknown, never
+    as settled (F4).
+    """
+    requested, settled = _tool_call_effect_sets(messages)
+    return bool(requested), bool(requested - settled)
+
+
+def _outstanding_tool_call_ids(messages: Sequence[LLMMessage]) -> set[str]:
+    """The tool calls the transcript shows requested but never settled.
+
+    Review R5: a reconcile submission must account for exactly these ids —
+    an unrelated id, an incomplete subset, a repeated id, or an empty
+    submission verifies nothing about the unknown effects and never clears
+    the barrier.
+    """
+    requested, settled = _tool_call_effect_sets(messages)
+    return requested - settled
+
+
+#: The cumulative AgentStats fields a replacement inherits from its
+#: predecessor (review R7): the middleware limits evaluate these against
+#: the loop-local stats, so a fresh replacement loop must not start them
+#: from zero. Per-turn measurements and pricing stay loop-local.
+_CUMULATIVE_STAT_FIELDS = (
+    "steps",
+    "session_prompt_tokens",
+    "session_completion_tokens",
+    "session_cached_tokens",
+    "tool_calls_agreed",
+    "tool_calls_rejected",
+    "tool_calls_hook_denied",
+    "tool_calls_failed",
+    "tool_calls_succeeded",
+    "known_cost_total",
+)
+
+
+def _transfer_cumulative_stats(source: AgentStats, target: AgentStats) -> None:
+    """Seed a replacement's fresh stats with the predecessor's consumption.
+
+    Review R7: a replacement creates a fresh loop whose AgentStats start at
+    zero while turn/price/token middleware limits are evaluated against
+    those LOCAL stats — without the transfer, replacement renewed every
+    budget the predecessor had already consumed. The cumulative counters
+    add up; per-turn measurements and pricing stay local to the new loop.
+    """
+    for field_name in _CUMULATIVE_STAT_FIELDS:
+        setattr(
+            target,
+            field_name,
+            getattr(target, field_name) + getattr(source, field_name),
+        )
+    target.has_unknown_cost = target.has_unknown_cost or source.has_unknown_cost
 
 
 class ExecutionStateView(Protocol):
@@ -166,6 +261,14 @@ class ExecutionStateView(Protocol):
         self, record: AgentRecord, run: RunRecord | None, *, name: str
     ) -> bool: ...
 
+    def _suspend_after_failure_locked(
+        self, record: AgentRecord, run: RunRecord
+    ) -> bool: ...
+
+    def _observe_run_completion_locked(
+        self, record: AgentRecord, run: RunRecord
+    ) -> None: ...
+
 
 @dataclass
 class ForegroundExecutionContext:
@@ -269,6 +372,10 @@ class BackgroundExecutionContext:
     action: TurnStartAction | None = None
     backend_publication: BackendPublish | None = None
     committed: bool = False
+    # WP5: the validated failure-time replacement decision for a claimed
+    # replacement launch (carries the milestone notice with its honest cost
+    # implication); None for unclaimed launches.
+    replacement_decision: ReplacementDecision | None = None
 
     async def consume_event(self, event: BaseEvent) -> None:
         """Feed one child event into the run record's progress summaries.
@@ -374,6 +481,8 @@ class SubagentExecution:
         *,
         replacement: _ReplacementClaim | None,
         summary_task: str | None,
+        resume: _ResumeAdmission | None = None,
+        replacement_decision: ReplacementDecision | None = None,
     ) -> BackgroundExecutionContext:
         """Prepare one background execution and return its context.
 
@@ -383,6 +492,17 @@ class SubagentExecution:
         and the run-record setup, moved intact. Registry state is read
         through the view at call time; the returned context carries the
         preparation + acceptance-tail state as references.
+
+        WP2: ``resume`` carries a checked resume admission — a RESTORING
+        record is admitted (an ordinary reuse still requires IDLE), the
+        child session keeps its original transcript link (no re-link to a
+        synthesized tool call), and the run id is the successor id
+        published at admission.
+
+        WP5: ``replacement_decision`` is the validated failure-time
+        replacement decision for a claimed replacement launch (already
+        admitted by the launch admission); the fresh record carries the
+        claim's predecessor/package lineage from ``args.config``.
         """
         self._view._validate_background_admission(parent, parent_identity)
         retained_candidate: LaunchCandidate | None = None
@@ -415,9 +535,11 @@ class SubagentExecution:
                     self._view._validate_replacement_locked(replacement)
                     if record is not replacement.record:
                         raise RuntimeError("Agent replacement residency changed")
-                elif (
-                    record.reserved_for_replacement
-                    or record.state is not _AgentState.IDLE
+                elif record.reserved_for_replacement or (
+                    record.state is not _AgentState.IDLE
+                    and not (
+                        resume is not None and record.state is _AgentState.RESTORING
+                    )
                 ):
                     raise AgentBusyError("Agent is already running a task")
                 if (
@@ -480,9 +602,13 @@ class SubagentExecution:
                     raise
             if parent.turns._projector is not None:
                 try:
-                    await parent.turns.link_subagent(
-                        ctx.tool_call_id, record.session_id
-                    )
+                    if resume is None:
+                        # WP2: a resumed child session keeps its original
+                        # transcript link; re-linking to a synthesized tool
+                        # call would corrupt the parent's projection.
+                        await parent.turns.link_subagent(
+                            ctx.tool_call_id, record.session_id
+                        )
                     async with self._view._registry_lock:
                         self._view._validate_background_admission(
                             parent, parent_identity
@@ -515,6 +641,10 @@ class SubagentExecution:
             )
             launch_profile = profile
             agent_id = await self._view._issue_agent_id(parent)
+            # WP5: a claimed replacement launch (args.agent_id is None with
+            # a config.predecessor_agent_id claim) gets a NEW agent_id whose
+            # record carries the predecessor/package lineage from the claim.
+            claim = args.config
             record = AgentRecord(
                 agent_id=agent_id,
                 profile=runtime.agent_loop.launch_profile or args.agent_type,
@@ -527,6 +657,11 @@ class SubagentExecution:
                     args.task_summary, fallback=effective_task
                 ),
                 state=_AgentState.RUNNING,
+                work_package_id=claim.work_package_id if claim is not None else None,
+                predecessor_agent_id=(
+                    claim.predecessor_agent_id if claim is not None else None
+                ),
+                package_tier=claim.package_tier if claim is not None else None,
             )
             try:
                 async with self._view._registry_lock:
@@ -542,10 +677,26 @@ class SubagentExecution:
                 )
                 raise
             created_record = True
+            # Review R7: a claimed replacement inherits the predecessor's
+            # cumulative execution budgets — a fresh loop starts every
+            # middleware limit from zero, so without the transfer the
+            # replacement renews the budgets the predecessor consumed.
+            if claim is not None and claim.predecessor_agent_id is not None:
+                predecessor = self._view._agent_records.get(claim.predecessor_agent_id)
+                if predecessor is not None:
+                    _transfer_cumulative_stats(
+                        predecessor.runtime.agent_loop.stats, runtime.agent_loop.stats
+                    )
 
         record.work_slot = slot
         agent_id = record.agent_id
-        run_id = self._view._new_run_id(agent_id)
+        # WP2: a resume admission publishes the successor run id allocated
+        # at admission; every other path allocates a fresh one.
+        run_id = (
+            resume.successor_run_id
+            if resume is not None
+            else self._view._new_run_id(agent_id)
+        )
         prior_current_run = record.current_run
         prior_retained = record.retained
         prior_latest_run_id = record.latest_run_id
@@ -626,6 +777,7 @@ class SubagentExecution:
             completion_metadata_mark=completion_metadata_mark,
             completion_placeholder=completion_placeholder,
             publication_token=publication_token,
+            replacement_decision=replacement_decision,
         )
 
     async def rollback_background(
@@ -695,7 +847,117 @@ class SubagentExecution:
                 apply_policy=replacement is not None,
             )
 
-    async def monitor(  # noqa: PLR0912, PLR0915
+    def _build_failure_envelope(
+        self,
+        context: BackgroundExecutionContext,
+        *,
+        observation: FailureObservation | None,
+        turn: PublicTurn | None,
+        turns_used: int,
+    ) -> FailureEnvelope | None:
+        """Build the public typed failure envelope for one failed run (WP1).
+
+        Total by contract: the envelope is additive diagnostics — any
+        construction failure is logged and reported as ``None`` (no
+        envelope), never masking the primary run failure. The envelope is
+        bounded and redacted; full diagnostics stay in the private WP0
+        observation carrier.
+        """
+        try:
+            agent_loop = context.runtime.agent_loop
+            committed = agent_loop.committed_model
+            # Review R11: the attempted deployment frozen at the completion
+            # boundary — the identity that actually served the failed attempt
+            # (the same attempt the observed endpoint describes) — preferred
+            # over the committed identity the failed-attempt rollback
+            # restored.
+            attempted_deployment = (
+                observation.attempted_deployment
+                if observation is not None
+                and observation.attempted_deployment is not None
+                else (
+                    (committed.base_model, committed.provider, committed.wire_name)
+                    if committed is not None
+                    else None
+                )
+            )
+            exclusion_reasons: list[str] | None = None
+            if turn is not None and turn.error is not None:
+                details = turn.error.details
+                if isinstance(details, dict):
+                    exclusions = details.get("exclusions")
+                    if isinstance(exclusions, list):
+                        exclusion_reasons = [
+                            reason
+                            for item in exclusions
+                            if isinstance(item, dict)
+                            and isinstance(reason := item.get("reason"), str)
+                        ]
+            tool_calls_present, tool_calls_pending = _tool_effect_inputs(
+                agent_loop.messages
+            )
+            endpoint_correlated = False
+            endpoint_identity = canonical_endpoint_identity(
+                observation.endpoint if observation is not None else None
+            )
+            if endpoint_identity is not None:
+                endpoint_correlated = agent_loop.config_orchestrator.availability_registry.endpoint_correlation_active(
+                    endpoint_identity
+                )
+            return build_failure_envelope(
+                observation=observation,
+                agent_id=context.agent_id,
+                run_id=context.run_id,
+                turn_id=context.turn_id,
+                turns_used=turns_used,
+                attempted_deployment=attempted_deployment,
+                configured_model=agent_loop.config.active_model or None,
+                stop_reason=(
+                    context.run_record.stop_reason.value
+                    if context.run_record.stop_reason is not None
+                    else None
+                ),
+                exclusion_reasons=exclusion_reasons,
+                tool_calls_present=tool_calls_present,
+                tool_calls_pending=tool_calls_pending,
+                endpoint_correlated=endpoint_correlated,
+                # Review R10: a resumed run's envelope keeps the record's
+                # recovery identity — the episode chain and the actual
+                # same-agent resume count — never a fresh chain derived
+                # per run or a reset counter.
+                same_agent_resumes_used=context.record.same_agent_resumes_used,
+                recovery_chain_id=context.record.recovery_chain_id,
+                # WP5: the envelope carries the run's predecessor/package
+                # lineage (the WP4 recovery controller keys endpoint
+                # correlation on the envelope's work_package_id).
+                work_package_id=context.record.work_package_id,
+                predecessor_agent_id=context.record.predecessor_agent_id,
+            )
+        except Exception as exc:
+            logger.warning("Failed to build failure envelope", exc_info=exc)
+            return None
+
+    @staticmethod
+    def _result_update(
+        context: BackgroundExecutionContext,
+        failure_envelope: FailureEnvelope | None,
+        run_status: RunStatus | None,
+    ) -> dict[str, Any]:
+        """Result update carrying identity/metadata plus typed failure evidence."""
+        update: dict[str, Any] = {
+            "agent_id": context.agent_id,
+            "run_id": context.run_id,
+            "metadata": context.runtime.agent_loop.completion_metadata_since(
+                context.completion_metadata_mark
+            ),
+        }
+        if failure_envelope is not None:
+            update["failure"] = failure_envelope
+            update["run_status"] = run_status
+            update["recovery"] = RecoveryReference.from_envelope(failure_envelope)
+        return update
+
+    async def monitor(  # noqa: PLR0912, PLR0914, PLR0915
         self,
         context: BackgroundExecutionContext,
         parent: SessionRuntime,
@@ -723,26 +985,46 @@ class SubagentExecution:
         assert turn_id is not None
         try:
             turn = await context.runtime.turns.wait_for_operation(turn_id)
+            observation: FailureObservation | None = None
             if turn.error is not None:
                 context.accumulator.record_error(turn.error.message)
+                # The turn's PublicError is message-only; link the typed
+                # observation captured before that projection (WP0 F5) to
+                # the failed run so recovery can classify it later. The
+                # carrier stays private — the public projection below is
+                # unchanged.
+                observation = turn_observation(turn_id)
+                if observation is not None:
+                    observation = preserve_run_observation(
+                        context.agent_id, context.run_id, observation
+                    )
             end_count = sum(
                 message.role is Role.assistant
                 for message in context.runtime.agent_loop.messages
             )
-            context.run_record.result = context.accumulator.build_result(
-                turns_used=end_count - context.run_record.start_count,
-                completed=turn.status is PublicTurnStatus.COMPLETED,
-            ).model_copy(
-                update={
-                    "agent_id": context.agent_id,
-                    "run_id": context.run_id,
-                    "metadata": context.runtime.agent_loop.completion_metadata_since(
-                        context.completion_metadata_mark
-                    ),
-                }
-            )
+            turns_used = end_count - context.run_record.start_count
             context.run_record.status, context.run_record.stop_reason = (
                 self._view._resolve_run_outcome(context.run_record, turn)
+            )
+            # WP1: the public typed failure envelope rides the failed run's
+            # result and run record; bounded and redacted, full diagnostics
+            # stay in the private observation carrier.
+            failure_envelope = (
+                self._build_failure_envelope(
+                    context, observation=observation, turn=turn, turns_used=turns_used
+                )
+                if turn.error is not None
+                else None
+            )
+            if failure_envelope is not None:
+                context.run_record.failure = failure_envelope
+            context.run_record.result = context.accumulator.build_result(
+                turns_used=turns_used,
+                completed=turn.status is PublicTurnStatus.COMPLETED,
+            ).model_copy(
+                update=self._result_update(
+                    context, failure_envelope, context.run_record.status
+                )
             )
         except asyncio.CancelledError:
             context.run_record.status, context.run_record.stop_reason = (
@@ -770,18 +1052,48 @@ class SubagentExecution:
             raise
         except Exception as exc:
             context.accumulator.record_error(str(exc))
+            # Preserve the typed monitor failure (WP0 F5): the monitor
+            # itself failed to observe the terminal turn, so capture the
+            # exception here — the turn-level observation (if any) stays
+            # turn-keyed. The carrier is private; the public projection
+            # below is unchanged.
+            monitor_observation = observe_exception(
+                exc,
+                phase="monitor",
+                turn_id=turn_id,
+                agent_id=context.agent_id,
+                run_id=context.run_id,
+            )
+            record_observation(monitor_observation)
             context.run_record.status = RunStatus.FAILED
             context.run_record.stop_reason = RunStopReason.ERROR
+            # Measure turns from observed work (assistant messages), never
+            # from a synthetic zero: a monitor failure after real work must
+            # not erase the run's progress (WP0 F5 zero-turn fix).
+            end_count = sum(
+                message.role is Role.assistant
+                for message in context.runtime.agent_loop.messages
+            )
+            turns_used = end_count - context.run_record.start_count
+            # WP1: a harness-side monitor failure is represented honestly as
+            # an INTERNAL-class envelope (phase=monitor), never relabeled.
+            monitor_envelope = self._build_failure_envelope(
+                context,
+                observation=monitor_observation,
+                turn=None,
+                turns_used=turns_used,
+            )
+            # Review R12: the PRIMARY failure stays authoritative evidence —
+            # a secondary result/finalization failure never replaces the
+            # run's published typed envelope (nor the result's recovery
+            # reference) with an INTERNAL-class monitor one.
+            if context.run_record.failure is None:
+                context.run_record.failure = monitor_envelope
+            failure_envelope = context.run_record.failure
             context.run_record.result = context.accumulator.build_result(
-                turns_used=0, completed=False
+                turns_used=turns_used, completed=False
             ).model_copy(
-                update={
-                    "agent_id": context.agent_id,
-                    "run_id": context.run_id,
-                    "metadata": context.runtime.agent_loop.completion_metadata_since(
-                        context.completion_metadata_mark
-                    ),
-                }
+                update=self._result_update(context, failure_envelope, RunStatus.FAILED)
             )
         finally:
             if context.run_record.result is not None:
@@ -954,11 +1266,16 @@ class SubagentExecution:
                             context.record.root_generation
                         )
                     ):
-                        # Completion transition: a retained instance
-                        # returns to idle; an unretained instance closes
-                        # (detach + `closed` tombstone + tracked runtime
-                        # close) after the result was published above.
-                        if not self._view._close_unretained_locked(
+                        # Completion transition (WP2): a recoverably failed
+                        # run SUSPENDS the record — warm, resident, explicitly
+                        # resumable — instead of closing it; a retained
+                        # instance otherwise returns to idle; an unretained
+                        # instance closes (detach + `closed` tombstone +
+                        # tracked runtime close) after the result was
+                        # published above.
+                        if not self._view._suspend_after_failure_locked(
+                            context.record, context.run_record
+                        ) and not self._view._close_unretained_locked(
                             context.record,
                             context.run_record,
                             name=(
@@ -966,6 +1283,13 @@ class SubagentExecution:
                             ),
                         ):
                             context.record.state = _AgentState.IDLE
+                    # WP4: observe the settled run for the automatic recovery
+                    # controller AFTER the completion transition — a
+                    # recoverably failed run is SUSPENDED by then. INERT
+                    # unless [recovery.subagents] enabled.
+                    self._view._observe_run_completion_locked(
+                        context.record, context.run_record
+                    )
                     self._view._expire_results_locked()
                     if not self._view._draining_children:
                         self._view._rearm_reaper_locked()
@@ -1137,13 +1461,20 @@ class SubagentExecution:
         # The name is derived from the record's committed admission state;
         # refusals and failed admissions never relabel (§5).
         agent_name = self._view._record_name(context.record)
+        response_text = (
+            f"Background agent {agent_name} ({context.agent_id}, run {context.run_id}) "
+            "launched and running; use check_agents to monitor, "
+            "get_agent_result or wait_for_agent to retrieve the "
+            "result." + policy_guidance
+        )
+        # WP5: every substitution emits its milestone notice (with the honest
+        # cost implication) on the acknowledgment, and the ack carries the
+        # validated decision plus the predecessor/package lineage.
+        decision = context.replacement_decision
+        if decision is not None and decision.notice:
+            response_text += f"\n{decision.notice}"
         return TaskResult(
-            response=(
-                f"Background agent {agent_name} ({context.agent_id}, run {context.run_id}) "
-                "launched and running; use check_agents to monitor, "
-                "get_agent_result or wait_for_agent to retrieve the "
-                "result." + policy_guidance
-            ),
+            response=response_text,
             turns_used=0,
             completed=True,
             status="launched",
@@ -1151,6 +1482,9 @@ class SubagentExecution:
             agent_id=context.agent_id,
             run_id=context.run_id,
             name=agent_name,
+            work_package_id=context.record.work_package_id,
+            predecessor_agent_id=context.record.predecessor_agent_id,
+            replacement=decision,
             metadata={
                 "base_model": context.record.base_model,
                 "active_provider": context.record.active_provider,

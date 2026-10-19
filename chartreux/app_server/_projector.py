@@ -23,6 +23,7 @@ from chartreux.app_server.models import (
     EffectDetail,
     EffectResultDisplay,
     EffectState,
+    ExpiredCallbackState,
     FailedEffectState,
     GenericEffectDetail,
     HookNoticeDetail,
@@ -361,6 +362,58 @@ class EventProjector:
                             "status": "answered",
                             "output": output.model_dump(mode="json", by_alias=True),
                         },
+                    ),
+                    JsonPatchOperation(
+                        op="replace", path="/generationStatus", value="completed"
+                    ),
+                ],
+            )
+        ]
+        if entry.related_entry_id in self._entries:
+            effect = self._entries[cast(str, entry.related_entry_id)]
+            if isinstance(effect, PublicEffectEntry):
+                output_text = (
+                    effect.state.output_text
+                    if isinstance(effect.state, BlockedEffectState)
+                    else ""
+                )
+                updates.append(
+                    self._patch(
+                        effect.id,
+                        [
+                            JsonPatchOperation(
+                                op="replace",
+                                path="/state",
+                                value=RunningEffectState(
+                                    output_text=output_text
+                                ).model_dump(mode="json", by_alias=True),
+                            )
+                        ],
+                    )
+                )
+        return updates
+
+    def expire_callback(self, callback_id: str, reason: str) -> list[ProjectedUpdate]:
+        """Publish the terminal expired state for an unanswered callback (plan U).
+
+        Mirrors resolve_callback: the entry becomes terminal history (a
+        reconnecting client sees history, not a ghost callback) and the
+        blocked related effect unblocks so the turn can continue.
+        """
+        entry_id = self._callback_entries.get(callback_id)
+        if entry_id is None:
+            return []
+        entry = cast(PublicCallbackEntry, self._entries[entry_id])
+        updates = [
+            self._patch(
+                entry_id,
+                [
+                    JsonPatchOperation(
+                        op="replace",
+                        path="/state",
+                        value=ExpiredCallbackState(reason=reason).model_dump(
+                            mode="json", by_alias=True
+                        ),
                     ),
                     JsonPatchOperation(
                         op="replace", path="/generationStatus", value="completed"

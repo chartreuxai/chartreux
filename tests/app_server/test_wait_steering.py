@@ -1037,3 +1037,206 @@ async def test_real_child_survives_parent_wait_steering_and_ledger_is_unchanged(
         await root.close()
         await registry.close()
         await process.close()
+
+
+@pytest.mark.asyncio
+async def test_composed_skill_steer_over_the_live_reuse_tail_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-5 Y5: the app-server steer with ``inject_invoked_skill=True``
+    over the EXACT live-reuse tail ``[U, A1(c1), R1(c1), U, A2(c1)
+    in-flight]`` — the composed injection lands behind the steered user
+    message over the in-flight anchor, and the TurnController steer is
+    ACCEPTED (no "Steering committed; accepted-operation recovery failed").
+
+    The reuse tail: the turn's assistant REUSES the id ``c1`` whose genuine
+    result an earlier settled turn already recorded, so the in-flight call
+    is only legitimate inside the live-region walk — which now keys on the
+    injector's provenance marker, never on the call id's format. The
+    post-steer turn continuation races this pin, so the assertions locate
+    the composed prefix instead of pinning the moving tail.
+    """
+    import json
+
+    from chartreux.app_server._runtime import _install_transcript_repair
+    from chartreux.core.agent_loop._transcript_integrity import (
+        find_persistence_violations,
+    )
+    from chartreux.core.config import SessionLoggingConfig
+    from chartreux.core.llm_models import (
+        CONTEXT_INJECTION_ORIGIN_KEY,
+        CONTEXT_INJECTION_TOOL_PAIR_V1,
+        LLMMessage,
+        PersistedToolResult,
+    )
+    from chartreux.core.session.session_loader import MESSAGES_FILENAME, SessionLoader
+    from chartreux.core.skills.models import ParsedSkillCommand, SkillInfo
+
+    backend = FakeBackend([
+        [mock_llm_chunk(content="Waiting", tool_calls=[wait_call("c1")])],
+        [mock_llm_chunk(content="Continued")],
+    ])
+    config = build_test_vibe_config(
+        enabled_tools=["wait_for_agent", "ask_user_question", "skill"],
+        session_logging=SessionLoggingConfig(
+            save_dir=str(tmp_path), session_prefix="y-steer", enabled=True
+        ),
+    )
+    loop = build_test_agent_loop(config=config, backend=backend)
+    manager = WaitManager()
+    registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
+    root = registry._build_child_runtime(loop)
+    root.turns._subagent_runner = cast(SubagentRunnerPort, manager)
+    try:
+        # Seed the settled earlier turn: [U, A1(c1), R1(c1)] — the id c1
+        # already has a recorded genuine result.
+        loop.messages.append(LLMMessage(role=Role.user, content="first"))
+        loop.messages.append(
+            LLMMessage(
+                role=Role.assistant,
+                content="Working",
+                tool_calls=[
+                    ToolCall(
+                        id="c1",
+                        index=0,
+                        function=FunctionCall(name="read_file", arguments="{}"),
+                    )
+                ],
+            )
+        )
+        loop.messages.append(
+            LLMMessage(
+                role=Role.tool,
+                tool_call_id="c1",
+                name="read_file",
+                content="file contents",
+                tool_result=PersistedToolResult(output={"text": "file contents"}),
+            )
+        )
+        # The turn's user message, then its assistant response REUSING the
+        # id c1 with a wait_for_agent call: the exact reuse tail
+        # [U, A1(c1), R1(c1), U, A2(c1) in-flight].
+        response, action = root.turns.start(
+            TurnStartParams(
+                session_id=loop.session_id, message=[TextContentBlock(text="second")]
+            )
+        )
+        action()
+        await until(lambda: loop.is_waiting_only(response.turn.id))
+        transcript = list(loop.messages)
+        assert [message.role for message in transcript] == [
+            Role.system,
+            Role.user,
+            Role.assistant,
+            Role.tool,
+            Role.user,
+            Role.assistant,
+        ]
+        in_flight = transcript[-1]
+        assert in_flight.tool_calls and in_flight.tool_calls[0].id == "c1"
+        # A2's call is in flight: the only tool result so far is R1(c1).
+        assert [m.tool_call_id for m in transcript if m.role == Role.tool] == ["c1"]
+        # The skill expansion the steer will compose.
+        skill = SkillInfo(name="y-skill", description="test", prompt="Do the thing.")
+        monkeypatch.setattr(
+            loop.skill_manager,
+            "parse_skill_command",
+            lambda text: (
+                ParsedSkillCommand(name=skill.name, content=skill.prompt)
+                if text.strip().startswith("/")
+                else None
+            ),
+        )
+        monkeypatch.setattr(loop.skill_manager, "get_skill", lambda _name: skill)
+        # THE Y5 PIN: the composed steer (inject_invoked_skill=True, the
+        # production default) over the in-flight anchor.
+        steer_response = await root.turns.steer(
+            TurnSteerParams(
+                session_id=loop.session_id,
+                expected_turn_id=response.turn.id,
+                message=[TextContentBlock(text="/y-skill")],
+                idempotency_key="steer:y5",
+                inject_invoked_skill=True,
+                require_waiting_only=True,
+            )
+        )
+        # Accepted end-to-end: no "Steering committed; accepted-operation
+        # recovery failed" — the save seam accepted the composed shape.
+        assert steer_response.accepted is True
+        transcript = list(loop.messages)
+        steer_index = next(
+            index
+            for index, message in enumerate(transcript)
+            if message.role == Role.user and message.content == "/y-skill"
+        )
+        steered, pair_assistant, pair_result = transcript[steer_index : steer_index + 3]
+        assert steered.injected is False  # production flag values
+        assert pair_assistant.role == Role.assistant
+        assert pair_assistant.injected is False  # production flag values
+        assert pair_assistant.tool_calls
+        pair_call_id = pair_assistant.tool_calls[0].id
+        # THE PROVENANCE: the injector's assistant is marked; the executor's
+        # result is not.
+        assert (
+            pair_assistant._context_injection_origin == CONTEXT_INJECTION_TOOL_PAIR_V1
+        )
+        assert pair_result.role == Role.tool
+        assert pair_result.tool_call_id == pair_call_id
+        assert pair_result.tool_result is not None
+        assert type(pair_result._context_injection_origin) is not str
+        # The prefix through the composed pair is the accepted shape. The
+        # wait's steering-cancellation result is anchored right after its
+        # owner A2 (the S5 anchored placement), before the steered user.
+        prefix = transcript[: steer_index + 3]
+        assert [message.role for message in prefix] == [
+            Role.system,
+            Role.user,
+            Role.assistant,
+            Role.tool,
+            Role.user,
+            Role.assistant,
+            Role.tool,
+            Role.user,
+            Role.assistant,
+            Role.tool,
+        ]
+        assert find_persistence_violations(prefix) == []
+        # The actual saved record carries the provenance key, and the
+        # trusted loader restores it.
+        session_dir = loop.session_logger.session_dir
+        assert session_dir is not None
+        records = [
+            json.loads(line)
+            for line in (session_dir / MESSAGES_FILENAME)
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        pair_records = [
+            record
+            for record in records
+            if record.get("role") == "assistant"
+            and any(
+                tool_call.get("id") == pair_call_id
+                for tool_call in record.get("tool_calls") or []
+            )
+        ]
+        assert len(pair_records) == 1
+        assert (
+            pair_records[0][CONTEXT_INJECTION_ORIGIN_KEY]
+            == CONTEXT_INJECTION_TOOL_PAIR_V1
+        )
+        loaded, _metadata = SessionLoader.load_session(session_dir)
+        restored = [
+            message
+            for message in loaded
+            if message.role == Role.assistant
+            and message.tool_calls
+            and message.tool_calls[0].id == pair_call_id
+        ]
+        assert len(restored) == 1
+        assert restored[0]._context_injection_origin == CONTEXT_INJECTION_TOOL_PAIR_V1
+        assert _install_transcript_repair(session_dir, loaded, _metadata) is loaded
+    finally:
+        await root.close()
+        await loop.aclose()

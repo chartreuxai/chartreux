@@ -58,6 +58,11 @@ from chartreux.core.model_catalog.availability import (
     EligibleDeployment,
     eligible_deployments,
 )
+from chartreux.core.recovery_models import (
+    CallEvidence,
+    attach_attempted_deployment,
+    attach_call_evidence,
+)
 from chartreux.core.session_types import AgentStats, CommittedModelIdentity
 from chartreux.core.usage import AccountingSink, UsageAttribution, UsagePurpose
 from chartreux.core.utils import RetryObserver
@@ -361,6 +366,22 @@ class CompletionCoordinator:
             return budget
         return RequestRetryBudget(0.0)
 
+    def _failure_endpoint(self, model: ModelConfig) -> str | None:
+        """Raw endpoint URL of the provider serving ``model``, if resolvable.
+
+        Total by contract: endpoint evidence is additive — a provider that
+        cannot be resolved reports ``None`` (unavailable), never a guess.
+        The availability registry canonicalizes the URL before keying.
+        """
+        try:
+            provider = self._config_getter().get_provider_for_model(model)
+        except Exception:
+            return None
+        api_base = getattr(provider, "api_base", None)
+        if isinstance(api_base, str) and api_base:
+            return api_base
+        return None
+
     def release_unattempted_probes(
         self, candidates: Sequence[EligibleDeployment], attempted: set[str]
     ) -> None:
@@ -400,8 +421,13 @@ class CompletionCoordinator:
         self, publication: object, candidate: EligibleDeployment
     ) -> None:
         self._install_launch_metadata()
+        # Review R13: the settlement carries the candidate's probe token, so
+        # a successful recovery probe settles (and releases) its own claim —
+        # and a late normal attempt can never delete a newer probe's claim.
         self._config_orchestrator.availability_registry.record_success(
-            candidate.resolved.base_model, candidate.resolved.deployment.provider
+            candidate.resolved.base_model,
+            candidate.resolved.deployment.provider,
+            probe_token=candidate.recovery_probe_token,
         )
         publication.finalize(whole_turn_active=True)  # type: ignore[attr-defined]
 
@@ -420,9 +446,16 @@ class CompletionCoordinator:
     ) -> AsyncGenerator[LLMChunk]:
         """Run one shared preparation/publication/rollback attempt lifecycle."""
         budget = RequestRetryBudget(self._config_getter().api_retry_max_elapsed_time)
-        candidates = self._enumerate_candidates(
-            messages, fallback_model, call_type=call_type
-        )
+        try:
+            candidates = self._enumerate_candidates(
+                messages, fallback_model, call_type=call_type
+            )
+        except BaseException as error:
+            # Admission-phase failure (WP1): no backend was created or
+            # borrowed for this logical call, so zero transport starts is a
+            # MEASURED fact — launch_failure requires admission/init evidence.
+            attach_call_evidence(error, CallEvidence.admission_phase())
+            raise
         if not candidates:  # noqa: PLR1702
             inputs = self._prepare_inputs(
                 model=fallback_model,
@@ -545,6 +578,20 @@ class CompletionCoordinator:
                         )
                     raise
                 except Exception as error:
+                    # Review R11: freeze the attempted deployment BEFORE the
+                    # rollback restores the committed identity, so a
+                    # failed-attempt envelope reports the deployment that
+                    # actually served the failed attempt (the error's endpoint
+                    # comes from this same attempt) instead of the restored
+                    # one.
+                    attach_attempted_deployment(
+                        error,
+                        (
+                            failover_identity.base_model,
+                            failover_identity.provider,
+                            failover_identity.wire_name,
+                        ),
+                    )
                     if publication is not None:
                         self._rollback_publication(
                             publication, previous_identity, candidate
@@ -552,8 +599,25 @@ class CompletionCoordinator:
                     last_error = error
                     failure = classify(error)
                     if failure.failover_eligible:
+                        # WP1 endpoint correlation: the raw endpoint URL (the
+                        # registry canonicalizes it) plus a structured
+                        # signature, so cross-model rate-limit evidence on one
+                        # endpoint is representable WITHOUT log parsing.
                         registry.record_failure(
-                            resolved.base_model, provider_name, failure
+                            resolved.base_model,
+                            provider_name,
+                            failure,
+                            endpoint=self._failure_endpoint(model),
+                            signature=(
+                                f"{failure.category.value}:{failure.status}:"
+                                f"{failure.error_code or ''}:"
+                                f"{failure.error_type or ''}"
+                            ),
+                            # Review R13: token-owned probe settlement — the
+                            # failed attempt settles its own probe claim, and
+                            # a late normal attempt never replaces a newer
+                            # in-flight probe's claim.
+                            probe_token=candidate.recovery_probe_token,
                         )
                     self._backend_lifetime.drain(whole_turn_active=False)
                     if (

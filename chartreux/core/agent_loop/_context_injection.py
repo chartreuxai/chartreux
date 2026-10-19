@@ -33,6 +33,7 @@ from uuid import uuid4
 
 from pydantic import JsonValue
 
+from chartreux.core.agent_loop._transcript_integrity import check_tool_message_admission
 from chartreux.core.agent_loop._transcript_recorder import TranscriptRecorder
 from chartreux.core.agent_loop.errors import AgentLoopError
 from chartreux.core.autocompletion.path_prompt import build_path_prompt_payload
@@ -47,6 +48,7 @@ from chartreux.core.events import (
 from chartreux.core.hooks.models import HookEvent
 from chartreux.core.llm.format import ResolvedToolCall
 from chartreux.core.llm_models import (
+    CONTEXT_INJECTION_TOOL_PAIR_V1,
     FunctionCall,
     ImageAttachment,
     LLMMessage,
@@ -337,39 +339,50 @@ class ContextInjector:
         )
 
         call_event = self._record_tool_call_event(call_event)
-        self._messages.append(
-            LLMMessage(
-                role=Role.assistant,
-                content="",
-                tool_calls=[
-                    self._record_tool_call(
-                        ToolCall(
-                            id=call_id,
-                            index=0,
-                            function=FunctionCall(
-                                name="skill",
-                                arguments=json.dumps({"name": parsed.name}),
-                            ),
-                            presentation=call_event.presentation,
-                        )
+        skill_assistant = LLMMessage(
+            role=Role.assistant,
+            content="",
+            tool_calls=[
+                self._record_tool_call(
+                    ToolCall(
+                        id=call_id,
+                        index=0,
+                        function=FunctionCall(
+                            name="skill", arguments=json.dumps({"name": parsed.name})
+                        ),
+                        presentation=call_event.presentation,
                     )
-                ],
-            )
+                )
+            ],
         )
+        # Round-5 Y: the injector OWNS this assistant message — stamp the
+        # private origin marker immediately before its initial append (never
+        # derived from call ids, content, or any provider-supplied value).
+        # The marker means "originated in ContextInjector", not "settled";
+        # the pair's result below is unmarked (its ownership and settlement
+        # stay established by the existing integrity checks).
+        skill_assistant._context_injection_origin = CONTEXT_INJECTION_TOOL_PAIR_V1
+        self._messages.append(skill_assistant)
         result_text = "\n".join(f"{k}: {v}" for k, v in result.model_dump().items())
-        self._messages.append(
-            LLMMessage(
-                role=Role.tool,
-                tool_call_id=call_id,
-                name="skill",
-                content=result_text,
-                tool_result=PersistedToolResult(
-                    output=cast(dict[str, JsonValue], result.model_dump(mode="json")),
-                    duration=duration,
-                    presentation=result_event.presentation,
-                ),
-            )
+        skill_result_message = LLMMessage(
+            role=Role.tool,
+            tool_call_id=call_id,
+            name="skill",
+            content=result_text,
+            tool_result=PersistedToolResult(
+                output=cast(dict[str, JsonValue], result.model_dump(mode="json")),
+                duration=duration,
+                presentation=result_event.presentation,
+            ),
         )
+        # PI1/T (S1 append boundary): the direct skill-expansion append is an
+        # insert path like any other — it may not create a duplicate tool
+        # result or an unrepairable [user, tool] adjacency (fail closed with
+        # the typed local diagnostic).
+        check_tool_message_admission(
+            self._messages, len(self._messages), skill_result_message
+        )
+        self._messages.append(skill_result_message)
 
         yield call_event
         yield result_event
@@ -388,24 +401,26 @@ class ContextInjector:
         for resource in file_resources:
             file_path = str(resource.path)
             call_id = str(uuid4())
-            self._messages.append(
-                LLMMessage(
-                    role=Role.assistant,
-                    content="",
-                    tool_calls=[
-                        self._record_tool_call(
-                            ToolCall(
-                                id=call_id,
-                                index=0,
-                                function=FunctionCall(
-                                    name="read_file",
-                                    arguments=json.dumps({"file_path": file_path}),
-                                ),
-                            )
+            mention_assistant = LLMMessage(
+                role=Role.assistant,
+                content="",
+                tool_calls=[
+                    self._record_tool_call(
+                        ToolCall(
+                            id=call_id,
+                            index=0,
+                            function=FunctionCall(
+                                name="read_file",
+                                arguments=json.dumps({"file_path": file_path}),
+                            ),
                         )
-                    ],
-                )
+                    )
+                ],
             )
+            # Round-5 Y: the injector OWNS this assistant message — stamp the
+            # private origin marker immediately before its initial append.
+            mention_assistant._context_injection_origin = CONTEXT_INJECTION_TOOL_PAIR_V1
+            self._messages.append(mention_assistant)
             tool_call = ResolvedToolCall(
                 tool_name="read_file",
                 tool_class=tool_class,

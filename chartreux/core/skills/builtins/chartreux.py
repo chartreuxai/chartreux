@@ -948,6 +948,25 @@ Detailed instructions for the model...
 Configured, project, and user skills can shadow a shipped skill. Python built-in
 skill names remain reserved.
 
+### Built-in Skills
+
+Two skills ship as Python built-ins (reserved names; they sit first in the
+search order and cannot be overridden):
+
+- `chartreux` — this self-awareness reference: the standalone knowledge of
+  the running Chartreux version. It is model-only (`user-invocable: false`);
+  load it with the `skill` tool when the user asks anything about Chartreux
+  itself.
+- `skill-creator` — the methodology for creating, updating, or deleting a
+  Chartreux skill: SKILL.md frontmatter, discovery order, support files, and
+  the permission flow. It is user-invocable (a user-invocable skill is
+  invoked as `/skill-name`) and loadable with the `skill` tool.
+
+When you create, update, or delete a skill, load `skill-creator` FIRST and
+follow its methodology and permission flow before writing any SKILL.md. The
+orchestrating executor follows the same rule: it loads `skill-creator` before
+touching any skill file.
+
 ### Invoking Skills
 
 Two entry points:

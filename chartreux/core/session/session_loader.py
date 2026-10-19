@@ -10,7 +10,12 @@ import stat
 from typing import TYPE_CHECKING, Any, BinaryIO
 import warnings
 
-from chartreux.core.llm_models import LLMMessage
+from chartreux.core.llm_models import (
+    CONTEXT_INJECTION_ORIGIN_KEY,
+    CONTEXT_INJECTION_TOOL_PAIR_V1,
+    LLMMessage,
+    Role,
+)
 from chartreux.core.session.session_index import (
     MESSAGES_FILENAME,
     METADATA_FILENAME,
@@ -457,10 +462,56 @@ class SessionLoader:
             )
 
         messages = [
-            LLMMessage.model_validate(msg) for msg in data if msg["role"] != "system"
+            SessionLoader._message_from_session_record(msg)
+            for msg in data
+            if msg["role"] != "system"
         ]
 
+        # PI1/T (S4 in-memory repair): validate + deterministically repair the
+        # loaded transcript for EVERY caller — the two write-owning root
+        # install paths and the read-only RPCs alike. This load never hard-fails
+        # on integrity defects: read-only consumers get the repaired view, and
+        # the repair report rides the metadata dict to the install paths, which
+        # fail closed on unrepairable (ambiguous) defects and durably migrate a
+        # repair under write ownership. Function-level import: a top-level
+        # import of the agent_loop validator would cycle
+        # (agent_loop -> _loop -> this module).
+        from chartreux.core.agent_loop._transcript_integrity import (
+            TRANSCRIPT_INTEGRITY_METADATA_KEY,
+            repair_transcript,
+            report_to_metadata,
+        )
+
+        messages, report = repair_transcript(messages)
+        if report.repaired or report.violations:
+            metadata[TRANSCRIPT_INTEGRITY_METADATA_KEY] = report_to_metadata(report)
+
         return messages, metadata
+
+    @staticmethod
+    def _message_from_session_record(record: dict[str, Any]) -> LLMMessage:
+        """Hydrate one message from a TRUSTED session transcript record.
+
+        Round-5 Y: restoration is not inference and not new attribution —
+        the private origin marker is restored only from Chartreux's OWNED
+        session transcript (``messages.jsonl``), only when the session key
+        has exact type ``str``, its value is the recognized constant, and
+        the validated message is an assistant tool-call block. Ordinary
+        ``LLMMessage.model_validate`` never hydrates the marker, so provider
+        dictionaries and programmatic construction keep no provenance
+        authority; this helper runs BEFORE ``repair_transcript`` so the
+        integrity validation sees the restored provenance.
+        """
+        message = LLMMessage.model_validate(record)
+        origin = record.get(CONTEXT_INJECTION_ORIGIN_KEY)
+        if (
+            type(origin) is str
+            and origin == CONTEXT_INJECTION_TOOL_PAIR_V1
+            and message.role == Role.assistant
+            and message.tool_calls
+        ):
+            message._context_injection_origin = CONTEXT_INJECTION_TOOL_PAIR_V1
+        return message
 
     @staticmethod
     def _clean_text(text: str) -> str:

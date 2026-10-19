@@ -152,6 +152,189 @@ the last assistant message shows the whole-turn total. These values do not tick
 while work runs. Turning the setting off hides the displays but does not stop
 capture or persistence; older messages without timestamps stay unstamped.
 
+## User questions and unattended expiry
+
+The `ask_user_question` tool can mark a question as safe to leave unanswered.
+Each question gains a `kind` — `informational`, `preference`, or `requires_user`
+(the default) — and an optional `unattended_default` describing what to do when
+no answer arrives: `defer_affected_work`, or `preserve_existing_choice` naming an
+already-existing option to keep. A question without an `unattended_default`
+never expires, and any `requires_user` question blocks expiry for its whole
+batch.
+
+When every question in a batch is explicitly defaultable and the feature is
+enabled, an unanswered question expires into an honest **unanswered**
+disposition after the configured timeout: the dependent work is deferred and
+nothing is approved. Expiry never selects an option, never fabricates an
+answer, and never applies to runtime approvals such as dangerous-command or
+root-access grants — those always wait for an explicit decision. While an
+eligible question is open, the TUI shows a countdown with the declared outcome
+and a **Keep waiting** action (`Ctrl+K`) that lifts the deadline so the question
+stays open without one; answering before the deadline always wins, and a late
+answer is rejected with a definite expired response.
+
+Configure the feature with the `[user_questions]` table:
+
+```toml
+[user_questions]
+unattended_timeout_enabled = true
+default_timeout_seconds = 300
+max_timeout_seconds = 3600
+```
+
+`unattended_timeout_enabled` defaults to `true` (enabled since v0.5.6; set it
+to `false` to return to always-wait behavior). The per-question opt-in marker
+remains the primary safety gate regardless of this flag: only questions that
+declare an `unattended_default` can ever expire. The timeouts must be finite
+numbers between 60 and 3600 seconds with `default_timeout_seconds <=
+max_timeout_seconds`; invalid values are rejected, not clamped. A model may
+pass a per-request `timeout_seconds` override, which must fit the configured
+range and is rejected otherwise. Configuration changes apply to newly opened
+questions only, and configuration can never make a protected question expire.
+Headless and programmatic modes are unchanged: the ask tool stays disabled
+there.
+
+Unanswered batches are recorded as deferred questions (bounded, oldest first,
+with the overflow counted rather than silently dropped) and carried through
+compaction, so a resumed session still reports what was deferred. See the
+[configuration reference](../reference/configuration.md) for the complete
+setting schema.
+
+## Automatic root recovery
+
+When a root turn ends with a terminal model-call failure — a connection error,
+timeout, server error, overload, rate limit, launch failure, interrupted
+stream, or empty response — the harness can schedule the continuation turn
+itself, bounded and cooldown-aware, instead of waiting for a manual retry.
+The manual retry affordance (button, `Ctrl+R`, `/retry`) remains the fallback
+when the automatic budget or deadline is exhausted.
+
+Configure it with the `[recovery.root]` table (symmetric with
+`[recovery.subagents]`):
+
+```toml
+[recovery.root]
+enabled = true
+auto_retries_max = 2
+deadline_seconds = 2400
+cooldowns_seconds = [30, 120]
+jitter_fraction = 0.2
+availability_recheck_seconds = 1
+eligible_classes = [
+  "connection",
+  "timeout",
+  "server_error",
+  "overload",
+  "rate_limit",
+  "launch_failure",
+  "incomplete_stream",
+  "empty_response",
+]
+```
+
+- `enabled` defaults to `true` (enabled since v0.5.6). While it is false NO
+  root automatic continuation runs at all — including the interrupted-stream
+  continuation — and the manual retry affordance is the only recovery (a
+  breaking change for the interrupted-stream path, which used to continue
+  unconditionally). Setting it to `false` returns the root agent to
+  manual-retry-only recovery. Enabling it requires `auto_retries_max >= 1`
+  and a non-empty `eligible_classes`.
+- `auto_retries_max` (0–10) is the ONE shared automatic-turn budget per
+  user-turn episode: the interrupted-stream continuation and provider
+  failures share one count. It counts admitted continuations, not request
+  attempts. A manual user retry starts a new user-directed episode and never
+  replenishes this budget.
+- `deadline_seconds` (1–86400) is a monotonic, advisory bound anchored to the
+  first failed logical call's start. It bounds scheduling and admission; it
+  never kills an in-flight request.
+- `cooldowns_seconds` is the backoff schedule (finite, non-negative,
+  non-decreasing, at least `auto_retries_max` entries). The continuation is
+  due at `max(configured backoff, deployment cooldown, endpoint cooldown,
+  Retry-After)` plus `jitter_fraction` (0–1) of bounded jitter. Automatic
+  continuations NEVER reset cooldowns.
+- `availability_recheck_seconds` (positive, at most `deadline_seconds`) is the
+  floor for read-only availability rechecks while a probe is in flight or a
+  cooldown gap remains; such rechecks never consume a retry.
+- `eligible_classes` is restricted to the transient allowlist above.
+  Preflight, permission or authorization denial, budget stop, cancellation,
+  task blocker, permanent config/auth/billing/quota, context-size, and
+  unknown-internal failures never schedule, and neither does a tool's network
+  exception without measured model-call provenance.
+
+Typing, submitting, answering a question, or interrupting cancels a pending
+continuation; each milestone (scheduled, started, recovered, exhausted,
+cancelled) is a notice line in the transcript. See
+[Troubleshooting](troubleshooting.md#provider-outages-and-the-root-agent) for
+the behavior and its honest limits.
+
+## Automatic subagent recovery
+
+When a background subagent's run fails recoverably, the agent is suspended
+(see [Subagents](subagents.md#failure-recovery-suspension-and-resume)) and the
+harness can resume the SAME agent itself — a successor run with a new `run_id`
+on the same identity, admitted through the same `resume_agent` operation an
+explicit request uses, bounded and cooldown-aware, running independently of
+parent turns (an overnight parent idle does not block it). Recovery is enabled
+in stages — observation (always on), explicit resume (always available),
+automatic recovery (default ON since v0.5.6) — and the controller below is the
+third stage.
+
+Configure it with the `[recovery.subagents]` table (symmetric with
+`[recovery.root]`):
+
+```toml
+[recovery.subagents]
+enabled = true
+auto_retries_max = 2
+same_agent_resumes_max = 2
+cooldowns_seconds = [30, 120]
+jitter_fraction = 0.2
+episode_deadline_seconds = 2400
+suspension_ttl_seconds = 1800
+max_suspended_agents = 8
+max_suspended_bytes = 67108864
+recovery_concurrency = 2
+eligible_classes = [
+  "connection",
+  "timeout",
+  "server_error",
+  "overload",
+  "rate_limit",
+  "launch_failure",
+  "incomplete_stream",
+  "empty_response",
+]
+```
+
+- `enabled` defaults to `true` (enabled since v0.5.6). While it is false the
+  controller is inert: suspension and the explicit `resume_agent` /
+  `reconcile_result` ports are untouched either way, and disabling cancels
+  future scheduling without discarding evidence (failed results, envelopes,
+  and counters are kept). Enabling it requires `auto_retries_max >= 1`.
+- `auto_retries_max` (0–10) bounds the automatic resumes per recovery chain;
+  `same_agent_resumes_max` bounds explicit plus automatic resumes per chain.
+  Spend/turn/permission budgets never reset on resume, and a package-lineage
+  recurrence counter spans replacements.
+- `cooldowns_seconds` is the backoff schedule (finite, non-negative,
+  non-decreasing, at least `auto_retries_max` entries) with `jitter_fraction`
+  (0–1) of bounded jitter; a longer `Retry-After` and any deployment or
+  endpoint cooldown postpone admission. An automatic resume NEVER resets
+  cooldowns.
+- `episode_deadline_seconds` is a monotonic, advisory bound anchored to the
+  first failure: no new admission after it, never an in-flight kill (there is
+  no hard in-flight timeout; the retry budget is consulted only between
+  attempts).
+- The suspension caps (`suspension_ttl_seconds`, `max_suspended_agents`,
+  `max_suspended_bytes`) bound warm suspension separately from idle retention
+  and tombstones; `0` disables each.
+- `eligible_classes` is restricted to the transient allowlist above.
+  Cancellation, budget stop, authorization denial, preflight, task blocker,
+  permanent config errors, and unknown-internal failures never auto-resume;
+  unknown tool effects suspend with `reconcile_required` until reconciled.
+- Endpoint-correlated throttling blocks recovery onto ALL affected-endpoint
+  deployments regardless of model/provider naming; the eligibility view is
+  read-only and never claims another caller's probe.
+
 ## Logging and diagnostics
 
 Use `chartreux doctor` to validate trusted configuration, catalog entries, and

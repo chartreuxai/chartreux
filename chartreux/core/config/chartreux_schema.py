@@ -38,10 +38,12 @@ from chartreux.core.config.models import (
     ModelConfig,
     ProjectContextConfig,
     ProviderConfig,
+    RecoverySectionConfig,
     SessionLoggingConfig,
     StatusLineConfig,
     SubagentsConfig,
     ThinkingLevel,
+    UserQuestionsConfig,
     normalize_authorized_roots,
     normalize_dangerous_command_grants,
 )
@@ -473,6 +475,22 @@ class ChartreuxConfigSchema(ConfigSchema):
 
     session_logging: Annotated[SessionLoggingConfig, WithDeepMerge()] = Field(
         default_factory=SessionLoggingConfig
+    )
+
+    # WP4/R2: the [recovery] section is a container — [recovery.subagents]
+    # is the child automatic-recovery controller's policy (RecoveryConfig);
+    # [recovery.root] (R2) is the root-turn automatic-recovery controller's
+    # policy (RootRecoveryConfig), symmetric with [user_questions].
+    recovery: Annotated[RecoverySectionConfig, WithDeepMerge()] = Field(
+        default_factory=RecoverySectionConfig
+    )
+
+    # U (OD1): the [user_questions] section controls the server-owned
+    # unattended-expiry timer for eligible ask_user_question calls. Expiry
+    # is enabled by default (WP6 promoted it, OD4b); set
+    # user_questions.unattended_timeout_enabled = false to disable it.
+    user_questions: Annotated[UserQuestionsConfig, WithDeepMerge()] = Field(
+        default_factory=UserQuestionsConfig
     )
 
     def _resolve_orchestrator_model(self) -> ResolvedModel:

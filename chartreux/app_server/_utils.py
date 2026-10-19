@@ -45,6 +45,25 @@ _REFUSED_CREDENTIAL_STATUSES = frozenset({
     HTTPStatus.FORBIDDEN,
 })
 
+#: Bound on public error message text (WP1: bounded + redacted messages).
+_MAX_PUBLIC_ERROR_CHARS = 500
+
+
+def _bound_and_redact_public_message(message: str) -> str:
+    """Bound and redact a public error message (WP1).
+
+    The public error projection is message-only; typed evidence lives in the
+    private observation carrier and the public failure envelope. Redaction
+    is best-effort — the bound always applies.
+    """
+    bounded = message[:_MAX_PUBLIC_ERROR_CHARS]
+    try:
+        from chartreux.core.tools.secret_redaction import redact
+
+        return redact(bounded)[:_MAX_PUBLIC_ERROR_CHARS]
+    except Exception:
+        return bounded
+
 
 @dataclass(frozen=True, slots=True)
 class DecodedInput:
@@ -194,7 +213,11 @@ def public_error(exc: Exception) -> PublicError:  # noqa: PLR0912
             details["model"] = cause.model
         case _:
             code = TurnErrorCode.INTERNAL_ERROR
-    return PublicError(message=message, code=code, details=details or None)
+    return PublicError(
+        message=_bound_and_redact_public_message(message),
+        code=code,
+        details=details or None,
+    )
 
 
 def dump_model(model: BaseModel) -> dict[str, JsonValue]:

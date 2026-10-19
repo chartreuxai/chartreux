@@ -112,6 +112,10 @@ class RetentionStateView(Protocol):
 
     def _prune_expired_tombstones_locked(self, now: float) -> list[str]: ...
 
+    def _suspension_next_expiry_locked(self) -> float | None: ...
+
+    def _suspension_expire_elapsed_locked(self, now: float) -> list[AgentRecord]: ...
+
 
 @dataclass(frozen=True)
 class EvictionNotice:
@@ -167,6 +171,13 @@ class AgentRetention:
         retained at all, and the handle behaves as metadata-expired/unknown
         once the record detaches (the result stays published and
         retrievable).
+
+        WP1 E4 #2 (carried into tombstones): the summary carries the
+        latest failed run's public typed failure envelope — the same
+        latest-first search the live summary uses — so a closed (or
+        expired-suspension) agent's terminal metadata still shows WHY the
+        run failed. The data is on the record at build time and the wire
+        (``AgentSummary.last_failure``) already supports it.
         """
         agent_id = record.agent_id
         latest_run_id = record.latest_run_id or (
@@ -176,6 +187,14 @@ class AgentRetention:
         ttl = self._view._retention_policy.tombstone_ttl_seconds
         if ttl <= 0:
             return None
+        # The latest failed run's envelope, searched latest-first (the
+        # terminal run, then the current run, then run history) — mirroring
+        # the live summary projection in the registry.
+        last_failure = None
+        for candidate in (run, record.current_run, *reversed(record.run_history)):
+            if candidate is not None and candidate.failure is not None:
+                last_failure = candidate.failure
+                break
         summary = AgentSummary(
             agent_id=agent_id,
             profile=record.profile,
@@ -197,6 +216,7 @@ class AgentRetention:
             context_window=record.context_window,
             compacting=record.compacting,
             stop_reason=record.stop_reason,
+            last_failure=last_failure,
             result_expired=(
                 (agent_id, latest_run_id) in self._view._expired_results
                 if latest_run_id is not None
@@ -619,6 +639,12 @@ class AgentRetention:
             ]
             if expiries:
                 delays.append(max(0.0, min(expiries) - now))
+        # WP3: the warm-suspension TTL is a SEPARATE reaper deadline — the
+        # earliest suspension expiry arms the shared timer too, so suspension
+        # expiry runs on the reaper without any parent model turn.
+        suspension_deadline = self._view._suspension_next_expiry_locked()
+        if suspension_deadline is not None:
+            delays.append(max(0.0, suspension_deadline - now))
         if not delays:
             return
         delay = min(delays)
@@ -665,9 +691,11 @@ class AgentRetention:
         eviction cleanup; the reaper invocation state (victims, pruned ids,
         notices, publication disposition) never replaces the authoritative
         shared timer fields. Victim ordering uses the existing record
-        ordering (idle_since, agent_id).
+        ordering (idle_since, agent_id). WP3: the pass also expires
+        suspensions whose warm window elapsed (handoff §1.5).
         """
         pruned_tombstones: list[str] = []
+        expired_suspensions: list[AgentRecord] = []
         try:
             await self._view._wakeup(delay)
             async with self._view._registry_lock:
@@ -701,6 +729,12 @@ class AgentRetention:
                 # Expired terminal metadata is pruned here; results, expiry
                 # markers, latest-run indexes, and wait leases are untouched.
                 pruned_tombstones = self._view._prune_expired_tombstones_locked(now)
+                # WP3: suspension records whose warm window elapsed convert
+                # to closed terminal tombstones here — eligibility removed,
+                # transcripts/artifacts/stored results untouched, runtime
+                # closed through the normal ownership paths. This runs on
+                # the reaper's timer, without any parent model turn.
+                expired_suspensions = self._view._suspension_expire_elapsed_locked(now)
                 if victims:
                     # Hand the schedule to a fresh timer BEFORE awaiting
                     # eviction cleanup: stalled runtime cleanup must not hold
@@ -737,15 +771,22 @@ class AgentRetention:
                 except asyncio.CancelledError:
                     await asyncio.shield(eviction_results)
                     published = await self.notify_evictions(eviction_notifications)
-                    if not published and (pruned_tombstones or eviction_notifications):
+                    if not published and (
+                        pruned_tombstones
+                        or eviction_notifications
+                        or expired_suspensions
+                    ):
                         await self.publish_inventory_change()
                     raise
                 published = await self.notify_evictions(eviction_notifications)
             # Publish whenever the inventory actually changed — pruned
-            # terminal metadata and/or actual evictions — regardless of
-            # whether eviction tasks existed or what they did. Permitted
-            # eviction notifications already published this same inventory.
-            if not published and (pruned_tombstones or eviction_notifications):
+            # terminal metadata, actual evictions, and/or expired suspensions
+            # — regardless of whether eviction tasks existed or what they
+            # did. Permitted eviction notifications already published this
+            # same inventory.
+            if not published and (
+                pruned_tombstones or eviction_notifications or expired_suspensions
+            ):
                 await self.publish_inventory_change()
         finally:
             # A pending reaper can be destroyed while no event loop is

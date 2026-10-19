@@ -29,6 +29,16 @@ validates and restores that identity rather than resolving a role again.
 creates a separate resumable copy. See the [command reference](../reference/commands.md)
 for the complete command surface.
 
+Resume restores the committed identity and the transcript; it never restores
+in-flight questions or callbacks, and session-only grants such as root-access
+or dangerous-command approvals are per-session and must be granted again.
+Warm suspension of background subagents is likewise process-local: a restart
+forfeits suspended agents (they convert to closed, non-resumable) with no
+dangling scheduled recovery, so a suspended agent's partial work survives a
+restart only through scratch artifacts and the persisted transcript, not
+through an automatic resume. See
+[Failure recovery, suspension, and resume](subagents.md#failure-recovery-suspension-and-resume).
+
 ## Managed-job lifetime
 
 Managed shell jobs belong to one live root runtime, including jobs launched by

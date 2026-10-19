@@ -344,9 +344,16 @@ def parse_dangerous_command_result(
     """Map a user answer to a grant choice; anything else fails closed to deny.
 
     A choice invalid for any required operation (a forged consequential
-    "always", a free-text answer, an unknown label) authorizes nothing.
+    "always", a free-text answer, an unknown label) authorizes nothing. The
+    parser requires the typed disposition ``answered`` and never inspects
+    declared unattended defaults (plan U/OD1): an unanswered expiry result
+    can never become a grant.
     """
-    if isinstance(result, UserQuestionResult) and not result.cancelled:
+    if (
+        isinstance(result, UserQuestionResult)
+        and result.disposition == "answered"
+        and not result.cancelled
+    ):
         for answer in result.answers:
             choice = _LABEL_TO_CHOICE.get(answer.answer)
             if choice is not None and all(

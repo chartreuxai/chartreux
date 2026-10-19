@@ -78,6 +78,8 @@ class ReplacementStateView(Protocol):
 
     def _generation_is_current(self, generation: int) -> bool: ...
 
+    def _invalidate_recovery_locked(self, record: AgentRecord | None) -> None: ...
+
 
 class ReplacementCoordinator:
     """Replacement arbitration and claim lifecycle for the registry.
@@ -203,6 +205,8 @@ class ReplacementCoordinator:
                 )
             if record.state is _AgentState.IDLE:
                 return None
+            if record.state is _AgentState.SUSPENDED:
+                return self._reserve_suspended_locked(record, args, parent, identity)
             run = record.current_run
             if (
                 record.state is _AgentState.FINALIZING
@@ -245,9 +249,69 @@ class ReplacementCoordinator:
             record.replacement_owner = claim
             return claim
 
+    def _reserve_suspended_locked(
+        self,
+        record: AgentRecord,
+        args: TaskArgs,
+        parent: SessionRuntime,
+        identity: tuple[str, int],
+    ) -> _ReplacementClaim:
+        """Reserve a suspended record for replacement (handoff §1.8).
+
+        WP2: replacement remains permitted at any point — including while
+        a suspended barrier is pending or prohibited. The failed run is
+        already terminal, so the handoff only joins it; a fresh capacity
+        slot is allocated for the replacement launch (the suspended
+        record's slot was released when its run finalized), and pending
+        recovery is superseded.
+        """
+        if args.config is not None:
+            raise LaunchConfigError(
+                "Busy replacement cannot change launch configuration"
+            )
+        if args.retain is not None and args.retain is not record.retained:
+            raise LaunchConfigError("Busy replacement cannot change retention policy")
+        failed_run = record.run_history[-1] if record.run_history else None
+        if (
+            failed_run is None
+            or failed_run.run_id != record.latest_run_id
+            or record.runtime._closed is True
+            or self._view._children.get(record.session_id) is not record.runtime
+            or not self._view._generation_is_current(record.root_generation)
+        ):
+            raise RuntimeError("Agent is no longer eligible for replacement")
+        slot = _ActiveWorkSlot()
+        self._view._active_work_slots.add(slot)
+        record.work_slot = slot
+        claim = _ReplacementClaim(
+            record,
+            failed_run,
+            parent,
+            identity,
+            record.runtime.agent_loop._session_generation,
+            parent.agent_loop._authority_revision,
+            slot,
+        )
+        self._view._invalidate_recovery_locked(record)
+        record.reserved_for_replacement = True
+        record.replacement_owner = claim
+        return claim
+
     @asynccontextmanager
     async def handoff(self, claim: _ReplacementClaim) -> AsyncIterator[None]:
-        """Interrupt the replaced run and transfer its capacity slot (async context)."""
+        """Interrupt the replaced run and transfer its capacity slot (async context).
+
+        This is the WP2 SAME-AGENT replacement path (``replace_run``): one
+        identity, a new run. The WP5 failure-time CROSS-MODEL replacement is
+        a distinct path: the orchestrator claims a replacement through
+        ``config.predecessor_agent_id`` on a fresh launch, and
+        ``ChildLaunchAdmission.validate_replacement_claim`` disables the old
+        recovery (``_invalidate_recovery_locked``) BEFORE the new run's write
+        token is registered at acceptance — the write-ownership transfer
+        happens only after reconciliation state is settled and the explicit
+        handoff is admitted. Both paths preserve lineage, counters, and
+        artifacts, and neither auto-restarts the predecessor.
+        """
         try:
             self._view._interrupt_run(claim.record, claim.run)
             await asyncio.shield(claim.run.completion_task)

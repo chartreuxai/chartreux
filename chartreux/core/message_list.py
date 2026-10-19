@@ -19,6 +19,15 @@ class MessageList(Sequence[LLMMessage]):
     def insert(self, i: int, msg: LLMMessage) -> None:
         self._data.insert(i, msg)
 
+    def replace(self, i: int, msg: LLMMessage) -> None:
+        """Replace the message at ``i`` in place (PI1/T designed replacement).
+
+        Used by the transcript recorder to swap a synthetic TOOL_NO_RESPONSE
+        placeholder for the genuine result that supersedes it — same length,
+        same position, no reset hooks fired.
+        """
+        self._data[i] = msg
+
     def extend(self, msgs: list[LLMMessage]) -> None:
         for msg in msgs:
             self.append(msg)

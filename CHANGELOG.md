@@ -2,6 +2,163 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.5.6 (2026-10-17)
+
+### Added
+
+- Bounded automatic root-turn recovery (recovery program R2/OD3): after a
+  terminal root model-call failure — a connection error, timeout, server
+  error, overload, rate limit, launch failure, interrupted stream, or empty
+  response — the harness schedules the continuation turn itself, with no
+  manual `/retry` or new message required. Two collaborators implement it:
+  the TUI's `RootRecoveryController` owns an in-process timer and local
+  cancellation via an input-generation token (invalidated synchronously on
+  typing, submission, question actions, manual retry, interrupt, or session
+  change), and the app-server gate (`recovery/root/schedule`,
+  `recovery/root/admit`, `recovery/root/cancel`) owns authoritative
+  eligibility, episode accounting, and single-flight admission. The
+  continuation is due at `max(configured backoff, deployment cooldown,
+  endpoint cooldown, Retry-After)` plus bounded jitter, re-reads live
+  availability at admission, and never resets a cooldown — an automatic
+  continuation is an injected turn, never a user request, and never switches
+  base model. One shared automatic-turn budget (default 2 per user-turn
+  episode, merging the interrupted-stream continuation) and one monotonic
+  advisory deadline (default 2400s, never an in-flight kill) bound the
+  episode; a manual retry starts a new user-directed episode and never
+  replenishes it. Eligibility is restricted to the typed transient
+  allowlist; preflight, permission/authorization denial, budget stop,
+  cancellation, task blocker, permanent config/auth/billing/quota,
+  context-size, and unknown-internal failures never schedule. Each milestone
+  (scheduled, started, recovered, exhausted, cancelled) is a notice line in
+  the transcript with a deterministic id — readable after an overnight
+  failure and across a reconnect, never injected as a fresh instruction.
+  Policy lives in the new `[recovery.root]` config table; exhaustion parks to
+  the existing manual retry affordance (button, `Ctrl+R`, `/retry`).
+- Typed failure envelope (recovery program WP1): every terminal model-call
+  failure now carries a typed envelope — a failure class drawn from an
+  authoritative transient allowlist (connection, timeout, server error,
+  overload, rate limit, launch failure, interrupted stream, empty response)
+  with the protected classes (cancellation, auth, billing, quota, invalid
+  request, context size) explicitly ineligible — plus one deduplicatable
+  evidence event per logical call, bounded and redacted public messages, and
+  typed failure data on task results and agent summaries. Recovery
+  eligibility, suspension, and resume/reconcile all consume this envelope;
+  old results without it stay immutable.
+- Warm subagent suspension and explicit same-agent resume (WP2/WP3): after a
+  recoverable failure a subagent can be suspended warm — process-local,
+  never persisted, bounded by a TTL (default 1800s), a count cap (8), and a
+  byte cap (64 MiB) with oldest-first expiry — and resumed explicitly through
+  the new `agents/resume` route with typed dispositions (scheduled,
+  already_scheduled, already_resumed, reconcile_required, expired,
+  not_resumable, forbidden). `agents/reconcile` settles a pending tool-outcome
+  barrier (cleared, prohibited, stale, duplicate, not_pending, forbidden);
+  stale or duplicate evidence can never clear a newer barrier. Suspension is
+  not retention and not resurrection: a parent restart forfeits suspended
+  agents (they close, non-resumable), and a resumed run gets a new run id
+  with the old failed results left immutable. There are no exactly-once
+  guarantees.
+- Bounded automatic subagent recovery (WP4): the new `[recovery.subagents]`
+  controller schedules automatic recovery for eligible child-subagent
+  failures — jittered backoff over the configured cooldowns, an advisory
+  episode deadline (never an in-flight kill), single-flight admission, and
+  one bounded startup retry that converts the launch-path cooldown block into
+  a cancellable wait instead of an instant terminal error.
+- Failure-time replacement policy and the unattended-resilience rule (WP5):
+  when a package fails, the orchestrator selects a replacement at failure
+  time from validated eligible sets — endpoint independence is enforced
+  against the attempted failed endpoint (same-endpoint aliases and
+  same-endpoint different-model substitutions are rejected; the worker route
+  is rejected for substantive packages), there is no dispatch-time
+  substitution table and no automatic cross-model fallback — and every
+  substitution emits a milestone notice with an honest cost implication, a
+  new agent id with predecessor/package lineage, and a per-package
+  replacement budget. Infrastructure and harness failures never produce an
+  `ask_user_question`: the failed package is parked and independent work
+  continues, ending at worst in a consolidated resumable blocker report;
+  authorization, scope, safety, and destructive-action decisions remain
+  genuine user questions.
+- Unattended question expiry (U): with `[user_questions]`
+  `unattended_timeout_enabled`, a non-protected question left unanswered past
+  its deadline expires server-side — exactly one typed unanswered disposition
+  and one deferred record, drafts preserved locally and never
+  auto-delivered, and a detached client sees the expiry on reconnect.
+  Runtime approvals (dangerous-command grants, root-access) never arm a
+  timer and never expire.
+- Manual root retry affordance (R1): after a terminal root-turn failure the
+  error widget offers "Retry — new turn" (button, `Ctrl+R`, or `/retry`),
+  with an honest exhaustion hint that states both the
+  deployments-were-unavailable fact and the cooldown-reset consequence. It is
+  a manual fallback, not a watchdog.
+- Worker prompt and tool-description rules (track P): the worker brief now
+  states the literal-shell rule explicitly (no variable expansion, command
+  substitution, or loops; literal commands; uppercase env assignments only;
+  no leading `=` words; explicit interpreter, no implicit `uv`), and the
+  `bash_read` tool description documents its line limit.
+- Transcript message-order integrity validation (PI1/T): a shared
+  validator/repair now guards the session transcript's message order —
+  duplicate tool-result detection scoped per originating assistant call,
+  provider-safe order admission verified after the request-build reorder,
+  deterministic repair of the unambiguous steering/backfill duplicate
+  pattern, and a typed LOCAL `transcript_integrity` diagnostic (never
+  transient, never retried, never scheduled; projected as an internal error
+  carrying `category=transcript_integrity`). The append/save boundary
+  refuses to persist a defect, request build rejects an unrepairable order
+  before any provider call, and the root recovery gate's schedule/admission
+  pre-check parks a poisoned transcript to the manual fallback with a repair
+  offer.
+
+### Changed
+
+- Default promotion (OD4b/OD5): automatic recovery is now enabled by
+  default in all three places — `[recovery.root]` `enabled`,
+  `[recovery.subagents]` `enabled`, and `[user_questions]`
+  `unattended_timeout_enabled`. Set `enabled = false` (or
+  `unattended_timeout_enabled = false`) for the previous manual-only /
+  always-wait behavior; disabling cancels future scheduling without
+  discarding evidence.
+- Cooldown behavior (F6): injected and automatic turns no longer clear
+  shared availability cooldowns — only a manual `/retry` (TUI or ACP)
+  resets them.
+- Breaking (OD4a removal-by-default): the legacy unconditional
+  interrupted-stream continuation no longer exists as a hidden second
+  scheduler. Automatic root continuation — including the interrupted-stream
+  path — runs only through the bounded `[recovery.root]` controller, and
+  when `enabled` is false NO root automatic continuation runs at all. The
+  flag shipped disabled during development; it is enabled by default in this
+  release. The manual retry affordance remains the fallback in disabled
+  mode.
+
+### Fixed
+
+- Shell-command policy: a quoted grep PATTERN operand containing glob
+  metacharacters (`*`, `?`, or a bracket class, including alternations
+  containing `.*`) was falsely rejected as a path-glob candidate. The policy
+  now treats the first positional as the pattern when no `-e`/`--regexp`/`-f`
+  supplies the regex; all nineteen pinned protections (genuine file-operand
+  globs, `-f`/`--exclude-from` values, unscoped `ls`/`cat` globs, `find`
+  start points, and the rest) remain denied. Accepted limitation: an
+  unquoted glob in pattern position is regex data under the same rule and
+  is no longer path-inspected.
+- Managed-job output redaction now covers shell-hex-escaped secrets (`\xHH`
+  variants, both hex cases, multi-byte byte-wise): the escaped spelling is a
+  known secret value, so job output summaries redact it at capture and at
+  page time. This closes a real redaction leak intermittently exposed by
+  the background-jobs sanitization test.
+- Session transcript message-order poisoning (PI1): mid-turn steering could
+  persist a user message before the in-flight tool call's cancellation
+  settled, and the missing-response backfill — blind to the genuine result
+  behind the steered message — inserted a DUPLICATE synthetic
+  `TOOL_NO_RESPONSE` placeholder, producing a permanent provider 400
+  (`invalid_request_message_order`) that survived restarts and could not be
+  reached by manual rewind. The backfill's lookahead is now bounded to the
+  logical block (no duplicate is ever created), the recorder anchors the
+  settled result after its owning assistant message (before the steered
+  user message, replacing a placeholder in place), the save boundary never
+  persists a duplicate, and loading a session validates and repairs the
+  transcript in memory — healing a poisoned file without manual rewind,
+  with the durable migration preserving the original as a recovery artifact
+  before replacement.
+
 ## 0.5.5 (2026-10-17)
 
 ### Changed

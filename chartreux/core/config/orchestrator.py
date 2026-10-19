@@ -95,6 +95,29 @@ class DefaultLayerResolutionError(Exception):
 type DefaultLayerResolver = Callable[[], ConfigLayer[RawConfig]]
 
 
+def _availability_registry_from_config(config: object) -> AvailabilityRegistry:
+    """Build the shared registry from the recovery correlation thresholds.
+
+    WP4 (WP1 E4 #4): the root-owned availability registry was constructed
+    with defaults, so the validated ``[recovery.subagents]`` endpoint
+    correlation thresholds never reached the shared component. The registry
+    is shared by the root and every child runtime, so the child
+    controller's configured correlation policy now arms it. Only the
+    correlation thresholds are wired; the per-deployment cooldown length
+    (``initial_cooldown``) keeps its own default because it is armed by the
+    low-level failover path, not by the recovery policy.
+    """
+    if not isinstance(config, ChartreuxConfigSchema):
+        return AvailabilityRegistry()
+    subagents = config.recovery.subagents
+    return AvailabilityRegistry(
+        endpoint_correlation_window=subagents.endpoint_correlation_window_seconds,
+        endpoint_correlation_min_events=subagents.endpoint_correlation_min_events,
+        endpoint_correlation_min_models=subagents.endpoint_correlation_min_models,
+        endpoint_cooldown=subagents.endpoint_cooldown_seconds,
+    )
+
+
 class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
     """Single entry point for config management."""
 
@@ -113,7 +136,14 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
         self._default_layer_resolver = default_layer_resolver
         self._bus = bus if bus is not None else EventBus()
         self._catalog_loader = catalog_loader
-        self._availability_registry = availability_registry or AvailabilityRegistry()
+        # WP4 (WP1 E4 #4): the default registry is built from the accepted
+        # config's [recovery.subagents] correlation thresholds instead of
+        # hard defaults; an explicitly supplied registry always wins.
+        self._availability_registry = (
+            availability_registry
+            if availability_registry is not None
+            else _availability_registry_from_config(candidate.config)
+        )
         self._mutation_lock = asyncio.Lock()
         self._accepted_token = uuid4()
         self._can_persist = True

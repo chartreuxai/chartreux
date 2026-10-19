@@ -374,6 +374,30 @@ def _date_has_setting_operand(args: list[str]) -> bool:
     return any(_matches_bsd_date_setting_operand(value) for value in positional)
 
 
+# grep options that supply the search pattern: -e/--regexp name the regex
+# directly and -f/--file name a pattern file. --exclude-from only filters
+# file names, so it does not move the pattern position.
+_GREP_PATTERN_OPTIONS = frozenset({"-e", "--regexp", "-f", "--file"})
+
+
+def _grep_positional_values(parsed: _ParsedOptions) -> tuple[str, ...]:
+    """grep's file operands: every positional after the regex pattern.
+
+    Without -e/--regexp/-f/--file, grep's first positional operand is the
+    regex PATTERN, not a path: a quoted pattern such as ``[0-9]`` or ``a.*b``
+    is data for the regex engine, never a pathname the shell expands, so it
+    must not become a path candidate. Only the remaining positionals are
+    file operands. When a pattern option supplies the regex, every
+    positional is a file operand.
+    """
+    supplies_pattern = any(
+        option in _GREP_PATTERN_OPTIONS for option, _value in parsed.values
+    )
+    if supplies_pattern:
+        return parsed.positionals
+    return parsed.positionals[1:]
+
+
 def _standard_policy(command: str, args: list[str]) -> ShellCommandPolicy:
     table = _TABLES[command]
     parsed = _scan_options(args, table)
@@ -440,11 +464,16 @@ def _standard_policy(command: str, args: list[str]) -> ShellCommandPolicy:
         )
     if command == "date":
         requires_approval = requires_approval or _date_has_setting_operand(args)
+    positional_values = parsed.positionals
+    if command == "grep":
+        # The pattern position is regex data, not a path; file operands and
+        # path-option values stay path candidates (see _grep_positional_values).
+        positional_values = _grep_positional_values(parsed)
     return ShellCommandPolicy(
         requires_approval=requires_approval,
         inspect_positional_paths=inspect,
         option_path_values=path_values,
-        positional_values=parsed.positionals,
+        positional_values=positional_values,
     )
 
 

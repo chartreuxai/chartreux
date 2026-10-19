@@ -579,6 +579,20 @@ async def test_browser_click_uses_content_relative_row_when_scrolled() -> None:
             "budget-stopped",
             False,
         ),
+        # WP2: suspension/restoring render truthfully instead of falling back
+        # to the run-outcome label, and restoring counts as active work.
+        (
+            {"availability": "suspended", "last_run_status": "failed"},
+            "suspended",
+            False,
+        ),
+        ({"availability": "suspended", "stop_reason": "error"}, "suspended", False),
+        (
+            {"availability": "restoring", "current_run_status": "running"},
+            "restoring",
+            True,
+        ),
+        ({"availability": "restoring", "last_run_status": "failed"}, "restoring", True),
     ],
 )
 def test_agent_presentation_state_and_shared_active_predicate(
@@ -595,6 +609,9 @@ def test_agent_presentation_state_and_shared_active_predicate(
         ({"availability": "running"}, "active"),
         ({"availability": "running", "compacting": True}, "active"),
         ({"availability": "finalizing"}, "active"),
+        # WP2: suspended (warm-preserved) and restoring agents group as active.
+        ({"availability": "suspended"}, "active"),
+        ({"availability": "restoring"}, "active"),
         ({}, "idle"),
         ({"availability": "failed"}, "idle"),
         ({"availability": "idle"}, "idle"),
@@ -920,6 +937,10 @@ async def test_widget_local_sheet_budget_footer_and_cell_fitting(
         ({"last_run_status": "failed"}, "✗ Failed"),
         ({"stop_reason": "user_cancelled"}, "! Cancelled"),
         ({"stop_reason": "budget_exceeded"}, "! Budget stopped"),
+        # WP2: suspension shows with the warning glyph; restoring with the
+        # running glyph — neither defaults to the idle label.
+        ({"availability": "suspended", "last_run_status": "failed"}, "! Suspended"),
+        ({"availability": "restoring", "current_run_status": "running"}, "… Restoring"),
         ({"availability": "evicted"}, "Evicted"),
         ({"availability": "closed"}, "Closed"),
         ({"availability": "closed", "last_run_status": "failed"}, "✗ Failed"),

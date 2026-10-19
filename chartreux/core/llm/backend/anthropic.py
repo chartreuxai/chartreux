@@ -97,10 +97,19 @@ class AnthropicMapper:
         return {"role": "assistant", "content": content if content else ""}
 
     def _convert_tool_call(self, tc: ToolCall) -> dict[str, Any]:
+        raw_arguments = tc.function.arguments or ""
+        # An absent argument payload is a faithful no-args call ({}). A
+        # MALFORMED payload is never silently replaced with an empty object
+        # (WP1 acceptance): the raw text rides under a reserved key so the
+        # provider sees the failure instead of an invocation with
+        # synthesized arguments.
         try:
-            tool_input = json.loads(tc.function.arguments or "{}")
+            tool_input = json.loads(raw_arguments) if raw_arguments else {}
         except json.JSONDecodeError:
-            tool_input = {}
+            tool_input = {"malformed_arguments": raw_arguments}
+        else:
+            if not isinstance(tool_input, dict):
+                tool_input = {"malformed_arguments": raw_arguments}
         return {
             "type": "tool_use",
             "id": self._sanitize_tool_call_id(tc.id),

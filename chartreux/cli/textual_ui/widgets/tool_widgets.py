@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, JsonValue
+from pydantic import BaseModel, JsonValue, TypeAdapter
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.content import Content
@@ -23,6 +23,7 @@ from chartreux.app_server.models import (
     FileWriteEffectOutput as FileWriteOutput,
     ShellEffectOutput as ShellOutput,
     TodoEffectOutput as TodoOutput,
+    UnansweredQuestions as UnansweredQuestions,
     UserQuestionResult as AskUserQuestionResult,
     WebFetchEffectOutput as WebFetchOutput,
     WebSearchEffectOutput as WebSearchOutput,
@@ -389,6 +390,15 @@ class AskUserQuestionResultWidget(ToolResultWidget[AskUserQuestionResult]):
     COLLAPSIBLE = False
 
     def compose(self) -> ComposeResult:
+        if isinstance(self.result, UnansweredQuestions):
+            # The server-owned unanswered disposition (plan U/OD1): expiry
+            # deferred the affected work; no permission was granted.
+            yield NoMarkupStatic(
+                "Unanswered — deferred (no answer within "
+                f"{self.result.timeout_seconds:g}s); no permission granted",
+                classes="tool-result-detail",
+            )
+            return
         yield from ()
 
 
@@ -424,9 +434,18 @@ class WebFetchResultWidget(ToolResultWidget[WebFetchOutput]):
         yield from self._footer()
 
 
+# The ask_user_question result is a typed union: the client-submittable
+# UserQuestionResult plus the server-owned UnansweredQuestions disposition
+# (plan U/OD1). The union is unambiguous: the base rejects the unanswered
+# shape (extra="forbid" plus the disposition validator).
+_ASK_USER_QUESTION_RESULT_ADAPTER = TypeAdapter(
+    AskUserQuestionResult | UnansweredQuestions
+)
+
+
 @dataclass(frozen=True, slots=True)
 class EffectWidgets:
-    output_model: type[BaseModel] | None = None
+    output_model: type[BaseModel] | TypeAdapter[Any] | None = None
     result: type[ToolResultWidget] = GenericToolResultWidget
     linkify_result: bool = False
 
@@ -451,7 +470,8 @@ EFFECT_WIDGETS: dict[ToolEffectKind, EffectWidgets] = {
         output_model=TodoOutput, result=TodoResultWidget
     ),
     ToolEffectKind.USER_QUESTION: EffectWidgets(
-        output_model=AskUserQuestionResult, result=AskUserQuestionResultWidget
+        output_model=_ASK_USER_QUESTION_RESULT_ADAPTER,
+        result=AskUserQuestionResultWidget,
     ),
     ToolEffectKind.WEB_SEARCH: EffectWidgets(
         output_model=WebSearchOutput, result=WebSearchResultWidget
@@ -472,6 +492,8 @@ def get_result_widget(
     widgets = EFFECT_WIDGETS.get(detail.kind, EffectWidgets())
     if result is None:
         parsed = None
+    elif isinstance(widgets.output_model, TypeAdapter):
+        parsed = widgets.output_model.validate_python(result)
     elif widgets.output_model is not None:
         parsed = widgets.output_model.model_validate(result)
     else:

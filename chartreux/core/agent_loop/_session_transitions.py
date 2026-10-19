@@ -39,6 +39,7 @@ from chartreux.core.agent_loop._loop_types import RootAccountingOwner
 from chartreux.core.agents.manager import AgentManager
 from chartreux.core.background_jobs import BackgroundJobRegistry, BackgroundJobsPort
 from chartreux.core.config import ChartreuxConfigSchema
+from chartreux.core.deferred_questions import DeferredQuestionStore
 from chartreux.core.dispatch.renderer import task_description_for_config
 from chartreux.core.dispatch.session import (
     BoundDispatchPolicy,
@@ -97,8 +98,9 @@ class _PreparedReset:
 class SessionTransitions:
     """Own the session-transition replay participants and transition preparation.
 
-    ``restore_todo_state``/``restore_file_state`` replay the resumed
-    transcript's todo and working-set state; ``apply_active_model_pricing``
+    ``restore_todo_state``/``restore_file_state``/``restore_deferred_questions``
+    replay the resumed transcript's todo, working-set, and deferred-question
+    state; ``apply_active_model_pricing``
     rebinds the fresh stats to the active model's prices;
     ``prepare_resume`` computes every value a resume rebind needs without
     mutating the live loop and returns them as a ``_PreparedResume`` for the
@@ -138,6 +140,7 @@ class SessionTransitions:
             str,
         ],
         messages: MessageList,
+        deferred_questions: DeferredQuestionStore,
         session_id_getter: Callable[[], str],
         parent_session_id_getter: Callable[[], str | None],
         session_lease_getter: Callable[[], SessionLease | None],
@@ -149,13 +152,15 @@ class SessionTransitions:
         generate_session_id: Callable[[str | None], str],
     ) -> None:
         # Borrowed shared ownership: the file-state context, the message list,
-        # the out-of-band event queue, and the detached accounting-producer set
-        # are the loop's own objects, never cloned or replaced (the title-
-        # producer retention registers into the same set the loop and the
-        # runtime read; the clear orchestration trims the same list the loop
-        # reads).
+        # the deferred-question store, the out-of-band event queue, and the
+        # detached accounting-producer set are the loop's own objects, never
+        # cloned or replaced (the title-producer retention registers into the
+        # same set the loop and the runtime read; the clear orchestration
+        # trims the same list the loop reads; the deferred-question restore
+        # merges into the same store the app server records into).
         self._file_state_context = file_state_context
         self._messages = messages
+        self._deferred_questions = deferred_questions
         self._out_of_band_events = out_of_band_events
         self._detached_accounting_producers = detached_accounting_producers
         # Live getters: the config is re-read per operation (the dispatch
@@ -219,6 +224,24 @@ class SessionTransitions:
             self._file_state_context.merge_replayed(FileStateStore.replay(messages))
         except Exception as exc:
             logger.warning("File state restore failed error=%s", type(exc).__name__)
+
+    def restore_deferred_questions(self, messages: Sequence[LLMMessage]) -> None:
+        """Restore the deferred-question records from the resumed transcript.
+
+        Structural replay across compaction (plan U), mirroring
+        ``restore_file_state``: the last compaction boundary's envelope wins,
+        merged into the live store (the store breaks ties per record key, so
+        a record created after the boundary survives). Fail-safe: a corrupt
+        envelope degrades to the live state.
+        """
+        try:
+            self._deferred_questions.merge_replayed(
+                DeferredQuestionStore.replay(messages)
+            )
+        except Exception as exc:
+            logger.warning(
+                "Deferred question restore failed error=%s", type(exc).__name__
+            )
 
     def apply_active_model_pricing(self) -> None:
         try:

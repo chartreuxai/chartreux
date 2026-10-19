@@ -18,7 +18,12 @@ from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 import warnings
 
-from chartreux.core.llm_models import LLMMessage, Role
+from chartreux.core.llm_models import (
+    CONTEXT_INJECTION_ORIGIN_KEY,
+    CONTEXT_INJECTION_TOOL_PAIR_V1,
+    LLMMessage,
+    Role,
+)
 from chartreux.core.session.session_loader import (
     MESSAGES_FILENAME,
     METADATA_FILENAME,
@@ -496,10 +501,33 @@ class SessionLogger:  # noqa: PLR0904
             ) from e
 
     @staticmethod
+    def _message_record(message: LLMMessage) -> dict[str, Any]:
+        """The explicit session-transcript record for one message (round-5 Y).
+
+        Starts with the ordinary ``model_dump`` (which NEVER emits the
+        private origin marker — private attributes are absent without an
+        exclusion) and adds the recognized provenance key ONLY when the
+        message is an assistant tool-call block whose private marker is an
+        exact string equal to the recognized constant. The proof therefore
+        travels atomically with its owning message in ``messages.jsonl``, on
+        every serialization/fingerprint path (the fingerprint, the durable
+        repaired-transcript serialization, the incremental boundary
+        comparison and tail serialization, and the full-save
+        serialization/comparison).
+        """
+        record = message.model_dump(exclude_none=True, mode="json")
+        if (
+            message.role == Role.assistant
+            and message.tool_calls
+            and type(message._context_injection_origin) is str
+            and message._context_injection_origin == CONTEXT_INJECTION_TOOL_PAIR_V1
+        ):
+            record[CONTEXT_INJECTION_ORIGIN_KEY] = CONTEXT_INJECTION_TOOL_PAIR_V1
+        return record
+
+    @staticmethod
     def _message_fingerprint(message: LLMMessage) -> str:
-        payload = json.dumps(
-            message.model_dump(exclude_none=True, mode="json"), sort_keys=True
-        )
+        payload = json.dumps(SessionLogger._message_record(message), sort_keys=True)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
@@ -538,6 +566,12 @@ class SessionLogger:  # noqa: PLR0904
         # the first message); otherwise an empty log would be unloadable.
         if not non_system_messages and not allow_empty:
             return
+
+        # PI1/T (S1 save boundary): a transcript defect is never silently
+        # persisted. The append/insert boundary already refuses to create one;
+        # this backstop fails closed with the typed local diagnostic so no
+        # unknown path can re-poison the log the load-time repair just healed.
+        self._check_transcript_persistence(non_system_messages)
 
         # Serialization and fsync are too slow for the UI thread, so snapshot
         # here and hand off to a worker thread.
@@ -625,6 +659,24 @@ class SessionLogger:  # noqa: PLR0904
             if self._launch_config_generation == launch_config_generation:
                 self._launch_config_dirty = False
 
+    @staticmethod
+    def _check_transcript_persistence(
+        non_system_messages: Sequence[LLMMessage],
+    ) -> None:
+        """S1 save boundary: fail closed, never silently persist a defect.
+
+        Function-level import: a top-level import of the agent_loop validator
+        would cycle (agent_loop -> _loop -> this module).
+        """
+        from chartreux.core.agent_loop._transcript_integrity import (
+            TranscriptIntegrityError,
+            find_persistence_violations,
+        )
+
+        violations = find_persistence_violations(non_system_messages)
+        if violations:
+            raise TranscriptIntegrityError(violations, context="session save boundary")
+
     def _note_disk_full(self, disk_full: SessionDiskFullError) -> None:
         """Record a disk-full save failure, logging it at a bounded rate."""
         now = utc_now()
@@ -675,6 +727,58 @@ class SessionLogger:  # noqa: PLR0904
         logger.warning(message)
         warnings.warn(message, RuntimeWarning, stacklevel=3)
         return quarantine_path
+
+    @staticmethod
+    def migrate_repaired_transcript(
+        messages_path: Path, repaired_messages: Sequence[LLMMessage]
+    ) -> Path:
+        """Durably install an in-memory transcript repair (PI1/T S4).
+
+        Mirrors ``_quarantine_corrupt_transcript``: the ORIGINAL transcript is
+        preserved as a recovery artifact and the backup is verified by
+        read-back BEFORE the live path is replaced, so a failed migration
+        never destroys the original. Any failure raises the typed
+        transcript-integrity diagnostic — the write-owning resume install
+        fails closed, never a silent partial migration. The repair never
+        deletes genuine structured tool results; the serialization matches a
+        normal full save, so the transcript cursor stays consistent.
+        """
+        from chartreux.core.agent_loop._transcript_integrity import (
+            TranscriptIntegrityError,
+        )
+
+        non_system_messages = [
+            message for message in repaired_messages if message.role != Role.system
+        ]
+        repaired_bytes = SessionLogger._transcript_bytes([
+            SessionLogger._message_record(message) for message in non_system_messages
+        ])
+        timestamp = utc_now().strftime("%Y%m%dT%H%M%S%fZ")
+        artifact_path = messages_path.with_name(
+            f"{messages_path.name}.recovered-{timestamp}-{uuid4().hex}"
+        )
+        while artifact_path.exists():
+            artifact_path = messages_path.with_name(
+                f"{messages_path.name}.recovered-{timestamp}-{uuid4().hex}"
+            )
+        try:
+            original_bytes = messages_path.read_bytes()
+            durable_replace(artifact_path, original_bytes)
+            restrict_private_file(artifact_path)
+            if artifact_path.read_bytes() != original_bytes:
+                raise OSError(
+                    f"recovery artifact read-back mismatch at {artifact_path}"
+                )
+            durable_replace(messages_path, repaired_bytes)
+        except OSError as exc:
+            raise TranscriptIntegrityError.migration_failed(messages_path, exc) from exc
+        message = (
+            f"Session transcript repaired in place at {messages_path}; the "
+            f"original transcript was preserved at {artifact_path}."
+        )
+        logger.warning(message)
+        warnings.warn(message, RuntimeWarning, stacklevel=3)
+        return artifact_path
 
     @staticmethod
     def _read_persisted_messages(
@@ -813,8 +917,8 @@ class SessionLogger:  # noqa: PLR0904
             return verified_cursor, 0
 
         if cursor.count:
-            boundary_data = non_system_messages[cursor.count - 1].model_dump(
-                exclude_none=True, mode="json"
+            boundary_data = SessionLogger._message_record(
+                non_system_messages[cursor.count - 1]
             )
             if (
                 cursor.boundary_digest is None
@@ -832,7 +936,7 @@ class SessionLogger:  # noqa: PLR0904
                 return verified_cursor, 0
 
         tail = [
-            message.model_dump(exclude_none=True, mode="json")
+            SessionLogger._message_record(message)
             for message in non_system_messages[cursor.count :]
         ]
         updated_cursor = cursor
@@ -917,8 +1021,7 @@ class SessionLogger:  # noqa: PLR0904
 
         persisted_count = len(persisted_messages)
         current_data = [
-            message.model_dump(exclude_none=True, mode="json")
-            for message in non_system_messages
+            SessionLogger._message_record(message) for message in non_system_messages
         ]
         boundary_unchanged = transcript_valid and persisted_count <= len(current_data)
         if boundary_unchanged:

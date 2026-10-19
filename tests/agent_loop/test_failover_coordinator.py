@@ -33,6 +33,8 @@ from chartreux.core.llm_models import (
 from chartreux.core.model_catalog.availability import (
     AllDeploymentsUnavailableError,
     ExclusionReason,
+    availability_snapshot,
+    eligible_deployments,
 )
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.schema import ModelCatalog
@@ -836,6 +838,277 @@ async def test_metadata_restoration_failure_still_releases_recovery_probe() -> N
 
 
 @pytest.mark.asyncio
+async def test_coordinator_path_still_claims_probes_while_read_only_view_does_not() -> (
+    None
+):
+    """The failover path keeps claiming single-flight probes; the controller's
+    READ-ONLY eligibility view never does (WP4).
+
+    ``_failover_candidates`` (the coordinator's enumeration, default
+    ``claim_probes=True``) claims the registry's recovery probe for the
+    expired-cooldown deployment and marks the candidate with its owner token;
+    a second admission is refused while the claim is held (single-flight).
+    The read-only view (``claim_probes=False`` — the automatic recovery
+    controller's scheduling check) sees the probe-in-flight deployment as
+    unavailable WITHOUT claiming or releasing anything: every surviving
+    candidate reports no probe and no token, and the held claim is untouched.
+    Releasing the probe with the owner token re-admits with a fresh token.
+    """
+    agent = _agent()
+    registry = agent.config_orchestrator.availability_registry
+    registry.initial_cooldown = 0
+    registry.record_failure("base", "test-first")
+    active = agent.config.get_active_model()
+    # The coordinator path (default claim_probes=True) claims the probe.
+    candidates = agent._failover_candidates(agent.messages, active)
+    assert [item.resolved.deployment.provider for item in candidates] == [
+        "test-first",
+        "test-second",
+    ]
+    probed = candidates[0]
+    held_token = probed.recovery_probe_token
+    assert probed.recovery_probe is True
+    assert held_token is not None
+    assert candidates[1].recovery_probe is False
+    assert candidates[1].recovery_probe_token is None
+    # The claim is single-flight: a second admission is refused while held.
+    assert registry.admission("base", "test-first")[:2] == (False, False)
+    # The READ-ONLY view (the controller's scheduling check) claims nothing:
+    # the probe-in-flight deployment reads unavailable, every surviving
+    # candidate is probe-free, and the held claim is untouched.
+    committed = agent.committed_model
+    assert committed is not None
+    read_only = eligible_deployments(
+        snapshot=agent.config.catalog_snapshot,
+        committed=committed,
+        registry=registry,
+        config=agent.config,
+        history=[],
+        thinking=active.thinking,
+        claim_probes=False,
+    )
+    assert [item.resolved.deployment.provider for item in read_only.candidates] == [
+        "test-second"
+    ]
+    assert all(not item.recovery_probe for item in read_only.candidates)
+    assert all(item.recovery_probe_token is None for item in read_only.candidates)
+    assert [item.reason for item in read_only.exclusions] == [ExclusionReason.COOLDOWN]
+    assert registry.admission("base", "test-first")[:2] == (False, False)
+    # Releasing the probe with the owner token re-admits with a fresh token.
+    registry.release_probe("base", "test-first", held_token)
+    admitted, probe, token = registry.admission("base", "test-first")
+    assert (admitted, probe) == (True, True)
+    assert token is not None
+    assert token != held_token
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_availability_snapshot_never_claims_or_releases_a_probe() -> None:
+    """R2: the gate's NON-MUTATING eligibility snapshot observes held
+    single-flight probes WITHOUT claiming or releasing them, and never
+    records or clears cooldown state — a read-only check cannot consume
+    another caller's probe or strand a token-owned claim.
+    """
+    agent = _agent()
+    registry = agent.config_orchestrator.availability_registry
+    committed = agent.committed_model
+    assert committed is not None
+    active = agent.config.get_active_model()
+    # Both deployments are blocked by HELD single-flight recovery probes
+    # (claimed through the registry exactly the way the coordinator path
+    # claims them — an expired-cooldown admission claims a recovery probe),
+    # so no deployment of the base is eligible right now.
+    registry.initial_cooldown = 0
+    registry.record_failure("base", "test-first")
+    registry.record_failure("base", "test-second")
+    first = registry.admission("base", "test-first")
+    second = registry.admission("base", "test-second")
+    assert first[:2] == (True, True)
+    assert second[:2] == (True, True)
+    assert registry.probe_in_flight("base", "test-first") is True
+    assert registry.probe_in_flight("base", "test-second") is True
+
+    snap = availability_snapshot(
+        snapshot=agent.config.catalog_snapshot,
+        committed=committed,
+        registry=registry,
+        config=agent.config,
+        history=[],
+        thinking=active.thinking,
+    )
+    # Both probes read in-flight; the only blocker is probe occupancy, so
+    # the recheck delay is 0 (the gate applies its recheck floor).
+    assert snap.available is False
+    assert snap.permanent is False
+    assert snap.endpoint_blocked is False
+    assert snap.probe_in_flight is True
+    assert snap.next_check_delay == 0.0
+    assert [item.reason for item in snap.exclusions] == [
+        ExclusionReason.COOLDOWN,
+        ExclusionReason.COOLDOWN,
+    ]
+
+    # The held claims are untouched: still in flight, admission still
+    # refused (single-flight), and a repeated snapshot is identical (no
+    # state was consumed by the read-only check).
+    assert registry.probe_in_flight("base", "test-first") is True
+    assert registry.probe_in_flight("base", "test-second") is True
+    assert registry.admission("base", "test-first")[:2] == (False, False)
+    assert registry.admission("base", "test-second")[:2] == (False, False)
+    again = availability_snapshot(
+        snapshot=agent.config.catalog_snapshot,
+        committed=committed,
+        registry=registry,
+        config=agent.config,
+        history=[],
+        thinking=active.thinking,
+    )
+    assert again == snap
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_availability_snapshot_reports_cooldown_gap_and_survivor() -> None:
+    """R2: with a live deployment cooldown the snapshot reports the
+    temporary gap for the recheck when NOTHING is eligible, while a healthy
+    same-base deployment keeps the base available (existing failover — R2
+    never switches base).
+    """
+    agent = _agent()
+    registry = agent.config_orchestrator.availability_registry
+    registry.record_failure("base", "test-first")
+    committed = agent.committed_model
+    assert committed is not None
+    active = agent.config.get_active_model()
+    cooldown_until = registry.cooldown_until("base", "test-first")
+    assert cooldown_until is not None
+
+    # A survivor exists (test-second): the base stays available and the
+    # exclusions are reported without a recheck delay (the gap is moot).
+    survivor = availability_snapshot(
+        snapshot=agent.config.catalog_snapshot,
+        committed=committed,
+        registry=registry,
+        config=agent.config,
+        history=[],
+        thinking=active.thinking,
+    )
+    assert survivor.available is True
+    assert survivor.permanent is False
+    assert survivor.probe_in_flight is False
+    assert survivor.next_check_delay == 0.0
+    assert [item.reason for item in survivor.exclusions] == [ExclusionReason.COOLDOWN]
+
+    # Nothing eligible (the second deployment also cooling down): the
+    # snapshot reports the temporary gap for the recheck.
+    registry.record_failure("base", "test-second")
+    snap = availability_snapshot(
+        snapshot=agent.config.catalog_snapshot,
+        committed=committed,
+        registry=registry,
+        config=agent.config,
+        history=[],
+        thinking=active.thinking,
+    )
+    assert snap.available is False
+    assert snap.permanent is False
+    assert snap.endpoint_blocked is False
+    assert snap.probe_in_flight is False
+    assert 0.0 < snap.next_check_delay <= 30.0
+    assert [item.reason for item in snap.exclusions] == [
+        ExclusionReason.COOLDOWN,
+        ExclusionReason.COOLDOWN,
+    ]
+    # The read changed nothing: the cooldown is exactly where it was.
+    assert registry.cooldown_until("base", "test-first") == cooldown_until
+    await agent.aclose()
+
+
+def _mixed_exclusion_agent() -> AgentLoop:
+    """One temporary-blockable deployment (test-first) beside one permanently
+    disabled provider (test-second).
+    """
+    snapshot = CatalogSnapshot(
+        ModelCatalog.model_validate({
+            "providers": {
+                "test-first": {"api_base": "https://first.invalid"},
+                "test-second": {"api_base": "https://second.invalid", "disabled": True},
+            },
+            "models": {
+                "base": {
+                    "deployments": [
+                        {"provider": "test-first", "name": "first"},
+                        {"provider": "test-second", "name": "second"},
+                    ]
+                }
+            },
+            "roles": {},
+        }),
+        "test-revision",
+    )
+    config = ChartreuxConfigSchema.model_validate(
+        {"active_model": "base"}, context={"catalog_snapshot": snapshot}
+    ).attach_catalog_snapshot(snapshot)
+    return build_test_agent_loop(config=config, backend=FakeBackend())
+
+
+@pytest.mark.asyncio
+async def test_availability_snapshot_classifies_exclusions_first() -> None:
+    """R2: exclusions are classified BEFORE availability — a MIX of one
+    temporary (cooldown) and one permanent (disabled) exclusion waits (the
+    gate defers), while ALL-permanent exclusions reject (permanent
+    incompatibility is not auto-retryable).
+    """
+    agent = _mixed_exclusion_agent()
+    registry = agent.config_orchestrator.availability_registry
+    registry.record_failure("base", "test-first")
+    committed = agent.committed_model
+    assert committed is not None
+    active = agent.config.get_active_model()
+
+    mixed = availability_snapshot(
+        snapshot=agent.config.catalog_snapshot,
+        committed=committed,
+        registry=registry,
+        config=agent.config,
+        history=[],
+        thinking=active.thinking,
+    )
+    assert mixed.available is False
+    # NOT all-permanent: the temporary cooldown keeps the episode waitable.
+    assert mixed.permanent is False
+    assert mixed.endpoint_blocked is False
+    assert 0.0 < mixed.next_check_delay <= 30.0
+    assert [item.reason for item in mixed.exclusions] == [
+        ExclusionReason.COOLDOWN,
+        ExclusionReason.DISABLED,
+    ]
+
+    # Every deployment excluded for a PERMANENT reason (the allowlist admits
+    # only "other"; the exclusion chain checks disabled before allowlist):
+    # recovery must not be scheduled at all.
+    permanent = availability_snapshot(
+        snapshot=agent.config.catalog_snapshot,
+        committed=committed,
+        registry=registry,
+        config=agent.config,
+        history=[],
+        thinking=active.thinking,
+        allowed_models=["other"],
+    )
+    assert permanent.available is False
+    assert permanent.permanent is True
+    assert permanent.endpoint_blocked is False
+    assert permanent.next_check_delay == 0.0
+    assert [item.reason for item in permanent.exclusions] == [
+        ExclusionReason.ALLOWLIST_EXCLUDED,
+        ExclusionReason.DISABLED,
+    ]
+    await agent.aclose()
+
+
+@pytest.mark.asyncio
 async def test_outer_stream_aclose_releases_attempt_resources_and_preserves_partial_output() -> (
     None
 ):
@@ -1212,3 +1485,72 @@ class _InterruptingBackend(FakeBackend):
         async for chunk in super().complete_streaming(**kwargs):  # type: ignore[arg-type]
             yield chunk
         raise httpx.ConnectError("down")
+
+
+def _same_endpoint_snapshot() -> CatalogSnapshot:
+    """Two providers on ONE shared endpoint for the same base model."""
+    return CatalogSnapshot(
+        ModelCatalog.model_validate({
+            "providers": {
+                "test-a": {"api_base": "https://shared.invalid"},
+                "test-b": {"api_base": "https://shared.invalid"},
+            },
+            "models": {
+                "base": {
+                    "deployments": [
+                        {"provider": "test-a", "name": "base-a"},
+                        {"provider": "test-b", "name": "base-b"},
+                    ]
+                }
+            },
+            "roles": {},
+        }),
+        "test-revision",
+    )
+
+
+def test_r0_root_loop_has_no_subagent_exclusion_in_candidate_selection() -> None:
+    """R0 (OD2 key finding): same-base deployment failover is NOT child-only.
+
+    A ROOT loop (``build_test_agent_loop`` constructs no subagent) builds a
+    CompletionCoordinator and its candidate selection offers every eligible
+    same-base deployment — there is no subagent exclusion in the path.
+    """
+    agent = _agent()
+    assert agent.is_subagent is False
+    assert agent._completion_coordinator is not None
+    candidates = agent._failover_candidates(
+        agent.messages, agent.config.get_active_model()
+    )
+    assert [candidate.resolved.deployment.provider for candidate in candidates] == [
+        "test-first",
+        "test-second",
+    ]
+    assert all(candidate.resolved.base_model == "base" for candidate in candidates)
+
+
+def test_r0_failover_candidates_include_same_endpoint_alternative() -> None:
+    """R0: a same-endpoint alternative IS a failover candidate while healthy.
+
+    Candidate selection keys on deployment identity, not on the endpoint
+    alone: two deployments of one base sharing an endpoint are both offered.
+    (They are NOT outage-independent — an endpoint-wide correlation cooldown
+    excludes both; that half is characterized end-to-end in
+    tests/recovery/test_root_resilience.py.)
+    """
+    snapshot = _same_endpoint_snapshot()
+    config = ChartreuxConfigSchema.model_validate(
+        {"active_model": "base"}, context={"catalog_snapshot": snapshot}
+    ).attach_catalog_snapshot(snapshot)
+    agent = build_test_agent_loop(config=config, backend=FakeBackend())
+    candidates = agent._failover_candidates(
+        agent.messages, agent.config.get_active_model()
+    )
+    assert [candidate.resolved.deployment.provider for candidate in candidates] == [
+        "test-a",
+        "test-b",
+    ]
+    assert [candidate.resolved.deployment.name for candidate in candidates] == [
+        "base-a",
+        "base-b",
+    ]

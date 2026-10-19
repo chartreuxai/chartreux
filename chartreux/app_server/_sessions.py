@@ -8,6 +8,7 @@ from collections.abc import (
     Callable,
     Coroutine,
     Iterator,
+    Sequence,
 )
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
@@ -31,6 +32,7 @@ from chartreux.app_server._projection import (
     project_launch_slot_purposes,
     project_session_log,
 )
+from chartreux.app_server._recovery_controller import RecoveryController
 from chartreux.app_server._root_session import SessionHandoff, rebind_history
 from chartreux.app_server._runtime import (
     AgentRuntimeFactory,
@@ -70,6 +72,10 @@ from chartreux.app_server._subagent_records import (
     _grant_wire as _grant_wire,
     _ReplacementClaim as _ReplacementClaim,
 )
+from chartreux.app_server._subagent_recovery import (
+    SubagentRecovery,
+    _recovery_config as _recovery_config,
+)
 from chartreux.app_server._subagent_release import (
     AgentRelease,
     ReleaseContext as ReleaseContext,
@@ -82,12 +88,15 @@ from chartreux.app_server._subagent_results import (
 )
 from chartreux.app_server._subagent_retention import AgentRetention, EvictionNotice
 from chartreux.app_server._subagent_transcript import TranscriptReads
+from chartreux.app_server._suspension_lifecycle import SuspensionLifecycle
 from chartreux.app_server._turns import DeliverCallback, TurnController, TurnStartAction
 from chartreux.app_server.models import (
     CallbackOutput,
     OpenCallbackState,
     PublicCallbackEntry,
+    PublicFailureEnvelope,
     PublicHistoryEntry,
+    PublicRecoveryEligibility,
     PublicSessionState,
     PublicTurn,
     PublicTurnQueue,
@@ -110,9 +119,11 @@ from chartreux.core.config._restrictions import (
     partition_policy_sources,
 )
 from chartreux.core.config.layers.user import UserConfigLayer
+from chartreux.core.config.models import RecoveryConfig
 from chartreux.core.config.types import ConfigSaveResult
 from chartreux.core.events import BaseEvent, ToolStreamEvent
 from chartreux.core.llm_models import Role
+from chartreux.core.recovery_models import FailureEnvelope, RecoveryEligibility
 from chartreux.core.session_types import ChildSessionLink
 from chartreux.core.subagents import (
     AgentAvailability,
@@ -120,10 +131,14 @@ from chartreux.core.subagents import (
     AgentClosedError,
     AgentEviction,
     AgentSummary,
+    CancelOutcome,
     CancelResult,
+    EffectVerification,
     LaunchConfigError,
     LaunchOutcome,
+    ReconcileResult,
     ReleaseAgentOutcome,
+    ResumeAgentResult,
     RetentionPolicy,
     RunStatus,
     RunStopReason,
@@ -154,6 +169,23 @@ type EventWatermark = Callable[[str], int]
 
 # Per root-session registry; retained idle agents do not consume active-work slots.
 _DEFAULT_MAX_RUNNING_SUBAGENTS = 16
+
+
+def _public_failure_envelope(
+    envelope: FailureEnvelope | None,
+) -> PublicFailureEnvelope | None:
+    """Project a run's core failure envelope onto the public wire model (WP1).
+
+    The public app-server layer cannot import core models (app-server
+    boundary), so the agents/update projection converts the canonical
+    envelope at this server boundary; the wire model mirrors the §1.7
+    schema field-for-field (pinned by a mirror-contract test).
+    """
+    if envelope is None:
+        return None
+    return PublicFailureEnvelope.model_validate(
+        envelope.model_dump(mode="json", by_alias=True)
+    )
 
 
 @dataclass(slots=True)
@@ -254,6 +286,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._wait_leases: dict[tuple[str, str], int] = {}
         self._pending_notifications: set[tuple[str, str]] = set()
         self._result_write_tokens: dict[tuple[str, str], object] = {}
+        # WP5: per-work-package replacement counter (keyed by work_package_id)
+        # against recovery.fallback_replacements_max_per_package; the budget
+        # spans replacements — a package's replacements are counted, never
+        # reset, across the package's lineage.
+        self._package_replacements: dict[str, int] = {}
         self._teardown_tasks: set[asyncio.Task[None]] = set()
         self._pending_child_closes: dict[
             str, tuple[SessionRuntime, asyncio.Task[None]]
@@ -302,16 +339,28 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._execution = SubagentExecution(self)
         self._child_runtime = ChildRuntimeAssembler(self)
         self._child_drain = ChildDrain(self)
+        self._recovery = SubagentRecovery(self)
+        self._suspension = SuspensionLifecycle(self)
+        # WP4: the bounded automatic recovery controller. INERT unless
+        # [recovery.subagents] enabled — suspension and the explicit
+        # resume/reconcile ports above are untouched either way.
+        self._recovery_controller = RecoveryController(self)
 
     def __getattr__(self, name: str) -> Any:
         # Registries built without __init__ (tests construct bare instances
         # with object.__new__ and set only the state they exercise) lazily
-        # wire the child drain collaborator on first use; the reserve/close
-        # facade is the only port those bare registries call.
+        # wire the collaborators on first use; the reserve/close facade is
+        # the only port those bare registries call. The WP4 recovery
+        # controller's constructor never touches the view, so lazy wiring is
+        # inert for a bare registry (its cancel-all iterates no episodes).
         if name == "_child_drain":
             drain = ChildDrain(self)
             self._child_drain = drain
             return drain
+        if name == "_recovery_controller":
+            controller = RecoveryController(self)
+            self._recovery_controller = controller
+            return controller
         raise AttributeError(f"SessionRuntimeRegistry has no attribute {name!r}")
 
     def _policy_runtimes(self, root: SessionRuntime) -> tuple[SessionRuntime, ...]:
@@ -749,6 +798,10 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             self._suppressed_notifications.discard(agent_id)
 
     def _retire_generation_agents(self) -> None:
+        # WP4: a retired generation forfeits pending automatic recovery along
+        # with its records — the controller's timers are cancelled here and
+        # their re-validation (generation fence) is the backstop.
+        self._recovery_controller.cancel_all()
         records = list(self._agent_records.values())
         # Drop terminal metadata belonging to the retiring generation. The
         # matching is on the full (parent session, generation) identity captured
@@ -766,6 +819,9 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             self._pending_evictions.pop(agent_id, None)
         for record in records:
             self._acquire_notification_suppression(record.agent_id)
+            # WP3: a retired generation forfeits its suspended records'
+            # storage-seam state along with the records themselves.
+            self._suspension.discard_locked(record.agent_id)
             self._agent_records.pop(record.agent_id, None)
             self._children.pop(record.session_id, None)
             self._child_links.pop(record.session_id, None)
@@ -1388,6 +1444,22 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             parent.agent_loop._session_generation,
         )
         if args.background:
+            # WP5: a replacement claim (config.predecessor_agent_id on a
+            # fresh-agent launch) is validated at failure time by the launch
+            # admission BEFORE preparation — the old recovery is disabled and
+            # the per-package budget consumed before the new run's write
+            # token is registered at acceptance.
+            replacement_decision = None
+            if (
+                args.agent_id is None
+                and args.config is not None
+                and args.config.predecessor_agent_id is not None
+            ):
+                replacement_decision = (
+                    await self._launch_admission.validate_replacement_claim(
+                        parent, args
+                    )
+                )
             # Background execution context (ASC area 3, step 3): the
             # preparation region moved to the executor's prepare_background;
             # the returned context carries the preparation + acceptance-tail
@@ -1400,6 +1472,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 slot,
                 replacement=replacement,
                 summary_task=summary_task,
+                replacement_decision=replacement_decision,
             )
 
             try:
@@ -1631,6 +1704,30 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 and record.idle_since is not None
                 else None
             )
+            # WP1: the latest failed run's public typed failure envelope,
+            # searched latest-first (current run, then run history); the
+            # run record is the canonical store, so it survives result expiry.
+            last_failure = None
+            if run is not None and run.failure is not None:
+                last_failure = run.failure
+            else:
+                for history_run in reversed(record.run_history):
+                    if history_run.failure is not None:
+                        last_failure = history_run.failure
+                        break
+            # WP2: the suspended barrier's recovery linkage. The published
+            # envelope stays immutable; recovery_eligibility is the EFFECTIVE
+            # view (a reconcile_result submission flips it). None when no
+            # barrier is active.
+            recovery_eligibility = None
+            if record.state is _AgentState.SUSPENDED and last_failure is not None:
+                if record.reconcile_outcome == "cleared":
+                    recovery_eligibility = RecoveryEligibility.ELIGIBLE
+                elif record.reconcile_outcome == "prohibited":
+                    recovery_eligibility = RecoveryEligibility.PROHIBITED
+                else:
+                    recovery_eligibility = last_failure.recovery.eligibility
+            latest_run = run or (record.run_history[-1] if record.run_history else None)
             summary = AgentSummary(
                 agent_id=record.agent_id,
                 profile=record.profile,
@@ -1661,6 +1758,22 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 context_window=record.context_window,
                 compacting=record.compacting,
                 stop_reason=record.stop_reason,
+                last_failure=last_failure,
+                recovery_chain_id=record.recovery_chain_id,
+                same_agent_resumes_used=(
+                    record.same_agent_resumes_used
+                    if record.recovery_chain_id is not None
+                    else None
+                ),
+                resumed_from_run_id=(
+                    latest_run.resumed_from_run_id if latest_run is not None else None
+                ),
+                recovery_eligibility=recovery_eligibility,
+                # WP5: the predecessor/package lineage pair of the latest
+                # claimed run (a replacement carries its predecessor's package
+                # identity; None for a fresh agent).
+                work_package_id=record.work_package_id,
+                predecessor_agent_id=record.predecessor_agent_id,
                 result_expired=(
                     (record.agent_id, latest_run_id) in self._expired_results
                     if latest_run_id is not None
@@ -1672,15 +1785,29 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         # Deterministic server ordering: Active (oldest launch first), then
         # Retained Idle (most recently completed first), then Recent terminal
         # metadata (newest closure first); numeric agent id breaks ties.
+        # WP2: suspended/restoring records hold resident runtimes awaiting
+        # recovery, so they sort with Active, never with Retained Idle.
         active = [
             entry
             for entry in entries
-            if entry[0].state in {_AgentState.RUNNING, _AgentState.FINALIZING}
+            if entry[0].state
+            in {
+                _AgentState.RUNNING,
+                _AgentState.FINALIZING,
+                _AgentState.SUSPENDED,
+                _AgentState.RESTORING,
+            }
         ]
         idle = [
             entry
             for entry in entries
-            if entry[0].state not in {_AgentState.RUNNING, _AgentState.FINALIZING}
+            if entry[0].state
+            not in {
+                _AgentState.RUNNING,
+                _AgentState.FINALIZING,
+                _AgentState.SUSPENDED,
+                _AgentState.RESTORING,
+            }
         ]
         active.sort(
             key=lambda entry: (
@@ -1783,6 +1910,18 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                         if summary.stop_reason is not None
                         else None
                     ),
+                    last_failure=_public_failure_envelope(summary.last_failure),
+                    recovery_chain_id=summary.recovery_chain_id,
+                    same_agent_resumes_used=summary.same_agent_resumes_used,
+                    resumed_from_run_id=summary.resumed_from_run_id,
+                    recovery_eligibility=(
+                        PublicRecoveryEligibility(summary.recovery_eligibility.value)
+                        if summary.recovery_eligibility is not None
+                        else None
+                    ),
+                    # WP5: the predecessor/package lineage pair.
+                    work_package_id=summary.work_package_id,
+                    predecessor_agent_id=summary.predecessor_agent_id,
                     result_expired=summary.result_expired,
                 )
                 for summary in self._visible_summaries()
@@ -1829,9 +1968,68 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         reason: RunStopReason,
         requester_session_id: str,
     ) -> CancelResult:
-        """Delegate to the run results collaborator."""
+        """Delegate to the run results collaborator (WP3 cancellation gate).
+
+        An authoritative cancellation of a SUSPENDED agent invalidates its
+        pending recovery FIRST (handoff §1.8: cancellation invalidates
+        scheduled recovery): the barrier converts to a closed terminal
+        tombstone — the failed run's stored result survives — and the
+        cancel reports STOP_REQUESTED. A foreign/stale request, a
+        non-suspended record, or a run pinned away from the barrier falls
+        through to the run results collaborator's own authority checks.
+        """
+        intercepted: CancelResult | None = None
+        async with self._registry_lock:
+            record = self._agent_records.get(agent_id)
+            if record is not None and record.state is _AgentState.SUSPENDED:
+                if (
+                    not self._admission_closed
+                    and not self._draining_children
+                    and (
+                        reason is RunStopReason.USER_CANCELLED
+                        or requester_session_id == record.parent_session_id
+                    )
+                ):
+                    barrier_run_id = record.latest_run_id or (
+                        record.current_run.run_id
+                        if record.current_run is not None
+                        else None
+                    )
+                    if run_id is None or run_id == barrier_run_id:
+                        intercepted = self._cancel_suspension_locked(record, reason)
+        if intercepted is not None:
+            try:
+                await self._emit_agents_update()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to publish suspension cancellation update", exc_info=exc
+                )
+            return intercepted
         return await self._run_results.cancel(
             agent_id, run_id, reason=reason, requester_session_id=requester_session_id
+        )
+
+    def _cancel_suspension_locked(
+        self, record: AgentRecord, reason: RunStopReason
+    ) -> CancelResult:
+        """Invalidate a suspended barrier on an authoritative cancellation.
+
+        The caller holds the registry lock. The conversion keeps the failed
+        run's stored result and closes the warm runtime through the normal
+        ownership paths; the tombstone records the cancellation stop reason.
+        WP4: the cancellation also cancels the record's pending automatic
+        recovery (rollback: cancel timers, retain counters/results).
+        """
+        barrier_run_id = record.latest_run_id or (
+            record.current_run.run_id if record.current_run is not None else None
+        )
+        record.stop_reason = reason
+        self._recovery_controller.cancel_pending(record.agent_id)
+        self._suspension_expire_record_locked(record)
+        return CancelResult(
+            outcome=CancelOutcome.STOP_REQUESTED,
+            run_id=barrier_run_id,
+            stop_reason=reason,
         )
 
     def _resolve_run(
@@ -1985,13 +2183,107 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
 
     async def release_agent(self, agent_id: str) -> ReleaseAgentOutcome:
         """Delegate to the agent release collaborator."""
+        # WP4: releasing an agent invalidates its pending automatic
+        # recovery FIRST (rollback: cancel timers, retain counters/results).
+        self._recovery_controller.cancel_pending(agent_id)
         return await self._agent_release.release(agent_id)
 
     async def release_agent_guarded(
         self, agent_id: str, expected_run_id: str | None = None
     ) -> ReleaseAgentOutcome:
         """Delegate to the agent release collaborator."""
+        # WP4: see release_agent.
+        self._recovery_controller.cancel_pending(agent_id)
         return await self._agent_release.release_guarded(agent_id, expected_run_id)
+
+    def _suspend_after_failure_locked(
+        self, record: AgentRecord, run: RunRecord
+    ) -> bool:
+        """Delegate to the recovery collaborator (WP2 suspension hook)."""
+        return self._recovery.suspend_after_failure_locked(record, run)
+
+    def _observe_run_completion_locked(
+        self, record: AgentRecord, run: RunRecord
+    ) -> None:
+        """Delegate to the automatic recovery controller (WP4 observation).
+
+        INERT unless ``[recovery.subagents] enabled`` — suspension (WP2/WP3)
+        and the explicit resume/reconcile ports are untouched either way.
+        """
+        self._recovery_controller.observe_run_locked(record, run)
+
+    def _invalidate_recovery_locked(self, record: AgentRecord | None) -> None:
+        """Delegate to the recovery collaborator (WP2 invalidation).
+
+        WP3: the invalidation also drops the record's suspension storage
+        seam state — release/replacement forfeits any suspended capture.
+        WP4: the invalidation also stops the record's automatic-recovery
+        episode and cancels its pending schedule.
+        """
+        self._recovery_controller.invalidate(record)
+        self._recovery.invalidate_locked(record)
+        if record is not None:
+            self._suspension.discard_locked(record.agent_id)
+
+    def _suspension_admit_locked(
+        self, record: AgentRecord, config: RecoveryConfig
+    ) -> bool:
+        """Delegate to the suspension lifecycle collaborator (WP3 byte cap)."""
+        return self._suspension.admit_locked(record, config)
+
+    def _suspension_capture_locked(self, record: AgentRecord) -> None:
+        """Delegate to the suspension lifecycle collaborator (WP3 seam)."""
+        self._suspension.capture_locked(record)
+
+    def _suspension_next_expiry_locked(self) -> float | None:
+        """Delegate to the suspension lifecycle collaborator (WP3 TTL)."""
+        return self._suspension.next_expiry_locked(_recovery_config(self))
+
+    def _suspension_expire_elapsed_locked(self, now: float) -> list[AgentRecord]:
+        """Delegate to the suspension lifecycle collaborator (WP3 expiry)."""
+        return self._suspension.expire_elapsed_locked(now, _recovery_config(self))
+
+    def _suspension_expire_record_locked(self, record: AgentRecord) -> None:
+        """Delegate to the suspension lifecycle collaborator (WP3 conversion)."""
+        self._suspension.expire_locked(record)
+
+    def _suspension_discard_locked(self, agent_id: str) -> None:
+        """Delegate to the suspension lifecycle collaborator (WP3 seam)."""
+        self._suspension.discard_locked(agent_id)
+
+    async def resume_agent(
+        self,
+        agent_id: str,
+        expected_run_id: str,
+        idempotency_key: str,
+        *,
+        requester_session_id: str,
+    ) -> ResumeAgentResult:
+        """Delegate to the recovery collaborator (WP2 explicit resume)."""
+        return await self._recovery.resume_agent(
+            agent_id,
+            expected_run_id,
+            idempotency_key,
+            requester_session_id=requester_session_id,
+        )
+
+    async def reconcile_result(
+        self,
+        agent_id: str,
+        expected_run_id: str,
+        transcript_boundary: str,
+        verified_effects: Sequence[EffectVerification],
+        *,
+        requester_session_id: str,
+    ) -> ReconcileResult:
+        """Delegate to the recovery collaborator (WP2 reconciliation)."""
+        return await self._recovery.reconcile_result(
+            agent_id,
+            expected_run_id,
+            transcript_boundary,
+            verified_effects,
+            requester_session_id=requester_session_id,
+        )
 
     @classmethod
     def _resolve_run_outcome(
@@ -2074,7 +2366,13 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._admission_closed = False
 
     async def reserve_resume_admission(self, root: SessionRuntime) -> None:
-        """Delegate to the child drain collaborator."""
+        """Delegate to the child drain collaborator (WP4 prelude).
+
+        A session switch forfeits pending automatic recovery along with the
+        retiring generation: cancel every controller schedule before resume
+        admission is reserved (rollback: cancel timers, retain counters).
+        """
+        self._recovery_controller.cancel_all()
         await self._child_drain.reserve_resume(root)
 
     async def close_children(self) -> None:
@@ -2082,7 +2380,12 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         await self._child_drain.close_children()
 
     async def drain_children(self) -> None:
-        """Delegate to the child drain collaborator."""
+        """Delegate to the child drain collaborator (WP4 prelude).
+
+        Shutdown cancels every pending automatic-recovery schedule (rollback:
+        cancel timers, retain counters/results).
+        """
+        self._recovery_controller.cancel_all()
         await self._child_drain.drain_children()
 
     @staticmethod

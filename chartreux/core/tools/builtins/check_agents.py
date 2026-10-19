@@ -30,14 +30,28 @@ class CheckAgentsResult(BaseModel):
         description="How to reuse the instance handles listed in agents.",
     )
 
+    resume_guidance: str = Field(
+        default=(
+            "A suspended agent failed recoverably and keeps its identity, "
+            "conversation, tool state, and budgets: resume it explicitly with "
+            "resume_agent(agent_id, expected_run_id=latest_run_id). When "
+            "recovery_eligibility is reconcile_required, verify the unknown "
+            "tool effects and call reconcile_result first. Resume is always "
+            "explicit; replacement (task with replace_run=true) and "
+            "release_agent remain available while suspended."
+        ),
+        description="How to resume a suspended agent (WP2).",
+    )
+
     agents: list[AgentSummary] = Field(
         default_factory=list,
         description=(
             "The bounded agent inventory and its status: resident records "
-            "(running, finalizing, idle) plus closed/evicted terminal metadata "
-            "within its metadata window. Each entry's name is display-only; "
-            "agent_id is the only handle. ttl_remaining_seconds is advisory "
-            "and does not guarantee the agent will remain available."
+            "(running, finalizing, idle, suspended, restoring) plus "
+            "closed/evicted terminal metadata within its metadata window. "
+            "Each entry's name is display-only; agent_id is the only handle. "
+            "ttl_remaining_seconds is advisory and does not guarantee the "
+            "agent will remain available."
         ),
     )
 

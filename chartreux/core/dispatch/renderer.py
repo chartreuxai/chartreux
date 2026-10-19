@@ -337,7 +337,11 @@ def _failure_paragraph(policy: DispatchPolicy) -> str:
         f"dispatch the `{advisor}` slot for read-only analysis; never "
         f"re-dispatch implementation to the `{advisor}` slot. Escalate "
         "architectural blockers to an advisor and authorization or scope "
-        "blockers to the user."
+        "blockers to the user. Infrastructure and harness failures never "
+        "produce a user question (UNATTENDED-RESILIENCE): park the failed "
+        "package and continue independent work, and end the turn with one "
+        "consolidated resumable blocker report only when eligible routes "
+        "and budgets are exhausted."
     )
 
 

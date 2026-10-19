@@ -331,6 +331,72 @@ class TestAgentAvailability:
             "idle",
             "evicted",
             "closed",
+            # WP2: warm recovery states (handoff §1.8).
+            "suspended",
+            "restoring",
+        }
+
+
+class TestTaskResultFailureContract:
+    """WP1: TaskResult carries the typed failure evidence (0.5.6 recovery)."""
+
+    def test_failure_fields_default_to_none_and_stay_unset(self) -> None:
+        result = TaskResult(response="done", turns_used=1, completed=True)
+
+        assert result.run_status is None
+        assert result.failure is None
+        assert result.recovery is None
+        dumped = result.model_dump(mode="json")
+        assert "run_status" not in dumped
+        assert "failure" not in dumped
+        assert "recovery" not in dumped
+
+    def test_failed_result_carries_envelope_run_status_and_reference(self) -> None:
+        from chartreux.core.recovery_models import (
+            RecoveryEligibility,
+            RecoveryReference,
+            build_failure_envelope,
+        )
+
+        envelope = build_failure_envelope(
+            observation=None, agent_id="agent-1", run_id="run-1"
+        )
+        result = TaskResult(
+            response="failed",
+            turns_used=1,
+            completed=False,
+            agent_id="agent-1",
+            run_id="run-1",
+            run_status=RunStatus.FAILED,
+            failure=envelope,
+            recovery=RecoveryReference.from_envelope(envelope),
+        )
+
+        assert result.run_status is RunStatus.FAILED
+        assert result.failure is envelope
+        assert result.recovery is not None
+        assert result.recovery.event_id == envelope.event_id
+        assert result.recovery.eligibility is RecoveryEligibility.PROHIBITED
+        restored = TaskResult.model_validate(result.model_dump(mode="json"))
+        assert restored == result
+
+    def test_legacy_result_payload_validates_without_failure_fields(self) -> None:
+        legacy = TaskResult.model_validate({
+            "response": "done",
+            "turns_used": 1,
+            "completed": True,
+        })
+
+        assert legacy.failure is None
+        assert legacy.recovery is None
+        assert legacy.run_status is None
+
+    def test_run_status_values_match_the_public_contract(self) -> None:
+        assert {status.value for status in RunStatus} == {
+            "running",
+            "completed",
+            "failed",
+            "cancelled",
         }
 
 

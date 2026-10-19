@@ -200,8 +200,24 @@ class RunResults:
         the exact (agent, run) key at acceptance; publication later accepts
         this exact token — authority is never reconstructed from handle
         strings. The caller must hold the registry lock.
+
+        Review R6: writer tokens are PACKAGE-exclusive, not agent-keyed.
+        Registering a replacement's token revokes every OTHER live token
+        whose record carries the same work package, so a superseded
+        predecessor (or an earlier replacement of the same package) still
+        in flight can never publish over the package's current owner.
         """
         self._view._result_write_tokens[(agent_id, run_id)] = token
+        record = self._view._agent_records.get(agent_id)
+        package_id = record.work_package_id if record is not None else None
+        if package_id is None:
+            return
+        for key in list(self._view._result_write_tokens):
+            if key[0] == agent_id:
+                continue
+            other = self._view._agent_records.get(key[0])
+            if other is not None and other.work_package_id == package_id:
+                self._view._result_write_tokens.pop(key, None)
 
     def publish_locked(
         self, context: BackgroundExecutionContext

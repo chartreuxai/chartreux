@@ -39,6 +39,7 @@ from chartreux.app_server.client import AppServerClient, AppServerResponseError
 from chartreux.app_server.events import AgentsUpdate, ClientProjection
 from chartreux.app_server.models import (
     IdleSessionStatus,
+    PublicRecoveryEligibility,
     PublicSession,
     PublicSessionState,
     TextContentBlock,
@@ -54,14 +55,21 @@ from chartreux.app_server.protocol import (
 from chartreux.app_server.session import AppServerSession
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.agent_loop import AgentLoop
+from chartreux.core.agent_loop.errors import EmptyLLMResponseError
 from chartreux.core.agents.models import AgentProfile
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.message_list import MessageList
+from chartreux.core.recovery_models import RecoveryEligibility
 from chartreux.core.subagents import (
     AgentAvailability,
     AgentProfileMismatchError,
     AgentSummary,
+    EffectVerification,
+    ReconcileOutcome,
+    ReconcileResult,
     ReleaseAgentOutcome,
+    ResumeAgentResult,
+    ResumeOutcome,
     RunStatus,
     RunStopReason,
     TaskArgs,
@@ -79,6 +87,7 @@ from chartreux.core.tools.builtins.wait_for_agent import (
 )
 from tests.app_server._subagent_test_support import (
     BlockingBackend,
+    ImmediateFailureBackend,
     _background_result,
     _config,
     _idle_record,
@@ -451,6 +460,163 @@ async def test_completion_notification_derives_from_its_own_run_record(
         )
     finally:
         backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_background_run_carries_envelope_and_last_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WP1: a failed background run's stored result carries the public typed
+    failure envelope (run_status + recovery reference), and the agents/update
+    summary projection carries it as ``last_failure``.
+    """
+    backend = ImmediateFailureBackend(RuntimeError("child backend failed immediately"))
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: backend
+    )
+    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    try:
+        launch = await _background_result(
+            registry,
+            TaskArgs(task="fail", agent_type="worker", background=True, retain=True),
+            InvokeContext(tool_call_id="launch", session_id=parent.session_id),
+        )
+        assert launch.agent_id is not None and launch.run_id is not None
+        failed = await _wait_result(registry, launch.agent_id, launch.run_id)
+        assert not failed.completed
+        assert failed.run_status is RunStatus.FAILED
+        envelope = failed.failure
+        assert envelope is not None
+        assert envelope.agent_id == launch.agent_id
+        assert envelope.run_id == launch.run_id
+        # The synthetic fault is unfamiliar: unknown reports-and-parks.
+        assert envelope.recovery.eligibility is RecoveryEligibility.PROHIBITED
+        assert failed.recovery is not None
+        assert failed.recovery.event_id == envelope.event_id
+        assert failed.recovery.recovery_chain_id == envelope.recovery_chain_id
+        # The summary projection (the agents/update source) carries it.
+        summary = next(
+            item
+            for item in await registry.check_agents()
+            if item.agent_id == launch.agent_id
+        )
+        assert summary.last_failure is not None
+        assert summary.last_failure.event_id == envelope.event_id
+        assert summary.last_run_status is RunStatus.FAILED
+        # The agents/update wire projection carries the projected envelope:
+        # the public layer cannot import core models, so the server boundary
+        # converts the canonical envelope onto the public wire model.
+        notify = AsyncMock()
+        registry._notify_agents = notify
+        await registry._emit_agents_update()
+        await_args = notify.await_args
+        assert await_args is not None
+        summaries, _evictions = await_args.args
+        wire_summary = next(
+            item for item in summaries if item.agent_id == launch.agent_id
+        )
+        assert wire_summary.last_failure is not None
+        assert wire_summary.last_failure.event_id == envelope.event_id
+        assert (
+            wire_summary.last_failure.recovery.eligibility
+            is PublicRecoveryEligibility.PROHIBITED
+        )
+        wire_dump = wire_summary.model_dump(mode="json", by_alias=True)
+        assert wire_dump["lastFailure"]["event_id"] == envelope.event_id
+        assert (
+            wire_dump["lastFailure"]["failure"]["class"]
+            == envelope.failure.failure_class.value
+        )
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_suspended_failure_projects_recovery_state_on_the_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WP2: a recoverably failed retained agent SUSPENDS warm; the summary
+    and the agents/update wire projection carry the suspension truthfully —
+    availability ``suspended``, the recovery-chain linkage, and the effective
+    recovery eligibility — never defaulting to idle.
+    """
+    backend = ImmediateFailureBackend(
+        EmptyLLMResponseError("test-provider", "test-model")
+    )
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: backend
+    )
+    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    try:
+        launch = await _background_result(
+            registry,
+            TaskArgs(task="fail", agent_type="worker", background=True, retain=True),
+            InvokeContext(tool_call_id="launch", session_id=parent.session_id),
+        )
+        assert launch.agent_id is not None and launch.run_id is not None
+        failed = await _wait_result(registry, launch.agent_id, launch.run_id)
+        assert not failed.completed
+        envelope = failed.failure
+        assert envelope is not None
+        # The typed empty-response transient with no tool calls: unknown
+        # outcomes suspend behind a reconcile barrier.
+        assert envelope.recovery.eligibility is RecoveryEligibility.RECONCILE_REQUIRED
+        record = registry._agent_records[launch.agent_id]
+        await _until(lambda: record.state is _AgentState.SUSPENDED)
+
+        # The summary projection shows the suspension truthfully (not idle).
+        summary = next(
+            item
+            for item in await registry.check_agents()
+            if item.agent_id == launch.agent_id
+        )
+        assert summary.availability is AgentAvailability.SUSPENDED
+        assert summary.last_run_status is RunStatus.FAILED
+        assert summary.latest_run_id == launch.run_id
+        assert summary.recovery_chain_id == envelope.recovery_chain_id
+        assert summary.same_agent_resumes_used == 0
+        assert summary.recovery_eligibility is RecoveryEligibility.RECONCILE_REQUIRED
+        assert summary.last_failure is not None
+        assert summary.last_failure.event_id == envelope.event_id
+
+        # The agents/update wire projection carries the same truth (the
+        # public layer mirrors the core summary; it cannot import core).
+        notify = AsyncMock()
+        registry._notify_agents = notify
+        await registry._emit_agents_update()
+        await_args = notify.await_args
+        assert await_args is not None
+        summaries, _evictions = await_args.args
+        wire_summary = next(
+            item for item in summaries if item.agent_id == launch.agent_id
+        )
+        assert wire_summary.availability == "suspended"
+        assert wire_summary.last_run_status == RunStatus.FAILED.value
+        assert wire_summary.recovery_chain_id == envelope.recovery_chain_id
+        assert wire_summary.same_agent_resumes_used == 0
+        assert wire_summary.resumed_from_run_id is None
+        assert (
+            wire_summary.recovery_eligibility
+            is PublicRecoveryEligibility.RECONCILE_REQUIRED
+        )
+        wire_dump = wire_summary.model_dump(mode="json", by_alias=True)
+        assert wire_dump["recoveryChainId"] == envelope.recovery_chain_id
+        assert wire_dump["sameAgentResumesUsed"] == 0
+        assert wire_dump["recoveryEligibility"] == "reconcile_required"
+    finally:
         await registry.drain_children()
         await parent.aclose()
 
@@ -948,6 +1114,95 @@ async def test_agents_release_route_dispatches_to_guarded_registry_release(
         response = await client.request("agents/release", {"agentId": "child"})
         assert response["outcome"] == outcome.value
         guard.assert_awaited_once_with("child", None)
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_agents_resume_route_dispatches_to_registry_resume() -> None:
+    """WP2: the agents/resume RPC route dispatches to the registry's explicit
+    resume admission, defaulting the idempotency key to the run pin.
+    """
+    client, session, root, parent = await _release_rpc_session()
+    guard = AsyncMock(
+        return_value=ResumeAgentResult(
+            outcome=ResumeOutcome.NOT_RESUMABLE,
+            agent_id="child",
+            run_id="run-1",
+            reason="Agent is idle, not suspended",
+            reason_codes=["not_suspended"],
+        )
+    )
+    root.children.resume_agent = guard
+    try:
+        assert "agents/resume" in SERVER_METHODS
+        response = await client.request(
+            "agents/resume", {"agentId": "child", "expectedRunId": "run-1"}
+        )
+        assert response["outcome"] == "not_resumable"
+        assert response["agentId"] == "child"
+        assert response["runId"] == "run-1"
+        assert response["reasonCodes"] == ["not_suspended"]
+        guard.assert_awaited_once_with(
+            "child", "run-1", "child:run-1", requester_session_id=parent.session_id
+        )
+
+        # An explicit idempotency key is forwarded verbatim.
+        guard.reset_mock()
+        response = await client.request(
+            "agents/resume",
+            {"agentId": "child", "expectedRunId": "run-1", "idempotencyKey": "key-1"},
+        )
+        assert response["outcome"] == "not_resumable"
+        guard.assert_awaited_once_with(
+            "child", "run-1", "key-1", requester_session_id=parent.session_id
+        )
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_agents_reconcile_route_dispatches_to_registry_reconcile() -> None:
+    """WP2: the agents/reconcile RPC route dispatches to the registry's
+    run/boundary-pinned reconcile_result barrier.
+    """
+    client, session, root, parent = await _release_rpc_session()
+    guard = AsyncMock(
+        return_value=ReconcileResult(
+            outcome=ReconcileOutcome.CLEARED,
+            agent_id="child",
+            run_id="run-1",
+            transcript_boundary="turn-1",
+            eligibility=RecoveryEligibility.ELIGIBLE,
+            reason_codes=["effects_verified_settled", "call-1"],
+            reason="All verified effects settled; the barrier is cleared.",
+        )
+    )
+    root.children.reconcile_result = guard
+    try:
+        assert "agents/reconcile" in SERVER_METHODS
+        response = await client.request(
+            "agents/reconcile",
+            {
+                "agentId": "child",
+                "expectedRunId": "run-1",
+                "transcriptBoundary": "turn-1",
+                "verifiedEffects": [{"toolCallId": "call-1", "disposition": "settled"}],
+            },
+        )
+        assert response["outcome"] == "cleared"
+        assert response["agentId"] == "child"
+        assert response["runId"] == "run-1"
+        assert response["transcriptBoundary"] == "turn-1"
+        assert response["eligibility"] == "eligible"
+        assert response["reasonCodes"] == ["effects_verified_settled", "call-1"]
+        guard.assert_awaited_once_with(
+            "child",
+            "run-1",
+            "turn-1",
+            [EffectVerification(tool_call_id="call-1", disposition="settled")],
+            requester_session_id=parent.session_id,
+        )
     finally:
         await session.close()
 

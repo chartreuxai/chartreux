@@ -15,12 +15,17 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from http import HTTPStatus
 import json
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from chartreux.core.llm.failures import FailureInfo, classify_failure
+from chartreux.core.llm.failures import (
+    FailureCategory,
+    FailureInfo,
+    classify_failure,
+    classify_failure_fresh,
+)
 from chartreux.core.llm_models import AvailableTool, LLMMessage, StrToolChoice
 from chartreux.utils.api_keys import ApiKeyOrigin
 
@@ -79,6 +84,16 @@ class ModelCall:
 
 
 class IncompleteStreamError(RuntimeError):
+    """The provider's stream ended without a finish reason.
+
+    Typed transient (WP1): the classifier reads this marker so the measured
+    provenance — a truncated stream, not a connection failure and not an
+    unknown — survives wrapping and reaches the recovery layer's
+    eligible_classes without log parsing.
+    """
+
+    failure_category: ClassVar[FailureCategory] = FailureCategory.INCOMPLETE_STREAM
+
     def __init__(self, provider: str, model: str) -> None:
         self.provider = provider
         self.model = model
@@ -88,7 +103,7 @@ class IncompleteStreamError(RuntimeError):
 
 
 class BackendError(RuntimeError):
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         provider: str,
@@ -101,6 +116,7 @@ class BackendError(RuntimeError):
         model: str,
         payload_summary: PayloadSummary,
         api_key_origin: ApiKeyOrigin | None = None,
+        failure_info: FailureInfo | None = None,
     ) -> None:
         self.provider = provider
         self.endpoint = endpoint
@@ -112,8 +128,24 @@ class BackendError(RuntimeError):
         self.model = model
         self.payload_summary = payload_summary
         self.api_key_origin = api_key_origin
-        self.failure_info: FailureInfo = classify_failure(self)
+        # D2: classification is LAZY (or explicitly overridden by the builder
+        # from the underlying transport error). The former eager
+        # construction-time classification froze a status=None request error
+        # BEFORE callers attached the HTTPX cause with ``raise ... from``,
+        # so a wrapped READ TIMEOUT was recorded as a plain CONNECTION and
+        # lost its timeout subtype and retry semantics.
+        self._failure_info_override = failure_info
+        self._failure_info_cache: FailureInfo | None = None
         super().__init__(self._fmt())
+
+    @property
+    def failure_info(self) -> FailureInfo:
+        """The classified failure info, computed lazily on first access."""
+        if self._failure_info_override is not None:
+            return self._failure_info_override
+        if self._failure_info_cache is None:
+            self._failure_info_cache = classify_failure_fresh(self)
+        return self._failure_info_cache
 
     @property
     def is_context_too_long(self) -> bool:
@@ -289,6 +321,10 @@ class BackendErrorBuilder:
         has_tools: bool,
         tool_choice: StrToolChoice | AvailableTool | None,
     ) -> BackendError:
+        # D2: the original transport subtype is preserved through
+        # construction — classify the underlying HTTPX error here so the
+        # wrapped READ TIMEOUT keeps its timeout classification (and its
+        # retry semantics) even before the caller's ``raise ... from``.
         return BackendError(
             provider=provider,
             endpoint=endpoint,
@@ -301,6 +337,7 @@ class BackendErrorBuilder:
             payload_summary=cls._payload_summary(
                 model, messages, temperature, has_tools, tool_choice
             ),
+            failure_info=classify_failure(error),
         )
 
     @staticmethod

@@ -14,6 +14,7 @@ from chartreux.app_server.models import (
     MCPSourceSummary,
     PublicEntryGenerationStatus,
     PublicQueuedTurn,
+    PublicRecoveryEligibility,
     PublicRetryCategory,
     PublicRetryState,
     PublicSession,
@@ -35,8 +36,12 @@ from chartreux.app_server.protocol import (
     AgentEvictionModel,
     AgentsCancelParams,
     AgentsCancelResponse,
+    AgentsReconcileParams,
+    AgentsReconcileResponse,
     AgentsReleaseParams,
     AgentsReleaseResponse,
+    AgentsResumeParams,
+    AgentsResumeResponse,
     AgentSummaryModel,
     AgentsUpdateParams,
     AgentTranscriptEntry,
@@ -55,7 +60,15 @@ from chartreux.app_server.protocol import (
     MCPToggleParams,
     MessageAnnotations,
     PageRequest,
+    ReconcileOutcome,
     ReleaseOutcome,
+    ResumeOutcome,
+    RootRecoveryAdmitParams,
+    RootRecoveryAdmitResponse,
+    RootRecoveryCancelParams,
+    RootRecoveryCancelResponse,
+    RootRecoveryScheduleParams,
+    RootRecoveryScheduleResponse,
     SessionContinueResponse,
     SessionEmbeddedResourceContentBlock,
     SessionForkResponse,
@@ -85,6 +98,7 @@ from chartreux.app_server.protocol import (
     UsageReadParams,
     UsageReadResponse,
     UsageUpdatedParams,
+    VerifiedEffectWire,
     server_notification_registry,
     validate_notification_method,
 )
@@ -387,6 +401,172 @@ def test_agents_release_rejects_unknown_response_outcome() -> None:
         validate_wire(AgentsReleaseResponse, {"outcome": "purged"})
     with pytest.raises(ValidationError):
         validate_wire(AgentsReleaseResponse, {"outcome": "released", "extra": True})
+
+
+@pytest.mark.parametrize("outcome", list(ResumeOutcome))
+def test_agents_resume_public_wire_contract(outcome: ResumeOutcome) -> None:
+    """WP2: the explicit resume route's public wire contract."""
+    assert "agents/resume" in SERVER_METHODS
+    params = validate_wire(
+        AgentsResumeParams, {"agentId": "agent", "expectedRunId": "run"}
+    )
+    assert params.idempotency_key is None
+    params = validate_wire(
+        AgentsResumeParams,
+        {"agentId": "agent", "expectedRunId": "run", "idempotencyKey": "key"},
+    )
+    assert params.model_dump(mode="json") == {
+        "agentId": "agent",
+        "expectedRunId": "run",
+        "idempotencyKey": "key",
+    }
+    wire = {
+        "outcome": outcome.value,
+        "agentId": "agent",
+        "runId": "run",
+        "successorRunId": "run-2",
+        "recoveryOperationId": "resume-op:agent:run-2",
+        "retryAt": 1.5,
+        "eligibility": "eligible",
+        "reasonCodes": ["transient_cause"],
+        "reason": "why",
+        "sameAgentResumesUsed": 1,
+    }
+    response = validate_wire(AgentsResumeResponse, wire)
+    assert response.outcome is outcome
+    assert response.eligibility is PublicRecoveryEligibility.ELIGIBLE
+    assert response.model_dump(mode="json") == wire
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        {},
+        {"agent_id": "a"},
+        {"agentId": ""},
+        {"agentId": 1},
+        {"agentId": "a"},
+        {"agentId": "a", "expectedRunId": ""},
+        {"agentId": "a", "expected_run_id": "r"},
+        {"agentId": "a", "expectedRunId": "r", "idempotency_key": "k"},
+        {"agentId": "a", "expectedRunId": "r", "extra": True},
+    ],
+)
+def test_agents_resume_rejects_invalid_wire_params(wire: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(AgentsResumeParams, wire)
+
+
+def test_agents_resume_rejects_unknown_response_outcome() -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(AgentsResumeResponse, {"outcome": "resumed"})
+    with pytest.raises(ValidationError):
+        validate_wire(AgentsResumeResponse, {"outcome": "scheduled", "extra": True})
+
+
+@pytest.mark.parametrize("outcome", list(ReconcileOutcome))
+def test_agents_reconcile_public_wire_contract(outcome: ReconcileOutcome) -> None:
+    """WP2: the reconcile barrier route's public wire contract."""
+    assert "agents/reconcile" in SERVER_METHODS
+    params = validate_wire(
+        AgentsReconcileParams,
+        {
+            "agentId": "agent",
+            "expectedRunId": "run",
+            "transcriptBoundary": "turn-1",
+            "verifiedEffects": [
+                {"toolCallId": "call-1", "disposition": "settled", "note": "checked"}
+            ],
+        },
+    )
+    assert params.verified_effects[0].tool_call_id == "call-1"
+    assert params.verified_effects[0].note == "checked"
+    wire = {
+        "outcome": outcome.value,
+        "agentId": "agent",
+        "runId": "run",
+        "transcriptBoundary": "turn-1",
+        "eligibility": "prohibited",
+        "reasonCodes": ["verified_unrepeatable_damage", "call-1"],
+        "reason": "why",
+    }
+    response = validate_wire(AgentsReconcileResponse, wire)
+    assert response.outcome is outcome
+    assert response.eligibility is PublicRecoveryEligibility.PROHIBITED
+    assert response.model_dump(mode="json") == wire
+
+
+@pytest.mark.parametrize(
+    "wire",
+    [
+        {},
+        {"agent_id": "a"},
+        {"agentId": ""},
+        {"agentId": 1},
+        {"agentId": "a"},
+        {"agentId": "a", "expectedRunId": "r"},
+        {"agentId": "a", "expectedRunId": "r", "transcriptBoundary": ""},
+        {"agentId": "a", "expectedRunId": "r", "transcript_boundary": "t"},
+        {"agentId": "a", "expectedRunId": "r", "transcriptBoundary": "t"},
+        {
+            "agentId": "a",
+            "expectedRunId": "r",
+            "transcriptBoundary": "t",
+            "verifiedEffects": [{"toolCallId": "c", "disposition": "guessed"}],
+        },
+        {
+            "agentId": "a",
+            "expectedRunId": "r",
+            "transcriptBoundary": "t",
+            "verifiedEffects": [{"tool_call_id": "c", "disposition": "settled"}],
+        },
+        {"agentId": "a", "expectedRunId": "r", "transcriptBoundary": "t", "extra": 1},
+    ],
+)
+def test_agents_reconcile_rejects_invalid_wire_params(wire: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(AgentsReconcileParams, wire)
+
+
+def test_agents_reconcile_accepts_the_zero_entry_submission() -> None:
+    """Round-2 V4: the public wire port accepts the complete zero-entry
+    accounting — one verified_effects entry per unknown tool call, so a
+    failed run that left no tool call outstanding submits an EMPTY list
+    (the internal barrier already clears on it; the port no longer
+    rejects it, which leaves the no-calls barrier publicly clearable).
+
+    FAILS pre-fix: AgentsReconcileParams enforced min_length=1, so the
+    zero-entry wire was rejected with a ValidationError.
+    """
+    params = validate_wire(
+        AgentsReconcileParams,
+        {
+            "agentId": "agent",
+            "expectedRunId": "run",
+            "transcriptBoundary": "turn-1",
+            "verifiedEffects": [],
+        },
+    )
+    assert params.verified_effects == []
+
+
+def test_agents_reconcile_rejects_unknown_response_outcome() -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(AgentsReconcileResponse, {"outcome": "reconciled"})
+    with pytest.raises(ValidationError):
+        validate_wire(AgentsReconcileResponse, {"outcome": "cleared", "extra": True})
+
+
+def test_verified_effect_wire_rejects_invalid_dispositions() -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(VerifiedEffectWire, {"toolCallId": "c", "disposition": "maybe"})
+    with pytest.raises(ValidationError):
+        validate_wire(VerifiedEffectWire, {"toolCallId": "", "disposition": "settled"})
+    with pytest.raises(ValidationError):
+        validate_wire(
+            VerifiedEffectWire,
+            {"toolCallId": "c", "disposition": "settled", "extra": True},
+        )
 
 
 def _turn_queue() -> PublicTurnQueue:
@@ -1054,6 +1234,15 @@ def test_agents_update_carries_retention_metadata() -> None:
         "activeProvider": "test-provider",
         "effectiveThinking": "high",
         "resultExpired": True,
+        "lastFailure": None,
+        # WP2: the warm-recovery summary fields default to None (no barrier).
+        "recoveryChainId": None,
+        "sameAgentResumesUsed": None,
+        "resumedFromRunId": None,
+        "recoveryEligibility": None,
+        # WP5: the predecessor/package lineage pair defaults to None.
+        "workPackageId": None,
+        "predecessorAgentId": None,
     }
     assert update.model_dump(mode="json")["evictions"][0]["reason"] == "ttl"
 
@@ -1078,6 +1267,221 @@ def test_agent_context_contract_accepts_older_wire_payloads() -> None:
     }
     dump = validate_wire(AgentSummaryModel, current).model_dump(mode="json")
     assert {key: dump[key] for key in current} == current
+    # WP1: legacy wire payloads without lastFailure still validate.
+    assert summary.last_failure is None
+
+
+def test_agents_update_carries_last_failure_envelope() -> None:
+    """WP1: the agents/update projection carries the latest failed run's
+    public typed failure envelope; wire round trips preserve it.
+    """
+    from chartreux.app_server.models import (
+        PublicFailureEnvelope,
+        PublicRecoveryEligibility,
+    )
+    from chartreux.core.recovery_models import build_failure_envelope
+
+    envelope = build_failure_envelope(
+        observation=None, agent_id="agent-1", run_id="run-1"
+    )
+    assert envelope.recovery.eligibility.value == "prohibited"
+    # The server boundary projects the canonical core envelope onto the
+    # public wire model (the public layer cannot import core models).
+    wire_envelope = PublicFailureEnvelope.model_validate(
+        envelope.model_dump(mode="json", by_alias=True)
+    )
+    update = AgentsUpdateParams(
+        event_id=1,
+        session_id="session-1",
+        emitted_at=2,
+        agents=[
+            AgentSummaryModel(
+                agent_id="agent-1",
+                profile="worker",
+                name="worker-base-1",
+                availability="idle",
+                last_failure=wire_envelope,
+            )
+        ],
+    )
+    # The production wire path serializes with by_alias=True (dump_model /
+    # the notification dispatch), so the envelope's "class" alias round-trips.
+    wire = update.model_dump(mode="json", by_alias=True)
+    assert wire["agents"][0]["lastFailure"]["event_id"] == envelope.event_id
+    assert wire["agents"][0]["lastFailure"]["failure"]["class"] == "unknown"
+    restored = validate_wire(AgentsUpdateParams, wire)
+    assert restored.agents[0].last_failure is not None
+    assert restored.agents[0].last_failure.event_id == envelope.event_id
+    assert (
+        restored.agents[0].last_failure.recovery.eligibility
+        is PublicRecoveryEligibility.PROHIBITED
+    )
+
+
+def test_public_failure_envelope_mirrors_the_core_schema() -> None:
+    """WP1 boundary: the public wire envelope mirrors the canonical core
+    envelope field-for-field (one §1.7 schema, two spellings), so the
+    server-boundary projection cannot silently drop or rename evidence.
+    """
+    from chartreux.app_server.models import (
+        PublicEnvelopeDeployment,
+        PublicEnvelopeFailure,
+        PublicEnvelopeProgress,
+        PublicEnvelopeRecovery,
+        PublicEnvelopeRequest,
+        PublicExhaustionReason,
+        PublicFailureCategory,
+        PublicFailureClass,
+        PublicFailureConfidence,
+        PublicFailureEnvelope,
+        PublicFailurePhase,
+        PublicProgressState,
+        PublicRecoveryEligibility,
+        PublicToolEffectsDisposition,
+    )
+    from chartreux.core import recovery_models as core
+    from chartreux.core.llm.failures import FailureCategory
+
+    model_pairs = [
+        (PublicFailureEnvelope, core.FailureEnvelope),
+        (PublicEnvelopeFailure, core.EnvelopeFailure),
+        (PublicEnvelopeDeployment, core.EnvelopeDeployment),
+        (PublicEnvelopeRequest, core.EnvelopeRequest),
+        (PublicEnvelopeProgress, core.EnvelopeProgress),
+        (PublicEnvelopeRecovery, core.EnvelopeRecovery),
+    ]
+    for public_model, core_model in model_pairs:
+        assert set(public_model.model_fields) == set(core_model.model_fields), (
+            core_model.__name__
+        )
+
+    enum_pairs = [
+        (PublicFailureClass, core.FailureClass),
+        (PublicFailureCategory, FailureCategory),
+        (PublicFailurePhase, core.FailurePhase),
+        (PublicFailureConfidence, core.FailureConfidence),
+        (PublicProgressState, core.ProgressState),
+        (PublicToolEffectsDisposition, core.ToolEffectsDisposition),
+        (PublicRecoveryEligibility, core.RecoveryEligibility),
+        (PublicExhaustionReason, core.ExhaustionReason),
+    ]
+    for public_enum, core_enum in enum_pairs:
+        assert {item.value for item in public_enum} == {
+            item.value for item in core_enum
+        }, core_enum.__name__
+
+    # The failure block's wire spelling ("class") is identical on both sides.
+    for model in (PublicEnvelopeFailure, core.EnvelopeFailure):
+        field = model.model_fields["failure_class"]
+        assert field.serialization_alias == "class"
+        assert field.validation_alias == "class"
+
+    # A fully populated core envelope projects losslessly: the wire dump of
+    # the projected envelope equals the core dump byte-for-byte.
+    envelope = core.FailureEnvelope(
+        event_id="event-1",
+        agent_id="agent-1",
+        run_id="run-1",
+        work_package_id="wp-1",
+        # WP5: the lineage pair mirrors field-for-field with a populated value.
+        predecessor_agent_id="agent-0",
+        recovery_chain_id="chain-1",
+        observed_at=1_700_000_000.0,
+        failure=core.EnvelopeFailure(
+            failure_class=core.FailureClass.LAUNCH_FAILURE,
+            cause_category=FailureCategory.TIMEOUT,
+            phase=core.FailurePhase.ADMISSION,
+            exception_type="ReadTimeout",
+            message="bounded",
+            confidence=core.FailureConfidence.MEASURED,
+            evidence_codes=["admission_phase"],
+            fingerprint="fp",
+            classification_version=core.CLASSIFICATION_VERSION,
+            classification_provenance="measured at admission",
+            diagnostics_state="captured",
+        ),
+        deployment=core.EnvelopeDeployment(
+            configured_model="cfg",
+            base_model="base",
+            provider="prov",
+            wire_name="wire",
+            endpoint="api.example.test",
+        ),
+        request=core.EnvelopeRequest(
+            logical_call_id="call-1",
+            transport_attempts=0,
+            elapsed_seconds=1.5,
+            retry_budget_seconds=900.0,
+            exhaustion=core.ExhaustionReason.DEADLINE,
+            request_id="req-1",
+            request_state="finished",
+            retry_after_seconds=2.0,
+            response_started=False,
+            semantic_output_published=False,
+        ),
+        progress=core.EnvelopeProgress(
+            turns_used=3,
+            state=core.ProgressState.CHECKPOINTED,
+            checkpoint_ref="ckpt",
+            transcript_boundary="turn-7",
+            touched_paths_hint=["a.py"],
+            artifact_refs=["artifact-1"],
+            tool_effects=core.ToolEffectsDisposition.SETTLED,
+            last_progress_at=1_700_000_001.0,
+        ),
+        recovery=core.EnvelopeRecovery(
+            eligibility=core.RecoveryEligibility.ELIGIBLE,
+            reason_codes=["transient_cause"],
+            same_agent_resumes_used=1,
+            expires_at=1_700_000_500.0,
+        ),
+    )
+    projected = PublicFailureEnvelope.model_validate(
+        envelope.model_dump(mode="json", by_alias=True)
+    )
+    assert projected.model_dump(mode="json", by_alias=True) == envelope.model_dump(
+        mode="json", by_alias=True
+    )
+
+
+def test_task_result_wire_contract_carries_failure_evidence() -> None:
+    """WP1: TaskResult carries run_status + the typed failure envelope and
+    the compact recovery reference; legacy payloads stay valid.
+    """
+    from chartreux.core.recovery_models import RecoveryReference, build_failure_envelope
+    from chartreux.core.subagents import RunStatus, TaskResult
+
+    envelope = build_failure_envelope(
+        observation=None, agent_id="agent-1", run_id="run-1"
+    )
+    result = TaskResult(
+        response="failed",
+        turns_used=1,
+        completed=False,
+        agent_id="agent-1",
+        run_id="run-1",
+        run_status=RunStatus.FAILED,
+        failure=envelope,
+        recovery=RecoveryReference.from_envelope(envelope),
+    )
+    wire = result.model_dump(mode="json")
+    assert wire["failure"]["event_id"] == envelope.event_id
+    assert wire["run_status"] == "failed"
+    restored = TaskResult.model_validate(wire)
+    assert restored.failure is not None
+    assert restored.failure.event_id == envelope.event_id
+    assert restored.recovery is not None
+    assert restored.recovery.recovery_chain_id == envelope.recovery_chain_id
+    assert restored.run_status is RunStatus.FAILED
+
+    legacy = TaskResult.model_validate({
+        "response": "done",
+        "turns_used": 1,
+        "completed": True,
+    })
+    assert legacy.failure is None
+    assert legacy.recovery is None
+    assert legacy.run_status is None
 
 
 @pytest.mark.parametrize(
@@ -1170,3 +1574,139 @@ def test_posting_times_are_optional_and_independent_of_lifecycle_ordinals() -> N
             dump["createdAt"] == old["createdAt"]
             and dump["updatedAt"] == old["updatedAt"]
         )
+
+
+def test_root_recovery_wire_methods_are_registered() -> None:
+    # R2: the app-server gate's wire surface is registered so the server
+    # accepts the methods (the handler routes them; SERVER_METHODS is the
+    # first gate a request passes).
+    assert "recovery/root/schedule" in SERVER_METHODS
+    assert "recovery/root/admit" in SERVER_METHODS
+    assert "recovery/root/cancel" in SERVER_METHODS
+
+
+def test_root_recovery_schedule_wire_contract() -> None:
+    params = validate_wire(
+        RootRecoveryScheduleParams,
+        {
+            "sessionId": "s",
+            "terminalTurnId": "t",
+            "solicited": True,
+            "inputGeneration": 3,
+        },
+    )
+    assert params.model_dump(mode="json", exclude_none=True) == {
+        "sessionId": "s",
+        "terminalTurnId": "t",
+        "solicited": True,
+        "inputGeneration": 3,
+    }
+    response = validate_wire(
+        RootRecoveryScheduleResponse,
+        {
+            "decision": "scheduled",
+            "episodeId": "root-auto-t",
+            "idempotencyKey": "root-auto-recovery:root-auto-t:1",
+            "attempt": 1,
+            "limit": 2,
+            "delaySeconds": 30.0,
+            "eligibleClass": "timeout",
+            "affectedDeployment": "test-first/first",
+        },
+    )
+    assert response.decision == "scheduled"
+    assert response.episode_id == "root-auto-t"
+    assert response.idempotency_key == "root-auto-recovery:root-auto-t:1"
+    assert response.delay_seconds == 30.0
+    # A declined decision carries the reason and no episode identity.
+    declined = validate_wire(
+        RootRecoveryScheduleResponse, {"decision": "declined", "reason": "disabled"}
+    )
+    assert declined.decision == "declined"
+    assert declined.reason == "disabled"
+    assert declined.episode_id is None
+    assert declined.idempotency_key is None
+
+
+def test_root_recovery_schedule_rejects_invalid_wire() -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(RootRecoveryScheduleParams, {"sessionId": "s"})
+    with pytest.raises(ValidationError):
+        validate_wire(
+            RootRecoveryScheduleParams,
+            {"sessionId": "s", "terminalTurnId": "t", "extra": 1},
+        )
+    with pytest.raises(ValidationError):
+        validate_wire(RootRecoveryScheduleResponse, {"decision": "maybe"})
+    with pytest.raises(ValidationError):
+        validate_wire(
+            RootRecoveryScheduleResponse,
+            {"decision": "scheduled", "delaySeconds": "soon"},
+        )
+
+
+def test_root_recovery_admit_wire_contract() -> None:
+    params = validate_wire(
+        RootRecoveryAdmitParams,
+        {
+            "sessionId": "s",
+            "episodeId": "root-auto-t",
+            "idempotencyKey": "root-auto-recovery:root-auto-t:1",
+            "terminalTurnId": "t",
+            "inputGeneration": 3,
+        },
+    )
+    assert params.input_generation == 3
+    admitted = validate_wire(
+        RootRecoveryAdmitResponse,
+        {"decision": "admitted", "attempt": 1, "limit": 2, "predecessorTurnId": "t"},
+    )
+    assert admitted.decision == "admitted"
+    assert admitted.turn_id is None
+    deferred = validate_wire(
+        RootRecoveryAdmitResponse,
+        {"decision": "deferred", "attempt": 1, "limit": 2, "delaySeconds": 1.0},
+    )
+    assert deferred.delay_seconds == 1.0
+    reconciled = validate_wire(
+        RootRecoveryAdmitResponse,
+        {
+            "decision": "already_admitted",
+            "attempt": 1,
+            "limit": 2,
+            "turnId": "t2",
+            "predecessorTurnId": "t",
+        },
+    )
+    assert reconciled.turn_id == "t2"
+
+
+def test_root_recovery_admit_rejects_invalid_wire() -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(RootRecoveryAdmitParams, {"sessionId": "s", "episodeId": "e"})
+    with pytest.raises(ValidationError):
+        validate_wire(RootRecoveryAdmitResponse, {"decision": "perhaps"})
+    with pytest.raises(ValidationError):
+        validate_wire(
+            RootRecoveryAdmitResponse,
+            {"decision": "admitted", "attempt": 1, "limit": 2, "delaySeconds": "soon"},
+        )
+
+
+def test_root_recovery_cancel_wire_contract() -> None:
+    params = validate_wire(
+        RootRecoveryCancelParams,
+        {"sessionId": "s", "episodeId": "e", "reason": "user_input"},
+    )
+    assert params.reason == "user_input"
+    assert params.model_dump(mode="json", exclude_none=True) == {
+        "sessionId": "s",
+        "episodeId": "e",
+        "reason": "user_input",
+    }
+    response = validate_wire(RootRecoveryCancelResponse, {"cancelled": False})
+    assert response.cancelled is False
+    with pytest.raises(ValidationError):
+        validate_wire(RootRecoveryCancelParams, {"sessionId": "s"})
+    with pytest.raises(ValidationError):
+        validate_wire(RootRecoveryCancelResponse, {"cancelled": "maybe"})

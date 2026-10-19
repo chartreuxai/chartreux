@@ -13,6 +13,7 @@ from chartreux.app_server.protocol import (
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.dangerous_commands import DangerousCommandAuthority, RepositoryScope
 from chartreux.core.llm_models import LLMMessage
+from chartreux.core.recovery_models import FailureEnvelope, PackageTier
 from chartreux.core.session_types import ChildSessionLink
 from chartreux.core.subagents import (
     AgentAvailability,
@@ -46,6 +47,11 @@ class _AgentState(enum.StrEnum):
     FINALIZING = "finalizing"
     IDLE = "idle"
     EVICTING = "evicting"
+    # WP2 (handoff §1.2/§1.8): a recoverable failure suspends the record —
+    # warm, resident, explicitly resumable — instead of closing it; an
+    # admitted resume restores it until the successor run starts.
+    SUSPENDED = "suspended"
+    RESTORING = "restoring"
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +82,13 @@ class RunRecord:
     stop_reason: RunStopReason | None = None
     requested_stop_reason: RunStopReason | None = None
     initial_turn_id: str | None = None
+    # Canonical store of the run's public typed failure envelope (WP1), so
+    # the summary's last_failure survives result expiry. None = no envelope.
+    failure: FailureEnvelope | None = None
+    # WP2 resume linkage: the failed run this run resumed from, and the
+    # stable recovery-chain identity carried across the episode.
+    resumed_from_run_id: str | None = None
+    recovery_chain_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -110,6 +123,32 @@ class AgentRecord:
     replacement_owner: _ReplacementClaim | None = None
     work_slot: _ActiveWorkSlot | None = None
     first_admitted_at: float | None = None
+    # WP2 recovery bookkeeping (handoff §1.2/§1.4/§1.8): the stable
+    # recovery-chain identity, the same-agent resume budget counter, the
+    # single-flight resume operation, and the reconciliation state of the
+    # suspended barrier. The published failure envelope stays immutable;
+    # reconcile flips the EFFECTIVE eligibility tracked here.
+    recovery_chain_id: str | None = None
+    same_agent_resumes_used: int = 0
+    suspended_at: float | None = None
+    # WP3 warm-suspension byte accounting (handoff §1.5): the deterministic
+    # estimated size of the live conversation captured when the record
+    # suspends; None while the record is not holding a suspended warm
+    # conversation. Counted toward ``recovery.max_suspended_bytes`` while the
+    # record is SUSPENDED or RESTORING.
+    suspended_warm_bytes: int | None = None
+    pending_resume: _ResumeOperation | None = None
+    reconcile_outcome: str | None = None
+    reconcile_reason_codes: list[str] = field(default_factory=list)
+    last_reconciled: tuple[str, str] | None = None
+    recovery_superseded: bool = False
+    # WP5 failure-time replacement lineage: the orchestrator work-package
+    # identity claimed at launch, the failed agent this agent replaced (a
+    # replacement gets a NEW agent_id carrying the predecessor/package
+    # lineage), and the claimed package tier (None = not claimed).
+    work_package_id: str | None = None
+    predecessor_agent_id: str | None = None
+    package_tier: PackageTier | None = None
 
     def effective_idle_ttl(self, global_ttl: int | float) -> int | float:
         return (
@@ -122,6 +161,10 @@ class AgentRecord:
             return AgentAvailability.RUNNING
         if self.state is _AgentState.FINALIZING:
             return AgentAvailability.FINALIZING
+        if self.state is _AgentState.SUSPENDED:
+            return AgentAvailability.SUSPENDED
+        if self.state is _AgentState.RESTORING:
+            return AgentAvailability.RESTORING
         return AgentAvailability.IDLE
 
     @availability.setter
@@ -129,8 +172,48 @@ class AgentRecord:
         self.state = (
             _AgentState.RUNNING
             if value is AgentAvailability.RUNNING
+            else _AgentState.SUSPENDED
+            if value is AgentAvailability.SUSPENDED
+            else _AgentState.RESTORING
+            if value is AgentAvailability.RESTORING
             else _AgentState.IDLE
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _ResumeOperation:
+    """One in-flight or admitted resume admission (single-flight, run-pinned).
+
+    The operation id deduplicates concurrent same-key calls; the successor
+    run id is published on admission so waiters and the summary can
+    correlate the successor without mutating the failed run.
+    """
+
+    operation_id: str
+    agent_id: str
+    expected_run_id: str
+    idempotency_key: str
+    successor_run_id: str
+    admitted_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ResumeAdmission:
+    """A checked resume admission handed from the locked check to execution.
+
+    Carries the exact record, the pinned failed run, the single-flight
+    operation, the owning parent and its identity, the pre-allocated
+    successor run id (published on admission), and the resume-budget
+    counter to restore if the admission rolls back.
+    """
+
+    record: AgentRecord
+    failed_run: RunRecord
+    operation: _ResumeOperation
+    parent: SessionRuntime
+    parent_identity: tuple[str, int]
+    successor_run_id: str
+    resumes_used_before: int
 
 
 @dataclass(frozen=True, slots=True)

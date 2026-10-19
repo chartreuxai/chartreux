@@ -349,6 +349,8 @@ def test_background_subagent_handle_types() -> None:
         "idle",
         "evicted",
         "closed",
+        "suspended",
+        "restoring",
     ]
     summary = AgentSummary(
         agent_id="agent-1",

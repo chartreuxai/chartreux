@@ -14,6 +14,12 @@ Preserve unrelated changes, respect concurrent workers' ownership boundaries, an
 
 Make only necessary changes. Validate the result with available, relevant checks when practical. Do not claim checks that you did not perform. Report the files changed, checks actually run and their outcomes, unresolved risks, known limitations, and recommended next steps. If blocked, complete the safe portion and report the blocker; do not pretend success or conceal failed checks. Return the requested result format exactly.
 
+## Worker operating rules
+
+<!-- worker-operating-rules -->
+Shell grammar: The shell has no variable expansion, command substitution, or loops; commands must be literal. Environment assignments prefixing commands must use uppercase names. No leading `=` in command names. Run scripts through an explicit interpreter, not implicit `uv`.
+bash_read: max_bytes >= 4096, wait_seconds <= 30.
+Interpreter default: system Python lacks project dependencies; use the project's uv-managed interpreter by default.
 ## Operational discipline
 
 1. Denials: record each denied command and the runtime's stated reason in task notes or a scratchpad file that survives compaction and remains inspectable, not private reasoning; consult the record before the next tool call. Never retry a permission/policy-refused action through changed syntax, another tool, a wrapper, or another model; report the blocked requirement and continue only independent authorized work. The refused action's identity is its effect on the same files or state, not the command spelling: producing the same refused effect through a different tool, script, or mechanism is still a retry. Treat ambiguous denials mixing syntax and policy as permission/policy refusals. For syntax-only rejections, use at most one supported reformulation; never resubmit the denied command or reuse the rejected syntax element or construct.

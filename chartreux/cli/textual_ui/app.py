@@ -36,7 +36,7 @@ from textual.events import (
 from textual.screen import Screen
 from textual.timer import Timer
 from textual.widget import Widget
-from textual.widgets import Static
+from textual.widgets import Static, TextArea
 from textual.worker import Worker, WorkerError, WorkerFailed, WorkerState
 
 from chartreux import __version__ as CORE_VERSION
@@ -123,6 +123,7 @@ from chartreux.cli.textual_ui.provider_services import (
     persist_api_key_for_provider as persist_api_key_for_provider,
 )
 from chartreux.cli.textual_ui.quit_manager import QuitConfirmKey, QuitManager
+from chartreux.cli.textual_ui.root_recovery import RootRecoveryController
 from chartreux.cli.textual_ui.scheduled_loop_runner import ScheduledLoopCommands
 from chartreux.cli.textual_ui.session_flow import (
     SessionFlowController,
@@ -182,6 +183,7 @@ from chartreux.cli.textual_ui.widgets.messages import (
     AssistantMessage,
     CustomToolsDeprecationMessage,
     ErrorMessage,
+    ErrorRetryRequested,
     PlanFileMessage,
     ReasoningMessage,
     SlashCommandMessage,
@@ -578,6 +580,12 @@ class ChartreuxApp(App):  # noqa: PLR0904
         Binding(
             "ctrl+shift+a", "toggle_agent_browser", "Background Agents", show=False
         ),
+        # R1 (plan v0.5.6-recovery): the keyboard path of the "Retry — new
+        # turn" affordance. The chat input's focus policy reclaims focus from
+        # transcript widgets, so the displayed button is pointer-activated and
+        # this binding is the keyboard path; both invoke the EXISTING retry
+        # operation, gated exactly like the /retry command.
+        Binding("ctrl+r", "retry_turn", "Retry turn", show=False),
     ]
 
     _main_ui_mounted: bool = False
@@ -836,6 +844,17 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._side_channel = SideChannelController(
             SideChannelPorts(invoke_command=self._invoke_resolved_command)
         )
+        # R2/OD3: the TUI half of bounded automatic root-turn recovery — an
+        # in-process timer owning local cancellation via the input-generation
+        # token (the app-server gate owns the authoritative decisions). The
+        # app binds it late (never constructor-captured), like the turn
+        # supervisor.
+        self._root_recovery = RootRecoveryController()
+        self._root_recovery._bind_app(self)
+        # Bumped synchronously on every user input (typing, submission,
+        # question action, manual retry, interrupt); a pending automatic
+        # continuation is invalidated when it moves.
+        self._input_generation = 0
 
     def _agent_job_active(self) -> bool:
         return self._turn_supervisor.agent_job_active()
@@ -1486,6 +1505,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
 
     def on_unmount(self) -> None:
+        # R2/OD3: app shutdown cancels the local recovery timer and drops
+        # its references (an admitted successor in flight settles via normal
+        # interruption rules — never cancelled as rollback).
+        self._root_recovery.shutdown()
         if self._diagnostic_heartbeat_timer is not None:
             self._diagnostic_heartbeat_timer.stop()
             self._diagnostic_heartbeat_timer = None
@@ -1846,7 +1869,24 @@ class ChartreuxApp(App):  # noqa: PLR0904
     ) -> None:
         await self._submit_or_defer(event.value)
 
+    def _invalidate_user_input(self) -> None:
+        # R2/OD3: the input-generation token behind the bounded automatic
+        # root-turn recovery schedule. Bumped synchronously on every user
+        # input action (typing, submission, question action, manual retry,
+        # interrupt, session change); a pending automatic continuation is
+        # cancelled when it moves — the user took over, so no unattended
+        # turn is admitted.
+        self._input_generation += 1
+        self._root_recovery.cancel_local(reason="user_input")
+
+    def on_text_area_changed(self, _event: TextArea.Changed) -> None:
+        # Typing is user input: invalidate any pending automatic continuation
+        # synchronously (the generation token's primary half). ChatTextArea
+        # does not stop this message, so the app observes every edit.
+        self._invalidate_user_input()
+
     async def _submit_or_defer(self, raw_value: str) -> None:
+        self._invalidate_user_input()
         await self._turn_supervisor.submit_or_defer(raw_value)
 
     async def _dispatch_submitted_value(self, raw_value: str) -> None:
@@ -2161,10 +2201,38 @@ class ChartreuxApp(App):  # noqa: PLR0904
         )
 
     async def on_question_app_answered(self, message: QuestionApp.Answered) -> None:
+        # R2/OD3: a question action is user input — invalidate any pending
+        # automatic continuation before the answer flows.
+        self._invalidate_user_input()
         await self._turn_supervisor.question_answered(message)
 
     async def on_question_app_cancelled(self, message: QuestionApp.Cancelled) -> None:
+        self._invalidate_user_input()
         await self._turn_supervisor.question_cancelled(message)
+
+    async def on_question_app_keep_waiting(
+        self, message: QuestionApp.KeepWaiting
+    ) -> None:
+        self._invalidate_user_input()
+        await self._turn_supervisor.question_keep_waiting(message)
+
+    async def on_error_retry_requested(self, _: ErrorRetryRequested) -> None:
+        # R1 (plan v0.5.6-recovery): the "Retry — new turn" affordance on a
+        # terminal retryable root failure invokes the EXISTING retry operation
+        # — one injected new turn with the user-initiated cooldown reset —
+        # never resume_agent, never an automatic continuation. The operation
+        # self-gates: no retry action while stopping, active execution, or an
+        # unresolved runtime approval is present.
+        await self._retry()
+
+    async def action_retry_turn(self) -> None:
+        # R1: the keyboard path (Ctrl+R) of the "Retry — new turn" affordance.
+        # Gated exactly like the /retry command (a retry presentation is
+        # offered and not yet active), then invokes the EXISTING retry
+        # operation — never resume_agent, never automatic.
+        if not self._command_context().retry_available:
+            return
+        await self._retry()
 
     async def _remove_loading_widget(self) -> None:
         if self._loading_widget and self._loading_widget.parent:
@@ -2928,6 +2996,17 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._update_context_progress(event)
             return
         entry = _public_entry(event)
+        if (
+            isinstance(event, HistoryEntryUpdated)
+            and isinstance(entry, PublicCallbackEntry)
+            and entry.state.status == "expired"
+        ):
+            # The server expired this question unanswered (plan U/OD1): close
+            # the live question UI, preserve the draft, and continue. The
+            # entry still flows through the generic handler so history shows
+            # the terminal expired state.
+            self._invalidate_user_input()
+            await self._turn_supervisor.question_expired(entry)
         if isinstance(entry, PublicNoticeEntry) and isinstance(
             entry.detail, WaitingForInputNoticeDetail
         ):
@@ -3009,6 +3088,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         injected: bool = False,
         user_initiated_retry: bool = False,
         incomplete_stream_retries: int = 0,
+        idempotency_key: str | None = None,
     ) -> None:
         await self._turn_supervisor.handle_turn(
             prompt,
@@ -3017,13 +3097,14 @@ class ChartreuxApp(App):  # noqa: PLR0904
             injected=injected,
             user_initiated_retry=user_initiated_retry,
             incomplete_stream_retries=incomplete_stream_retries,
+            idempotency_key=idempotency_key,
         )
 
     async def _auto_retry_incomplete_stream(
-        self, incomplete_stream_retries: int
+        self, incomplete_stream_retries: int, *, idempotency_key: str | None = None
     ) -> None:
         await self._turn_supervisor.auto_retry_incomplete_stream(
-            incomplete_stream_retries
+            incomplete_stream_retries, idempotency_key=idempotency_key
         )
 
     async def _retry(
@@ -3033,6 +3114,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
         incomplete_stream_retries: int = 0,
         **_kwargs: Any,
     ) -> None:
+        # R2/OD3: a MANUAL retry is a user-directed new episode — it
+        # invalidates any pending automatic continuation (and keeps its
+        # intentional cooldown reset: it starts a NEW user-directed episode,
+        # never replenishing the automatic one).
+        self._invalidate_user_input()
         await self._turn_supervisor.retry(
             cmd_args,
             command_message=command_message,
@@ -3428,8 +3514,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
                         self._graduation_live_attempts[key], key, attempt_budgeted=True
                     )
                 # Idle (retained) and closed (ephemeral terminal) agents both
-                # end the live attempt; stale keys must not accumulate.
-                if agent.availability in {"idle", "closed"}:
+                # end the live attempt; stale keys must not accumulate. WP2:
+                # a suspended/restoring agent's failed run is terminal too —
+                # the resumed successor is a NEW run identity tracked fresh.
+                if agent.availability in {"idle", "closed", "suspended", "restoring"}:
                     self._graduation_live_attempts.pop(key, None)
 
     def _graduation_models_saved(
@@ -3628,6 +3716,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
         await self._session_flow.on_session_picker_app_cancelled(event)
 
     async def _resume_local_session(self, session_id: str) -> None:
+        # R2/OD3: a session change invalidates any pending automatic
+        # continuation synchronously (the schedule belongs to the old
+        # session's episode; the gate is invalidated server-side too).
+        self._root_recovery.cancel_local(reason="session_changed")
         await self._session_flow.resume_local_session(session_id)
 
     async def _reset_presentation_after_resume(self) -> None:
@@ -3818,6 +3910,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         await self._messages_area.remove_children()
 
     async def _clear_history(self, cmd_args: str = "", **kwargs: Any) -> None:
+        # R2/OD3: clearing starts a NEW session — invalidate any pending
+        # automatic continuation synchronously (session change).
+        self._root_recovery.cancel_local(reason="session_changed")
         await self._request_agent_transcript_close(restore_focus=False)
         old_session_id = self.app_server.session_id
         session_log = self.app_server.resources.runtime.session_log
@@ -4148,6 +4243,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
             pass
 
     def _handle_agent_running_escape(self) -> None:
+        # R2/OD3: an interrupt is user input — invalidate any pending
+        # automatic continuation before the interrupt settles.
+        self._invalidate_user_input()
         self._turn_supervisor.handle_agent_running_escape()
 
     def _begin_interrupt_settle(self) -> None:

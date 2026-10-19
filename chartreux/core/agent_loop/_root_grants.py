@@ -120,8 +120,17 @@ def root_grant_request(root: Path) -> UserQuestionRequest:
 
 
 def parse_root_grant_result(result: BaseModel) -> str:
-    """Map a user answer to a grant decision; anything else fails closed."""
-    if isinstance(result, UserQuestionResult) and not result.cancelled:
+    """Map a user answer to a grant decision; anything else fails closed.
+
+    The parser requires the typed disposition ``answered`` and never inspects
+    declared unattended defaults (plan U/OD1): an unanswered expiry result
+    can never become a grant.
+    """
+    if (
+        isinstance(result, UserQuestionResult)
+        and result.disposition == "answered"
+        and not result.cancelled
+    ):
         for answer in result.answers:
             if answer.answer == ROOT_GRANT_SESSION_LABEL:
                 return ROOT_GRANT_SESSION

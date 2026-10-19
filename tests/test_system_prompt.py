@@ -945,6 +945,157 @@ def test_cli_prompt_uses_ascii_tree_and_arrow_characters() -> None:
     assert "A -> B -> C" in prompt
 
 
+def test_cli_prompt_carries_unattended_resilience_rule() -> None:
+    """WP5: the unattended-resilience rule is in the orchestrator prompt with
+    its greppable marker, right after the asking paragraph it complements
+    (never contradicts): infrastructure/harness failures never ask, genuine
+    authorization decisions still do.
+    """
+    from chartreux.core.recovery_policy import (
+        UNATTENDED_RESILIENCE_MARKER,
+        UNATTENDED_RESILIENCE_RULE,
+    )
+
+    prompt = SystemPrompt.CLI.read()
+
+    # The greppable marker and the rule's core sentences.
+    assert UNATTENDED_RESILIENCE_MARKER in prompt
+    assert "(UNATTENDED-RESILIENCE)" in prompt
+    assert (
+        "never produce a user question mid-run: never call `ask_user_question`"
+        in prompt
+    )
+    assert "Park the failed package and continue independent work" in prompt
+    assert "one consolidated blocker report carrying the resumable state" in prompt
+    assert "Never leave an open interactive question pending mid-run" in prompt
+    # The rule never overrides genuine user questions.
+    assert (
+        "Authorization, scope, safety, and destructive-action decisions remain "
+        "genuine user questions; this rule never overrides them." in prompt
+    )
+    # The deferred-records surfacing is named in the consolidated report.
+    assert "distinguishing deferred preferences from actual blockers" in prompt
+    assert "still-open authorization decisions" in prompt
+    # U's asking paragraph is untouched: both rules coexist.
+    assert "**Asking the user.**" in prompt
+    assert "`requires_user` questions (the default) always wait for an answer" in prompt
+    asking_at = prompt.index("**Asking the user.**")
+    rule_at = prompt.index(UNATTENDED_RESILIENCE_MARKER)
+    assert rule_at > asking_at
+    # The module-level rule sentence matches the prompt's behavior.
+    assert "never produce ask_user_question" in UNATTENDED_RESILIENCE_RULE
+
+
+def test_cli_prompt_carries_failure_time_replacement_policy() -> None:
+    """WP5: the delegation protocol names the failure-time replacement
+    policy: choice at failure time, endpoint independence, luna rejection
+    for substantive packages, the claim shape, and park-and-continue.
+    """
+    prompt = SystemPrompt.CLI.read()
+
+    assert "**Failure-time replacement.**" in prompt
+    assert (
+        "choose its replacement AT FAILURE TIME from the validated eligible set"
+        in prompt
+    )
+    assert (
+        "no dispatch-time substitution table and no automatic cross-model fallback"
+        in prompt
+    )
+    assert "independent of the ATTEMPTED failed endpoint" in prompt
+    assert (
+        "same-endpoint aliases and same-endpoint different-model substitutions are rejected"
+        in prompt
+    )
+    assert (
+        "never route a substantive package to a mechanical-tier (luna-class) model"
+        in prompt
+    )
+    assert "A HEAD/branch/workspace preflight stop stays a stop" in prompt
+    assert "`config.predecessor_agent_id`" in prompt
+    assert "`config.work_package_id`" in prompt
+    assert "`config.package_tier`" in prompt
+    assert "submit `reconcile_result` first" in prompt
+    assert "per-package replacement budget" in prompt
+    assert "milestone notice with its honest cost implication" in prompt
+    assert (
+        "Budgets and recurrence counters span replacements and are never reset"
+        in prompt
+    )
+    assert "park it and continue independent work" in prompt
+    assert "the root orchestrator is never autonomously replaced" in prompt
+
+
+def test_task_prompt_documents_replacement_claim() -> None:
+    """WP5: the task tool prompt documents the cross-model replacement claim
+    shape (NEW agent_id + config lineage) next to the replace_run paragraph.
+    """
+    task = (
+        Path(__file__).parents[1] / "chartreux/core/tools/builtins/prompts/task.md"
+    ).read_text()
+
+    assert "For a cross-model replacement after a failure, omit `agent_id`" in task
+    assert "`config.predecessor_agent_id` (the failed agent)" in task
+    assert "`config.work_package_id` (the package identity)" in task
+    assert "`config.package_tier` (`mechanical` or `substantive`)" in task
+    assert "Launch admission validates the claim at failure time" in task
+    assert "endpoint independence from the ATTEMPTED failed endpoint" in task
+    assert "the reconciliation barrier" in task
+    assert "milestone notice with the honest cost implication" in task
+    # The claim paragraph sits between the replace_run and cancel paragraphs.
+    replace_at = task.index("To supersede busy work")
+    claim_at = task.index("For a cross-model replacement after a failure")
+    cancel_at = task.index("Use `cancel_agent(agent_id, run_id)`")
+    assert replace_at < claim_at < cancel_at
+
+
+def test_rendered_failure_routes_carry_unattended_resilience_marker(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+) -> None:
+    """WP5: the unattended-resilience rule is findable from the rendered
+    prompt — the cli skeleton paragraph carries the greppable marker in every
+    mode, and the rendered failure paragraph (standalone / single-model
+    rosters and the task description) carries it too.
+    """
+    from chartreux.core.dispatch.renderer import (
+        _failure_paragraph,
+        render_routing_region,
+        roster_for,
+    )
+    from chartreux.core.recovery_policy import UNATTENDED_RESILIENCE_MARKER
+    from tests.conftest import single_model_catalog
+
+    config = build_config(
+        system_prompt_id="cli", include_model_info=False, include_commit_signature=False
+    )
+    config.attach_catalog_snapshot(
+        CatalogSnapshot(
+            multi_model_catalog(), "routing-test", dispatch=ORCHESTRATED_PRESET
+        )
+    )
+    prompt = get_universal_system_prompt(
+        config, SkillManager(lambda: config), AgentManager(load_orchestrator(config))
+    )
+
+    # The skeleton rule carries the marker in every rendered mode, alongside
+    # the failure-time replacement paragraph.
+    assert UNATTENDED_RESILIENCE_MARKER in prompt
+    assert "**Failure-time replacement.**" in prompt
+    # The rendered failure paragraph carries the marker sentence too.
+    failure = _failure_paragraph(ORCHESTRATED_PRESET)
+    assert UNATTENDED_RESILIENCE_MARKER in failure
+    assert "never produce a user question" in failure
+    assert "consolidated resumable blocker report" in failure
+    # A single-model routing render surfaces it under the Failure routes
+    # section heading.
+    single = render_routing_region(
+        ORCHESTRATED_PRESET, roster_for(single_model_catalog(), ORCHESTRATED_PRESET)
+    )
+    assert "### Failure routes" in single
+    assert UNATTENDED_RESILIENCE_MARKER in single
+
+
 def test_cli_and_task_prompts_retire_implementation_escalation() -> None:
     cli = SystemPrompt.CLI.read()
     task = (

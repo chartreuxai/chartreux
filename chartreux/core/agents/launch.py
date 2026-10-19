@@ -388,6 +388,14 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     inputs = semantic.model_dump(exclude_unset=True, mode="python")
     # Persona is loop-owned rather than a mutable configuration-layer concern.
     inputs.pop("instructions", None)
+    # WP5 replacement-claim lineage (work_package_id, predecessor_agent_id,
+    # package_tier) is loop-owned claim metadata, not a configuration-layer
+    # concern: it rides the LaunchConfig (semantic_overrides) into the loop's
+    # launch metadata and the agent record — never into the child's
+    # config-layer build, whose source validation rejects unknown keys.
+    inputs.pop("work_package_id", None)
+    inputs.pop("predecessor_agent_id", None)
+    inputs.pop("package_tier", None)
     if "model" in inputs:
         inputs["active_model"] = inputs.pop("model")
     if committed_model is not None and not explicit_model and not explicit_profile:

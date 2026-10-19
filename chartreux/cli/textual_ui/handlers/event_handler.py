@@ -35,6 +35,7 @@ from chartreux.app_server.models import (
     PublicMessageEntry,
     PublicNoticeEntry,
     PublicReasoningEntry,
+    RootRecoveryNoticeDetail,
     ScheduledLoopFiredNoticeDetail,
     SessionTitleUpdatedNoticeDetail,
     SkippedEffectState,
@@ -139,11 +140,17 @@ class EventHandler:
         presentation.active = False
 
     def begin_retry(self, command: SlashCommandMessage | None = None) -> bool:
-        if self._retry_presentation is None:
+        presentation = self._retry_presentation
+        if presentation is None:
+            return False
+        if presentation.active:
+            # R1: a retry is already admitted — double activation starts at
+            # most one turn, so a second begin refuses outright (the retry
+            # operation's turn-ownership claim is the authoritative guard).
             return False
         if command is not None:
-            self._retry_presentation.transient_widgets.append(command)
-        self._retry_presentation.active = True
+            presentation.transient_widgets.append(command)
+        presentation.active = True
         return True
 
     def cancel_retry_presentation(self) -> None:
@@ -173,7 +180,7 @@ class EventHandler:
         if self.on_session_title_changed is not None:
             self.on_session_title_changed(title)
 
-    async def _handle_entry_added(
+    async def _handle_entry_added(  # noqa: PLR0912 - one case per entry kind
         self, entry: PublicHistoryEntry, loading_widget: LoadingWidget | None
     ) -> ToolCallMessage | None:
         if self.current_tool_group is not None and not entry_keeps_tool_group(entry):
@@ -214,7 +221,12 @@ class EventHandler:
                 if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
                     await self._handle_compact_end()
             case PublicNoticeEntry():
-                await self._resolve_retry_presentation(continue_assistant=False)
+                # R2: the root-recovery milestone notices are PART of the
+                # retry presentation (they describe the continuation it
+                # drives), so they must not resolve it; any other notice
+                # still does.
+                if not isinstance(entry.detail, RootRecoveryNoticeDetail):
+                    await self._resolve_retry_presentation(continue_assistant=False)
                 await self._handle_notice(entry, loading_widget)
             case PublicCallbackEntry():
                 await self._resolve_retry_presentation(continue_assistant=False)
@@ -477,6 +489,13 @@ class EventHandler:
             case SessionTitleUpdatedNoticeDetail(title=title):
                 if self.on_session_title_changed is not None:
                     self.on_session_title_changed(title)
+            case RootRecoveryNoticeDetail():
+                # R2/OD3: milestone notices of the bounded automatic root
+                # recovery — a history entry (readable after an overnight
+                # interval and across reconnect), never a fresh instruction
+                # that would trigger another turn.
+                await self.finalize_streaming()
+                await self.mount_callback(UserCommandMessage(entry.message))
 
     async def _handle_hook_notice(
         self, detail: HookNoticeDetail, loading_widget: LoadingWidget | None

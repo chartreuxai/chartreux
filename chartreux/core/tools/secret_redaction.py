@@ -49,6 +49,7 @@ REDACTED_PLACEHOLDER = "[REDACTED]"
 #: carriers remain subject to the bounded decode-candidate budget.
 MAX_SUPPORTED_CREDENTIAL_LENGTH = 16 * 1024
 _MAX_SINGLE_PERCENT_VARIANT_LENGTH = 1024
+_MAX_SINGLE_HEX_VARIANT_LENGTH = 1024
 #: Direct known-value matching includes short (but not trivial) credentials.
 MIN_SECRET_LENGTH = 8
 #: Decode matching uses the same minimum secret length as direct matching.
@@ -385,7 +386,9 @@ def known_secret_values() -> frozenset[str]:
     The base64 encodings of the bare value and of the ``NAME=value`` .env line
     shapes are included so obfuscated exfiltration (``base64 ~/.chartreux/.env``)
     is caught by the fast path even without the decode-and-scan backstop, as is
-    the reversed value (``rev`` on the value or the .env file).
+    the reversed value (``rev`` on the value or the .env file). Percent and
+    ``\\xHH`` shell hex escapes of the value are included for the same reason:
+    a shell may echo the credential back in an escaped spelling.
     """
     values: set[str] = set()
     policy = current_policy()
@@ -393,6 +396,7 @@ def known_secret_values() -> frozenset[str]:
         values.add(value)
         values.add(value[::-1])
         values.update(_percent_variants(value))
+        values.update(_hex_variants(value))
         values.update(_b64_variants(value))
         for line in (f"{name}={value}", f"{name}={value}\n"):
             values.update(_b64_variants(line))
@@ -400,6 +404,7 @@ def known_secret_values() -> frozenset[str]:
         values.update((value, value[::-1]))
         values.update(_b64_variants(value))
         values.update(_percent_variants(value))
+        values.update(_hex_variants(value))
     return frozenset(values)
 
 
@@ -412,6 +417,25 @@ def _percent_variants(value: str) -> set[str]:
         return variants
     for index, character in enumerate(value):
         encoded = "".join(f"%{byte:02X}" for byte in character.encode("utf-8"))
+        for spelling in (encoded, encoded.lower()):
+            variants.add(value[:index] + spelling + value[index + 1 :])
+    return variants
+
+
+def _hex_variants(value: str) -> set[str]:
+    """Recognize full and single-character ``\\xHH`` shell hex escapes.
+
+    A shell that does not expand ANSI-C quoting (POSIX ``sh``) can echo a
+    credential back in this escaped form, so the escaped spellings are known
+    values exactly like the percent encodings.
+    """
+    variants = {"".join(f"\\x{byte:02X}" for byte in value.encode("utf-8"))}
+    # Building one whole-string copy per character is quadratic in the secret
+    # length; large credentials remain covered by direct/whole-body matching.
+    if len(value) > _MAX_SINGLE_HEX_VARIANT_LENGTH:
+        return variants
+    for index, character in enumerate(value):
+        encoded = "".join(f"\\x{byte:02X}" for byte in character.encode("utf-8"))
         for spelling in (encoded, encoded.lower()):
             variants.add(value[:index] + spelling + value[index + 1 :])
     return variants

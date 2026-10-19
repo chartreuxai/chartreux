@@ -68,8 +68,10 @@ from chartreux.questions import (
     UserAnswer as QuestionAnswer,
     UserQuestionResult as QuestionResult,
 )
+from tests.app_server._session_runtime_support import _consume, _next_event
+from tests.app_server._subagent_test_support import _GatedWakeup, _ManualClock
 from tests.mock.utils import mock_llm_chunk
-from tests.stubs.app_server import build_test_app_server
+from tests.stubs.app_server import build_test_app_server, legacy_backend
 from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_mcp_registry import FakeMCPRegistry
 
@@ -1183,6 +1185,70 @@ async def test_routine_git_commands_execute_without_prompts(
         assert "On branch main" in pairs["routine-status"]
         assert _commit_count(project) == 2
         assert _authorities(loop) == []
+    finally:
+        await session.close()
+        await loop.aclose()
+
+
+async def test_dangerous_command_approval_never_expires_and_executes_nothing(
+    tmp_path: Path, config_dir: Path
+) -> None:
+    """Plan U acceptance (5), dangerous-command half.
+
+    A dangerous-command approval shares the request broker, callback
+    plumbing, and renderer, but its runtime-approval provenance makes it
+    permanently ineligible for unattended expiry: even with
+    ``[user_questions]`` enabled, the approval stays unanswered
+    indefinitely, no timer is armed, nothing is executed, and an explicit
+    Deny still works and is remembered.
+    """
+    project, remote = (
+        _make_repo(tmp_path / "project"),
+        _make_remote(tmp_path / "remote.git"),
+    )
+    _link_remote(project, remote)
+    _commit(project)
+    marker = project / "expiry-marker"
+    config_path = config_dir / "config.toml"
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n[user_questions]\nunattended_timeout_enabled = true\n")
+    command = f"git push origin main; touch {marker.name}"
+    backend = FakeBackend([*_turn(command, "expiry-1")])
+    loop = await _make_loop(project, config_path, backend)
+    server, _, session = await _open_session(loop)
+    clock = _ManualClock()
+    wakeup = _GatedWakeup()
+    turns = legacy_backend(server).session.turns
+    turns._clock = clock
+    turns._wakeup = wakeup
+    try:
+        stream = session.act(TURN_PROMPT)
+        callback = (await _next_event(stream, CallbackRequested)).callback
+        _assert_dangerous_question(callback.detail)
+        # The runtime approval is permanently ineligible: no expiry policy.
+        assert callback.detail.unattended_expiry is None
+        await asyncio.sleep(0.05)
+        # No unattended-expiry timer is armed at all.
+        assert wakeup.calls == []
+        # Silence far past any deadline changes nothing: the approval
+        # stays open, nothing is deferred, nothing is executed.
+        clock.advance(10_000.0)
+        await asyncio.sleep(0.05)
+        assert [c.callback_id for c in session.state.active_callbacks] == [
+            callback.callback_id
+        ]
+        assert loop.deferred_questions.records() == []
+        assert not marker.exists()
+        assert not _remote_has_main(remote)
+        assert _authorities(loop) == []
+        # An explicit Deny still works and is remembered; still nothing ran.
+        await session.respond_to_callback(callback.callback_id, _grant_answer("Deny"))
+        await asyncio.wait_for(_consume(stream), timeout=10)
+        assert any(DECLINED_FEEDBACK in text for text in _tool_texts(loop))
+        assert not marker.exists()
+        assert not _remote_has_main(remote)
+        assert _authorities(loop) == []
+        assert loop.deferred_questions.records() == []
     finally:
         await session.close()
         await loop.aclose()

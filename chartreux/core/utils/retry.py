@@ -10,6 +10,7 @@ import functools
 from itertools import count
 import logging
 import math
+import random
 import time
 
 import httpx
@@ -168,6 +169,26 @@ def _next_delay(
     return min(exponential + (0.05 * attempt), max_delay_seconds)
 
 
+def jittered_backoff(
+    base: float, jitter_fraction: float, *, draw: Callable[[], float] = random.random
+) -> float:
+    """Scale ``base`` by a symmetric ±``jitter_fraction`` using ``draw``.
+
+    WP4: the automatic recovery controller's cooldown/jitter schedule. The
+    draw is an injectable uniform [0, 1) sample (``random.random`` by
+    default), so tests pin exact delays deterministically. A zero jitter
+    fraction returns ``base`` unchanged; the result is never negative and a
+    nonpositive base yields zero.
+    """
+    if base <= 0:
+        return 0.0
+    if jitter_fraction <= 0:
+        return base
+    sample = min(max(draw(), 0.0), 1.0)
+    spread = base * jitter_fraction * (2.0 * sample - 1.0)
+    return max(0.0, base + spread)
+
+
 def async_retry[T, **P](
     tries: int | None = 3,
     delay_seconds: float = 0.5,
@@ -177,6 +198,7 @@ def async_retry[T, **P](
     budget: RequestRetryBudget | None = None,
     is_retryable: Callable[[Exception], bool] = _is_retryable_http_error,
     on_retry: RetryObserver | None = None,
+    on_attempt: Callable[[int], None] | None = None,
 ) -> Callable[[Callable[P, Awaitable[T]]], Callable[P, Awaitable[T]]]:
     """Args:
         tries: Number of retry attempts, or None to retry for as long as the
@@ -191,6 +213,9 @@ def async_retry[T, **P](
         is_retryable: Function to determine if an exception should trigger a retry
                      (defaults to checking for retryable HTTP errors from both urllib and httpx)
         on_retry: Notified before each backoff, so callers can surface the retry
+        on_attempt: Called synchronously at each attempt start (WP1) with the
+                     zero-based attempt index, so backends can count measured
+                     transport starts for failure evidence
 
     Returns:
         Decorated function with retry logic
@@ -210,6 +235,8 @@ def async_retry[T, **P](
             start = time.monotonic() if max_elapsed_time is not None else 0.0
             attempts = count() if tries is None else range(tries)
             for attempt in attempts:
+                if on_attempt is not None:
+                    on_attempt(attempt)
                 try:
                     return await func(*args, **kwargs)
                 except Exception as e:
@@ -268,6 +295,7 @@ def async_generator_retry[T, **P](
     budget: RequestRetryBudget | None = None,
     is_retryable: Callable[[Exception], bool] = _is_retryable_http_error,
     on_retry: RetryObserver | None = None,
+    on_attempt: Callable[[int], None] | None = None,
 ) -> Callable[[Callable[P, AsyncGenerator[T]]], Callable[P, AsyncGenerator[T]]]:
     """Retry decorator for async generators.
 
@@ -287,6 +315,9 @@ def async_generator_retry[T, **P](
         is_retryable: Function to determine if an exception should trigger a retry
                      (defaults to checking for retryable HTTP errors from both urllib and httpx)
         on_retry: Notified before each backoff, so callers can surface the retry
+        on_attempt: Called synchronously at each attempt start (WP1) with the
+                     zero-based attempt index, so backends can count measured
+                     transport starts for failure evidence
 
     Returns:
         Decorated async generator function with retry logic
@@ -308,6 +339,8 @@ def async_generator_retry[T, **P](
             start = time.monotonic() if max_elapsed_time is not None else 0.0
             attempts = count() if tries is None else range(tries)
             for attempt in attempts:
+                if on_attempt is not None:
+                    on_attempt(attempt)
                 retry_error: Exception | None = None
                 async with aclosing(func(*args, **kwargs)) as generator:
                     try:

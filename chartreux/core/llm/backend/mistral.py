@@ -389,6 +389,10 @@ class MistralBackend:
         self._timeout = timeout
         self._retry_max_elapsed_time = retry_max_elapsed_time
         self._retry_budget = retry_budget
+        # Measured transport starts (WP1): the SDK's opaque retry layer is
+        # disabled (retry_config=None), so every retry runs through the
+        # wrapper below and on_attempt counts every real transport start.
+        self._transport_attempts = 0
         # Retained for diagnostics/backward-compatible inspection only. It is
         # deliberately not passed to the SDK.
         self._retry_config = self._build_retry_config()
@@ -410,6 +414,15 @@ class MistralBackend:
             retry_connection_errors=True,
         )
 
+    def _record_transport_attempt(self, _attempt: int) -> None:
+        """Count one measured transport start (WP1 failure evidence)."""
+        self._transport_attempts += 1
+
+    @property
+    def transport_attempts(self) -> int:
+        """Total measured transport starts on this backend instance."""
+        return self._transport_attempts
+
     def _with_retry(self, call: Callable[..., Any]) -> Callable[..., Any]:
         return async_retry(
             tries=None,
@@ -418,6 +431,7 @@ class MistralBackend:
             ),
             budget=self._retry_budget,
             on_retry=self._on_retry,
+            on_attempt=self._record_transport_attempt,
         )(call)
 
     async def _bound_transport_timeouts(self, request: httpx.Request) -> None:

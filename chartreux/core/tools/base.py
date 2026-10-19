@@ -28,7 +28,7 @@ from chartreux.core.config.harness_files import (
     HarnessFilesManager,
     get_harness_files_manager,
 )
-from chartreux.core.events import ToolStreamEvent
+from chartreux.core.events import ToolStreamEvent, UserInputOrigin
 from chartreux.core.llm_models import ImageAttachment
 from chartreux.core.tools.models import (
     ToolPermission,
@@ -65,7 +65,11 @@ def _no_dangerous_command_authorities() -> tuple[DangerousCommandAuthority, ...]
 
 class InteractionRequestPort(Protocol):
     async def request_user_input(
-        self, args: BaseModel, tool_call_id: str
+        self,
+        args: BaseModel,
+        tool_call_id: str,
+        *,
+        origin: UserInputOrigin = UserInputOrigin.RUNTIME_APPROVAL,
     ) -> BaseModel: ...
 
 

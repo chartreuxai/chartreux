@@ -36,6 +36,9 @@ method list, including typed parameter and result models. It covers:
 - dangerous-command authority inspection and revocation
   (`policy/dangerous_commands/read` and `policy/dangerous_commands/revoke`);
 - queued-turn enqueue/read/remove/replace/resume operations;
+- subagent resume and effect reconciliation (`agents/resume`, `agents/reconcile`);
+- root automatic-recovery scheduling/admission/cancellation
+  (`recovery/root/schedule`, `recovery/root/admit`, `recovery/root/cancel`);
 - agent transcripts, skills, tools, scheduled loops, reviews, and workspace
   trust and Git worktree operations; and
 - MCP catalog read/add/remove/toggle/refresh/login/logout operations.
@@ -184,6 +187,88 @@ Unlike `agents/cancel`, release gets no lifecycle-transition exemption: it is
 rejected while a root lifecycle transition is active, while attachment and
 shutdown fences still apply. The model tool `release_agent(agent_id)` stays
 unguarded and may still release an active instance.
+
+## Subagent resume and reconciliation
+
+A recoverably failed background agent is suspended (warm, non-terminal; see
+[Subagents](../guides/subagents.md#failure-recovery-suspension-and-resume)).
+Two root-session operations operate on it; the automatic recovery controller
+and the model tools both go through the same `agents/resume` admission, so
+they cannot create duplicate successors.
+
+`agents/resume` accepts
+`{"agentId": "…", "expectedRunId": "…", "idempotencyKey": "…"}`.
+`expectedRunId` pins the failed run to resume from; `idempotencyKey`
+single-flights concurrent calls. `AppServerSession.resume_agent(agent_id,
+expected_run_id, idempotency_key)` returns a typed public response with
+`outcome`, `agentId`, nullable `runId`, `successorRunId`,
+`recoveryOperationId`, `retryAt`, `eligibility`, `reasonCodes`, and
+`sameAgentResumesUsed`.
+
+The outcomes are `scheduled` (a successor run of the SAME agent identity was
+admitted; `successorRunId` is published on admission), `already_scheduled`
+(same key, same run: the pending admission is returned),
+`already_resumed` (a different key while an admission is in flight: refused —
+exactly one successor), `reconcile_required` (unknown tool effects block
+replay), `expired` (the warm suspension window closed),
+`not_resumable` (closed, evicted, released, or otherwise ineligible), and
+`forbidden` (authority). The failed run's result is immutable and stays
+retrievable; waits pinned to it return ITS failed result.
+
+`agents/reconcile` accepts
+`{"agentId": "…", "expectedRunId": "…", "transcriptBoundary": "…", "verifiedEffects": [{"toolCallId": "…", "disposition": "settled"|"unrepeatable_damage", "note": "…"}]}`.
+It is pinned to the failed run and its transcript boundary, so stale or
+duplicate evidence from an earlier run cannot clear a later run's barrier.
+`AppServerSession.reconcile_result(...)` returns a typed public response with
+`outcome`, `agentId`, nullable `runId` and `transcriptBoundary`,
+`eligibility`, and `reasonCodes`.
+
+The outcomes are `cleared` (the barrier flips to eligible), `prohibited`
+(verification shows unrepeatable damage, with reason codes),
+`stale`/`duplicate` (never change the barrier), `not_pending` (no barrier),
+and `forbidden` (authority). The barrier never auto-clears; replacement with
+`task(agent_id=..., replace_run=True)` remains permitted at any point. A run
+that left no tool call outstanding submits `verifiedEffects: []` — the
+complete zero-entry accounting — which clears the barrier exactly when zero
+tool calls are outstanding.
+
+Both operations are rejected while attachment and shutdown fences apply, and
+release, cancellation, a session change, or shutdown invalidate pending
+recovery without discarding the failed run's evidence.
+
+## Root turn recovery
+
+`recovery/root/schedule`, `recovery/root/admit`, and `recovery/root/cancel`
+are the wire surface of the bounded automatic root-turn recovery gate (the
+TUI's `RootRecoveryController` is the only production caller). They are
+root-session operations: `sessionId` must be the attached root session.
+
+- `recovery/root/schedule` accepts
+  `{"sessionId": "…", "terminalTurnId": "…", "solicited": false, "inputGeneration": 0}`.
+  The gate decides from the typed terminal projection of `terminalTurnId`:
+  `scheduled` (with `episodeId`, `idempotencyKey`, `attempt`, `limit`,
+  `delaySeconds`, `eligibleClass`, `affectedDeployment`),
+  `already_scheduled`, or `declined` (with `reason`).
+- `recovery/root/admit` accepts
+  `{"sessionId": "…", "episodeId": "…", "idempotencyKey": "…", "terminalTurnId": "…", "inputGeneration": 0}`
+  and is the single-flight admission: `admitted` (counted once per episode),
+  `already_admitted` (an ambiguous redelivery reconciles to the original
+  successor via the idempotency key — never a second one), `deferred` (a
+  read-only availability wait with `delaySeconds`; it never consumes a
+  retry), or `declined` (with `reason`). Every decision rechecks the session,
+  turn, input generation, queued work, callbacks, stop state, budget,
+  deadline, and live availability.
+- `recovery/root/cancel` accepts `{"sessionId": "…", "episodeId": "…", "reason": "…"}`
+  and cancels a pending schedule; it never cancels an already-admitted
+  successor in flight (that settles via normal interruption rules).
+
+The gate owns authoritative eligibility, episode accounting, and
+single-flight admission; the caller owns the local timer and local
+cancellation. Milestone notices (`RootRecoveryNoticeDetail`, kind
+`root_recovery`) ride the normal history as `PublicNoticeEntry` records with
+deterministic ids. See
+[Automatic root recovery](../guides/configuration.md#automatic-root-recovery)
+for the policy.
 
 ## Managed-job state
 

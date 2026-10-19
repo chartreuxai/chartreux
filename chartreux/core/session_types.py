@@ -17,6 +17,7 @@ from pydantic import (
 )
 
 from chartreux.core.launch_types import LaunchConfig
+from chartreux.core.recovery_models import PackageTier
 
 
 class LaunchPersonaV1(BaseModel):
@@ -63,6 +64,30 @@ class LaunchMetadataV2(BaseModel):
     overrides: LaunchConfig = Field(default_factory=LaunchConfig)
     persona: LaunchPersonaV1
     committed_model: CommittedModelIdentity
+    # WP5 lineage pair + package tier: the failure-time replacement claim,
+    # committed with the launch state so a resumed or restarted child keeps its
+    # work-package identity (resume revalidates it rather than re-resolving).
+    work_package_id: str | None = None
+    predecessor_agent_id: str | None = None
+    package_tier: PackageTier | None = None
+
+    @model_validator(mode="after")
+    def _lift_lineage_from_overrides(self) -> LaunchMetadataV2:
+        """Lift unset lineage fields from the committed overrides.
+
+        Both construction sites (the app server's launch metadata and the
+        loop's own re-install) build from the semantic overrides; the claim
+        fields ride there, so an explicitly unset first-class field is
+        lifted from them instead of silently dropped.
+        """
+        overrides = self.overrides
+        if self.work_package_id is None:
+            self.work_package_id = overrides.work_package_id
+        if self.predecessor_agent_id is None:
+            self.predecessor_agent_id = overrides.predecessor_agent_id
+        if self.package_tier is None:
+            self.package_tier = overrides.package_tier
+        return self
 
     @field_serializer("overrides")
     def _serialize_overrides(self, value: LaunchConfig) -> dict[str, Any]:

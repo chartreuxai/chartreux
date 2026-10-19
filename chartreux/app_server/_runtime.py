@@ -55,6 +55,10 @@ from chartreux.core._usage_startup import (
 from chartreux.core.agent_loop import AgentLoop, AgentRuntimePolicy
 from chartreux.core.agent_loop._file_state_context import RevisionRegistryPort
 from chartreux.core.agent_loop._loop import RootAccountingOwner
+from chartreux.core.agent_loop._transcript_integrity import (
+    TranscriptIntegrityError,
+    pop_report_from_metadata,
+)
 from chartreux.core.agents.launch import FrozenPersona, LaunchCandidate, resolve_launch
 from chartreux.core.agents.manager import AgentManager
 from chartreux.core.background_jobs import BackgroundJobsPort
@@ -83,7 +87,8 @@ from chartreux.core.session import last_session_pointer
 from chartreux.core.session.session_id import extract_suffix, generate_session_id
 from chartreux.core.session.session_index import warm_session_index
 from chartreux.core.session.session_lease import SessionLease
-from chartreux.core.session.session_loader import SessionLoader
+from chartreux.core.session.session_loader import MESSAGES_FILENAME, SessionLoader
+from chartreux.core.session.session_logger import SessionLogger
 from chartreux.core.session_types import (
     AgentStats,
     CommittedModelIdentity,
@@ -506,6 +511,12 @@ class AgentRuntimeFactory:
             session_path, loaded_messages, metadata = await asyncio.to_thread(
                 _load_session, source.config, session_id
             )
+            # PI1/T (S4 resume install): under the held lease, fail closed on an
+            # unrepairable transcript and durably migrate a repaired one BEFORE
+            # the loop is rebound to the repaired messages.
+            loaded_messages = await asyncio.to_thread(
+                _install_transcript_repair, session_path, loaded_messages, metadata
+            )
             await source.retire_background_jobs()
             # Prepare the only fallible part of rebinding before the reload. This
             # keeps a scratchpad failure from leaving the old session's runtime
@@ -619,6 +630,12 @@ class AgentRuntimeFactory:
     ) -> AgentLoop:
         session_path, loaded_messages, metadata = await asyncio.to_thread(
             _load_session, blueprint.config, session_id
+        )
+        # PI1/T (S4 resume install): under the held lease, fail closed on an
+        # unrepairable transcript and durably migrate a repaired one BEFORE the
+        # loop is built around the repaired messages.
+        loaded_messages = await asyncio.to_thread(
+            _install_transcript_repair, session_path, loaded_messages, metadata
         )
         await blueprint.config_orchestrator.reload()
         session_metadata = SessionMetadata.model_validate(metadata)
@@ -1720,6 +1737,32 @@ def _load_session(
         raise RuntimeSessionNotFoundError(session_id)
     loaded_messages, metadata = SessionLoader.load_session(session_path)
     return session_path, loaded_messages, metadata
+
+
+def _install_transcript_repair(
+    session_path: Path, loaded_messages: list[LLMMessage], metadata: dict[str, object]
+) -> list[LLMMessage]:
+    """S4 resume install: fail closed on violations, migrate repairs durably.
+
+    Runs only on the two write-owning root install paths, under the held
+    session lease. ``SessionLoader.load_session`` already repaired the
+    transcript in memory for every caller and never hard-fails; this install
+    is where an unrepairable (ambiguous) transcript fails closed with the
+    typed transcript-integrity diagnostic, and where a repaired transcript is
+    durably migrated — the original preserved as an artifact first.
+    """
+    report = pop_report_from_metadata(metadata)
+    if report is None:
+        return loaded_messages
+    if report.violations:
+        raise TranscriptIntegrityError(
+            report.violations, context="session resume install"
+        )
+    if report.repaired:
+        SessionLogger.migrate_repaired_transcript(
+            session_path / MESSAGES_FILENAME, loaded_messages
+        )
+    return loaded_messages
 
 
 def _resolve_resume_session_id(config: ChartreuxConfigSchema, session_id: str) -> str:

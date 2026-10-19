@@ -5,7 +5,8 @@ from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import aclosing, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import cast
+import time
+from typing import Literal, cast
 from uuid import uuid4
 
 from pydantic import JsonValue
@@ -22,6 +23,10 @@ from chartreux.app_server._projection import (
     project_stats,
 )
 from chartreux.app_server._projector import EventProjector, ProjectedUpdate
+from chartreux.app_server._root_recovery import (
+    RootRecoveryGate,
+    RootRecoverySessionView,
+)
 from chartreux.app_server._root_session import SessionCoordinator, rebind_history
 from chartreux.app_server._state import session_preview
 from chartreux.app_server._turn_input import vibe_content_blocks
@@ -34,10 +39,13 @@ from chartreux.app_server._utils import (
     public_error,
 )
 from chartreux.app_server.models import (
+    BlockedEffectState,
     CallbackOutput,
     EffectDetail,
     EffectState,
+    PendingEffectState,
     PublicCallbackEntry,
+    PublicEffectEntry,
     PublicError,
     PublicHistoryEntry,
     PublicMessageSource,
@@ -48,8 +56,11 @@ from chartreux.app_server.models import (
     PublicTurnQueue,
     PublicTurnStatus,
     PublicTurnStopReason,
+    RootRecoveryNoticeDetail,
+    RunningEffectState,
     ScheduledLoopFiredNoticeDetail,
     UserInputCallbackDetail,
+    UserInputCallbackExpiry,
     UserInputCallbackOutput,
     UserQuestionRequest,
 )
@@ -78,6 +89,12 @@ from chartreux.app_server.protocol import (
     TurnUpdatedParams,
 )
 from chartreux.core.agent_loop import AgentLoop, AgentTurnOptions
+from chartreux.core.agent_loop._transcript_integrity import (
+    TranscriptIntegrityError,
+    validate_transcript,
+)
+from chartreux.core.compaction import reorder_for_tool_adjacency
+from chartreux.core.compaction.context import select_model_context
 from chartreux.core.events import (
     AssistantEvent,
     BackgroundJobsChangedEvent,
@@ -85,13 +102,26 @@ from chartreux.core.events import (
     BaseEvent,
     CompactEndEvent,
     ToolWaitStateChangedEvent,
+    UserInputOrigin,
     UserInputRequestEvent,
     UserMessageEvent,
 )
 from chartreux.core.llm_models import ImageAttachment, ManualShellContext
+from chartreux.core.model_catalog.availability import (
+    AvailabilitySnapshot,
+    availability_snapshot,
+)
+from chartreux.core.recovery_models import build_root_turn_failure
+from chartreux.core.recovery_observation import (
+    observe_exception,
+    record_observation,
+    turn_observation,
+)
 from chartreux.core.subagents import SubagentRunnerPort
 from chartreux.core.tools.io_port import ToolIOPort
 from chartreux.core.utils.retry import RetryCategory, RetryReason
+from chartreux.observability.logging import logger
+from chartreux.questions import QuestionKind, UnansweredQuestion, UnansweredQuestions
 from chartreux.user_content import UserResource
 
 type Notify = Callable[[str, ProtocolModel], Awaitable[None]]
@@ -107,6 +137,11 @@ type SnapshotState = Callable[[], PublicSessionState]
 _retry_turn_id: ContextVar[str | None] = ContextVar(
     "app_server_retry_turn_id", default=None
 )
+
+#: R2: the single persistent harness-effects projector carrying the root
+#: recovery milestone notices (deterministic ids; readable via the normal
+#: history across a reconnect; never injected as fresh instructions).
+_ROOT_RECOVERY_EFFECT_ID = "root-recovery"
 
 
 class TurnConflictError(RuntimeError):
@@ -141,6 +176,26 @@ class CallbackRejectedError(RuntimeError):
 
 _STEER_RECEIPT_CAPACITY = 128
 
+# The unattended-expiry floor mirrors the [user_questions] config validation
+# (both configured timeout bounds are >= 60s); an override outside the
+# configured range is rejected, never clamped (plan U/OD1).
+_MIN_UNATTENDED_TIMEOUT_SECONDS = 60.0
+
+# The terminal history reason for an expired-unanswered callback (plan U/OD1).
+EXPIRED_CALLBACK_REASON = "unanswered_timeout"
+
+# Model-facing continuation guidance carried by the server-owned unanswered
+# disposition (plan U/OD1).
+UNANSWERED_CONTINUATION_GUIDANCE = (
+    "The user did not answer in time, so no choice was made and no permission "
+    "was granted. The declared unattended default describes how to proceed "
+    "without the answer: defer the affected work or keep the existing "
+    "choice. Do not re-ask the same question in a loop; continue with the "
+    "deferred outcome, or ask a new, different question if one is still "
+    "needed. If the user later provides the answer explicitly, treat it as "
+    "a new user message."
+)
+
 
 @dataclass(slots=True)
 class SteerReceipt:
@@ -153,12 +208,36 @@ class SteerReceipt:
 
 
 @dataclass(slots=True)
+class CallbackExpiry:
+    """Authoritative unattended-expiry timer state (plan U/OD1).
+
+    Owned by the callback record — not the tool and not the TUI. The policy
+    is snapshotted at callback open; the monotonic deadline arbitrates
+    against answer/keep-waiting/cancel/reconnect under the record's
+    resolution lock, so exactly one terminal disposition wins. A stale timer
+    (session or turn generation changed) never fires.
+    """
+
+    deadline: float
+    opened_at: float
+    timeout_seconds: float
+    questions: list[UnansweredQuestion]
+    session_id: str
+    session_generation: int
+    turn_id: str
+    timer: asyncio.Task[None] | None = None
+    kept_waiting: bool = False
+
+
+@dataclass(slots=True)
 class CallbackRecord:
     event: UserInputRequestEvent
-    future: asyncio.Future[CallbackOutput]
+    future: asyncio.Future[CallbackOutput | UnansweredQuestions]
     resolution: CallbackOutput | CallbackResultError | None = None
     core_resolved: bool = False
     resolution_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    expiry: CallbackExpiry | None = None
+    expired: bool = False
 
 
 def _public_retry_category(category: RetryCategory) -> PublicRetryCategory:
@@ -254,6 +333,10 @@ class TurnController:  # noqa: PLR0904
         self._harness_effects: dict[str, EventProjector] = {}
         self._history: list[PublicHistoryEntry] = []
         self._callbacks: dict[str, CallbackRecord] = {}
+        # Monotonic clock / wakeup seams for the unattended-expiry timer
+        # (plan U/OD1): tests override these per instance.
+        self._clock: Callable[[], float] = time.monotonic
+        self._wakeup: Callable[[float], Awaitable[None]] = asyncio.sleep
         self._scheduled_loop_id: str | None = None
         self._turn_queue = TurnQueue()
         self._queue_lock = asyncio.Lock()
@@ -265,6 +348,26 @@ class TurnController:  # noqa: PLR0904
         self._closing = False
         self._queue_tasks: set[asyncio.Task[None]] = set()
         self._handoff_pending = False
+        # R2/OD3: the app-server root recovery gate (authoritative
+        # eligibility, episode accounting, single-flight admission). Its
+        # config/session/availability providers read LIVE state at every
+        # decision; its notices stage into the harness-effects projector.
+        self._root_recovery_tasks: set[asyncio.Task[None]] = set()
+        self._root_recovery_gate = RootRecoveryGate(
+            config=lambda: self._agent_loop.config.recovery.root,
+            session_view=self._root_recovery_view,
+            availability=self._root_recovery_availability,
+            stage_notice=self._stage_root_recovery_notice,
+            emit_projected=self._emit_projected,
+            # PI1/T (S6): the gate's schedule/admission pre-check validates
+            # the live transcript (fail closed on a poisoned transcript).
+            transcript_integrity=lambda: self._agent_loop.messages,
+        )
+
+    @property
+    def root_recovery(self) -> RootRecoveryGate:
+        """The R2 root automatic-recovery gate (the wire surface's target)."""
+        return self._root_recovery_gate
 
     @property
     def active_turn(self) -> PublicTurn | None:
@@ -353,6 +456,18 @@ class TurnController:  # noqa: PLR0904
     ) -> tuple[TurnStartResponse, TurnStartAction]:
         self._require_policy_unreserved()
         self.require_model_choice()
+        # PI1/T (S6 turn admission): fail closed BEFORE scheduling or
+        # appending — a poisoned transcript would fail the same way at the
+        # provider. Typed local diagnostic: never transient, never retried,
+        # never scheduled; projected through public_error as an internal
+        # error carrying category=transcript_integrity.
+        integrity_violations = validate_transcript(
+            self._agent_loop.messages, live_tail_exempt=True
+        )
+        if integrity_violations:
+            raise TranscriptIntegrityError(
+                integrity_violations, context="turn start admission"
+            )
         active_task = self._active_task
         if (
             active_task is not None
@@ -406,6 +521,11 @@ class TurnController:  # noqa: PLR0904
                 raise
             finally:
                 _retry_turn_id.reset(retry_turn_token)
+            # R2: feed the start to the recovery gate — an admitted
+            # continuation's idempotency key links the successor (and stages
+            # the `started` notice); any other start while a schedule is
+            # pending is a takeover that cancels it.
+            self._observe_root_turn_started(turn.id, params.idempotency_key)
 
         action = TurnStartAction(self, turn, session_execution, start_turn)
         self._pending_start = action
@@ -939,6 +1059,10 @@ class TurnController:  # noqa: PLR0904
         if record is None:
             raise CallbackNotFoundError(f"Callback not found: {callback_id}")
         async with record.resolution_lock:
+            if record.expired:
+                # A definite expired response: the unattended timer already
+                # resolved this callback (plan U/OD1).
+                raise CallbackClosedError(f"Callback expired unanswered: {callback_id}")
             if record.core_resolved and record.resolution is None:
                 raise CallbackClosedError(f"Callback is closed: {callback_id}")
             if record.resolution is not None:
@@ -957,6 +1081,7 @@ class TurnController:  # noqa: PLR0904
                     await self._emit_projected(update)
             await self._emit_status("running")
             record.resolution = output
+            self._cancel_expiry_timer(record)
             if not record.future.done():
                 record.future.set_result(output)
             return "accepted"
@@ -968,6 +1093,8 @@ class TurnController:  # noqa: PLR0904
         if record is None:
             raise CallbackNotFoundError(f"Callback not found: {callback_id}")
         async with record.resolution_lock:
+            if record.expired:
+                raise CallbackClosedError(f"Callback expired unanswered: {callback_id}")
             if record.core_resolved and record.resolution is None:
                 raise CallbackClosedError(f"Callback is closed: {callback_id}")
             if record.resolution is not None:
@@ -980,9 +1107,47 @@ class TurnController:  # noqa: PLR0904
             self._reject_callback_record(record, CallbackRejectedError(error.message))
             return "accepted"
 
+    async def keep_waiting_callback(
+        self, callback_id: str
+    ) -> Literal["kept", "already_terminal", "no_deadline"]:
+        """Lift the unattended-expiry deadline for a callback (plan U/OD1).
+
+        The question stays open without a deadline (OPEN_WITHOUT_DEADLINE);
+        the expiry timer is cancelled under the record's resolution lock so
+        the answer/expiry/keep-waiting race still has exactly one winner.
+        """
+        record = self._callbacks.get(callback_id)
+        if record is None:
+            raise CallbackNotFoundError(f"Callback not found: {callback_id}")
+        async with record.resolution_lock:
+            expiry = record.expiry
+            if expiry is None:
+                return "no_deadline"
+            if (
+                record.resolution is not None
+                or record.core_resolved
+                or record.future.done()
+            ):
+                return "already_terminal"
+            expiry.kept_waiting = True
+            if expiry.timer is not None:
+                expiry.timer.cancel()
+                expiry.timer = None
+            return "kept"
+
     async def close(self) -> None:
         self._closing = True
+        # R2: invalidate the recovery gate's episodes/projections/admissions
+        # (session change / shutdown cancels timers and invalidates
+        # references; the failed turns, notices, and history stay retained).
+        self._root_recovery_gate.invalidate_all()
         errors: list[BaseException] = []
+        if self._root_recovery_tasks:
+            errors.extend(
+                await cancel_tasks(
+                    self._root_recovery_tasks.copy(), label="root recovery notices"
+                )
+            )
         if self._steer_tasks:
             errors.extend(
                 await cancel_tasks(self._steer_tasks.copy(), label="steering")
@@ -1167,6 +1332,17 @@ class TurnController:  # noqa: PLR0904
     async def _terminalize_failed_turn(
         self, turn: PublicTurn, status: PublicTurnStatus, exc: BaseException
     ) -> None:
+        # R2: capture the typed terminal projection and feed the finish
+        # transition BEFORE _cancel_callbacks — the interaction/effect
+        # barriers are read while the callbacks are still open (their
+        # absence afterwards proves nothing).
+        self._capture_root_turn_failure(
+            turn,
+            stop_reason=(
+                "user_cancelled" if status is PublicTurnStatus.INTERRUPTED else None
+            ),
+        )
+        await self._observe_root_turn_finished(turn.id, status)
         # Cleanup may itself be the failing operation. Never let a second
         # projector/callback failure prevent the promised terminal notification.
         with suppress(Exception):
@@ -1194,6 +1370,13 @@ class TurnController:  # noqa: PLR0904
         self._active_turn = None
         self._projector = None
         self._retrying = None
+        if isinstance(exc, Exception):
+            # Preserve the typed failure evidence before the message-only
+            # PublicError projection discards it (WP0 F5; the public
+            # envelope is WP1's scope — this carrier stays private).
+            record_observation(
+                observe_exception(exc, phase="turn_terminal", turn_id=turn.id)
+            )
         completed = turn.model_copy(
             update={
                 "session_id": self._agent_loop.session_id,
@@ -1246,9 +1429,7 @@ class TurnController:  # noqa: PLR0904
                         turn_id=turn.id,
                         retry_sink=self._emit_retrying,
                         injected=params.injected,
-                        user_initiated_retry=(
-                            params.user_initiated_retry or params.injected
-                        ),
+                        user_initiated_retry=params.user_initiated_retry,
                     ),
                 )
             ) as events:
@@ -1292,6 +1473,13 @@ class TurnController:  # noqa: PLR0904
             status = PublicTurnStatus.INTERRUPTED
         except Exception as exc:
             status = PublicTurnStatus.FAILED
+            # Preserve the typed failure evidence before the message-only
+            # PublicError projection discards it (WP0 F5; the public
+            # envelope is WP1's scope — this carrier stays private).
+            record_observation(observe_exception(exc, phase="turn", turn_id=turn.id))
+            # R2: capture the typed terminal projection for the recovery
+            # gate BEFORE public_error() discards the exception context.
+            self._capture_root_turn_failure(turn, stop_reason=None)
             error = public_error(exc)
         return status, error, stop_reason
 
@@ -1347,6 +1535,186 @@ class TurnController:  # noqa: PLR0904
             )
         )
 
+    # ------------------------------------------------------------------
+    # R2/OD3 — the root automatic-recovery gate's observation hooks
+    # ------------------------------------------------------------------
+
+    def _root_recovery_view(self) -> RootRecoverySessionView:
+        """The live interaction state the gate decides on (never snapshotted
+        at construction — read at every schedule/admission).
+        """
+        active = self._execution.active
+        return RootRecoverySessionView(
+            session_id=self._agent_loop.session_id,
+            active_turn_id=(
+                self._active_turn.id if self._active_turn is not None else None
+            ),
+            queued_work=bool(self._turn_queue),
+            open_callbacks=any(
+                not record.core_resolved for record in self._callbacks.values()
+            ),
+            stop_requested=bool(
+                self._active_task is not None and self._active_task.cancelling()
+            ),
+            handoff_pending=self._handoff_pending,
+            lifecycle_reserved=(
+                active is not None and active.kind is SessionExecutionKind.LIFECYCLE
+            ),
+            closing=self._closing,
+        )
+
+    def _root_recovery_availability(self) -> AvailabilitySnapshot:
+        """The NON-MUTATING same-base eligibility snapshot (R2): never claims
+        or releases a single-flight probe, never records or clears anything.
+        """
+        loop = self._agent_loop
+        config = loop.config
+        snapshot = config.catalog_snapshot
+        committed = loop.committed_model
+        if snapshot is None or committed is None:
+            # Missing evidence never blocks scheduling on its own — the
+            # admission itself is the authority.
+            return AvailabilitySnapshot(
+                available=True,
+                permanent=False,
+                endpoint_blocked=False,
+                probe_in_flight=False,
+                next_check_delay=0.0,
+            )
+        return availability_snapshot(
+            snapshot=snapshot,
+            committed=committed,
+            registry=loop.config_orchestrator.availability_registry,
+            config=config,
+            history=reorder_for_tool_adjacency(select_model_context(loop.messages)),
+            thinking=config.get_active_model().thinking,
+            compaction_base=config.compaction_model or None,
+            allowed_models=config.allowed_models,
+        )
+
+    def _stage_root_recovery_notice(
+        self, detail: RootRecoveryNoticeDetail, message: str
+    ) -> ProjectedUpdate | None:
+        """Stage one root-recovery milestone notice into the session history.
+
+        The deterministic entry id (``root-recovery:{milestone}:
+        {episode_id}:{attempt}``) makes the emission idempotent at the
+        projection layer; the entry rides the normal history (readable after
+        an overnight interval and across a reconnect) and is never injected
+        as a fresh instruction that would trigger another turn. The projector
+        stays registered under one harness-effects key for the session's
+        lifetime, so rebind/reset handle it like every other harness effect.
+        """
+        projector = self._harness_effects.get(_ROOT_RECOVERY_EFFECT_ID)
+        if projector is None:
+            projector = EventProjector(self._agent_loop.session_id, None)
+            self._harness_effects[_ROOT_RECOVERY_EFFECT_ID] = projector
+        entry_id = (
+            f"root-recovery:{detail.milestone}:{detail.episode_id}:{detail.attempt}"
+        )
+        if any(entry.id == entry_id for entry in projector.history):
+            return None
+        return projector.add_notice(entry_id, message=message, detail=detail)
+
+    def _deliver_root_recovery_notices(self, updates: list[ProjectedUpdate]) -> None:
+        """Deliver staged notice updates (sync context: the entries are
+        already durable in the history; delivery is best-effort).
+        """
+        if not updates:
+            return
+
+        async def deliver() -> None:
+            for update in updates:
+                with suppress(Exception):
+                    await self._emit_projected(update)
+
+        task = asyncio.create_task(deliver())
+        self._root_recovery_tasks.add(task)
+        task.add_done_callback(self._root_recovery_tasks.discard)
+
+    def _observe_root_turn_started(
+        self, turn_id: str, idempotency_key: str | None
+    ) -> None:
+        """Feed one turn start to the gate (sync context). Total by
+        contract: an observation failure must never mask the turn start.
+        """
+        try:
+            updates = self._root_recovery_gate.observe_turn_started(
+                turn_id, idempotency_key
+            )
+        except Exception:
+            logger.exception("root recovery turn-start observation failed")
+            return
+        self._deliver_root_recovery_notices(updates)
+
+    async def _observe_root_turn_finished(
+        self, turn_id: str, status: PublicTurnStatus
+    ) -> None:
+        """Feed one turn's terminal transition to the gate (async context).
+
+        Total by contract: an observation failure must never mask the
+        terminalization it observes.
+        """
+        try:
+            await self._root_recovery_gate.observe_turn_finished(turn_id, status)
+        except Exception:
+            logger.exception("root recovery turn-finish observation failed")
+
+    def _root_interaction_barrier(self) -> tuple[bool, str]:
+        """The interaction barrier read BEFORE callback cancellation (R2):
+        an open approval/question, queued user work, or unsettled
+        predecessor cleanup. Absence of callbacks AFTERWARD proves nothing.
+        """
+        if any(not record.core_resolved for record in self._callbacks.values()):
+            return True, "an approval or user question callback is still open"
+        if self._turn_queue:
+            return True, "queued user work is pending"
+        if self._handoff_pending:
+            return True, "predecessor cleanup is still settling"
+        return False, ""
+
+    def _root_effects_settled(self) -> bool:
+        """Whether every projected tool effect of the turn reached a settled
+        state (pending/running/blocked effects are unsettled).
+        """
+        projector = self._projector
+        if projector is None:
+            return True
+        return not any(
+            isinstance(entry, PublicEffectEntry)
+            and isinstance(
+                entry.state,
+                (PendingEffectState, RunningEffectState, BlockedEffectState),
+            )
+            for entry in projector.history
+        )
+
+    def _capture_root_turn_failure(
+        self, turn: PublicTurn, *, stop_reason: str | None
+    ) -> None:
+        """Stash the typed terminal projection for the recovery gate (R2).
+
+        Captured at ``_run_turn_phase``'s except — BEFORE ``public_error()``
+        destroys the exception context — and at the top of
+        ``_terminalize_failed_turn`` — BEFORE ``_cancel_callbacks`` — so the
+        eligibility decision never depends on post-cancellation state. Total
+        by contract: a capture failure must never mask the primary failure.
+        """
+        try:
+            barrier, barrier_detail = self._root_interaction_barrier()
+            failure = build_root_turn_failure(
+                observation=turn_observation(turn.id),
+                turn_id=turn.id,
+                committed=self._agent_loop.committed_model,
+                stop_reason=stop_reason,
+                effects_settled=self._root_effects_settled(),
+                interaction_barrier=barrier,
+                barrier_detail=barrier_detail,
+            )
+            self._root_recovery_gate.capture_terminal(failure)
+        except Exception:
+            logger.exception("root recovery projection capture failed")
+
     async def _finalize_turn(
         self,
         turn: PublicTurn,
@@ -1367,6 +1735,10 @@ class TurnController:  # noqa: PLR0904
             ):
                 await self._emit_projected(update)
             self._history.extend(projector.history)
+        # R2: feed the terminal transition to the recovery gate (a COMPLETED
+        # successor recovers the episode; an INTERRUPTED one is a user
+        # takeover; a FAILED one keeps the episode for the next schedule).
+        await self._observe_root_turn_finished(turn.id, status)
         self._cancel_callbacks("Turn ended")
         completed = turn.model_copy(
             update={
@@ -1550,17 +1922,118 @@ class TurnController:  # noqa: PLR0904
             raise TypeError(
                 f"Unsupported user-input request: {type(event.args).__name__}"
             )
+        # Admission for unattended expiry (plan U/OD1): the public snapshot
+        # rides on the callback detail for clients. An out-of-range timeout
+        # override is rejected here, before any callback is opened.
+        expiry = self._unattended_expiry(event)
         output = await self._open_callback(
             event,
             UserInputCallbackDetail(
-                request=event.args, related_entry_id=event.tool_call_id
+                request=event.args,
+                related_entry_id=event.tool_call_id,
+                unattended_expiry=expiry,
             ),
             title="User input required",
         )
+        record = self._callbacks[event.request_id]
+        if isinstance(output, UnansweredQuestions):
+            # Server-owned expiry disposition: resolve the core broker request
+            # with it and record exactly one deferred-question record. Expiry
+            # never approves anything; the tool result IS the unanswered
+            # disposition.
+            self._agent_loop.resolve_user_input_request(event.request_id, output)
+            record.core_resolved = True
+            self._agent_loop.deferred_questions.record_unanswered(
+                session_id=self._agent_loop.session_id,
+                request_id=event.request_id,
+                unanswered=output,
+            )
+            return
         if not isinstance(output, UserInputCallbackOutput):
             raise RuntimeError("Client returned the wrong user-input result")
         self._agent_loop.resolve_user_input_request(event.request_id, output.result)
-        self._callbacks[event.request_id].core_resolved = True
+        record.core_resolved = True
+
+    @staticmethod
+    def _echoed_questions(
+        request_id: str, args: UserQuestionRequest
+    ) -> list[UnansweredQuestion] | None:
+        """Echoed questions with stable IDs, or None when not defaultable.
+
+        Every question must be explicitly defaultable (plan U/OD1): a
+        requires_user question (or a missing default) blocks the whole batch,
+        so a mixed or protected batch never expires.
+        """
+        echoed: list[UnansweredQuestion] = []
+        for index, question in enumerate(args.questions):
+            default = question.unattended_default
+            if question.kind is QuestionKind.REQUIRES_USER or default is None:
+                return None
+            echoed.append(
+                UnansweredQuestion(
+                    question_id=f"{request_id}:{index}",
+                    question=question.question,
+                    header=question.header,
+                    kind=question.kind,
+                    unattended_default=default,
+                )
+            )
+        return echoed or None
+
+    def _unattended_expiry(
+        self, event: UserInputRequestEvent
+    ) -> UserInputCallbackExpiry | None:
+        """Admission for unattended expiry (plan U/OD1).
+
+        Returns the public expiry snapshot to attach to the callback detail,
+        or None when the request is permanently ineligible. Raises
+        ValueError when a model-supplied timeout override does not fit the
+        configured range (rejected, never clamped).
+
+        Every gate is provenance- or policy-based, never model-controlled:
+        runtime approvals (dangerous-command and root-access grants) share
+        the broker and callback plumbing but are permanently ineligible, and
+        a requires_user question (or a missing default) blocks the batch.
+        """
+        args = event.args
+        if not isinstance(args, UserQuestionRequest):
+            return None
+        loop = self._agent_loop
+        eligible = (
+            # Runtime approvals are permanently ineligible (see docstring).
+            event.origin is UserInputOrigin.MODEL_QUESTION
+            # Root agent in a supported interactive session only.
+            and not loop.is_subagent
+            and loop.user_input_capability
+            and loop.config.user_questions.unattended_timeout_enabled
+        )
+        if not eligible:
+            return None
+        questions = self._echoed_questions(event.request_id, args)
+        if questions is None:
+            return None
+        config = loop.config.user_questions
+        # The only actions a default may declare are defer_affected_work and
+        # preserve_existing_choice: neither authorizes anything new, and no
+        # option label can become an answer through expiry.
+        timeout = config.default_timeout_seconds
+        # The timeout override is tool-owned (AskUserQuestionArgs); the
+        # generic runtime request stays free of it.
+        override = getattr(args, "timeout_seconds", None)
+        if override is not None:
+            if (
+                override < _MIN_UNATTENDED_TIMEOUT_SECONDS
+                or override > config.max_timeout_seconds
+            ):
+                raise ValueError(
+                    "ask_user_question timeout_seconds must fit the configured "
+                    "[user_questions] range "
+                    f"[{_MIN_UNATTENDED_TIMEOUT_SECONDS:g}, "
+                    f"{config.max_timeout_seconds:g}] seconds; got "
+                    f"{override:g} (rejected, not clamped)"
+                )
+            timeout = override
+        return UserInputCallbackExpiry(timeout_seconds=timeout, questions=questions)
 
     async def _open_callback(
         self,
@@ -1568,9 +2041,10 @@ class TurnController:  # noqa: PLR0904
         detail: UserInputCallbackDetail,
         *,
         title: str,
-    ) -> CallbackOutput:
+    ) -> CallbackOutput | UnansweredQuestions:
         projector = self._projector
-        if projector is None or self._active_turn is None:
+        turn = self._active_turn
+        if projector is None or turn is None:
             raise RuntimeError("Cannot open callback without an active turn")
         callback_id = event.request_id
         record = CallbackRecord(
@@ -1589,7 +2063,97 @@ class TurnController:  # noqa: PLR0904
         )
         await self._emit_status("blocked", callback=entry)
         await self._deliver_callback(entry)
+        # The authoritative unattended-expiry timer lives beside the callback
+        # record (plan U/OD1) and is armed only AFTER delivery succeeds: a
+        # delivery failure is not user silence. A detached client is a
+        # silent no-op delivery, so server-side expiry works detached.
+        if detail.unattended_expiry is not None:
+            record.expiry = self._arm_expiry(
+                callback_id, detail.unattended_expiry, turn.id
+            )
         return await record.future
+
+    def _arm_expiry(
+        self, callback_id: str, policy: UserInputCallbackExpiry, turn_id: str
+    ) -> CallbackExpiry:
+        """Arm the authoritative unattended-expiry timer (plan U/OD1)."""
+        opened_at = self._clock()
+        expiry = CallbackExpiry(
+            deadline=opened_at + policy.timeout_seconds,
+            opened_at=opened_at,
+            timeout_seconds=policy.timeout_seconds,
+            questions=policy.questions,
+            session_id=self._agent_loop.session_id,
+            session_generation=self._agent_loop.session_generation,
+            turn_id=turn_id,
+        )
+        expiry.timer = asyncio.create_task(
+            self._expire_callback(callback_id, expiry),
+            name=f"app-server-question-expiry:{callback_id}",
+        )
+        return expiry
+
+    async def _expire_callback(self, callback_id: str, expiry: CallbackExpiry) -> None:
+        """Fire the unattended-expiry timer (plan U/OD1).
+
+        Waits out the monotonic deadline, then arbitrates under the callback
+        record's resolution lock: answer, expiry, keep-waiting, cancellation,
+        and reconnect races have exactly one winner. A stale timer (session
+        or turn generation changed) never fires, and there is no timer
+        restoration after a restart.
+        """
+        try:
+            await self._wakeup(max(0.0, expiry.deadline - self._clock()))
+        except asyncio.CancelledError:
+            # Keep-waiting, cancellation, or controller close won the race.
+            return
+        record = self._callbacks.get(callback_id)
+        if record is None:
+            return
+        async with record.resolution_lock:
+            if (
+                record.resolution is not None
+                or record.core_resolved
+                or record.future.done()
+                or record.expiry is not expiry
+                or expiry.kept_waiting
+            ):
+                return
+            loop = self._agent_loop
+            if (
+                loop.session_id != expiry.session_id
+                or loop.session_generation != expiry.session_generation
+            ):
+                return
+            turn = self._active_turn
+            if turn is None or turn.id != expiry.turn_id:
+                return
+            record.expired = True
+            record.core_resolved = True
+            unanswered = UnansweredQuestions(
+                questions=expiry.questions,
+                elapsed_seconds=self._clock() - expiry.opened_at,
+                timeout_seconds=expiry.timeout_seconds,
+                continuation_guidance=UNANSWERED_CONTINUATION_GUIDANCE,
+            )
+            # Closure is published BEFORE the future resolves (mirrors
+            # answer_callback): the effect-unblock patch must land while the
+            # related effect is still running — a completed effect is frozen,
+            # and a rejected patch drops the notification, gaps the client's
+            # event sequence, and triggers a resync.
+            if self._projector is not None:
+                for update in self._projector.expire_callback(
+                    callback_id, EXPIRED_CALLBACK_REASON
+                ):
+                    await self._emit_projected(update)
+            record.future.set_result(unanswered)
+        await self._emit_status("running")
+
+    def _cancel_expiry_timer(self, record: CallbackRecord) -> None:
+        expiry = record.expiry
+        if expiry is not None and expiry.timer is not None:
+            expiry.timer.cancel()
+            expiry.timer = None
 
     async def _project_events(
         self,
@@ -1795,6 +2359,7 @@ class TurnController:  # noqa: PLR0904
         if record.core_resolved:
             return
         record.core_resolved = True
+        self._cancel_expiry_timer(record)
         self._agent_loop.reject_request(record.event.request_id, error)
         if not record.future.done():
             record.future.set_exception(error)

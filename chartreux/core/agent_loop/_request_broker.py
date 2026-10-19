@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
-from chartreux.core.events import BaseEvent, UserInputRequestEvent
+from chartreux.core.events import BaseEvent, UserInputOrigin, UserInputRequestEvent
 from chartreux.core.tools.base import InteractionRequestPort, ToolError
 
 
@@ -24,7 +24,13 @@ class InteractionRequestBroker(InteractionRequestPort):
             raise RuntimeError("Cannot close an inactive interaction request stream")
         self._events = None
 
-    async def request_user_input(self, args: BaseModel, tool_call_id: str) -> BaseModel:
+    async def request_user_input(
+        self,
+        args: BaseModel,
+        tool_call_id: str,
+        *,
+        origin: UserInputOrigin = UserInputOrigin.RUNTIME_APPROVAL,
+    ) -> BaseModel:
         events = self._events
         if events is None:
             raise ToolError("User input is not available outside an active turn")
@@ -34,7 +40,10 @@ class InteractionRequestBroker(InteractionRequestPort):
         self._user_input_requests[request_id] = future
         await events.put(
             UserInputRequestEvent(
-                request_id=request_id, args=args, tool_call_id=tool_call_id
+                request_id=request_id,
+                args=args,
+                tool_call_id=tool_call_id,
+                origin=origin,
             )
         )
         try:

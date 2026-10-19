@@ -107,9 +107,26 @@ class RequestEvent(BaseEvent):
     request_id: str
 
 
+class UserInputOrigin(StrEnum):
+    """Trusted provenance for a user-input request (plan U/OD1).
+
+    ``MODEL_QUESTION`` marks a model-originated ``ask_user_question`` call —
+    the only origin eligible for unattended expiry. ``RUNTIME_APPROVAL`` marks
+    a runtime approval/grant prompt (dangerous-command and root-access
+    approvals share the request broker but never call the ask tool); those
+    requests are permanently ineligible for expiry. The origin is stamped by
+    trusted code through the interaction port, never by model arguments, and
+    defaults to the ineligible origin so a forgotten call site fails closed.
+    """
+
+    MODEL_QUESTION = "model_question"
+    RUNTIME_APPROVAL = "runtime_approval"
+
+
 class UserInputRequestEvent(RequestEvent):
     args: BaseModel
     tool_call_id: str
+    origin: UserInputOrigin = UserInputOrigin.RUNTIME_APPROVAL
 
 
 class TokenUsageUpdatedEvent(BaseEvent):

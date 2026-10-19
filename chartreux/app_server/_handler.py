@@ -80,16 +80,23 @@ from chartreux.app_server.models import (
     CallbackOutput,
     PublicCallbackEntry,
     PublicHistoryEntry,
+    PublicRecoveryEligibility,
     PublicSessionState,
 )
 from chartreux.app_server.protocol import (
     AgentsCancelParams,
     AgentsCancelResponse,
+    AgentsReconcileParams,
+    AgentsReconcileResponse,
     AgentsReleaseParams,
     AgentsReleaseResponse,
+    AgentsResumeParams,
+    AgentsResumeResponse,
     AgentTranscriptGetParams,
     AgentTranscriptGetResponse,
     AgentTranscriptState,
+    CallbackKeepWaitingParams,
+    CallbackKeepWaitingResponse,
     CallbackRespondParams,
     CallbackRespondResponse,
     CallbackResultError,
@@ -99,7 +106,12 @@ from chartreux.app_server.protocol import (
     ContextInjectParams,
     EmptyResponse,
     ProtocolErrorCode,
+    ReconcileOutcome,
     ReleaseOutcome,
+    ResumeOutcome,
+    RootRecoveryAdmitParams,
+    RootRecoveryCancelParams,
+    RootRecoveryScheduleParams,
     RunStopReason as PublicRunStopReason,
     RuntimeUpdatedParams,
     SessionCompactParams,
@@ -177,6 +189,7 @@ from chartreux.core.session_types import (
     SessionMetadata,
 )
 from chartreux.core.subagents import (
+    EffectVerification,
     ReleaseAgentOutcome,
     RunStopReason,
     UnknownAgentError,
@@ -367,6 +380,8 @@ class CoreRequestHandler:
                 result = await self._dispatch_workspace(method, raw_params)
             case "callback":
                 result = await self._dispatch_callback(method, raw_params)
+            case "recovery":
+                result = await self._dispatch_recovery(method, raw_params)
             case "review":
                 result = self._review.dispatch(method, raw_params)
             case (
@@ -426,6 +441,76 @@ class CoreRequestHandler:
                 AgentsReleaseResponse(
                     outcome=ReleaseOutcome(outcome.value),
                     reason=_RELEASE_REASONS[outcome],
+                )
+            )
+        if method == "agents/resume":
+            # WP2: explicit warm resume of a suspended failed run. The
+            # owning parent's attached session is the requester.
+            params = validate_wire(AgentsResumeParams, raw_params)
+            self._require_attached(self._agent_loop.session_id)
+            if self._closed:
+                raise RequestFailure(ProtocolErrorCode.CONFLICT, "Session is closing")
+            idempotency_key = params.idempotency_key or (
+                f"{params.agent_id}:{params.expected_run_id}"
+            )
+            result = await self._sessions.resume_agent(
+                params.agent_id,
+                params.expected_run_id,
+                idempotency_key,
+                requester_session_id=self._agent_loop.session_id,
+            )
+            return DispatchResult(
+                AgentsResumeResponse(
+                    outcome=ResumeOutcome(result.outcome.value),
+                    agent_id=result.agent_id,
+                    run_id=result.run_id,
+                    successor_run_id=result.successor_run_id,
+                    recovery_operation_id=result.recovery_operation_id,
+                    retry_at=result.retry_at,
+                    eligibility=(
+                        PublicRecoveryEligibility(result.eligibility.value)
+                        if result.eligibility is not None
+                        else None
+                    ),
+                    reason_codes=result.reason_codes,
+                    reason=result.reason,
+                    same_agent_resumes_used=result.same_agent_resumes_used,
+                )
+            )
+        if method == "agents/reconcile":
+            # WP2: reconcile_result pinned to the failed run and its
+            # transcript boundary; clears or prohibits the barrier.
+            params = validate_wire(AgentsReconcileParams, raw_params)
+            self._require_attached(self._agent_loop.session_id)
+            if self._closed:
+                raise RequestFailure(ProtocolErrorCode.CONFLICT, "Session is closing")
+            result = await self._sessions.reconcile_result(
+                params.agent_id,
+                params.expected_run_id,
+                params.transcript_boundary,
+                [
+                    EffectVerification(
+                        tool_call_id=effect.tool_call_id,
+                        disposition=effect.disposition,
+                        note=effect.note,
+                    )
+                    for effect in params.verified_effects
+                ],
+                requester_session_id=self._agent_loop.session_id,
+            )
+            return DispatchResult(
+                AgentsReconcileResponse(
+                    outcome=ReconcileOutcome(result.outcome.value),
+                    agent_id=result.agent_id,
+                    run_id=result.run_id,
+                    transcript_boundary=result.transcript_boundary,
+                    eligibility=(
+                        PublicRecoveryEligibility(result.eligibility.value)
+                        if result.eligibility is not None
+                        else None
+                    ),
+                    reason_codes=result.reason_codes,
+                    reason=result.reason,
                 )
             )
         raise method_not_found(method)
@@ -897,7 +982,49 @@ class CoreRequestHandler:
                     validate_wire(CallbackResultParams, raw_params)
                 )
             )
+        if method == "callback/keepWaiting":
+            return DispatchResult(
+                await self._keep_waiting_callback(
+                    validate_wire(CallbackKeepWaitingParams, raw_params)
+                )
+            )
         raise method_not_found(method)
+
+    async def _dispatch_recovery(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult:
+        """R2/OD3: the root automatic-recovery gate's wire surface.
+
+        ``recovery/root/schedule|admit|cancel`` are root-session operations
+        (``_require_attached`` rejects a child session's id); the gate itself
+        owns authoritative eligibility, episode accounting, and single-flight
+        admission. The TUI controller is the only production caller.
+        """
+        if method == "recovery/root/schedule":
+            params = validate_wire(RootRecoveryScheduleParams, raw_params)
+            self._require_attached(params.session_id)
+            return DispatchResult(await self._turns.root_recovery.schedule(params))
+        if method == "recovery/root/admit":
+            params = validate_wire(RootRecoveryAdmitParams, raw_params)
+            self._require_attached(params.session_id)
+            return DispatchResult(await self._turns.root_recovery.admit(params))
+        if method == "recovery/root/cancel":
+            params = validate_wire(RootRecoveryCancelParams, raw_params)
+            self._require_attached(params.session_id)
+            return DispatchResult(await self._turns.root_recovery.cancel(params))
+        raise method_not_found(method)
+
+    async def _keep_waiting_callback(
+        self, params: CallbackKeepWaitingParams
+    ) -> CallbackKeepWaitingResponse:
+        # Child sessions have no root turn controller; their callbacks are
+        # answered through the parent, so a keep-waiting request has no
+        # deadline to lift (plan U/OD1).
+        if await self._sessions.ensure_child(params.session_id):
+            return CallbackKeepWaitingResponse(status="no_deadline")
+        self._require_attached(params.session_id)
+        status = await self._turns.keep_waiting_callback(params.callback_id)
+        return CallbackKeepWaitingResponse(status=status)
 
     async def _callback_result(
         self, params: CallbackResultParams

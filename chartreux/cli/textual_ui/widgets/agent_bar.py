@@ -46,7 +46,7 @@ def _run_outcome(agent: AgentSummaryModel) -> str | None:
     return None
 
 
-def agent_state(agent: AgentSummaryModel) -> str:
+def agent_state(agent: AgentSummaryModel) -> str:  # noqa: PLR0911 - state matrix
     """Presentation state; finalization is not active generation."""
     availability = agent.availability.lower()
     if availability == "evicted":
@@ -55,6 +55,11 @@ def agent_state(agent: AgentSummaryModel) -> str:
         return _run_outcome(agent) or "closed"
     if availability == "finalizing":
         return "finishing"
+    if availability in {"suspended", "restoring"}:
+        # WP2: a suspended agent is held warm after a recoverable failure
+        # (its failed run is NOT the presentation state); a restoring agent
+        # has an admitted successor starting. Neither is an idle default.
+        return availability
     outcome = _run_outcome(agent)
     if outcome is not None:
         return outcome
@@ -66,7 +71,7 @@ def agent_state(agent: AgentSummaryModel) -> str:
 
 def agent_is_active(agent: AgentSummaryModel) -> bool:
     """Shared UI predicate for output polling and active-agent chrome."""
-    return agent_state(agent) in {"running", "compacting"}
+    return agent_state(agent) in {"running", "compacting", "restoring"}
 
 
 # Lifecycle groups (design §8). Grouping and counting key on availability,
@@ -101,7 +106,9 @@ _FILTER_EMPTY_NOTES = {
 def agent_group(agent: AgentSummaryModel) -> str:
     """The lifecycle group of an agent: active work, retained idle, or recent."""
     availability = agent.availability.lower()
-    if availability in {"running", "finalizing"}:
+    if availability in {"running", "finalizing", "suspended", "restoring"}:
+        # WP2: suspended/restoring agents are resident with recovery work
+        # pending or admitted — never the retained-idle default.
         return GROUP_ACTIVE
     if availability in {"closed", "evicted"}:
         return GROUP_RECENT
@@ -142,6 +149,8 @@ def _state_label(state: str, outcome: str | None = None) -> str:
         "compacting": f"{chrome_glyph('running')} Compacting",
         "finishing": f"{chrome_glyph('running')} Finishing",
         "idle": "Idle",
+        "suspended": f"{chrome_glyph('warning')} Suspended",
+        "restoring": f"{chrome_glyph('running')} Restoring",
         "failed": f"{chrome_glyph('error')} Failed",
         "cancelled": "! Cancelled",
         "budget-stopped": "! Budget stopped",
@@ -1201,6 +1210,8 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
                         for word, short in (
                             ("Compacting", "Comp"),
                             ("Running", "Run"),
+                            ("Suspended", "Susp"),
+                            ("Restoring", "Rest"),
                             ("Failed", "F"),
                             ("Budget", "B"),
                             ("Cancelled", "C"),

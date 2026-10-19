@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field
 import enum
 import json
@@ -17,9 +17,24 @@ from chartreux.core.events import (
     ToolStreamEvent,
 )
 from chartreux.core.launch_types import LaunchConfig, LaunchToolOverride
+from chartreux.core.recovery_models import (
+    FailureEnvelope,
+    RecoveryEligibility,
+    RecoveryReference,
+)
+from chartreux.core.recovery_policy import ReplacementDecision
 from chartreux.core.tools.ui import ToolUIDataAdapter
 
-__all__ = ["LaunchConfig", "LaunchToolOverride"]
+__all__ = [
+    "EffectVerification",
+    "LaunchConfig",
+    "LaunchToolOverride",
+    "ReconcileOutcome",
+    "ReconcileResult",
+    "RecoveryReference",
+    "ResumeAgentResult",
+    "ResumeOutcome",
+]
 
 if TYPE_CHECKING:
     from chartreux.core.tools.base import InvokeContext
@@ -180,6 +195,54 @@ class TaskResult(BaseModel):
         default=None,
         description="Additive completion metadata, including provider failover visibility.",
     )
+    run_status: RunStatus | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Terminal run status for background runs; None for launch "
+            "acknowledgments and foreground results."
+        ),
+    )
+    failure: FailureEnvelope | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Public typed failure envelope (bounded, redacted); set only for "
+            "failed background runs. Full diagnostics stay private."
+        ),
+    )
+    recovery: RecoveryReference | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Recovery-chain linkage for the failed run; None when there is "
+            "no failure envelope."
+        ),
+    )
+    # WP5 lineage pair: the orchestrator work-package identity and the failed
+    # agent this run's agent replaced (a replacement gets a NEW agent_id with
+    # predecessor/package lineage). Populated from the launch claim.
+    work_package_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Orchestrator work-package lineage; None when not claimed.",
+    )
+    predecessor_agent_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="The failed agent this run's agent replaced; None for a fresh agent.",
+    )
+    # WP5 failure-time replacement policy outcome for a claimed replacement
+    # launch: the validated decision (with its milestone notice) or the
+    # rejection/parking reason. None for unclaimed launches.
+    replacement: ReplacementDecision | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "The failure-time replacement policy decision for a claimed "
+            "replacement launch; None for unclaimed launches."
+        ),
+    )
 
 
 class RunStopReason(enum.StrEnum):
@@ -310,6 +373,14 @@ class AgentAvailability(enum.StrEnum):
     ``evicted`` is terminal metadata for a retained runtime removed by
     the idle TTL or idle cap. Terminal metadata is bounded (a TTL and a
     count cap) and disappears without expiring retained results.
+
+    WP2 (handoff §1.2/§1.8) adds ``suspended`` and ``restoring``: a
+    recoverable failure moves the record to ``suspended`` — an explicit,
+    bounded exception BEFORE closure, keeping the live conversation warm
+    and the agent explicitly resumable — and an admitted resume moves it
+    to ``restoring`` until the successor run starts. Suspension is not
+    retention under another name and not resurrection: closed and evicted
+    agents remain non-reusable.
     """
 
     RUNNING = "running"
@@ -317,6 +388,8 @@ class AgentAvailability(enum.StrEnum):
     IDLE = "idle"
     EVICTED = "evicted"
     CLOSED = "closed"
+    SUSPENDED = "suspended"
+    RESTORING = "restoring"
 
 
 class ReleaseAgentOutcome(enum.StrEnum):
@@ -335,6 +408,153 @@ class ReleaseAgentOutcome(enum.StrEnum):
     EVICTED = "evicted"
     CONFLICT = "conflict"
     UNKNOWN = "unknown"
+
+
+class ResumeOutcome(enum.StrEnum):
+    """Typed disposition of an explicit ``resume_agent`` request (WP2).
+
+    One management-port operation serves both the orchestrator's explicit
+    requests and (later) the automatic controller, so they cannot create
+    duplicate runs. ``scheduled`` admits exactly one successor (a NEW
+    run_id on the SAME agent identity); ``already_scheduled`` is the
+    single-flight deduplication of a concurrent same-key call;
+    ``already_resumed`` reports that the pinned failed run already has an
+    admitted successor. ``reconcile_required`` blocks replay while tool
+    outcomes are unresolved/unknown; ``expired`` reports a lapsed recovery
+    window (an admission stop, never an in-flight kill); ``not_resumable``
+    covers non-suspended, prohibited, or budget-exhausted targets;
+    ``forbidden`` covers authority failures.
+    """
+
+    SCHEDULED = "scheduled"
+    ALREADY_SCHEDULED = "already_scheduled"
+    ALREADY_RESUMED = "already_resumed"
+    RECONCILE_REQUIRED = "reconcile_required"
+    EXPIRED = "expired"
+    NOT_RESUMABLE = "not_resumable"
+    FORBIDDEN = "forbidden"
+
+
+class ResumeAgentResult(BaseModel):
+    """Result of one explicit resume admission (handoff §1.4).
+
+    Nonblocking acceptance: ``scheduled``/``already_scheduled`` carry the
+    recovery-operation id and the successor run id published on admission.
+    The failed run's result and every wait pinned to it stay immutable.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    outcome: ResumeOutcome
+    agent_id: str
+    run_id: str | None = Field(
+        default=None, description="The failed run the request targeted."
+    )
+    successor_run_id: str | None = Field(
+        default=None,
+        description="The admitted successor run; set for scheduled/already_*.",
+    )
+    recovery_operation_id: str | None = Field(
+        default=None, description="Deduplicatable id of the recovery operation."
+    )
+    retry_at: float | None = Field(
+        default=None,
+        description=(
+            "Epoch seconds at which the successor may start. WP2 admits "
+            "immediately (no auto-scheduling), so this is the admission time."
+        ),
+    )
+    eligibility: RecoveryEligibility | None = Field(
+        default=None,
+        description="The target run's current effective recovery eligibility.",
+    )
+    reason_codes: list[str] = Field(
+        default_factory=list, description="Bounded machine-readable explanation codes."
+    )
+    reason: str | None = Field(
+        default=None, description="Bounded human-readable explanation."
+    )
+    same_agent_resumes_used: int = Field(
+        default=0, description="Same-agent resumes already used in this recovery chain."
+    )
+
+
+class EffectVerification(BaseModel):
+    """One externally verified tool effect (``reconcile_result`` input).
+
+    The orchestrator (or a worker it dispatches) verifies unknown tool
+    outcomes externally — inspecting git/filesystem/job state — and submits
+    the verified dispositions. ``settled`` confirms the effect completed
+    consistently; ``unrepeatable_damage`` reports verification showing damage
+    that cannot be undone or safely repeated, which flips the barrier to
+    prohibited. An unverifiable outcome is simply not submitted: the
+    barrier never auto-clears.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool_call_id: str = Field(description="The tool call whose effect was verified.")
+    disposition: Literal["settled", "unrepeatable_damage"] = Field(
+        description=(
+            "settled: the effect completed consistently. "
+            "unrepeatable_damage: verification shows damage that cannot be "
+            "undone or safely repeated."
+        )
+    )
+    note: str | None = Field(
+        default=None, description="Bounded (<=500 chars) redacted verification note."
+    )
+
+    @field_validator("note")
+    @classmethod
+    def _bound_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value[:500]
+
+
+class ReconcileOutcome(enum.StrEnum):
+    """Typed disposition of a ``reconcile_result`` barrier submission (WP2).
+
+    The submission is PINNED to the failed run and its transcript
+    boundary: ``stale`` evidence (an earlier run or a different boundary)
+    cannot clear a newer barrier, and ``duplicate`` submissions change
+    nothing. ``cleared`` flips SUSPENDED[reconcile_required] to eligible;
+    ``prohibited`` flips it to prohibited with reason codes (verification
+    showed unrepeatable damage). Replacement remains permitted at any
+    point; the barrier never auto-clears.
+    """
+
+    CLEARED = "cleared"
+    PROHIBITED = "prohibited"
+    STALE = "stale"
+    DUPLICATE = "duplicate"
+    NOT_PENDING = "not_pending"
+    FORBIDDEN = "forbidden"
+
+
+class ReconcileResult(BaseModel):
+    """Result of one reconcile_result submission (handoff §1.4/§1.8)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    outcome: ReconcileOutcome
+    agent_id: str
+    run_id: str | None = Field(
+        default=None, description="The failed run the submission targeted."
+    )
+    transcript_boundary: str | None = Field(
+        default=None, description="The transcript boundary the evidence is pinned to."
+    )
+    eligibility: RecoveryEligibility | None = Field(
+        default=None, description="The barrier's eligibility after this submission."
+    )
+    reason_codes: list[str] = Field(
+        default_factory=list, description="Bounded machine-readable explanation codes."
+    )
+    reason: str | None = Field(
+        default=None, description="Bounded human-readable explanation."
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,6 +617,25 @@ class AgentSummary:
     compacting: bool = False
     stop_reason: RunStopReason | None = None
     """Current/latest run's structured stop reason, retained after finalization."""
+    last_failure: FailureEnvelope | None = None
+    """Public typed failure envelope of the latest failed run, if any."""
+    recovery_chain_id: str | None = None
+    """Stable recovery-chain identity across the resumes of one episode (WP2)."""
+    same_agent_resumes_used: int | None = None
+    """Same-agent resumes used in the chain; None when no chain is active."""
+    resumed_from_run_id: str | None = None
+    """The failed run the latest run resumed from, if it is a successor."""
+    recovery_eligibility: RecoveryEligibility | None = None
+    """The current effective recovery eligibility of the suspended barrier.
+
+    WP2: the published envelope stays immutable; a reconcile_result
+    submission flips this effective view (cleared -> eligible, verified
+    unrepeatable damage -> prohibited). None when no barrier is active.
+    """
+    work_package_id: str | None = None
+    """Orchestrator work-package lineage of the latest run (WP5); None when unclaimed."""
+    predecessor_agent_id: str | None = None
+    """The failed agent this agent replaced (WP5); None for a fresh agent."""
     name: str = ""
     """Human-facing ``{profile}-{model}-{number}`` name (design §5).
 
@@ -617,6 +856,46 @@ class SubagentManagementPort(Protocol):
         removing a closed or evicted tombstone. Raises ValueError for
         unknown agent_id. Release purges retained results, expiry markers,
         and wait leases.
+        """
+        ...
+
+    async def resume_agent(
+        self,
+        agent_id: str,
+        expected_run_id: str,
+        idempotency_key: str,
+        *,
+        requester_session_id: str,
+    ) -> ResumeAgentResult:
+        """Explicitly resume a suspended agent (handoff §1.4; WP2).
+
+        Nonblocking acceptance through ONE admission operation (the later
+        automatic controller must call the same operation): single-flight
+        and run-pinned, so concurrent same-key and different-key calls
+        admit exactly one successor with a NEW run_id on the SAME agent
+        identity. The old failed result and waits pinned to it stay
+        immutable; prior execution/tool tasks are joined before admission.
+        NO auto-scheduling: an admitted successor starts immediately.
+        """
+        ...
+
+    async def reconcile_result(
+        self,
+        agent_id: str,
+        expected_run_id: str,
+        transcript_boundary: str,
+        verified_effects: Sequence[EffectVerification],
+        *,
+        requester_session_id: str,
+    ) -> ReconcileResult:
+        """Submit externally verified tool effects for a reconcile barrier.
+
+        PINNED to the failed run and its transcript boundary: stale or
+        duplicate evidence cannot clear a newer barrier. ``cleared`` flips
+        SUSPENDED[reconcile_required] to eligible; verification showing
+        unrepeatable damage flips it to prohibited with reason codes.
+        Replacement remains permitted at any point; the barrier never
+        auto-clears.
         """
         ...
 

@@ -8,6 +8,7 @@ import time
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from chartreux.app_server._model import validate_wire
@@ -57,6 +58,7 @@ from chartreux.app_server.session import AppServerTurnError, _PublishedEvent
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.compaction import CompactionFailedError
 from chartreux.core.config import ModelConfig, SessionLoggingConfig
+from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.events import (
     AssistantEvent,
@@ -64,7 +66,10 @@ from chartreux.core.events import (
     CompactStartEvent,
     UserMessageEvent,
 )
+from chartreux.core.llm.exceptions import BackendError, PayloadSummary
 from chartreux.core.llm_models import FunctionCall, LLMMessage, Role, ToolCall
+from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.session_types import ScheduledLoop
 from chartreux.core.tools.models import ToolPermission
 from chartreux.user_content import UserResourceLink
@@ -75,6 +80,7 @@ from tests.app_server._session_runtime_support import (
 )
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
+from tests.recovery.conftest import ControlledTransport
 from tests.stubs.app_server import (
     attach_test_app_server_session,
     build_test_app_server,
@@ -105,6 +111,19 @@ async def test_injected_turn_hides_user_after_stream_failure() -> None:
 
         assert agent_loop.messages[-1].role is Role.assistant
         assert agent_loop.messages[-1].content == "partial"
+        # The interrupted stream armed the shared deployment cooldown. Since
+        # the WP0 F6 fix an injected turn no longer resets it (only a
+        # user-initiated retry does), so clear it explicitly here: this test's
+        # intent is the injected turn's hidden user message, not cooldown
+        # semantics, which tests/recovery/test_injected_retry_flag.py owns.
+        registry = agent_loop.config_orchestrator.availability_registry
+        committed = agent_loop.committed_model
+        assert committed is not None
+        assert (
+            registry.cooldown_until(committed.base_model, committed.provider)
+            is not None
+        )
+        registry.reset_base(committed.base_model)
         await _consume(session.act("hidden continuation", injected=True))
         restored_history = project_history(agent_loop)
     finally:
@@ -1095,3 +1114,84 @@ async def test_install_root_restores_previous_backend_when_replacement_setup_fai
         await session.clear_history()
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_r0_all_deployments_unavailable_surfaces_typed_turn_error() -> None:
+    """R0 acceptance 3 (app-server surface): all-deployments-unavailable is a
+    VISIBLE terminal state for the root turn.
+
+    Turn 1 faults on the only deployment and arms the shared cooldown. Turn 2
+    is blocked at admission: it fails with the typed
+    ``ALL_DEPLOYMENTS_UNAVAILABLE`` error whose message names the model and
+    each deployment's exclusion reason — and no second transport attempt
+    exists (no retry storm, no hidden automatic continuation).
+    """
+    snapshot = CatalogSnapshot(
+        ModelCatalog.model_validate({
+            "providers": {"test-first": {"api_base": "https://first.invalid"}},
+            "models": {
+                "base": {"deployments": [{"provider": "test-first", "name": "first"}]}
+            },
+            "roles": {},
+        }),
+        "test-revision",
+    )
+    config = ChartreuxConfigSchema.model_validate(
+        {"active_model": "base"}, context={"catalog_snapshot": snapshot}
+    ).attach_catalog_snapshot(snapshot)
+    # Production-faithful (D1/L): the fault carries its httpx cause, so it
+    # classifies CONNECTION and the deployment cooldown arms.
+    fault = BackendError(
+        provider="test-first",
+        endpoint="https://first.invalid/chat",
+        status=None,
+        reason="network boom",
+        headers=None,
+        body_text=None,
+        parsed_error="Network error",
+        model="first",
+        payload_summary=PayloadSummary(
+            model="first",
+            message_count=1,
+            approx_chars=10,
+            temperature=0,
+            has_tools=False,
+            tool_choice=None,
+        ),
+    )
+    fault.__cause__ = httpx.ConnectError("network boom")
+    backend = ControlledTransport([fault])
+    agent_loop = build_test_agent_loop(
+        config=config, backend=backend, enable_streaming=True
+    )
+    session = await create_test_app_server_session(agent_loop)
+    try:
+        # Turn 1: the only deployment faults; the failure arms the cooldown.
+        with pytest.raises(AppServerTurnError) as first:
+            await _consume(session.act("hi", client_message_id="u1"))
+        assert first.value.error.code == TurnErrorCode.BACKEND_ERROR
+
+        # Turn 2: admission finds no eligible deployment — the visible
+        # terminal state, with zero further transport attempts.
+        with pytest.raises(AppServerTurnError) as second:
+            await _consume(session.act("again", client_message_id="u2"))
+        assert second.value.error.code == TurnErrorCode.ALL_DEPLOYMENTS_UNAVAILABLE
+        assert (
+            "All deployments for model 'base' are unavailable"
+            in second.value.error.message
+        )
+        assert "test-first" in second.value.error.message
+        assert "cooldown" in second.value.error.message
+        details = second.value.error.details
+        assert isinstance(details, dict)
+        assert details["base_model"] == "base"
+        exclusions = cast(list[dict[str, str]], details["exclusions"])
+        assert len(exclusions) == 1
+        assert exclusions[0]["provider"] == "test-first"
+        assert exclusions[0]["reason"] == "cooldown"
+        # Exactly one transport attempt across both turns.
+        assert len(backend.requests_messages) == 1
+    finally:
+        await session.close()
+        await agent_loop.aclose()

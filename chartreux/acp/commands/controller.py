@@ -35,9 +35,16 @@ type SendConfigOptions = Callable[[AcpSession], Awaitable[None]]
 
 @dataclass(frozen=True)
 class InjectedPrompt:
-    """Command outcome that runs a turn on a prompt the user never typed."""
+    """Command outcome that runs a turn on a prompt the user never typed.
+
+    ``user_initiated_retry`` marks the /retry command: a user action that
+    must keep its intentional shared-cooldown reset on the app server. Any
+    other injected prompt is an automatic continuation and never resets
+    cooldowns (WP0 F6).
+    """
 
     text: str
+    user_initiated_retry: bool = False
 
 
 class AcpCommandController:
@@ -294,7 +301,12 @@ class AcpCommandController:
     ) -> PromptResponse | InjectedPrompt:
         if not session.app_server.history:
             return await self._reply(session, _RETRY_NO_HISTORY_MESSAGE)
-        return InjectedPrompt(build_retry_prompt(instructions))
+        # /retry is a user-initiated retry: mark the injected prompt so the
+        # app server resets that base's shared availability cooldowns (the
+        # same behavior as the TUI /retry; WP0 F6).
+        return InjectedPrompt(
+            build_retry_prompt(instructions), user_initiated_retry=True
+        )
 
     async def _reply(
         self,

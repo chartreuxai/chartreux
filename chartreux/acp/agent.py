@@ -244,6 +244,7 @@ class _TurnInput:
     user_display_content: UserDisplayContent | None = None
     mention_stats: MentionStats | None = None
     injected: bool = False
+    user_initiated_retry: bool = False
 
 
 def _project_acp_mcp_servers(
@@ -699,8 +700,18 @@ class ChartreuxAcpAgent(AcpAgent):
         match await self._command_controller.execute(session, text, message_id):
             case PromptResponse() as response:
                 return response
-            case InjectedPrompt(text=injected_text):
-                turn_input = _TurnInput(text=injected_text, injected=True)
+            case InjectedPrompt(
+                text=injected_text, user_initiated_retry=user_initiated_retry
+            ):
+                # The /retry command marks its InjectedPrompt as
+                # user-initiated; any other injected prompt is an
+                # automatic continuation and never resets cooldowns
+                # (WP0 F6).
+                turn_input = _TurnInput(
+                    text=injected_text,
+                    injected=True,
+                    user_initiated_retry=user_initiated_retry,
+                )
             case None:
                 turn_input = await self._prepare_turn_input(
                     session, content, message_id=message_id, display=display
@@ -717,6 +728,7 @@ class ChartreuxAcpAgent(AcpAgent):
                     user_display_content=turn_input.user_display_content,
                     mention_stats=turn_input.mention_stats,
                     injected=turn_input.injected,
+                    user_initiated_retry=turn_input.user_initiated_retry,
                 )
             ) as events:
                 async for event in events:
@@ -787,10 +799,21 @@ class ChartreuxAcpAgent(AcpAgent):
                 callback.callback_id, CallbackResultError(message=str(exc))
             )
             return
-        await session.app_server.respond_to_callback(
-            callback.callback_id,
-            UserInputCallbackOutput(result=UserQuestionResult(answers=answers)),
-        )
+        try:
+            await session.app_server.respond_to_callback(
+                callback.callback_id,
+                UserInputCallbackOutput(result=UserQuestionResult(answers=answers)),
+            )
+        except AppServerResponseError as exc:
+            if exc.error.code is ProtocolErrorCode.CALLBACK_CLOSED:
+                # The question expired unanswered server-side (plan U/OD1);
+                # the turn already continued with the deferred outcome, so a
+                # late elicitation answer must never grant the old operation.
+                logger.info(
+                    "Skipping late answer for expired callback %s", callback.callback_id
+                )
+                return
+            raise
 
     @override
     async def cancel(self, session_id: str, **kwargs: Any) -> None:

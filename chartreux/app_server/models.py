@@ -8,6 +8,8 @@ from typing import Annotated, Literal, Self
 from pydantic import (
     AliasChoices,
     AwareDatetime,
+    BaseModel,
+    ConfigDict,
     Field,
     JsonValue,
     TypeAdapter,
@@ -64,6 +66,9 @@ from chartreux.app_server._effect_models import (
 from chartreux.app_server._model import ProtocolModel
 from chartreux.questions import (
     QuestionChoice as QuestionChoice,
+    UnansweredQuestion as UnansweredQuestion,
+    UnansweredQuestions as UnansweredQuestions,
+    UnattendedDefaultAction as UnattendedDefaultAction,
     UserAnswer as UserAnswer,
     UserQuestion as UserQuestion,
     UserQuestionRequest as UserQuestionRequest,
@@ -263,10 +268,28 @@ def validate_turn_input_entries(entries: list[TurnInputEntry]) -> None:
         raise ValueError("The user entry must be the final turn input entry")
 
 
+class UserInputCallbackExpiry(ProtocolModel):
+    """Public snapshot of an armed unattended-expiry policy (plan U/OD1).
+
+    Attached to the callback detail when the server arms the unattended timer
+    for an eligible model-originated question. It carries the effective
+    timeout and the echoed questions with their declared defaults so clients
+    can show an honest countdown. Expiry defers the affected work; it never
+    approves anything, and no option label ever becomes an answer through it.
+    """
+
+    timeout_seconds: float = Field(gt=0.0)
+    questions: list[UnansweredQuestion] = Field(
+        description="Echoed questions with stable IDs and declared defaults",
+        min_length=1,
+    )
+
+
 class UserInputCallbackDetail(ProtocolModel):
     kind: Literal["user_input"] = "user_input"
     request: UserQuestionRequest
     related_entry_id: str | None = None
+    unattended_expiry: UserInputCallbackExpiry | None = None
 
 
 CallbackDetail = UserInputCallbackDetail
@@ -530,6 +553,214 @@ class AgentSummary(ProtocolModel):
     description: str
     safety: AgentSafety
     agent_type: AgentType
+
+
+# --- Agent failure envelope (WP1) -------------------------------------------
+# Public wire spelling of the typed failure envelope (handoff §1.7 schema v1).
+# The canonical models live in chartreux.core.recovery_models; the public
+# app-server layer cannot import core (app-server boundary), so these wire
+# models mirror the core schema field-for-field — pinned by a mirror-contract
+# test — and the server boundary projects core envelopes onto them. Plain
+# BaseModel (not ProtocolModel) on purpose: the envelope's wire spelling is
+# snake_case with the failure block's "class" alias, exactly like the core
+# models, so the notification wire shape is unchanged.
+
+
+class PublicFailureClass(StrEnum):
+    """Subagent-level operational signature (not a proven cause)."""
+
+    PROVIDER_STALL = "provider_stall"
+    PROVIDER_OVERLOADED = "provider_overloaded"
+    PROVIDER_RATE_LIMIT = "provider_rate_limit"
+    LAUNCH_FAILURE = "launch_failure"
+    PREFLIGHT = "preflight"
+    TASK = "task"
+    CANCELLATION = "cancellation"
+    AUTHORIZATION = "authorization"
+    PERMANENT_CONFIG = "permanent_config"
+    BUDGET_STOP = "budget_stop"
+    INCOMPLETE_STREAM = "incomplete_stream"
+    EMPTY_RESPONSE = "empty_response"
+    UNKNOWN = "unknown"
+    INTERNAL = "internal"
+
+
+class PublicFailureCategory(StrEnum):
+    """The low-level classifier's category for the observed cause."""
+
+    AUTH = "auth"
+    BILLING = "billing"
+    QUOTA = "quota"
+    INVALID_REQUEST = "invalid_request"
+    CONTEXT_SIZE = "context_size"
+    CANCELLATION = "cancellation"
+    CONNECTION = "connection"
+    TIMEOUT = "timeout"
+    SERVER_ERROR = "server_error"
+    OVERLOAD = "overload"
+    RATE_LIMIT = "rate_limit"
+    CONFLICT = "conflict"
+    TOO_EARLY = "too_early"
+    INCOMPLETE_STREAM = "incomplete_stream"
+    EMPTY_RESPONSE = "empty_response"
+    UNKNOWN = "unknown"
+
+
+class PublicFailurePhase(StrEnum):
+    """Execution phase where the failure was observed."""
+
+    ADMISSION = "admission"
+    INIT = "init"
+    LLM_CALL = "llm_call"
+    TOOL = "tool"
+    FINALIZE = "finalize"
+    MONITOR = "monitor"
+    UNKNOWN = "unknown"
+
+
+class PublicFailureConfidence(StrEnum):
+    """How the failure class was established."""
+
+    MEASURED = "measured"
+    SIGNATURE = "signature"
+
+
+class PublicProgressState(StrEnum):
+    """Progress state of the failed run."""
+
+    NONE = "none"
+    CHECKPOINTED = "checkpointed"
+    UNCHECKPOINTED = "uncheckpointed"
+    UNCERTAIN = "uncertain"
+
+
+class PublicToolEffectsDisposition(StrEnum):
+    """Tool-effect reconciliation state."""
+
+    SETTLED = "settled"
+    UNRESOLVED = "unresolved"
+    UNKNOWN = "unknown"
+
+
+class PublicRecoveryEligibility(StrEnum):
+    """Recovery disposition carried by the envelope (never acted on in WP1)."""
+
+    ELIGIBLE = "eligible"
+    RECONCILE_REQUIRED = "reconcile_required"
+    PROHIBITED = "prohibited"
+
+
+class PublicExhaustionReason(StrEnum):
+    """Why the exhausted logical call gave up."""
+
+    DEADLINE = "deadline"
+    ATTEMPTS = "attempts"
+    NONRETRYABLE = "nonretryable"
+    UNKNOWN = "unknown"
+
+
+class PublicEnvelopeFailure(BaseModel):
+    """The failure block: class, cause, phase, bounded redacted message."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    failure_class: PublicFailureClass = Field(
+        # The wire spelling is "class" (§1.7), mirrored from the core model.
+        serialization_alias="class",
+        validation_alias="class",
+    )
+    cause_category: PublicFailureCategory | None = None
+    phase: PublicFailurePhase
+    exception_type: str | None = None
+    message: str | None = None
+    confidence: PublicFailureConfidence
+    evidence_codes: list[str] = Field(default_factory=list)
+    fingerprint: str | None = None
+    classification_version: str = "v0.5.6-wp1"
+    classification_provenance: str = ""
+    diagnostics_state: Literal["captured", "unavailable"] = "unavailable"
+
+
+class PublicEnvelopeDeployment(BaseModel):
+    """The ATTEMPTED deployment — not just the committed model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    configured_model: str | None = None
+    base_model: str | None = None
+    provider: str | None = None
+    wire_name: str | None = None
+    endpoint: str | None = None
+
+
+class PublicEnvelopeRequest(BaseModel):
+    """The request block: one logical call, measured."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    logical_call_id: str | None = None
+    transport_attempts: int | None = None
+    elapsed_seconds: float | None = None
+    retry_budget_seconds: float | None = None
+    exhaustion: PublicExhaustionReason | None = None
+    request_id: str | None = None
+    request_state: str | None = None
+    retry_after_seconds: float | None = None
+    response_started: bool | None = None
+    semantic_output_published: bool | None = None
+
+
+class PublicEnvelopeProgress(BaseModel):
+    """The progress block — observable artifacts, not accounting."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    turns_used: int | None = None
+    state: PublicProgressState = PublicProgressState.UNCERTAIN
+    checkpoint_ref: str | None = None
+    transcript_boundary: str | None = None
+    touched_paths_hint: list[str] = Field(default_factory=list)
+    artifact_refs: list[str] = Field(default_factory=list)
+    tool_effects: PublicToolEffectsDisposition = PublicToolEffectsDisposition.UNKNOWN
+    last_progress_at: float | None = None
+
+
+class PublicEnvelopeRecovery(BaseModel):
+    """The recovery block: represented disposition, never acted on."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    eligibility: PublicRecoveryEligibility
+    reason_codes: list[str] = Field(default_factory=list)
+    same_agent_resumes_used: int = 0
+    expires_at: float | None = None
+
+
+class PublicFailureEnvelope(BaseModel):
+    """The public typed failure envelope (handoff §1.7, schema v1).
+
+    One envelope per exhausted logical call — deduplicatable by ``event_id``,
+    never one per transport retry. Wire mirror of
+    ``chartreux.core.recovery_models.FailureEnvelope``; bounded and redacted
+    throughout, full diagnostics stay private.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    event_id: str
+    agent_id: str
+    run_id: str
+    work_package_id: str | None = None
+    # WP5 lineage pair: the failed agent this run's agent replaced
+    # (null = not a replacement). Mirrors the core envelope field.
+    predecessor_agent_id: str | None = None
+    recovery_chain_id: str
+    observed_at: float
+    failure: PublicEnvelopeFailure
+    deployment: PublicEnvelopeDeployment
+    request: PublicEnvelopeRequest
+    progress: PublicEnvelopeProgress
+    recovery: PublicEnvelopeRecovery
 
 
 class SkillSummary(ProtocolModel):
@@ -812,6 +1043,33 @@ class ScheduledLoopFiredNoticeDetail(ProtocolModel):
     loop_id: str
 
 
+class RootRecoveryNoticeDetail(ProtocolModel):
+    """R2: a root automatic-recovery milestone line (deterministic notice id).
+
+    The milestone vocabulary: ``scheduled`` (attempt/limit, reason, delay,
+    affected deployment), ``started`` (successor turn id + the
+    preserved-conversation warning), ``recovered``, ``exhausted``/``blocked``
+    (manual Retry availability), ``cancelled`` (user takeover). The entry id
+    carries the deterministic identity (``root-recovery:{milestone}:
+    {episode_id}``); notices ride the normal history, so they stay readable
+    across a reconnect, and they are never injected as fresh instructions.
+    """
+
+    kind: Literal["root_recovery"] = "root_recovery"
+    milestone: Literal[
+        "scheduled", "started", "recovered", "exhausted", "cancelled"
+    ] = "scheduled"
+    episode_id: str = ""
+    attempt: int = 0
+    limit: int = 0
+    reason: str = ""
+    delay_seconds: float = 0.0
+    successor_turn_id: str | None = None
+    predecessor_turn_id: str | None = None
+    eligible_class: str | None = None
+    affected_deployment: str | None = None
+
+
 NoticeDetail = Annotated[
     HookNoticeDetail
     | ContextClearedNoticeDetail
@@ -819,7 +1077,8 @@ NoticeDetail = Annotated[
     | PlanReviewStartedNoticeDetail
     | PlanReviewEndedNoticeDetail
     | WaitingForInputNoticeDetail
-    | ScheduledLoopFiredNoticeDetail,
+    | ScheduledLoopFiredNoticeDetail
+    | RootRecoveryNoticeDetail,
     Field(discriminator="kind"),
 ]
 

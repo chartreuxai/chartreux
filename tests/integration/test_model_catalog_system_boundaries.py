@@ -679,3 +679,53 @@ async def test_repeated_attempt_lifecycle_closes_once_and_does_not_extend_deadli
     assert deadlines[2] >= deadlines[1]
     assert len(os.listdir("/proc/self/fd")) - before <= 2
     assert (first.closes, second.closes) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_wires_recovery_subagents_thresholds_into_shared_registry() -> (
+    None
+):
+    """WP4 (WP1 E4 #4): the config reaches the shared availability registry.
+
+    The real ConfigOrchestrator builds its default AvailabilityRegistry from
+    the accepted ``[recovery.subagents]`` endpoint correlation thresholds, so
+    the child controller's validated policy arms the root-owned component
+    shared by every runtime.
+    """
+    snapshot = _snapshot("A")
+    layer = OverridesLayer(
+        data={
+            "recovery": {
+                "subagents": {
+                    "endpoint_correlation_window_seconds": 123.0,
+                    "endpoint_correlation_min_events": 3,
+                    "endpoint_correlation_min_models": 4,
+                    "endpoint_cooldown_seconds": 9.5,
+                }
+            }
+        }
+    )
+    orchestrator = await ConfigOrchestrator.create(
+        schema=ChartreuxConfigSchema,
+        layers=[DefaultConfigLayer(schema=ChartreuxConfigSchema), layer],
+        default_layer_resolver=lambda: layer,
+        catalog_snapshot=snapshot,
+    )
+    registry = orchestrator.availability_registry
+    assert registry.endpoint_correlation_window == 123.0
+    assert registry.endpoint_correlation_min_events == 3
+    assert registry.endpoint_correlation_min_models == 4
+    assert registry.endpoint_cooldown == 9.5
+
+    # Defaults still apply when the section is absent.
+    plain_layer = OverridesLayer(data={"active_model": "first"})
+    plain = await ConfigOrchestrator.create(
+        schema=ChartreuxConfigSchema,
+        layers=[DefaultConfigLayer(schema=ChartreuxConfigSchema), plain_layer],
+        default_layer_resolver=lambda: plain_layer,
+        catalog_snapshot=snapshot,
+    )
+    assert plain.availability_registry.endpoint_correlation_window == 300.0
+    assert plain.availability_registry.endpoint_correlation_min_events == 2
+    assert plain.availability_registry.endpoint_correlation_min_models == 2
+    assert plain.availability_registry.endpoint_cooldown == 30.0

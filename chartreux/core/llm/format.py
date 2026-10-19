@@ -17,6 +17,11 @@ class ParsedToolCall(BaseModel):
     tool_name: str
     raw_args: dict[str, Any]
     call_id: str = ""
+    # Set when the model's argument payload is not a JSON object: malformed
+    # JSON, or well-formed JSON that is not an object. Such a call is never
+    # invoked with silently substituted arguments (WP1 acceptance: REJECTED
+    # via the structured invalid-call path).
+    arguments_error: str | None = None
 
 
 class ResolvedToolCall(BaseModel):
@@ -94,16 +99,31 @@ class APIToolFormatHandler:
         for tc in api_tool_calls:
             if not (function_call := tc.function):
                 continue
+            arguments_error: str | None = None
+            raw_arguments = function_call.arguments or ""
             try:
-                args = json.loads(function_call.arguments or "{}")
-            except json.JSONDecodeError:
+                args = json.loads(raw_arguments) if raw_arguments else {}
+            except json.JSONDecodeError as exc:
+                # Malformed argument JSON is never silently replaced with an
+                # empty object (WP1 acceptance): the call is routed to the
+                # structured invalid-call path instead of being invoked with
+                # synthesized arguments.
                 args = {}
+                arguments_error = f"Malformed tool arguments JSON: {exc}"
+            else:
+                if not isinstance(args, dict):
+                    arguments_error = (
+                        "Tool arguments must be a JSON object, got "
+                        f"{type(args).__name__}"
+                    )
+                    args = {}
 
             tool_calls.append(
                 ParsedToolCall(
                     tool_name=function_call.name or "",
                     raw_args=args,
                     call_id=tc.id or "",
+                    arguments_error=arguments_error,
                 )
             )
 
@@ -118,6 +138,17 @@ class APIToolFormatHandler:
         active_tools = tool_manager.available_tools
 
         for parsed_call in parsed.tool_calls:
+            if parsed_call.arguments_error is not None:
+                # A malformed argument payload is a rejected call: it is
+                # never invoked (not even with all-optional arguments).
+                failed_calls.append(
+                    FailedToolCall(
+                        tool_name=parsed_call.tool_name,
+                        call_id=parsed_call.call_id,
+                        error=parsed_call.arguments_error,
+                    )
+                )
+                continue
             tool_class = active_tools.get(parsed_call.tool_name)
             if not tool_class:
                 failed_calls.append(

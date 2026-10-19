@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from typing import cast
 
-from chartreux.core.events import ToolResultEvent
+from pydantic import Field
+
+from chartreux.core.events import ToolResultEvent, UserInputOrigin
 from chartreux.core.tools.base import (
     BaseTool,
     BaseToolConfig,
@@ -14,10 +16,37 @@ from chartreux.core.tools.base import (
 )
 from chartreux.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from chartreux.questions import (
-    UserQuestionRequest as AskUserQuestionArgs,
-    UserQuestionResult as AskUserQuestionResult,
+    UnansweredQuestions,
+    UserQuestionRequest,
+    UserQuestionResult,
 )
 from chartreux.utils.tool_presentation import ToolEffectKind
+
+# The result covers all three typed dispositions (answered | cancelled |
+# unanswered); the unanswered disposition is the server-owned
+# UnansweredQuestions subclass (plan U/OD1).
+AskUserQuestionResult = UserQuestionResult
+
+
+class AskUserQuestionArgs(UserQuestionRequest):
+    """Dedicated ask_user_question arguments (plan U/OD1).
+
+    Not an alias of the generic runtime request: the tool contract owns the
+    request-level unattended-timeout override. The override must fit the
+    configured [user_questions] range; it is rejected, never clamped.
+    """
+
+    timeout_seconds: float | None = Field(
+        default=None,
+        gt=0.0,
+        allow_inf_nan=False,
+        description=(
+            "Optional per-request unattended timeout in seconds. Must fit the "
+            "configured [user_questions] range; out-of-range values are "
+            "rejected. Only questions with kind informational/preference and "
+            "an unattended_default may expire."
+        ),
+    )
 
 
 class AskUserQuestionConfig(BaseToolConfig):
@@ -58,6 +87,16 @@ class AskUserQuestion(
             return ToolResultDisplay(success=False, message=event.error)
 
         result = event.result
+        if isinstance(result, UnansweredQuestions):
+            return ToolResultDisplay(
+                success=False,
+                verb="Unanswered",
+                message=(
+                    f"Unanswered — deferred (no answer within "
+                    f"{result.timeout_seconds:g}s); no permission granted"
+                ),
+            )
+
         if not isinstance(result, AskUserQuestionResult):
             return ToolResultDisplay(success=True, verb="Answered", message="")
 
@@ -85,6 +124,10 @@ class AskUserQuestion(
             )
 
         result = await ctx.interaction_requests.request_user_input(
-            args, ctx.tool_call_id
+            args,
+            ctx.tool_call_id,
+            # Model-originated question: the only origin eligible for
+            # unattended expiry (plan U/OD1).
+            origin=UserInputOrigin.MODEL_QUESTION,
         )
         yield cast(AskUserQuestionResult, result)

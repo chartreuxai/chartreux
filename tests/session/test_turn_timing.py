@@ -344,6 +344,8 @@ async def test_recovery_reannounces_timing_and_replaces_copied_stale_entries() -
         _cancel_callbacks=lambda _reason: None,
         _emit_projected=emit,
         _publish_turn_completed=noop,
+        _capture_root_turn_failure=lambda *_args, **_kwargs: None,
+        _observe_root_turn_finished=noop,
         _emit_status=noop,
     )
     turn = PublicTurn(

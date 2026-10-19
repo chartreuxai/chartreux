@@ -178,6 +178,18 @@ class CallbackRespondResponse(ProtocolModel):
     status: Literal["accepted", "duplicate"]
 
 
+class CallbackKeepWaitingParams(ProtocolModel):
+    session_id: str
+    callback_id: str
+
+
+class CallbackKeepWaitingResponse(ProtocolModel):
+    # "kept" lifts the deadline (OPEN_WITHOUT_DEADLINE); "already_terminal"
+    # means the callback resolved first; "no_deadline" means no unattended
+    # timer is armed for it (plan U/OD1).
+    status: Literal["kept", "already_terminal", "no_deadline"]
+
+
 class CallbackResultError(ProtocolModel):
     message: str
     code: str | None = None
@@ -209,3 +221,72 @@ def validate_callback_acknowledgement(
     if callback_id != response.callback_id:
         raise ValueError("Callback acknowledgement does not match the request")
     return response
+
+
+class RootRecoveryScheduleParams(ProtocolModel):
+    """R2: ask the app-server recovery gate to schedule the automatic
+    continuation of one terminally failed ROOT turn.
+
+    ``terminal_turn_id`` carries the terminal turn identity (the solicited
+    ``AppServerTurnError`` and the unsolicited ``TurnCompleted`` both name
+    it); ``input_generation`` is the client's input-generation token at
+    observation time — the gate rechecks it at admission.
+    """
+
+    session_id: str
+    terminal_turn_id: str
+    solicited: bool = False
+    input_generation: int = 0
+
+
+class RootRecoveryScheduleResponse(ProtocolModel):
+    decision: Literal["scheduled", "already_scheduled", "declined"]
+    reason: str = ""
+    episode_id: str | None = None
+    idempotency_key: str | None = None
+    attempt: int = 0
+    limit: int = 0
+    delay_seconds: float = 0.0
+    eligible_class: str | None = None
+    affected_deployment: str | None = None
+
+
+class RootRecoveryAdmitParams(ProtocolModel):
+    """R2: single-flight admission of the scheduled continuation.
+
+    The idempotency key comes from the episode/predecessor/retry index; the
+    gate rechecks session/turn/input generation, queued work, callbacks,
+    stop state, budget, and LIVE availability at admission.
+    """
+
+    session_id: str
+    episode_id: str
+    idempotency_key: str
+    terminal_turn_id: str
+    input_generation: int = 0
+
+
+class RootRecoveryAdmitResponse(ProtocolModel):
+    decision: Literal["admitted", "already_admitted", "deferred", "declined"]
+    reason: str = ""
+    attempt: int = 0
+    limit: int = 0
+    # The recheck delay for a "deferred" read-only availability wait.
+    delay_seconds: float = 0.0
+    # For "already_admitted": the linked successor turn when the gate has
+    # already observed its start (ambiguous-delivery reconciliation); None
+    # when the admission was consumed but no successor start was observed.
+    turn_id: str | None = None
+    predecessor_turn_id: str | None = None
+
+
+class RootRecoveryCancelParams(ProtocolModel):
+    """R2: cancel a pending schedule (user takeover / local cancellation)."""
+
+    session_id: str
+    episode_id: str
+    reason: str = ""
+
+
+class RootRecoveryCancelResponse(ProtocolModel):
+    cancelled: bool = True

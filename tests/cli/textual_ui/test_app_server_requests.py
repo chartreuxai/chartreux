@@ -8,7 +8,9 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
+from textual.widgets import Button
 
 from chartreux.app_server.events import AgentsUpdate, CallbackRequested
 from chartreux.app_server.models import (
@@ -39,7 +41,10 @@ from chartreux.app_server.session import AppServerTurnError
 from chartreux.cli.textual_ui import startup
 from chartreux.cli.textual_ui.app import ChartreuxApp
 from chartreux.cli.textual_ui.screens.settings import SettingsScreen
-from chartreux.cli.textual_ui.turn_supervisor import TurnSupervisor
+from chartreux.cli.textual_ui.turn_supervisor import (
+    _MAX_INCOMPLETE_STREAM_RETRIES,
+    TurnSupervisor,
+)
 from chartreux.cli.textual_ui.widgets.agent_transcript import AgentTranscriptViewer
 from chartreux.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
 from chartreux.cli.textual_ui.widgets.loading import (
@@ -49,6 +54,7 @@ from chartreux.cli.textual_ui.widgets.loading import (
 from chartreux.cli.textual_ui.widgets.messages import (
     AssistantMessage,
     ErrorMessage,
+    ErrorRetryRequested,
     ReasoningMessage,
     SlashCommandMessage,
     UserCommandMessage,
@@ -57,8 +63,14 @@ from chartreux.cli.textual_ui.widgets.messages import (
 from chartreux.cli.textual_ui.widgets.question_app import QuestionApp
 from chartreux.cli.textual_ui.widgets.session_status_line import SessionStatusLine
 from chartreux.core.config import SessionLoggingConfig
+from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+from chartreux.core.config.models import RecoverySectionConfig, RootRecoveryConfig
 from chartreux.core.events import UserMessageEvent
+from chartreux.core.llm.exceptions import BackendError, PayloadSummary
 from chartreux.core.llm_models import Role
+from chartreux.core.model_catalog.availability import AvailabilityRegistry
+from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.session_types import ScheduledLoop
 from chartreux.core.subagents import derive_agent_name
 from chartreux.setup.trusted_folders.trust_folder_dialog import TrustFolderApp
@@ -68,8 +80,10 @@ from tests.conftest import (
     build_test_agent_loop,
     build_test_chartreux_app,
     build_test_vibe_config,
+    wait_until,
 )
 from tests.mock.utils import mock_llm_chunk
+from tests.recovery.conftest import ControlledTransport, FakeClock
 from tests.stubs.fake_backend import FakeBackend, FakeInterruptedStreamingBackend
 
 
@@ -94,6 +108,49 @@ async def _wait_until(pilot, predicate, timeout: float = 2.0) -> None:
         if time.monotonic() >= deadline:
             raise AssertionError("Timed out waiting for UI state")
         await pilot.pause(0.01)
+
+
+def _enabled_root_recovery_config() -> ChartreuxConfigSchema:
+    """Explicitly-enabled ``[recovery.root]`` (round-2 amendment: never rely
+    on the development default — WP6 promotes it and must not break tests).
+    """
+    return build_test_vibe_config().model_copy(
+        update={
+            "recovery": RecoverySectionConfig(root=RootRecoveryConfig(enabled=True))
+        }
+    )
+
+
+def _disabled_root_recovery_config() -> ChartreuxConfigSchema:
+    """Explicitly-disabled ``[recovery.root]`` (Q, WP6 promotion ripple).
+
+    WP6 promoted the enabled default, but these tests characterize the MANUAL
+    retry surface — the error widget and the /retry affordance that only
+    appear when no automatic continuation is scheduled — so the pre-promotion
+    default (disabled) is pinned explicitly.
+    """
+    return build_test_vibe_config().model_copy(
+        update={
+            "recovery": RecoverySectionConfig(root=RootRecoveryConfig(enabled=False))
+        }
+    )
+
+
+def _root_recovery_clock_sleep(agent_loop: Any) -> Any:
+    """R2: point the shared availability registry at a manual clock and return
+    the root-recovery controller's timer sleep, which advances that clock past
+    the armed deployment cooldown — the gated continuation is scheduled and
+    admitted with NO real wait (fake clock + deterministic transport).
+    """
+    clock = FakeClock()
+    agent_loop.config_orchestrator._availability_registry = AvailabilityRegistry(
+        clock=clock
+    )
+
+    async def _advancing_sleep(_delay: float) -> None:
+        clock.advance(40.0)
+
+    return _advancing_sleep
 
 
 def _turn_error(code: TurnErrorCode) -> AppServerTurnError:
@@ -166,6 +223,20 @@ async def _wait_for_retry_error(app: ChartreuxApp, pilot) -> None:
             and app.event_handler._retry_presentation is not None
         ),
     )
+
+
+async def _wait_for_retry_button(pilot, error_widget: ErrorMessage) -> Button:
+    """Wait for the "Retry — new turn" button to mount on the error widget.
+
+    Textual registers a mounted widget in the DOM before its compose()
+    children mount, so the button needs its own settling wait: under
+    full-suite load the widget's message pump can lag the turn-state
+    updates the text/job waits observe (R1).
+    """
+    await _wait_until(
+        pilot, lambda: len(error_widget.query(".error-retry-button")) == 1
+    )
+    return error_widget.query_one(".error-retry-button", Button)
 
 
 @pytest.mark.asyncio
@@ -344,7 +415,8 @@ async def test_question_answer_responds_to_public_callback() -> None:
     answer = UserAnswer(question="Ship it?", answer="Yes")
 
     await TurnSupervisor.question_answered(
-        _callback_stand_in(app), QuestionApp.Answered([answer])
+        _callback_stand_in(app),
+        QuestionApp.Answered([answer], callback_id="callback-1"),
     )
 
     app._respond_to_active_callback.assert_awaited_once_with(
@@ -788,8 +860,14 @@ async def test_incomplete_stream_retries_and_reuses_assistant_message() -> None:
         [mock_llm_chunk(content="Ran three dummy read-only", stop_reason=None)],
         [mock_llm_chunk(content=" tool calls successfully.")],
     ])
-    agent_loop = build_test_agent_loop(backend=backend, enable_streaming=True)
+    # R2: the continuation is gated — enabled explicitly (round-2
+    # amendment) with the manual availability clock advanced past the armed
+    # cooldown, so the controller's timer admits the continuation at once.
+    agent_loop = build_test_agent_loop(
+        config=_enabled_root_recovery_config(), backend=backend, enable_streaming=True
+    )
     app = build_test_chartreux_app(agent_loop=agent_loop)
+    app._root_recovery._sleep = _root_recovery_clock_sleep(agent_loop)
 
     async with app.run_test() as pilot:
         await pilot.pause(0.1)
@@ -833,8 +911,14 @@ async def test_incomplete_stream_hides_error_while_retrying() -> None:
         [mock_llm_chunk(content="partial", stop_reason=None)],
         [mock_llm_chunk(content=" recovered.")],
     ])
-    agent_loop = build_test_agent_loop(backend=backend, enable_streaming=True)
+    # R2: the continuation is gated — enabled explicitly (round-2
+    # amendment) with the manual availability clock advanced past the armed
+    # cooldown, so the controller's timer admits the continuation at once.
+    agent_loop = build_test_agent_loop(
+        config=_enabled_root_recovery_config(), backend=backend, enable_streaming=True
+    )
     app = build_test_chartreux_app(agent_loop=agent_loop)
+    app._root_recovery._sleep = _root_recovery_clock_sleep(agent_loop)
 
     async with app.run_test() as pilot:
         await pilot.pause(0.1)
@@ -879,8 +963,14 @@ async def test_interrupting_auto_retry_keeps_event_listener_alive() -> None:
         [mock_llm_chunk(content=" retry", stop_reason=None)],
         [mock_llm_chunk(content="after cancel")],
     ])
-    agent_loop = build_test_agent_loop(backend=backend, enable_streaming=True)
+    # R2: the continuation is gated — enabled explicitly (round-2
+    # amendment) with the manual availability clock advanced past the armed
+    # cooldown, so the controller's timer admits the continuation at once.
+    agent_loop = build_test_agent_loop(
+        config=_enabled_root_recovery_config(), backend=backend, enable_streaming=True
+    )
     app = build_test_chartreux_app(agent_loop=agent_loop)
+    app._root_recovery._sleep = _root_recovery_clock_sleep(agent_loop)
 
     try:
         async with app.run_test() as pilot:
@@ -890,7 +980,12 @@ async def test_interrupting_auto_retry_keeps_event_listener_alive() -> None:
             await _wait_until(pilot, backend.retry_started.is_set)
 
             await pilot.press("escape")
-            await _wait_until(pilot, lambda: not app._agent_job_active())
+            # The interrupt settle tears the act() stream down through the
+            # server (a few async hops); under parallel load the gated model
+            # call was observed taking 5.1s to fail — the assertion is the
+            # settled state, not the latency. 8.0s stays under the 10s
+            # per-test ceiling with room for the post-settle steps.
+            await _wait_until(pilot, lambda: not app._agent_job_active(), timeout=8.0)
 
             chat_input.post_message(ChatInputContainer.Submitted("next"))
             await _wait_until(pilot, lambda: len(backend.requests_messages) == 3)
@@ -939,8 +1034,14 @@ async def test_incomplete_stream_stops_after_two_automatic_retries() -> None:
         [mock_llm_chunk(content=" second", stop_reason=None)],
         [mock_llm_chunk(content=" third", stop_reason=None)],
     ])
-    agent_loop = build_test_agent_loop(backend=backend, enable_streaming=True)
+    # R2: the continuation is gated — enabled explicitly (round-2
+    # amendment) with the manual availability clock advanced past the armed
+    # cooldown, so the controller's timer admits each continuation at once.
+    agent_loop = build_test_agent_loop(
+        config=_enabled_root_recovery_config(), backend=backend, enable_streaming=True
+    )
     app = build_test_chartreux_app(agent_loop=agent_loop)
+    app._root_recovery._sleep = _root_recovery_clock_sleep(agent_loop)
 
     async with app.run_test() as pilot:
         await pilot.pause(0.1)
@@ -982,8 +1083,13 @@ async def test_incomplete_stream_does_not_retry_ahead_of_queued_prompts(
         [mock_llm_chunk(content="t1 partial", stop_reason=None)],
         [mock_llm_chunk(content="t2 done")],
     ])
-    agent_loop = build_test_agent_loop(backend=backend, enable_streaming=True)
+    # R2: enabled explicitly (round-2 amendment) so this exercises the GATE's
+    # queued-work barrier — the schedule is declined, never silently rearmed.
+    agent_loop = build_test_agent_loop(
+        config=_enabled_root_recovery_config(), backend=backend, enable_streaming=True
+    )
     app = build_test_chartreux_app(agent_loop=agent_loop)
+    app._root_recovery._sleep = _root_recovery_clock_sleep(agent_loop)
     prepare_started = asyncio.Event()
     release_prepare = asyncio.Event()
     original_prepare = app._prepare_prompt_or_abort
@@ -1062,7 +1168,9 @@ async def test_retry_command_reuses_interrupted_assistant_message() -> None:
         [mock_llm_chunk(content="Ran three dummy read-only")],
         [mock_llm_chunk(content=" tool calls successfully.")],
     ])
-    agent_loop = build_test_agent_loop(backend=backend, enable_streaming=True)
+    agent_loop = build_test_agent_loop(
+        config=_disabled_root_recovery_config(), backend=backend, enable_streaming=True
+    )
     app = build_test_chartreux_app(agent_loop=agent_loop)
 
     async with app.run_test() as pilot:
@@ -1122,7 +1230,9 @@ async def test_retry_command_keeps_separate_assistant_after_reasoning() -> None:
             mock_llm_chunk(content="recovered"),
         ],
     ])
-    agent_loop = build_test_agent_loop(backend=backend, enable_streaming=True)
+    agent_loop = build_test_agent_loop(
+        config=_disabled_root_recovery_config(), backend=backend, enable_streaming=True
+    )
     app = build_test_chartreux_app(agent_loop=agent_loop)
 
     async with app.run_test() as pilot:
@@ -1154,7 +1264,9 @@ async def test_retry_command_keeps_separate_assistant_after_reasoning() -> None:
 @pytest.mark.asyncio
 async def test_retry_command_keeps_diagnostics_until_retry_progress() -> None:
     backend = FakeInterruptedStreamingBackend([[mock_llm_chunk(content="partial")]])
-    agent_loop = build_test_agent_loop(backend=backend, enable_streaming=True)
+    agent_loop = build_test_agent_loop(
+        config=_disabled_root_recovery_config(), backend=backend, enable_streaming=True
+    )
     app = build_test_chartreux_app(agent_loop=agent_loop)
 
     async with app.run_test() as pilot:
@@ -1759,3 +1871,594 @@ async def test_dangerous_command_question_presents_safely_via_callback(
         assert output.result.cancelled is False
         assert output.result.answers[0].answer == DANGEROUS_COMMAND_DENY_LABEL
         assert output.result.answers[0].question == request.questions[0].question
+
+
+def _r0_single_deployment_config() -> ChartreuxConfigSchema:
+    snapshot = CatalogSnapshot(
+        ModelCatalog.model_validate({
+            "providers": {"test-first": {"api_base": "https://first.invalid"}},
+            "models": {
+                "base": {"deployments": [{"provider": "test-first", "name": "first"}]}
+            },
+            "roles": {},
+        }),
+        "test-revision",
+    )
+    # Q (WP6 promotion ripple): both callers characterize the MANUAL retry
+    # surface (the terminal exhaustion error and its affordance), so root
+    # recovery is explicitly disabled — the pre-promotion default.
+    config = ChartreuxConfigSchema.model_validate(
+        {"active_model": "base"}, context={"catalog_snapshot": snapshot}
+    ).model_copy(
+        update={
+            "recovery": RecoverySectionConfig(root=RootRecoveryConfig(enabled=False))
+        }
+    )
+    return config.attach_catalog_snapshot(snapshot)
+
+
+def _r0_connect_fault() -> BackendError:
+    """A production-faithful transport fault (D1/L): the BackendError carries
+    its httpx cause, so it classifies CONNECTION and the cooldown arms.
+    """
+    fault = BackendError(
+        provider="test-first",
+        endpoint="https://first.invalid/chat",
+        status=None,
+        reason="network boom",
+        headers=None,
+        body_text=None,
+        parsed_error="Network error",
+        model="first",
+        payload_summary=PayloadSummary(
+            model="first",
+            message_count=1,
+            approx_chars=10,
+            temperature=0,
+            has_tools=False,
+            tool_choice=None,
+        ),
+    )
+    fault.__cause__ = httpx.ConnectError("network boom")
+    return fault
+
+
+@pytest.mark.asyncio
+async def test_r0_all_deployments_unavailable_is_visible_terminal_state() -> None:
+    """R0 acceptance 3 (TUI): all-deployments-unavailable is a VISIBLE
+    terminal state.
+
+    Turn 1 faults on the only deployment (a retryable backend error that
+    offers /retry). Turn 2 is blocked at admission and surfaces an error
+    naming the model and each deployment's exclusion reason — with no hidden
+    automatic continuation: exactly one transport attempt exists across both
+    turns.
+
+    R1 (plan v0.5.6-recovery) layers the manual fallback ON TOP of R0's
+    characterization: the terminal exhaustion error now carries the
+    keyboard-accessible "Retry — new turn" affordance. R0 pinned its pre-R1
+    absence ("NO /retry affordance today — R1's design territory"); R1 makes
+    the exhaustion state retryable-for-the-affordance, with honest text that
+    the deployments were unavailable and a manual retry resets the model's
+    cooldowns.
+    """
+    backend = ControlledTransport([_r0_connect_fault()])
+    agent_loop = build_test_agent_loop(
+        config=_r0_single_deployment_config(), backend=backend, enable_streaming=True
+    )
+    app = build_test_chartreux_app(agent_loop=agent_loop)
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("hi"))
+        # Turn 1: the only deployment faults — a retryable backend error
+        # whose widget offers /retry.
+        await _wait_until(
+            pilot,
+            lambda: any(
+                "/retry" in str(error._error) for error in app.query(ErrorMessage)
+            ),
+        )
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+
+        # Turn 2: blocked at admission — the visible terminal state.
+        chat_input.post_message(ChatInputContainer.Submitted("again"))
+        await _wait_until(
+            pilot,
+            lambda: any(
+                "All deployments for model 'base' are unavailable" in str(error._error)
+                for error in app.query(ErrorMessage)
+            ),
+        )
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+
+        terminal = [
+            error
+            for error in app.query(ErrorMessage)
+            if "All deployments for model 'base' are unavailable" in str(error._error)
+        ]
+        assert len(terminal) == 1
+        terminal_text = str(terminal[0]._error)
+        assert "test-first" in terminal_text
+        assert "cooldown" in terminal_text
+        # R1: the terminal exhaustion error carries the retry affordance —
+        # the keyboard-accessible button on the widget, the retry hint, and
+        # the honest text that a manual retry resets the model's cooldowns.
+        assert terminal[0]._retryable is True
+        button = await _wait_for_retry_button(pilot, terminal[0])
+        assert str(button.label) == "Retry — new turn"
+        assert "Retry — new turn" in terminal_text
+        assert "resets the model's cooldowns" in terminal_text
+        assert "recent actions may repeat" in terminal_text
+        assert await wait_until(pilot, lambda: app.commands.has_command("retry"))
+        # Still no automatic continuation: exactly one transport attempt
+        # across both turns.
+        assert len(backend.requests_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_r0_retry_command_starts_exactly_one_new_turn() -> None:
+    """R0 acceptance 4 (TUI): manual /retry is ONE injected new turn.
+
+    One /retry submission produces exactly one additional turn: one new
+    transport attempt, an injected retry-prompt message, and no new user
+    message. The retry's admission also resets the cooldown the interrupted
+    stream armed — the attempt exists at all; without the user-initiated
+    reset the retry would be blocked at admission (F6 path 3 pins the same
+    block for the automatic continuation).
+    """
+    backend = FakeInterruptedStreamingBackend([
+        [mock_llm_chunk(content="Ran three dummy read-only")],
+        [mock_llm_chunk(content=" tool calls successfully.")],
+    ])
+    agent_loop = build_test_agent_loop(
+        config=_disabled_root_recovery_config(), backend=backend, enable_streaming=True
+    )
+    app = build_test_chartreux_app(agent_loop=agent_loop)
+    registry = agent_loop.config_orchestrator.availability_registry
+    committed = agent_loop.committed_model
+    assert committed is not None
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("hi"))
+        await _wait_for_retry_error(app, pilot)
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+
+        # The interrupted stream armed the shared deployment cooldown.
+        assert (
+            registry.cooldown_until(committed.base_model, committed.provider)
+            is not None
+        )
+        # The /retry command exists only once the failed turn's retry
+        # presentation is offered; the turn job can finish before the offer
+        # is processed, so wait for the command gate before submitting it.
+        assert await wait_until(pilot, lambda: app.commands.has_command("retry"))
+
+        chat_input.post_message(ChatInputContainer.Submitted("/retry"))
+        await _wait_until(pilot, lambda: backend.streaming_attempts == 2)
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+
+        # Exactly ONE new turn: one additional attempt, one assistant
+        # message — and no new user message (the retry turn is injected).
+        assert backend.streaming_attempts == 2
+        assert len(app.query(AssistantMessage)) == 1
+        assert [
+            message._content
+            for message in app.query(UserMessage)
+            if not isinstance(message, SlashCommandMessage)
+        ] == ["hi"]
+
+    retry_message = backend.requests_messages[-1][-1]
+    assert retry_message.injected is True
+    assert retry_message.content == build_retry_prompt("")
+
+
+@pytest.mark.asyncio
+async def test_r0_incomplete_stream_bound_is_per_episode() -> None:
+    """R0 acceptance 5 (TUI): the incomplete-stream continuation stays
+    BOUNDED — at most ``_MAX_INCOMPLETE_STREAM_RETRIES`` automatic
+    continuations per user turn (each an injected new turn carrying the
+    retry prompt), then a visible error. A fresh user turn starts a fresh
+    bounded episode rather than extending or resetting the shared counter
+    globally.
+    """
+    assert _MAX_INCOMPLETE_STREAM_RETRIES == 2
+    backend = FakeBackend([
+        [mock_llm_chunk(content="first", stop_reason=None)],
+        [mock_llm_chunk(content=" second", stop_reason=None)],
+        [mock_llm_chunk(content=" third", stop_reason=None)],
+        [mock_llm_chunk(content="fourth", stop_reason=None)],
+        [mock_llm_chunk(content=" fifth", stop_reason=None)],
+        [mock_llm_chunk(content=" sixth", stop_reason=None)],
+    ])
+    # R2: the bound now lives in the GATE's shared episode budget — enabled
+    # explicitly (round-2 amendment) with the manual availability clock
+    # advanced past the armed cooldown on each timer wake.
+    agent_loop = build_test_agent_loop(
+        config=_enabled_root_recovery_config(), backend=backend, enable_streaming=True
+    )
+    app = build_test_chartreux_app(agent_loop=agent_loop)
+    app._root_recovery._sleep = _root_recovery_clock_sleep(agent_loop)
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("hi"))
+        # Episode 1: the turn plus two bounded continuations, then a
+        # visible error offering /retry.
+        await _wait_until(pilot, lambda: len(backend.requests_messages) == 3)
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+        await _wait_until(pilot, lambda: len(app.query(ErrorMessage)) == 1)
+        assert "/retry" in str(app.query_one(ErrorMessage)._error)
+        # Each continuation is an injected new turn carrying the retry
+        # prompt — never a user message.
+        for attempt in (1, 2):
+            continuation = backend.requests_messages[attempt][-1]
+            assert continuation.injected is True
+            assert continuation.content == build_retry_prompt("")
+
+        # Episode 2: a fresh user turn starts a fresh bounded episode.
+        chat_input.post_message(ChatInputContainer.Submitted("again"))
+        await _wait_until(pilot, lambda: len(backend.requests_messages) == 6)
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+        await _wait_until(pilot, lambda: len(app.query(ErrorMessage)) == 2)
+
+    assert len(backend.requests_messages) == 6
+
+
+@pytest.mark.asyncio
+async def test_r1_retry_affordance_button_starts_exactly_one_new_turn() -> None:
+    """R1 (TUI): the "Retry — new turn" affordance invokes the EXISTING retry
+    operation.
+
+    One activation of the button on the terminal error widget starts exactly
+    one new turn: one additional transport attempt, an injected retry-prompt
+    message, and no new user message. The intentional user-requested cooldown
+    reset (the only path allowed to reset it) is what admits the retry past
+    the armed cooldown. The completed-actions-may-repeat warning stays on the
+    error text, and the button disables itself on activation.
+    """
+    backend = FakeInterruptedStreamingBackend([
+        [mock_llm_chunk(content="Ran three dummy read-only")],
+        [mock_llm_chunk(content=" tool calls successfully.")],
+    ])
+    agent_loop = build_test_agent_loop(
+        config=_disabled_root_recovery_config(), backend=backend, enable_streaming=True
+    )
+    app = build_test_chartreux_app(agent_loop=agent_loop)
+    registry = agent_loop.config_orchestrator.availability_registry
+    committed = agent_loop.committed_model
+    assert committed is not None
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("hi"))
+        await _wait_for_retry_error(app, pilot)
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+
+        error_widget = app.query_one(ErrorMessage)
+        # The affordance is displayed with the warning preserved.
+        assert error_widget._retryable is True
+        assert "recent actions may repeat" in str(error_widget._error)
+        button = await _wait_for_retry_button(pilot, error_widget)
+        assert str(button.label) == "Retry — new turn"
+
+        # The interrupted stream armed the shared deployment cooldown.
+        assert (
+            registry.cooldown_until(committed.base_model, committed.provider)
+            is not None
+        )
+
+        # Activate the affordance button.
+        button.press()
+        await _wait_until(pilot, lambda: backend.streaming_attempts == 2)
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+
+        # The button disabled itself on activation.
+        assert button.disabled is True
+        # Exactly ONE new turn: one additional attempt, one assistant
+        # message — and no new user message (the retry turn is injected).
+        assert backend.streaming_attempts == 2
+        assert len(app.query(AssistantMessage)) == 1
+        assert [
+            message._content
+            for message in app.query(UserMessage)
+            if not isinstance(message, SlashCommandMessage)
+        ] == ["hi"]
+        # The manual retry retained its intentional cooldown reset: the
+        # retry was admitted past the armed cooldown, and the reset cleared
+        # it.
+        assert registry.cooldown_until(committed.base_model, committed.provider) is None
+        # The terminal error widget (affordance included) was resolved away
+        # once the retry turn produced output.
+        assert len(app.query(ErrorMessage)) == 0
+
+    retry_message = backend.requests_messages[-1][-1]
+    assert retry_message.injected is True
+    assert retry_message.content == build_retry_prompt("")
+
+
+@pytest.mark.asyncio
+async def test_r1_retry_affordance_keyboard_shortcut_starts_one_turn() -> None:
+    """R1 (TUI): the affordance is keyboard-accessible — Ctrl+R invokes the
+    EXISTING retry operation, gated exactly like /retry.
+
+    The chat input's focus policy reclaims focus from transcript widgets, so
+    the displayed button is pointer-activated and Ctrl+R is the keyboard
+    path; the error text names both. With no retry offered the shortcut is a
+    no-op; with the affordance offered it starts exactly one new turn with
+    the intentional user-requested cooldown reset.
+    """
+    backend = FakeInterruptedStreamingBackend([
+        [mock_llm_chunk(content="partial")],
+        [mock_llm_chunk(content="recovered")],
+    ])
+    agent_loop = build_test_agent_loop(
+        config=_disabled_root_recovery_config(), backend=backend, enable_streaming=True
+    )
+    app = build_test_chartreux_app(agent_loop=agent_loop)
+    registry = agent_loop.config_orchestrator.availability_registry
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        # Gate: with no retry offered, Ctrl+R starts nothing.
+        await pilot.press("ctrl+r")
+        await pilot.pause(0.2)
+        assert backend.streaming_attempts == 0
+        assert not app.commands.has_command("retry")
+
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("hi"))
+        await _wait_for_retry_error(app, pilot)
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+        committed = agent_loop.committed_model
+        assert committed is not None
+        assert (
+            registry.cooldown_until(committed.base_model, committed.provider)
+            is not None
+        )
+        error_widget = app.query_one(ErrorMessage)
+        # The error text names the keyboard path and the button.
+        assert "Ctrl+R" in str(error_widget._error)
+        assert "Retry — new turn" in str(error_widget._error)
+        assert await wait_until(pilot, lambda: app.commands.has_command("retry"))
+
+        # Keyboard activation starts exactly one new turn.
+        await pilot.press("ctrl+r")
+        await _wait_until(pilot, lambda: backend.streaming_attempts == 2)
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+
+        assert backend.streaming_attempts == 2
+        assert registry.cooldown_until(committed.base_model, committed.provider) is None
+
+    retry_message = backend.requests_messages[-1][-1]
+    assert retry_message.injected is True
+    assert retry_message.content == build_retry_prompt("")
+
+
+@pytest.mark.asyncio
+async def test_r1_retry_affordance_double_activation_starts_one_turn() -> None:
+    """R1 (TUI): double activation starts AT MOST one turn.
+
+    Two rapid activations of the affordance — the widget-level guard (the
+    button disables itself and posts once) and the operation-level guard (the
+    retry operation's turn-ownership claim refuses a second turn) both apply.
+    """
+    backend = FakeInterruptedStreamingBackend([
+        [mock_llm_chunk(content="partial")],
+        [mock_llm_chunk(content="recovered")],
+    ])
+    agent_loop = build_test_agent_loop(
+        config=_disabled_root_recovery_config(), backend=backend, enable_streaming=True
+    )
+    app = build_test_chartreux_app(agent_loop=agent_loop)
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("hi"))
+        await _wait_for_retry_error(app, pilot)
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+
+        error_widget = app.query_one(ErrorMessage)
+        button = await _wait_for_retry_button(pilot, error_widget)
+
+        # Two rapid activations: a real button press plus a directly posted
+        # affordance message (exercising the operation-level guard).
+        button.press()
+        error_widget.post_message(ErrorRetryRequested())
+        await _wait_until(pilot, lambda: backend.streaming_attempts == 2)
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+        await pilot.pause(0.2)
+
+        # At most one new turn started.
+        assert backend.streaming_attempts == 2
+        assert button.disabled is True
+
+    retry_message = backend.requests_messages[-1][-1]
+    assert retry_message.injected is True
+    assert retry_message.content == build_retry_prompt("")
+
+
+@pytest.mark.asyncio
+async def test_r1_exhaustion_affordance_retries_with_cooldown_reset() -> None:
+    """R1 (TUI): the affordance's retryable set INCLUDES
+    exhaustion-after-cooldown — the terminal all-deployments-unavailable
+    error offers "Retry — new turn", and activating it starts exactly one
+    new turn.
+
+    The retry is a genuine user action, so the EXISTING retry operation's
+    intentional cooldown reset (the only path allowed to reset it) admits the
+    retry past the armed cooldown: without the reset the turn would be
+    blocked at admission (zero additional transport attempts). The error text
+    stays honest that the deployments were unavailable and that a manual
+    retry resets the model's cooldowns.
+    """
+    backend = ControlledTransport([
+        _r0_connect_fault(),
+        [mock_llm_chunk(content="recovered")],
+    ])
+    agent_loop = build_test_agent_loop(
+        config=_r0_single_deployment_config(), backend=backend, enable_streaming=True
+    )
+    app = build_test_chartreux_app(agent_loop=agent_loop)
+    registry = agent_loop.config_orchestrator.availability_registry
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("hi"))
+        # Turn 1: the only deployment faults — a retryable backend error.
+        await _wait_until(
+            pilot,
+            lambda: any(
+                "/retry" in str(error._error) for error in app.query(ErrorMessage)
+            ),
+        )
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+        committed = agent_loop.committed_model
+        assert committed is not None
+        # The fault armed the shared deployment cooldown.
+        assert (
+            registry.cooldown_until(committed.base_model, committed.provider)
+            is not None
+        )
+
+        # Turn 2: blocked at admission — the terminal exhaustion error,
+        # which (R1) carries the affordance with honest text.
+        chat_input.post_message(ChatInputContainer.Submitted("again"))
+        await _wait_until(
+            pilot,
+            lambda: any(
+                "All deployments for model 'base' are unavailable" in str(error._error)
+                for error in app.query(ErrorMessage)
+            ),
+        )
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+        assert len(backend.requests_messages) == 1
+
+        terminal = [
+            error
+            for error in app.query(ErrorMessage)
+            if "All deployments for model 'base' are unavailable" in str(error._error)
+        ]
+        assert len(terminal) == 1
+        terminal_text = str(terminal[0]._error)
+        assert "test-first" in terminal_text
+        assert "cooldown" in terminal_text
+        assert "Retry — new turn" in terminal_text
+        assert "resets the model's cooldowns" in terminal_text
+        assert "recent actions may repeat" in terminal_text
+        assert terminal[0]._retryable is True
+        await _wait_for_retry_button(pilot, terminal[0])
+        assert await wait_until(pilot, lambda: app.commands.has_command("retry"))
+
+        # Activate the affordance (keyboard path): the user-initiated retry
+        # resets the cooldown and is admitted — exactly one new turn.
+        await pilot.press("ctrl+r")
+        await _wait_until(pilot, lambda: len(backend.requests_messages) == 2)
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+
+        assert len(backend.requests_messages) == 2
+        assert registry.cooldown_until(committed.base_model, committed.provider) is None
+        assert app.query_one(AssistantMessage).get_content() == "recovered"
+
+    retry_message = backend.requests_messages[-1][-1]
+    assert retry_message.injected is True
+    assert retry_message.content == build_retry_prompt("")
+
+
+@pytest.mark.asyncio
+async def test_r1_no_retry_action_with_unresolved_runtime_approval() -> None:
+    """R1 (TUI): no retry action while an unresolved runtime approval is
+    present — activating the affordance under an open callback starts no
+    turn.
+    """
+    backend = FakeInterruptedStreamingBackend([[mock_llm_chunk(content="partial")]])
+    agent_loop = build_test_agent_loop(
+        config=_disabled_root_recovery_config(), backend=backend, enable_streaming=True
+    )
+    app = build_test_chartreux_app(agent_loop=agent_loop)
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        chat_input = app.query_one(ChatInputContainer)
+        chat_input.post_message(ChatInputContainer.Submitted("hi"))
+        await _wait_for_retry_error(app, pilot)
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+
+        error_widget = app.query_one(ErrorMessage)
+        button = await _wait_for_retry_button(pilot, error_widget)
+
+        # An unresolved runtime approval arrives while the affordance is shown.
+        await app._handle_turn_event(CallbackRequested(_question_callback("cb-1")))
+        await _wait_until(pilot, lambda: app._active_callback is not None)
+
+        button.press()
+        await pilot.pause(0.2)
+
+        # No retry turn started: still exactly one transport attempt, and
+        # the approval is still unresolved.
+        assert backend.streaming_attempts == 1
+        assert app._active_callback is not None
+
+
+@pytest.mark.asyncio
+async def test_r1_disconnect_offers_inspection_guidance_not_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1 (TUI): a transport disconnect offers inspection/reconnect guidance,
+    not automatic continuation — the error widget carries the guidance text,
+    no retry affordance, and no new turn starts.
+
+    The disconnect is injected at the client-driven turn path (the same path
+    the retry operation drives): ``app_server.act``'s event stream raises
+    ``AppServerConnectionClosed`` on first read, so the turn fails with a
+    generic (non-typed) exception.
+    """
+    from chartreux.app_server import AppServerConnectionClosed
+
+    app = build_test_chartreux_app()
+    act_calls = 0
+
+    def _disconnecting_act(*_args: object, **_kwargs: object):
+        nonlocal act_calls
+        act_calls += 1
+
+        async def _stream():
+            for _item in ():
+                yield _item
+            raise AppServerConnectionClosed("App server connection closed")
+
+        return _stream()
+
+    async with app.run_test() as pilot:
+        await app._session_ready.wait()
+        monkeypatch.setattr(app.app_server, "act", _disconnecting_act)
+        await pilot.pause(0.1)
+        turn = asyncio.create_task(app._handle_turn("hi"))
+        await _wait_until(pilot, lambda: len(app.query(ErrorMessage)) == 1)
+        await turn
+        await _wait_until(pilot, lambda: not app._agent_job_active())
+
+        error_widget = app.query_one(ErrorMessage)
+        text = str(error_widget._error)
+        assert "App server connection closed" in text
+        assert "Inspect the session and server state" in text
+        assert "reconnects automatically" in text
+        assert "Nothing is continued automatically" in text
+        # No retry affordance, no retry hint, no automatic continuation.
+        assert error_widget._retryable is False
+        assert len(error_widget.query(".error-retry-button")) == 0
+        assert "/retry" not in text
+        assert "Retry — new turn" not in text
+        assert "Ctrl+R" not in text
+        assert app.event_handler is not None
+        assert app.event_handler._retry_presentation is None
+        assert not app.commands.has_command("retry")
+        await pilot.pause(0.2)
+        assert act_calls == 1

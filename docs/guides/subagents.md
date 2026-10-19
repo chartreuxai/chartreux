@@ -165,9 +165,16 @@ If the parent is only waiting on subagents, submitting a new message in the TUI
 cancels its waits, not the child runs, and steers the same parent turn immediately.
 See [Input and queueing](terminal.md#input-and-queueing).
 
+A subagent's `ask_user_question` calls never expire: unattended-expiry admission
+is limited to the root agent in an interactive session, so a background agent's
+question waits for an explicit answer (or the run's cancellation) instead of
+deferring on a timer. Only the root agent's explicitly defaultable questions
+can expire unanswered; see
+[User questions and unattended expiry](configuration.md#user-questions-and-unattended-expiry).
+
 - `check_agents` lists resident and Recent subagents with their names, handles,
-  availability (`running`, `finalizing`, `idle`, `closed`, or `evicted`), and
-  effective model and thinking information.
+  availability (`running`, `finalizing`, `idle`, `suspended`, `restoring`,
+  `closed`, or `evicted`), and effective model and thinking information.
 - `get_agent_result(agent_id, run_id)` returns a completed result without
   waiting; it returns no result while the run is active. It keeps working for
   closed and evicted records while their stored result is retained; a released
@@ -217,6 +224,73 @@ idle row and the status line counts active work only, completion and eviction
 notifications — which carry the agent name, handle, run, and outcome — are the
 primary failure surface for ephemeral agents. Release subagents when you are
 done.
+
+### Failure recovery, suspension, and resume
+
+A recoverable failure — a typed transient provider fault with settled or
+verifiable tool effects — moves a background agent to **suspended** instead of
+closing it. Suspension is an explicit, bounded exception before closure: it is
+not retention under another name, and it is not resurrection. A suspended
+agent keeps its identity, conversation, tool state, and cumulative budgets
+warm while its provider connection is released; **closed** and **evicted**
+agents remain non-reusable exactly as before. Suspension is warm-only: a
+parent-process restart forfeits suspended agents (they convert to closed,
+non-resumable) with no dangling scheduled recovery, and scratch artifacts
+remain the salvage path across restarts. Suspension expires under its own
+bounds (`[recovery.subagents]` `suspension_ttl_seconds`,
+`max_suspended_agents`, `max_suspended_bytes` — separate from the
+idle-retention and tombstone caps); expiry removes recovery eligibility and
+emits a notification without deleting the transcript, artifacts, or stored
+results. Cancellation, release, a session change, and shutdown invalidate
+pending recovery; normal successful completion still closes an ephemeral
+agent.
+
+Two management tools operate on a suspended agent:
+
+- `resume_agent(agent_id, expected_run_id, idempotency_key)` admits a
+  successor run of the SAME agent identity: a new `run_id`, the same
+  `agent_id`, session, persona, and task scope. Outcomes: `scheduled`,
+  `already_scheduled`, `already_resumed`, `reconcile_required`, `expired`,
+  `not_resumable`, `forbidden`. Concurrent calls admit exactly one successor
+  (single-flight, run-pinned). The failed run's result is immutable and stays
+  retrievable; waits pinned to it return ITS failed result, never silently
+  redirecting to the successor.
+- `reconcile_result(agent_id, expected_run_id, transcript_boundary,
+  verified_effects)` clears a `reconcile_required` barrier after the unknown
+  tool outcomes are verified externally (inspect git, filesystem, or job
+  state). It is pinned to the failed run and its transcript boundary, so
+  stale or duplicate evidence from an earlier run cannot clear a later run's
+  barrier. Outcomes: `cleared`, `prohibited` (verification shows unrepeatable
+  damage, with reason codes), `stale`, `duplicate`, `not_pending`,
+  `forbidden`. Replacement with `task(agent_id=..., replace_run=True)` remains
+  permitted at any point; the barrier never auto-clears.
+
+Reconciliation barriers: when a failed run's tool effects are unknown, no
+action is replayed — the agent suspends with `reconcile_required` until the
+effects are verified. Recovery promises no exactly-once tool execution:
+recent actions may have completed despite the interruption, so a resumed
+agent inspects completed tool results and current workspace state before
+acting rather than repeating them blindly. A run that left no tool call
+outstanding submits the empty `verified_effects` list — the complete
+zero-entry accounting — which clears the barrier exactly when zero tool
+calls are outstanding.
+
+Recovery is enabled in stages, and the release default is automatic:
+
+1. **Observation** (always on): every terminal failure carries a typed
+   failure envelope — class, phase, attempted deployment and endpoint,
+   request evidence, progress, and recovery eligibility — through the
+   result, wait, and notification surfaces.
+2. **Explicit resume** (always available): `resume_agent` and
+   `reconcile_result` are not gated on any flag.
+3. **Automatic recovery** (default ON since v0.5.6): the bounded controller
+   in `[recovery.subagents]` schedules and admits a same-agent resume itself
+   after an eligible failure — bounded by `auto_retries_max` per recovery
+   chain, cooldown-aware through the shared availability registry (an
+   automatic resume never resets cooldowns), and running independently of
+   parent turns. Disabling the flag cancels future scheduling without
+   discarding evidence. See
+   [Automatic subagent recovery](configuration.md#automatic-subagent-recovery).
 
 ### Cancelling and replacing background work
 

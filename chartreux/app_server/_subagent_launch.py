@@ -1,19 +1,44 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Iterator
 from contextlib import AbstractAsyncContextManager, contextmanager, suppress
 from dataclasses import dataclass
 import fnmatch
 from typing import TYPE_CHECKING, Protocol
 
+from chartreux.app_server._subagent_records import AgentRecord
+from chartreux.app_server._subagent_recovery import _effective_eligibility
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agents.launch import FrozenPersona, LaunchCandidate, resolve_launch
 from chartreux.core.agents.models import AgentProfile
+from chartreux.core.model_catalog.resolver import ModelResolutionError, resolver_for
+from chartreux.core.recovery_models import (
+    FailureEnvelope,
+    PackageTier,
+    RecoveryEligibility,
+    canonical_endpoint_identity,
+)
+from chartreux.core.recovery_policy import (
+    ReplacementCandidate,
+    ReplacementDecision,
+    ReplacementPolicyError,
+    candidates_from_catalog,
+    mechanical_base_models_from_policy,
+    validate_replacement_selection,
+)
 from chartreux.core.session.saved_sessions import delete_saved_session
-from chartreux.core.subagents import TaskArgs
+from chartreux.core.subagents import (
+    InvalidLaunchModelError,
+    LaunchConfig,
+    LaunchConfigError,
+    RunStatus,
+    TaskArgs,
+)
 from chartreux.core.tools.base import InvokeContext
 from chartreux.core.tools.manager import ToolManager
 from chartreux.core.tools.models import ToolPermission, ToolPermissionError
+from chartreux.observability.logging import logger
 
 if TYPE_CHECKING:
     from chartreux.app_server._runtime import AgentRuntimeFactory
@@ -43,6 +68,9 @@ class LaunchStateView(Protocol):
     _child_links: dict[str, tuple[SessionRuntime, str]]
     _next_agent_seq: int
     _runtime_factory: AgentRuntimeFactory
+    _agent_records: dict[str, AgentRecord]
+    _package_replacements: dict[str, int]
+    _registry_lock: asyncio.Lock
 
     def _require_policy_unreserved(self) -> None: ...
 
@@ -62,6 +90,8 @@ class LaunchStateView(Protocol):
     def _child_publication(
         self, runtime: SessionRuntime
     ) -> AbstractAsyncContextManager[None]: ...
+
+    def _invalidate_recovery_locked(self, record: AgentRecord | None) -> None: ...
 
 
 @dataclass
@@ -222,6 +252,288 @@ class ChildLaunchAdmission:
                 else "Agent admission changed during child creation"
             )
             raise RuntimeError(message)
+
+    @staticmethod
+    def _claim_shape_guards(args: TaskArgs, claim: LaunchConfig) -> None:
+        """Claim-shape guards: a NEW agent_id, an explicit model, an explicit package."""
+        if args.agent_id is not None:
+            raise LaunchConfigError(
+                "config.predecessor_agent_id",
+                "a replacement claim launches a NEW agent: agent_id must be None",
+            )
+        if claim.model is None:
+            raise LaunchConfigError(
+                "config.model",
+                "a replacement claim must name the replacement model explicitly",
+            )
+        if claim.work_package_id is None:
+            raise LaunchConfigError(
+                "config.work_package_id",
+                "a replacement claim must name its work package: the per-package "
+                "replacement budget is keyed on work_package_id",
+            )
+
+    def _predecessor_envelope_locked(
+        self, parent: SessionRuntime, predecessor_id: str
+    ) -> tuple[AgentRecord, FailureEnvelope]:
+        """The owned predecessor record and its latest failed run's envelope."""
+        record = self._view._agent_records.get(predecessor_id)
+        if record is None:
+            raise ReplacementPolicyError(
+                ["predecessor_unknown"],
+                f"Replacement claim rejected: predecessor agent "
+                f"{predecessor_id} is not a live record (closed/evicted "
+                "agents cannot be replaced); re-dispatch the package fresh",
+            )
+        if record.parent_session_id != parent.agent_loop.session_id:
+            raise ReplacementPolicyError(
+                ["predecessor_not_owned"],
+                f"Replacement claim rejected: predecessor agent "
+                f"{predecessor_id} is not owned by this parent session",
+            )
+        # The failed run's envelope, latest-first over the current run
+        # and the run history.
+        failed_run = next(
+            (
+                run
+                for run in (record.current_run, *reversed(record.run_history))
+                if run is not None
+                and run.status is RunStatus.FAILED
+                and run.failure is not None
+            ),
+            None,
+        )
+        if failed_run is None or failed_run.failure is None:
+            raise ReplacementPolicyError(
+                ["predecessor_has_no_failure_envelope"],
+                f"Replacement claim rejected: predecessor agent "
+                f"{predecessor_id} has no failed run with a failure envelope",
+            )
+        envelope = failed_run.failure
+        # Review R6: the envelope must come from the predecessor's LATEST
+        # run, and that run must be terminal — a claim never launches a
+        # replacement alongside a resumed successor or after a newer run
+        # already displaced the failed one.
+        if (
+            failed_run.run_id != record.latest_run_id
+            or record.current_run is not None
+            and record.current_run.run_id != failed_run.run_id
+        ):
+            raise ReplacementPolicyError(
+                ["predecessor_run_not_terminal"],
+                f"Replacement claim rejected: predecessor agent "
+                f"{predecessor_id} has a newer run than its failed run "
+                f"{failed_run.run_id}; the failure is not the latest "
+                "terminal state, so the package has no failed run to "
+                "replace",
+            )
+        return record, envelope
+
+    @staticmethod
+    def _check_lineage_and_barrier_locked(
+        record: AgentRecord, claim: LaunchConfig, envelope: FailureEnvelope
+    ) -> None:
+        """Lineage match-or-establish plus the reconciliation barrier (locked).
+
+        A predecessor that already carries package lineage (it was itself a
+        replacement) pins the claim to it; otherwise the claim establishes
+        the lineage. The write-ownership transfer happens only after
+        reconciliation — a suspended barrier that still requires
+        reconcile_result blocks the claim; verified unrepeatable damage
+        prohibits any repeat of the package.
+        """
+        if (
+            record.work_package_id is not None
+            and record.work_package_id != claim.work_package_id
+        ):
+            raise ReplacementPolicyError(
+                ["work_package_lineage_mismatch"],
+                f"Replacement claim rejected: package "
+                f"{claim.work_package_id} does not match the predecessor's "
+                f"established package {record.work_package_id}",
+            )
+        if (
+            record.package_tier is not None
+            and claim.package_tier is not None
+            and record.package_tier is not claim.package_tier
+        ):
+            raise ReplacementPolicyError(
+                ["package_tier_lineage_mismatch"],
+                f"Replacement claim rejected: tier {claim.package_tier.value} "
+                f"does not match the predecessor's established tier "
+                f"{record.package_tier.value}",
+            )
+        eligibility, _codes = _effective_eligibility(record, envelope)
+        if eligibility is RecoveryEligibility.RECONCILE_REQUIRED:
+            raise ReplacementPolicyError(
+                ["reconcile_required_before_replacement"],
+                f"Replacement claim rejected: predecessor agent "
+                f"{record.agent_id} is suspended with a reconcile-required "
+                "barrier; submit reconcile_result first — the transfer "
+                "happens only after reconciliation",
+            )
+        if eligibility is RecoveryEligibility.PROHIBITED:
+            raise ReplacementPolicyError(
+                ["recovery_prohibited"],
+                f"Replacement claim rejected: predecessor agent "
+                f"{record.agent_id} has verified unrepeatable damage; the "
+                "package is not repeatable on any model",
+            )
+
+    def _validate_claim_policy_locked(
+        self,
+        parent: SessionRuntime,
+        record: AgentRecord,
+        claim: LaunchConfig,
+        envelope: FailureEnvelope,
+    ) -> ReplacementDecision:
+        """Per-package budget + policy validation (locked); returns the decision.
+
+        The budget spans the package lineage (keyed on work_package_id);
+        exhaustion rejects with ``package_replacements_exhausted`` so the
+        orchestrator parks the package. The policy validation resolves the
+        claimed model, builds the claimed candidate, and runs the full
+        failure-time decision procedure — endpoint independence against the
+        ATTEMPTED failed endpoint, tier capability, allowlist/price cap.
+        """
+        recovery = parent.agent_loop.config.recovery.subagents
+        package_key = claim.work_package_id
+        assert package_key is not None  # the claim-shape guard ran first
+        used = self._view._package_replacements.get(package_key, 0)
+        if used >= recovery.fallback_replacements_max_per_package:
+            raise ReplacementPolicyError(
+                ["package_replacements_exhausted"],
+                f"Replacement claim rejected: package {package_key} has "
+                f"used its budget of "
+                f"{recovery.fallback_replacements_max_per_package} "
+                "replacements; park the package and continue independent work",
+            )
+        config = parent.agent_loop.config
+        model = claim.model
+        assert model is not None  # the claim-shape guard ran first
+        try:
+            resolved = resolver_for(config).resolve(model)
+        except ModelResolutionError as exc:
+            raise InvalidLaunchModelError("config.model", str(exc)) from exc
+        bound = parent.agent_loop.bound_dispatch_policy
+        mechanical_models = (
+            mechanical_base_models_from_policy(
+                bound.render_policy, bound.roster.slot_bindings
+            )
+            if bound is not None
+            else frozenset()
+        )
+        claimed = ReplacementCandidate(
+            base_model=resolved.base_model,
+            provider=resolved.deployment.provider,
+            wire_name=resolved.deployment.name,
+            endpoint=canonical_endpoint_identity(resolved.provider.api_base),
+            tier=(
+                PackageTier.MECHANICAL
+                if resolved.base_model in mechanical_models
+                else PackageTier.SUBSTANTIVE
+            ),
+            output_price_per_million=resolved.deployment.prices.output,
+        )
+        snapshot = config.catalog_snapshot
+        assert snapshot is not None  # resolver_for raised otherwise
+        candidates = candidates_from_catalog(
+            snapshot.catalog, mechanical_base_models=mechanical_models
+        )
+        effective_tier = (
+            claim.package_tier
+            if claim.package_tier is not None
+            else (
+                record.package_tier
+                if record.package_tier is not None
+                else PackageTier.SUBSTANTIVE
+            )
+        )
+        decision = validate_replacement_selection(
+            envelope=envelope,
+            package_tier=effective_tier,
+            claimed=claimed,
+            candidates=candidates,
+            config=recovery,
+        )
+        if decision.disposition != "selected":
+            raise ReplacementPolicyError(
+                decision.reason_codes,
+                decision.notice
+                or f"Replacement claim rejected for package {package_key}",
+            )
+        return decision
+
+    async def validate_replacement_claim(
+        self, parent: SessionRuntime, args: TaskArgs
+    ) -> ReplacementDecision:
+        """Validate a WP5 failure-time replacement claim at launch admission.
+
+        The orchestrator claims a replacement by launching a NEW agent
+        (``args.agent_id is None``) whose ``config`` carries the claim:
+        ``predecessor_agent_id`` (the failed agent), ``work_package_id`` (the
+        package identity the per-package budget is keyed on), and
+        ``package_tier`` (mechanical/substantive; unknown defaults
+        conservatively to substantive). There is NO dispatch-time
+        substitution table and NO automatic cross-model fallback: the claim
+        is validated HERE, against the predecessor's failed run's failure
+        envelope, at failure time.
+
+        Admission order (the write-ownership handoff): claim-shape guards →
+        predecessor ownership + failed-run envelope → lineage
+        match-or-establish → reconciliation barrier → per-package budget →
+        policy validation (endpoint independence against the ATTEMPTED failed
+        endpoint, tier capability, allowlist/price cap). Only then is the
+        old recovery invalidated and the package counter incremented —
+        BEFORE the new run's write token is registered at accept_background,
+        so the transfer happens only after reconciliation state is settled
+        and the explicit handoff is admitted. Budgets and recurrence counters
+        span replacements: they are never reset.
+
+        Policy rejections raise :class:`ReplacementPolicyError` (the
+        orchestrator parks the package on those reason codes); claim-shape
+        violations raise :class:`LaunchConfigError` /
+        :class:`InvalidLaunchModelError`.
+        """
+        claim = args.config
+        assert claim is not None and claim.predecessor_agent_id is not None
+        self._claim_shape_guards(args, claim)
+        async with self._view._registry_lock:
+            record, envelope = self._predecessor_envelope_locked(
+                parent, claim.predecessor_agent_id
+            )
+            self._check_lineage_and_barrier_locked(record, claim, envelope)
+            decision = self._validate_claim_policy_locked(
+                parent, record, claim, envelope
+            )
+            # Review R6: exclusive package ownership — a predecessor
+            # already superseded (an earlier claim or busy replacement
+            # admitted) can never ground a second claim: repeated claims
+            # must not create multiple replacements. The check runs AFTER
+            # the per-package budget so an exhausted package still reports
+            # its exhaustion reason.
+            if record.recovery_superseded or record.reserved_for_replacement:
+                raise ReplacementPolicyError(
+                    ["predecessor_already_superseded"],
+                    f"Replacement claim rejected: predecessor agent "
+                    f"{record.agent_id} was already superseded by an "
+                    "admitted replacement; the package already has its "
+                    "replacement",
+                )
+            # Handoff ordering: the old recovery is disabled and the package
+            # counter incremented BEFORE the new run's write token is
+            # registered at accept_background — the write-ownership transfer
+            # happens only after reconciliation state is settled and the
+            # explicit claim is admitted. The predecessor is never
+            # auto-restarted; its lineage, counters, and artifacts survive.
+            package_key = claim.work_package_id
+            assert package_key is not None  # the claim-shape guard ran first
+            self._view._invalidate_recovery_locked(record)
+            self._view._package_replacements[package_key] = (
+                self._view._package_replacements.get(package_key, 0) + 1
+            )
+            logger.info(decision.notice)
+            return decision
 
     @contextmanager
     def creation_fence(self) -> Iterator[None]:

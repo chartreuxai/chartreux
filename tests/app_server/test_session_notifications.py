@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
+from pydantic import ValidationError
 import pytest
 
 from chartreux.app_server._model import validate_wire
@@ -27,7 +28,9 @@ from chartreux.app_server.models import (
     PublicCheckpointEntry,
     PublicEffectEntry,
     PublicMessageEntry,
+    PublicNoticeEntry,
     PublicRetryCategory,
+    RootRecoveryNoticeDetail,
     UserAnswer,
     UserInputCallbackOutput,
     UserQuestionResult,
@@ -1316,3 +1319,72 @@ async def _create_reconnectable_session_with_server(
         client_factory=reconnect,
     )
     return session, server
+
+
+def test_root_recovery_notice_detail_discriminates_on_kind() -> None:
+    # R2: the milestone notice is a member of the NoticeDetail union,
+    # discriminated by kind="root_recovery" — a PublicNoticeEntry carrying
+    # it round-trips through the wire into RootRecoveryNoticeDetail.
+    entry = validate_wire(
+        PublicNoticeEntry,
+        {
+            "id": "root-recovery:scheduled:root-auto-t:1",
+            "sessionId": "s",
+            "createdAt": 1,
+            "updatedAt": 1,
+            "generationStatus": "completed",
+            "type": "notice",
+            "level": "info",
+            "message": "Automatic retry 1 of 2 scheduled in 30.0s",
+            "detail": {
+                "kind": "root_recovery",
+                "milestone": "scheduled",
+                "episodeId": "root-auto-t",
+                "attempt": 1,
+                "limit": 2,
+                "delaySeconds": 30.0,
+                "eligibleClass": "timeout",
+                "affectedDeployment": "test-first/first",
+            },
+        },
+    )
+    assert isinstance(entry.detail, RootRecoveryNoticeDetail)
+    assert entry.detail.kind == "root_recovery"
+    assert entry.detail.milestone == "scheduled"
+    assert entry.detail.episode_id == "root-auto-t"
+    assert entry.detail.attempt == 1
+    assert entry.detail.limit == 2
+    assert entry.detail.delay_seconds == 30.0
+    assert entry.detail.eligible_class == "timeout"
+    assert entry.detail.affected_deployment == "test-first/first"
+    # The wire spelling is camelCase; snake_case is rejected.
+    assert "episodeId" in entry.model_dump(mode="json")["detail"]
+    with pytest.raises(ValidationError):
+        validate_wire(
+            PublicNoticeEntry,
+            {
+                "id": "n",
+                "sessionId": "s",
+                "createdAt": 1,
+                "updatedAt": 1,
+                "generationStatus": "completed",
+                "type": "notice",
+                "level": "info",
+                "message": "m",
+                "detail": {"kind": "root_recovery", "episode_id": "root-auto-t"},
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "milestone", ["scheduled", "started", "recovered", "exhausted", "cancelled"]
+)
+def test_root_recovery_notice_milestone_vocabulary(milestone: str) -> None:
+    detail = validate_wire(
+        RootRecoveryNoticeDetail, {"milestone": milestone, "episodeId": "e"}
+    )
+    assert detail.milestone == milestone
+    with pytest.raises(ValidationError):
+        validate_wire(RootRecoveryNoticeDetail, {"milestone": "paused"})
+    with pytest.raises(ValidationError):
+        validate_wire(RootRecoveryNoticeDetail, {"kind": "subagent_recovery"})

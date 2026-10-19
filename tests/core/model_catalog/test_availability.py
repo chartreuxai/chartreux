@@ -290,13 +290,20 @@ def test_probe_success_clears_and_failure_extends() -> None:
     registry = AvailabilityRegistry(initial_cooldown=1.0, clock=lambda: now[0])
     registry.record_failure("base", "provider")
     now[0] = 2.0
-    assert registry.admission("base", "provider")[:2] == (True, True)
-    registry.record_success("base", "provider")
+    admitted, is_probe, token = registry.admission("base", "provider")
+    assert (admitted, is_probe) == (True, True)
+    assert token is not None
+    # Review R13: the settlement is token-owned — the probe OWNER's
+    # success clears the cooldown (and releases the claim).
+    registry.record_success("base", "provider", probe_token=token)
     assert registry.cooldown_until("base", "provider") is None
     registry.record_failure("base", "provider")
     now[0] = 4.0
-    assert registry.admission("base", "provider")[:2] == (True, True)
-    registry.record_failure("base", "provider")
+    admitted, is_probe, token = registry.admission("base", "provider")
+    assert (admitted, is_probe) == (True, True)
+    assert token is not None
+    # The owner's failure extends the cooldown (and releases the claim).
+    registry.record_failure("base", "provider", probe_token=token)
     assert registry.cooldown_until("base", "provider") == pytest.approx(5.0)
 
 
@@ -320,7 +327,10 @@ def test_stale_probe_release_cannot_release_a_newer_claim() -> None:
     _, _, first_token = registry.admission("base", "provider")
     assert first_token is not None
 
-    registry.record_failure("base", "provider")
+    # Review R13: the settlement is token-owned — the first probe's OWNER
+    # settles it (re-arming the cooldown), which alone makes the key
+    # claimable again for the newer probe.
+    registry.record_failure("base", "provider", probe_token=first_token)
     now[0] = 4.0
     _, _, newer_token = registry.admission("base", "provider")
     assert newer_token is not None
@@ -330,6 +340,219 @@ def test_stale_probe_release_cannot_release_a_newer_claim() -> None:
     assert registry.admission("base", "provider")[:2] == (False, False)
     registry.release_probe("base", "provider", newer_token)
     assert registry.admission("base", "provider")[:2] == (True, True)
+
+
+def test_out_of_band_error_mid_probe_leaves_no_stranded_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-2 V3 (a): an exception between claiming a recovery probe and
+    handing the candidate to the caller must not strand the claim.
+
+    FAILS pre-fix: eligible_deployments claimed the probe for the first
+    deployment and the compatibility check then raised — probe_in_flight
+    stayed True, so the deployment stayed probe-blocked until a user
+    reset_base.
+    """
+    snapshot = _catalog()
+    now = [0.0]
+    registry = AvailabilityRegistry(initial_cooldown=1.0, clock=lambda: now[0])
+    registry.record_failure("base", "test-first")
+    now[0] = 2.0  # cooldown expired: the eligibility pass claims the probe
+
+    def boom(**kwargs: object) -> None:
+        raise RuntimeError("out-of-band probe error")
+
+    monkeypatch.setattr(
+        "chartreux.core.model_catalog.availability.compatibility_exclusion", boom
+    )
+    with pytest.raises(RuntimeError, match="out-of-band probe error"):
+        eligible_deployments(
+            snapshot=snapshot,
+            committed=_committed(),
+            registry=registry,
+            config=_config(snapshot),
+            thinking="off",
+        )
+    # The claim was released on the way out: nothing is in flight and the
+    # deployment is claimable again without a user reset_base.
+    assert not registry.probe_in_flight("base", "test-first")
+    assert registry.admission("base", "test-first")[:2] == (True, True)
+
+
+def test_out_of_band_error_releases_earlier_candidates_claims_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-2 V3 (a), multi-deployment: an exception on a LATER deployment
+    must also release the probes already claimed for EARLIER candidates —
+    the caller never receives them when eligible_deployments raises.
+
+    FAILS pre-fix: both deployments stayed probe-blocked (stranded claims).
+    """
+    snapshot = _catalog()
+    now = [0.0]
+    registry = AvailabilityRegistry(initial_cooldown=1.0, clock=lambda: now[0])
+    registry.record_failure("base", "test-first")
+    registry.record_failure("base", "test-second")
+    now[0] = 2.0  # both cooldowns expired: the pass claims both probes
+
+    calls = [0]
+
+    def boom_on_second(**kwargs: object) -> None:
+        calls[0] += 1
+        if calls[0] == 2:
+            raise RuntimeError("out-of-band probe error")
+        return None
+
+    monkeypatch.setattr(
+        "chartreux.core.model_catalog.availability.compatibility_exclusion",
+        boom_on_second,
+    )
+    with pytest.raises(RuntimeError, match="out-of-band probe error"):
+        eligible_deployments(
+            snapshot=snapshot,
+            committed=_committed(),
+            registry=registry,
+            config=_config(snapshot),
+            thinking="off",
+        )
+    assert not registry.probe_in_flight("base", "test-first")
+    assert not registry.probe_in_flight("base", "test-second")
+    assert registry.admission("base", "test-first")[:2] == (True, True)
+    assert registry.admission("base", "test-second")[:2] == (True, True)
+
+
+def test_stale_probe_claim_stops_blocking_after_the_ttl() -> None:
+    """Round-2 V3 (b): a probe claim carries a wall-clock TTL — a claim older
+    than the bound is dead (no live probe attempt can outlive the request
+    timeout plus the retry budget), so it stops blocking availability and
+    can be re-claimed under a NEW owner token.
+
+    FAILS pre-fix: the constructor has no TTL (TypeError) and a claim never
+    expires — the deployment stays probe-blocked until a user reset_base.
+    """
+    now = [0.0]
+    registry = AvailabilityRegistry(
+        initial_cooldown=1.0, clock=lambda: now[0], probe_claim_ttl=10.0
+    )
+    registry.record_failure("base", "provider")
+    now[0] = 2.0  # cooldown expired
+    admitted, is_probe, first_token = registry.admission("base", "provider")
+    assert (admitted, is_probe) == (True, True)
+    assert first_token is not None
+    assert registry.probe_in_flight("base", "provider")
+    assert not registry.is_available("base", "provider")
+
+    now[0] = 13.0  # beyond the 10s claim TTL: the claim is dead
+    assert registry.is_available("base", "provider")
+    assert not registry.probe_in_flight("base", "provider")
+    admitted, is_probe, second_token = registry.admission("base", "provider")
+    assert (admitted, is_probe) == (True, True)
+    assert second_token is not None
+    assert second_token != first_token
+    # The re-claim is fresh: it blocks again until its own owner settles it.
+    assert registry.probe_in_flight("base", "provider")
+    assert not registry.is_available("base", "provider")
+
+
+def test_stale_probe_claim_never_lifts_an_active_cooldown() -> None:
+    """Round-3 W4: staleness never lifts a cooldown.
+
+    ``is_available``/``admission`` evaluate the cooldown's ``until`` BEFORE
+    the claim's staleness, so a STALE probe claim combined with an ACTIVE
+    unexpired cooldown still reports unavailable — pin the evaluation order
+    so a future refactor cannot flip it (the TTL only unblocks a claim whose
+    cooldown has already expired).
+    """
+    now = [0.0]
+    registry = AvailabilityRegistry(
+        initial_cooldown=1.0, clock=lambda: now[0], probe_claim_ttl=10.0
+    )
+    registry.record_failure("base", "provider")
+    now[0] = 2.0  # cooldown expired: the probe claim is taken
+    admitted, is_probe, token = registry.admission("base", "provider")
+    assert (admitted, is_probe) == (True, True)
+    assert token is not None
+    # A late normal attempt (no owner token) extends the cooldown while the
+    # probe claim stays outstanding.
+    registry.record_failure(
+        "base", "provider", FailureInfo(FailureCategory.RATE_LIMIT, retry_after=100.0)
+    )
+    now[0] = 13.0  # claim age 11s > the 10s TTL: the claim is STALE...
+    # ...but the cooldown is still active: staleness never lifts it.
+    assert not registry.is_available("base", "provider")
+    assert registry.admission("base", "provider") == (False, False, None)
+    # Once the cooldown expires, the stale claim no longer blocks either.
+    now[0] = 103.0
+    assert registry.is_available("base", "provider")
+    admitted, is_probe, reclaimed = registry.admission("base", "provider")
+    assert (admitted, is_probe) == (True, True)
+    assert reclaimed is not None
+    assert reclaimed != token
+
+
+def test_orphaned_token_never_releases_a_reclaimed_probe() -> None:
+    """Round-2 V3 (b): token-ownership survives a TTL re-claim — the
+    orphaned claim's late release is a no-op and never touches the new
+    owner's claim (release stays token-owned).
+
+    FAILS pre-fix: the constructor has no TTL (TypeError).
+    """
+    now = [0.0]
+    registry = AvailabilityRegistry(
+        initial_cooldown=1.0, clock=lambda: now[0], probe_claim_ttl=10.0
+    )
+    registry.record_failure("base", "provider")
+    now[0] = 2.0
+    _, _, first_token = registry.admission("base", "provider")
+    assert first_token is not None
+    now[0] = 13.0  # first claim is stale; re-claim under a new token
+    _, _, second_token = registry.admission("base", "provider")
+    assert second_token is not None
+    assert second_token != first_token
+
+    # The orphaned owner's late release must not release the new claim.
+    registry.release_probe("base", "provider", first_token)
+    assert registry.probe_in_flight("base", "provider")
+    assert registry.admission("base", "provider")[:2] == (False, False)
+    # The new owner's release settles it.
+    registry.release_probe("base", "provider", second_token)
+    assert not registry.probe_in_flight("base", "provider")
+    assert registry.admission("base", "provider")[:2] == (True, True)
+
+
+def test_eligible_deployments_reclaims_a_stale_probe_claim() -> None:
+    """Round-2 V3 (b), integration: a stranded (abandoned) probe claim past
+    its TTL no longer blocks the eligibility pass — the deployment is
+    admitted with a fresh owner token.
+
+    FAILS pre-fix: the constructor has no TTL (TypeError); without a TTL
+    the abandoned claim probe-blocks the deployment (the first candidate
+    would be test-second, not test-first).
+    """
+    snapshot = _catalog()
+    now = [0.0]
+    registry = AvailabilityRegistry(
+        initial_cooldown=1.0, clock=lambda: now[0], probe_claim_ttl=10.0
+    )
+    registry.record_failure("base", "test-first")
+    now[0] = 2.0
+    # A probe claimed and abandoned (the stranded-claim shape V3 fixes at
+    # the source; the TTL is the backstop).
+    _, _, stranded_token = registry.admission("base", "test-first")
+    assert stranded_token is not None
+    now[0] = 13.0  # the abandoned claim is now stale
+    result = eligible_deployments(
+        snapshot=snapshot,
+        committed=_committed(),
+        registry=registry,
+        config=_config(snapshot),
+        thinking="off",
+    )
+    candidate = result.candidates[0]
+    assert candidate.resolved.deployment.provider == "test-first"
+    assert candidate.recovery_probe
+    assert candidate.recovery_probe_token is not None
+    assert candidate.recovery_probe_token != stranded_token
 
 
 def test_keys_are_independent() -> None:

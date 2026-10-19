@@ -60,6 +60,32 @@ def _result_display_names(result: TaskResult) -> list[str]:
     )
 
 
+def _validate_replacement_claim_args(args: TaskArgs) -> None:
+    """WP5 claim-shape guards: a cross-model replacement claim
+    (``config.predecessor_agent_id``) launches a NEW agent in the background
+    and names its model and package explicitly; launch admission validates
+    the rest at failure time.
+    """
+    if args.config is None or args.config.predecessor_agent_id is None:
+        return
+    if args.agent_id is not None:
+        raise ToolError(
+            "a replacement claim (config.predecessor_agent_id) launches "
+            "a NEW agent: omit agent_id"
+        )
+    if not args.background:
+        raise ToolError("a replacement claim requires background mode")
+    if args.config.model is None:
+        raise ToolError(
+            "a replacement claim requires config.model (the replacement model)"
+        )
+    if args.config.work_package_id is None:
+        raise ToolError(
+            "a replacement claim requires config.work_package_id (the "
+            "package identity the per-package budget is keyed on)"
+        )
+
+
 class TaskToolConfig(BaseToolConfig):
     permission: ToolPermission = ToolPermission.ALWAYS
     allowlist: list[str] = Field(default=["worker"])
@@ -109,12 +135,21 @@ class Task(
             switches = _switch_notice_lines(result.metadata)
             detail = "; ".join([*names, *switches])
             if result.agent_id is not None:
+                # WP5: a replacement launch acknowledgment shows the
+                # validated decision's milestone notice (with its honest
+                # cost implication).
+                notice = (
+                    f"; {result.replacement.notice}"
+                    if result.replacement is not None and result.replacement.notice
+                    else ""
+                )
                 return ToolResultDisplay(
                     success=True,
                     verb="Launched",
                     message=(
                         f"agent {result.agent_id} (run {result.run_id})"
                         + (f": {detail}" if detail else "")
+                        + notice
                     ),
                 )
             turn_word = "turn" if result.turns_used == 1 else "turns"
@@ -190,6 +225,11 @@ class Task(
             raise ToolError("agent_id can only be used with background mode")
         if args.retain is not None and not args.background:
             raise ToolError("retain can only be used with background mode")
+        # WP5: a cross-model replacement claim (config.predecessor_agent_id)
+        # launches a NEW agent in the background and names its model and
+        # package explicitly; launch admission validates the rest at failure
+        # time.
+        _validate_replacement_claim_args(args)
         if args.agent_id is not None and "agent_type" not in args.model_fields_set:
             if ctx.subagent_runner is None:
                 raise ToolError("Task tool requires a subagent runner in context")

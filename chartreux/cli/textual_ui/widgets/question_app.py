@@ -15,7 +15,9 @@ from textual.widgets import Input
 
 from chartreux.app_server.models import (
     QuestionChoice,
+    UnattendedDefaultAction,
     UserAnswer,
+    UserInputCallbackExpiry,
     UserQuestion,
     UserQuestionRequest,
 )
@@ -26,6 +28,7 @@ from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 from chartreux.ui.widgets.vscode_compat import VscodeCompatInput
 
 _INPUT_GRACE_PERIOD_S = 0.5
+_COUNTDOWN_INTERVAL_S = 1.0
 
 
 def _redact_for_display(text: str) -> str:
@@ -42,6 +45,7 @@ def _redact_for_display(text: str) -> str:
 
 
 if TYPE_CHECKING:
+    from textual.timer import Timer
     from textual.widget import Widget
 
 
@@ -58,15 +62,31 @@ class QuestionApp(VimNavigationMixin, Container):
         Binding("enter", "select", "Select", show=False),
         Binding("space", "toggle_option", "Toggle", show=False),
         Binding("escape", "cancel", "Cancel", show=False),
+        # Lift the unattended-expiry deadline (plan U/OD1). Priority so it
+        # also reaches the free-text input, which binds ctrl+k itself.
+        Binding("ctrl+k", "keep_waiting", "Keep waiting", show=False, priority=True),
     ]
 
     class Answered(Message):
-        def __init__(self, answers: list[UserAnswer]) -> None:
+        def __init__(
+            self, answers: list[UserAnswer], callback_id: str | None = None
+        ) -> None:
             super().__init__()
             self.answers = answers
+            # Server-originated questions carry their callback id so stale
+            # messages never answer the wrong callback (plan U/OD1); local
+            # questions post None.
+            self.callback_id = callback_id
 
     class Cancelled(Message):
-        pass
+        def __init__(self, callback_id: str | None = None) -> None:
+            super().__init__()
+            self.callback_id = callback_id
+
+    class KeepWaiting(Message):
+        def __init__(self, callback_id: str | None = None) -> None:
+            super().__init__()
+            self.callback_id = callback_id
 
     def __init__(self, args: UserQuestionRequest) -> None:
         super().__init__(id="question-app")
@@ -91,6 +111,89 @@ class QuestionApp(VimNavigationMixin, Container):
         self._submitted = False
         self._submission_status: str | None = None
         self._body_max_height: int | None = None
+        # Unattended-expiry state (plan U/OD1): the server-owned deadline
+        # snapshot, the display-only countdown, and the callback identity.
+        self._callback_id: str | None = None
+        self._expiry: UserInputCallbackExpiry | None = None
+        self._countdown_timer: Timer | None = None
+        self._remaining_seconds: float = 0.0
+        self._keep_waiting_pressed = False
+        self._expired = False
+
+    def attach_callback(
+        self, callback_id: str, expiry: UserInputCallbackExpiry | None
+    ) -> None:
+        """Attach the server callback identity and its expiry policy (plan U).
+
+        Called by the turn supervisor once the widget is mounted. Starts the
+        display-only countdown; it is never reset by typing (user presence is
+        never inferred from input activity).
+        """
+        self._callback_id = callback_id
+        self._expiry = expiry
+        if expiry is not None and not self._keep_waiting_pressed:
+            self._start_countdown(expiry.timeout_seconds)
+
+    def _start_countdown(self, timeout_seconds: float) -> None:
+        self._remaining_seconds = timeout_seconds
+        self._stop_countdown()
+        self._countdown_timer = self.set_interval(
+            _COUNTDOWN_INTERVAL_S, self._tick_countdown
+        )
+        self._update_help()
+
+    def _stop_countdown(self) -> None:
+        if self._countdown_timer is not None:
+            self._countdown_timer.stop()
+            self._countdown_timer = None
+
+    def _tick_countdown(self) -> None:
+        if not self.is_mounted:
+            self._stop_countdown()
+            return
+        if self._remaining_seconds > 0:
+            self._remaining_seconds = max(0.0, self._remaining_seconds - 1.0)
+        self._update_help()
+
+    def _countdown_text(self) -> str:
+        expiry = self._expiry
+        if expiry is None:
+            return ""
+        minutes, seconds = divmod(max(0, int(self._remaining_seconds)), 60)
+        if any(
+            question.unattended_default.action
+            is UnattendedDefaultAction.PRESERVE_EXISTING_CHOICE
+            for question in expiry.questions
+        ):
+            outcome = "the existing choice will be kept"
+        else:
+            outcome = "dependent work will be deferred"
+        return (
+            f"No answer received yet. In {minutes}:{seconds:02d}, {outcome}; "
+            "no permission will be granted."
+        )
+
+    def action_keep_waiting(self) -> None:
+        """Ask the server to keep this question open without a deadline."""
+        if self._expiry is None or self._keep_waiting_pressed or self._expired:
+            return
+        self._keep_waiting_pressed = True
+        self._stop_countdown()
+        self._update_help()
+        self.post_message(self.KeepWaiting(callback_id=self._callback_id))
+
+    def close_for_expiry(self) -> None:
+        """Close live input after the server expired this question (plan U).
+
+        The unsent draft stays in ``other_texts`` for the supervisor to
+        preserve locally; it is never auto-delivered.
+        """
+        self._stop_countdown()
+        self._expired = True
+        self._submitted = True
+        self.disabled = True
+        if self.other_input is not None:
+            self.other_input.disabled = True
 
     def set_submission_status(self, status: str) -> None:
         self._submission_status = status
@@ -423,6 +526,8 @@ class QuestionApp(VimNavigationMixin, Container):
             )
         if len(self.questions) > 1:
             help_text = f"{shortcut('←→')} questions  {help_text}"
+        if self._expiry is not None and not self._keep_waiting_pressed:
+            help_text = f"{shortcut('Ctrl+K')} keep waiting  {help_text}"
         if self._submission_status:
             if self._submission_status.startswith(
                 "Warning: Answer delivery is uncertain"
@@ -431,6 +536,9 @@ class QuestionApp(VimNavigationMixin, Container):
             elif self._submission_status.startswith("Running: Sending answer"):
                 help_text = "Sending answer; please wait"
             help_text = f"{self._submission_status}\n{help_text}"
+        if self._expiry is not None and not self._keep_waiting_pressed:
+            # The honest countdown with the declared default's outcome.
+            help_text = f"{self._countdown_text()}\n{help_text}"
         self.help_widget.update(shortcut_hint(help_text))
 
     def _store_other_text(self) -> None:
@@ -552,7 +660,7 @@ class QuestionApp(VimNavigationMixin, Container):
             self._switch_question(new_idx)
 
     def action_cancel(self) -> None:
-        self.post_message(self.Cancelled())
+        self.post_message(self.Cancelled(callback_id=self._callback_id))
 
     def on_input_submitted(self, _event: Input.Submitted) -> None:
         if self._current_question.multi_select:
@@ -680,7 +788,7 @@ class QuestionApp(VimNavigationMixin, Container):
             result.append(
                 UserAnswer(question=q.question, answer=answer_text, is_other=is_other)
             )
-        self.post_message(self.Answered(answers=result))
+        self.post_message(self.Answered(answers=result, callback_id=self._callback_id))
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         if (

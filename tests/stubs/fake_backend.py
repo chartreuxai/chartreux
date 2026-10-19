@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Iterable
 from typing import Any, cast
 
+import httpx
+
 from chartreux.core.llm.exceptions import BackendError, PayloadSummary
 from chartreux.core.llm_models import LLMChunk, LLMMessage, Role
 from chartreux.core.utils import RetryObserver, RetryReason
@@ -179,6 +181,12 @@ class FakeInterruptedStreamingBackend(FakeBackend):
         async for chunk in super().complete_streaming(**kwargs):
             yield chunk
             if self.streaming_attempts == 1:
+                # Production-faithful (D1): a real network failure carries its
+                # httpx transport cause — generic.py raises the BackendError
+                # ``from`` the caught httpx.RequestError — so the classifier
+                # honestly resolves CONNECTION through the cause chain and the
+                # deployment cooldown arms. A bare status=None error stays
+                # UNKNOWN by design (tests/recovery/test_failure_envelope.py).
                 raise BackendError(
                     provider="test",
                     endpoint="https://example.test/chat",
@@ -196,4 +204,4 @@ class FakeInterruptedStreamingBackend(FakeBackend):
                         has_tools=False,
                         tool_choice=None,
                     ),
-                )
+                ) from httpx.ConnectError("network boom")

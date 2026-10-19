@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 import time
@@ -56,11 +56,17 @@ from chartreux.app_server.models import (
 from chartreux.app_server.protocol import (
     AgentsCancelParams,
     AgentsCancelResponse,
+    AgentsReconcileParams,
+    AgentsReconcileResponse,
     AgentsReleaseParams,
     AgentsReleaseResponse,
+    AgentsResumeParams,
+    AgentsResumeResponse,
     AppServerResponseError,
     CallbackCallParams,
     CallbackCallResponse,
+    CallbackKeepWaitingParams,
+    CallbackKeepWaitingResponse,
     CallbackResult,
     CallbackResultError,
     CallbackResultParams,
@@ -77,6 +83,12 @@ from chartreux.app_server.protocol import (
     Notification,
     ProtocolError,
     ProtocolErrorCode,
+    RootRecoveryAdmitParams,
+    RootRecoveryAdmitResponse,
+    RootRecoveryCancelParams,
+    RootRecoveryCancelResponse,
+    RootRecoveryScheduleParams,
+    RootRecoveryScheduleResponse,
     RuntimeReadParams,
     RuntimeReadResponse,
     ServerRequest,
@@ -110,6 +122,7 @@ from chartreux.app_server.protocol import (
     TurnSteerParams,
     TurnSteerResponse,
     TurnUserInputEntry,
+    VerifiedEffectWire,
 )
 from chartreux.app_server.resources import AppServerResources
 from chartreux.observability.logging import logger
@@ -138,8 +151,14 @@ _RESYNC_COALESCE_WINDOW_SECONDS = 0.5
 
 
 class AppServerTurnError(RuntimeError):
-    def __init__(self, error: PublicError | None) -> None:
+    def __init__(
+        self, error: PublicError | None, *, turn_id: str | None = None
+    ) -> None:
         self.error = error or PublicError(message="App-server turn failed")
+        # R2: the TERMINAL turn identity, so the TUI controller's single
+        # observation path can deduplicate by (session_generation,
+        # terminal_turn_id) across the solicited and unsolicited paths.
+        self.turn_id = turn_id
         super().__init__(self.error.message)
 
 
@@ -348,6 +367,7 @@ class AppServerSession:  # noqa: PLR0904
         mention_stats: MentionStats | None = None,
         injected: bool = False,
         user_initiated_retry: bool = False,
+        idempotency_key: str | None = None,
     ) -> AsyncGenerator[AppServerEvent, None]:
         client = await self._ensure_attached()
         if self.turn_active:
@@ -367,6 +387,7 @@ class AppServerSession:  # noqa: PLR0904
                         auto_title=auto_title,
                         user_display_content=user_display_content,
                         mention_stats=mention_stats,
+                        idempotency_key=idempotency_key,
                     ),
                 ),
             )
@@ -395,10 +416,20 @@ class AppServerSession:  # noqa: PLR0904
                     operation_completed = True
                     await self.resources.runtime.refresh()
                     if event.turn.status is PublicTurnStatus.FAILED:
-                        raise AppServerTurnError(event.turn.error)
+                        # R2: the raised error carries the TERMINAL turn
+                        # identity (the turn this TurnCompleted finalized).
+                        raise AppServerTurnError(
+                            event.turn.error, turn_id=event.turn.id
+                        )
                     return
                 yield event
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit):
+            # The stream ended without the turn completing: a cancellation
+            # thrown into the stream, or a CONSUMER CLOSE — aclosing() throws
+            # GeneratorExit at the yield, which a CancelledError-only arm
+            # bypasses and the server turn would keep running unobserved
+            # (the TUI's agent-job state keys on turn_active). Interrupt the
+            # server turn so it settles via normal interruption rules.
             with suppress(Exception):
                 await self.interrupt()
             raise
@@ -698,6 +729,51 @@ class AppServerSession:  # noqa: PLR0904
             AgentsReleaseResponse, await client.request("agents/release", params)
         )
 
+    async def resume_agent(
+        self, agent_id: str, expected_run_id: str, idempotency_key: str | None = None
+    ) -> AgentsResumeResponse:
+        """Explicitly resume a suspended failed agent run (WP2).
+
+        ``expected_run_id`` pins the suspended failed run; the server
+        single-flights on ``idempotency_key`` and admits at most one
+        successor run. Resume is always explicit — no automatic recovery
+        is scheduled.
+        """
+        params = AgentsResumeParams(
+            agent_id=agent_id,
+            expected_run_id=expected_run_id,
+            idempotency_key=idempotency_key,
+        )
+        client = await self._ensure_attached()
+        return validate_wire(
+            AgentsResumeResponse, await client.request("agents/resume", params)
+        )
+
+    async def reconcile_result(
+        self,
+        agent_id: str,
+        expected_run_id: str,
+        transcript_boundary: str,
+        verified_effects: Sequence[VerifiedEffectWire],
+    ) -> AgentsReconcileResponse:
+        """Submit verified tool-effect evidence for a suspended barrier (WP2).
+
+        The submission is pinned to the failed run and its transcript
+        boundary: stale or duplicate evidence never clears a newer
+        barrier, and evidence of unrepeatable damage flips the barrier to
+        prohibited.
+        """
+        params = AgentsReconcileParams(
+            agent_id=agent_id,
+            expected_run_id=expected_run_id,
+            transcript_boundary=transcript_boundary,
+            verified_effects=list(verified_effects),
+        )
+        client = await self._ensure_attached()
+        return validate_wire(
+            AgentsReconcileResponse, await client.request("agents/reconcile", params)
+        )
+
     async def interrupt(self) -> None:
         active_turn_id = self._active_public_turn_id()
         if active_turn_id is None:
@@ -773,6 +849,84 @@ class AppServerSession:  # noqa: PLR0904
             result=UserQuestionResult(answers=[], cancelled=True)
         )
         await self.respond_to_callback(callback.callback_id, output)
+
+    async def keep_waiting_callback(self, callback_id: str) -> str:
+        """Lift the unattended-expiry deadline for a callback (plan U/OD1).
+
+        Returns "kept" (the question stays open without a deadline),
+        "already_terminal", or "no_deadline".
+        """
+        client = await self._ensure_attached()
+        params = CallbackKeepWaitingParams(
+            session_id=self._callback_sessions.get(callback_id, self.session_id),
+            callback_id=callback_id,
+        )
+        response = validate_wire(
+            CallbackKeepWaitingResponse,
+            await client.request("callback/keepWaiting", params),
+        )
+        return response.status
+
+    async def schedule_root_recovery(
+        self,
+        terminal_turn_id: str,
+        *,
+        solicited: bool = False,
+        input_generation: int = 0,
+    ) -> RootRecoveryScheduleResponse:
+        """R2/OD3: ask the app-server gate to schedule the automatic
+        continuation of one terminally failed root turn (bounded,
+        cooldown-aware; never resets availability cooldowns).
+        """
+        client = await self._ensure_attached()
+        params = RootRecoveryScheduleParams(
+            session_id=self.session_id,
+            terminal_turn_id=terminal_turn_id,
+            solicited=solicited,
+            input_generation=input_generation,
+        )
+        return validate_wire(
+            RootRecoveryScheduleResponse,
+            await client.request("recovery/root/schedule", params),
+        )
+
+    async def admit_root_recovery(
+        self,
+        episode_id: str,
+        idempotency_key: str,
+        terminal_turn_id: str,
+        *,
+        input_generation: int = 0,
+    ) -> RootRecoveryAdmitResponse:
+        """R2/OD3: single-flight admission of one scheduled continuation.
+
+        Rechecks session/turn/input generation, queued work, callbacks,
+        stop state, episode budget, and live availability AT admission.
+        """
+        client = await self._ensure_attached()
+        params = RootRecoveryAdmitParams(
+            session_id=self.session_id,
+            episode_id=episode_id,
+            idempotency_key=idempotency_key,
+            terminal_turn_id=terminal_turn_id,
+            input_generation=input_generation,
+        )
+        return validate_wire(
+            RootRecoveryAdmitResponse,
+            await client.request("recovery/root/admit", params),
+        )
+
+    async def cancel_root_recovery(self, episode_id: str, *, reason: str = "") -> bool:
+        """R2/OD3: cancel a pending automatic-continuation schedule."""
+        client = await self._ensure_attached()
+        params = RootRecoveryCancelParams(
+            session_id=self.session_id, episode_id=episode_id, reason=reason
+        )
+        response = validate_wire(
+            RootRecoveryCancelResponse,
+            await client.request("recovery/root/cancel", params),
+        )
+        return response.cancelled
 
     async def resume(
         self, session_id: str, *, on_adopt: Callable[[], None] | None = None

@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable
 
 from pydantic import BaseModel
 
+from chartreux.core.events import UserInputOrigin
 from chartreux.core.tools.base import ToolError
 
 type UserInputRequestHandler = Callable[[BaseModel], Awaitable[BaseModel]]
@@ -12,9 +13,17 @@ type UserInputRequestHandler = Callable[[BaseModel], Awaitable[BaseModel]]
 class FakeInteractionRequests:
     def __init__(self, *, user_input: UserInputRequestHandler | None = None) -> None:
         self._user_input = user_input
+        self.origins: list[UserInputOrigin] = []
 
-    async def request_user_input(self, args: BaseModel, tool_call_id: str) -> BaseModel:
+    async def request_user_input(
+        self,
+        args: BaseModel,
+        tool_call_id: str,
+        *,
+        origin: UserInputOrigin = UserInputOrigin.RUNTIME_APPROVAL,
+    ) -> BaseModel:
         del tool_call_id
+        self.origins.append(origin)
         if self._user_input is None:
             raise ToolError("User input is not available")
         return await self._user_input(args)

@@ -65,6 +65,30 @@ _RETRYABLE_TURN_ERROR_CODES = {
     TurnErrorCode.INCOMPLETE_STREAM,
 }
 
+# R1 (plan v0.5.6-recovery): the terminal root-failure codes that display the
+# keyboard-accessible "Retry — new turn" affordance. The affordance's
+# retryable set is the existing retryable set PLUS exhaustion-after-cooldown
+# (ALL_DEPLOYMENTS_UNAVAILABLE): the user pressing Retry is a genuine user
+# action, and the existing manual retry operation's intentional cooldown reset
+# (the only path allowed to reset it, ``_loop.py``) is exactly what makes a
+# retry meaningful once every deployment was excluded. The error text stays
+# honest that deployments were unavailable and that a manual retry resets the
+# model's cooldowns (``_exhaustion_retry_hint``).
+_RETRY_AFFORDANCE_TURN_ERROR_CODES = _RETRYABLE_TURN_ERROR_CODES | {
+    TurnErrorCode.ALL_DEPLOYMENTS_UNAVAILABLE
+}
+
+# R1: transport-disconnect / suspected-hang signals. A lost app-server
+# connection or a stalled transport surfaces as a generic exception, not a
+# typed turn error. These get inspection/reconnect GUIDANCE — never a retry
+# affordance and never an automatic continuation.
+_DISCONNECT_ERROR_TYPES: tuple[type[Exception], ...] = (ConnectionError, TimeoutError)
+
+# R2/OD3: the mirrored default of the gate-controlled episode budget
+# ([recovery.root] auto_retries_max=2) — the legacy incomplete-stream
+# continuation is MERGED into the gate, so this constant documents the shared
+# limit rather than deciding it (kept for the app.py re-export and the R0
+# per-episode bound test).
 _MAX_INCOMPLETE_STREAM_RETRIES = 2
 
 # Interrupt wait/settle timeouts. app.py re-exports these names, so the
@@ -85,6 +109,47 @@ def _public_entry(event: AppServerEvent) -> PublicHistoryEntry | None:
             return entry
         case _:
             return None
+
+
+def _transport_disconnect_guidance(error: Exception) -> str:
+    """R1: inspection/reconnect guidance for a transport disconnect or a
+    suspected hang — never a retry affordance, never an automatic
+    continuation.
+
+    A lost app-server connection surfaces as a generic exception (not a typed
+    ``AppServerTurnError``), so it never enters the retry affordance set. This
+    is not a watchdog: a stalled turn with no terminal failure produces no
+    error widget at all.
+    """
+    from chartreux.app_server import AppServerConnectionClosed
+
+    if not isinstance(error, (AppServerConnectionClosed, *_DISCONNECT_ERROR_TYPES)):
+        return ""
+    return (
+        "\n\nThe connection to the app server was lost or the turn stalled. "
+        "Inspect the session and server state; the client reconnects "
+        "automatically, and a new turn can be started once the connection is "
+        "back. Nothing is continued automatically."
+    )
+
+
+def _message_matches_active_callback(
+    active_callback: PublicCallbackEntry | None,
+    message: QuestionApp.Answered | QuestionApp.Cancelled,
+) -> bool:
+    """Correlate QuestionApp messages with callback identity (plan U).
+
+    A server-originated question posts its callback id; a local question
+    posts None. A stale message (an expired or replaced question) never
+    answers the active callback and never resolves a local question.
+    """
+    if message.callback_id is None:
+        # Local question: only valid while no server callback is active.
+        return active_callback is None
+    return (
+        active_callback is not None
+        and active_callback.callback_id == message.callback_id
+    )
 
 
 class TurnSupervisor:
@@ -159,6 +224,9 @@ class TurnSupervisor:
         self.callback_delivery_uncertain = False
         self.pending_local_question: asyncio.Future[UserQuestionResult] | None = None
         self.active_turn_start: int | None = None
+        # Unsent drafts preserved locally when a question expires unanswered
+        # (plan U/OD1); keyed by callback id, never auto-delivered.
+        self.expired_question_drafts: dict[str, dict[int, str]] = {}
 
     def _bind_app(self, app: ChartreuxApp) -> None:
         """Bind the host app after construction."""
@@ -501,15 +569,19 @@ class TurnSupervisor:
 
         if event.turn.next_turn_id is not None:
             return
-        retry_incomplete_stream = False
+        recovery_pending = False
         if event.turn.status is PublicTurnStatus.FAILED:
-            error = AppServerTurnError(event.turn.error)
+            error = AppServerTurnError(event.turn.error, turn_id=event.turn.id)
             await self._handle_turn_error()
-            retry_incomplete_stream = (
-                error.error.code == TurnErrorCode.INCOMPLETE_STREAM
-                and not self._app._queue.has_server_work
+            # R2/OD3: the one terminal observation path — the app-server
+            # gate decides eligibility/budget/barriers; the TUI controller
+            # owns the local timer. The legacy incomplete-stream immediate
+            # continuation is MERGED into that controller (OD4a: when
+            # [recovery.root] is disabled no automatic continuation runs).
+            recovery_pending = await self._app._root_recovery.observe_terminal(
+                event, solicited=False
             )
-            if retry_incomplete_stream:
+            if recovery_pending:
                 if self._app.event_handler is not None:
                     self._app.event_handler.offer_retry()
             else:
@@ -517,13 +589,7 @@ class TurnSupervisor:
                 await self._mount_turn_error(error, message)
         elif event.turn.status is PublicTurnStatus.INTERRUPTED:
             await self._handle_turn_error(cancelled=True)
-        await self.finalize_turn_ui(notify_complete=not retry_incomplete_stream)
-        if retry_incomplete_stream:
-            # Do not publish a retry blocked on the interrupt gate as the active
-            # agent task: the interrupt supervisor must be able to observe idle
-            # turn ownership and settle that same gate. The retry claims
-            # ``_agent_task`` itself immediately after admission.
-            asyncio.create_task(self._app._auto_retry_incomplete_stream(1))
+        await self.finalize_turn_ui(notify_complete=not recovery_pending)
 
     async def handle_turn(
         self,
@@ -534,14 +600,13 @@ class TurnSupervisor:
         injected: bool = False,
         user_initiated_retry: bool = False,
         incomplete_stream_retries: int = 0,
+        idempotency_key: str | None = None,
     ) -> None:
-        from chartreux.app_server.session import AppServerTurnError
-
         turn_ui_generation = self.turn_ui_generation
         if self.active_turn_start is None:
             self.active_turn_start = self._app._transcript.admitted_end_index
         await self._app._remove_loading_widget()
-        retry_incomplete_stream = False
+        recovery_pending = False
 
         try:
             await self.ensure_runtime_ready()
@@ -573,6 +638,7 @@ class TurnSupervisor:
                     mention_stats=mentions,
                     injected=injected,
                     user_initiated_retry=user_initiated_retry,
+                    idempotency_key=idempotency_key,
                 )
             ) as events:
                 await self._handle_turn_events(events)
@@ -587,13 +653,16 @@ class TurnSupervisor:
             if self._app._fatal_init_error:
                 return
 
-            retry_incomplete_stream = (
-                isinstance(e, AppServerTurnError)
-                and e.error.code == TurnErrorCode.INCOMPLETE_STREAM
-                and incomplete_stream_retries < _MAX_INCOMPLETE_STREAM_RETRIES
-                and not self._app._queue.has_server_work
+            # R2/OD3: the one terminal observation path — the app-server
+            # gate decides eligibility/budget/barriers; the TUI controller
+            # owns the local timer. The legacy incomplete-stream immediate
+            # continuation is MERGED into that controller (OD4a: when
+            # [recovery.root] is disabled no automatic continuation runs at
+            # all — the manual R1 retry affordance is the fallback).
+            recovery_pending = await self._app._root_recovery.observe_terminal(
+                e, solicited=True
             )
-            if retry_incomplete_stream:
+            if recovery_pending:
                 # Auto-retry silently: don't surface the error while we retry.
                 # Arm the retry presentation (without an error widget) so the
                 # partial assistant message is reused when the retry streams in.
@@ -607,37 +676,44 @@ class TurnSupervisor:
                 await self._mount_turn_error(e, message)
         finally:
             await self.finalize_turn_ui(
-                notify_complete=not retry_incomplete_stream,
+                notify_complete=not recovery_pending,
                 turn_ui_generation=turn_ui_generation,
             )
-
-        if retry_incomplete_stream:
-            await self._app._auto_retry_incomplete_stream(incomplete_stream_retries + 1)
 
     async def _mount_turn_error(self, error: Exception, message: str) -> None:
         from chartreux.app_server.session import AppServerTurnError
 
+        event_handler = self._app.event_handler
         if (
-            self._app.event_handler is not None
+            event_handler is not None
             and isinstance(error, AppServerTurnError)
             and error.error.code == TurnErrorCode.INVALID_API_KEY
         ):
-            self._app.event_handler.cancel_retry_presentation()
-        widget = ErrorMessage(message, collapsed=self._app._tools_collapsed)
-        await self._app._mount_and_scroll(widget)
-        if (
-            self._app.event_handler is not None
+            event_handler.cancel_retry_presentation()
+        # R1: an authoritative terminal retryable root failure displays the
+        # keyboard-accessible "Retry — new turn" affordance on the error
+        # widget and arms the retry presentation, so the affordance invokes
+        # the EXISTING retry operation (never resume_agent, never automatic).
+        offer_retry = (
+            event_handler is not None
             and isinstance(error, AppServerTurnError)
-            and error.error.code in _RETRYABLE_TURN_ERROR_CODES
-        ):
-            self._app.event_handler.offer_retry(widget)
+            and error.error.code in _RETRY_AFFORDANCE_TURN_ERROR_CODES
+        )
+        widget = ErrorMessage(
+            message, collapsed=self._app._tools_collapsed, retryable=offer_retry
+        )
+        await self._app._mount_and_scroll(widget)
+        if offer_retry and event_handler is not None:
+            event_handler.offer_retry(widget)
             self._app._refresh_command_registry()
 
     def _resolve_turn_error_message(self, e: Exception) -> str:
         from chartreux.app_server.session import AppServerTurnError
 
         if not isinstance(e, AppServerTurnError):
-            return str(e)
+            # R1: a transport disconnect / suspected hang gets
+            # inspection/reconnect guidance — never a retry affordance.
+            return f"{e}{_transport_disconnect_guidance(e)}"
         code = e.error.code
         match code:
             case TurnErrorCode.RATE_LIMIT:
@@ -648,15 +724,33 @@ class TurnSupervisor:
                 return self._refusal_message(e.error)
             case _:
                 base = str(e)
-        if code in _RETRYABLE_TURN_ERROR_CODES:
+        if code in _RETRY_AFFORDANCE_TURN_ERROR_CODES:
+            # PublicError.code arrives as a plain str (pydantic enum
+            # coercion), so compare by value, never by identity.
+            if code == TurnErrorCode.ALL_DEPLOYMENTS_UNAVAILABLE:
+                return f"{base}{self._exhaustion_retry_hint()}"
             return f"{base}{self._retry_hint()}"
         return base
 
     @staticmethod
     def _retry_hint() -> str:
         return (
-            "\n\nRun /retry [additional instructions] to start a new turn. "
-            "Completed tool results are kept; recent actions may repeat."
+            "\n\nRetry — new turn: use the button below, press Ctrl+R, or run "
+            "/retry [additional instructions]. Completed tool results are "
+            "kept; recent actions may repeat."
+        )
+
+    @staticmethod
+    def _exhaustion_retry_hint() -> str:
+        # R1: honest exhaustion text — the deployments really were
+        # unavailable, and only a manual user retry resets the model's
+        # cooldowns (the sole path allowed to do so).
+        return (
+            "\n\nAll deployments for this model were unavailable. Retry — new "
+            "turn: use the button below, press Ctrl+R, or run /retry "
+            "[additional instructions]; a manual retry is your request and "
+            "resets the model's cooldowns. Completed tool results are kept; "
+            "recent actions may repeat."
         )
 
     def _rate_limit_message(self) -> str:
@@ -690,8 +784,14 @@ class TurnSupervisor:
         return f"{lead}\n\n{detail}"
 
     async def auto_retry_incomplete_stream(
-        self, incomplete_stream_retries: int
+        self, incomplete_stream_retries: int, *, idempotency_key: str | None = None
     ) -> None:
+        # R2/OD3: the continuation DRIVER for the bounded automatic
+        # root-turn recovery (the legacy incomplete-stream continuation is
+        # MERGED into the gate-controlled episode). ``idempotency_key`` is
+        # the gate's single-flight admission key; the continuation is an
+        # injected, NON-user-initiated new turn, so it never resets
+        # availability cooldowns (WP0 F6).
         # Automatic retries are new turns too. Keep them behind the same
         # interrupt admission gate as submitted prompts so late interrupt
         # finalization cannot mutate the replacement turn's presentation.
@@ -704,6 +804,7 @@ class TurnSupervisor:
             build_retry_prompt(""),
             injected=True,
             incomplete_stream_retries=incomplete_stream_retries,
+            idempotency_key=idempotency_key,
         )
 
     async def retry(
@@ -716,6 +817,12 @@ class TurnSupervisor:
         # _agent_job_active and _handle_turn are read through the app
         # delegates so instance patches on them keep intercepting.
         if self._app._agent_job_active():
+            return
+        # R1: no retry action while stopping (an interrupt is still settling)
+        # or while a runtime approval / user question is unresolved.
+        if self.interrupt_requested:
+            return
+        if self.active_callback is not None:
             return
         if self._app.event_handler is None or not self._app.event_handler.begin_retry(
             command_message
@@ -733,6 +840,8 @@ class TurnSupervisor:
         self._app._queue.notify_busy_changed()
 
     async def question_answered(self, message: QuestionApp.Answered) -> None:
+        if not _message_matches_active_callback(self.active_callback, message):
+            return
         result = UserQuestionResult(answers=message.answers, cancelled=False)
         if self.active_callback is not None:
             await self._app._respond_to_active_callback(
@@ -742,6 +851,8 @@ class TurnSupervisor:
         self._cancel_pending_question(result)
 
     async def question_cancelled(self, message: QuestionApp.Cancelled) -> None:
+        if not _message_matches_active_callback(self.active_callback, message):
+            return
         if self.active_callback is not None and (
             self.callback_submitting or self.callback_delivery_uncertain
         ):
@@ -753,6 +864,81 @@ class TurnSupervisor:
             )
             return
         self._cancel_pending_question(result)
+
+    async def question_keep_waiting(self, message: QuestionApp.KeepWaiting) -> None:
+        """Lift the unattended-expiry deadline for the active callback (plan U)."""
+        if message.callback_id is None:
+            return
+        active = self.active_callback
+        if active is None or active.callback_id != message.callback_id:
+            return
+        try:
+            await self._app.app_server.keep_waiting_callback(active.callback_id)
+        except Exception as exc:
+            # The server timer still fires on failure; the question may
+            # expire even though the user asked to keep waiting.
+            logger.warning("Keep-waiting request failed", exc_info=exc)
+            self._app.notify(
+                "Keep-waiting request failed; the question may still expire.",
+                severity="warning",
+            )
+
+    async def question_expired(self, entry: PublicCallbackEntry) -> None:
+        """Close the UI for a callback the server expired unanswered (plan U).
+
+        The live input is closed, the unsent draft is preserved locally (never
+        auto-delivered), and the next pending callback (if any) is shown.
+        """
+        callback_id = entry.callback_id
+        self._prune_expired_pending()
+        active = self.active_callback
+        if active is not None and active.callback_id == callback_id:
+            from chartreux.cli.textual_ui.app import _get_question_app_class
+
+            try:
+                question = self._app.query_one(_get_question_app_class())
+            except Exception:
+                question = None
+            if question is not None and question._callback_id == callback_id:
+                # Preserve the unsent draft locally; never auto-deliver it.
+                self.expired_question_drafts[callback_id] = dict(question.other_texts)
+                question.close_for_expiry()
+            self.active_callback = None
+            self._app.notify("Unanswered — deferred", severity="warning")
+            if self.pending_callbacks:
+                await self._app._show_callback(self.pending_callbacks.popleft())
+                return
+            if self._app._loading_widget is not None:
+                self._app._loading_widget.end_action_required()
+            await self._app._switch_to_input_app()
+            return
+        # A queued callback expired before it was ever displayed.
+        self.pending_callbacks = deque(
+            pending
+            for pending in self.pending_callbacks
+            if pending.callback_id != callback_id
+        )
+
+    def _prune_expired_pending(self) -> None:
+        """Drop queued callbacks the server already closed (plan U/OD1).
+
+        A queued callback can expire before it is ever displayed. Only prune
+        callbacks the client projection has actually seen reach a non-open
+        state: a callback the projection has not seen yet (for example one
+        delivered before the projection caught up) must still present.
+        """
+        closed_ids = {
+            entry.callback_id
+            for entry in (self._app.app_server.state.history or [])
+            if isinstance(entry, PublicCallbackEntry) and entry.state.status != "open"
+        }
+        if not closed_ids:
+            return
+        self.pending_callbacks = deque(
+            pending
+            for pending in self.pending_callbacks
+            if pending.callback_id not in closed_ids
+        )
 
     def _cancel_pending_question(self, result: UserQuestionResult) -> None:
         """Resolve a pending local question with ``result`` if one is open."""
@@ -786,6 +972,7 @@ class TurnSupervisor:
                     await self._app._switch_to_input_app()
 
     async def present_pending_callback(self) -> None:
+        self._prune_expired_pending()
         if self._app._secondary_surface_active():
             self._app._indicate_pending_action()
             return
@@ -829,6 +1016,14 @@ class TurnSupervisor:
                 return
             self._app._terminal_notifier.notify(NotificationContext.ACTION_REQUIRED)
             await self._app._switch_to_question_app(callback.detail.request)
+            # Attach the callback identity and the armed unattended-expiry
+            # policy so the widget can correlate messages and count down
+            # honestly (plan U/OD1).
+            from chartreux.cli.textual_ui.app import _get_question_app_class
+
+            self._app.query_one(_get_question_app_class()).attach_callback(
+                callback.callback_id, callback.detail.unattended_expiry
+            )
         except BaseException:
             if self.active_callback is callback:
                 self.active_callback = None

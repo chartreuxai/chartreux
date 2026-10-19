@@ -13,7 +13,9 @@ from chartreux.app_server._model import ProtocolModel
 from chartreux.app_server.models import (
     AgentStatsSnapshot,
     JsonPatchOperation,
+    PublicFailureEnvelope,
     PublicHistoryEntry,
+    PublicRecoveryEligibility,
     PublicSessionState,
     PublicTurn,
     PublicTurnQueue,
@@ -124,6 +126,24 @@ class AgentSummaryModel(ProtocolModel):
     active_provider: str | None = None
     effective_thinking: str | None = None
     result_expired: bool = False
+    # Public typed failure envelope of the latest failed run (WP1); bounded
+    # and redacted, full diagnostics stay private. The public wire model
+    # mirrors the core envelope (the public layer cannot import core).
+    last_failure: PublicFailureEnvelope | None = None
+    # WP2 recovery linkage: the stable recovery-chain identity, the
+    # same-agent resume counter, the failed run the latest run resumed
+    # from, and the suspended barrier's EFFECTIVE recovery eligibility
+    # (a reconcile_result submission flips it; the envelope stays
+    # immutable). None when no barrier is active.
+    recovery_chain_id: str | None = None
+    same_agent_resumes_used: int | None = None
+    resumed_from_run_id: str | None = None
+    recovery_eligibility: PublicRecoveryEligibility | None = None
+    # WP5 lineage pair: the orchestrator work-package identity of the latest
+    # run and the failed agent this agent replaced (a replacement gets a NEW
+    # agent_id with predecessor/package lineage). None when unclaimed.
+    work_package_id: str | None = None
+    predecessor_agent_id: str | None = None
 
 
 class AgentEvictionModel(ProtocolModel):
