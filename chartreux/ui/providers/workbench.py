@@ -836,9 +836,6 @@ class ProviderWorkbenchScreen(  # noqa: PLR0904 - widget host surface and delega
     def _persisted_credential_value(self, env_var: str) -> str | None:
         return self._connection_controller.persisted_credential_value(env_var)
 
-    def _bound_roster_identities(self, snapshot: CatalogSnapshot) -> frozenset[str]:
-        return self._connection_controller.bound_roster_identities(snapshot)
-
     def _notify_models_saved(
         self, previously_usable: frozenset[str], roster_before: frozenset[str]
     ) -> None:

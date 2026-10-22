@@ -1,14 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 
-from chartreux.core.dispatch.presets import ORCHESTRATED_PRESET, STANDALONE_PRESET
 from chartreux.core.dispatch.renderer import task_description_for_config
-from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
-from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.dispatch.session import bound_identity_reference
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
+
+
+def _description_lines(description: str) -> list[str]:
+    """The description's lines, order-insensitive.
+
+    The conversation's frozen route table is sorted by purpose, while the
+    live configured table follows the configured order, so a description
+    rendered from the frozen source carries the same content as the live
+    render with the launch-target rows in sorted order.
+    """
+    return sorted(description.splitlines())
 
 
 @pytest.mark.asyncio
@@ -37,62 +44,76 @@ async def test_refresh_system_prompt_preserves_scratchpad_section() -> None:
 
 
 @pytest.mark.asyncio
-async def test_internal_refresh_renders_frozen_system_prompt_id(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    agent = build_test_agent_loop(
-        config=build_test_vibe_config(system_prompt_id="tests"),
-        frozen_system_prompt_id="tests",
-    )
-    rendered_ids: list[str] = []
+async def test_internal_refresh_serves_the_frozen_policy_bundle() -> None:
+    # Package 10: the refresh renders the bundle captured at startup. A live
+    # config copy carrying a different identity selection must not change
+    # what the refresh renders — the bound bundle is the only frozen-policy
+    # source (design §10: no live reread of frozen policy during prompt
+    # refresh).
+    agent = build_test_agent_loop(config=build_test_vibe_config())
+    frozen_prompt = agent.messages[0].content or ""
+    bound = agent._bound_policy
+    assert bound is not None
 
-    def render(config, *_args, **_kwargs) -> str:
-        rendered_ids.append(config.system_prompt_id)
-        return f"prompt:{config.system_prompt_id}"
-
-    monkeypatch.setattr(
-        "chartreux.core.agent_loop._loop.get_universal_system_prompt", render
+    live_config = agent.config.model_copy(
+        update={"agent": agent.config.agent.model_copy(update={"identity": "reviewer"})}
     )
-    live_config = agent.config.model_copy(update={"system_prompt_id": "cli"})
 
     refreshed_prompt = agent._render_system_prompt(
         agent.skill_manager, config=live_config
     )
 
-    assert rendered_ids == ["tests"]
-    assert refreshed_prompt == "prompt:tests"
+    assert refreshed_prompt == frozen_prompt
+    assert agent._bound_policy is bound
 
 
 @pytest.mark.asyncio
-async def test_saved_policy_edit_applies_next_session_not_refresh() -> None:
+async def test_saved_identity_edit_applies_next_session_not_refresh() -> None:
+    # Package 10/16b: the bound policy bundle is frozen at startup, so a
+    # saved identity selection takes effect in the next session, never in a
+    # refresh of the running one. The task tool description renders from the
+    # route facts and the session model, so it is selection-independent and
+    # stable across the edit.
     config = build_test_vibe_config(
-        system_prompt_id="cli", include_prompt_detail=True, include_model_info=False
-    ).attach_catalog_snapshot(
-        CatalogSnapshot(SHIPPED_CATALOG, "initial", dispatch=ORCHESTRATED_PRESET)
+        include_prompt_detail=True, include_model_info=False
     )
     agent = build_test_agent_loop(config=config)
     initial = agent.messages[0].content
     initial_task = task_description_for_config(agent.config)
-    original = agent.bound_dispatch_policy
-    snapshot = agent.config.catalog_snapshot
-    changed = replace(snapshot, dispatch=STANDALONE_PRESET)
-    agent.config.attach_catalog_snapshot(changed)
+    bound = agent._bound_policy
+    assert bound is not None
+
+    edited = config.model_copy(
+        update={"agent": config.agent.model_copy(update={"identity": "reviewer"})}
+    )
+
+    # The refresh and any prepared consumer serve the frozen bundle's prompt;
+    # the edited live config does not leak into the running conversation.
     await agent.refresh_system_prompt()
     assert agent.messages[0].content == initial
-    assert agent.bound_dispatch_policy == original
-    assert task_description_for_config(agent.config) == initial_task
-    fresh_config = config.model_copy(deep=True).attach_catalog_snapshot(changed)
-    staged_config = fresh_config.model_copy(deep=True).attach_dispatch_policy(None)
-    prepared = agent._prepare_reload_consumers(staged_config, False, reuse_backend=True)
-    assert prepared.tool_manager._tool_descriptions["task"] == initial_task
+    assert agent._render_system_prompt(agent.skill_manager, config=edited) == initial
+    assert agent._bound_policy is bound
+    assert task_description_for_config(edited) == initial_task
+
+    prepared = agent._prepare_reload_consumers(edited, False, reuse_backend=True)
+    # The prepared consumers serve the conversation's FROZEN route table:
+    # content-identical to the initial description (the identity edit does
+    # not touch the routes), with the launch-target rows in the frozen
+    # table's sorted-by-purpose order.
+    assert _description_lines(prepared.tool_manager._tool_descriptions["task"]) == (
+        _description_lines(initial_task)
+    )
     assert prepared.system_prompt == initial
     retained = agent._prepare_launch_consumers(
-        fresh_config.model_copy(deep=True).attach_dispatch_policy(None),
-        replace_tools=True,
-        reuse_backend=True,
+        edited, replace_tools=True, reuse_backend=True
     )
-    assert retained.tool_manager._tool_descriptions["task"] == initial_task
-    fresh = build_test_agent_loop(config=fresh_config)
-    assert fresh.bound_dispatch_policy.policy == STANDALONE_PRESET
-    assert "You may implement directly" in (fresh.messages[0].content or "")
-    assert fresh.bound_dispatch_policy != original
+    assert _description_lines(retained.tool_manager._tool_descriptions["task"]) == (
+        _description_lines(initial_task)
+    )
+
+    # The next session binds and composes the saved selection.
+    fresh = build_test_agent_loop(config=edited)
+    assert fresh._bound_policy is not None
+    assert bound_identity_reference(fresh._bound_policy) == "reviewer"
+    assert "You are the reviewer" in (fresh.messages[0].content or "")
+    assert fresh._bound_policy is not bound

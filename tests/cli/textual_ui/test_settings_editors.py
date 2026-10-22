@@ -245,27 +245,27 @@ async def test_enum_choice_editor() -> None:
 
 
 @pytest.mark.asyncio
-async def test_prompt_enum_runtime_choices() -> None:
+async def test_identity_enum_runtime_choices() -> None:
     service = FakeService()
     for item in service.snapshot.catalog:
-        if item.path == "system_prompt_id":
-            item.choices = ("cli", "custom-prompt", "explore")
+        if item.path == "agent.identity":
+            item.choices = ("coder", "orchestrator", "researcher")
     for field in service.snapshot.fields:
-        if field.path == "system_prompt_id":
-            field.effective_value = "custom-prompt"
+        if field.path == "agent.identity":
+            field.effective_value = "orchestrator"
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        await pilot.press(*"system_prompt_id", "enter")
+        await pilot.press(*"agent.identity", "enter")
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
         options = screen.query_one("#settings-choices", OptionList)
         assert (
             options.highlighted_option
-            and options.highlighted_option.id == "choice:system_prompt_id:custom-prompt"
+            and options.highlighted_option.id == "choice:agent.identity:orchestrator"
         )
         await pilot.press("up", "space", "down", "enter")
         await pilot.pause()
-        assert service.saved == [{"system_prompt_id": "cli"}]
+        assert service.saved == [{"agent.identity": "coder"}]
 
 
 @pytest.mark.asyncio
@@ -320,13 +320,11 @@ async def test_wp4_membership_is_draft_only(gesture: str) -> None:
 @pytest.mark.parametrize("pointer", [False, True])
 async def test_wp4_radio_accepts_selected_not_cursor(pointer: bool) -> None:
     service = FakeService()
-    descriptor = next(
-        d for d in service.snapshot.catalog if d.path == "system_prompt_id"
-    )
+    descriptor = next(d for d in service.snapshot.catalog if d.path == "agent.identity")
     descriptor.choices = ("first", "second")
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         screen = cast(SettingsScreen, pilot.app.screen)
-        await pilot.press(*"system_prompt_id", "enter")
+        await pilot.press(*"agent.identity", "enter")
         choices = screen.query_one("#settings-choices", OptionList)
         if pointer:
             await pilot.click(choices, offset=(5, 0), times=2)
@@ -343,7 +341,7 @@ async def test_wp4_radio_accepts_selected_not_cursor(pointer: bool) -> None:
         else:
             await pilot.press("enter")
         await pilot.pause()
-        assert service.saved == [{"system_prompt_id": "first"}]
+        assert service.saved == [{"agent.identity": "first"}]
 
 
 @pytest.mark.asyncio
@@ -351,7 +349,7 @@ async def test_wp4_radio_accepts_selected_not_cursor(pointer: bool) -> None:
 @pytest.mark.parametrize(
     "path",
     [
-        "agent_paths",
+        "skill_paths",
         "displayed_workdir",
         "auto_compact_threshold",
         "ask_confirmation_on_exit",
@@ -359,7 +357,7 @@ async def test_wp4_radio_accepts_selected_not_cursor(pointer: bool) -> None:
 )
 async def test_wp4_editor_and_scalar_pointer_parity(path: str, pointer: bool) -> None:
     service = FakeService()
-    if path == "agent_paths":
+    if path == "skill_paths":
         next(f for f in service.snapshot.fields if f.path == path).effective_value = [
             "original"
         ]
@@ -381,7 +379,7 @@ async def test_wp4_editor_and_scalar_pointer_parity(path: str, pointer: bool) ->
             await pilot.pause()
             assert service.saved == [{path: True}]
             return
-        if path == "agent_paths":
+        if path == "skill_paths":
             entries = screen.query_one("#settings-entries", OptionList)
             if pointer:
                 await pilot.click(entries, offset=(5, 0))
@@ -397,7 +395,7 @@ async def test_wp4_editor_and_scalar_pointer_parity(path: str, pointer: bool) ->
         else:
             await pilot.press("enter")
         await pilot.pause()
-        if path == "agent_paths":
+        if path == "skill_paths":
             assert (
                 _draft_values(screen._list_draft) == ["replacement value"]
                 and not service.saved
@@ -411,7 +409,7 @@ async def test_wp4_editor_and_scalar_pointer_parity(path: str, pointer: bool) ->
         assert service.saved == [
             {
                 path: ["replacement value"]
-                if path == "agent_paths"
+                if path == "skill_paths"
                 else 3
                 if path == "auto_compact_threshold"
                 else "replacement value"
@@ -422,12 +420,13 @@ async def test_wp4_editor_and_scalar_pointer_parity(path: str, pointer: bool) ->
 @pytest.mark.asyncio
 async def test_review_narrow_enum_accept_pointer_target() -> None:
     service = FakeService()
-    next(
-        i for i in service.snapshot.catalog if i.path == "system_prompt_id"
-    ).choices = ("first", "second")
+    next(i for i in service.snapshot.catalog if i.path == "agent.identity").choices = (
+        "first",
+        "second",
+    )
     async with Harness(service).run_test(size=(50, 20)) as pilot:
         screen = cast(SettingsScreen, pilot.app.screen)
-        await pilot.press(*"system_prompt_id", "enter")
+        await pilot.press(*"agent.identity", "enter")
         await pilot.click("#settings-choices", offset=(3, 1))
         assert screen._enum_draft == "second" and not service.saved
         await pilot.click(
@@ -437,23 +436,24 @@ async def test_review_narrow_enum_accept_pointer_target() -> None:
             ),
         )
         await pilot.pause()
-        assert service.saved == [{"system_prompt_id": "second"}]
+        assert service.saved == [{"agent.identity": "second"}]
 
 
 @pytest.mark.asyncio
 async def test_review_clean_enum_enter_collapses_without_override() -> None:
     service = FakeService()
+    next(i for i in service.snapshot.catalog if i.path == "agent.identity").choices = (
+        "first",
+        "second",
+    )
     next(
-        i for i in service.snapshot.catalog if i.path == "system_prompt_id"
-    ).choices = ("first", "second")
-    next(
-        f for f in service.snapshot.fields if f.path == "system_prompt_id"
+        f for f in service.snapshot.fields if f.path == "agent.identity"
     ).effective_value = "first"
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         screen = cast(SettingsScreen, pilot.app.screen)
-        await pilot.press(*"system_prompt_id", "enter", "down", "enter")
+        await pilot.press(*"agent.identity", "enter", "down", "enter")
         assert screen._expanded is None and not service.saved
-        assert not screen.fields["system_prompt_id"].saved_explicit
+        assert not screen.fields["agent.identity"].saved_explicit
 
 
 class FakeAuthorityResource:

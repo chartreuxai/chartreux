@@ -18,14 +18,14 @@ def test_shared_display_name_helper_formats_provider_and_missing_values() -> Non
 async def test_agent_browser_row_uses_effective_provider_model() -> None:
     agent = AgentSummaryModel(
         agent_id="agent-1",
-        profile="worker",
+        identity="coder",
         availability="idle",
         base_model="base",
         active_provider="provider",
         name=derive_agent_name(
             agent_id="agent-1",
-            profile="worker",
-            profile_display_label=None,
+            identity="coder",
+            identity_display_label=None,
             base_model="base",
             effective_model=None,
         ),

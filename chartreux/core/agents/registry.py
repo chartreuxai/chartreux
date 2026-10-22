@@ -1,60 +1,24 @@
+"""Child configuration assembly for launches (package 16a keeps the launch path).
+
+The profile registry is retired with the profile axis (package 16a):
+agents/*.toml discovery and the profile-override layer are gone, and the
+child's resolved identity selection rides the launch-override inputs instead
+(see :func:`build_child_orchestrator`). What remains is the pure layer
+machinery the resource-free launch resolution needs.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
 import copy
-from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from chartreux.core.agents.models import BUILTIN_SUBAGENTS, AgentProfile
-from chartreux.core.config.harness_files import HarnessFilesManager
-from chartreux.core.config.layers.agent_profile import AgentProfileLayer
 from chartreux.core.config.layers.launch_overrides import LaunchOverridesLayer
 from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
-from chartreux.core.paths import dedup_paths
-from chartreux.observability.logging import logger
 
 if TYPE_CHECKING:
     from chartreux.core.config import ChartreuxConfigSchema
-
-
-def apply_profile_overrides(
-    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
-    overrides: dict[str, object],
-    *,
-    role: str | None = None,
-) -> None:
-    """Install profile overrides before the first runtime override layer."""
-    data = dict(overrides)
-    if role is not None:
-        data["active_model"] = f"@{role}"
-    layers = orchestrator.layers
-    profile = next(
-        (
-            (index, layer)
-            for index, layer in enumerate(layers)
-            if isinstance(layer, AgentProfileLayer)
-        ),
-        None,
-    )
-    if profile is None:
-        profile_layer = AgentProfileLayer(data=data)
-        profile_index = None
-    else:
-        profile_index, current_layer = profile
-        profile_layer = AgentProfileLayer(data=data, name=current_layer.name)
-        orchestrator.remove_layer(profile_index)
-
-    insertion_index = next(
-        (
-            index
-            for index, layer in enumerate(orchestrator.layers)
-            if isinstance(layer, OverridesLayer)
-        ),
-        profile_index if profile_index is not None else len(orchestrator.layers),
-    )
-    orchestrator.insert_layer(profile_layer, insertion_index)
-    orchestrator.rebuild()
 
 
 def _mutable_copy(value: object) -> object:
@@ -96,161 +60,77 @@ def apply_launch_overrides(
     orchestrator.rebuild()
 
 
+def _strip_inherited_identity_selection(
+    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
+) -> None:
+    """Drop inherited runtime ``agent.identity`` overrides from a child chain.
+
+    The child's identity is bound by the launch resolution: admission
+    validates that binding and the runtime enforces it. An inherited runtime
+    override (the parent session's own identity selection) sits in the merge
+    order and would otherwise silently disagree with the validated admission
+    (S2 identity disagreement): a parent running ``coder`` would launch a
+    ``reviewer`` child that executes as ``coder``. Children never inherit the
+    parent's identity selection; the launch inputs install the child's own
+    selection afterwards.
+    """
+    for index, layer in enumerate(orchestrator.layers):
+        if not isinstance(layer, OverridesLayer):
+            continue
+        data = dict(layer._data)
+        agent = data.get("agent")
+        if not (isinstance(agent, Mapping) and "identity" in agent):
+            continue
+        agent = {key: value for key, value in agent.items() if key != "identity"}
+        if agent:
+            data["agent"] = agent
+        else:
+            data.pop("agent", None)
+        orchestrator.remove_layer(index)
+        orchestrator.insert_layer(OverridesLayer(data=data, name=layer.name), index)
+
+
+def _strip_runtime_thinking_overrides(
+    orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
+) -> None:
+    """Drop inherited runtime thinking overrides for an explicitly modeled launch.
+
+    Main-session thinking choices are local to the main assistant: a launch
+    that carries its own model selection starts from that model's own preset
+    even when it shares the selected model.
+    """
+    for index, layer in enumerate(orchestrator.layers):
+        if not isinstance(layer, OverridesLayer):
+            continue
+        data = (
+            dict(layer.cached_data.model_dump(exclude_unset=True))
+            if layer.cached_data
+            else {}
+        )
+        if "thinking_overrides" in data:
+            data.pop("thinking_overrides")
+            orchestrator.remove_layer(index)
+            orchestrator.insert_layer(OverridesLayer(data=data, name=layer.name), index)
+        break
+
+
 def build_child_orchestrator(
     source: ConfigOrchestrator[ChartreuxConfigSchema],
-    profile_overrides: dict[str, object] | None,
     launch_overrides: Mapping[str, object],
     *,
-    profile_role: str | None = None,
+    strip_runtime_thinking: bool = False,
 ) -> ConfigOrchestrator[ChartreuxConfigSchema]:
     """Build the authoritative resource-free child configuration assembly.
 
-    ``None`` preserves the source's captured profile layer for retained agents.
+    The launch overrides carry the child's resolved identity selection
+    (``agent.identity``) and its model/thinking inputs; the child never
+    inherits the parent's identity selection (S2 identity disagreement).
+    ``strip_runtime_thinking`` drops the parent's runtime thinking overrides
+    for a launch that carries its own model selection.
     """
     candidate = source._copy_for_child()
-    selected_expression = launch_overrides.get("active_model")
-    if profile_role is not None or (
-        isinstance(selected_expression, str) and selected_expression.startswith("@")
-    ):
-        # Main-session thinking choices are local to the main assistant. A role
-        # starts with its own preset even when it shares the selected model.
-        for index, layer in enumerate(candidate.layers):
-            if not isinstance(layer, OverridesLayer):
-                continue
-            data = (
-                dict(layer.cached_data.model_dump(exclude_unset=True))
-                if layer.cached_data
-                else {}
-            )
-            if "thinking_overrides" in data:
-                data.pop("thinking_overrides")
-                candidate.remove_layer(index)
-                candidate.insert_layer(
-                    OverridesLayer(data=data, name=layer.name), index
-                )
-            break
-    if profile_overrides is not None:
-        apply_profile_overrides(candidate, profile_overrides, role=profile_role)
+    _strip_inherited_identity_selection(candidate)
+    if strip_runtime_thinking:
+        _strip_runtime_thinking_overrides(candidate)
     apply_launch_overrides(candidate, dict(launch_overrides))
     return candidate
-
-
-class AgentRegistry:
-    """Discovers and parses agent-profile definitions from the filesystem.
-
-    Owns search-path resolution and TOML loading. Each custom
-    profile is validated by folding it onto a throwaway orchestrator copy, so a
-    broken definition is dropped at discovery rather than at selection.
-    """
-
-    def __init__(
-        self,
-        orchestrator: ConfigOrchestrator[ChartreuxConfigSchema],
-        harness_files: HarnessFilesManager,
-    ) -> None:
-        self._orchestrator = orchestrator
-        self._harness_files = harness_files
-        self.search_paths = self._compute_search_paths()
-        self.discovered = self._discover()
-        self.validate_dispatch()
-
-    def validate_dispatch(self) -> None:
-        """Bind policy profile references only after discovery has completed.
-
-        Child configuration copies never create a registry, so this boundary
-        cannot recurse through profile validation. Session-policy freezing is
-        intentionally separate from discovery.
-        """
-        from chartreux.core.dispatch.lint import lint_activation, lint_catalog
-        from chartreux.core.model_catalog.loader import fallback_dispatch_snapshot
-
-        self._orchestrator.config.attach_dispatch_diagnostics(())
-        snapshot = self._orchestrator.config.catalog_snapshot
-        if snapshot is None:
-            return
-        diagnostics = (
-            *lint_catalog(snapshot.dispatch, snapshot.catalog),
-            *lint_activation(
-                snapshot.dispatch,
-                self.discovered,
-                shadowed_profiles=self._shadowed_profiles,
-            ),
-        )
-        if any(item.severity == "error" for item in diagnostics):
-            recovered = fallback_dispatch_snapshot(
-                snapshot, "; ".join(map(str, diagnostics))
-            )
-            self._orchestrator.config.attach_catalog_snapshot(recovered)
-            logger.warning("%s", recovered.dispatch_diagnostics[-1])
-            # Recovery is a preset selection, not a candidate repair. The shipped
-            # standalone slots may still be unavailable in this catalog; do not
-            # re-lint recovery into a session-start failure or invent role bindings.
-            return
-        self._orchestrator.config.attach_dispatch_diagnostics(
-            tuple(map(str, diagnostics))
-        )
-        for diagnostic in diagnostics:
-            logger.warning("%s", diagnostic)
-
-    def rediscover(self, harness_files: HarnessFilesManager) -> None:
-        """Point discovery at a different set of project directories.
-
-        Search paths are resolved once at construction, so a session that has
-        moved keeps offering the agents of the directory it left until this runs.
-        """
-        self._harness_files = harness_files
-        self.search_paths = self._compute_search_paths()
-        self.discovered = self._discover()
-
-    def _compute_search_paths(self) -> list[Path]:
-        mgr = self._harness_files
-        return dedup_paths([
-            *(p for p in self._orchestrator.config.agent_paths if p.is_dir()),
-            *mgr.project_agents_dirs,
-            *mgr.user_agents_dirs,
-        ])
-
-    def _discover(self) -> dict[str, AgentProfile]:
-        agents: dict[str, AgentProfile] = dict(BUILTIN_SUBAGENTS)
-        custom_names: set[str] = set()
-        self._shadowed_profiles: set[str] = set()
-
-        for base in self.search_paths:
-            if not base.is_dir():
-                continue
-            for agent_file in base.glob("*.toml"):
-                if not agent_file.is_file():
-                    continue
-                if (
-                    agent := self._try_load(agent_file, self._orchestrator.copy())
-                ) is not None:
-                    if agent.name in custom_names:
-                        logger.debug(
-                            "Skipping duplicate agent '%s' at %s",
-                            agent.name,
-                            agent_file,
-                        )
-                        continue
-                    custom_names.add(agent.name)
-                    if agent.name in BUILTIN_SUBAGENTS:
-                        self._shadowed_profiles.add(agent.name)
-                        logger.warning(
-                            "S2 Rejected custom profile %r at %s: builtin names cannot be shadowed",
-                            agent.name,
-                            agent_file,
-                        )
-                        continue
-                    agents[agent.name] = agent
-
-        return agents
-
-    def _try_load(
-        self, agent_file: Path, candidate: ConfigOrchestrator[ChartreuxConfigSchema]
-    ) -> AgentProfile | None:
-        try:
-            agent = AgentProfile.from_toml(agent_file)
-            apply_profile_overrides(candidate, agent.overrides, role=agent.role)
-            return agent
-        except Exception as e:
-            logger.warning("Failed to load agent at %s: %s", agent_file, e)
-            return None

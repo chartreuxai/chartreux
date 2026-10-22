@@ -24,7 +24,6 @@ from chartreux.app_server.config import (
 from chartreux.app_server.models import (
     COMMITTED_MODEL_RECOVERY_ISSUE_FILE,
     AgentStatsSnapshot,
-    AgentSummary,
     CancelledEffectState,
     CompletedEffectState,
     ConfigIssue,
@@ -57,9 +56,7 @@ from chartreux.app_server.models import (
     ToolSummary,
 )
 from chartreux.core.agent_loop import AgentLoop
-from chartreux.core.agents import AgentProfile
 from chartreux.core.config import ChartreuxConfigSchema, ModelConfig
-from chartreux.core.launch_types import LaunchConfig
 from chartreux.core.llm_models import (
     ImageAttachment as CoreImageAttachment,
     LLMMessage,
@@ -88,30 +85,18 @@ from chartreux.utils.mcp import format_tool_display_description
 from chartreux.utils.tool_presentation import ToolCallPresentation
 
 
-def project_launch_slot_purposes(agent_loop: AgentLoop, profile: str) -> list[str]:
-    bound = agent_loop.config.bound_dispatch_policy
-    launch = agent_loop.launch_overrides
-    if bound is None or not isinstance(launch, LaunchConfig) or not launch.model:
+def project_launch_purposes(agent_loop: AgentLoop) -> list[str]:
+    """The purpose label a routed launch declared at launch resolution.
+
+    Package 16b retired the dispatch slot/roster surface: a launch's purpose
+    is the label recorded on the loop (``AgentLoop.launch_purpose``), set
+    when the launch resolved through a purpose route. A direct launch
+    carries no purpose.
+    """
+    purpose = agent_loop.launch_purpose
+    if purpose is None:
         return []
-    # Preserve role identity even when multiple slots share a model/thinking pair.
-    candidates = [
-        set(slot.purposes)
-        for name, slot in bound.render_policy.slots.items()
-        if slot.profile == profile
-        and (
-            slot.role == launch.model
-            if launch.model.startswith("@")
-            else name in bound.bindings
-            and bound.bindings[name].base_model == launch.model
-            and bound.bindings[name].thinking
-            == agent_loop.config.get_active_model().thinking
-        )
-    ]
-    # Neither role aliases nor canonical launches identify a slot when matches
-    # disagree. Prefer a missed signal to attributing verification to implementation.
-    if not candidates or any(candidate != candidates[0] for candidate in candidates):
-        return []
-    return sorted(candidates[0])
+    return [purpose]
 
 
 def project_config(agent_loop: AgentLoop) -> ConfigView:
@@ -124,12 +109,7 @@ def project_config(agent_loop: AgentLoop) -> ConfigView:
 def project_config_view(
     config: ChartreuxConfigSchema, *, active_model_pinned: bool = False
 ) -> ConfigView:
-    bound = config.bound_dispatch_policy
     return ConfigView(
-        dispatch_mode=bound.render_policy.mode if bound is not None else None,
-        bound_roster=(
-            sorted(bound.bound_canonical_identities) if bound is not None else None
-        ),
         active_model=_project_model_config(config.get_active_model()),
         active_model_expression=config.active_model,
         allowed_models=list(config.allowed_models),
@@ -225,19 +205,6 @@ def project_stats(agent_loop: AgentLoop) -> AgentStatsSnapshot:
         last_turn_duration=stats.last_turn_duration,
         tokens_per_second=stats.tokens_per_second,
     )
-
-
-def project_agent_summaries(
-    active: AgentProfile, available: Iterable[AgentProfile]
-) -> tuple[AgentSummary, list[AgentSummary]]:
-    return _project_agent(active), [_project_agent(profile) for profile in available]
-
-
-def project_agents(agent_loop: AgentLoop) -> tuple[None, list[AgentSummary]]:
-    return None, [
-        _project_agent(profile)
-        for profile in agent_loop.agent_manager.available_agents.values()
-    ]
 
 
 def project_skill_summaries(skills: Iterable[SkillInfo]) -> list[SkillSummary]:
@@ -674,16 +641,6 @@ def history_user_message_index(agent_loop: AgentLoop, entry_id: str) -> int | No
 class _ConfigIssue(Protocol):
     file: Path
     message: str
-
-
-def _project_agent(profile: AgentProfile) -> AgentSummary:
-    return AgentSummary(
-        name=profile.name,
-        display_name=profile.display_name,
-        description=profile.description,
-        safety=profile.safety,
-        agent_type=profile.agent_type,
-    )
 
 
 def _project_issue(issue: _ConfigIssue) -> ConfigIssue:

@@ -197,7 +197,8 @@ class AgentRetention:
                 break
         summary = AgentSummary(
             agent_id=agent_id,
-            profile=record.profile,
+            identity=record.identity,
+            identity_revision=record.identity_revision,
             availability=availability,
             current_run_id=run.run_id if run is not None else None,
             current_run_status=run.status if run is not None else None,
@@ -231,7 +232,7 @@ class AgentRetention:
             reason="closed" if availability is AgentAvailability.CLOSED else "evicted",
             closed_at=now,
             expires_at=now + ttl,
-            profile_display_label=record.profile_display_label,
+            identity_display_label=record.identity_display_label,
         )
 
     def insert_locked(self, agent_id: str, tombstone: _AgentTombstone) -> None:

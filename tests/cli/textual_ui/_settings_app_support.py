@@ -41,9 +41,27 @@ from chartreux.core.config.settings_catalog import (
     DEFERRED_SETTINGS,
     EDITABLE_BY_PATH,
     LINK_SETTINGS,
+    TASK_DENYLIST_SETTING,
     VISIBLE_SETTINGS,
 )
 from chartreux.ui.settings_service import SettingsSaveOutcome, SettingsService
+
+# Real enum defaults for the fake leaves so displays stay representative.
+FAKE_ENUM_DEFAULTS = {
+    "agent.identity": "coder",
+    "agent.workflow": "minimal",
+    "agent.orchestration_strategy": "none",
+    "compaction_prompt_id": "compact",
+    "status_line.directory_style": "name",
+    "status_line.context_style": "tokens-percent",
+    "status_line.separator": "pipe",
+}
+
+FAKE_INVENTORIES: dict[Literal["tools", "skills", "identities"], list[str]] = {
+    "tools": ["bash", "read_file"],
+    "skills": ["review", "search"],
+    "identities": ["coder", "researcher"],
+}
 
 
 def focus_action(screen: SettingsScreen, identifier: str) -> OptionList:
@@ -70,7 +88,7 @@ def navigation_payload(screen: SettingsScreen) -> object:
 class FakeService:
     def __init__(self) -> None:
         inventory_states: dict[
-            Literal["tools", "skills", "agents"], dict[str, InventoryItemStateWire]
+            Literal["tools", "skills", "identities"], dict[str, InventoryItemStateWire]
         ] = {
             category: {
                 name: InventoryItemStateWire(
@@ -79,12 +97,8 @@ class FakeService:
                 for name in names
             }
             for category, names in cast(
-                dict[Literal["tools", "skills", "agents"], list[str]],
-                {
-                    "tools": ["bash", "read_file"],
-                    "skills": ["review", "search"],
-                    "agents": ["worker", "reviewer"],
-                },
+                dict[Literal["tools", "skills", "identities"], list[str]],
+                FAKE_INVENTORIES,
             ).items()
         }
         self.snapshot = SettingsReadResponse(
@@ -99,6 +113,8 @@ class FakeService:
                         item.path.split(".")[1]
                     ]
                     if item.path.startswith("status_line.")
+                    else FAKE_ENUM_DEFAULTS.get(item.path, "")
+                    if item.kind == "enum"
                     else False
                     if item.kind == "bool"
                     else 2
@@ -110,12 +126,16 @@ class FakeService:
                     saved_explicit=False,
                 )
                 for item in EDITABLE_BY_PATH.values()
+            ]
+            + [
+                SettingLeafWire(
+                    path=TASK_DENYLIST_SETTING.path,
+                    effective_value=[],
+                    origin="default",
+                    saved_explicit=False,
+                )
             ],
-            inventories={
-                "tools": ["bash", "read_file"],
-                "skills": ["review", "search"],
-                "agents": ["worker", "reviewer"],
-            },
+            inventories=dict(FAKE_INVENTORIES),
             inventory_states=inventory_states,
             user_layer="user",
             user_revision="revision",

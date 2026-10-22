@@ -70,7 +70,7 @@ async def test_public_root_tree(
     assert registry._root is not None
     runtimes = [registry._root]
     try:
-        for agent in ("worker", "worker"):
+        for agent in ("coder", "coder"):
             parent = runtimes[-1]
             child = await AgentRuntimeFactory().create_child(parent.agent_loop, agent)
             runtime = registry._build_child_runtime(child)
@@ -173,7 +173,7 @@ async def test_public_root_tree(
                 # Exercise the real subagent entry point, not just its guard helper.
                 with pytest.raises(RuntimeError):
                     async for _ in registry.run(
-                        TaskArgs(task="must not run", agent_type="plan"),
+                        TaskArgs(task="must not run", identity="coder"),
                         InvokeContext(
                             tool_call_id="racing-child",
                             session_id=runtimes[-1].agent_loop.session_id,

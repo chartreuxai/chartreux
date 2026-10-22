@@ -205,7 +205,7 @@ async def test_child_sessions_share_the_server_owned_tool_io_port() -> None:
     )
     try:
         children = legacy_backend(server).children
-        child = await AgentRuntimeFactory().create_child(agent_loop, "worker")
+        child = await AgentRuntimeFactory().create_child(agent_loop, "coder")
         child_runtime = children._build_child_runtime(child)
 
         assert child_runtime.turns._tool_io is children._tool_io

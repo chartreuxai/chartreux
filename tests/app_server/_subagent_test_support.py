@@ -14,8 +14,7 @@ retention record builders (``_background_result``, ``_wait_result``,
 ``_foreground_result``, ``_real_reused_background``), the clock and wakeup
 doubles (``_ManualClock``, ``_GatedWakeup``), the reaper arm helper
 (``_rearm``), the event-stream helpers (``_consume``,
-``_wait_for_turn_completion``), and the dynamic-profile constant
-(``_DYNAMIC_PROFILE``). No test bodies, fixtures, or marks live here; the
+``_wait_for_turn_completion``). No test bodies, fixtures, or marks live here; the
 test population stays in ``test_subagents.py`` until the phase-(ii)
 concern moves. Importers: ``test_subagents.py`` itself plus the seven seam
 files (``test_wait_steering_app``, ``test_subagent_management_surface``,
@@ -39,7 +38,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from chartreux.agents import AgentSafety, AgentType
 from chartreux.app_server._model import validate_wire
 from chartreux.app_server._runtime import AgentRuntimeFactory
 from chartreux.app_server._sessions import (
@@ -59,7 +57,6 @@ from chartreux.app_server.protocol import (
 )
 from chartreux.app_server.session import AppServerSession
 from chartreux.core.agent_loop import AgentLoop
-from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config import SessionLoggingConfig
 from chartreux.core.llm_models import FunctionCall, LLMChunk, ToolCall
 from chartreux.core.message_list import MessageList
@@ -95,7 +92,7 @@ async def _read_child(
 
 
 def _task_call(
-    agent: str = "worker",
+    identity: str = "coder",
     *,
     background: bool = True,
     agent_id: str | None = None,
@@ -105,7 +102,9 @@ def _task_call(
 ) -> ToolCall:
     arguments: dict[str, object] = {
         "task": "Inspect the project",
-        "agent_type": agent,
+        # Package 16a: the task call names the launch identity directly
+        # (the legacy profile-spelling bridge is retired with the alias).
+        "identity": identity,
         "background": background,
     }
     if agent_id is not None:
@@ -318,11 +317,11 @@ def _evicted_tombstone(
     return _AgentTombstone(
         summary=AgentSummary(
             agent_id=agent_id,
-            profile="worker",
+            identity="coder",
             availability=AgentAvailability.EVICTED,
             current_run_id=run_id,
             current_run_status=status,
-            name=derive_agent_name(agent_id, "worker", None, None, None),
+            name=derive_agent_name(agent_id, "coder", None, None, None),
         ),
         child_session_id=f"session-{agent_id}",
         parent_identity=("root", 0),
@@ -338,9 +337,12 @@ def _idle_record(
 ) -> AgentRecord:
     runtime = MagicMock()
     runtime.close = AsyncMock()
+    # A direct launch carries no purpose label (the projection reads the
+    # loop-owned record); a bare MagicMock would auto-create a truthy one.
+    runtime.agent_loop.launch_purpose = None
     return AgentRecord(
         agent_id=agent_id,
-        profile="worker",
+        identity="coder",
         session_id=f"session-{agent_id}",
         runtime=runtime,
         root_generation=0,
@@ -410,14 +412,14 @@ async def _real_reused_background() -> tuple[
         config=_config(),
         backend=FakeBackend([mock_llm_chunk(content="Notification received")]),
     )
-    child = await AgentRuntimeFactory().create_child(parent, "worker")
+    child = await AgentRuntimeFactory().create_child(parent, "coder")
     registry = _retention_registry(_ManualClock())
     root = registry._build_child_runtime(parent)
     registry.bind_root(root)
     runtime = registry._build_child_runtime(child)
     record = AgentRecord(
         agent_id="agent-1",
-        profile="worker",
+        identity="coder",
         session_id=child.session_id,
         runtime=runtime,
         root_generation=parent._session_generation,
@@ -436,7 +438,7 @@ async def _real_reused_background() -> tuple[
         # reused runs, so the reuse opts into retention explicitly.
         TaskArgs(
             task="retry",
-            agent_type="worker",
+            identity="coder",
             agent_id=record.agent_id,
             background=True,
             retain=True,
@@ -445,24 +447,9 @@ async def _real_reused_background() -> tuple[
     )
 
 
-_DYNAMIC_PROFILE = AgentProfile(
-    name="dynamic",
-    display_name="Dynamic",
-    description="Dynamic launch acceptance profile",
-    safety=AgentSafety.NEUTRAL,
-    agent_type=AgentType.SUBAGENT,
-    instructions="Retained role instruction.",
-    idle_ttl_seconds=300,
-    # A profile TTL alone no longer implies retention; the profile opts in
-    # explicitly so launches through it stay resident for reuse.
-    retain=True,
-)
-
-
 def _dynamic_config():
     return build_test_vibe_config(**{
         "active_model": "small",
-        "system_prompt_id": "tests",
         "include_project_context": False,
         "include_prompt_detail": False,
         "enabled_tools": ["task", "read_file"],
@@ -513,7 +500,6 @@ async def _dynamic_registry(monkeypatch: pytest.MonkeyPatch):
         "chartreux.core.agent_loop._loop.create_backend", create_backend
     )
     parent = build_test_agent_loop(config=_dynamic_config(), backend=FakeBackend())
-    parent.agent_manager._discovered[_DYNAMIC_PROFILE.name] = _DYNAMIC_PROFILE
     registry = _retention_registry()
     root = registry._build_child_runtime(parent)
     root.turns._projector = MagicMock()
@@ -524,8 +510,13 @@ async def _dynamic_registry(monkeypatch: pytest.MonkeyPatch):
         registry,
         TaskArgs(
             task="first",
-            agent_type="dynamic",
+            # Package 16a: the custom profile is the custom identity whose
+            # prompt resource the app_server conftest installs.
+            identity="user:dynamic",
             background=True,
+            # Identity retention no longer rides the record; the helper opts
+            # in so the child stays resident across the reuse checks.
+            retain=True,
             config=LaunchConfig(
                 model="small",
                 thinking="off",
@@ -563,7 +554,6 @@ async def _persistent_dynamic_registry(tmp_path: Path, monkeypatch: pytest.Monke
         config=_dynamic_config().model_copy(update={"session_logging": logging}),
         backend=FakeBackend([mock_llm_chunk(content="Notification received")]),
     )
-    parent.agent_manager._discovered[_DYNAMIC_PROFILE.name] = _DYNAMIC_PROFILE
     registry = _retention_registry()
     root = registry._build_child_runtime(parent)
     root.turns._projector = MagicMock()
@@ -574,8 +564,13 @@ async def _persistent_dynamic_registry(tmp_path: Path, monkeypatch: pytest.Monke
         registry,
         TaskArgs(
             task="first",
-            agent_type="dynamic",
+            # Package 16a: the custom profile is the custom identity whose
+            # prompt resource the app_server conftest installs.
+            identity="user:dynamic",
             background=True,
+            # Identity retention no longer rides the record; the helper opts
+            # in so the child stays resident across the reuse checks.
+            retain=True,
             config=LaunchConfig(
                 model="small",
                 thinking="off",
@@ -613,7 +608,7 @@ async def _foreground_result(
         [
             item
             async for item in registry.run(
-                TaskArgs(task="foreground", agent_type="worker", background=False),
+                TaskArgs(task="foreground", identity="coder", background=False),
                 InvokeContext(tool_call_id=tool_call_id, session_id=parent.session_id),
             )
         ][-1],
@@ -687,9 +682,9 @@ def _run(
     run = RunRecord(
         run_id,
         record.agent_id,
-        record.profile,
         status,
         future,
+        record.identity,
         started_at=started_at,
         completed_at=completed_at,
     )
@@ -712,7 +707,7 @@ def _tombstone(
     return _AgentTombstone(
         summary=AgentSummary(
             agent_id=agent_id,
-            profile="worker",
+            identity="coder",
             availability=availability,
             current_run_id=run_id,
             current_run_status=RunStatus.COMPLETED,

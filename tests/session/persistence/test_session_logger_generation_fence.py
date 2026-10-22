@@ -9,7 +9,6 @@ from typing import Any
 
 import pytest
 
-from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session.session_loader import SessionLoader
@@ -20,11 +19,11 @@ from chartreux.core.session_types import (
     LaunchMetadataV1,
     LaunchMetadataV2,
     LaunchPersonaV1,
+    LaunchPersonaV2,
 )
 from chartreux.core.subagents import LaunchConfig, LaunchToolOverride
 from chartreux.core.tools.manager import ToolManager
 from tests.session.persistence._session_persistence_support import (
-    mock_agent_profile as mock_agent_profile,
     mock_tool_manager as mock_tool_manager,
     mock_vibe_config as mock_vibe_config,
     session_config as session_config,
@@ -46,7 +45,7 @@ async def test_stale_save_is_fenced_before_transcript_and_metadata(
 
     async def save(messages: list[LLMMessage]) -> None:
         await logger.save_interaction(
-            messages, AgentStats(), mock_vibe_config, mock_tool_manager, None
+            messages, AgentStats(), mock_vibe_config, mock_tool_manager
         )
 
     await save([first, second])
@@ -68,7 +67,6 @@ async def test_stale_save_is_fenced_before_transcript_and_metadata(
             [first],
             AgentStats(),
             mock_tool_manager,
-            None,
             logger.session_dir,
             logger.session_metadata,
             False,
@@ -114,7 +112,6 @@ async def test_repeated_cancellation_drains_worker_under_save_lock(
             AgentStats(),
             mock_vibe_config,
             mock_tool_manager,
-            None,
         )
 
     first = asyncio.create_task(save())
@@ -156,20 +153,20 @@ async def test_launch_envelope_survives_interaction_saves_and_failed_update(
     session_config: SessionLoggingConfig,
     mock_vibe_config: ChartreuxConfigSchema,
     mock_tool_manager: ToolManager,
-    mock_agent_profile: AgentProfile,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The dedicated envelope writer is authoritative across every metadata path."""
     logger = SessionLogger(session_config, "launch-envelope")
     initial = LaunchMetadataV2(
         version=2,
-        profile="test-agent",
         overrides=LaunchConfig(
             model="test",
             instructions="Frozen role",
             tools={"read_file": LaunchToolOverride(allowlist=["*.py"])},
         ),
-        persona=LaunchPersonaV1(system_prompt_id="tests", instructions="Frozen role"),
+        persona=LaunchPersonaV2(
+            identity="coder", identity_revision="rev-1", instructions="Frozen role"
+        ),
         committed_model=CommittedModelIdentity(
             base_model="test",
             provider="test-provider",
@@ -187,7 +184,7 @@ async def test_launch_envelope_survives_interaction_saves_and_failed_update(
         LLMMessage(role=Role.user, content="Hello"),
     ]
     await logger.save_interaction(
-        messages, AgentStats(), mock_vibe_config, mock_tool_manager, mock_agent_profile
+        messages, AgentStats(), mock_vibe_config, mock_tool_manager
     )
     assert SessionLoader.load_metadata(logger.session_dir).launch_config == initial
 
@@ -222,7 +219,6 @@ async def test_cancelled_launch_persistence_lock_wait_keeps_new_envelope_authori
     session_config: SessionLoggingConfig,
     mock_vibe_config: ChartreuxConfigSchema,
     mock_tool_manager: ToolManager,
-    mock_agent_profile: AgentProfile,
 ) -> None:
     logger = SessionLogger(session_config, "launch-envelope-cancel")
     old = LaunchMetadataV1(
@@ -251,7 +247,6 @@ async def test_cancelled_launch_persistence_lock_wait_keeps_new_envelope_authori
         AgentStats(),
         mock_vibe_config,
         mock_tool_manager,
-        mock_agent_profile,
     )
     assert logger.session_dir is not None
     assert SessionLoader.load_metadata(logger.session_dir).launch_config == new
@@ -262,7 +257,6 @@ async def test_inflight_unchanged_save_cannot_clear_new_launch_envelope_dirty_st
     session_config: SessionLoggingConfig,
     mock_vibe_config: ChartreuxConfigSchema,
     mock_tool_manager: ToolManager,
-    mock_agent_profile: AgentProfile,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     logger = SessionLogger(session_config, "launch-envelope-inflight")
@@ -278,7 +272,7 @@ async def test_inflight_unchanged_save_cannot_clear_new_launch_envelope_dirty_st
     messages = [LLMMessage(role=Role.user, content="unchanged")]
     await logger.persist_launch_config(old)
     await logger.save_interaction(
-        messages, AgentStats(), mock_vibe_config, mock_tool_manager, mock_agent_profile
+        messages, AgentStats(), mock_vibe_config, mock_tool_manager
     )
 
     started, release = Event(), Event()
@@ -292,11 +286,7 @@ async def test_inflight_unchanged_save_cannot_clear_new_launch_envelope_dirty_st
     monkeypatch.setattr(logger, "_save_interaction_sync", gated_save)
     ordinary_save = asyncio.create_task(
         logger.save_interaction(
-            messages,
-            AgentStats(),
-            mock_vibe_config,
-            mock_tool_manager,
-            mock_agent_profile,
+            messages, AgentStats(), mock_vibe_config, mock_tool_manager
         )
     )
     assert await asyncio.to_thread(started.wait, 5)
@@ -313,7 +303,7 @@ async def test_inflight_unchanged_save_cannot_clear_new_launch_envelope_dirty_st
     assert SessionLoader.load_metadata(logger.session_dir).launch_config == old
 
     await logger.save_interaction(
-        messages, AgentStats(), mock_vibe_config, mock_tool_manager, mock_agent_profile
+        messages, AgentStats(), mock_vibe_config, mock_tool_manager
     )
     assert logger._launch_config_dirty is False
     assert SessionLoader.load_metadata(logger.session_dir).launch_config == new

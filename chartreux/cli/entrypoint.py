@@ -97,6 +97,28 @@ def parse_arguments() -> argparse.Namespace:
         "regex with 're:' prefix. Can be specified multiple times.",
     )
     parser.add_argument(
+        "--identity",
+        metavar="ID",
+        help="Identity for new conversations (e.g. coder, orchestrator, researcher, "
+        "reviewer, advisor, or a custom prompt name). Outranks "
+        "CHARTREUX_AGENT__IDENTITY and config.toml [agent] identity.",
+    )
+    parser.add_argument(
+        "--workflow",
+        metavar="ID",
+        help="Workflow for new conversations (minimal, ceremony, or a custom "
+        "workflow name). Outranks CHARTREUX_AGENT__WORKFLOW and config.toml "
+        "[agent] workflow.",
+    )
+    parser.add_argument(
+        "--orchestration-strategy",
+        metavar="ID",
+        help="Orchestration strategy for new conversations (none, default, or a "
+        "custom strategy name). Outranks "
+        "CHARTREUX_AGENT__ORCHESTRATION_STRATEGY and config.toml [agent] "
+        "orchestration_strategy.",
+    )
+    parser.add_argument(
         "--disabled-tools",
         action="append",
         metavar="TOOL",

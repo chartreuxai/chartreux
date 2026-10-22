@@ -766,8 +766,21 @@ def test_versioned_authority_inputs_invalidate_without_aliasing(tmp_path: Path):
     first = grep.config
     calls[0] = 0
     first.denylist.clear()
-    assert grep.config.denylist == ["*first*"]
-    assert calls[0] == 0
+    served = grep.config
+    # No aliasing: the cache serves its own materialization, so mutating a
+    # returned config never corrupts the cache.
+    assert served.denylist == ["*first*"]
+    assert served is not first
+    # S2 W2 re-pin: the authority token carries the live identity and the
+    # tool-filter digest, so a cache hit consults the config getter to
+    # compute the token (the calls counter is no longer zero) — but the
+    # served config is the cache's materialization, and an in-place edit of
+    # the live config's tool entry invalidates the token-keyed cache even
+    # without an accepted-token bump, so it is never served stale.
+    assert calls[0] > 0
+    config[0].tools["grep"] = {"permission": "never"}
+    assert grep.config.permission == ToolPermission.NEVER
+    config[0].tools["grep"] = {"permission": "always"}
     first_workspace = manager.workspace
     assert manager.workspace is first_workspace
 

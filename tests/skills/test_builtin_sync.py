@@ -136,8 +136,9 @@ class TestBuiltinSkills:
         assert "https://github.com/mistralai/mistral-vibe" not in prompt
         assert "https://docs.mistral.ai/vibe/code/overview" not in prompt
 
-        assert "Bound dispatch role removed" in prompt
-        assert "Committed model identities still resolve" in prompt
+        assert "@main" in prompt
+        assert "@orchestrator" in prompt
+        assert "Bound dispatch role removed" not in prompt
 
     def test_chartreux_skill_keeps_cli_command_reference(self) -> None:
         prompt = BUILTIN_SKILLS["chartreux"].prompt
@@ -172,16 +173,14 @@ class TestBuiltinSkills:
         # inherits the instance's committed policy.
         assert "close when their run completes unless they are retained" in prompt
         assert (
-            "precedence is the launch argument, then the profile's `retain` setting"
+            "precedence is the launch argument, then the global `[subagents].retain_agents` setting"
             in prompt
         )
         assert (
             "omit `retain` to inherit the instance's committed retention policy"
             in prompt
         )
-        # The advisor profile ships retained by default (resident-cast).
-        assert "advisors are retained by profile default" in prompt
-        assert "`retain = true`) with a 3600-second idle TTL" in prompt
+        assert "no identity-specific retention setting" in prompt
 
     def test_chartreux_skill_documents_dangerous_command_approval(self) -> None:
         prompt = BUILTIN_SKILLS["chartreux"].prompt

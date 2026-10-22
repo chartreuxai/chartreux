@@ -7,7 +7,6 @@ from typing import Any
 
 import pytest
 
-from chartreux.core.dispatch import DEFAULT_DISPATCH_MODE, SHIPPED_PRESETS
 from chartreux.core.model_catalog import materialization
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import (
@@ -33,6 +32,10 @@ def test_template_carries_the_shipped_default_setup_without_providers() -> None:
     # No provider tables: providers stay inherited from the shipped catalog,
     # which keeps overlaid_providers empty (no provenance flip).
     assert "providers" not in template
+    # The catalog file owns models and presets only: no dispatch policy is
+    # materialized (v0.5.7 §12 — the catalog no longer carries executable
+    # dispatch policy).
+    assert "dispatch" not in template
     assert set(template["models"]) == set(SHIPPED_CATALOG.models)
     assert set(template["roles"]) == set(SHIPPED_CATALOG.roles)
     for name, definition in SHIPPED_CATALOG.models.items():
@@ -50,23 +53,15 @@ def test_template_carries_the_shipped_default_setup_without_providers() -> None:
         assert rendered["model"] == definition.model
         assert rendered["thinking"] == definition.thinking
 
-    # Sparse dispatch: the mode plus slot role bindings only; prose and slot
-    # metadata inherit from the shipped preset.
-    policy = SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE]
-    dispatch = template["dispatch"]
-    assert dispatch["mode"] == DEFAULT_DISPATCH_MODE.value
-    assert set(dispatch) == {"mode", "slots"}
-    assert set(dispatch["slots"]) == set(policy.slots)
-    for name, slot in policy.slots.items():
-        assert dispatch["slots"][name] == {"role": slot.role}
-
 
 def test_template_round_trips_to_the_shipped_snapshot() -> None:
     snapshot = _snapshot_for_overlay(_parsed_template(), source="<default template>")
     shipped = _snapshot(SHIPPED_CATALOG)
 
     assert snapshot.catalog == shipped.catalog
-    assert snapshot.dispatch == shipped.dispatch
+    # The retired [dispatch] READ path is gone: no dispatch state at all.
+    assert not hasattr(snapshot, "dispatch")
+    assert not hasattr(shipped, "dispatch")
     assert snapshot.revision == shipped.revision
     assert snapshot.overlaid_providers == frozenset()
     assert snapshot.dispatch_diagnostics == ()
@@ -104,7 +99,7 @@ def test_materialize_publishes_a_revision_neutral_template(tmp_path: Path) -> No
     # Materialize -> load is equivalent to loading the in-code defaults.
     loaded = load_catalog(path)
     assert loaded.catalog == SHIPPED_CATALOG
-    assert loaded.dispatch == SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE]
+    assert not hasattr(loaded, "dispatch")
     assert loaded.overlaid_providers == frozenset()
     assert loaded.revision == load_catalog(tmp_path / "absent.toml").revision
     assert loaded.revision == snapshot.revision

@@ -96,75 +96,68 @@ Authentication, billing, quota, invalid-request, context, and cancellation failu
 
 ## Selecting models and roles
 
-The `@orchestrator` preset is the main assistant's saved default. Set it in
+The `@main` preset is the main assistant's saved default. Set it in
 `models.toml`; there is no separate persisted active-model selection. Use
-`/model` and `/thinking` for current-session overrides. `compaction_model`
-accepts a canonical base name or role expression; an empty value uses the
-current main model:
+`/model` and `/thinking` for current-session overrides; both leave the saved
+`@main` preset unchanged. `compaction_model` accepts a canonical base name or
+role expression; an empty value uses the current main model:
 
 ```toml
 compaction_model = "example-model"
 allowed_models = ["example-model"]
 ```
 
-The shipped presets are `orchestrator` (the main assistant), `worker`, `scout`,
-and `heavy`. Built-in Worker and Reviewer profiles use `worker` by default;
-Advisor uses `heavy`. The UI labels `orchestrator` as **Main**.
+The shipped presets are `main` (the main assistant), `worker`, `scout`,
+and `heavy`. The presets screen labels them **Main assistant (@main)**, **Worker
+(@worker)**, **Scout (@scout)**, and **Heavy (@heavy)**.
 
 A role is one default preset: a canonical model and a thinking level. A role
-expression such as `@worker` selects that exact pair. Different roles can use
-the same model with different thinking levels. An unavailable model or
+expression such as `@worker` selects that exact pair, and the `task` tool's
+top-level `model` field accepts one — use it to aim a delegation at a preset.
+Different roles can use the same model with different thinking levels. Roles are
+model/thinking presets used as launch targets; they carry no agent behavior —
+the identity does that (see [Identity
+architecture](../reference/identity-architecture.md)). An unavailable model or
 credential produces an explicit error; Chartreux does not select another
 canonical model from the role. A session or retained child preserves its
 committed model, provider, and thinking identity on resume. To launch multiple
-independent agents, make separate `task` calls with explicit presets or models;
-`fan_out: true` is rejected with guidance.
+independent agents, make separate `task` calls with explicit presets, purposes,
+or identities; `fan_out: true` is rejected with guidance. See
+[Subagents](subagents.md).
 
 Shipped roles are the four presets above; they can be patched one role at a
 time in `models.toml`. Custom roles are TOML-only: define `[roles.<name>]` with
 `description`, `model`, and `thinking`; the preset editor selects built-in
 roles. Old `models = [...]` role tables are rejected with a conversion hint.
 
-The former thinking-tier roles `small`, `medium`, `large`, and `peer` are no
-longer shipped; the current model-tier roles are `orchestrator`, `worker`,
-`scout`, and `heavy`. Review every `[roles.<name>]` and `[dispatch.slots.*]`
-entry in an existing overlay after upgrading:
+Orchestration is not configured through the catalog. Delegated routing lives in
+`[orchestration.routes.*]` in `config.toml`, and who performs the work is
+selected by the `[agent]` identity/workflow/orchestration_strategy selections —
+see [Configuration](configuration.md) and the [identity
+architecture](../reference/identity-architecture.md).
 
-- A sparse patch of a removed role loses the shipped fields it inherited and
-  fails validation. Replace it with a complete role definition including
-  `description`, `model`, and `thinking`, or bind it to an available shipped
-  role.
-- Complete definitions of old roles remain as custom roles; they are not
-  deleted. Rename or remove them yourself if you no longer want them.
-- A dispatch overlay that references a role that does not exist falls back to
-  the applicable default and emits a diagnostic. Update the `role` binding to
-  an existing role in `models.toml`.
-- A saved session dispatch policy that references a removed role fails resume
-  with `SessionPolicyError` ("Bound dispatch role removed"). No role
-  substitution is performed; start a new session with a repaired dispatch
-  configuration. Committed model identities still resolve independently of
-  roles.
+## The presets screen
 
-Role descriptions are brief model-preset descriptions, not dispatch policy:
-routing semantics are defined by the dispatch purpose vocabulary and rendered
-slots. To select dispatch behavior, add a `[dispatch]` overlay in `models.toml`:
+The presets screen (Provider Settings, or the **Customize role presets** step of
+setup) edits role presets: one row per role showing its model and thinking
+level, with a per-role editor for both fields. It offers no dispatch modes —
+there is nothing to switch, because routing is configured by purpose routes and
+agent selections, not by the catalog. Explicit existing selections are
+preserved.
 
-```toml
-[dispatch]
-mode = "orchestrated"
+Setup seeds the presets automatically: usable existing role selections are
+kept, and unavailable bindings are assigned a ready configured model. No
+per-role questions are required. **Finish setup** saves the seeded presets and
+completes setup; **Customize role presets** opens the model/thinking editor for
+optional changes or repairs. Invalid or unavailable bindings block completion
+with repair guidance.
 
-[dispatch.slots.implementor]
-role = "@worker"
-```
-
-Without an explicit mode, fresh sessions use `standalone` (direct implementation,
-with delegated verification and independent review). The example above explicitly
-selects `orchestrated`; existing explicit selections remain authoritative, and
-legacy tier roles do not imply orchestration. Multi-model users can follow the
-dismissible graduation nudge to the presets screen; it never switches mode
-automatically. Dispatch changes are bound when a session
-starts and apply to the next session. See [Subagents](subagents.md) and
-[Configuration](configuration.md) for routing and overlay details.
+After two deduplicated, budget-exceeded implementation attempts fail on the same
+task, a passive graduation nudge at an idle boundary suggests reviewing model
+presets or delegating differently. It opens the presets screen, never changes
+anything automatically, and can be dismissed permanently; headless sessions do
+not show it. Saving a second canonical model no longer triggers it —
+orchestration is never inferred from the roster size.
 
 ## Thinking levels
 
@@ -177,5 +170,36 @@ Use `/thinking` during a session or an explicit spawn `config.thinking` to
 override the selected preset in that scope. Persisted
 `[thinking_overrides]` in user or project `config.toml` are rejected; set the
 desired role's `thinking` in `models.toml` instead.
+
+## Upgrading from 0.5.6
+
+Chartreux is pre-release alpha; breaking changes may occur without migration
+paths. Every retirement below fails loudly with an actionable error — nothing
+is silently migrated, and no compatibility aliases are kept:
+
+- **The `@orchestrator` model role is `@main`.** Selecting `@orchestrator` fails
+  with rename guidance and no alias, and a `[roles.orchestrator]` overlay over
+  the shipped base fails loudly at load — rename the table to `[roles.main]`;
+  the catalog file is never rewritten automatically. `active_model` in
+  `config.toml` is rejected with guidance to edit the `[roles.main]` preset.
+  Sessions persisted with `active_model = "@orchestrator"` fail resume with the
+  same guidance.
+- **The `[dispatch]` catalog overlay is superseded.** It no longer appears in the
+  catalog template or the presets editor; orchestration is selected through the
+  `[agent]` identity/workflow/orchestration_strategy selections and configured
+  through `[orchestration.routes.*]`. A legacy `[dispatch]` table in
+  `models.toml` is reported loudly at load with successor guidance — it is never
+  merged — and catalog writes preserve its values (comments and formatting are
+  not preserved), never rewriting it.
+- **The former thinking-tier roles** `small`, `medium`, `large`, and `peer` are
+  no longer shipped; the current model-tier roles are `main`, `worker`,
+  `scout`, and `heavy`. Review every `[roles.<name>]` entry in an existing
+  overlay after upgrading:
+  - A sparse patch of a removed role loses the shipped fields it inherited and
+    fails validation. Replace it with a complete role definition including
+    `description`, `model`, and `thinking`, or bind it to an available shipped
+    role.
+  - Complete definitions of old roles remain as custom roles; they are not
+    deleted. Rename or remove them yourself if you no longer want them.
 
 For field definitions, merge behavior, and the full validation rules, see the [Configuration reference](../reference/configuration.md).

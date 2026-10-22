@@ -34,7 +34,6 @@ from chartreux.core.config.layer import (
     RawConfig,
     UntrustedLayerError,
 )
-from chartreux.core.config.layers.agent_profile import AgentProfileLayer
 from chartreux.core.config.layers.launch_overrides import LaunchOverridesLayer
 from chartreux.core.config.layers.project import ProjectConfigLayer
 from chartreux.core.config.layers.user import UserConfigLayer
@@ -255,7 +254,7 @@ class ConfigBuilder[S: ConfigSchema]:
                 if not isinstance(layer, LaunchOverridesLayer):
                     restrictions.append(
                         SourceRestrictions.from_raw(
-                            self._restriction_projection(layer, raw, replacement),
+                            raw,
                             root_layer=layer,
                             layer_name=layer.name,
                             identity=self.source_identities.get(layer.name),
@@ -263,9 +262,7 @@ class ConfigBuilder[S: ConfigSchema]:
                                 replacement and replacement.replaces_roots
                             ),
                             locator=layer.source_locator,
-                            kind="mode"
-                            if isinstance(layer, AgentProfileLayer)
-                            else "source",
+                            kind="source",
                             store_fingerprint=(
                                 None
                                 if layer.name in overrides
@@ -301,7 +298,7 @@ class ConfigBuilder[S: ConfigSchema]:
         if "active_model" in raw:
             raise ValueError(
                 f"{layer.name} ({layer.source_locator}) contains obsolete "
-                "'active_model'; set [roles.orchestrator] model and thinking "
+                "'active_model'; set [roles.main] model and thinking "
                 "in models.toml instead"
             )
         if "thinking_overrides" in raw:
@@ -349,21 +346,6 @@ class ConfigBuilder[S: ConfigSchema]:
                     "Dangerous command grant interpretation changed; "
                     "explicit reload required"
                 )
-
-    @staticmethod
-    def _restriction_projection(
-        layer: ConfigLayer[RawConfig],
-        raw: dict[str, Any],
-        replacement: SourceRestrictions | None,
-    ) -> dict[str, Any]:
-        """Keep only ordinary child-profile NEVER values out of irrevocable policy."""
-        if not isinstance(layer, AgentProfileLayer) or replacement is not None:
-            return raw
-        projected = copy.deepcopy(raw)
-        for settings in projected.get("tools", {}).values():
-            if settings.get("permission") == "never":
-                settings["permission"] = "always"
-        return projected
 
     def _merge_fields(
         self, schema: type[S], layer_dicts: list[_LayerData]

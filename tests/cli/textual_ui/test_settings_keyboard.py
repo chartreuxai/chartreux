@@ -43,18 +43,18 @@ from tests.cli.textual_ui._settings_app_support import (
 async def test_wp3_bounded_keyboard_groups(group: str, count: int, last: bool) -> None:
     service = FakeService()
     path = (
-        "system_prompt_id"
+        "agent.identity"
         if group == "settings-choices"
         else "inventory_tools"
         if group == "settings-checklist"
-        else "agent_paths"
+        else "skill_paths"
     )
     next(
-        field for field in service.snapshot.fields if field.path == "agent_paths"
+        field for field in service.snapshot.fields if field.path == "skill_paths"
     ).effective_value = [f"value-{i}" for i in range(count)]
     service.snapshot.inventories["tools"] = [f"member-{i}" for i in range(count)]
     next(
-        item for item in service.snapshot.catalog if item.path == "system_prompt_id"
+        item for item in service.snapshot.catalog if item.path == "agent.identity"
     ).choices = tuple(f"choice-{i}" for i in range(count))
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         screen = cast(SettingsScreen, pilot.app.screen)
@@ -96,8 +96,8 @@ async def test_wp3_bounded_keyboard_groups(group: str, count: int, last: bool) -
 @pytest.mark.parametrize(
     "path,body_id",
     [
-        ("agent_paths", "settings-entries"),
-        ("system_prompt_id", "settings-choices"),
+        ("skill_paths", "settings-entries"),
+        ("agent.identity", "settings-choices"),
         ("inventory_tools", "settings-checklist"),
     ],
 )
@@ -106,14 +106,14 @@ async def test_wp3_tab_order_and_row_scroll_reentry(
 ) -> None:
     service = FakeService()
     next(
-        field for field in service.snapshot.fields if field.path == "agent_paths"
+        field for field in service.snapshot.fields if field.path == "skill_paths"
     ).effective_value = [f"value-{i}" for i in range(40)]
     next(
-        item for item in service.snapshot.catalog if item.path == "system_prompt_id"
+        item for item in service.snapshot.catalog if item.path == "agent.identity"
     ).choices = tuple(f"choice-{i}" for i in range(40))
     service.snapshot.inventories["tools"] = [f"member-{i}" for i in range(40)]
     next(
-        field for field in service.snapshot.fields if field.path == "system_prompt_id"
+        field for field in service.snapshot.fields if field.path == "agent.identity"
     ).effective_value = "choice-39"
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         screen = cast(SettingsScreen, pilot.app.screen)
@@ -121,7 +121,7 @@ async def test_wp3_tab_order_and_row_scroll_reentry(
         catalog.highlighted = catalog.get_option_index(path)
         await pilot.press("enter")
         body = screen.query_one(f"#{body_id}", OptionList)
-        if path == "system_prompt_id":
+        if path == "agent.identity":
             await pilot.pause()
             assert body.highlighted == 39 and body.scroll_y > 0
         body.highlighted = 25
@@ -133,7 +133,7 @@ async def test_wp3_tab_order_and_row_scroll_reentry(
         assert selected is not None and scroll > 0
         payload = navigation_payload(screen)
         groups = ["settings-options", body_id] + (
-            [] if path == "system_prompt_id" else ["settings-actions"]
+            [] if path == "agent.identity" else ["settings-actions"]
         )
         index = groups.index(body_id)
         direction = -1 if reverse else 1
@@ -215,12 +215,12 @@ async def test_wp3_nested_openers_and_exact_escape(opener: str) -> None:
     service = FakeService()
     values = [f"value-{i}" for i in range(40)]
     next(
-        field for field in service.snapshot.fields if field.path == "agent_paths"
+        field for field in service.snapshot.fields if field.path == "skill_paths"
     ).effective_value = [value for value in values]
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         screen = cast(SettingsScreen, pilot.app.screen)
         catalog = screen.query_one(SettingsOptionList)
-        catalog.highlighted = catalog.get_option_index("agent_paths")
+        catalog.highlighted = catalog.get_option_index("skill_paths")
         await pilot.pause()
         catalog.scroll_to(y=2, animate=False, immediate=True, force=True)
         expansion_position = screen._capture_group_position(catalog)
@@ -246,7 +246,7 @@ async def test_wp3_nested_openers_and_exact_escape(opener: str) -> None:
         editor.cursor_position = 2
         await pilot.press("f1")
         assert screen._help_open
-        item = next(item for item in screen.catalog if item.path == "agent_paths")
+        item = next(item for item in screen.catalog if item.path == "skill_paths")
         screen._open_confirmation(
             "discard", item, None, "Inspect nested confirmation", "Discard"
         )
@@ -264,7 +264,7 @@ async def test_wp3_nested_openers_and_exact_escape(opener: str) -> None:
         assert (
             screen._editing is None
             and origin.has_focus
-            and screen._expanded == "agent_paths"
+            and screen._expanded == "skill_paths"
         )
         assert origin_position is not None
         assert screen._capture_group_position(origin) == origin_position
@@ -284,7 +284,7 @@ async def test_wp3_nested_openers_and_exact_escape(opener: str) -> None:
         assert screen._confirmation is not None
         await pilot.press("escape")
         await pilot.pause()
-        assert origin.has_focus and screen._expanded == "agent_paths"
+        assert origin.has_focus and screen._expanded == "skill_paths"
         assert screen._capture_group_position(origin) == origin_position
         # Confirm discard unwinds expansion, not the filter or Settings itself.
         await pilot.press("escape", "down", "enter")
@@ -298,12 +298,12 @@ async def test_wp3_nested_openers_and_exact_escape(opener: str) -> None:
 async def test_wp3_confirmation_over_editor_and_help_group_exit() -> None:
     service = FakeService()
     async with Harness(service).run_test(size=(80, 24)) as pilot:
-        await pilot.press(*"agent_paths", "enter", "tab", "enter")
+        await pilot.press(*"skill_paths", "enter", "tab", "enter")
         screen = cast(SettingsScreen, pilot.app.screen)
         editor = screen.query_one("#settings-input", Input)
         editor.value = "untouched"
         editor.cursor_position = 3
-        item = next(item for item in screen.catalog if item.path == "agent_paths")
+        item = next(item for item in screen.catalog if item.path == "skill_paths")
         screen._open_confirmation(
             "discard", item, None, "Confirmation over editor", "Discard"
         )
@@ -336,16 +336,16 @@ async def test_wp3_filter_opener_repair_and_escape_purity() -> None:
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         screen = cast(SettingsScreen, pilot.app.screen)
         catalog = screen.query_one(SettingsOptionList)
-        catalog.highlighted = catalog.get_option_index("agent_paths")
+        catalog.highlighted = catalog.get_option_index("skill_paths")
         await pilot.pause()
         catalog.scroll_to(y=2, animate=False, immediate=True, force=True)
         await pilot.pause()
         opener = screen._capture_group_position(catalog)
         payload = navigation_payload(screen)
-        await pilot.press(*"system_prompt")
+        await pilot.press(*"agent.identity")
         assert (
             catalog.highlighted_option is not None
-            and catalog.highlighted_option.id == "system_prompt_id"
+            and catalog.highlighted_option.id == "agent.identity"
         )
         await pilot.press("escape")
         await pilot.pause()
@@ -360,17 +360,14 @@ async def test_wp3_filter_opener_repair_and_escape_purity() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "path,body_id",
-    [
-        ("system_prompt_id", "settings-choices"),
-        ("inventory_tools", "settings-checklist"),
-    ],
+    [("agent.identity", "settings-choices"), ("inventory_tools", "settings-checklist")],
 )
 async def test_wp3_dirty_collection_confirmation_and_help_openers(
     path: str, body_id: str
 ) -> None:
     service = FakeService()
     next(
-        item for item in service.snapshot.catalog if item.path == "system_prompt_id"
+        item for item in service.snapshot.catalog if item.path == "agent.identity"
     ).choices = ("default", "other")
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         screen = cast(SettingsScreen, pilot.app.screen)
@@ -420,9 +417,9 @@ async def test_wp3_busy_escape_owns_press_before_confirmation_help_editor() -> N
         "not_saved", "unchanged", error="write failed"
     )
     async with Harness(service).run_test(size=(80, 24)) as pilot:
-        await pilot.press(*"agent_paths", "enter", "tab", "enter", "f1")
+        await pilot.press(*"skill_paths", "enter", "tab", "enter", "f1")
         screen = cast(SettingsScreen, pilot.app.screen)
-        item = next(item for item in screen.catalog if item.path == "agent_paths")
+        item = next(item for item in screen.catalog if item.path == "skill_paths")
         screen._open_confirmation(
             "discard", item, None, "Nested busy confirmation", "Discard"
         )
@@ -499,7 +496,7 @@ async def test_wp3_action_bookmarks_are_collection_context_local() -> None:
         screen = cast(SettingsScreen, pilot.app.screen)
         catalog = screen.query_one(SettingsOptionList)
         actions = screen.query_one("#settings-actions", OptionList)
-        catalog.highlighted = catalog.get_option_index("agent_paths")
+        catalog.highlighted = catalog.get_option_index("tool_paths")
         await pilot.press("enter", "tab", "down", "escape")
         catalog.highlighted = catalog.get_option_index("skill_paths")
         await pilot.press("enter", "tab")
@@ -508,7 +505,7 @@ async def test_wp3_action_bookmarks_are_collection_context_local() -> None:
             and actions.highlighted_option.id == "add-item"
         )
         await pilot.press("escape")
-        catalog.highlighted = catalog.get_option_index("agent_paths")
+        catalog.highlighted = catalog.get_option_index("tool_paths")
         await pilot.press("enter", "tab")
         assert (
             actions.highlighted_option is not None
@@ -523,7 +520,7 @@ async def test_focused_group_owns_commands_and_expanded_catalog_does_not_filter(
 ):
     service = FakeService()
     async with Harness(service).run_test(size=(80, 24)) as pilot:
-        await pilot.press(*"agent_paths", "enter")
+        await pilot.press(*"skill_paths", "enter")
         screen = cast(SettingsScreen, pilot.app.screen)
         screen._list_draft = screen._make_draft(["draft-entry"])
         screen._refresh_options()
@@ -536,7 +533,7 @@ async def test_focused_group_owns_commands_and_expanded_catalog_does_not_filter(
             if row.id == "ask_confirmation_on_exit"
         )
         entries = screen.query_one("#settings-entries", OptionList)
-        assert entries.has_focus and screen._current_item().path == "agent_paths"  # type: ignore[union-attr]
+        assert entries.has_focus and screen._current_item().path == "skill_paths"  # type: ignore[union-attr]
         catalog.focus()
         await pilot.pause()
         assert screen._current_item().path == "ask_confirmation_on_exit"  # type: ignore[union-attr]
@@ -545,9 +542,9 @@ async def test_focused_group_owns_commands_and_expanded_catalog_does_not_filter(
         assert _draft_values(screen._list_draft) == ["draft-entry"]
         focus_action(screen, "add-item")
         await pilot.pause()
-        assert screen._current_item().path == "agent_paths"  # type: ignore[union-attr]
+        assert screen._current_item().path == "skill_paths"  # type: ignore[union-attr]
         await pilot.press("enter")
-        assert screen._editing == "agent_paths"
+        assert screen._editing == "skill_paths"
         assert not service.saved
 
 
@@ -636,7 +633,7 @@ async def test_space_on_compact_catalog_boolean_uses_navigation_guard(
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         screen = cast(SettingsScreen, pilot.app.screen)
         catalog = screen.query_one(SettingsOptionList)
-        catalog.highlighted = catalog.get_option_index("agent_paths")
+        catalog.highlighted = catalog.get_option_index("skill_paths")
         await pilot.press("enter")
         if dirty:
             focus_action(screen, "add-item")
@@ -644,7 +641,7 @@ async def test_space_on_compact_catalog_boolean_uses_navigation_guard(
         catalog.focus()
         catalog.highlighted = catalog.get_option_index("ask_confirmation_on_exit")
         await pilot.pause()
-        assert screen._expanded == "agent_paths" and catalog.has_focus
+        assert screen._expanded == "skill_paths" and catalog.has_focus
         assert "Tab/Shift+Tab" in str(
             screen.query_one("#settings-hint", NoMarkupStatic).content
         )
@@ -670,7 +667,7 @@ async def test_flat_sections_filter_and_navigation() -> None:
             if isinstance(screen, SettingsScreen)
         )
         options = screen.query_one(SettingsOptionList)
-        assert len([option for option in options.options if option.disabled]) == 7
+        assert len([option for option in options.options if option.disabled]) == 8
         assert all(
             option.id not in {"write_all_settings", "open_config_file"}
             for option in options.options
@@ -1025,12 +1022,12 @@ async def test_settings_provider_link_returns_to_settings(
 async def test_wp4_hover_and_wheel_only_affect_pointed_region() -> None:
     service = FakeService()
     next(
-        f for f in service.snapshot.fields if f.path == "agent_paths"
+        f for f in service.snapshot.fields if f.path == "skill_paths"
     ).effective_value = [f"item-{i}" for i in range(40)]
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         screen = cast(SettingsScreen, pilot.app.screen)
         catalog = screen.query_one(SettingsOptionList)
-        catalog.highlighted = catalog.get_option_index("agent_paths")
+        catalog.highlighted = catalog.get_option_index("skill_paths")
         await pilot.press("enter")
         entries = screen.query_one("#settings-entries", OptionList)
         await pilot.pause()

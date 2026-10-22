@@ -22,6 +22,9 @@ prompt, prints a response, and exits.
 | `--worktree [NAME]` | Run in a managed Git worktree. With a name, create or reuse it; without one, create a name from the prompt or a random slug. Ignored with `--setup`. |
 | `--add-dir DIR` | Repeatable additional workspace root; trusted for this session. |
 | `--trust` | Trust the working directory for this invocation only. |
+| `--identity ID` | Select identity for a new conversation (for example `coder` or `user:name`); frozen for that conversation. |
+| `--workflow ID` | Select workflow for a new conversation (for example `minimal` or `ceremony`). |
+| `--orchestration-strategy ID` | Select orchestration strategy for a new conversation; `none` disables a strategy body. |
 | `-c`, `--continue` | Continue the most recent saved session. Mutually exclusive with `--resume`. |
 | `--resume [SESSION_ID]` | Resume a session; without an ID, open the picker. |
 
@@ -75,9 +78,9 @@ can add commands.
 | Command | Action |
 | --- | --- |
 | `/help` | Show command and shortcut help. |
-| `/model` | Override the main model for this session; the saved orchestrator preset remains unchanged. |
-| `/thinking` | Override the thinking level for this session; the saved orchestrator preset remains unchanged. |
-| `/reload` | Reload configuration, instructions, and skills from disk. |
+| `/model` | Override the main model for this session; the saved `@main` preset remains unchanged. |
+| `/thinking` | Override the thinking level for this session; the saved `@main` preset remains unchanged. |
+| `/reload` | Refresh AGENTS.md, skills, and catalogs; frozen policy stays bound, edits reported as pending. |
 | `/open-config-file` | Open the user config file in your editor; creates the file with a commented template if absent, and reloads after editing if it changed. |
 | `/settings` | Browse and edit curated user settings. |
 | `/clear`, `/new` | Start a new conversation; optionally provide a seed prompt. |

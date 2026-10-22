@@ -1,10 +1,10 @@
 # Configuration reference
 
-This page defines the accepted configuration surface. For locations, layering, and examples, see the [configuration guide](../guides/configuration.md); for models, see the [models guide](../guides/models.md).
+This page defines the accepted configuration surface. For locations, layering, and examples, see the [configuration guide](../guides/configuration.md); for models, see the [models guide](../guides/models.md); for the identity/workflow/strategy model, see the [identity architecture](identity-architecture.md).
 
 ## Files and precedence
 
-`config.toml` selects runtime behavior. Open the user file in your editor with `/open-config-file`. The user file is `$CHARTREUX_HOME/config.toml` (`~/.chartreux/config.toml` by default). A trusted project may provide `.chartreux/config.toml`; discovery searches upward from the working directory. Effective precedence, low to high, is built-in defaults, user file, trusted project file, `CHARTREUX_*` environment overrides, agent profile, and runtime override.
+`config.toml` selects runtime behavior. Open the user file in your editor with `/open-config-file`. The user file is `$CHARTREUX_HOME/config.toml` (`~/.chartreux/config.toml` by default). A trusted project may provide `.chartreux/config.toml`; discovery searches upward from the working directory. Effective precedence, low to high, is built-in defaults, user file, trusted project file, `CHARTREUX_*` environment overrides, and runtime selections (CLI > environment > config > shipped default for `[agent]` identity, workflow, and orchestration strategy).
 
 `models.toml` is a separate user-only catalog overlay at `$CHARTREUX_HOME/models.toml`. Provider and deployment tables in `config.toml` are rejected. To move a legacy catalog, run `chartreux models migrate --apply`.
 
@@ -21,6 +21,18 @@ Unless noted, list defaults are `[]`, map defaults are `{}`, and booleans shown 
 | `compaction_model` | `""` | Model expression; empty uses the current main model. The resolved model must share the main provider. |
 | `allowed_models` | `[]` | Model-expression patterns. A non-empty list restricts selection. |
 | `auto_compact_threshold` | `200000` | Integer fallback token threshold; `0` turns automatic compaction off when the deployment has no threshold of its own. A catalog deployment may override this fallback. |
+
+### Agent selections
+
+The `[agent]` table selects who performs the work and how it is orchestrated; the selections and their resource content freeze per conversation. See the [identity architecture](identity-architecture.md) for the model and the frozen lifecycle.
+
+| Key | Default | Accepted value |
+| --- | --- | --- |
+| `[agent].identity` | `"coder"` | Built-in identity (`coder`, `orchestrator`, `researcher`, `reviewer`, `advisor`), a `builtin:`- or `user:`-qualified id, or a bare custom prompt id resolving to `<name>.md` in the user prompts directory. |
+| `[agent].workflow` | `"minimal"` | Built-in workflow (`minimal`, `ceremony`), a `builtin:`- or `user:`-qualified id, or a bare custom body in `~/.chartreux/workflows/`. |
+| `[agent].orchestration_strategy` | `"none"` | `none`, a built-in strategy (`builtin:default`), a `user:`-qualified id, or a bare custom body in `~/.chartreux/orchestration_strategies/`. |
+
+New-conversation precedence is CLI flag (`--identity`, `--workflow`, `--orchestration-strategy`) > environment (`CHARTREUX_AGENT__IDENTITY`, `CHARTREUX_AGENT__WORKFLOW`, `CHARTREUX_AGENT__ORCHESTRATION_STRATEGY`) > `config.toml` > shipped default; an omitted flag is distinguished from an explicit selection at every level. Saved changes apply to new conversations only — `/reload` reports them as pending — and the Settings > Identity & Orchestration group edits the same keys with the same next-conversation timing. Unknown or malformed selections fail loudly at conversation start with actionable errors; reserved shipped names cannot be shadowed by custom files. `chartreux doctor` resolves the selections offline and reports retired settings with their successors.
 
 ### Tools and integrations
 
@@ -44,7 +56,7 @@ Every ordinary `[tools.<name>]` table accepts `permission` (`always` or `never`)
 | `tools.bash_read`, `tools.bash_stop`, `tools.bash_list` | Permission `always`; no additional documented fields. Job ownership checks also apply. |
 | `tools.web_fetch` | `default_timeout = 30`, `max_timeout = 120`, `max_content_bytes = 120000`, `user_agent` (the built-in browser-like value). |
 | `tools.web_search` | `provider = "auto"`, `api_key_env_var` and `base_url` unset, `timeout = 120` (> 0), `max_results = 5`, `model = "mistral-vibe-cli-with-tools"`. A blank or unset `base_url` uses the selected provider's default endpoint. Provider is `auto`, `mistral`, `exa`, `brave`, or `duckduckgo`; `auto` means Mistral only and never falls back. Configure it in Settings > Web search or with `/web-search`. `Configured; connection not verified` reflects configuration and credential availability, not a connectivity check. |
-| `tools.task` | `allowlist = ["worker"]`; permission `always`. |
+| `tools.task` | `allowlist = ["coder"]`, `denylist = []`; permission `always`. The allowlist auto-permits launches of matching identities; the denylist is an absolute veto applied after launch resolution, keyed on the resolved identity (see [Identity architecture](identity-architecture.md#the-identity-denylist)). |
 | `tools.todo` | `max_todos = 100`; permission `always`. |
 | `tools.read_image` | Permission `always`; no additional documented fields. |
 | `tools.edit` | Permission `always`; no additional documented fields. |
@@ -83,22 +95,21 @@ The built-in read/edit/write/image/grep configurations include sensitive pattern
 
 | Key | Default | Accepted value |
 | --- | --- | --- |
-| `agent_paths` | `[]` | Directories containing agent profiles. |
-| `enabled_agents` | `[]` | Agent-name patterns; non-empty restricts available profiles. |
-| `disabled_agents` | `[]` | Agent-name patterns; ignored when `enabled_agents` is set. |
 | `skill_paths` | `[]` | Directories containing skills. |
 | `enabled_skills` | `[]` | Skill-name patterns; non-empty restricts active skills. |
 | `disabled_skills` | `[]` | Skill-name patterns; ignored when `enabled_skills` is set. |
 | `[subagents].idle_ttl_seconds` | `300` | Integer seconds, at least 0. Resident-runtime limit: seconds before a retained idle agent's runtime is retired; 0 disables TTL eviction. |
 | `[subagents].max_idle_agents` | `4` | Integer, at least 0. Resident-runtime limit: maximum retained idle agents; 0 disables the count cap. |
-| `[subagents].retain_agents` | `false` | Strict boolean. Global retention default: `true` keeps a completed background agent resident (idle) for reuse; `false` closes it when the run completes. A per-launch `retain` argument or a profile `retain` setting takes precedence over this default. |
+| `[subagents].retain_agents` | `false` | Strict boolean. Global retention default: `true` keeps a completed background agent resident (idle) for reuse; `false` closes it when the run completes. A per-launch `retain` argument takes precedence over this default. |
 | `[subagents].tombstone_ttl_seconds` | `900` | Integer seconds, at least 0. Recent-metadata bound: how long the terminal record of a closed or evicted agent stays browsable; 0 retains no terminal metadata. |
 | `[subagents].max_tombstones` | `32` | Strict integer, at least 1. Recent-metadata bound: maximum Recent entries kept; the oldest expire first. |
 | `[subagents].max_running_subagents` | `16` | Strict positive integer, at least 1. Active-work admission cap set in `config.toml` or via `CHARTREUX_SUBAGENTS__MAX_RUNNING_SUBAGENTS`; excluded from the settings-UI catalog. |
 
-The `[subagents]` lifecycle settings come in two classes. Resident-runtime limits — `retain_agents`, `idle_ttl_seconds`, and `max_idle_agents` — decide whether a completed background agent stays resident for reuse and for how long; by default agents are ephemeral and close on completion, keeping only the run result. Recent-metadata bounds — `tombstone_ttl_seconds` and `max_tombstones` — decide how long the terminal record of a closed or evicted agent stays in the agent browser's Recent group; they never bound stored results, which expire separately by count. The two zero meanings differ: `idle_ttl_seconds = 0` disables TTL eviction for retained agents, while `tombstone_ttl_seconds = 0` retains no terminal metadata at all, and `max_tombstones` must stay positive (there is no unlimited-metadata mode). Metadata expiry is not release: an expired record's stored result can remain retrievable, while release discards the record, its results, and browser access immediately. The shipped `advisor` profile sets `retain = true` and `idle_ttl_seconds = 3600` at the profile level; worker and reviewer profiles inherit the global default.
+The `[subagents]` lifecycle settings come in two classes. Resident-runtime limits — `retain_agents`, `idle_ttl_seconds`, and `max_idle_agents` — decide whether a completed background agent stays resident for reuse and for how long; by default agents are ephemeral and close on completion, keeping only the run result. Recent-metadata bounds — `tombstone_ttl_seconds` and `max_tombstones` — decide how long the terminal record of a closed or evicted agent stays in the agent browser's Recent group; they never bound stored results, which expire separately by count. The two zero meanings differ: `idle_ttl_seconds = 0` disables TTL eviction for retained agents, while `tombstone_ttl_seconds = 0` retains no terminal metadata at all, and `max_tombstones` must stay positive (there is no unlimited-metadata mode). Metadata expiry is not release: an expired record's stored result can remain retrievable, while release discards the record, its results, and browser access immediately. Retention is global by default plus the per-launch `retain` argument; there are no per-identity retention settings.
 
-The active-work cap counts foreground and background runs, including reuse and pending child creation, but not idle retained agents. The root session's effective configuration controls admission; child configuration does not. Accepted configuration changes affect later admissions without stopping existing work. Completion, cancellation, release, or failed creation frees capacity. Busy `task(..., replace_run=True)` transfers the existing allocation rather than allocating another; the handoff holds capacity until replacement admission or unwind. `replace_run` is a call argument (default `false`), not configuration. Busy replacement requires `agent_id` and background mode and rejects launch `config` or profile changes before stopping; idle reuse still accepts its usual overrides. Configure `cancel_agent` through `[tools.cancel_agent]` and ordinary tool filters; it has no extra settings.
+Agent selection is identity-based: the `[agent]` selections above choose the main-session identity, and the task tool launches child identities (see [Identity architecture](identity-architecture.md)). The retired agent-profile filters `agent_paths`, `enabled_agents`, and `disabled_agents` are no longer offered in the settings catalog, and `chartreux doctor` reports them with successor guidance — block launchable identities with `tools.task.denylist` (Settings > Identities) instead.
+
+The active-work cap counts foreground and background runs, including reuse and pending child creation, but not idle retained agents. The root session's effective configuration controls admission; child configuration does not. Accepted configuration changes affect later admissions without stopping existing work. Completion, cancellation, release, or failed creation frees capacity. Busy `task(..., replace_run=True)` transfers the existing allocation rather than allocating another; the handoff holds capacity until replacement admission or unwind. `replace_run` is a call argument (default `false`), not configuration. Busy replacement requires `agent_id` and background mode and rejects launch `config` or identity changes before stopping; idle reuse still accepts its usual overrides. Configure `cancel_agent` through `[tools.cancel_agent]` and ordinary tool filters; it has no extra settings.
 
 ### Recovery and unattended questions
 
@@ -157,7 +168,6 @@ rejected. Both subsections keep deep-merge semantics across sparse layers.
 | `show_message_timestamps` | `true` | Boolean. Show known message posting times, whole-turn totals, and settled tool durations (also in child transcripts). Capture and persistence continue when off; unstamped history stays unstamped. |
 | `ascii_chrome` | `false` | Boolean. Use ASCII equivalents for application chrome glyphs. |
 | `raise_on_compaction_failure` | `false` | Boolean. |
-| `system_prompt_id` | `"cli"` | Prompt ID. Built-ins are `cli`, `explore`, `tests`, `minimal`, `worker`, `advisor`, and `reviewer`; custom IDs resolve from prompt directories. |
 | `compaction_prompt_id` | `"compact"` | Compaction prompt ID; `compact` is the default built-in. |
 | `include_commit_signature` | `true` | Boolean. |
 | `include_model_info` | `true` | Boolean. |
@@ -165,6 +175,8 @@ rejected. Both subsections keep deep-merge semantics across sparse layers.
 | `include_prompt_detail` | `true` | Boolean. |
 | `[project_context].default_commit_count` | `5` | Integer. |
 | `[project_context].timeout_seconds` | `2.0` | Number of seconds. |
+
+`system_prompt_id` is retired: it no longer selects the composed prompt — the `[agent]` identity/workflow/orchestration_strategy selections do — it is no longer offered in the settings catalog, and `chartreux doctor` reports it with successor guidance (a custom identity plus workflow/strategy composition replaces full-skeleton prompt replacement). The `include_prompt_detail` and related optional-detail settings still trim their composition sections as before.
 
 ### Status line
 
@@ -246,11 +258,12 @@ For local servers, set `transport = "stdio"`, `command`, optional `args = []`, `
 
 ## `models.toml` catalog overlay
 
-The overlay patches the shipped catalog. Scalars replace shipped values, lists replace lists, deployments are matched by base model and provider, and roles are merged per role key. Provider IDs must not contain `/` or `@`; canonical model names, role names, role model values, and deployment identities must not contain `@`. `@orchestrator` is the sole saved main-assistant default. `/model` and `/thinking` affect the current session; `active_model` in `config.toml` is rejected with guidance to edit the orchestrator preset.
+The overlay patches the shipped catalog. Scalars replace shipped values, lists replace lists, deployments are matched by base model and provider, and roles are merged per role key. Provider IDs must not contain `/` or `@`; canonical model names, role names, role model values, and deployment identities must not contain `@`. `@main` is the sole saved main-assistant preset; the retired `@orchestrator` role fails loudly with rename guidance and no alias, and a `[roles.orchestrator]` overlay over the shipped base fails at load — rename the table to `[roles.main]`; the catalog file is never rewritten automatically. `/model` and `/thinking` affect the current session; `active_model` in `config.toml` is rejected with guidance to edit the main preset (`[roles.main]`).
 
 Persisted `thinking_overrides` in user or project `config.toml` are also rejected.
-Set the orchestrator or other role's `thinking` in `models.toml`; use
-`/thinking` for a session choice or `config.thinking` for one subagent launch.
+Set the main assistant's or another role's `thinking` in `models.toml` (the main
+assistant's preset is `[roles.main]`); use `/thinking` for a session choice or
+`config.thinking` for one subagent launch.
 
 | Table and field | Default / allowed value |
 | --- | --- |
@@ -273,40 +286,44 @@ Set the orchestrator or other role's `thinking` in `models.toml`; use
 | `[models."base".deployments.prices]` | `input`, `output`, and `cached_input`: non-negative price per million tokens. Omit an unknown price; zero means explicitly free. |
 | `[roles."name"]` | Default preset: `model` is one canonical base-model name; `thinking` is one of `off`, `low`, `medium`, `high`, or `max`; `description` is optional. Old `models` lists are rejected. |
 
-The shipped role presets are `orchestrator` (the main assistant), `worker`,
-`scout`, and `heavy`. Worker and Reviewer profiles use `worker`; Advisor uses
-`heavy`. The preset editor labels `orchestrator` as **Main**.
+The shipped role presets are `main` (the main assistant), `worker`, `scout`,
+and `heavy`. Roles are model/thinking presets used as launch targets; they
+carry no agent behavior — the identity does that (see
+[Identity architecture](identity-architecture.md)).
 
-### Dispatch overlay
+<a id="dispatch-overlay"></a>
 
-Dispatch policy is accepted only in the user-owned `models.toml` catalog
-overlay. Project configuration and project profiles cannot select dispatch
-policy. The `[dispatch]` table accepts `mode = "orchestrated"` or
-`mode = "standalone"`; absent selection defaults to `standalone`. Explicit
-selections are authoritative, regardless of legacy tier roles or roster size.
-Standalone permits approved direct implementation but keeps delegated verification,
-independent review, and all approval gates. Select `mode = "orchestrated"` to
-delegate implementation too. A dismissible multi-model graduation nudge opens the
-presets editor without changing mode automatically. Slots are keyed tables and may
-sparsely patch a shipped slot. Omitted fields inherit; lists replace, rather
-than append. New slots require their complete definition.
+### Orchestration routes
 
-| Table and field | Accepted value |
+Purpose routes — the executable launch bindings for `task` purposes and seats — live in the `[orchestration]` section of `config.toml` and deep-merge across sparse layers. Orchestration itself is selected through the `[agent]` identity/workflow/orchestration_strategy selections, not through the catalog; see [Identity architecture](identity-architecture.md#purpose-routes-seats-and-diversity) for resolution, seats, and diversity semantics.
+
+| Table and field | Default / accepted value |
 | --- | --- |
-| `[dispatch]` | Dispatch overlay table. |
-| `mode` | `orchestrated` or `standalone`; no free-form values. |
-| `[dispatch.slots.<name>]` | Slot binding table. |
-| `profile` | Discovered agent profile name. |
-| `role` | `@`-prefixed role from the merged model catalog. |
-| `purposes` | List of purpose identifiers; replaces the inherited list. |
-| `implements` | `never`, `routine`, or `escalation`. |
-| `review_eligible` | Boolean review eligibility. |
+| `[orchestration.routes.<purpose>]` | Purpose-route table; sparse entries override the shipped route of the same purpose, and new keys introduce custom purposes. |
+| `targets` | Required, non-empty list of route-target tables. |
+| `targets[].model` | Required. A canonical model name, or `$session` to bind the session model (what every shipped target uses). |
+| `targets[].identity` | Required. Built-in or custom identity id. |
+| `targets[].tier` | Required. `mechanical` or `substantive` (the work-class label feeding the replacement policy). |
+| `targets[].seat` | Optional seat name for multi-seat purposes. |
+| `targets[].overlay` | Optional harness-owned instruction overlay id (shipped: `review-execution`); there is no user overlay directory. |
+| `targets[].replacement_capability` | Optional, default `none`; `mechanical` or `substantive` — replacement eligibility, separate from the tier. |
+| `requires_distinct_models` | Integer, at least 1, default 1; evaluated over canonical-model cardinality at the resolution of the seat composition. |
 
-Invalid dispatch overlays are rejected as a whole; startup uses the shipped
-standalone policy and emits a visible diagnostic while retaining valid catalog
-entries. The invalid source is not overwritten. Dispatch binds to a session;
-saved changes apply only to the next session. See the [models guide](../guides/models.md)
-for examples and [Subagents](../guides/subagents.md) for routing behavior.
+An unavailable model binding fails with an error telling you to configure it explicitly — no other canonical model is substituted. A legacy `[dispatch]` table in `models.toml` is superseded by this section: load reports it loudly with successor guidance naming the `[orchestration.routes.*]` tables above — it is never merged — the catalog write side no longer emits or manages dispatch, and a legacy table's values are preserved by catalog writes (comments and formatting are not preserved), never rewritten.
+
+```toml
+[orchestration.routes.research]
+targets = [{ model = "$session", identity = "researcher", tier = "substantive" }]
+
+[orchestration.routes."review.deep"]
+requires_distinct_models = 3
+
+[[orchestration.routes."review.deep".targets]]
+model = "$session"
+identity = "reviewer"
+tier = "substantive"
+seat = "analytical"
+```
 
 ```toml
 [providers."example-openai"]
@@ -336,6 +353,7 @@ thinking = "high"
 | --- | --- |
 | `CHARTREUX_HOME` | Changes the home directory; default `~/.chartreux`. Set it in the process environment before launch. |
 | `CHARTREUX_<FIELD>` | Overrides a `config.toml` field. Use `__` for nesting, for example `CHARTREUX_PROJECT_CONTEXT__TIMEOUT_SECONDS`. Names are case-insensitive; empty values are still supplied and must validate. |
+| `CHARTREUX_AGENT__IDENTITY`, `CHARTREUX_AGENT__WORKFLOW`, `CHARTREUX_AGENT__ORCHESTRATION_STRATEGY` | New-conversation `[agent]` selections, outranked only by the `--identity`, `--workflow`, and `--orchestration-strategy` CLI flags. An unset variable means no override; see [Agent selections](#agent-selections). |
 | Provider key named by `api_key_env_var` | Credential for that catalog provider; the shipped Mistral provider uses `MISTRAL_API_KEY`. |
 | `EXA_API_KEY`, `BRAVE_SEARCH_API_KEY`, or the variable selected by `tools.web_search.api_key_env_var` | Credentials for web-search providers. Exa and Brave use their corresponding variable by default. Mistral/auto uses `tools.web_search.api_key_env_var` when set; otherwise it selects the configured Mistral provider key, or `MISTRAL_API_KEY` if no Mistral provider is configured. Chartreux checks only the selected variable and reports a missing-key diagnostic if it is unavailable. |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`; outranks `log_level`. `DEBUG_MODE=true` forces debug logging. |

@@ -129,32 +129,34 @@ class TestProjectToolsDirs:
         assert mgr.project_tools_dirs == [tmp_path / ".chartreux" / "tools"]
 
 
-class TestProjectAgentsDirs:
-    def test_returns_empty_when_project_not_in_sources(
+class TestRetiredProjectAgentDirs:
+    """Project agents/*.toml dirs are detected as retired, never loaded (16a)."""
+
+    def test_not_detected_when_project_not_in_sources(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(tmp_path)
         mgr = HarnessFilesManager(sources=("user",))
-        assert mgr.project_agents_dirs == []
+        assert mgr.retired_agent_dirs == []
 
-    def test_returns_empty_when_not_trusted(
+    def test_not_detected_when_not_trusted(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(trusted_folders_manager, "is_trusted", lambda _: False)
         (tmp_path / ".chartreux" / "agents").mkdir(parents=True)
         mgr = HarnessFilesManager(sources=("user", "project"))
-        assert mgr.project_agents_dirs == []
+        assert mgr.retired_agent_dirs == []
 
-    def test_returns_empty_when_agents_dir_does_not_exist(
+    def test_not_detected_when_agents_dir_does_not_exist(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(trusted_folders_manager, "is_trusted", lambda _: True)
         mgr = HarnessFilesManager(sources=("user", "project"))
-        assert mgr.project_agents_dirs == []
+        assert mgr.retired_agent_dirs == []
 
-    def test_returns_path_when_agents_dir_exists_and_trusted(
+    def test_detected_when_agents_dir_exists_and_trusted(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(tmp_path)
@@ -162,7 +164,7 @@ class TestProjectAgentsDirs:
         agents_dir = tmp_path / ".chartreux" / "agents"
         agents_dir.mkdir(parents=True)
         mgr = HarnessFilesManager(sources=("user", "project"))
-        assert mgr.project_agents_dirs == [agents_dir]
+        assert mgr.retired_agent_dirs == [agents_dir]
 
     def test_ignores_agents_when_file_not_dir(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -172,7 +174,7 @@ class TestProjectAgentsDirs:
         (tmp_path / ".chartreux").mkdir()
         (tmp_path / ".chartreux" / "agents").write_text("", encoding="utf-8")
         mgr = HarnessFilesManager(sources=("user", "project"))
-        assert mgr.project_agents_dirs == []
+        assert mgr.retired_agent_dirs == []
 
     def test_does_not_find_nested_agents_dirs(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -182,7 +184,7 @@ class TestProjectAgentsDirs:
         (tmp_path / ".chartreux" / "agents").mkdir(parents=True)
         (tmp_path / "sub" / "deep" / ".chartreux" / "agents").mkdir(parents=True)
         mgr = HarnessFilesManager(sources=("user", "project"))
-        assert mgr.project_agents_dirs == [tmp_path / ".chartreux" / "agents"]
+        assert mgr.retired_agent_dirs == [tmp_path / ".chartreux" / "agents"]
 
 
 class TestUserToolsDirs:
@@ -239,22 +241,24 @@ class TestUserSkillsDirs:
         assert mgr.user_skills_dirs == [vibe_skills_dir, agents_skills]
 
 
-class TestUserAgentsDirs:
-    def test_returns_empty_when_user_not_in_sources(self) -> None:
+class TestRetiredUserAgentDirs:
+    """The user agents/*.toml dir is detected as retired, never loaded (16a)."""
+
+    def test_not_detected_when_user_not_in_sources(self) -> None:
         mgr = HarnessFilesManager(sources=("project",))
-        assert mgr.user_agents_dirs == []
+        assert mgr.retired_agent_dirs == []
 
-    def test_returns_empty_when_dir_does_not_exist(self) -> None:
+    def test_not_detected_when_dir_does_not_exist(self) -> None:
         mgr = HarnessFilesManager(sources=("user",))
-        assert mgr.user_agents_dirs == []
+        assert mgr.retired_agent_dirs == []
 
-    def test_returns_path_when_user_in_sources_and_dir_exists(
+    def test_detected_when_user_in_sources_and_dir_exists(
         self, config_dir: Path
     ) -> None:
         agents_dir = config_dir / "agents"
         agents_dir.mkdir()
         mgr = HarnessFilesManager(sources=("user",))
-        assert mgr.user_agents_dirs == [agents_dir]
+        assert mgr.retired_agent_dirs == [agents_dir]
 
 
 class TestLoadProjectDocs:

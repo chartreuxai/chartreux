@@ -11,7 +11,6 @@ import pytest
 from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.config.builder import ConfigBuilder
 from chartreux.core.config.layer import ConfigLayer, RawConfig
-from chartreux.core.config.layers.agent_profile import AgentProfileLayer
 from chartreux.core.config.layers.default import DefaultConfigLayer
 from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.config.layers.user import UserConfigLayer
@@ -43,8 +42,9 @@ async def test_candidate_preserves_shadowed_restrictions_without_changing_merge(
                 }
             },
         ),
-        AgentProfileLayer(
-            data={"tools": {"write_file": {"permission": "always", "denylist": []}}}
+        OverridesLayer(
+            name="higher",
+            data={"tools": {"write_file": {"permission": "always", "denylist": []}}},
         ),
     )
     candidate = await builder.build_candidate()
@@ -59,13 +59,11 @@ async def test_candidate_preserves_shadowed_restrictions_without_changing_merge(
     assert user.tools[0].denied is True
     assert user.tools[0].denylist == ("*private*",)
     assert user.kind == "source"
-    mode = next(
-        source
-        for source in candidate.restrictions
-        if source.layer_name == "agent-profile"
+    higher = next(
+        source for source in candidate.restrictions if source.layer_name == "higher"
     )
-    assert mode.kind == "mode"
-    assert mode.tools == ()
+    assert higher.kind == "source"
+    assert higher.tools == ()
     frozen_field = "denied"
     with pytest.raises(FrozenInstanceError):
         setattr(user.tools[0], frozen_field, False)

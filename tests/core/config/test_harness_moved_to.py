@@ -29,10 +29,12 @@ def test_local_extensions_survive_without_plugin_discovery(
 
     assert manager.user_tools_dirs == [home / "tools"]
     assert home / "skills" in manager.user_skills_dirs
-    assert manager.user_agents_dirs == [home / "agents"]
+    assert manager.retired_agent_dirs == [
+        home / "agents",
+        project / ".chartreux" / "agents",
+    ]
     assert manager.project_tools_dirs == [project / ".chartreux" / "tools"]
     assert manager.project_skills_dirs == [project / ".chartreux" / "skills"]
-    assert manager.project_agents_dirs == [project / ".chartreux" / "agents"]
     assert manager.hook_files == [
         project / ".chartreux" / "hooks.toml",
         home / "hooks.toml",

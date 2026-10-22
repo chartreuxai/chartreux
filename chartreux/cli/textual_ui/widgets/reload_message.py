@@ -18,7 +18,10 @@ class ReloadConfigMessage(StatusMessage):
         if self.error_message:
             return f"Failed to reload config: {self.error_message}"
 
-        return "Configuration reloaded (includes agent instructions and skills)."
+        return (
+            "Configuration refreshed (AGENTS.md, skills, catalogs). "
+            "Frozen policy stays bound; edits reported as pending."
+        )
 
     def set_complete(self) -> None:
         self.stop_spinning(success=True)

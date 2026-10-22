@@ -50,7 +50,7 @@ def test_cli_real_provider_and_direct_mcp_without_product_services(
                 }
             },
             "roles": {
-                "orchestrator": {
+                "main": {
                     "description": "Network contract test preset",
                     "model": "contract-model",
                     "thinking": "off",

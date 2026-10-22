@@ -496,6 +496,59 @@ async def test_compaction_boundary_serves_file_state_in_the_request(
 
 
 @pytest.mark.asyncio
+async def test_post_compaction_boundary_keeps_system_prompt_and_summary_structure(
+    tmp_path: Path,
+) -> None:
+    # Package-14 precedent pins at the boundary seam: the captured post-
+    # compaction request still opens with the FULL system prompt (the frozen
+    # policy's composed text), the summary rides the boundary verbatim inside
+    # its structural wrapper, and the file-state section sits alongside it.
+    target = tmp_path / "mod.py"
+    target.write_text("def f():\n    return 1\n")
+    backend = FakeBackend([
+        [mock_llm_chunk(tool_calls=[_read_call(target)])],
+        [mock_llm_chunk(content="read done")],
+        [mock_llm_chunk(content="<summary>no agents were launched</summary>")],
+        [mock_llm_chunk(content="after compaction")],
+    ])
+    loop = build_test_agent_loop(
+        config=build_test_vibe_config(tools={"read_file": {"permission": "always"}}),
+        cwd=tmp_path,
+        backend=backend,
+    )
+    try:
+        async for _event in loop.act("read the file"):
+            pass
+        system_prompt = loop.messages[0]
+
+        await loop.compact()
+
+        boundary = loop.messages[-1]
+        assert boundary.context_boundary == "compaction"
+        content = str(boundary.content)
+        assert "<previous_user_messages>" in content
+        assert "<compaction_summary>" in content
+        assert "no agents were launched" in content
+        assert str(target) in content
+
+        async for _event in loop.act("continue"):
+            pass
+        request = backend.requests_messages[-1]
+        assert request[0].role == Role.system
+        assert request[0].content == system_prompt.content
+        request_system = str(request[0].content)
+        assert "## Resolved contract" in request_system
+        boundary_in_request = next(
+            message
+            for message in request
+            if message.role == Role.user and str(target) in str(message.content)
+        )
+        assert "no agents were launched" in str(boundary_in_request.content)
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_clear_history_resets_working_set(tmp_path: Path) -> None:
     target = tmp_path / "mod.py"
     target.write_text("a = 1\n")

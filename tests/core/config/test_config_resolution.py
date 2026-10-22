@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import ValidationError
 import pytest
 
 from chartreux.core.config.builder import ConfigBuilder
@@ -81,7 +82,7 @@ async def test_orchestrator_preset_never_skips_missing_credentials(
             "models": {
                 "local": {"deployments": [{"provider": "keyless", "name": "local"}]}
             },
-            "roles": {"orchestrator": {"model": "glm-5-3", "thinking": "high"}},
+            "roles": {"main": {"model": "glm-5-3", "thinking": "high"}},
         },
     )
     config = await _build(snapshot=CatalogSnapshot(catalog, "credential-preset"))
@@ -127,7 +128,7 @@ async def test_semantic_orchestrator_without_ready_candidate_keeps_missing_key_e
 @pytest.mark.parametrize(
     ("field_text", "error_hint"),
     [
-        ('active_model = "glm-5-3"', "roles.orchestrator.*models.toml"),
+        ('active_model = "glm-5-3"', "roles.main.*models.toml"),
         ('[thinking_overrides]\nglm-5-3 = "low"', "models.toml.*session"),
     ],
 )
@@ -212,11 +213,11 @@ async def test_runtime_selection_patch_stays_in_session_layer(tmp_path: Path) ->
     assert orch.config.get_active_model().thinking == "low"
 
 
-async def test_save_replaces_top_level_list_and_reload_keeps_project_user_resolution(
+async def test_save_patch_to_a_retired_field_is_rejected_without_touching_disk(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "config.toml"
-    path.write_text('disabled_agents = ["first", "other"]\n')
+    path.write_text('theme = "original"\n')
     user = UserConfigLayer(path=path, name="user")
     orch = await ConfigOrchestrator.create(
         schema=ChartreuxConfigSchema,
@@ -231,9 +232,23 @@ async def test_save_replaces_top_level_list_and_reload_keeps_project_user_resolu
         expected_revision=revision,
         reason="test",
     )
-    assert (result.persistence, result.application) == ("saved", "applied")
-    await orch.reload()
-    assert orch.config.disabled_agents == ["first"]
+    assert (result.persistence, result.application) == ("not_saved", "unchanged")
+    assert result.error == "validation"
+    assert path.read_text(encoding="utf-8") == 'theme = "original"\n'
+
+
+async def test_retired_agents_field_in_user_file_fails_with_successor_guidance(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('disabled_agents = ["first"]\n')
+    user = UserConfigLayer(path=path, name="user")
+    with pytest.raises(ValidationError, match="disabled_agents is retired"):
+        await ConfigOrchestrator.create(
+            schema=ChartreuxConfigSchema,
+            layers=[DefaultConfigLayer(schema=ChartreuxConfigSchema), user],
+            default_layer_resolver=lambda: user,
+        )
 
 
 @pytest.mark.parametrize("field", ["models", "providers"])

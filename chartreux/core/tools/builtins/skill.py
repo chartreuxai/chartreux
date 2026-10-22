@@ -175,6 +175,14 @@ class Skill(
         skill_info = skill_manager.get_skill(args.name)
 
         if skill_info is None:
+            # One rule, three surfaces: exposure/loading is filtered by the
+            # conversation's frozen workflow (design §5). An explicit
+            # invocation of a withheld skill gets an actionable diagnostic
+            # naming the workflow/identity requirement — not a generic
+            # not-found and never the skill's content.
+            diagnostic = skill_manager.incompatibility_diagnostic(args.name)
+            if diagnostic is not None:
+                raise ToolError(diagnostic)
             available = ", ".join(sorted(skill_manager.available_skills.keys()))
             raise ToolError(
                 f'Skill "{args.name}" not found. Available skills: {available or "none"}'

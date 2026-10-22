@@ -183,7 +183,7 @@ class AgentBrowserController:
         if selected is not None:
             # The viewer is reused per agent: refresh its header in place
             # when the selected handle re-tasks.
-            viewer.set_header(selected.name, selected.profile)
+            viewer.set_header(selected.name, identity=selected.identity)
             if self._app._agent_bar is not None:
                 viewer.set_metadata(self._app._agent_bar.full_metadata(selected))
 
@@ -311,7 +311,7 @@ class AgentBrowserController:
                         ),
                     ),
                     agent.agent_id,
-                    profile=agent.profile,
+                    identity=agent.identity,
                     name=agent.name,
                     metadata=(
                         self._app._agent_bar.full_metadata(agent)

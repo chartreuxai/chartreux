@@ -6,7 +6,8 @@ from pathlib import Path
 
 from chartreux import CHARTREUX_ROOT
 from chartreux.core.config.harness_files import get_harness_files_manager
-from chartreux.utils.io import read_safe
+from chartreux.core.policy.models import ResourceKind
+from chartreux.core.policy.resources import ResourceLoader
 
 PROMPTS_DIR = CHARTREUX_ROOT / "core" / "prompts"
 
@@ -17,17 +18,13 @@ class Prompt(StrEnum):
         return (PROMPTS_DIR / self.value).with_suffix(".md")
 
     def read(self) -> str:
-        return read_safe(self.path).text.strip()
-
-
-class SystemPrompt(Prompt):
-    CLI = auto()
-    EXPLORE = auto()
-    TESTS = auto()
-    MINIMAL = auto()
-    WORKER = auto()
-    ADVISOR = auto()
-    REVIEWER = auto()
+        content = (
+            ResourceLoader({ResourceKind.IDENTITY: PROMPTS_DIR})
+            .resolve(ResourceKind.IDENTITY, self.value)
+            .content
+        )
+        assert content is not None
+        return content.strip()
 
 
 class UtilityPrompt(Prompt):
@@ -89,36 +86,41 @@ def custom_prompt_ids() -> set[str]:
 def load_prompt(
     prompt_id: str, *, setting_name: str, builtins: Mapping[str, Path]
 ) -> str:
-    _validate_prompt_id(prompt_id, setting_name)
+    """Load a utility prompt through the strict resource loader.
+
+    Package 16b retired the enum-based full-skeleton prompt axis: the
+    ``SystemPrompt`` enum, ``load_system_prompt``, and the legacy unqualified
+    branch (project/user custom directories shadowing shipped prompts) are
+    gone. What survives is the utility/compaction surface: a built-in id
+    resolves from the shipped ``builtins`` map, a custom id resolves from the
+    user prompts directory, and the reserved built-in names cannot be
+    shadowed.
+    """
+    _validate_prompt_id(prompt_id.split(":", 1)[-1], setting_name)
     mgr = get_harness_files_manager()
-    custom_dirs = mgr.project_prompts_dirs + mgr.user_prompts_dirs
-    for d in custom_dirs:
-        path = (d / prompt_id).with_suffix(".md")
-        if path.is_file():
-            return read_safe(path).text.strip()
-
-    builtin_path = builtins.get(prompt_id.lower())
-    if builtin_path is not None and builtin_path.is_file():
-        return read_safe(builtin_path).text.strip()
-
-    custom_ids = sorted(custom_prompt_ids())
-    raise MissingPromptFileError(
-        setting_name, prompt_id, tuple(builtins), custom_dirs, custom_ids
+    builtin_map = {name.lower(): path for name, path in builtins.items()}
+    user_dirs = mgr.user_prompts_dirs
+    loader = ResourceLoader(
+        {ResourceKind.IDENTITY: user_dirs[0] if user_dirs else Path("/nonexistent")},
+        {ResourceKind.IDENTITY: builtin_map},
     )
-
-
-def load_system_prompt(prompt_id: str) -> str:
-    builtins: dict[str, Path] = {p.name.lower(): p.path for p in SystemPrompt}
-    return load_prompt(prompt_id, setting_name="system_prompt_id", builtins=builtins)
+    resource = loader.resolve(ResourceKind.IDENTITY, prompt_id)
+    if resource.content is not None:
+        return resource.content
+    raise MissingPromptFileError(
+        setting_name,
+        prompt_id,
+        tuple(builtin_map),
+        user_dirs,
+        tuple(sorted(custom_prompt_ids())),
+    )
 
 
 __all__ = [
     "PROMPTS_DIR",
     "MissingPromptFileError",
     "Prompt",
-    "SystemPrompt",
     "UtilityPrompt",
     "custom_prompt_ids",
     "load_prompt",
-    "load_system_prompt",
 ]

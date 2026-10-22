@@ -207,7 +207,7 @@ async def test_navigation_from_dirty_list_requires_explicit_discard(
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
         options = screen.query_one(SettingsOptionList)
-        options.highlighted = options.get_option_index("agent_paths")
+        options.highlighted = options.get_option_index("skill_paths")
         await pilot.press("enter", "tab", "enter")
         await pilot.press(*"new-entry", "enter")
         assert _draft_values(screen._list_draft) == ["new-entry"]
@@ -252,9 +252,9 @@ async def test_failed_list_save_retains_editable_draft_and_retry(failure: str) -
     )
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        await pilot.press(*"agent_paths", "enter")
+        await pilot.press(*"skill_paths", "enter")
         screen = cast(SettingsScreen, pilot.app.screen)
-        item = next(item for item in screen.catalog if item.path == "agent_paths")
+        item = next(item for item in screen.catalog if item.path == "skill_paths")
         draft = ["my-agent", "other-agent"]
         screen._list_draft = screen._make_draft(draft)
         screen._refresh_options()
@@ -278,7 +278,7 @@ async def test_failed_list_save_retains_editable_draft_and_retry(failure: str) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["inventory_tools", "agent_paths"])
+@pytest.mark.parametrize("path", ["inventory_tools", "skill_paths"])
 async def test_wp4_apply_reserves_busy_before_worker_and_blocks_mutation(
     path: str,
 ) -> None:
@@ -363,7 +363,7 @@ async def test_wp4_unfiltered_apply_double_click_does_not_activate_new_catalog_r
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         screen = cast(SettingsScreen, pilot.app.screen)
         catalog = screen.query_one(SettingsOptionList)
-        catalog.highlighted = catalog.get_option_index("agent_paths")
+        catalog.highlighted = catalog.get_option_index("skill_paths")
         await pilot.press("enter")
         screen._list_draft = screen._make_draft(["new"])
         screen._refresh_options()
@@ -371,7 +371,7 @@ async def test_wp4_unfiltered_apply_double_click_does_not_activate_new_catalog_r
         await pilot.pause()
         await pilot.click(actions, offset=(5, 1), times=2)
         await pilot.pause()
-        assert service.saved == [{"agent_paths": ["new"]}]
+        assert service.saved == [{"skill_paths": ["new"]}]
         assert (
             screen._expanded is None
             and screen._editing is None

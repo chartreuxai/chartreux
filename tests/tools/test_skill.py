@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -52,6 +53,9 @@ def _make_skill_manager(skills: dict[str, SkillInfo]) -> SkillManager:
     manager = MagicMock(spec=SkillManager)
     manager.available_skills = skills
     manager.get_skill.side_effect = lambda n: skills.get(n)
+    # No discovered-but-withheld skills in these fixtures: the plain
+    # not-found path stays in force.
+    cast(MagicMock, manager.incompatibility_diagnostic).return_value = None
     return manager
 
 
@@ -277,6 +281,43 @@ class TestSkillErrors:
 
         result = await collect_result(skill_tool.run(SkillArgs(name="broken"), ctx=ctx))
         assert "Use prompt from state." in result.content
+
+    @pytest.mark.asyncio
+    async def test_withheld_skill_gets_actionable_diagnostic(
+        self, skill_tool: Skill
+    ) -> None:
+        # An explicit invocation of a skill the conversation's frozen
+        # workflow withholds (design §5) raises an actionable diagnostic
+        # naming the workflow/identity requirement — not a generic
+        # not-found and never the skill's content.
+        manager = _make_skill_manager({})
+        cast(MagicMock, manager.incompatibility_diagnostic).return_value = (
+            'Skill "main-design" is not available in this conversation: it is a '
+            "ceremony-bearing workflow skill and requires the `ceremony` "
+            "workflow (this conversation runs the `minimal` workflow with the "
+            "`coder` identity)."
+        )
+        ctx = _make_ctx(manager)
+
+        with pytest.raises(ToolError, match="ceremony"):
+            await collect_result(skill_tool.run(SkillArgs(name="main-design"), ctx=ctx))
+
+    @pytest.mark.asyncio
+    async def test_withheld_skill_diagnostic_beats_not_found_listing(
+        self, skill_tool: Skill
+    ) -> None:
+        manager = _make_skill_manager({"alpha": MagicMock()})
+        cast(MagicMock, manager.incompatibility_diagnostic).return_value = (
+            'Skill "main-review" is not available in this conversation: it is a '
+            "ceremony-bearing workflow skill and requires the `ceremony` "
+            "workflow."
+        )
+        ctx = _make_ctx(manager)
+
+        with pytest.raises(ToolError) as excinfo:
+            await collect_result(skill_tool.run(SkillArgs(name="main-review"), ctx=ctx))
+        assert "not found" not in str(excinfo.value)
+        assert "ceremony" in str(excinfo.value)
 
 
 class TestSkillPermission:

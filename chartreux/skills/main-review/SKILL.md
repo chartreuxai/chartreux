@@ -20,31 +20,24 @@ For a pull request, fetch its branch before delegating, then review the branch c
 
 ## Review purposes
 
-- **Quick:** launch one reviewer for `review.quick`; use the eligible slot the rendered slot table lists for that purpose. Use for quick, fast, trivial, or rename-only reviews.
-- **Standard:** launch one reviewer for `review.standard` through its configured eligible slot. Use for most reviews; do not add a second reviewer by default.
-- **Deep:** launch fresh, independent reviewers for `review.deep`, one separate task per seat in the rendered review composition, honoring its authorship substitutions. Synthesize their reports.
+- **Quick:** launch one reviewer with `purpose="review.quick"`. Use for quick, fast, trivial, or rename-only reviews.
+- **Standard:** launch one reviewer with `purpose="review.standard"`. Use for most reviews; do not add a second reviewer by default.
+- **Deep:** launch fresh, independent reviewers with `purpose="review.deep"`, one separate task per seat — `seat="analytical"`, `seat="peer"`, and `seat="execution"` — honoring the review composition's authorship substitutions. Synthesize their reports.
 - **Plans:** use the Deep procedure for plans, specifications, and designs.
 
-Use only the rendered eligible slots and their launch bindings. Do not call the usage tool automatically. Keep each phase bounded to one dispatch per listed reviewer and at most two refinement rounds unless the user approves a larger budget.
+Every launch resolves its reviewer through the purpose route: the analytical and peer seats bind the read-only `reviewer` identity, and the execution seat binds the `coder` identity with the review-execution instructions overlay (the executing seat — it runs the checks; it is not a read-only seat). Do not call the usage tool automatically. Keep each phase bounded to one dispatch per listed seat and at most two refinement rounds unless the user approves a larger budget.
 
-If a listed reviewer fails or is unavailable, report the failure as a blocker in the synthesis with per-reviewer status. Do not silently substitute an unlisted agent for an approved purpose slot; a substitution is a scope change to propose to the user.
+If a seat's launch fails or is unavailable, report the failure as a blocker in the synthesis with per-seat status. Do not silently substitute another identity or model for a seat; a substitution is a scope change to propose to the user. The route's declared requirements (for example `review.deep`'s distinct canonical models) are validated by the launch itself: an unmet requirement is reported, never papered over — a fresh reviewer context on the same model is context separation, not model diversity.
 
 ## Dispatch
 
 Each task string must be self-contained:
 
 ```text
-task(task="Review: <target>. Intent: <intent>. Purpose: <review purpose>. Return a complete review report with findings, evidence, and verification status.", agent_type="<slot.profile>", config={model="<slot launch binding>"})
+task(task="Review: <target>. Intent: <intent>. Purpose: <review purpose>. Return a complete review report with findings, evidence, and verification status.", purpose="<review purpose>"[, seat="<seat>"])
 ```
 
-Select the profile and launch binding from the rendered eligible slot for the
-purpose; do not infer routing from a profile default. For Deep and Plans,
-launch each configured composition seat separately with distinct tasks and
-independent instructions so each reviewer makes its own judgment. They may run
-in parallel; collect every result before synthesis. Use fresh contexts for
-second-round reviews, without earlier reviewers' conclusions. On a single-model
-roster, use fresh-context review on the available model; if a required independent
-slot is unavailable, report a blocker rather than silently substituting.
+Pass the purpose — and the seat for `review.deep` — as top-level fields; the route resolves the model and the seat's identity. For Deep and Plans, launch each seat separately with distinct tasks and independent instructions so each reviewer makes its own judgment. They may run in parallel; collect every result before synthesis. Use fresh contexts for second-round reviews, without earlier reviewers' conclusions.
 
 ## Synthesis
 

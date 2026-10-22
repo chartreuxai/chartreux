@@ -13,6 +13,13 @@ constraints the release evidence established:
   failure envelope; an unknown identity cannot prove independence.
 - (b) tier capability — a mechanical-tier model (luna-class) is never an
   eligible replacement for a substantive package.
+- (b2) candidate capability — replacement ELIGIBILITY is an intrinsic
+  model-level capability, explicitly marked execution-capable for the
+  requested work, and is evaluated SEPARATELY from the package tier
+  (interfaces.md settled decision): the package tier remains a separate
+  constraint/label and never changes the candidate's capability, and a model
+  bound on both mechanical and substantive route targets carries ONE canonical
+  capability, not two target-derived identities.
 - (c) cost awareness — every substitution emits a milestone notice stating the
   cost implication honestly (including when pricing is unavailable).
 
@@ -22,7 +29,8 @@ validated eligible sets; the choice is the orchestrator's, at failure time.
 
 This module also owns the unattended-resilience rule's harness side: the
 consolidated resumable blocker report (park-and-continue) and the greppable
-marker shared with the orchestrator prompt (``core/prompts/cli.md``).
+marker shared with the orchestrator prompt
+(``core/prompts/identities/orchestrator.md``).
 Infrastructure/harness failures NEVER produce a user question — the decision
 vocabulary is ``selected`` | ``rejected`` | ``parked``, never ``ask``.
 """
@@ -36,6 +44,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from chartreux.core.config.models import RecoveryConfig
 from chartreux.core.deferred_questions import DeferredQuestionStore
+from chartreux.core.dispatch.route_models import PurposeRoute, ReplacementCapability
+from chartreux.core.dispatch.routes import SESSION_MODEL
 from chartreux.core.recovery_models import (
     FailureClass,
     FailureEnvelope,
@@ -44,12 +54,10 @@ from chartreux.core.recovery_models import (
 )
 
 if TYPE_CHECKING:
-    from chartreux.core.dispatch.schema import DispatchPolicy
     from chartreux.core.model_catalog.schema import ModelCatalog
 
 __all__ = [
     "INFRASTRUCTURE_FAILURE_CLASSES",
-    "MECHANICAL_PURPOSES",
     "UNATTENDED_RESILIENCE_MARKER",
     "UNATTENDED_RESILIENCE_RULE",
     "ParkedPackage",
@@ -60,14 +68,15 @@ __all__ = [
     "candidates_from_catalog",
     "eligible_replacement_candidates",
     "is_infrastructure_failure",
-    "mechanical_base_models_from_policy",
+    "mechanical_base_models_from_routes",
     "parked_decision",
+    "route_recovery_facts",
     "validate_replacement_selection",
 ]
 
 #: Greppable marker for the unattended-resilience rule. The same marker appears
-#: in the orchestrator prompt (``core/prompts/cli.md``) and in the consolidated
-#: blocker report, so the rule is findable from either side.
+#: in the orchestrator prompt (``core/prompts/identities/orchestrator.md``) and
+#: in the consolidated blocker report, so the rule is findable from either side.
 UNATTENDED_RESILIENCE_MARKER = "UNATTENDED-RESILIENCE"
 
 #: The unattended-resilience rule in one sentence (the prompt carries the full
@@ -79,9 +88,6 @@ UNATTENDED_RESILIENCE_RULE = (
     "blocker report carrying resumable state. Authorization, scope, safety, "
     "and destructive-action decisions remain genuine user questions."
 )
-
-#: Dispatch purposes that mark the mechanical tier (the luna-class slot).
-MECHANICAL_PURPOSES = frozenset({"mechanical-edit", "mechanical"})
 
 #: Failure classes the unattended-resilience rule covers: provider/harness
 #: failures, never the protected classes (those are genuine stops/decisions).
@@ -116,8 +122,23 @@ class ReplacementCandidate(BaseModel):
     # Canonical redacted endpoint identity (recovery_models); None = unknown.
     endpoint: str | None = None
     tier: PackageTier = PackageTier.SUBSTANTIVE
+    # The model-level replacement capability — an EXPLICIT, intrinsic marking,
+    # independent of the package tier (interfaces.md settled decision).
+    # ``None`` derives the capability from the tier label (the legacy
+    # slot-purpose inference path); an explicit marking — including NONE — is
+    # honored as-is, so eligibility never depends on a tier guess.
+    capability: ReplacementCapability | None = None
     # Output price per million tokens; None = pricing unavailable (never 0.0).
     output_price_per_million: float | None = None
+
+    @property
+    def effective_capability(self) -> ReplacementCapability:
+        """The capability axis: the explicit marking, else the tier label."""
+        if self.capability is not None:
+            return self.capability
+        if self.tier is PackageTier.MECHANICAL:
+            return ReplacementCapability.MECHANICAL
+        return ReplacementCapability.SUBSTANTIVE
 
 
 class ReplacementDecision(BaseModel):
@@ -216,33 +237,83 @@ def is_infrastructure_failure(envelope: FailureEnvelope) -> bool:
     return envelope.failure.failure_class in INFRASTRUCTURE_FAILURE_CLASSES
 
 
-def mechanical_base_models_from_policy(
-    policy: DispatchPolicy, slot_bindings: Mapping[str, tuple[str, str | None]]
+def mechanical_base_models_from_routes(
+    routes: Mapping[str, PurposeRoute], *, session_model: str
 ) -> frozenset[str]:
-    """The mechanical-tier base models bound by the active dispatch policy.
+    """The mechanical-tier base models the configured purpose routes bind.
 
-    A slot is mechanical-tier when its purposes intersect the mechanical
-    purpose set; its roster binding names the bound base model. Unbound
-    mechanical slots contribute nothing (their model is unavailable anyway).
+    The successor of the retired slot-purpose inference (package 16b): a route
+    target is mechanical-tier when its explicit ``tier`` is ``mechanical``,
+    and its bound model is the target's model — ``$session`` resolves to the
+    session model. Unbound targets contribute nothing.
     """
     models: set[str] = set()
-    for name, slot in policy.slots.items():
-        if not MECHANICAL_PURPOSES.intersection(slot.purposes):
-            continue
-        binding = slot_bindings.get(name)
-        if binding is not None and binding[0]:
-            models.add(binding[0])
+    for route in routes.values():
+        for target in route.targets:
+            if target.tier != PackageTier.MECHANICAL:
+                continue
+            model = session_model if target.model == SESSION_MODEL else target.model
+            if model:
+                models.add(model)
     return frozenset(models)
 
 
+def route_recovery_facts(
+    routes: Mapping[str, PurposeRoute],
+    *,
+    session_model: str,
+    canonical_models: Mapping[str, str],
+) -> tuple[frozenset[str], dict[str, ReplacementCapability]]:
+    """The canonical mechanical-tier set and capability markings of the routes.
+
+    The recovery boundary labels candidates by canonical base model, but a
+    route target names its model by preset reference (``@role``), canonical
+    base, or the ``$session`` binding — so every reference is canonicalized
+    through the catalog mapping: a preset-bound mechanical target labels its
+    base model mechanical, and a target's explicit ``replacement_capability``
+    marking reaches the candidates keyed by the same canonical base (one
+    canonical capability per model, never two target-derived identities).
+    Targets without an explicit marking contribute no marking: the
+    explicit-marking regime is opt-in, and with no explicit marking anywhere
+    the legacy tier-label derivation applies unchanged.
+    """
+    mechanical: set[str] = set()
+    capabilities: dict[str, ReplacementCapability] = {}
+    for route in routes.values():
+        for target in route.targets:
+            model = (
+                session_model
+                if target.model == SESSION_MODEL
+                else canonical_models.get(target.model, target.model)
+            )
+            if not model:
+                continue
+            if target.tier == PackageTier.MECHANICAL:
+                mechanical.add(model)
+            if target.replacement_capability is not ReplacementCapability.NONE:
+                capabilities[model] = target.replacement_capability
+    return frozenset(mechanical), capabilities
+
+
 def candidates_from_catalog(
-    catalog: ModelCatalog, *, mechanical_base_models: frozenset[str] = frozenset()
+    catalog: ModelCatalog,
+    *,
+    mechanical_base_models: frozenset[str] = frozenset(),
+    capabilities: Mapping[str, ReplacementCapability] | None = None,
 ) -> list[ReplacementCandidate]:
     """The catalog-derived candidate list (deterministic catalog order).
 
     Only enabled models with enabled deployments on enabled providers are
     included; each candidate carries its canonical redacted endpoint identity
     and output price (``None`` = pricing unavailable).
+
+    ``capabilities`` is the model-level capability marking (route/model
+    capability explicitly marked execution-capable): it is keyed by canonical
+    base model, so a model bound on both mechanical and substantive route
+    targets carries ONE canonical capability — route duplication never upgrades
+    a model. When the mapping is supplied, an unmarked model is marked NONE
+    (eligibility requires an explicit marking); when it is omitted, the legacy
+    tier-label derivation applies unchanged.
     """
     candidates: list[ReplacementCandidate] = []
     for base_model, definition in catalog.models.items():
@@ -252,6 +323,11 @@ def candidates_from_catalog(
             PackageTier.MECHANICAL
             if base_model in mechanical_base_models
             else PackageTier.SUBSTANTIVE
+        )
+        capability = (
+            capabilities.get(base_model, ReplacementCapability.NONE)
+            if capabilities is not None
+            else None
         )
         for deployment in definition.deployments:
             if deployment.disabled:
@@ -266,6 +342,7 @@ def candidates_from_catalog(
                     wire_name=deployment.name,
                     endpoint=canonical_endpoint_identity(provider.api_base),
                     tier=tier,
+                    capability=capability,
                     output_price_per_million=deployment.prices.output,
                 )
             )
@@ -382,11 +459,12 @@ def validate_replacement_selection(
 
     The invariants are CODE, never config escape hatches: endpoint
     independence against the ATTEMPTED failed endpoint (unknown identity
-    cannot prove independence), tier capability, and the configured
-    allowlist/price-cap constraints. Protected failure classes (preflight,
-    cancellation, authorization, permanent config, budget stop, task) and
-    unknown/internal causes never substitute — a HEAD/branch/workspace
-    preflight stop is preserved, never bypassed.
+    cannot prove independence), tier capability, the SEPARATE candidate
+    capability axis (an intrinsic model-level marking, never a tier guess),
+    and the configured allowlist/price-cap constraints. Protected failure
+    classes (preflight, cancellation, authorization, permanent config,
+    budget stop, task) and unknown/internal causes never substitute — a
+    HEAD/branch/workspace preflight stop is preserved, never bypassed.
     """
     failure_class = envelope.failure.failure_class
     # Endpoint independence is enforced against the ATTEMPTED failed
@@ -447,6 +525,25 @@ def validate_replacement_selection(
             ["mechanical_tier_rejected_for_substantive_package"],
             f"replacement {claimed.base_model} is a mechanical-tier model and "
             "the package is substantive; luna-class models are mechanical-only",
+        ),
+        (
+            package_tier is PackageTier.SUBSTANTIVE
+            and claimed.effective_capability is not ReplacementCapability.SUBSTANTIVE,
+            ["candidate_capability_below_package_tier"],
+            f"replacement {claimed.base_model} is marked "
+            f"{claimed.effective_capability.value}-capable at the model level "
+            "and the package is substantive; replacement eligibility is an "
+            "intrinsic model capability, evaluated separately from the package "
+            "tier",
+        ),
+        (
+            package_tier is PackageTier.MECHANICAL
+            and claimed.effective_capability is ReplacementCapability.NONE,
+            ["candidate_capability_not_execution_marked"],
+            f"replacement {claimed.base_model} carries no explicit "
+            "execution-capability marking; a candidate is eligible only if its "
+            "model-level capability is explicitly marked execution-capable for "
+            "the requested work",
         ),
         (
             bool(config.fallback_allowed_base_models)

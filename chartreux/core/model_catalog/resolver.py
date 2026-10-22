@@ -29,6 +29,23 @@ class ModelResolutionError(ValueError):
         self.code = code
 
 
+_RETIRED_ROLE_MESSAGE = (
+    "Unknown model role '@orchestrator': the shipped main preset was renamed "
+    "to '@main' in v0.5.7 and no alias is provided. Update the selection to "
+    "'@main', and rename any [roles.orchestrator] table in models.toml to "
+    "[roles.main]."
+)
+
+
+def _role_error(expression: str, valid_roles: Sequence[str]) -> ModelResolutionError:
+    if expression == "@orchestrator":
+        return ModelResolutionError("retired_role", _RETIRED_ROLE_MESSAGE)
+    options = ", ".join(f"@{name}" for name in valid_roles) or "none"
+    return ModelResolutionError(
+        "unknown_role", f"Unknown model role {expression!r}. Valid roles: {options}"
+    )
+
+
 def supports_thinking(
     provider: ProviderDefinition, deployment: DeploymentDefinition, thinking: str
 ) -> bool:
@@ -140,6 +157,20 @@ class ModelResolver:
             if role.model in eligible
         )
 
+    def canonical_model_map(self) -> dict[str, str]:
+        """Every selectable model reference mapped to its canonical base.
+
+        Route targets (and route-derived recovery facts) name models by
+        preset reference (``@role``), canonical base, or the ``$session``
+        binding; the recovery boundary labels candidates by canonical base
+        model, so preset references canonicalize through this mapping.
+        """
+        mapping = {base: base for base in self.snapshot.catalog.models}
+        mapping.update({
+            f"@{name}": role.model for name, role in self.snapshot.catalog.roles.items()
+        })
+        return mapping
+
     def canonicalize(
         self, expression: str, *, allowed_models: Sequence[str] = ()
     ) -> str:
@@ -185,16 +216,7 @@ class ModelResolver:
         if expression.startswith("@"):
             definition = self.snapshot.catalog.roles.get(expression[1:])
             if definition is None:
-                options = (
-                    ", ".join(
-                        f"@{name}" for name in self.eligible_roles(allowed_models)
-                    )
-                    or "none"
-                )
-                raise ModelResolutionError(
-                    "unknown_role",
-                    f"Unknown model role {expression!r}. Valid roles: {options}",
-                )
+                raise _role_error(expression, self.eligible_roles(allowed_models))
             return (definition.model,)
         return (self.canonicalize(expression, allowed_models=allowed_models),)
 

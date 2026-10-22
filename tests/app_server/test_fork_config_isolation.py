@@ -74,7 +74,7 @@ async def test_derived_runtime_holds_the_shared_session_lease(
     derived = (
         await factory.fork(agent, None)
         if derived_kind == "fork"
-        else await factory.create_child(agent, "worker")
+        else await factory.create_child(agent, "coder")
     )
 
     try:
@@ -103,7 +103,7 @@ async def test_derived_runtime_clones_preconfigured_mcp_registry_before_init(
     derived = (
         await factory.fork(agent, None)
         if derived_kind == "fork"
-        else await factory.create_child(agent, "worker")
+        else await factory.create_child(agent, "coder")
     )
 
     try:

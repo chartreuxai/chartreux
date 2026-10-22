@@ -6,9 +6,6 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
-from chartreux.core.dispatch.lint import lint_catalog
-from chartreux.core.dispatch.presets import SHIPPED_PRESETS
-from chartreux.core.dispatch.schema import DispatchMode, DispatchPolicy
 from chartreux.core.llm.thinking_levels import get_thinking_levels
 from chartreux.core.model_catalog.contracts import (
     ApiStyle,
@@ -105,7 +102,6 @@ class ManagementState:
     canonical_edits: dict[str, dict[str, OptionalEdit[object]]] = field(
         default_factory=dict
     )
-    dispatch_mode: DispatchMode | None = None
     role_presets: dict[str, tuple[str, str]] = field(default_factory=dict)
     pending_by_provider: dict[str, dict[str, PendingModel]] = field(
         default_factory=dict
@@ -599,30 +595,6 @@ class ManagementState:
             entries.append(entry)
         return CatalogChanges(self.provider_id, self._provider_patch(), patches)
 
-    @property
-    def _dispatch(self) -> DispatchPolicy:
-        from chartreux.core.model_catalog.loader import merge_dispatch_overlay
-
-        patch = self._dispatch_patch()
-        return merge_dispatch_overlay(patch) if patch else self.snapshot.dispatch
-
-    def _dispatch_patch(self) -> Mapping[str, object] | None:
-        if self.dispatch_mode is None:
-            return None
-        if self.snapshot.dispatch_diagnostics:
-            # Explicit mode selection is also the repair affordance. Never erase
-            # an invalid table as a side effect of provider/role auto-seeding.
-            return {"mode": self.dispatch_mode.value}
-        if self.dispatch_mode == self.snapshot.dispatch.mode:
-            return None
-        # Writes replace the table. Preserve custom fields, but inherit the new
-        # mode's shipped instructions rather than freezing the previous preset.
-        original = SHIPPED_PRESETS[self.snapshot.dispatch.mode].model_dump(mode="json")
-        current = self.snapshot.dispatch.model_dump(mode="json")
-        patch = {key: value for key, value in current.items() if value != original[key]}
-        patch["mode"] = self.dispatch_mode.value
-        return patch
-
     def _build(self) -> CatalogChanges:
         focused = self.provider_id
         providers: dict[str, Mapping[str, object]] = {}
@@ -656,18 +628,12 @@ class ManagementState:
             models,
             self._role_patches() or None,
             providers,
-            dispatch=self._dispatch_patch(),
         )
 
     @property
     def dirty(self) -> bool:
         changes = self._build()
-        return bool(
-            changes.provider_patches
-            or changes.models
-            or changes.roles
-            or changes.dispatch
-        )
+        return bool(changes.provider_patches or changes.models or changes.roles)
 
     def _usable(
         self,
@@ -787,41 +753,7 @@ class ManagementState:
                 errors.append(f"Canonical name {name} is already occupied.")
         return errors
 
-    def _completion_roles(
-        self, mode: Literal["management", "onboarding"], errors: list[str]
-    ) -> set[str]:
-        if mode != "onboarding":
-            return set(self.catalog.roles)
-        candidate = self.catalog.model_copy(
-            update={
-                "roles": {
-                    role: definition.model_copy(
-                        update={
-                            "model": self.preset(role)[0],
-                            "thinking": self.preset(role)[1],
-                        }
-                    )
-                    for role, definition in self.catalog.roles.items()
-                }
-            }
-        )
-        errors.extend(
-            str(diagnostic)
-            for diagnostic in lint_catalog(self._dispatch, candidate)
-            if diagnostic.severity == "error"
-        )
-        if self.snapshot.dispatch_diagnostics and self.dispatch_mode is None:
-            errors.append(
-                "Dispatch needs repair: Customize and explicitly select a mode, "
-                "or repair the user catalog. "
-                + "; ".join(self.snapshot.dispatch_diagnostics)
-            )
-        return {
-            "orchestrator",
-            *(slot.role.removeprefix("@") for slot in self._dispatch.slots.values()),
-        }
-
-    def validate(  # noqa: PLR0912
+    def validate(
         self,
         active_expression: str | None = None,
         *,
@@ -854,15 +786,7 @@ class ManagementState:
         unresolved: list[str] = []
         unusable: list[str] = []
         if completion:
-            required_roles = self._completion_roles(mode, errors)
-            for role in (
-                *[role for role in self.catalog.roles if role in required_roles],
-                *sorted(required_roles - self.catalog.roles.keys()),
-            ):
-                if role not in self.catalog.roles:
-                    unresolved.append(role)
-                    errors.append(f"Dispatch role @{role}: configure the missing role.")
-                    continue
+            for role in self.catalog.roles:
                 model, thinking = self.preset(role)
                 if model not in self.catalog.models and model not in changes.models:
                     unresolved.append(role)

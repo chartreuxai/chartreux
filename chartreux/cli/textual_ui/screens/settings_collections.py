@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 from textual.widgets import OptionList
 from textual.widgets.selection_list import Selection
 
 from chartreux.app_server.protocol import SettingDescriptorWire
+from chartreux.app_server.protocol.config import TASK_IDENTITY_DENYLIST_PATH
 from chartreux.cli.textual_ui.widgets.settings_lists import (
     SettingsChecklist,
     SettingsOptionList,
@@ -19,6 +20,21 @@ from chartreux.cli.textual_ui.widgets.settings_lists import (
 
 if TYPE_CHECKING:
     from chartreux.cli.textual_ui.screens.settings import SettingsScreen
+
+InventoryCategory = Literal["tools", "skills", "identities"]
+_ListCategory = Literal["tools", "skills", "agents"]
+
+
+def _list_state_category(category: InventoryCategory) -> _ListCategory:
+    """The identity roster's denylist state uses the tools-shaped matcher.
+
+    A denylist-only list behaves exactly like the tools inventory with an
+    always-empty allow list: effective is ``not denied`` and pattern entries
+    come from the single denylist side.
+    """
+    if category == "identities":
+        return "tools"
+    return cast(_ListCategory, category)
 
 
 class SettingsCollectionsController:
@@ -129,6 +145,16 @@ class SettingsCollectionsController:
             self.collapse(restore_opener=False)
 
     def inventory_values(self, category: str) -> tuple[list[str], list[str]]:
+        if category == "identities":
+            field = self._screen.fields.get(TASK_IDENTITY_DENYLIST_PATH)
+            value = field.saved_value if field and field.saved_explicit else None
+            return (
+                [],
+                [entry for entry in value if isinstance(entry, str)]
+                if isinstance(value, list)
+                else [],
+            )
+
         def values(path: str) -> list[str]:
             field = self._screen.fields.get(path)
             value = field.saved_value if field and field.saved_explicit else None
@@ -151,17 +177,13 @@ class SettingsCollectionsController:
             name,
             _draft_values(draft["enabled"]),
             _draft_values(draft["disabled"]),
-            category=item.inventory or "tools",
+            category=_list_state_category(item.inventory or "tools"),
         )
 
-    def pattern_driven(
-        self, category: Literal["tools", "skills", "agents"], name: str
-    ) -> bool:
+    def pattern_driven(self, category: InventoryCategory, name: str) -> bool:
         return self.inventory_item_state(name)[1]
 
-    def effective_inventory_item(
-        self, category: Literal["tools", "skills", "agents"], name: str
-    ) -> bool:
+    def effective_inventory_item(self, category: InventoryCategory, name: str) -> bool:
         return self.inventory_item_state(name)[0]
 
     def render_checklist(self, *, highlight: str | None = None) -> None:
@@ -253,7 +275,7 @@ class SettingsCollectionsController:
             _draft_values(draft["enabled"]),
             _draft_values(draft["disabled"]),
             is_enabled=is_enabled,
-            category=category,
+            category=_list_state_category(category),
         )
         draft["enabled"] = self.reconcile_draft(draft["enabled"], enabled)
         draft["disabled"] = self.reconcile_draft(draft["disabled"], disabled)
@@ -282,6 +304,13 @@ class SettingsCollectionsController:
             return
         category = item.inventory or "tools"
         saved_enabled, saved_disabled = self.inventory_values(category)
+        if category == "identities":
+            denylist = _draft_values(draft["disabled"])
+            if denylist != saved_disabled:
+                self._screen._start_write(item, {TASK_IDENTITY_DENYLIST_PATH: denylist})
+            else:
+                self.collapse(restore_opener=False)
+            return
         changes = {
             f"{side}_{category}": _draft_values(draft[side])
             for side, saved in (

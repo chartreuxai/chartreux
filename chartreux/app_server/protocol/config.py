@@ -14,6 +14,7 @@ from chartreux.app_server.protocol.common import NonNegativeStrictInt
 from chartreux.app_server.protocol.runtime import RuntimeMutationResponse
 from chartreux.core.config.settings_catalog import (
     STATUS_LINE_PATHS as STATUS_LINE_PATHS,
+    TASK_IDENTITY_DENYLIST_PATH as TASK_IDENTITY_DENYLIST_PATH,
     validate_setting_value,
 )
 
@@ -125,6 +126,9 @@ class WebSearchSettingsWire(ProtocolModel):
     default_credential_env_vars: dict[str, str | None] = Field(default_factory=dict)
 
 
+type InventoryCategory = Literal["tools", "skills", "identities"]
+
+
 class SettingDescriptorWire(ProtocolModel):
     path: str
     label: str
@@ -137,7 +141,7 @@ class SettingDescriptorWire(ProtocolModel):
         Literal["checklist", "toggle_inventory", "status_line", "shell_permissions"]
         | None
     ) = None
-    inventory: Literal["tools", "skills", "agents"] | None = None
+    inventory: InventoryCategory | None = None
     minimum: int | float | None = None
     exclusive_minimum: bool = False
     empty: str = "Empty text is a saved value; use Remove User Override for Not Set."
@@ -170,12 +174,10 @@ class SettingsReadResponse(ProtocolModel):
     web_search: WebSearchSettingsWire | None = None
     catalog: list[SettingDescriptorWire] = Field(default_factory=list)
     backing_settings: dict[str, SettingDescriptorWire] = Field(default_factory=dict)
-    inventories: dict[Literal["tools", "skills", "agents"], list[str]] = Field(
-        default_factory=dict
+    inventories: dict[InventoryCategory, list[str]] = Field(default_factory=dict)
+    inventory_states: dict[InventoryCategory, dict[str, InventoryItemStateWire]] = (
+        Field(default_factory=dict)
     )
-    inventory_states: dict[
-        Literal["tools", "skills", "agents"], dict[str, InventoryItemStateWire]
-    ] = Field(default_factory=dict)
     user_layer: str | None = None
     user_revision: str | None = None
 

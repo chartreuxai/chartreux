@@ -9,6 +9,7 @@ from textual.widgets import OptionList
 from textual.widgets.option_list import Option
 
 from chartreux.app_server.protocol import STATUS_LINE_PATHS, SettingDescriptorWire
+from chartreux.app_server.protocol.config import TASK_IDENTITY_DENYLIST_PATH
 from chartreux.cli.textual_ui.widgets.settings_lists import (
     SettingsChecklist,
     SettingsOptionList,
@@ -146,9 +147,12 @@ class SettingsConfirmationController:
             self._screen._start_write(item, value)
         elif kind == "reset":
             category = item.inventory or "tools"
-            self._screen._start_write(
-                item, {f"enabled_{category}": None, f"disabled_{category}": None}
+            changes = (
+                {TASK_IDENTITY_DENYLIST_PATH: None}
+                if category == "identities"
+                else {f"enabled_{category}": None, f"disabled_{category}": None}
             )
+            self._screen._start_write(item, changes)
         else:
             self._screen._start_write(item, {item.path: value})
 
@@ -175,11 +179,16 @@ class SettingsConfirmationController:
                 )
                 if target is None:
                     return
+                source = (
+                    "the task identity denylist"
+                    if item.inventory == "identities"
+                    else f"{side}_{item.inventory}"
+                )
                 self.open_confirmation(
                     "pattern",
                     item,
                     (side, int(index)),
-                    f"Delete pattern {target} from {side}_{item.inventory}? Cancel preserves the pattern and current draft.",
+                    f"Delete pattern {target} from {source}? Cancel preserves the pattern and current draft.",
                     "Delete pattern",
                 )
             return
@@ -269,7 +278,9 @@ class SettingsConfirmationController:
                 "reset",
                 item,
                 None,
-                f"Reset {item.label}? Clears enabled and disabled {item.inventory} lists. Cancel preserves both saved lists and the current draft.",
+                f"Reset {item.label}? Clears the task identity denylist. Cancel preserves the saved denylist and the current draft."
+                if item.inventory == "identities"
+                else f"Reset {item.label}? Clears enabled and disabled {item.inventory} lists. Cancel preserves both saved lists and the current draft.",
                 "Reset lists",
             )
             self._confirmation_return_focus = opener

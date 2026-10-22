@@ -12,6 +12,7 @@ from acp.schema import (
 import pytest
 
 from chartreux.acp.agent import ChartreuxAcpAgent
+from chartreux.acp.commands.registry import AcpCommandRegistry
 from chartreux.acp.exceptions import COMPACTION_FAILED, CompactionError
 from chartreux.app_server.protocol import (
     AppServerResponseError,
@@ -112,6 +113,20 @@ async def test_reload_failure_is_reported_as_a_command_reply(
 
     assert response.stop_reason == "end_turn"
     assert _texts(acp_agent_loop)[-1] == "Failed to reload config: invalid config"
+
+
+def test_reload_command_description_matches_the_frozen_lifecycle() -> None:
+    # EF8 (final release review): the ACP registry ships the same
+    # frozen-lifecycle /reload description as the CLI registry — the
+    # refreshable sections are AGENTS.md, skills, and catalogs; frozen
+    # policy stays bound and edits are reported as pending (design §10).
+    command = AcpCommandRegistry().get("reload")
+
+    assert command is not None
+    assert command.description == (
+        "Refresh AGENTS.md, skills, and catalogs; frozen policy "
+        "stays bound, edits reported as pending"
+    )
 
 
 @pytest.mark.asyncio

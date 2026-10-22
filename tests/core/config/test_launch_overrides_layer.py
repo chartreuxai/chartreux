@@ -2,30 +2,24 @@ from __future__ import annotations
 
 import pytest
 
-from chartreux.core.agents.registry import (
-    apply_launch_overrides,
-    apply_profile_overrides,
-)
+from chartreux.core.agents.registry import apply_launch_overrides
 from chartreux.core.config.builder import ConfigBuilder
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
-from chartreux.core.config.layers.agent_profile import AgentProfileLayer
 from chartreux.core.config.layers.launch_overrides import LaunchOverridesLayer
 from chartreux.core.config.layers.overrides import OverridesLayer
 from tests.conftest import build_test_vibe_config
 from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
 
 
-def test_launch_layer_follows_profile_and_runtime_overrides() -> None:
+def test_launch_layer_follows_runtime_overrides() -> None:
     orchestrator = FakeConfigOrchestrator(
         build_test_vibe_config(enabled_tools=["parent"])
     )
-    apply_profile_overrides(orchestrator, {"enabled_tools": ["profile"]})
-    orchestrator.insert_layer(OverridesLayer(data={"enabled_tools": ["runtime"]}), 1)
+    orchestrator.insert_layer(OverridesLayer(data={"enabled_tools": ["runtime"]}), 0)
 
     apply_launch_overrides(orchestrator, {"enabled_tools": ["launch"]})
 
     assert [type(layer) for layer in orchestrator.layers] == [
-        AgentProfileLayer,
         OverridesLayer,
         LaunchOverridesLayer,
     ]

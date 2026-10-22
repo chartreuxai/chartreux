@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.skills.builtins import BUILTIN_SKILLS
+from chartreux.core.skills.compatibility import SHIPPED_SKILL_WORKFLOW_CLASS
 from chartreux.core.skills.manager import SHIPPED_SKILLS_DIR, SkillManager
 from chartreux.core.skills.models import SkillSource
 from chartreux.core.trusted_folders import trusted_folders_manager
@@ -16,6 +17,19 @@ from tests.conftest import build_test_vibe_config
 from tests.skills.conftest import create_skill
 
 SHIPPED_SKILL_COUNT = len(list(SHIPPED_SKILLS_DIR.glob("*/SKILL.md")))
+# The default test configuration selects the minimal workflow: the shipped
+# skills withheld by the workflow-compatibility rule (design §5) are not
+# exposed, so available_skills counts only the eligible (identity-neutral)
+# shipped skills. Discovery is NOT pruned: settings_inventory still lists all.
+CEREMONY_BEARING_SHIPPED_SKILLS = sorted(SHIPPED_SKILL_WORKFLOW_CLASS)
+ELIGIBLE_SHIPPED_SKILL_COUNT = SHIPPED_SKILL_COUNT - len(
+    CEREMONY_BEARING_SHIPPED_SKILLS
+)
+
+
+def ceremony_config(**kwargs: Any) -> ChartreuxConfigSchema:
+    """A test config whose conversation runs the ceremony workflow."""
+    return build_test_vibe_config(agent={"workflow": "ceremony"}, **kwargs)
 
 
 @pytest.fixture
@@ -32,9 +46,19 @@ class TestSkillManagerDiscovery:
     def test_discovers_no_skills_when_directory_empty(
         self, skill_manager: SkillManager
     ) -> None:
+        shipped_names = {
+            path.parent.name for path in SHIPPED_SKILLS_DIR.glob("*/SKILL.md")
+        }
+        # Discovery is not pruned: the inventory still lists every shipped
+        # skill, including the ceremony-bearing ones the minimal workflow
+        # withholds from exposure (design §5).
+        assert set(skill_manager.settings_inventory) == (
+            set(BUILTIN_SKILLS) | shipped_names
+        )
+        # Exposure/loading is filtered: the minimal default exposes only the
+        # identity-neutral shipped skills.
         assert set(skill_manager.available_skills) == (
-            set(BUILTIN_SKILLS)
-            | {path.parent.name for path in SHIPPED_SKILLS_DIR.glob("*/SKILL.md")}
+            set(BUILTIN_SKILLS) | shipped_names - set(CEREMONY_BEARING_SHIPPED_SKILLS)
         )
 
     def test_discovers_skill_from_skill_paths(self, skills_dir: Path) -> None:
@@ -56,7 +80,7 @@ class TestSkillManagerDiscovery:
 
         assert (
             len(manager.available_skills)
-            == 3 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
+            == 3 + len(BUILTIN_SKILLS) + ELIGIBLE_SHIPPED_SKILL_COUNT
         )
         assert "skill-one" in manager.available_skills
         assert "skill-two" in manager.available_skills
@@ -75,7 +99,7 @@ class TestSkillManagerDiscovery:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 1 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
+        assert len(skills) == 1 + len(BUILTIN_SKILLS) + ELIGIBLE_SHIPPED_SKILL_COUNT
         assert "valid-skill" in skills
         assert "not-a-skill" not in skills
 
@@ -90,7 +114,7 @@ class TestSkillManagerDiscovery:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 1 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
+        assert len(skills) == 1 + len(BUILTIN_SKILLS) + ELIGIBLE_SHIPPED_SKILL_COUNT
         assert "valid-skill" in skills
 
 
@@ -142,7 +166,7 @@ class TestSkillManagerParsing:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 1 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
+        assert len(skills) == 1 + len(BUILTIN_SKILLS) + ELIGIBLE_SHIPPED_SKILL_COUNT
         assert "valid-skill" in skills
         assert "invalid-skill" not in skills
 
@@ -159,7 +183,7 @@ class TestSkillManagerParsing:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 1 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
+        assert len(skills) == 1 + len(BUILTIN_SKILLS) + ELIGIBLE_SHIPPED_SKILL_COUNT
         assert "valid-skill" in skills
 
 
@@ -213,7 +237,7 @@ class TestSkillManagerSearchPaths:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 2 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
+        assert len(skills) == 2 + len(BUILTIN_SKILLS) + ELIGIBLE_SHIPPED_SKILL_COUNT
         assert skills["vibe-only"].description == "From .chartreux"
         assert skills["agents-only"].description == "From .agents"
 
@@ -232,7 +256,7 @@ class TestSkillManagerSearchPaths:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 1 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
+        assert len(skills) == 1 + len(BUILTIN_SKILLS) + ELIGIBLE_SHIPPED_SKILL_COUNT
         assert skills["shared-skill"].description == "First from .chartreux"
 
     def test_discovers_from_multiple_skill_paths(self, tmp_path: Path) -> None:
@@ -249,7 +273,7 @@ class TestSkillManagerSearchPaths:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 2 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
+        assert len(skills) == 2 + len(BUILTIN_SKILLS) + ELIGIBLE_SHIPPED_SKILL_COUNT
         assert "skill-from-dir1" in skills
         assert "skill-from-dir2" in skills
 
@@ -267,7 +291,7 @@ class TestSkillManagerSearchPaths:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 1 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
+        assert len(skills) == 1 + len(BUILTIN_SKILLS) + ELIGIBLE_SHIPPED_SKILL_COUNT
         assert skills["duplicate-skill"].description == "First version"
 
     def test_ignores_nonexistent_skill_paths(self, tmp_path: Path) -> None:
@@ -281,7 +305,7 @@ class TestSkillManagerSearchPaths:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 1 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
+        assert len(skills) == 1 + len(BUILTIN_SKILLS) + ELIGIBLE_SHIPPED_SKILL_COUNT
         assert "valid-skill" in skills
 
 
@@ -380,7 +404,7 @@ class TestSkillManagerFiltering:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 2 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
+        assert len(skills) == 2 + len(BUILTIN_SKILLS) + ELIGIBLE_SHIPPED_SKILL_COUNT
         assert "skill-a" in skills
         assert "skill-b" not in skills
         assert "skill-c" in skills
@@ -491,7 +515,7 @@ class TestSkillUserInvocable:
         manager = SkillManager(lambda: config)
 
         skills = manager.available_skills
-        assert len(skills) == 3 + len(BUILTIN_SKILLS) + SHIPPED_SKILL_COUNT
+        assert len(skills) == 3 + len(BUILTIN_SKILLS) + ELIGIBLE_SHIPPED_SKILL_COUNT
         assert skills["visible-skill"].user_invocable is True
         assert skills["hidden-skill"].user_invocable is False
         assert skills["default-skill"].user_invocable is True
@@ -607,3 +631,125 @@ class TestParseSkillCommandExtras:
         assert parsed.name == "my-skill"
         assert parsed.content == "Do the thing."
         assert parsed.extra_instructions == "fix the bug"
+
+
+class TestWorkflowCompatibility:
+    """The workflow-compatibility rule (design §5) at the manager level.
+
+    The acceptance pins across the three surfaces live in
+    ``test_workflow_compatibility.py``; these are the manager-level units.
+    """
+
+    def test_minimal_workflow_withholds_ceremony_bearing_shipped_skills(
+        self, vibe_config: ChartreuxConfigSchema
+    ) -> None:
+        manager = SkillManager(lambda: vibe_config)
+
+        for name in CEREMONY_BEARING_SHIPPED_SKILLS:
+            assert name not in manager.available_skills
+            assert manager.get_skill(name) is None
+            assert manager.parse_skill_command(f"/{name}") is None
+        # Identity-neutral shipped skills stay exposed under minimal.
+        assert "main-debugging" in manager.available_skills
+        assert "main-git-workflow" in manager.available_skills
+        assert "workspace" in manager.available_skills
+        assert "web-search" in manager.available_skills
+        for name in ("sub-finder", "sub-verifier", "sub-implementor"):
+            assert name in manager.available_skills
+        # Python builtins are identity-neutral.
+        assert "chartreux" in manager.available_skills
+        assert "skill-creator" in manager.available_skills
+
+    def test_ceremony_workflow_exposes_every_shipped_skill(self) -> None:
+        manager = SkillManager(lambda: ceremony_config())
+
+        shipped_names = {
+            path.parent.name for path in SHIPPED_SKILLS_DIR.glob("*/SKILL.md")
+        }
+        assert shipped_names <= set(manager.available_skills)
+        for name in CEREMONY_BEARING_SHIPPED_SKILLS:
+            assert manager.get_skill(name) is not None
+            assert manager.parse_skill_command(f"/{name}") is not None
+
+    def test_discovery_is_not_pruned_and_marks_incompatibilities(
+        self, vibe_config: ChartreuxConfigSchema
+    ) -> None:
+        manager = SkillManager(lambda: vibe_config)
+
+        assert set(CEREMONY_BEARING_SHIPPED_SKILLS) <= set(manager.settings_inventory)
+        assert set(manager.workflow_incompatibilities) == set(
+            CEREMONY_BEARING_SHIPPED_SKILLS
+        )
+        for name in CEREMONY_BEARING_SHIPPED_SKILLS:
+            eligibility = manager.skill_eligibility(name)
+            assert eligibility.eligible is False
+            assert eligibility.requirement is not None
+            assert "ceremony" in eligibility.requirement
+
+    def test_eligibility_reads_frozen_facts_not_pending_selections(
+        self, vibe_config: ChartreuxConfigSchema
+    ) -> None:
+        # The config getter serves whatever config is current; the manager
+        # snapshots the conversation's frozen policy facts once, at bind.
+        served: dict[str, ChartreuxConfigSchema] = {"config": vibe_config}
+        manager = SkillManager(lambda: served["config"])
+        assert manager.policy_facts.workflow == "minimal"
+
+        # A pending saved selection change (one that applies to new
+        # conversations) must not alter the bound conversation's eligibility,
+        # even once the config layer starts serving it.
+        served["config"] = vibe_config.model_copy(
+            update={
+                "agent": vibe_config.agent.model_copy(update={"workflow": "ceremony"})
+            }
+        )
+        assert served["config"].agent.workflow == "ceremony"
+
+        assert "main-design" not in manager.available_skills
+        assert manager.skill_eligibility("main-design").eligible is False
+        assert manager.parse_skill_command("/main-design") is None
+        assert manager.policy_facts.workflow == "minimal"
+
+    def test_explicit_policy_facts_override_the_config(
+        self, vibe_config: ChartreuxConfigSchema
+    ) -> None:
+        from chartreux.core.skills.compatibility import ConversationPolicyFacts
+
+        manager = SkillManager(
+            lambda: vibe_config,
+            policy_facts=ConversationPolicyFacts(identity="coder", workflow="ceremony"),
+        )
+
+        assert "main-design" in manager.available_skills
+        assert manager.incompatibility_diagnostic("main-design") is None
+
+    def test_local_shadow_copy_of_a_ceremony_bearing_name_stays_eligible(
+        self, skills_dir: Path, vibe_config: ChartreuxConfigSchema
+    ) -> None:
+        # Personal shadow copies are the user's own content: the harness
+        # classifies only its shipped copies and never rewrites or filters
+        # them (design §5 mechanism pin).
+        create_skill(skills_dir, "main-design", "My personal design skill")
+        config = build_test_vibe_config(skill_paths=[skills_dir])
+        manager = SkillManager(lambda: config)
+
+        skill = manager.get_skill("main-design")
+        assert skill is not None
+        assert skill.source is SkillSource.LOCAL
+        assert skill.description == "My personal design skill"
+
+    def test_incompatibility_diagnostic_names_the_requirement(
+        self, vibe_config: ChartreuxConfigSchema
+    ) -> None:
+        manager = SkillManager(lambda: vibe_config)
+
+        diagnostic = manager.incompatibility_diagnostic("main-design")
+        assert diagnostic is not None
+        assert "main-design" in diagnostic
+        assert "ceremony" in diagnostic
+        assert "minimal" in diagnostic
+        assert "coder" in diagnostic
+        # Unknown skills keep the plain not-found path (no diagnostic).
+        assert manager.incompatibility_diagnostic("nonexistent-skill") is None
+        # Eligible skills have no diagnostic.
+        assert manager.incompatibility_diagnostic("main-debugging") is None

@@ -3,13 +3,12 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field
 import enum
-import json
 import re
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from chartreux.core.agents.models import BUILTIN_SUBAGENTS
+from chartreux.core.agents.identity_launch import TaskIdentityArgs
 from chartreux.core.events import (
     AssistantEvent,
     BaseEvent,
@@ -51,66 +50,28 @@ def normalize_task_summary(
     return " ".join(value.split())[:240]
 
 
-class TaskArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class TaskArgs(TaskIdentityArgs):
+    """The task tool's argument surface (design §7; package-11b rewiring).
 
-    task: str = Field(description="The task for the agent to perform")
-    task_summary: str | None = Field(
-        default=None,
-        description="Optional short summary of the task for retained-agent status.",
-    )
-    agent_type: str = Field(
-        default="worker",
-        description=(
-            "Agent type: profile name for a new agent instance (default worker). "
-            "To continue a retained instance, use agent_id instead, with background: true."
-        ),
-    )
-    background: bool = Field(
-        default=True,
-        description=(
-            "If true (the default), launch the subagent in the background and "
-            "return a launch acknowledgment with handles instead of blocking "
-            "until completion. Launch in the background even when the result "
-            "is a dependency, then collect it with wait_for_agent; set false "
-            "only when blocking is truly required."
-        ),
-    )
+    The canonical fields (``model``, ``identity``, ``purpose``, ``seat``)
+    and their grammar come from the package-8 schema module. The legacy
+    ``agent_type`` profile bridge is retired with the profile axis (package
+    16a): a call that still supplies it fails with the successor guidance.
+    """
+
     agent_id: str | None = Field(
         default=None,
         description=(
             "Retained agent instance handle to continue with background: true; "
-            "reuse inherits the instance's committed retention policy unless "
-            "retain is passed. If omitted, create a new instance using the "
-            "agent_type profile name."
+            "if omitted, create a new instance selected by the identity field. "
+            "Reuse inherits the instance's committed retention policy unless "
+            "retain is passed."
         ),
-    )
-    replace_run: bool = Field(
-        default=False,
-        description="Stop busy background work before reusing agent_id in the same conversation.",
-    )
-    retain: bool | None = Field(
-        default=None,
-        strict=True,
-        description=(
-            "Retain the agent instance after this run completes so it stays "
-            "resident for reuse with agent_id; by default a background agent "
-            "closes on completion and its result stays retrievable. Precedence "
-            "for a new launch: this argument, then the profile's retain "
-            "setting, then the [subagents].retain_agents default. On reuse, "
-            "omitting retain keeps the instance's committed policy; "
-            "retain=false is a final continuation that closes afterward. "
-            "Only valid for background launches."
-        ),
-    )
-    config: LaunchConfig | None = Field(
-        default=None,
-        description="Optional semantic launch configuration overrides for this child.",
     )
 
     @model_validator(mode="before")
     @classmethod
-    def _omit_null_config(cls, value: Any) -> Any:
+    def _reject_legacy_fields(cls, value: Any) -> Any:
         if not isinstance(value, dict):
             return value
 
@@ -122,27 +83,15 @@ class TaskArgs(BaseModel):
             )
         value = {key: item for key, item in value.items() if key != "fan_out"}
 
-        config = value.get("config")
-        if isinstance(config, str):
-            try:
-                config = json.loads(config)
-            except json.JSONDecodeError as error:
-                raise ValueError("config must be a valid JSON object") from error
-            if config is not None and not isinstance(config, dict):
-                raise ValueError("config JSON must decode to an object")
-
-        if config is None:
-            return {key: item for key, item in value.items() if key != "config"}
-        return {**value, "config": config}
-
-    @model_validator(mode="after")
-    def _reject_instance_handle_as_type(self) -> TaskArgs:
-        if re.fullmatch(r"agent-\d+", self.agent_type):
+        if "agent_type" in value:
             raise ValueError(
-                "agent_type takes a profile name; to continue an existing agent "
-                "instance, pass its handle as agent_id (with background: true)"
+                "agent_type is retired; use the identity field instead (the "
+                "shipped profile names map to identities: worker -> coder, "
+                "advisor -> advisor, reviewer -> reviewer; a custom profile "
+                "name becomes a 'user:<name>' custom identity prompt in the "
+                "user prompts directory)"
             )
-        return self
+        return value
 
     @field_validator("task_summary")
     @classmethod
@@ -183,7 +132,7 @@ class TaskResult(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
         description=(
-            "Human-facing agent name ({profile}-{model}-{number}) for background "
+            "Human-facing agent name ({identity}-{model}-{number}) for background "
             "launches; None for foreground results. Display-only: agent_id "
             "remains the only handle."
         ),
@@ -589,7 +538,6 @@ class AgentEviction:
 @dataclass(slots=True)
 class AgentSummary:
     agent_id: str
-    profile: str
     availability: AgentAvailability
     current_run_id: str | None
     current_run_status: RunStatus | None
@@ -637,11 +585,14 @@ class AgentSummary:
     predecessor_agent_id: str | None = None
     """The failed agent this agent replaced (WP5); None for a fresh agent."""
     name: str = ""
-    """Human-facing ``{profile}-{model}-{number}`` name (design §5).
+    """Human-facing ``{identity}-{model}-{number}`` name (design §5).
 
     The server always populates this when projecting summaries; the empty
     string is the legacy-constructor default for older in-process callers.
     """
+    identity: str | None = None
+    """Canonical identity identifier of the agent's committed launch."""
+    identity_revision: str | None = None
 
 
 _AGENT_HANDLE_PREFIX = "agent-"
@@ -665,39 +616,31 @@ def _agent_sequence_number(agent_id: str) -> str:
 
 def derive_agent_name(
     agent_id: str,
-    profile: str,
-    profile_display_label: str | None,
+    identity: str,
+    identity_display_label: str | None,
     base_model: str | None,
     effective_model: str | None,
 ) -> str:
-    """Derive the human-facing agent name ``{profile}-{model}-{number}`` (design §5).
+    """Derive the human-facing agent name ``{identity}-{model}-{number}`` (design §5).
 
-    The profile segment is the profile name for builtin profiles and the
-    whitespace-collapsed display label for custom profiles, falling back to
-    the profile name when no label was captured at admission. The model
-    segment is the namespace-stripped canonical ``base_model``, falling back
-    to the namespace-stripped ``effective_model``, and is omitted entirely
-    when neither is known. The number is the agent sequence digits of the
-    handle (``agent-15`` ↔ ``...-15``). The helper is stateless: names are
-    derived from accepted task publication state, never persisted.
-
-    The result never parses as a handle (design §5): if it would match the
-    ``agent-\\d+`` handle shape — a custom profile or display label of
-    exactly ``agent`` with no known model yields ``agent-7`` — the profile
-    segment is prefixed to break the shape deterministically.
+    The identity segment is the resolved identity reference, or the display
+    label of a ``user:``-qualified custom identity. The model segment is the
+    namespace-stripped canonical ``base_model``, falling back to the
+    namespace-stripped ``effective_model``, and is omitted when unknown.
     """
-    if profile_display_label is not None and profile not in BUILTIN_SUBAGENTS:
-        profile_segment = "-".join(profile_display_label.split())
-    else:
-        profile_segment = profile
+    name_segment = (
+        "-".join(identity_display_label.split())
+        if identity_display_label is not None and identity.startswith("user:")
+        else identity
+    )
     model = base_model if base_model is not None else effective_model
     number = _agent_sequence_number(agent_id)
     if model is None:
-        name = f"{profile_segment}-{number}"
+        name = f"{name_segment}-{number}"
     else:
-        name = f"{profile_segment}-{_strip_model_namespace(model)}-{number}"
+        name = f"{name_segment}-{_strip_model_namespace(model)}-{number}"
     if _AGENT_HANDLE_PATTERN.fullmatch(name) is not None:
-        name = f"{profile_segment}-{name}"
+        name = f"{name_segment}-{name}"
     return name
 
 
@@ -746,8 +689,8 @@ class AgentBusyError(SubagentManagementError):
     """The agent is busy with another run."""
 
 
-class AgentProfileMismatchError(SubagentManagementError):
-    """The requested profile does not match the retained agent."""
+class AgentIdentityMismatchError(SubagentManagementError):
+    """The requested identity does not match the retained agent."""
 
 
 class AgentResultExpiredError(SubagentManagementError):
@@ -781,20 +724,12 @@ class InvalidLaunchThinkingError(InvalidLaunchConfigError):
     """The selected thinking level is not supported by the model."""
 
 
-class InvalidLaunchPromptError(InvalidLaunchConfigError):
-    """The selected system prompt is unavailable."""
-
-
 class InvalidLaunchToolError(InvalidLaunchConfigError):
     """A launch tool selection or override is invalid."""
 
 
 class ImmutableLaunchPersonaError(InvalidLaunchConfigError):
     """A retained agent's frozen persona was changed."""
-
-
-class MissingAgentProfileError(LaunchConfigError):
-    """The selected launch profile is unavailable."""
 
 
 class UnsupportedChildForkError(LaunchConfigError):

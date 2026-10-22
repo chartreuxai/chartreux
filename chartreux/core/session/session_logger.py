@@ -48,7 +48,6 @@ from chartreux.utils.platform import resolve_git_executable
 from chartreux.utils.session_id import shorten_session_id
 
 if TYPE_CHECKING:
-    from chartreux.core.agents.models import AgentProfile
     from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
     from chartreux.core.tools.manager import ToolManager
 
@@ -530,18 +529,6 @@ class SessionLogger:  # noqa: PLR0904
         payload = json.dumps(SessionLogger._message_record(message), sort_keys=True)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    @staticmethod
-    def _install_dispatch_policy(
-        metadata: SessionMetadata, config: ChartreuxConfigSchema
-    ) -> None:
-        if config.bound_dispatch_policy is not None:
-            metadata.dispatch_policy = config.bound_dispatch_policy.model_dump(
-                mode="json"
-            )
-            metadata.dispatch_policy_notes = list(
-                config.bound_dispatch_policy.diagnostics
-            )
-
     # Keep cancellation draining and error handling in one lock scope.
     async def save_interaction(  # noqa: PLR0915 - one serialized commit boundary
         self,
@@ -549,7 +536,6 @@ class SessionLogger:  # noqa: PLR0904
         stats: AgentStats,
         config: ChartreuxConfigSchema,
         tool_manager: ToolManager,
-        agent_profile: AgentProfile | None,
         *,
         allow_empty: bool = False,
     ) -> None:
@@ -584,7 +570,6 @@ class SessionLogger:  # noqa: PLR0904
                 logger.debug("Discarding stale interaction save for %s", session_dir)
                 return
             session_metadata.config = config_snapshot
-            self._install_dispatch_policy(session_metadata, config)
             launch_config_generation = self._launch_config_generation
             metadata_snapshot = session_metadata.model_copy(deep=True)
             cursor_snapshot = self._transcript_cursor
@@ -595,7 +580,6 @@ class SessionLogger:  # noqa: PLR0904
                     messages_snapshot,
                     stats,
                     tool_manager,
-                    agent_profile,
                     session_dir,
                     metadata_snapshot,
                     allow_empty,
@@ -822,7 +806,6 @@ class SessionLogger:  # noqa: PLR0904
         non_system_messages: list[LLMMessage],
         stats: AgentStats,
         tool_manager: ToolManager,
-        agent_profile: AgentProfile | None,
         session_metadata: SessionMetadata,
     ) -> dict[str, Any]:
         tools_available = [
@@ -846,11 +829,6 @@ class SessionLogger:  # noqa: PLR0904
             "total_messages": len(non_system_messages),
             "last_message_fingerprint": last_message_fingerprint,
             "tools_available": tools_available,
-            "agent_profile": (
-                {"name": agent_profile.name, "overrides": agent_profile.overrides}
-                if agent_profile is not None
-                else None
-            ),
             "system_prompt": system_prompt,
         }
         if session_metadata.launch_config is not None:
@@ -864,7 +842,6 @@ class SessionLogger:  # noqa: PLR0904
         messages: list[LLMMessage],
         stats: AgentStats,
         tool_manager: ToolManager,
-        agent_profile: AgentProfile | None,
         session_dir: Path,
         session_metadata: SessionMetadata,
         allow_empty: bool,
@@ -887,7 +864,6 @@ class SessionLogger:  # noqa: PLR0904
                 messages,
                 stats,
                 tool_manager,
-                agent_profile,
                 session_dir,
                 session_metadata,
                 launch_config_dirty,
@@ -909,7 +885,6 @@ class SessionLogger:  # noqa: PLR0904
                 messages,
                 stats,
                 tool_manager,
-                agent_profile,
                 session_dir,
                 session_metadata,
                 launch_config_dirty,
@@ -928,7 +903,6 @@ class SessionLogger:  # noqa: PLR0904
                     messages,
                     stats,
                     tool_manager,
-                    agent_profile,
                     session_dir,
                     session_metadata,
                     launch_config_dirty,
@@ -952,12 +926,7 @@ class SessionLogger:  # noqa: PLR0904
 
             if tail or not (cursor.metadata_published and not launch_config_dirty):
                 metadata_dump = self._interaction_metadata_dump(
-                    messages,
-                    non_system_messages,
-                    stats,
-                    tool_manager,
-                    agent_profile,
-                    session_metadata,
+                    messages, non_system_messages, stats, tool_manager, session_metadata
                 )
                 SessionLogger._persist_metadata_sync(metadata_dump, session_dir)
                 updated_cursor = _TranscriptCursor(
@@ -987,7 +956,6 @@ class SessionLogger:  # noqa: PLR0904
         messages: list[LLMMessage],
         stats: AgentStats,
         tool_manager: ToolManager,
-        agent_profile: AgentProfile | None,
         session_dir: Path,
         session_metadata: SessionMetadata,
         launch_config_dirty: bool,
@@ -1069,12 +1037,7 @@ class SessionLogger:  # noqa: PLR0904
                 SessionLogger._overwrite_messages_sync(current_data, session_dir)
 
             metadata_dump = self._interaction_metadata_dump(
-                messages,
-                non_system_messages,
-                stats,
-                tool_manager,
-                agent_profile,
-                session_metadata,
+                messages, non_system_messages, stats, tool_manager, session_metadata
             )
             SessionLogger._persist_metadata_sync(metadata_dump, session_dir)
         except SessionDiskFullError:

@@ -726,7 +726,7 @@ def _write_fake_config(home: Path, api_base: str, *, session_dir: Path) -> None:
             'provider = "installed-fake"',
             'name = "installed-fake-model"',
             "",
-            "[roles.orchestrator]",
+            "[roles.main]",
             'model = "installed-fake-model"',
             'thinking = "off"',
         ])
@@ -736,7 +736,7 @@ def _write_fake_config(home: Path, api_base: str, *, session_dir: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_fake_config_resolves_orchestrator_preset(tmp_path: Path) -> None:
+async def test_fake_config_resolves_main_preset(tmp_path: Path) -> None:
     home = tmp_path / "home"
     session_dir = tmp_path / "sessions"
     api_base = "http://127.0.0.1:12345/v1"

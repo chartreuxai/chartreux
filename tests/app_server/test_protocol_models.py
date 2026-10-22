@@ -1184,7 +1184,7 @@ def test_agents_update_carries_retention_metadata() -> None:
         agents=[
             AgentSummaryModel(
                 agent_id="agent-1",
-                profile="worker",
+                identity="coder",
                 name="worker-base-1",
                 availability="evicted",
                 initial_task_summary="Initial task",
@@ -1211,9 +1211,9 @@ def test_agents_update_carries_retention_metadata() -> None:
 
     assert update.model_dump(mode="json")["agents"][0] == {
         "agentId": "agent-1",
-        "profile": "worker",
+        "identity": "coder",
         "name": "worker-base-1",
-        "slotPurposes": [],
+        "launchPurposes": [],
         "availability": "evicted",
         "currentRunId": None,
         "currentRunStatus": None,
@@ -1248,12 +1248,7 @@ def test_agents_update_carries_retention_metadata() -> None:
 
 
 def test_agent_context_contract_accepts_older_wire_payloads() -> None:
-    old = {
-        "agentId": "child",
-        "profile": "worker",
-        "name": "worker-child",
-        "availability": "idle",
-    }
+    old = {"agentId": "child", "name": "worker-child", "availability": "idle"}
     summary = validate_wire(AgentSummaryModel, old)
     assert summary.context_tokens is None and summary.context_window is None
     assert summary.compacting is False and summary.stop_reason is None
@@ -1269,6 +1264,10 @@ def test_agent_context_contract_accepts_older_wire_payloads() -> None:
     assert {key: dump[key] for key in current} == current
     # WP1: legacy wire payloads without lastFailure still validate.
     assert summary.last_failure is None
+    # The retired profile field is not part of the wire contract: a legacy
+    # payload carrying it is rejected, never silently consumed (16a).
+    with pytest.raises(ValidationError):
+        validate_wire(AgentSummaryModel, old | {"profile": "worker"})
 
 
 def test_agents_update_carries_last_failure_envelope() -> None:
@@ -1297,7 +1296,7 @@ def test_agents_update_carries_last_failure_envelope() -> None:
         agents=[
             AgentSummaryModel(
                 agent_id="agent-1",
-                profile="worker",
+                identity="coder",
                 name="worker-base-1",
                 availability="idle",
                 last_failure=wire_envelope,
@@ -1510,16 +1509,16 @@ def test_run_stop_reason_contract(reason: str) -> None:
     assert PublicTurnStopReason(reason).value == reason
     core = AgentSummary(
         "child",
-        "worker",
         AgentAvailability.IDLE,
         "run",
         RunStatus.COMPLETED,
         stop_reason=CoreRunStopReason(reason),
         name="worker-child",
+        identity="coder",
     )
     wire = AgentSummaryModel(
         agent_id=core.agent_id,
-        profile=core.profile,
+        identity=core.identity,
         name=core.name,
         availability=core.availability.value,
         stop_reason=RunStopReason(core.stop_reason),
@@ -1531,12 +1530,7 @@ def test_run_stop_reason_contract(reason: str) -> None:
     with pytest.raises(ValidationError):
         validate_wire(
             AgentSummaryModel,
-            {
-                "agentId": "child",
-                "profile": "worker",
-                "availability": "idle",
-                "stopReason": "guess",
-            },
+            {"agentId": "child", "availability": "idle", "stopReason": "guess"},
         )
 
 

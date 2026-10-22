@@ -12,8 +12,9 @@ from chartreux.core.config.schema import ConfigSchema
 CATALOG_DEFINITION_FIELDS = frozenset({"models", "providers"})
 DISPATCH_AUTHORITY_FIELDS = frozenset({"dispatch"})
 DISPATCH_AUTHORITY_MESSAGE = (
-    "Dispatch policy tables are only supported in the user models.toml catalog "
-    "overlay; remove [dispatch] from this source."
+    "The [dispatch] table is retired and no source may carry it: delegated "
+    "routing is configured through [orchestration.routes.<purpose>] in "
+    "config.toml. Remove [dispatch] from this source."
 )
 
 

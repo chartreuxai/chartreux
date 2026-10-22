@@ -203,11 +203,11 @@ async def select_option(
     raise AssertionError(f"Option {option_id!r} was not reachable.")
 
 
-async def set_orchestrator_preset(
+async def set_main_preset(
     pilot, screen: ProviderWorkbenchScreen, model: str, thinking: str = "off"
 ) -> None:  # type: ignore[no-untyped-def]
     presets = screen.query_one("#wb-presets", WorkbenchList)
-    await select_option(pilot, presets, "preset:orchestrator")
+    await select_option(pilot, presets, "preset:main")
     editor = screen.query_one("#wb-preset-editor", WorkbenchList)
     await select_option(pilot, editor, "model")
     await select_option(pilot, screen.query_one("#wb-picker", WorkbenchList), model)
@@ -252,10 +252,10 @@ async def test_unknown_model_adopted_on_disk_through_real_orchestrator(
     try:
         async with Host(screen).run_test() as pilot:
             await add_provider(pilot, screen, "unknown")
-            await set_orchestrator_preset(pilot, screen, "unknown-wire")
+            await set_main_preset(pilot, screen, "unknown-wire")
         assert "unknown-wire" in load_catalog(config_dir / "models.toml").catalog.models
         assert (
-            load_catalog(config_dir / "models.toml").catalog.roles["orchestrator"].model
+            load_catalog(config_dir / "models.toml").catalog.roles["main"].model
             == "unknown-wire"
         )
         assert loop.config.get_active_model().provider == "unknown"
@@ -273,10 +273,10 @@ async def test_two_provider_models_are_available_to_default_preset(
         await add_provider(pilot, screen, "first")
         assert "first-wire" in load_catalog(config_dir / "models.toml").catalog.models
         await add_provider(pilot, screen, "second")
-        await set_orchestrator_preset(pilot, screen, "second-wire")
+        await set_main_preset(pilot, screen, "second-wire")
     catalog = load_catalog(config_dir / "models.toml").catalog
     assert {"first", "second"} <= catalog.providers.keys()
-    assert catalog.roles["orchestrator"].model == "second-wire"
+    assert catalog.roles["main"].model == "second-wire"
 
 
 @pytest.mark.asyncio
@@ -354,7 +354,7 @@ async def test_providers_host_completion_preserves_transcript_and_agent_state(
         assert isinstance(screen, ProviderWorkbenchScreen)
         screen.config = Services(config_dir, orchestrator)
         await add_provider(pilot, screen, "host-provider")
-        await set_orchestrator_preset(pilot, screen, "host-provider-wire")
+        await set_main_preset(pilot, screen, "host-provider-wire")
         screen._finish()
         await wait_for(pilot, lambda: app.screen is not screen)
         assert (

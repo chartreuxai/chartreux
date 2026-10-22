@@ -8,7 +8,7 @@ concern clusters share — ``temp_session_dir`` (the dependency closure of
 ``session_config`` (80 tests request it, spanning the initialization,
 metadata, title, save, generation-fence and cursor clusters),
 ``disabled_session_config`` (8 users across the initialization, title and
-save clusters), ``mock_agent_profile`` (40 users), ``mock_tool_manager``
+save clusters), ``mock_tool_manager``
 (43 users) and ``mock_vibe_config`` (35 users, each spanning the metadata,
 save, title, cursor and generation-fence clusters). The remaining
 module-level surface is single-concern and stays in
@@ -30,7 +30,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from chartreux.core.agents.models import AgentProfile, AgentSafety
 from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
 from chartreux.core.tools.manager import ToolManager
 from tests.conftest import build_test_vibe_config
@@ -57,18 +56,6 @@ def disabled_session_config() -> SessionLoggingConfig:
     """Create a disabled session logging config for testing."""
     return SessionLoggingConfig(
         save_dir="/tmp/test", session_prefix="test", enabled=False
-    )
-
-
-@pytest.fixture
-def mock_agent_profile() -> AgentProfile:
-    """Create a mock agent profile for testing."""
-    return AgentProfile(
-        name="test-agent",
-        display_name="Test Agent",
-        description="A test agent",
-        safety=AgentSafety.NEUTRAL,
-        overrides={},
     )
 
 

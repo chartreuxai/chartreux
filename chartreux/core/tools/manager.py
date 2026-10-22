@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 import hashlib
 import importlib.util
 import inspect
@@ -10,7 +10,9 @@ import re
 import sys
 import threading
 from typing import TYPE_CHECKING, Any, TypeGuard
+import weakref
 
+from chartreux.core.agents.identities import ToolPosture, get_builtin_identity
 from chartreux.core.config.harness_files import (
     HarnessFilesManager,
     get_harness_files_manager,
@@ -26,7 +28,19 @@ from chartreux.core.dispatch.renderer import (
 )
 from chartreux.core.llm_models import AvailableFunction
 from chartreux.core.paths import DEFAULT_TOOL_DIR
-from chartreux.core.tools.base import BaseTool, BaseToolConfig, ToolPermission
+from chartreux.core.tools.base import (
+    BaseTool,
+    BaseToolConfig,
+    ToolPermission,
+    registry_provenance_classification,
+)
+from chartreux.core.tools.classification import (
+    ToolClass,
+    _stamp_registry_builtin,
+    classification_revision,
+    classify_tool,
+    copy_registry_builtin_stamps,
+)
 from chartreux.core.tools.remote import MCPTool
 from chartreux.core.tools.utils import PathAuthority
 from chartreux.core.utils import name_matches, run_sync
@@ -90,14 +104,42 @@ class NoSuchToolError(Exception):
     """Exception raised when a tool is not found."""
 
 
-class ToolManager:
+_POSTURE_CLASSES: dict[ToolPosture, frozenset[ToolClass]] = {
+    ToolPosture.ALL_GRANTED: frozenset(ToolClass),
+    # Control-plane tools (task, agent lifecycle, user questions) ride with a
+    # read-only posture: they coordinate work without granting write authority,
+    # so an orchestrator can delegate without gaining direct write access.
+    ToolPosture.NON_MUTATING: frozenset({
+        ToolClass.NON_MUTATING,
+        ToolClass.CONTROL_PLANE,
+    }),
+}
+
+
+def posture_allows_class(posture: ToolPosture, tool_class: ToolClass) -> bool:
+    """Whether a posture selector admits a reviewed tool class."""
+    return tool_class in _POSTURE_CLASSES[posture]
+
+
+def posture_allows_name(posture: ToolPosture, tool_name: str) -> bool:
+    """Admission-level posture check by reviewed classification.
+
+    The central table is name-keyed, so an unknown name fails closed as
+    MUTATING. The authoritative check is the manager's registry-provenance
+    classification (``get_authority_classification``); this guard exists so
+    launch admission rejects loosening attempts before construction.
+    """
+    return posture_allows_class(posture, classify_tool(tool_name, builtin=True))
+
+
+class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full method budget
     """Manages tool discovery and instantiation for an Agent.
 
     Discovers available tools from the provided search paths. Each Agent
     should have its own ToolManager instance.
     """
 
-    def __init__(  # noqa: PLR0913 - runtime-owned dependency injection
+    def __init__(  # noqa: PLR0913, PLR0915 - runtime-owned dependency injection
         self,
         config_getter: Callable[[], ChartreuxConfigSchema],
         mcp_registry: MCPRegistry | None = None,
@@ -119,8 +161,16 @@ class ToolManager:
         session_root_grants: object | None = None,
         dangerous_command_authority_provider: DangerousCommandAuthorityProvider
         | None = None,
+        bound_identity: str | None = None,
     ) -> None:
         self._config_getter = config_getter
+        # The conversation's identity binding (design §3, decision log item 3):
+        # when the owning loop supplies its construction-time binding, posture
+        # derives from the bound identity — never from a later live config
+        # change. A reload or in-place edit that changes [agent] identity is a
+        # pending selection for new conversations, not a mid-conversation
+        # re-posture of an existing manager or child.
+        self._bound_identity = bound_identity
         self._cwd = (cwd or Path.cwd()).resolve()
         self._harness_files = harness_files or get_harness_files_manager()
         self._scratchpad_dir = scratchpad_dir
@@ -152,9 +202,34 @@ class ToolManager:
         self._selection_cache: dict[
             str, tuple[tuple[object, ...], type[BaseTool] | None]
         ] = {}
+        # Keyed by name for this manager's own delegation enumeration, or by
+        # (name, id(implementation)) when the decision carries a descendant's
+        # exact implementation through the ancestor chain; the entry's third
+        # element verifies that implementation by identity (weak reference),
+        # so a warm decision is never served for a different implementation
+        # (S2 round 3: the ancestor chain re-resolves by name).
+        self._delegation_selection_cache: dict[
+            str | tuple[str, int],
+            tuple[
+                tuple[object, ...],
+                type[BaseTool] | None,
+                weakref.ref[type[BaseTool]] | None,
+            ],
+        ] = {}
         self._workspace_cache: tuple[tuple[object, ...], Workspace] | None = None
         self._mcp_registry = mcp_registry
         self._instances: dict[str, BaseTool] = {}
+        # Keyed by (name, caller implementation), mirroring the delegation
+        # selection cache's carried-implementation keying: the instance's
+        # liveness closure classifies the EXACT implementation the caller
+        # runs, so a warm instance built for one caller's class is never
+        # served for another's (S2 final warning; package 3b amendment —
+        # the flip corner: without the class key, an admitted second
+        # caller's invocation reused the first caller's stale baked-class
+        # instance and failed closed).
+        self._delegated_instances: dict[
+            tuple[str, type[BaseTool] | None], BaseTool
+        ] = {}
         self._authority_retired = False
         self._search_paths: list[Path] = self._compute_search_paths(self._config)
         self._lock = threading.Lock()
@@ -185,6 +260,16 @@ class ToolManager:
                 self._all_tools = dict(discovery_source._all_tools)
                 self._tool_descriptions = dict(discovery_source._tool_descriptions)
                 self._mcp_integrated = discovery_source._mcp_integrated
+                # The provenance side table is keyed by the exact class, so the
+                # reused classes already carry their registry-conferred stamps;
+                # the copy re-asserts them alongside _tool_variants_by_name so
+                # the reuse path never depends on when the source's discovery
+                # ran (S2 round 2: forgeable provenance stamp).
+                copy_registry_builtin_stamps(
+                    tool_class
+                    for variants in self._tool_variants_by_name.values()
+                    for tool_class in variants
+                )
         else:
             for tool_class, is_custom in self._iter_tool_classes_with_origin(
                 self._search_paths
@@ -224,6 +309,18 @@ class ToolManager:
                 self._config_getter(), skeleton
             )
         self._tool_descriptions["task"] = task_description
+
+    def _bind_identity(self, identity: str) -> None:
+        """Rebind the conversation's identity binding (design §3, decision 3).
+
+        The owning loop calls this in the SAME transaction that rebinds its
+        own identity (a clear or an in-place resume), so effective tool
+        authority always matches the loop's current identity — a rebound
+        conversation never keeps the previous identity's posture. The
+        authority token carries the bound identity, so the rebind
+        invalidates every token-keyed cache.
+        """
+        self._bound_identity = identity
 
     def set_mcp_registry(self, mcp_registry: MCPRegistry | None) -> None:
         self._mcp_registry = mcp_registry
@@ -389,6 +486,18 @@ class ToolManager:
         self._tool_variants_by_name.setdefault(name, []).append(tool_class)
         self._custom_tool_variants_by_name.setdefault(name, []).append(is_custom)
         self._all_tools[name] = tool_class
+        if not is_custom and tool_class.__module__.startswith(
+            "chartreux.core.tools.builtins."
+        ):
+            # Only classes defined by shipped builtin modules carry the reviewed
+            # table entry; a subclass registered through this path still fails
+            # closed. The stamp is recorded in the harness-side provenance side
+            # table — never as a class attribute — so a custom class declaring
+            # `_registry_builtin_name` in its own body cannot forge it
+            # (S2 round 2: forgeable provenance stamp). The writer is private
+            # to the classification module (S2 round 4: stamp-writer
+            # hardening): only the harness's gated stamping paths reach it.
+            _stamp_registry_builtin(tool_class, name)
         self._registry_generation += 1
 
     @property
@@ -411,6 +520,60 @@ class ToolManager:
         return parent if parent is not self else None
 
     @property
+    def _identity_posture(self) -> tuple[ToolPosture | None, ToolPosture | None]:
+        """(personal, delegation) posture selectors of this manager's identity.
+
+        Derived from the ``[agent]`` selection below the tool-config layer: a
+        custom identity carries no harness-known posture (None = unrestricted
+        on that axis), with the delegation set defaulting to the full granted
+        ceiling (design decision 8). When the owning loop bound the
+        conversation's identity at construction (design §3, decision log item
+        3), posture derives from the BOUND identity: a later live config
+        change is a pending selection for new conversations and never
+        re-postures an existing manager.
+        """
+        if self._bound_identity is not None:
+            reference = self._bound_identity
+        else:
+            reference = self._config.agent.identity
+        if reference.startswith("user:"):
+            return None, None
+        identity = get_builtin_identity(reference.removeprefix("builtin:"))
+        if identity is None:
+            return None, None
+        return identity.personal_tools, identity.delegation_tools
+
+    def _personal_posture_allows(self, tool_class: type[BaseTool]) -> bool:
+        """Whether this identity may execute the SELECTED implementation itself.
+
+        The classification is computed from the exact selected class's registry
+        provenance — never re-resolved by name: with several variants of one
+        name, a name-keyed lookup can classify a DIFFERENT class than the one
+        the availability decision actually selected, letting an unstamped
+        custom ride a read-only posture (S2 round 2: posture reselects by
+        name).
+        """
+        personal, _ = self._identity_posture
+        if personal is None:
+            return True
+        return posture_allows_class(
+            personal, registry_provenance_classification(tool_class)
+        )
+
+    def _delegation_posture_allows(self, tool_class: type[BaseTool]) -> bool:
+        """Whether this identity may pass the SELECTED implementation to children.
+
+        Classifies the exact selected class, exactly as the personal axis does
+        (S2 round 2: posture reselects by name).
+        """
+        _, delegation = self._identity_posture
+        if delegation is None:
+            return True
+        return posture_allows_class(
+            delegation, registry_provenance_classification(tool_class)
+        )
+
+    @property
     def authority_revision(self) -> int | None:
         if self._parent_authority_revision_getter is None:
             return None
@@ -419,13 +582,44 @@ class ToolManager:
         except Exception:
             return None
 
+    def _tool_filter_digest(self) -> tuple[object, ...]:
+        """Live digest of the granted-axis tool filters.
+
+        The authority token is the sanctioned commit signal, but an
+        unsanctioned in-place config edit (no accepted-token bump) must still
+        invalidate every token-keyed cache: the digest covers the tool
+        allow/deny lists and the per-tool config mapping (S2 W2).
+        """
+        config = self._config
+        entries: list[tuple[str, str]] = []
+        for name, entry in config.tools.items():
+            if isinstance(entry, Mapping):
+                try:
+                    entries.append((
+                        name,
+                        json.dumps(entry, sort_keys=True, default=repr),
+                    ))
+                except (TypeError, ValueError):
+                    entries.append((name, repr(entry)))
+            else:
+                entries.append((name, repr(entry)))
+        entries.sort()
+        return (
+            tuple(config.enabled_tools),
+            tuple(config.disabled_tools),
+            tuple(entries),
+        )
+
     def _effective_authority_token(  # noqa: PLR0911 - each missing signal fails closed
         self, seen: set[int] | None = None
     ) -> tuple[object, ...] | None:
         """A revision for accepted inputs along the *entire* authority chain.
 
         An unavailable parent or revision signal disables caching; never reuse an
-        entry obtained while the chain was healthy.
+        entry obtained while the chain was healthy. The token also carries the
+        live identity selection and the granted-axis tool filters, so an
+        unsanctioned in-place edit invalidates cached authority even without an
+        accepted-token bump.
         """
         if self._authority_retired or self._accepted_token_getter is None:
             return None
@@ -455,6 +649,10 @@ class ToolManager:
                 self._inherited_workspace,
                 self._cwd,
                 self._registry_generation,
+                classification_revision(),
+                self._bound_identity,
+                self._config.agent.identity,
+                self._tool_filter_digest(),
                 parent_identity,
                 parent_token,
             )
@@ -486,6 +684,89 @@ class ToolManager:
         parent = self._parent_authority()
         return parent is not None and parent._name_versionable(name, seen)
 
+    def _select_available_variant_or_none(
+        self, name: str, fallback: type[BaseTool] | None
+    ) -> type[BaseTool] | None:
+        with self._lock:
+            return (
+                self._select_available_variant(name, fallback)
+                if fallback is not None
+                else None
+            )
+
+    def _live_tool_policy_allows(self, tool_name: str) -> bool:
+        """Whether the live per-tool config entry is well-formed for a tool.
+
+        The schema types ``tools`` entries as config mappings; an entry that is
+        not a mapping is a broken config, and broken config fails closed — the
+        tool is never served from a warm selection. An ABSENT entry means "no
+        per-tool policy" (allowed); a PRESENT but malformed entry — an
+        explicit ``None`` (malformed per the schema type) or any other
+        non-mapping value — fails closed on every surface, never a silent
+        reset to defaults (S2 round 2: explicit null tool entry fails open).
+        Well-formed entries keep the pinned execution-time denial semantics
+        (``permission = "never"`` denies at the execution decision, not at
+        selection).
+        """
+        name = "bash" if tool_name == "bash_start" else tool_name
+        tools = self._config.tools
+        if name not in tools:
+            return True
+        return isinstance(tools[name], Mapping)
+
+    def _apply_live_tool_filters(
+        self,
+        name: str,
+        selected: type[BaseTool],
+        *,
+        personal: bool,
+        chain_class: type[BaseTool] | None = None,
+    ) -> type[BaseTool] | None:
+        """Live granted-axis and posture filters for one availability decision.
+
+        These filters re-run on EVERY decision, cache hits included: the
+        selection caches key on the authority token, but an unsanctioned
+        in-place config edit (no accepted-token bump) must not leave a warm
+        selection serving a tool the current policy excludes (S2 W2).
+
+        The posture check classifies the EXACT selected class — never a
+        name-keyed re-resolution, which can pick a different variant of the
+        same name than the one this decision selected (S2 round 2: posture
+        reselects by name).
+
+        ``chain_class`` is the exact implementation the ANCESTOR chain must
+        classify: the caller's selected implementation when the caller is a
+        descendant, or the caller's selected implementation carried through a
+        delegation check. It defaults to ``selected`` — this manager's own
+        variant of the name. The ancestor chain never re-resolves the name
+        inside an ancestor's registry: that selects the ANCESTOR's variant of
+        the name and can admit a mutating custom implementation through a
+        read-only ancestor (S2 round 3: the ancestor chain re-resolves by
+        name).
+        """
+        if chain_class is None:
+            chain_class = selected
+        config = self._config
+        disabled, per_source = self._build_source_disable_index(config)
+        if (
+            self._is_source_disabled(selected, disabled, per_source)  # noqa: PLR0916
+            or (config.enabled_tools and not name_matches(name, config.enabled_tools))
+            or (config.disabled_tools and name_matches(name, config.disabled_tools))
+            or not self._live_tool_policy_allows(name)
+            or not (
+                self._personal_posture_allows(selected)
+                if personal
+                else self._delegation_posture_allows(chain_class)
+            )
+            or not (
+                self._parent_allows_tool(name, chain_class)
+                if personal
+                else self._parent_delegation_allows(name, chain_class)
+            )
+        ):
+            return None
+        return selected
+
     def _available_tool(self, name: str) -> type[BaseTool] | None:
         """Resolve only one name; custom availability callbacks remain live."""
         if self._authority_retired:
@@ -494,29 +775,19 @@ class ToolManager:
         with self._lock:
             fallback = self._all_tools.get(name)
         versionable = self._name_versionable(name)
+        selected: type[BaseTool] | None
         if token is not None and versionable:
             cached = self._selection_cache.get(name)
             if cached is not None and cached[0] == token:
-                return cached[1]
-        with self._lock:
-            selected = (
-                self._select_available_variant(name, fallback)
-                if fallback is not None
-                else None
-            )
+                selected = cached[1]
+            else:
+                selected = self._select_available_variant_or_none(name, fallback)
+        else:
+            selected = self._select_available_variant_or_none(name, fallback)
         if selected is not None:
-            config = self._config
-            disabled, per_source = self._build_source_disable_index(config)
-            if (
-                self._is_source_disabled(selected, disabled, per_source)  # noqa: PLR0916
-                or (
-                    config.enabled_tools
-                    and not name_matches(name, config.enabled_tools)
-                )
-                or (config.disabled_tools and name_matches(name, config.disabled_tools))
-                or not self._parent_allows_tool(name)
-            ):
-                selected = None
+            # Live filters run on cache hits too (S2 W2): a warm selection
+            # cannot serve a tool the current policy excludes.
+            selected = self._apply_live_tool_filters(name, selected, personal=True)
         if token is not None:
             if self._effective_authority_token() != token:
                 return None
@@ -524,15 +795,126 @@ class ToolManager:
                 self._selection_cache[name] = (token, selected)
         return selected
 
-    def _parent_allows_tool(self, tool_name: str) -> bool:
+    def _parent_allows_tool(
+        self, tool_name: str, selected_class: type[BaseTool] | None = None
+    ) -> bool:
+        """Chain-walk: every ancestor's DELEGATION ceiling admits the implementation.
+
+        The child ceiling is the parent's delegation set, not its personal
+        inventory: personal posture and delegation are independent axes, and
+        the granted ceiling never widens down the tree. The chain classifies
+        the EXACT implementation this decision selected — never a name-keyed
+        re-resolution inside an ancestor, which selects the ANCESTOR's variant
+        of the name and can admit a mutating custom implementation through a
+        read-only ancestor (S2 round 3: the ancestor chain re-resolves by
+        name).
+        """
         if tool_name == "bash_start" and self._available_tool("bash") is None:
             return False
+        if self._parent_authority_getter is None:
+            return True
         parent = self._parent_authority()
-        return (
-            parent is None
-            if self._parent_authority_getter is None
-            else (parent is not None and parent._available_tool(tool_name) is not None)
+        return parent is not None and parent._delegation_allows_tool(
+            tool_name, selected_class
         )
+
+    def _parent_delegation_allows(
+        self, tool_name: str, selected_class: type[BaseTool] | None = None
+    ) -> bool:
+        """Ancestor chain only: every ancestor's delegation ceiling admits it."""
+        if self._parent_authority_getter is None:
+            return True
+        parent = self._parent_authority()
+        return parent is not None and parent._delegation_allows_tool(
+            tool_name, selected_class
+        )
+
+    def _delegation_allows_tool(
+        self, tool_name: str, selected_class: type[BaseTool] | None = None
+    ) -> bool:
+        """This identity's full delegation ceiling admits the implementation.
+
+        Granted configuration ∩ this identity's delegation posture ∩ every
+        ancestor's delegation ceiling. The personal posture never narrows
+        what an identity may delegate: an orchestrator delegates writes it
+        cannot perform itself.
+
+        ``selected_class`` is the exact implementation the CALLER will run:
+        every delegation posture along the chain classifies THAT class, never
+        a name-keyed re-resolution inside this identity's registry (S2 round
+        3: the ancestor chain re-resolves by name). When omitted, this
+        identity's own selected variant of the name is judged — the
+        delegation-axis enumeration of what this identity may pass.
+        """
+        return self._delegated_available_tool(tool_name, selected_class) is not None
+
+    def _delegated_available_tool(
+        self, name: str, selected_class: type[BaseTool] | None = None
+    ) -> type[BaseTool] | None:
+        """Delegation-axis availability, cached like ``_available_tool``.
+
+        Mirrors the personal path without the personal posture: the class
+        resolves under the delegation ceiling (own granted config, own
+        delegation posture, ancestors' delegation). Live filters re-run on
+        cache hits too, so an in-place policy edit cannot serve a warm
+        selection (S2 W2).
+
+        ``selected_class`` carries the caller's EXACT implementation through
+        the ancestor chain: every ancestor's delegation posture classifies
+        THAT class, never a name-keyed re-resolution inside the ancestor's
+        registry (S2 round 3: the ancestor chain re-resolves by name). When
+        omitted, this identity's own selected variant of the name is carried
+        instead — the delegation-axis enumeration judges the class it would
+        pass. Cached decisions are keyed on the carried implementation as
+        well (verified by identity through a weak reference), so a warm entry
+        computed for one implementation is never served for another.
+        """
+        if self._authority_retired:
+            return None
+        token = self._effective_authority_token()
+        with self._lock:
+            fallback = self._all_tools.get(name)
+        versionable = self._name_versionable(name)
+        cache_key: str | tuple[str, int] = (
+            name if selected_class is None else (name, id(selected_class))
+        )
+        selected: type[BaseTool] | None
+        if token is not None and versionable:
+            cached = self._delegation_selection_cache.get(cache_key)
+            if (
+                cached is not None
+                and cached[0] == token
+                and (
+                    selected_class is None
+                    or cached[2] is not None
+                    and cached[2]() is selected_class
+                )
+            ):
+                selected = cached[1]
+            else:
+                selected = self._select_available_variant_or_none(name, fallback)
+        else:
+            selected = self._select_available_variant_or_none(name, fallback)
+        if selected is not None:
+            if (
+                name == "bash_start"
+                and self._delegated_available_tool("bash", selected_class) is None
+            ):
+                selected = None
+            else:
+                selected = self._apply_live_tool_filters(
+                    name, selected, personal=False, chain_class=selected_class
+                )
+        if token is not None:
+            if self._effective_authority_token() != token:
+                return None
+            if versionable:
+                self._delegation_selection_cache[cache_key] = (
+                    token,
+                    selected,
+                    None if selected_class is None else weakref.ref(selected_class),
+                )
+        return selected
 
     def path_authority(self, tool_name: str) -> PathAuthority:
         """Capture local policy with live chain-walked runtime capabilities."""
@@ -545,6 +927,51 @@ class ToolManager:
             tool_name = "bash"
         config = self.get_tool_config(tool_name)
         tool_class = self._available_tool(tool_name)
+        if tool_class is None:
+            raise NoSuchToolError(f"Unknown or disabled tool: {tool_name}")
+        return PathAuthority(
+            tool_name,
+            config.permission,
+            tuple(config.allowlist),
+            tuple(config.denylist),
+            tool_class.path_sensitive_patterns(config),
+            self.workspace,
+            self._scratchpad_dir,
+            self.scratchpad_roots,
+            self.instruction_read_files,
+            plan_file_write_scope=(
+                self._plan_file_write_scope_getter()
+                if tool_name in {"write_file", "edit"}
+                and self._plan_file_write_scope_getter is not None
+                else None
+            ),
+            inherited_plan_write_scopes=(
+                self._inherited_plan_write_scopes
+                if tool_name in {"write_file", "edit"}
+                else ()
+            ),
+        )
+
+    def _delegated_path_authority(
+        self, tool_name: str, selected_class: type[BaseTool] | None = None
+    ) -> PathAuthority:
+        """Delegation-axis path policy for ancestor policy resolution.
+
+        Mirrors ``path_authority`` under the delegation ceiling, so an
+        ancestor whose personal posture excludes the tool still contributes
+        its granted path policy to delegated execution. ``selected_class``
+        keys the liveness exactly as in ``_delegated_tool`` (S2 round 4:
+        invocation/availability implementation consistency).
+        """
+        if self._authority_retired:
+            raise NoSuchToolError("Tool manager authority retired")
+        if tool_name == "bash_start":
+            # Availability is still name-specific; execution paths use bash policy.
+            if self._delegated_available_tool(tool_name, selected_class) is None:
+                raise NoSuchToolError(f"Unknown or disabled tool: {tool_name}")
+            tool_name = "bash"
+        config = self.get_tool_config(tool_name)
+        tool_class = self._delegated_available_tool(tool_name, selected_class)
         if tool_class is None:
             raise NoSuchToolError(f"Unknown or disabled tool: {tool_name}")
         return PathAuthority(
@@ -612,7 +1039,12 @@ class ToolManager:
             return None, None
         return token, replace(states[0], parents=tuple(states[1:]))
 
-    def _shell_execution_permission(self, args: Any, local: Any = None) -> Any:
+    def _shell_execution_permission(
+        self,
+        args: Any,
+        local: Any = None,
+        execution_class: type[BaseTool] | None = None,
+    ) -> Any:
         # Launch arguments are not foreground arguments. Custom resolvers
         # must receive the canonical schema, under the same request ceilings.
         from chartreux.core.tools.builtins.bash import Bash, BashArgs
@@ -648,31 +1080,124 @@ class ToolManager:
                     # authority is missing: a parent dangerous-authority gap
                     # is never locally grantable, so it classifies as the
                     # parent ceiling instead of a grantable local denial.
-                    parent = self._parent_permission("bash_start", args)
+                    parent = self._parent_permission(
+                        "bash_start", args, execution_class
+                    )
                     if parent is not None and parent.permission == ToolPermission.NEVER:
                         return parent
                 return context
-            return self._parent_permission("bash_start", args)
+            return self._parent_permission("bash_start", args, execution_class)
         except Exception:
             return PermissionContext(
                 permission=ToolPermission.NEVER,
                 reason="Canonical shell authority is unavailable",
             )
 
-    def _parent_permission(self, tool_name: str, args: Any) -> Any:
-        """Return a parent invocation denial, including tool-specific guards."""
+    def _delegated_shell_execution_permission(
+        self,
+        args: Any,
+        local: Any = None,
+        execution_class: type[BaseTool] | None = None,
+    ) -> Any:
+        """Delegation-axis shell guard: canonical bash policy under the delegation ceiling.
+
+        Mirrors ``_shell_execution_permission`` for instances that resolve an
+        ancestor's policy for a tool the ancestor's personal posture excludes.
+        """
+        # Launch arguments are not foreground arguments. Custom resolvers
+        # must receive the canonical schema, under the same request ceilings.
+        from chartreux.core.tools.builtins.bash import Bash, BashArgs
+        from chartreux.core.tools.builtins.bash_start import BashStart
+        from chartreux.core.tools.permissions import PermissionContext
+        from chartreux.core.tools.utils import (
+            instruction_read_ceiling,
+            scratchpad_ceiling,
+        )
+
+        try:
+            canonical = self._delegated_tool("bash")
+            if (
+                type(canonical) is Bash
+                and type(self._delegated_tool("bash_start")) is BashStart
+            ):
+                # The builtin adapter already analyzed canonical Bash config and
+                # the complete path-authority chain under these request ceilings.
+                context = local
+            else:
+                with (
+                    instruction_read_ceiling(self.instruction_read_files),
+                    scratchpad_ceiling(self.scratchpad_roots),
+                ):
+                    context = canonical.resolve_permission(
+                        BashArgs(command=args.command)
+                    )
+            if self.get_tool_config("bash").permission == ToolPermission.NEVER:
+                return PermissionContext(
+                    permission=ToolPermission.NEVER,
+                    reason="Shell execution is disabled by canonical bash policy",
+                )
+            if context is not None and context.permission == ToolPermission.NEVER:
+                if context.denial_kind == "dangerous_command":
+                    # The parent ceiling is checked even when local dangerous
+                    # authority is missing: a parent dangerous-authority gap
+                    # is never locally grantable, so it classifies as the
+                    # parent ceiling instead of a grantable local denial.
+                    parent = self._parent_permission(
+                        "bash_start", args, execution_class
+                    )
+                    if parent is not None and parent.permission == ToolPermission.NEVER:
+                        return parent
+                return context
+            return self._parent_permission("bash_start", args, execution_class)
+        except Exception:
+            return PermissionContext(
+                permission=ToolPermission.NEVER,
+                reason="Canonical shell authority is unavailable",
+            )
+
+    def _parent_permission(
+        self, tool_name: str, args: Any, execution_class: type[BaseTool] | None = None
+    ) -> Any:
+        """Return a parent invocation denial, including tool-specific guards.
+
+        The parent ceiling is the DELEGATION axis: the ancestor lends its
+        policy for a tool its own personal posture excludes (an orchestrator
+        delegates writes it cannot perform itself).
+
+        ``execution_class`` is the exact implementation THIS invocation will
+        run. The parent's delegation posture classifies THAT class — exactly
+        like the availability chain — never a name-keyed re-resolution inside
+        the parent's registry, which selects the PARENT's variant of the name
+        and can deny an admitted child implementation (or admit one the
+        availability chain denies) when the two registries select different
+        variants of the same name (S2 round 4: invocation/availability
+        implementation consistency). The POLICY computation stays the parent's
+        own: the policy instance is built from the parent's own selected
+        variant under the parent's config, so a child-forged
+        ``resolve_permission`` never weakens the parent's ceiling.
+
+        Name-vs-class coherence (round-4 W2/W3): this runtime check is
+        class-exact — it classifies ``execution_class``, the exact
+        implementation this invocation runs — while the admission ceiling
+        (``delegable_tools``) is name-keyed on the parent's own variant.
+        Both derive posture from the conversation's bound identity
+        (``_bound_identity``), never from a live ``[agent]`` identity
+        re-read.
+        """
         from chartreux.core.tools.permissions import PermissionContext
 
         if self._parent_authority_getter is None:
             return None
         parent = self._parent_authority()
-        if parent is None or parent._available_tool(tool_name) is None:
+        if parent is None or not parent._delegation_allows_tool(
+            tool_name, execution_class
+        ):
             return PermissionContext(
                 permission=ToolPermission.NEVER,
                 reason="Tool is unavailable under parent authority",
             )
         try:
-            parent_tool = parent.get(tool_name)
+            parent_tool = parent._delegated_tool(tool_name, execution_class)
             from chartreux.core.tools.utils import (
                 instruction_read_ceiling,
                 scratchpad_ceiling,
@@ -729,12 +1254,16 @@ class ToolManager:
             }
         return sorted(
             name
-            for name in self._apply_per_source_filtering(candidates)
-            if self._parent_allows_tool(name)
+            for name, selected in self._apply_per_source_filtering(candidates).items()
+            if self._parent_allows_tool(name, selected)
         )
 
-    @property
-    def available_tools(self) -> dict[str, type[BaseTool]]:
+    def _config_available_tools(self) -> dict[str, type[BaseTool]]:
+        """Runtime-capable tools after per-source and allow/deny filters.
+
+        Shared base of the personal and delegation surfaces: no posture and
+        no ancestor chain are applied here.
+        """
         with self._lock:
             runtime_available: dict[str, type[BaseTool]] = {}
             for name, fallback_tool_class in self._all_tools.items():
@@ -761,9 +1290,61 @@ class ToolManager:
                 for name, cls in result.items()
                 if not name_matches(name, self._config.disabled_tools)
             }
+        return result
+
+    @property
+    def available_tools(self) -> dict[str, type[BaseTool]]:
+        """Tools this identity may execute itself (personal axis).
+
+        Granted configuration ∩ the identity's personal posture ∩ every
+        ancestor's delegation ceiling. The live per-tool policy check runs on
+        this enumeration too, so a malformed in-place ``tools`` entry fails
+        closed on every surface — inventory, specs, and admission ceilings —
+        exactly as on the ``get()`` path (S2 W2). The posture check classifies
+        the exact selected class of each entry, and the ancestor chain
+        classifies that same class (S2 round 2: posture reselects by name;
+        S2 round 3: the ancestor chain re-resolves by name).
+        """
         return {
-            name: cls for name, cls in result.items() if self._parent_allows_tool(name)
+            name: cls
+            for name, cls in self._config_available_tools().items()
+            if self._live_tool_policy_allows(name)
+            and self._personal_posture_allows(cls)
+            and self._parent_allows_tool(name, cls)
         }
+
+    @property
+    def delegable_tools(self) -> dict[str, type[BaseTool]]:
+        """Tools this identity may pass to children (delegation axis).
+
+        Granted configuration ∩ the identity's delegation posture ∩ every
+        ancestor's delegation ceiling. This is the admission ceiling for
+        child launches; the personal posture never narrows it.
+
+        Each name is resolved ONCE on the delegation axis
+        (``_delegated_available_tool``), and the listed class is exactly the
+        class that decision validated: the inventory never lists a class a
+        separate name-keyed re-resolution failed to check (S2 round 2:
+        posture reselects by name). The live per-tool policy check applies
+        here as well (S2 W2).
+
+        Name-vs-class coherence (round-4 W2/W3): the ADMISSION ceiling is
+        name-keyed — each name judged on THIS manager's own selected variant
+        of it — while the RUNTIME authority check (``_parent_permission``)
+        is class-exact, classifying the exact implementation the invocation
+        runs. Both axes derive their posture from the conversation's bound
+        identity (``_bound_identity``), never from a live ``[agent]``
+        identity re-read, so a later record re-key cannot re-introduce an
+        identity read that diverges from the bound identity.
+        """
+        result: dict[str, type[BaseTool]] = {}
+        with self._lock:
+            names = list(self._all_tools)
+        for name in names:
+            delegated = self._delegated_available_tool(name)
+            if delegated is not None:
+                result[name] = delegated
+        return result
 
     @property
     def custom_tool_names(self) -> set[str]:
@@ -1106,7 +1687,7 @@ class ToolManager:
             for name, (_, _, description, _) in tool_inputs.items()
         ]
 
-    def get_tool_config(  # noqa: PLR0912 - restriction sources and cache guards
+    def get_tool_config(  # noqa: PLR0912, PLR0915 - restriction sources and cache guards
         self, tool_name: str
     ) -> BaseToolConfig:
         # Managed launches have exactly one permission source: [tools.bash].
@@ -1131,8 +1712,25 @@ class ToolManager:
             config_class = BaseToolConfig
             default_config = BaseToolConfig()
 
-        user_overrides = self._config.tools.get(tool_name)
-        merged_dict = {**default_config.model_dump(), **(user_overrides or {})}
+        tools = self._config.tools
+        if tool_name in tools:
+            raw_entry = tools[tool_name]
+            if not isinstance(raw_entry, Mapping):
+                # A PRESENT but malformed tools entry (an explicit null, or
+                # any other non-mapping value) fails closed: the tool's
+                # effective permission is NEVER on this surface too — never
+                # a silent reset to defaults, which would flip a warm
+                # "never" entry to "always" (S2 round 2: explicit null tool
+                # entry fails open).
+                merged_dict = {
+                    **default_config.model_dump(),
+                    "permission": ToolPermission.NEVER,
+                }
+            else:
+                merged_dict = {**default_config.model_dump(), **raw_entry}
+        else:
+            # An ABSENT entry means "no per-tool policy": the defaults apply.
+            merged_dict = default_config.model_dump()
         config = (
             tool_class.validate_tool_config(merged_dict)
             if tool_class is not None
@@ -1291,6 +1889,51 @@ class ToolManager:
         except Exception:
             return False
 
+    def _delegated_tool_authority_is_current(
+        self,
+        tool_name: str,
+        tool_class: type[BaseTool],
+        selected_class: type[BaseTool] | None = None,
+    ) -> bool:
+        """Delegation-axis liveness for ancestor policy-resolution instances.
+
+        ``selected_class`` is the exact implementation the CALLER will run;
+        the liveness decision classifies THAT class, exactly as the
+        availability chain does (S2 round 4: invocation/availability
+        implementation consistency). When omitted, this manager's own selected
+        variant of the name is judged — the delegation-axis enumeration.
+        """
+        try:
+            if tool_name in {"read_file", "read_image", "write_file", "edit"}:
+                # Validate the chain before availability recursively visits parents.
+                _ = self.scratchpad_roots
+            return (
+                not self._authority_retired
+                and self._delegated_available_tool(tool_name, selected_class)
+                is tool_class
+            )
+        except Exception:
+            return False
+
+    def get_authority_classification(self, tool_name: str) -> ToolClass:
+        """Reviewed class of the registered implementation for ``tool_name``.
+
+        Computed MANAGER-SIDE from registry provenance: the selected class's
+        provenance stamp names its reviewed table entry, while anything
+        un-stamped (custom replacements, MCP proxies, subclasses) fails closed
+        as MUTATING regardless of its name or remote hints. The selected
+        class's ``get_authority_classification`` classmethod is deliberately
+        NOT consulted for authority — it is overridable, and a self-declared
+        class would widen a read-only posture (S2 classification
+        self-declaration blocker). Unknown names fail closed.
+        """
+        with self._lock:
+            fallback = self._all_tools.get(tool_name)
+        if fallback is None:
+            return classify_tool(tool_name)
+        selected = self._select_registered_variant(tool_name, fallback)
+        return registry_provenance_classification(selected)
+
     def get(self, tool_name: str) -> BaseTool:
         """Get a tool instance, creating it lazily on first call.
 
@@ -1307,6 +1950,84 @@ class ToolManager:
         cached = self._instances.get(tool_name)
         if cached is not None and type(cached) is tool_class:
             return cached
+        instance = self._build_instance(tool_name, tool_class, delegated=False)
+        self._instances[tool_name] = instance
+        return instance
+
+    def _delegated_tool(
+        self, tool_name: str, selected_class: type[BaseTool] | None = None
+    ) -> BaseTool:
+        """Delegation-axis instance resolving this manager's policy for a tool.
+
+        Used for ancestor policy checks when the ancestor's personal posture
+        excludes the tool: delegation is an independent axis, so the
+        ancestor's config (permission, denylist, workspace) still governs
+        delegated execution.
+
+        ``selected_class`` is the exact implementation the CALLER will run.
+        It keys the LIVENESS of this policy instance — this manager's
+        delegation posture classifies THAT class, never a name-keyed
+        re-resolution (S2 round 4: invocation/availability implementation
+        consistency) — while the instance itself is still built from THIS
+        manager's own selected variant under this manager's own config: the
+        caller's implementation never resolves the ancestor's policy, so a
+        child-forged ``resolve_permission`` cannot weaken the ancestor's
+        ceiling.
+
+        The instance cache is keyed by (name, caller implementation): the
+        liveness closure bakes ``selected_class``, so the cache never serves
+        one caller's instance — whose liveness classifies that caller's
+        class — to a different caller (S2 final warning; package 3b
+        amendment). Admission (``delegable_tools``) stays name-keyed on this
+        manager's own variant; the runtime stays class-exact — see
+        ``_parent_permission``.
+
+        Raises:
+            NoSuchToolError: If the tool is outside the delegation ceiling.
+        """
+        if self._authority_retired:
+            raise NoSuchToolError("Tool manager authority retired")
+        if tool_name in {"read_file", "read_image", "write_file", "edit"}:
+            _ = self.scratchpad_roots
+        tool_class = self._delegated_available_tool(tool_name, selected_class)
+        if tool_class is None:
+            raise NoSuchToolError(f"Unknown or disabled tool: {tool_name}")
+        cached = self._delegated_instances.get((tool_name, selected_class))
+        if cached is not None and type(cached) is tool_class:
+            return cached
+        instance = self._build_instance(
+            tool_name, tool_class, delegated=True, selected_class=selected_class
+        )
+        self._delegated_instances[(tool_name, selected_class)] = instance
+        return instance
+
+    def _build_instance(
+        self,
+        tool_name: str,
+        tool_class: type[BaseTool],
+        *,
+        delegated: bool,
+        selected_class: type[BaseTool] | None = None,
+    ) -> BaseTool:
+        """Construct one tool instance bound to this manager's live authority.
+
+        ``delegated`` instances resolve the delegation axis (ancestor policy
+        checks): their availability, path authority, and shell guard follow
+        the delegation ceiling instead of the personal posture.
+
+        Every invocation guard bound here receives the EXECUTION
+        implementation — ``tool_class``, the exact class this instance runs —
+        so the ancestor chain classifies the implementation the invocation
+        will actually execute, exactly as the availability chain classifies
+        the child's selected class (S2 round 4: invocation/availability
+        implementation consistency). For delegated instances,
+        ``selected_class`` is the CALLER's execution implementation: it keys
+        the instance's delegation-axis liveness (the ancestor's posture
+        classifies THAT class), while the instance itself — the policy
+        computation — stays this manager's own variant under this manager's
+        own config, so a caller-forged ``resolve_permission`` never weakens
+        the ancestor's ceiling.
+        """
         instance = tool_class.from_config(
             lambda: self.get_tool_config(tool_name),
             cwd=self._cwd,
@@ -1317,7 +2038,12 @@ class ToolManager:
         instance._workspace_getter = lambda: self.workspace
         instance.instruction_read_files_getter = lambda: self.instruction_read_files
         instance.scratchpad_roots_getter = lambda: self.scratchpad_roots
-        instance.path_authority_getter = lambda: self.path_authority(tool_name)
+        if delegated:
+            instance.path_authority_getter = lambda: self._delegated_path_authority(
+                tool_name, selected_class
+            )
+        else:
+            instance.path_authority_getter = lambda: self.path_authority(tool_name)
         instance.owned_scratchpad_getter = lambda: self._scratchpad_dir
         instance.dangerous_command_authorities_getter = lambda: (
             self._dangerous_command_authorities()
@@ -1328,19 +2054,40 @@ class ToolManager:
         if self._plan_file_write_scope_getter is not None:
             instance.plan_file_write_scope_getter = self._plan_file_write_scope_getter
         instance.inherited_plan_write_scopes = self._inherited_plan_write_scopes
+        if delegated:
+            is_current = lambda: self._delegated_tool_authority_is_current(
+                tool_name, tool_class, selected_class
+            )
+            local_permission_guard = (
+                (
+                    lambda args, local: self._delegated_shell_execution_permission(
+                        args, local, tool_class
+                    )
+                )
+                if tool_name == "bash_start"
+                else None
+            )
+        else:
+            is_current = lambda: self._tool_authority_is_current(tool_name, tool_class)
+            local_permission_guard = (
+                (
+                    lambda args, local: self._shell_execution_permission(
+                        args, local, tool_class
+                    )
+                )
+                if tool_name == "bash_start"
+                else None
+            )
         instance._bind_authority(
-            lambda: self._tool_authority_is_current(tool_name, tool_class),
+            is_current,
             None
             if tool_name == "bash_start"
-            else lambda args: self._parent_permission(tool_name, args),
-            local_permission_guard=self._shell_execution_permission
-            if tool_name == "bash_start"
-            else None,
+            else lambda args: self._parent_permission(tool_name, args, tool_class),
+            local_permission_guard=local_permission_guard,
         )
-        if tool_name == "grep":
+        if tool_name == "grep" and not delegated:
             # Optional per-invocation snapshot hook for the builtin grep tool.
             setattr(instance, "_grep_authority_manager", self)  # noqa: B010 - optional hook
-        self._instances[tool_name] = instance
         return instance
 
     def pop_mcp_errors(self) -> dict[str, str]:
@@ -1435,3 +2182,4 @@ class ToolManager:
 
     def reset_all(self) -> None:
         self._instances.clear()
+        self._delegated_instances.clear()

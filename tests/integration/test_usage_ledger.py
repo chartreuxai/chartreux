@@ -223,7 +223,7 @@ async def test_all_producers_survive_restart_and_transcript_deletion(
         assert context.state == "adopted"
         await turn(session, "first question")
         await turn(session, "second question")  # first fails, second deployment wins
-        child = await process.runtime_factory.create_child(root, "worker")
+        child = await process.runtime_factory.create_child(root, "coder")
         child_session = await create_test_app_server_session(child)
         await turn(child_session, "child task")
         assert await root.compaction_manager.compact() == "retained facts"
@@ -291,7 +291,7 @@ async def test_all_producers_survive_restart_and_transcript_deletion(
         assert child_record.parent_session_id == root_id
         assert (child_record.agent_role, child_record.agent_profile) == (
             "subagent",
-            "worker",
+            "coder",
         )
         for record in records:
             if record is not child_record:

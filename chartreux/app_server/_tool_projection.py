@@ -49,6 +49,7 @@ from chartreux.app_server.models import (
     WebSearchEffectInput,
     WebSearchEffectOutput,
 )
+from chartreux.core.agents.identity_launch import DEFAULT_CHILD_IDENTITY
 from chartreux.core.events import ToolResultEvent
 from chartreux.core.subagents import TaskArgs
 from chartreux.core.utils import TaggedText
@@ -109,11 +110,21 @@ def project_effect_detail(
         )
     try:
         if tool_name == "task" and projection.input_model is SubagentEffectInput:
-            # Keep the public effect's `agent` field stable across the Task rename.
-            if isinstance(value, dict) and "agent_type" in value:
-                value = {**value, "agent": value["agent_type"]}
+            # Keep the public effect's `agent` field stable across the task
+            # grammar: it carries the launch identity reference, defaulting
+            # to the shipped child identity for a plain task call. A stored
+            # argument map keeps its own spelling (a legacy `agent_type` key
+            # still projects; a map naming no identity degrades to generic).
+            if isinstance(value, dict):
+                if "agent" not in value:
+                    identity = value.get("identity") or value.get("agent_type")
+                    if identity is not None:
+                        value = {**value, "agent": identity}
             elif isinstance(value, TaskArgs):
-                value = {**value.model_dump(mode="json"), "agent": value.agent_type}
+                value = {
+                    **value.model_dump(mode="json"),
+                    "agent": value.identity or DEFAULT_CHILD_IDENTITY,
+                }
         projected_input = _project_model(projection.input_model, value)
     except ValidationError:
         # Stored tool arguments can predate a schema change (e.g. a field that

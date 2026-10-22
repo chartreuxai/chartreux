@@ -13,10 +13,11 @@ from chartreux.app_server._subagent_records import (
     _AgentTombstone,
     _ReplacementClaim,
 )
+from chartreux.core.agents.manager import requested_identity_reference
 from chartreux.core.subagents import (
     AgentClosedError,
     AgentEvictedError,
-    AgentProfileMismatchError,
+    AgentIdentityMismatchError,
     LaunchConfigError,
     LaunchOutcome,
     RunStatus,
@@ -40,7 +41,7 @@ class ReplacementStateView(Protocol):
     the tracked teardown set, the shared registry lock, and the clock are
     never snapshotted at construction — registry state mutated after the
     collaborator is built stays visible, and instance patches of the
-    registry delegates (including the profile-admission and reaper
+    registry delegates (including the identity-admission and reaper
     delegates) still shadow.
     """
 
@@ -61,8 +62,8 @@ class ReplacementStateView(Protocol):
         self, agent_id: str, now: float
     ) -> _AgentTombstone | None: ...
 
-    def _require_task_profile_allowed(
-        self, parent: SessionRuntime, profile: str
+    def _require_task_identity_allowed(
+        self, parent: SessionRuntime, identity: str
     ) -> None: ...
 
     def _close_unretained_locked(
@@ -163,7 +164,7 @@ class ReplacementCoordinator:
             or claim.slot not in self._view._active_work_slots
         ):
             raise RuntimeError("Agent replacement admission changed during handoff")
-        self._view._require_task_profile_allowed(claim.parent, record.profile)
+        self._view._require_task_identity_allowed(claim.parent, record.identity)
 
     async def reserve(
         self, args: TaskArgs, ctx: InvokeContext
@@ -191,14 +192,19 @@ class ReplacementCoordinator:
                 raise ToolPermissionError(
                     "Only the owning parent may replace this agent's run"
                 )
-            if (
-                "agent_type" in args.model_fields_set
-                and record.profile != args.agent_type
+            # A busy replacement reuses the SAME instance: the requested
+            # identity — structured or shorthand — must match the record's
+            # resolved identity on both sides (11c).
+            requested_identity = requested_identity_reference(args)
+            retained_identity = record.identity
+            if requested_identity is not None and requested_identity != (
+                retained_identity
             ):
-                raise AgentProfileMismatchError(
-                    f"Agent profile mismatch: expected {record.profile}, got {args.agent_type}"
+                raise AgentIdentityMismatchError(
+                    f"Requested identity {requested_identity} does not match "
+                    f"retained agent identity {retained_identity}"
                 )
-            self._view._require_task_profile_allowed(parent, record.profile)
+            self._view._require_task_identity_allowed(parent, record.identity)
             if record.reserved_for_replacement:
                 return self.replacement_refusal(
                     record, LaunchOutcome.REJECTED_RESERVATION
@@ -220,6 +226,13 @@ class ReplacementCoordinator:
             if run.requested_stop_reason is not None:
                 return self.replacement_refusal(record, LaunchOutcome.ALREADY_STOPPING)
             if args.config is not None:
+                raise LaunchConfigError(
+                    "Busy replacement cannot change launch configuration"
+                )
+            if args.model is not None:
+                # The retained launch path resolves the canonical top-level
+                # model; a busy replacement reuses the SAME instance, so a
+                # model selection would change its committed deployment.
                 raise LaunchConfigError(
                     "Busy replacement cannot change launch configuration"
                 )
@@ -266,6 +279,13 @@ class ReplacementCoordinator:
         recovery is superseded.
         """
         if args.config is not None:
+            raise LaunchConfigError(
+                "Busy replacement cannot change launch configuration"
+            )
+        if args.model is not None:
+            # The retained launch path resolves the canonical top-level
+            # model; a busy replacement reuses the SAME instance, so a
+            # model selection would change its committed deployment.
             raise LaunchConfigError(
                 "Busy replacement cannot change launch configuration"
             )

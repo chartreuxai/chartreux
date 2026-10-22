@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from typing import TYPE_CHECKING, Any, Protocol
 
-from chartreux.core.agents import AgentProfile
 from chartreux.utils import VIBE_WARNING_TAG
 
 if TYPE_CHECKING:
@@ -147,50 +145,6 @@ class ContextWarningMiddleware:
 
     def reset(self, reset_reason: ResetReason = ResetReason.STOP) -> None:
         self.has_warned = False
-
-
-class ReadOnlyAgentMiddleware:
-    def __init__(
-        self,
-        profile_getter: Callable[[], AgentProfile],
-        agent_name: str,
-        reminder: str | Callable[[], str],
-        exit_message: str,
-    ) -> None:
-        self._profile_getter = profile_getter
-        self._agent_name = agent_name
-        self._reminder = reminder
-        self.exit_message = exit_message
-        self._was_active = False
-
-    @property
-    def reminder(self) -> str:
-        return self._reminder() if callable(self._reminder) else self._reminder
-
-    def _is_active(self) -> bool:
-        return self._profile_getter().name == self._agent_name
-
-    async def before_turn(self, context: ConversationContext) -> MiddlewareResult:
-        is_active = self._is_active()
-        was_active = self._was_active
-
-        if was_active and not is_active:
-            self._was_active = False
-            return MiddlewareResult(
-                action=MiddlewareAction.INJECT_MESSAGE, message=self.exit_message
-            )
-
-        if is_active and not was_active:
-            self._was_active = True
-            return MiddlewareResult(
-                action=MiddlewareAction.INJECT_MESSAGE, message=self.reminder
-            )
-
-        self._was_active = is_active
-        return MiddlewareResult()
-
-    def reset(self, reset_reason: ResetReason = ResetReason.STOP) -> None:
-        self._was_active = False
 
 
 class MiddlewarePipeline:

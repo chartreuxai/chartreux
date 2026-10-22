@@ -228,7 +228,7 @@ async def test_lifecycle_makes_no_product_service_attempts_with_fake_inference(
                 }
             },
             "roles": {
-                "orchestrator": {
+                "main": {
                     "description": "Local contract test preset",
                     "model": model_alias,
                     "thinking": "off",

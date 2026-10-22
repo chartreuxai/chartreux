@@ -37,6 +37,7 @@ nav:
   - Reference:
       - Overview: reference/index.md
       - Configuration: reference/configuration.md
+      - Identity architecture: reference/identity-architecture.md
       - Commands: reference/commands.md
   - Integrations:
       - ACP: integrations/acp.md
@@ -62,7 +63,7 @@ nav:
       - 0015 Outbound TLS Trust Policy: adr/0015-outbound-tls-trust-policy.md
       - 0016 Durable Recovery Protocol (superseded): adr/0016-durable-recovery-protocol.md
       - 0017 Remove Durable Recovery: adr/0017-remove-durable-recovery.md
-      - 0018 Model-role dispatch redesign: adr/0018-model-role-redesign.md
+      - 0018 Model-role dispatch redesign (superseded in part): adr/0018-model-role-redesign.md
       - 0019 Dangerous Git Command Permissions: adr/0019-dangerous-git-permissions.md
       - "0020 Operational-discipline rewrite: strategy switch replaces stop rules": adr/0020-operational-discipline-strategy-switch.md
       - "0021 Shell policy v0.2: occurrence-local cd chains and scratchpad redirect targets": adr/0021-shell-policy-v02-cd-chains-and-scratchpad-redirects.md

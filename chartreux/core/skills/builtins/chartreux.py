@@ -18,7 +18,7 @@ When behavior changes, update this reference and its synchronization tests toget
 
 The user's Chartreux home directory defaults to `~/.chartreux` but can be overridden via
 the `CHARTREUX_HOME` environment variable. All user-level configuration, skills, tools,
-agents, prompts, logs, and session data live here.
+prompts, workflows, orchestration strategies, logs, and session data live here.
 
 ### Directory Structure
 
@@ -29,9 +29,10 @@ agents, prompts, logs, and session data live here.
   .env                 # API keys and credentials (dotenv format)
   chartreuxhistory          # Command history
   trusted_folders.toml # Trust database for project folders
-  agents/              # Custom agent profiles (*.toml)
-  prompts/             # Custom prompts (*.md)
-  skills/              # User-level skills that shadow shipped skills (each skill is a subdirectory with SKILL.md)
+  prompts/             # Custom identity prompts (*.md)
+  workflows/            # Custom workflow bodies (*.md)
+  orchestration_strategies/ # Custom strategy bodies (*.md)
+  skills/               # User-level skills
   tools/               # Custom tools (<name>.py); descriptions & overrides in tools/prompts/<name>.md
   logs/
     chartreux.log           # Main log file
@@ -49,8 +50,8 @@ When in a trusted folder, Chartreux also looks for project-local configuration:
 - `.chartreux/hooks.toml` - Project-specific hooks (requires trusted folder)
 - `.chartreux/skills/` - Project-specific skills
 - `.chartreux/tools/` - Project-specific tools (`<name>.py`); a `prompts/<name>.md` beside them sets or overrides the description of the tool named `<name>` — builtin, MCP, or custom (e.g. `.chartreux/tools/prompts/bash.md` re-describes `bash`). Same `tools/*.py` + `tools/prompts/*.md` layout as the builtins.
-- `.chartreux/agents/` - Project-specific agents
-- `.chartreux/prompts/` - Project-specific prompts
+- `.chartreux/agents/` and `.chartreux/prompts/` - Retired project-local resource directories; detected loudly and never consumed
+- User prompts, workflows, and orchestration strategies live only in `~/.chartreux/prompts/`, `~/.chartreux/workflows/`, and `~/.chartreux/orchestration_strategies/`
 - `.agents/skills/` - Standard agent skills directory
 
 ### AGENTS.md Discovery
@@ -114,7 +115,7 @@ folders to see a different set. The explicit `--resume <SESSION_ID>` form is
 **not** folder-scoped: it resolves the session by id regardless of which folder
 it ran in.
 
-Each session commits the resolved base model and concrete provider deployment when it is assigned. On resume, Chartreux validates that stored identity and never re-selects a role or deployment. However, a saved dispatch policy referencing a role removed from the current configuration fails resume with `SessionPolicyError` ("Bound dispatch role removed"); no role substitution is performed. Committed model identities still resolve. An explicit re-task can reconfigure a retained child; `/clear` starts a new conversation that follows the current configuration. `/model` and `/thinking` change the current session; edit `[roles.orchestrator]` in `models.toml` to change the saved main-model default. That role name does not select the dispatch mode: `[dispatch].mode` selects a session-level shipped preset, and saved dispatch changes apply next session.
+Each conversation commits its resolved model and concrete provider deployment. Resume validates that binding and restores the frozen identity/workflow/strategy policy bundle; it does not re-resolve policy from current resource files. `/reload` refreshes live context and reports policy edits as pending. `/clear` starts a fresh conversation using current selections. `/model` and `/thinking` change the current session; configure the saved main model in `[roles.main]` in `models.toml`. The retired `@orchestrator` role has no alias.
 
 ## Configuration (config.toml)
 
@@ -126,15 +127,14 @@ model defaults. Effective configuration is layered, from lowest to highest prece
 1. built-in defaults;
 2. user TOML (`~/.chartreux/config.toml`);
 3. trusted project TOML (`.chartreux/config.toml`);
-4. `CHARTREUX_` environment variables;
-5. the active agent profile; and
-6. explicit session overrides.
+4. `CHARTREUX_` environment variables; and
+5. explicit invocation selections (CLI > environment > config > shipped default for identity, workflow, and orchestration strategy).
 
 An untrusted project config is not loaded. Loading or inspecting persistence is pure: it does not write, publish, or cache a session change. Persistent saves require exactly one explicit `user` or `project` target and that target's expected revision; mixed or implicit persistent targets are rejected. Save results separate persistence (`not_saved`, `saved`, `durability_uncertain`) from application (`unchanged`, `applied`, `failed`), including saved-but-not-applied outcomes. Persistent saves never mirror values into session overrides.
 
 Catalog definitions (`models`, `providers`) come from the shipped catalog plus the
 user-owned `models.toml` overlay, not a `config.toml` layer. Project, environment,
-agent-profile, and session sources may select canonical catalog models or roles but cannot define
+and session sources may select canonical catalog models or roles but cannot define
 catalogs. `authorized_roots_by_project` is accepted only from an installed user
 layer. General `config/write` cannot grant or change roots; persistent roots must
 be saved explicitly in the user configuration. In an interactive TUI session, an
@@ -151,7 +151,7 @@ and `policy/roots/replace` can change in-memory roots only, and replacement
 requires an expected revision plus literal `userInitiated: true`. These RPCs never
 write disk.
 
-Agent profiles cannot replace protected endpoint settings, and ordinary higher-precedence settings do not remove independent permission or other source restrictions.
+Ordinary higher-precedence settings do not remove independent permission or other source restrictions.
 
 Configuration environment variables use the `CHARTREUX_` prefix. Nested schema fields
 use `__`, such as `CHARTREUX_SESSION_LOGGING__ENABLED`. Supplied unknown names or
@@ -160,23 +160,25 @@ offending value is not echoed. The exact non-config controls `CHARTREUX_HOME`,
 `CHARTREUX_TYPING_GRACE_PERIOD_MS`,
 `CHARTREUX_ACP_LOGGING_ENABLED`, `CHARTREUX_TEST_DISABLE_KEYRING`, and
 `CHARTREUX_TEST_DISABLE_AUTO_TITLE` remain honored by their consumers. Provider
-variables such as `MISTRAL_API_KEY` are separate. Invalid empty numeric, boolean, or
-structured values are errors, while valid empty strings and `[]` remain values (for
-example, `CHARTREUX_ACTIVE_MODEL=""` and `CHARTREUX_ENABLED_AGENTS="[]"`). Legacy
 `VIBE_*` variables are not a fallback.
 
-Custom prompt IDs are resolved from project-local `.chartreux/prompts/` first, then
-from `~/.chartreux/prompts/`, and finally from the built-in bundled prompts.
+Custom identity prompts resolve only from `~/.chartreux/prompts/`. Workflows and orchestration strategies resolve only from their user directories. Project-local resource directories are detected loudly and never consumed; reserved built-in names cannot be shadowed.
 
 ### Key Settings
 
-```toml
-# Model selection
-# Saved main model and thinking live in [roles.orchestrator] in models.toml.
-# Dispatch slots and purposes live in [dispatch]; mode is standalone or orchestrated.
-# Saved dispatch changes apply next session.
+Agent behavior is selected in `[agent]`:
 
-# UI preferences
+```toml
+[agent]
+identity = "coder"                  # Main identity
+workflow = "minimal"                # Conversation workflow
+orchestration_strategy = "none"     # Delegation packaging strategy
+```
+
+Selections resolve CLI > environment > config > shipped default and freeze with resource content for the conversation. `/reload` reports changed selections and resources as pending; they apply to new conversations. `/clear` starts a conversation with current selections, while resume restores the frozen bundle. The saved main model and thinking preset are configured in `[roles.main]` in `models.toml`; purpose routes are configured under `[orchestration.routes.*]`.
+
+`system_prompt_id`, profile settings, dispatch settings, agent path/filter settings, and `CHARTREUX_ENABLED_AGENTS` are retired and rejected with actionable diagnostics. Custom identities come only from user prompts; the strict loader rejects malformed or empty resources, and reserved built-in names are unshadowable.
+
 theme = "auto"  # Follow terminal background, then OS light/dark preference
 disable_welcome_banner_animation = false
 autocopy_to_clipboard = true  # Enable automatic copying of selected text to clipboard
@@ -196,8 +198,6 @@ show_thinking_nodes = false  # Show reasoning/thinking nodes in the UI
 
 ```toml
 # Behavior
-system_prompt_id = "cli"          # Built-in "cli" or custom .md filename
-compaction_prompt_id = "compact"  # Compaction prompt: built-in "compact" or custom .md filename
 compaction_model = ""             # Canonical model or @role; empty uses current main model, same provider required
 enable_notifications = true
 enable_system_trust_store = false  # Use OS trust store for outbound HTTPS
@@ -231,16 +231,7 @@ Chartreux does not create product analytics or OpenTelemetry spans, configure te
 
 ### Model Catalog
 
-Providers, models, roles, and dispatch selection live in `~/.chartreux/models.toml` (or
-`$CHARTREUX_HOME/models.toml`), a sparse user overlay on the shipped catalog.
-`config.toml` contains runtime settings; it cannot define catalog or dispatch tables or save
-the main-model selection. The `[roles.orchestrator]` preset is the saved main-model default,
-not a dispatch-mode selector. `[dispatch]` configures the mode, slots, and purposes;
-saved dispatch changes apply next session. `/model` and `/thinking` override the current session. If a legacy
-`config.toml` contains `active_model`, edit `[roles.orchestrator]`; if it
-contains `providers` or `models` tables, run `chartreux models migrate` (then
-`chartreux models migrate --apply` after reviewing the preview). Use `/providers`
-to manage providers in Provider Settings, or `chartreux --setup` for onboarding.
+Providers, models, and roles live in `~/.chartreux/models.toml` (or `$CHARTREUX_HOME/models.toml`), a sparse user overlay on the shipped catalog. Configure the saved main-model default under `[roles.main]`. Purpose routes live under `[orchestration.routes.*]`; legacy `[dispatch]` input is retired and diagnosed with successor guidance. `/model` and `/thinking` override the current session. If a legacy `config.toml` contains `active_model`, move that selection to the `[roles.main]` preset; if it contains `providers` or `models` tables, run `chartreux models migrate` (then `chartreux models migrate --apply` after reviewing the preview). Use `/providers` to manage providers in Provider Settings, or `chartreux --setup` for onboarding.
 
 Generic providers support the `openai`, `openai-responses`, and `anthropic` API
 styles. The Mistral backend uses `backend = "mistral"`. Provider definitions may
@@ -372,17 +363,18 @@ enabled_skills = ["chartreux", "custom-*"]
 disabled_skills = ["experimental-*"]
 ```
 
-### Agent Configuration
+### Identity, Workflow, and Strategy
 
 ```toml
-# Additional agent search paths
-agent_paths = ["/path/to/custom/agents"]
+[agent]
+identity = "coder"                  # coder, orchestrator, researcher, reviewer, advisor, or user:<name>
+workflow = "minimal"                # minimal or user:<name>
+orchestration_strategy = "none"     # none, default, or user:<name>
 
-# Enable/disable discovered subagents
-enabled_agents = ["worker", "custom-*"]
-disabled_agents = ["experimental-*"]
+[orchestration.routes.<purpose>]
+# Minimum number of distinct models required
+# targets: required, non-empty list of exact model/identity/tier bindings
 
-# Background-agent retention; agents close on completion unless retained
 [subagents]
 retain_agents = false
 idle_ttl_seconds = 300
@@ -391,21 +383,13 @@ tombstone_ttl_seconds = 900
 max_tombstones = 32
 ```
 
-Chartreux has one primary agent; `--agent` and `Shift+Tab` mode selection are
-unavailable. `agent_paths`, `enabled_agents`, and `disabled_agents` control
-discovered subagents. If `enabled_agents` is set, only matching subagents are
-available; otherwise, `disabled_agents` excludes matching subagents. Background
-subagents close when their run completes unless they are retained: retention
-comes from the per-launch `retain: true` argument, a profile's `retain` setting,
-or the `retain_agents` default (precedence: launch argument, then profile, then
-global default). Retained agents stay resident while idle subject to the
-configured TTL and idle-agent cap; either setting may be `0` to disable that
-limit, and setting both to `0` retains an agent with no limits. Close-on-
-completion, eviction, and terminal-metadata expiry preserve completed results
-until result expiry; `release_agent` discards them.
+The five built-in identities are coder (optional delegation, unrestricted personal tools within grants), orchestrator (required delegation; personally non-mutating), and researcher, reviewer, advisor (read-only, non-mutating personal and delegated tools). Custom `user:<name>` identities are prompt-only and carry no enforced posture. Purpose routes bind launch targets, not permissions. Multi-seat purposes require an explicit seat; review execution uses coder with the shipped review overlay, while analysis seats use reviewer. Model diversity is checked by canonical model, not provider deployment.
 
-Routine tool execution has no approval dialog. Runtime denials, sensitive-file
-protections, workspace-root checks, and other scope checks remain enforced.
+Selections resolve CLI > environment > config > shipped default. The default model role is `@main`; `@orchestrator` is retired, with no alias. The conversation freezes identity/workflow/strategy content in its policy bundle. Reload reports edits as pending; resume uses the persisted bundle; `/clear` binds current selections. Resource layout is `~/.chartreux/prompts/`, `~/.chartreux/workflows/`, and `~/.chartreux/orchestration_strategies/`; only user resources resolve, with reserved built-in names and no shadowing. A per-launch `retain` overrides the global `[subagents].retain_agents` default; there is no identity-specific retention setting. Idle TTL and capacity are global defaults.
+
+Legacy `system_prompt_id`, agent path/filter settings, dispatch slots, and profile settings are retired. `chartreux doctor` reports actionable retirement errors; rename model role `@orchestrator` to `@main`.
+
+Routine tool execution has no approval dialog. Runtime denials, sensitive-file protections, workspace-root checks, and other scope checks remain enforced.
 
 ### MCP Servers
 
@@ -698,6 +682,9 @@ chartreux -c / --continue                # Continue most recent session in this 
 chartreux --resume [SESSION_ID]          # Resume a specific session
 chartreux -v / --version                 # Show version
 chartreux --setup                        # Run onboarding/setup
+chartreux --identity ID                  # Identity for a new conversation (e.g. coder, orchestrator, or user:name); frozen for that conversation
+chartreux --workflow ID                  # Workflow for a new conversation (built-in or custom workflow name)
+chartreux --orchestration-strategy ID    # Orchestration strategy for a new conversation (none, default, or a custom strategy name)
 chartreux --max-turns N                  # Max assistant turns (programmatic mode)
 chartreux --max-price DOLLARS            # Max cost limit (programmatic mode)
 chartreux --max-tokens N                 # Max total session tokens (programmatic mode)
@@ -715,31 +702,13 @@ scope checks remain enforced.
 
 ### Subagents
 
-- **worker**: General-purpose subagent with the `worker` role prompt; its default model role is `@worker`. It closes on completion unless retained.
-- **advisor**: Independent, read-only advisor with the `advisor` role prompt; its default model role is `@heavy`. Its tools are limited to `read_file`, `grep`, `web_search`, `web_fetch`, and `skill`. It ships retained by profile default (`retain = true`) with a 3600-second idle TTL.
-- **reviewer**: Independent, read-only reviewer with the `reviewer` role prompt; its default model role is `@worker`. It closes on completion unless retained.
+Chartreux ships identity-based agent selection; use `identity` rather than the retired profile `agent_type` axis. The built-in identities are `coder`, `orchestrator`, `researcher`, `reviewer`, and `advisor`; their authority posture is enforced by the harness. The default child identity is `coder`; read-only analysis identities are available for research, advice, and review. The `@main` role is the default model role, and purpose routes in `[orchestration.routes.*]` bind model, identity, tier, and optional seat. Routes organize launches, not permissions. Multi-seat purposes require an explicit seat; review execution uses coder with the shipped review overlay, while analysis seats use reviewer. Model diversity is measured by canonical model, not provider deployment.
 
-Routing is configured separately from profiles. Inspect the rendered dispatch
-slot table for the current session's purposes and eligible slots. Each slot
-specifies a profile, a model-role binding, purposes, and implementation/review
-eligibility; use its profile as `agent_type` and its launch binding in
-`config.model`, rather than guessing a model or relying on the profile default.
-View or configure `[dispatch]` in the user `models.toml` overlay. `mode` is the
-session-level enum `standalone` or `orchestrated`, selecting a shipped preset;
-slot entries may override its bindings and purposes. Dispatch is not defined in
-project configuration or agent profiles. Saved dispatch changes apply next
-session, not as a mid-session mode switch.
+The global `[subagents]` settings control retention defaults and capacity: `retain_agents`, `idle_ttl_seconds`, `max_idle_agents`, `tombstone_ttl_seconds`, and `max_tombstones`. By default, background agents close when their run completes unless they are retained; completed results remain retrievable until result expiry. A per-launch `retain` overrides the global `[subagents].retain_agents` default. Its precedence is the launch argument, then the global `[subagents].retain_agents` setting; there is no identity-specific retention setting. On reuse, omit `retain` to inherit the instance's committed retention policy.
 
-Use `task(agent_type="worker", task=...)` to create an agent instance. The agent type is a profile name (default `worker`); `agent_id` identifies an agent instance instead, and each instance also has a display-only `{profile}-{model}-{number}` name — `agent_id` remains the only handle. The `agent-N` syntax (digits after `agent-`) is reserved for instance handles and rejected in `agent_type` before dispatch. Profiles are presets: the main agent can choose a configured canonical model or role, predefined system prompt, inline instructions, tools, and thinking for an individual launch, but never beyond the parent authority ceiling. Per-call configuration is not written to `config.toml`; committed child launch state is retained in child-session metadata and revalidated fail-closed on resume. Launch in the background even when the result is a dependency, then wait for it with `wait_for_agent`; set `background: false` only when blocking is truly required.
-Background agents close when their run completes unless they are retained: the completed result stays retrievable, and the handle lingers as `closed` terminal metadata until that metadata expires. Retention is opt-in — pass `retain: true`, or use a profile that ships retention; precedence is the launch argument, then the profile's `retain` setting, then the `[subagents].retain_agents` default. For a bounded design, feature, or review loop, keep the engagement cast — advisors, planner, implementors, and reviewers — resident while exchanging findings, requirements, and plan updates between them; advisors are retained by profile default, and workers or reviewers need `retain: true`.
-Background launches return stable `agent_id` and per-invocation `run_id` handles, and include guidance to continue a retained instance with `task(agent_id=..., background=true, task=...)`.
-`check_agents.reuse_guidance` also describes this reuse; omit `agent_type` to retain the profile, and omit `retain` to inherit the instance's committed retention policy (`retain: false` is a final continuation that closes afterward).
-`task_summary` is an optional concise action plus subsystem or feature (up to 240 characters); it identifies retained work in `check_agents`. `check_agents` lists the bounded inventory — resident agents plus `closed`/`evicted` terminal metadata within its metadata window — and includes each agent's name, effective model, thinking, initial and current task summaries, idle duration, and `ttl_remaining_seconds`; inspect those values and history suitability before reuse. Reuse an `idle` agent with `task(agent_id=..., background=true)` only for a genuine corrective continuation with the same profile and feature or subsystem; include the current scope and intervening changes because retained conversation is not proof that the working tree is unchanged. Persona is immutable on re-task: start a new agent when instructions, system prompt, role, stack, or independent judgment must change. A `running` agent is busy: wait when its result is required, and create another only for independent, non-conflicting work. Profile mismatch prevents reuse. The TTL estimate is advisory only. Retained idle agents can be evicted by the TTL or idle cap. A `closed` or `evicted` agent cannot be reused, but its completed result remains available through `get_agent_result(agent_id, run_id)` or `wait_for_agent(agent_id, run_id, timeout)` until result expiry.
-`wait_for_agent` returns a typed disposition: `completed` carries the finished run's result, and `still_running` — at the default 1500-second timeout, or an explicit one — carries the wait progress and guidance to end your turn and re-invoke the wait in a later turn; a timeout stops only the wait, never the run. A result-expired error means the result is gone; an unknown-agent or unknown-run error means the handle is invalid.
-For further work after closure or eviction, launch a new agent. `release_agent(agent_id)` closes a resident agent or removes a `closed`/`evicted` tombstone, and discards its retained results — retrieve results before releasing; release agents when the engagement concludes. Background agents cannot launch background agents.
+Use `task(identity="researcher", task=...)` to create an agent instance. `agent_id` identifies that instance, with a display-only name; `agent_id` remains the only handle. Launch in the background even when the result is a dependency, then wait for it with `wait_for_agent`. A wait returns `completed` or `still_running`; the default timeout is 1500 seconds and does not stop the run. `task_summary` identifies retained work in `check_agents`; `get_agent_result` retrieves completed results. The inventory reports `ttl_remaining_seconds` as an advisory estimate. Retained instances can be reused for a genuine continuation; `check_agents` shows their availability, effective model and thinking, task summaries, and TTL estimate. Reuse an `idle` agent only for a genuine continuation with the same identity and feature or subsystem; include current scope and intervening changes because retained conversation is not proof the working tree is unchanged. Persona is immutable on re-task. A `running` agent is busy; wait if its result is needed. Idle retained agents may be evicted by TTL or capacity. Closed and evicted agents cannot be reused, though results remain retrievable until expiry. `release_agent` discards retained results, so retrieve them first. Background agents cannot launch background agents.
 
-`agent_paths`, `enabled_agents`, and `disabled_agents` control discovered
-subagents. Custom subagents are TOML files in `~/.chartreux/agents/NAME.toml`.
+The `/agents` browser shows identity and agent lifecycle state alongside task summaries, model, run status, and idle/TTL information. Use it to inspect or manage active, idle, and recent agents; release discards retained results.
 
 ## Built-in Slash Commands
 
@@ -750,7 +719,7 @@ subagents. Custom subagents are TOML files in `~/.chartreux/agents/NAME.toml`.
 - `/theme` - Select Textual UI theme; `auto` follows terminal/OS appearance (persisted in config)
 - `/settings` - Browse and edit curated user settings in the bottom panel
 - `/web-search` - Configure the web-search provider and credentials in Settings
-- `/reload` - Reload configuration, agent instructions, and skills from disk
+- `/reload` - Refresh AGENTS.md, skills, and catalogs; frozen identity/workflow/strategy content stays bound to this conversation, and reports pending selections or resource edits for new conversations
 - `/open-config-file` - Open the user `~/.chartreux/config.toml` in the user's editor
   (`$VISUAL`/`$EDITOR`, falling back to `nano`); creates the file with a
   commented template when absent and reloads configuration after editing if the
@@ -767,7 +736,7 @@ subagents. Custom subagents are TOML files in `~/.chartreux/agents/NAME.toml`.
   Active, Retained Idle, and Recent (closed/evicted terminal metadata) —
   behind the Resident (default), Active, Idle, Recent, and All filter tabs,
   cycled with Left/Right. Rows show the agent's name with its handle dimmed,
-  plus profile, task summaries, availability, run status, model, turns used,
+  plus identity, task summaries, availability, run status, model, turns used,
   run ID, and idle/TTL information. Select an agent to open its bordered
   transcript pane, available within the terminal-metadata window when a saved
   transcript exists; running agents refresh live about once per second. Stop a
@@ -991,7 +960,7 @@ offered inline, and no popup is shown.
 - `CHARTREUX_HOME` - Override the Chartreux home directory (default: `~/.chartreux`)
 - `MISTRAL_API_KEY` - API key for Mistral provider
 - `CHARTREUX_ACTIVE_MODEL` - Override active model
-- `CHARTREUX_*` - Override a config field using its schema name; nested fields use `__`, such as `CHARTREUX_SESSION_LOGGING__ENABLED`. Supplied unknown names or malformed values fail with an error identifying the `environment` source and field, without echoing the offending value. Invalid empty numeric, boolean, or structured values are errors, while valid empty strings and `[]` remain values (for example, `CHARTREUX_ACTIVE_MODEL=""` and `CHARTREUX_ENABLED_AGENTS="[]"`).
+- `CHARTREUX_*` - Override a config field using its schema name; nested fields use `__`, such as `CHARTREUX_SESSION_LOGGING__ENABLED`. Supplied unknown names or malformed values fail with an error identifying the `environment` source and field, without echoing the offending value. `CHARTREUX_ENABLED_AGENTS` is retired and rejected.
 - Exact non-config controls remain honored by their consumers: `CHARTREUX_HOME`, `CHARTREUX_TYPING_GRACE_PERIOD_MS`, `CHARTREUX_ACP_LOGGING_ENABLED`, `CHARTREUX_TEST_DISABLE_KEYRING`, and `CHARTREUX_TEST_DISABLE_AUTO_TITLE`. Provider variables such as `MISTRAL_API_KEY` are separate. Legacy `VIBE_*` variables are not a fallback.
 - `LOG_LEVEL` - Overrides `log_level` config for `$CHARTREUX_HOME/logs/chartreux.log`.
   One of `DEBUG`, `INFO`, `WARNING` (default), `ERROR`, `CRITICAL`. Invalid values
@@ -1051,7 +1020,7 @@ To help the user modify their Chartreux configuration:
 2. **Create a backup when authorized**: Before editing an existing file, copy it to
    `config.toml.bak` in the same directory only when filesystem authority permits
    both operations. This applies to any existing config file you are about to modify
-   (`config.toml`, `trusted_folders.toml`, agent TOML files, etc.)
+   (`config.toml`, `trusted_folders.toml`, `models.toml`, etc.)
 3. **Edit the TOML file when authorized**: Make changes using the edit tool; do not
    claim that a permission prompt will be shown or that authorization will succeed.
 4. **Reload**: The user can run `/reload` to apply changes without restarting

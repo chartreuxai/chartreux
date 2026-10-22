@@ -187,13 +187,6 @@ class HarnessFilesManager:
             if d.is_dir()
         ]
 
-    @property
-    def user_agents_dirs(self) -> list[Path]:
-        if "user" not in self.sources:
-            return []
-        d = GLOBAL_AGENTS_DIR.path
-        return [d] if d.is_dir() else []
-
     def _collect_project_roots(self) -> LocalConfigDirs:
         result = LocalConfigDirs()
         for root in self.project_roots:
@@ -209,8 +202,35 @@ class HarnessFilesManager:
         return list(self._collect_project_roots().skills)
 
     @property
-    def project_agents_dirs(self) -> list[Path]:
-        return list(self._collect_project_roots().agents)
+    def retired_agent_dirs(self) -> list[Path]:
+        """Existing agent-profile directories — retired, detected, never loaded.
+
+        The agents/*.toml profile axis is retired (package 16a): nothing
+        discovers or consumes these directories any more. They are reported so
+        the retirement is loud; the files are never deleted or converted.
+        """
+        dirs: list[Path] = []
+        if "user" in self.sources:
+            user_agents = GLOBAL_AGENTS_DIR.path
+            if user_agents.is_dir():
+                dirs.append(user_agents)
+        dirs.extend(self._collect_project_roots().agents)
+        return dirs
+
+    @property
+    def retired_project_prompt_dirs(self) -> list[Path]:
+        """Existing project-level prompt directories — retired, never loaded.
+
+        Project-level custom prompt directories stop resolving (accepted v1
+        breakage, design §12): custom identities, workflows, and strategies
+        are user-level only. The directories are reported so the retirement is
+        loud; the files are never deleted or converted.
+        """
+        return [
+            candidate
+            for root in self.project_roots
+            if (candidate := root / ".chartreux" / "prompts").is_dir()
+        ]
 
     @property
     def user_config_file(self) -> Path:
@@ -218,11 +238,14 @@ class HarnessFilesManager:
 
     @property
     def project_prompts_dirs(self) -> list[Path]:
-        return [
-            candidate
-            for root in self.project_roots
-            if (candidate := root / ".chartreux" / "prompts").is_dir()
-        ]
+        """Always empty: project-level custom prompt directories are retired.
+
+        Package 16a keeps this property so the retired prompt-id loader
+        (``chartreux.core.prompts``, package 16b's file) never consumes project
+        prompt files; the loud detection lives in
+        :attr:`retired_project_prompt_dirs`.
+        """
+        return []
 
     @property
     def user_prompts_dirs(self) -> list[Path]:

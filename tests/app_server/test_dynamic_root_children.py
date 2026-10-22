@@ -78,7 +78,7 @@ def _task_call(
 ) -> ToolCall:
     arguments: dict[str, object] = {
         "task": "Read the granted note",
-        "agent_type": "worker",
+        "identity": "coder",
         "background": background,
     }
     if agent_id is not None:
@@ -384,7 +384,7 @@ async def test_child_dispatched_before_a_root_grant_stays_frozen_across_retask(
             registry,
             TaskArgs(
                 task="Read the granted note",
-                agent_type="worker",
+                identity="coder",
                 background=True,
                 agent_id=record.agent_id,
             ),

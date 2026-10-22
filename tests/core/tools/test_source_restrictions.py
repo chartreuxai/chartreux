@@ -8,8 +8,8 @@ import pytest
 
 from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.config.builder import ConfigBuilder
-from chartreux.core.config.layers.agent_profile import AgentProfileLayer
 from chartreux.core.config.layers.default import DefaultConfigLayer
+from chartreux.core.config.layers.launch_overrides import LaunchOverridesLayer
 from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.tools.base import ToolPermission
 from chartreux.core.tools.manager import ToolManager
@@ -35,7 +35,7 @@ async def test_source_restrictions_beat_merge_grants_and_scratch(
                 }
             },
         ),
-        AgentProfileLayer(
+        LaunchOverridesLayer(
             data={
                 "tools": {
                     "write_file": {
@@ -78,7 +78,7 @@ async def test_fixed_inherited_sources_survive_local_mode_replacement() -> None:
         OverridesLayer(
             name="user", data={"tools": {"write_file": {"permission": "never"}}}
         ),
-        AgentProfileLayer(data={"tools": {"edit": {"permission": "never"}}}),
+        LaunchOverridesLayer(data={"tools": {"edit": {"permission": "never"}}}),
     ])
     parent = await builder.build_candidate()
     inherited = tuple(

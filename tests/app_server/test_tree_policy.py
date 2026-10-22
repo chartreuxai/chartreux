@@ -13,7 +13,6 @@ from uuid import uuid4
 
 import pytest
 
-from chartreux.agents import AgentSafety
 from chartreux.app_server._execution import SessionExecutionKind
 from chartreux.app_server._runtime import AgentRuntimeFactory
 from chartreux.app_server._sessions import SessionRuntime, SessionRuntimeRegistry
@@ -29,9 +28,9 @@ from chartreux.app_server.protocol import (
 )
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._loop import AgentLoopStateError
-from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config import MCPHttp
 from chartreux.core.config.orchestrator import ConfigOrchestrator
+from chartreux.core.llm_models import AvailableFunction
 from chartreux.core.session_types import SessionMetadata
 from chartreux.core.tools.base import ToolPermissionError
 from chartreux.core.tools.mcp.authorization import (
@@ -58,16 +57,28 @@ async def ignore(*args: Any, **kwargs: Any) -> None:
     pass
 
 
-NEUTRAL_TEST_AGENT = AgentProfile(
-    name="neutral-test-agent",
-    display_name="Neutral Test Agent",
-    description="Unrestricted test subagent",
-    safety=AgentSafety.NEUTRAL,
-)
+def canonical_specs(specs: list[AvailableFunction]) -> list[AvailableFunction]:
+    """The specs with the task description's lines sorted.
+
+    A policy refresh rebuilds the ToolManager around the conversation's
+    FROZEN route table (sorted by purpose), while specs captured before it
+    carry the live configured table's order — the same content, so the
+    stability comparison normalizes the launch-target row order.
+    """
+    return [
+        spec.model_copy(
+            update={"description": "\n".join(sorted(spec.description.splitlines()))}
+        )
+        if spec.name == "task"
+        else spec
+        for spec in specs
+    ]
 
 
-def register_neutral_test_agent(loop: AgentLoop) -> None:
-    loop.agent_manager._discovered[NEUTRAL_TEST_AGENT.name] = NEUTRAL_TEST_AGENT
+# The custom identity the tree helper launches through (package 16a: custom
+# profiles are custom identities; the app_server conftest installs the
+# ``neutral-test-agent.md`` prompt resource into the per-test config_dir).
+NEUTRAL_TEST_AGENT_NAME = "neutral-test-agent"
 
 
 @asynccontextmanager
@@ -80,12 +91,11 @@ async def tree(
     registry.bind_root(runtimes[0])
     try:
         for parent, agent in [
-            (root, NEUTRAL_TEST_AGENT.name),
-            (None, NEUTRAL_TEST_AGENT.name),
-            (root, NEUTRAL_TEST_AGENT.name),
+            (root, NEUTRAL_TEST_AGENT_NAME),
+            (None, NEUTRAL_TEST_AGENT_NAME),
+            (root, NEUTRAL_TEST_AGENT_NAME),
         ]:
             parent = parent or runtimes[1].agent_loop
-            register_neutral_test_agent(parent)
             child = await AgentRuntimeFactory().create_child(parent, agent)
             runtime = registry._build_child_runtime(child)
             registry._children[child.session_id] = runtime
@@ -160,7 +170,7 @@ async def test_transitive_refresh_preserves_own_assertions_and_mode(
         assert '"A"' in (tmp_path / "settings.toml").read_text()
         # A later child captures the newly accepted ancestor ceiling.
         later = await AgentRuntimeFactory().create_child(
-            runtimes[0].agent_loop, "worker"
+            runtimes[0].agent_loop, "coder"
         )
         try:
             await later.wait_until_ready()
@@ -395,7 +405,9 @@ async def test_policy_staging_does_not_touch_expired_mcp(
                 tuple(getattr(loop.mcp_registry, f) for f in fields)
                 == before_registry[index]
             )
-            assert loop.tool_manager.available_tool_specs() == before_specs[index]
+            assert canonical_specs(
+                loop.tool_manager.available_tool_specs()
+            ) == canonical_specs(before_specs[index])
             providers[index].resolve.assert_not_awaited()
             providers[index].reject.assert_not_awaited()
             sinks[index].assert_not_called()
@@ -433,7 +445,7 @@ async def test_public_serialized_session_only_policy(
         assert registry._root is not None
         parent = registry._root.agent_loop
         descendants: list[AgentLoop] = []
-        for agent in ("worker", "worker"):
+        for agent in ("coder", "coder"):
             child = await AgentRuntimeFactory().create_child(parent, agent)
             registry._children[child.session_id] = registry._build_child_runtime(child)
             descendants.append(child)

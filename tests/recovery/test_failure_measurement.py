@@ -89,7 +89,7 @@ async def test_f5_monitor_failure_measures_observed_turns(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="work", agent_type="worker", background=True, retain=True),
+            TaskArgs(task="work", identity="coder", background=True, retain=True),
             InvokeContext(tool_call_id="t1", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None
@@ -141,7 +141,7 @@ async def test_f5_turn_failure_preserves_typed_evidence(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="work", agent_type="worker", background=True, retain=True),
+            TaskArgs(task="work", identity="coder", background=True, retain=True),
             InvokeContext(tool_call_id="t1", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None
@@ -214,7 +214,7 @@ async def test_f5_zero_request_launch_failure_shape(
         )
         launch = await _background_result(
             registry,
-            TaskArgs(task="work", agent_type="worker", background=True, retain=True),
+            TaskArgs(task="work", identity="coder", background=True, retain=True),
             InvokeContext(tool_call_id="t1", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None
@@ -282,7 +282,7 @@ async def test_f5_secondary_failure_preserves_the_primary_evidence(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="work", agent_type="worker", background=True, retain=True),
+            TaskArgs(task="work", identity="coder", background=True, retain=True),
             InvokeContext(tool_call_id="t1", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None

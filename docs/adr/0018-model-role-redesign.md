@@ -1,5 +1,16 @@
 # 0018 Model-role dispatch redesign
 
+> **Status: SUPERSEDED IN PART by the v0.5.7 identity-based agent architecture.**
+> The dispatch-mode enum (section A), the slot model (section D), the profile
+> axis, and the `[dispatch]` catalog overlay are retired: orchestration is
+> selected through the `[agent]` identity/workflow/orchestration-strategy
+> selections and configured through `[orchestration.routes.*]`. The purpose
+> vocabulary (section C) and the frozen, session-bound policy semantics
+> (section H) carried forward into the shipped architecture. The original
+> decision below is retained as historical context, not an active
+> implementation contract. See the [identity
+> architecture](../reference/identity-architecture.md).
+
 ## Status
 
 Accepted.

@@ -11,7 +11,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from chartreux.core.agents.models import AgentProfile, AgentSafety
 from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session.session_loader import SessionLoader
@@ -21,7 +20,6 @@ from chartreux.core.tools.manager import ToolManager
 from tests.conftest import build_test_vibe_config
 from tests.session.persistence._session_persistence_support import (
     disabled_session_config as disabled_session_config,
-    mock_agent_profile as mock_agent_profile,
     mock_tool_manager as mock_tool_manager,
     mock_vibe_config as mock_vibe_config,
     session_config as session_config,
@@ -79,7 +77,6 @@ async def test_default_disk_full_is_soft(
         AgentStats(),
         mock_vibe_config,
         mock_tool_manager,
-        None,
     )
     await save
     assert not logger.persisted
@@ -98,13 +95,6 @@ class TestSessionLoggerSaveInteraction:
             stats=AgentStats(),
             config=build_test_vibe_config(),
             tool_manager=MagicMock(),
-            agent_profile=AgentProfile(
-                name="test",
-                display_name="Test",
-                description="Test agent",
-                safety=AgentSafety.NEUTRAL,
-                overrides={},
-            ),
         )
 
         assert result is None
@@ -115,7 +105,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         """Test that save_interaction successfully saves session data."""
         session_id = "test-session-123"
@@ -138,7 +127,6 @@ class TestSessionLoggerSaveInteraction:
             stats=stats,
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         # Verify behavior via file system
@@ -165,7 +153,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         """Test that system prompt is saved in metadata and not in messages."""
         session_id = "test-session-123"
@@ -186,7 +173,6 @@ class TestSessionLoggerSaveInteraction:
             stats=stats,
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         assert logger.session_dir is not None
@@ -214,7 +200,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         """Test that save_interaction correctly handles existing messages."""
         session_id = "test-session-123"
@@ -236,7 +221,6 @@ class TestSessionLoggerSaveInteraction:
             stats=stats,
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         # Second save - add more messages
@@ -255,7 +239,6 @@ class TestSessionLoggerSaveInteraction:
             stats=updated_stats,
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         # Verify behavior via file system: metadata was updated
@@ -279,7 +262,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         """Test that save_interaction does nothing when there are no new messages."""
         session_id = "test-session-123"
@@ -299,7 +281,6 @@ class TestSessionLoggerSaveInteraction:
             stats=stats,
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         assert logger.session_dir is not None
@@ -317,7 +298,6 @@ class TestSessionLoggerSaveInteraction:
             stats=stats,
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         with open(metadata_file) as f:
@@ -336,7 +316,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         """Test that save_interaction handles sessions with no user messages."""
         session_id = "test-session-123"
@@ -357,7 +336,6 @@ class TestSessionLoggerSaveInteraction:
             stats=stats,
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         # Verify behavior via file system
@@ -383,7 +361,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         session_id = "test-session-123"
         logger = SessionLogger(session_config, session_id)
@@ -407,7 +384,6 @@ class TestSessionLoggerSaveInteraction:
             stats=stats,
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         assert logger.session_dir is not None
@@ -424,7 +400,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         session_id = "test-session-123"
         logger = SessionLogger(session_config, session_id)
@@ -446,7 +421,6 @@ class TestSessionLoggerSaveInteraction:
             stats=stats,
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         assert logger.session_dir is not None
@@ -468,7 +442,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         logger = SessionLogger(session_config, "test-session-123")
 
@@ -503,14 +476,12 @@ class TestSessionLoggerSaveInteraction:
                 stats=AgentStats(steps=1),
                 config=mock_vibe_config,
                 tool_manager=mock_tool_manager,
-                agent_profile=mock_agent_profile,
             )
             await logger.save_interaction(
                 messages=messages,
                 stats=AgentStats(steps=2),
                 config=mock_vibe_config,
                 tool_manager=mock_tool_manager,
-                agent_profile=mock_agent_profile,
             )
 
         assert persist_messages_mock.call_count == 2
@@ -548,7 +519,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         logger = SessionLogger(session_config, "corrupt-transcript")
@@ -564,7 +534,6 @@ class TestSessionLoggerSaveInteraction:
                 AgentStats(),
                 mock_vibe_config,
                 mock_tool_manager,
-                mock_agent_profile,
             )
 
         quarantined = list(logger.session_dir.glob("messages.jsonl.corrupt-*"))
@@ -582,7 +551,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         logger = SessionLogger(session_config, "shrink-history")
         stats = AgentStats(steps=1)
@@ -598,7 +566,6 @@ class TestSessionLoggerSaveInteraction:
             stats=stats,
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         await logger.save_interaction(
@@ -606,7 +573,6 @@ class TestSessionLoggerSaveInteraction:
             stats=stats,
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         assert logger.session_dir is not None
@@ -622,7 +588,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         logger = SessionLogger(session_config, "shrink-regrow")
         stats = AgentStats(steps=1)
@@ -633,7 +598,6 @@ class TestSessionLoggerSaveInteraction:
                 stats=stats,
                 config=mock_vibe_config,
                 tool_manager=mock_tool_manager,
-                agent_profile=mock_agent_profile,
             )
 
         system = LLMMessage(role=Role.system, content="System prompt")
@@ -670,7 +634,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         logger = SessionLogger(session_config, "reduced-to-system")
         stats = AgentStats(steps=1)
@@ -682,7 +645,6 @@ class TestSessionLoggerSaveInteraction:
                 stats=stats,
                 config=mock_vibe_config,
                 tool_manager=mock_tool_manager,
-                agent_profile=mock_agent_profile,
             )
 
         await save([
@@ -716,7 +678,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         logger = SessionLogger(session_config, "same-count-diff-tail")
         stats = AgentStats(steps=1)
@@ -728,7 +689,6 @@ class TestSessionLoggerSaveInteraction:
                 stats=stats,
                 config=mock_vibe_config,
                 tool_manager=mock_tool_manager,
-                agent_profile=mock_agent_profile,
             )
 
         await save([
@@ -756,7 +716,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         logger = SessionLogger(session_config, "legacy-no-fingerprint")
         stats = AgentStats(steps=1)
@@ -768,7 +727,6 @@ class TestSessionLoggerSaveInteraction:
                 stats=stats,
                 config=mock_vibe_config,
                 tool_manager=mock_tool_manager,
-                agent_profile=mock_agent_profile,
             )
 
         await save([
@@ -801,7 +759,6 @@ class TestSessionLoggerSaveInteraction:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         logger = SessionLogger(session_config, "rewind-to-top")
         stats = AgentStats(steps=1)
@@ -815,7 +772,6 @@ class TestSessionLoggerSaveInteraction:
                 stats=stats,
                 config=mock_vibe_config,
                 tool_manager=mock_tool_manager,
-                agent_profile=mock_agent_profile,
                 allow_empty=allow_empty,
             )
 

@@ -104,7 +104,6 @@ from tests.conftest import build_test_agent_loop
 from tests.mock.utils import mock_llm_chunk
 from tests.recovery.conftest import FakeClock, RetryableFault
 from tests.session.persistence._session_persistence_support import (
-    mock_agent_profile as mock_agent_profile,
     mock_tool_manager as mock_tool_manager,
     mock_vibe_config as mock_vibe_config,
     session_config as session_config,
@@ -366,7 +365,7 @@ async def test_f3_cancel_blocked_request_cleans_up(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="work", agent_type="worker", background=True),
+            TaskArgs(task="work", identity="coder", background=True),
             InvokeContext(tool_call_id="t1", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None
@@ -422,7 +421,7 @@ async def test_f3_delayed_cancellation_acknowledgement(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="work", agent_type="worker", background=True),
+            TaskArgs(task="work", identity="coder", background=True),
             InvokeContext(tool_call_id="t1", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None
@@ -511,7 +510,7 @@ async def test_f3_cancel_during_backoff_stops_before_next_attempt(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="work", agent_type="worker", background=True),
+            TaskArgs(task="work", identity="coder", background=True),
             InvokeContext(tool_call_id="t1", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None
@@ -564,7 +563,7 @@ async def test_f3_borrowed_backend_cleanup_and_sibling_survival(
     try:
         launch_a = await _background_result(
             registry,
-            TaskArgs(task="child A", agent_type="worker", background=True),
+            TaskArgs(task="child A", identity="coder", background=True),
             InvokeContext(tool_call_id="t1", session_id=parent.session_id),
         )
         assert launch_a.agent_id is not None and launch_a.run_id is not None
@@ -574,7 +573,7 @@ async def test_f3_borrowed_backend_cleanup_and_sibling_survival(
         await asyncio.wait_for(gate_a[0].wait(), timeout=2)
         launch_b = await _background_result(
             registry,
-            TaskArgs(task="child B", agent_type="worker", background=True, retain=True),
+            TaskArgs(task="child B", identity="coder", background=True, retain=True),
             InvokeContext(tool_call_id="t2", session_id=parent.session_id),
         )
         assert launch_b.agent_id is not None and launch_b.run_id is not None
@@ -839,7 +838,6 @@ async def test_f4_metadata_lag_boundary(
     session_config: SessionLoggingConfig,
     mock_vibe_config: ChartreuxConfigSchema,
     mock_tool_manager: Any,
-    mock_agent_profile: Any,
 ) -> None:
     """Metadata lag: messages.jsonl is authoritative; meta.json may lag.
 
@@ -857,7 +855,6 @@ async def test_f4_metadata_lag_boundary(
         stats=AgentStats(steps=1),
         config=mock_vibe_config,
         tool_manager=mock_tool_manager,
-        agent_profile=mock_agent_profile,
     )
     assert logger.session_dir is not None
     messages_path = logger.session_dir / "messages.jsonl"
@@ -876,7 +873,6 @@ async def test_f4_metadata_lag_boundary(
         stats=AgentStats(steps=2),
         config=mock_vibe_config,
         tool_manager=mock_tool_manager,
-        agent_profile=mock_agent_profile,
     )
     transcript_lines = messages_path.read_text().splitlines()
     assert len(transcript_lines) == 3
@@ -961,8 +957,8 @@ async def test_f4_resume_boundary_malformed_tails(tmp_path: Path) -> None:
     loaded, _metadata = SessionLoader.load_session(session_dir)
     assert loaded[0].context_boundary == "compaction"
 
-    # (f) Launch metadata: the stored envelope parses as session metadata and
-    # keeps the committed profile (resume_child's profile-match check reads it).
+    # (f) Launch metadata: a stored legacy V1 envelope still parses as
+    # session metadata (resume rejects it later with new-session guidance).
     write(
         '{"role": "user", "content": "ok"}\n',
         {
@@ -975,15 +971,10 @@ async def test_f4_resume_boundary_malformed_tails(tmp_path: Path) -> None:
             "username": "test-user",
             "environment": {"working_directory": str(tmp_path)},
             "launch_config": {
-                "version": 2,
+                "version": 1,
                 "profile": "worker",
+                "overrides": {},
                 "persona": {"system_prompt_id": "tests", "instructions": ""},
-                "committed_model": {
-                    "base_model": "glm-5-3",
-                    "provider": "mistral",
-                    "wire_name": "zai-glm-5-3",
-                    "catalog_revision": "test-fixture",
-                },
             },
         },
     )
@@ -991,9 +982,8 @@ async def test_f4_resume_boundary_malformed_tails(tmp_path: Path) -> None:
     metadata = SessionMetadata.model_validate(raw_metadata)
     envelope = metadata.launch_config
     assert envelope is not None
-    assert envelope.version == 2
+    assert envelope.version == 1
     assert envelope.profile == "worker"
-    assert envelope.committed_model.base_model == "glm-5-3"
 
 
 class _StubResultsView:

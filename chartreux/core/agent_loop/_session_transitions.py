@@ -25,6 +25,12 @@ patches keep intercepting. Session-ID minting resolves the patched
 module-level ``generate_session_id`` surface through a facade callback, and
 the session logger is read through a getter because it is constructed after
 this service and instance-patched by tests.
+
+Package 10 (design §6, §10): the prepared records carry the conversation's
+frozen policy bundle. Resume activates the PERSISTED bundle — the persisted
+policy record — and rebinds its committed identity binding; a root reset
+binds a FRESH bundle from the current selections (``/clear`` binds fresh
+resources), while a subagent rewind keeps the child's own bound bundle.
 """
 
 from __future__ import annotations
@@ -33,7 +39,9 @@ import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
 
+from chartreux.core.agent_loop._config_transactions import _policy_facts_from_bundle
 from chartreux.core.agent_loop._file_state_context import FileStateContext
 from chartreux.core.agent_loop._loop_types import RootAccountingOwner
 from chartreux.core.agents.manager import AgentManager
@@ -42,15 +50,16 @@ from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.deferred_questions import DeferredQuestionStore
 from chartreux.core.dispatch.renderer import task_description_for_config
 from chartreux.core.dispatch.session import (
-    BoundDispatchPolicy,
-    bind_policy,
-    resume_policy,
+    bind_policy_bundle,
+    bound_identity_reference,
+    resume_policy_bundle,
 )
 from chartreux.core.events import BaseEvent
 from chartreux.core.file_state import FileStateStore
 from chartreux.core.llm_models import LLMMessage
 from chartreux.core.message_list import MessageList
 from chartreux.core.middleware import MiddlewarePipeline
+from chartreux.core.policy.manifest import routes_from_snapshot
 from chartreux.core.session.session_id import extract_suffix
 from chartreux.core.session.session_lease import SessionLease
 from chartreux.core.session.session_logger import SessionLogger
@@ -59,6 +68,11 @@ from chartreux.core.skills.manager import SkillManager
 from chartreux.core.tools.builtins.todo import TodoState
 from chartreux.core.tools.manager import NoSuchToolError, ToolManager
 from chartreux.observability.logging import logger
+
+if TYPE_CHECKING:
+    from chartreux.core.config.harness_files import HarnessFilesManager
+    from chartreux.core.policy.bundle import ActivatedPolicy, BundleStore
+    from chartreux.core.policy.composition import ExecutionContext
 
 
 class _PrepareScratchpad:
@@ -72,7 +86,14 @@ _PREPARE_SCRATCHPAD = _PrepareScratchpad()
 class _PreparedResume:
     """Temporary values computed by resume preparation, applied by the loop's commit."""
 
-    resumed_policy: BoundDispatchPolicy
+    # The resumed conversation's activated policy bundle: the persisted policy
+    # record (design §6, §10). The commit re-installs its committed identity
+    # binding and serves its frozen content.
+    resumed_policy_bundle: ActivatedPolicy
+    resumed_identity: str
+    # The rebuilt SkillManager: eligibility reads the RESUMED conversation's
+    # frozen selections (the persisted bundle's), never the source loop's.
+    resumed_skill_manager: SkillManager
     replacement_jobs: BackgroundJobRegistry | None
     replacement_port: BackgroundJobsPort | None
     owner: RootAccountingOwner | None
@@ -88,11 +109,36 @@ class _PreparedReset:
 
     session_id: str
     parent_session_id: str | None
-    new_policy: BoundDispatchPolicy
+    # The newly bound policy bundle: fresh from the current selections for a
+    # root reset (``/clear``), the child's own bound bundle for a rewind.
+    new_policy_bundle: ActivatedPolicy
+    new_identity: str
+    # The rebuilt SkillManager: eligibility reads the NEW conversation's
+    # frozen selections (the freshly bound bundle's), never the previous
+    # conversation's.
+    new_skill_manager: SkillManager
     new_task_description: str
     new_prompt: str
     owner: RootAccountingOwner | None
     lease: SessionLease | None
+
+
+class _RenderSystemPrompt(Protocol):
+    """The loop's prompt-render seam, late-bound so instance patches intercept.
+
+    ``activated_policy`` renders a DIFFERENT conversation's bundle (resume and
+    reset preparation render the bundle being bound); the default serves the
+    loop's own bound one.
+    """
+
+    def __call__(
+        self,
+        skill_manager: SkillManager,
+        config: ChartreuxConfigSchema,
+        scratchpad_dir: Path | None | _PrepareScratchpad,
+        *,
+        activated_policy: ActivatedPolicy | None = None,
+    ) -> str: ...
 
 
 class SessionTransitions:
@@ -130,21 +176,18 @@ class SessionTransitions:
         auto_title_task_getter: Callable[[], asyncio.Task[None] | None],
         require_background_jobs_idle: Callable[[], None],
         prepare_scratchpad: Callable[[str], Path | None],
-        render_system_prompt: Callable[
-            [
-                SkillManager,
-                ChartreuxConfigSchema,
-                BoundDispatchPolicy | None,
-                Path | None | _PrepareScratchpad,
-            ],
-            str,
-        ],
+        render_system_prompt: _RenderSystemPrompt,
         messages: MessageList,
         deferred_questions: DeferredQuestionStore,
         session_id_getter: Callable[[], str],
         parent_session_id_getter: Callable[[], str | None],
         session_lease_getter: Callable[[], SessionLease | None],
-        bound_dispatch_policy_getter: Callable[[], BoundDispatchPolicy],
+        bound_policy_getter: Callable[[], ActivatedPolicy],
+        bound_identity_getter: Callable[[], str],
+        bundle_store_getter: Callable[[], BundleStore],
+        cwd_getter: Callable[[], Path],
+        harness_files_getter: Callable[[], HarnessFilesManager],
+        execution_context_getter: Callable[[], ExecutionContext],
         session_logger_getter: Callable[[], SessionLogger],
         middleware_pipeline_getter: Callable[[], MiddlewarePipeline],
         reset_session: Callable[[bool], Awaitable[None]],
@@ -163,8 +206,8 @@ class SessionTransitions:
         self._deferred_questions = deferred_questions
         self._out_of_band_events = out_of_band_events
         self._detached_accounting_producers = detached_accounting_producers
-        # Live getters: the config is re-read per operation (the dispatch
-        # policy rides it), the tool/agent managers and the stats object are
+        # Live getters: the config is re-read per operation, the tool/agent
+        # managers and the stats object are
         # replaced by configuration transactions and session transitions, and
         # the scratchpad/accounting owner/title producer rotate across
         # transitions — all resolved at call time, never captured. The session
@@ -186,7 +229,16 @@ class SessionTransitions:
         self._session_id_getter = session_id_getter
         self._parent_session_id_getter = parent_session_id_getter
         self._session_lease_getter = session_lease_getter
-        self._bound_dispatch_policy_getter = bound_dispatch_policy_getter
+        # The bound policy bundle and its committed identity binding are live
+        # loop values (they rotate across resume/reset); the cwd, harness
+        # files, and execution context feed a FRESH bundle bind on a root
+        # reset. All are resolved at call time, never captured.
+        self._bound_policy_getter = bound_policy_getter
+        self._bound_identity_getter = bound_identity_getter
+        self._bundle_store_getter = bundle_store_getter
+        self._cwd_getter = cwd_getter
+        self._harness_files_getter = harness_files_getter
+        self._execution_context_getter = execution_context_getter
         self._session_logger_getter = session_logger_getter
         self._middleware_pipeline_getter = middleware_pipeline_getter
         # Late-bound callbacks: the scratchpad preparation resolves the
@@ -261,6 +313,7 @@ class SessionTransitions:
         session_metadata: SessionMetadata,
         prepared_scratchpad: Path | None | _PrepareScratchpad,
         accounting_owner: RootAccountingOwner | None,
+        bound_policy: ActivatedPolicy | None = None,
     ) -> _PreparedResume:
         """Prepare a resume rebind without mutating the live loop.
 
@@ -268,13 +321,30 @@ class SessionTransitions:
         before any mutation, so a failed preparation leaves the loop bound to
         its original session. The caller applies the returned record in the
         synchronous commit section, which stays on the loop.
+
+        The resumed conversation's policy bundle — the persisted policy
+        record (design §10) — activates with precedence: an explicit
+        ``bound_policy`` (the runtime's disk-loading resume paths activate
+        the persisted record themselves — a legacy record rejects there,
+        actionably — and hand it over), else the metadata's persisted
+        bundle, else the loop's current bound bundle (the in-memory seam
+        for callers that rebind with hand-built metadata carrying no
+        record). Resume consumes the persisted content; identity validation
+        applies to NEW bindings only.
         """
+        # The commit persists the resumed conversation's bundle: settle the
+        # store's capacity during preparation, so an exhausted store fails
+        # the resume before any durable state changes (design §6: no mixed
+        # generation — the commit's put must never throw mid-rebind).
+        self._bundle_store_getter().ensure_capacity(session_id)
         self._require_background_jobs_idle()
-        resumed_policy = resume_policy(
-            self._config_getter(),
-            session_metadata.dispatch_policy,
-            self._agent_manager_getter().available_agents,
-        )
+        if bound_policy is not None:
+            resumed_activated = bound_policy
+        elif session_metadata.policy_bundle is not None:
+            resumed_activated = resume_policy_bundle(session_metadata)
+        else:
+            resumed_activated = self._bound_policy_getter()
+        resumed_identity = bound_identity_reference(resumed_activated)
         replacement_jobs = (
             BackgroundJobRegistry(
                 generation=self._job_lifetime_generation_getter() + 1,
@@ -316,12 +386,29 @@ class SessionTransitions:
         if self._is_subagent_getter() and scratchpad_dir is not None:
             raise ValueError("Child sessions cannot own a prepared scratchpad")
 
-        resumed_config = (
-            self._config_getter().model_copy().attach_dispatch_policy(resumed_policy)
+        resumed_config = self._config_getter()
+        # The task-tool description is conversation-owned policy like the
+        # prompt: it renders from the RESUMED conversation's frozen route
+        # snapshot — the same table launch admission resolves against —
+        # never the source loop's current saved config (design §6, §10).
+        resumed_task_description = task_description_for_config(
+            resumed_config,
+            routes=routes_from_snapshot(resumed_activated.manifest.route_snapshot),
         )
-        resumed_task_description = task_description_for_config(resumed_config)
+        # The rebuilt SkillManager reads the RESUMED conversation's frozen
+        # selections (the persisted bundle's manifest) — never the source
+        # loop's — so eligibility and the rendered skills catalog follow
+        # the rebind (design §3, §6).
+        resumed_skill_manager = SkillManager(
+            self._config_getter,
+            harness_files=self._harness_files_getter(),
+            policy_facts=_policy_facts_from_bundle(resumed_activated),
+        )
         resumed_prompt = self._render_system_prompt(
-            self._skill_manager_getter(), resumed_config, resumed_policy, scratchpad_dir
+            resumed_skill_manager,
+            resumed_config,
+            scratchpad_dir,
+            activated_policy=resumed_activated,
         )
 
         # Retain title work before reset drops its reference. Cancellation is not
@@ -333,7 +420,9 @@ class SessionTransitions:
             title_task.add_done_callback(self._detached_accounting_producers.discard)
 
         return _PreparedResume(
-            resumed_policy=resumed_policy,
+            resumed_policy_bundle=resumed_activated,
+            resumed_identity=resumed_identity,
+            resumed_skill_manager=resumed_skill_manager,
             replacement_jobs=replacement_jobs,
             replacement_port=replacement_port,
             owner=owner,
@@ -342,6 +431,36 @@ class SessionTransitions:
             resumed_task_description=resumed_task_description,
             resumed_prompt=resumed_prompt,
         )
+
+    async def _acquire_reset_lease(self, session_id: str) -> SessionLease | None:
+        """Acquire the reset target's lease (released again on any failure)."""
+        session_lease = self._session_lease_getter()
+        lease_root = (
+            session_lease.path.parent.parent
+            if session_lease is not None
+            else Path(self._config_getter().session_logging.save_dir)
+        )
+        if not self._config_getter().session_logging.enabled:
+            return None
+        return await asyncio.to_thread(SessionLease(lease_root, session_id).acquire)
+
+    def _bind_fresh_reset_policy(self) -> tuple[ActivatedPolicy, str]:
+        """Bind a FRESH policy bundle from the current selections (root reset).
+
+        The fresh bind validates the identity selection (a NEW binding);
+        its failure preserves the old generation — no mixed generation, no
+        half-bound state (design §10).
+        """
+        _bundle, new_activated = bind_policy_bundle(
+            self._config_getter(),
+            execution_context=self._execution_context_getter(),
+            skill_manager=self._skill_manager_getter(),
+            scratchpad_dir=self._scratchpad_dir_getter(),
+            cwd=self._cwd_getter(),
+            harness_files=self._harness_files_getter(),
+            role_instructions=None,
+        )
+        return new_activated, bound_identity_reference(new_activated)
 
     async def prepare_reset(self, keep_parent: bool) -> _PreparedReset:
         """Prepare a session reset without mutating the live loop.
@@ -352,21 +471,21 @@ class SessionTransitions:
         synchronous commit section, which stays on the loop. The reset keeps
         the loop's scratchpad (the render falls back to it), so unlike a
         resume it prepares no scratchpad of its own.
+
+        A root reset binds a FRESH policy bundle from the current selections
+        (``/clear`` binds fresh resources, design §10); a subagent rewind
+        keeps the child's own bound bundle.
         """
         old_session_id = self._session_id_getter()
         suffix = extract_suffix(old_session_id)
         session_id = self._generate_session_id(suffix)
-        session_lease = self._session_lease_getter()
-        lease_root = (
-            session_lease.path.parent.parent
-            if session_lease is not None
-            else Path(self._config_getter().session_logging.save_dir)
-        )
-        lease = (
-            await asyncio.to_thread(SessionLease(lease_root, session_id).acquire)
-            if self._config_getter().session_logging.enabled
-            else None
-        )
+        # Settle the bundle store's capacity BEFORE any durable change (and
+        # before the lease is acquired): the commit's put must never throw
+        # after the session id and generation already moved — the reset
+        # either completes fully or fails with the prior generation intact
+        # (design §6: no mixed generation).
+        self._bundle_store_getter().ensure_capacity(session_id)
+        lease = await self._acquire_reset_lease(session_id)
         is_subagent = self._is_subagent_getter()
         parent_session_id = (
             self._parent_session_id_getter()
@@ -376,18 +495,40 @@ class SessionTransitions:
             else None
         )
         try:
-            new_policy = self._bound_dispatch_policy_getter()
             if not keep_parent and not is_subagent:
-                new_policy = bind_policy(self._config_getter())
-            new_config = (
-                self._config_getter().model_copy().attach_dispatch_policy(new_policy)
-            )
-            new_task_description = task_description_for_config(new_config)
-            new_prompt = self._render_system_prompt(
-                self._skill_manager_getter(),
+                # A root reset binds a FRESH policy bundle from the current
+                # selections (``/clear`` binds fresh resources, design §10).
+                new_activated, new_identity = self._bind_fresh_reset_policy()
+            else:
+                # A subagent rewind keeps the child's own bound bundle.
+                new_activated = self._bound_policy_getter()
+                new_identity = self._bound_identity_getter()
+            new_config = self._config_getter()
+            # The task-tool description follows the NEW conversation's
+            # frozen route snapshot — the freshly bound bundle's (a root
+            # reset) or the child's own (a rewind) — the same table the
+            # new conversation's admission resolves against (design §6,
+            # §10).
+            new_task_description = task_description_for_config(
                 new_config,
-                new_policy,
+                routes=routes_from_snapshot(new_activated.manifest.route_snapshot),
+            )
+            # The rebuilt SkillManager reads the NEW conversation's frozen
+            # selections (the newly bound bundle's manifest) — a root reset
+            # binds them fresh from the current selections, a rewind keeps
+            # the child's own — so eligibility and the rendered skills
+            # catalog follow the reset, never the previous conversation's
+            # (design §3, §6).
+            new_skill_manager = SkillManager(
+                self._config_getter,
+                harness_files=self._harness_files_getter(),
+                policy_facts=_policy_facts_from_bundle(new_activated),
+            )
+            new_prompt = self._render_system_prompt(
+                new_skill_manager,
+                new_config,
                 _PREPARE_SCRATCHPAD,
+                activated_policy=new_activated,
             )
             # One getter read bound to a local: no await runs between this read
             # and the title retention below (the except re-raises first on
@@ -420,7 +561,9 @@ class SessionTransitions:
         return _PreparedReset(
             session_id=session_id,
             parent_session_id=parent_session_id,
-            new_policy=new_policy,
+            new_policy_bundle=new_activated,
+            new_identity=new_identity,
+            new_skill_manager=new_skill_manager,
             new_task_description=new_task_description,
             new_prompt=new_prompt,
             owner=owner,
@@ -440,7 +583,6 @@ class SessionTransitions:
             self._stats_getter(),
             self._config_getter(),
             self._tool_manager_getter(),
-            None,
         )
         # Prepare and commit the new root binding before clearing live history.
         await self._reset_session(False)

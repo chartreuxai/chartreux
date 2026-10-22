@@ -5,11 +5,10 @@ from pathlib import Path
 from pydantic import ValidationError
 import pytest
 
-from chartreux.core.agents.models import AgentProfile
-from chartreux.core.agents.registry import apply_profile_overrides
 from chartreux.core.config._catalog import validate_catalog_scope
 from chartreux.core.config.builder import ConfigBuilder
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.config.layer import LayerImplementationError
 from chartreux.core.config.layers.default import DefaultConfigLayer
 from chartreux.core.config.layers.environment import EnvironmentLayer
@@ -188,10 +187,13 @@ async def test_dispatch_tables_are_rejected_before_payload_decoding(
         EnvironmentLayer(schema=ChartreuxConfigSchema),
     ]
     for layer in layers:
-        with pytest.raises(ValidationError, match="models\\.toml") as raised:
+        with pytest.raises(
+            ValidationError, match="The \\[dispatch\\] table is retired"
+        ) as raised:
             validate_catalog_scope(
                 ChartreuxConfigSchema, {"dispatch"}, layer=layer, source=layer.name
             )
+        assert "[orchestration.routes.<purpose>]" in str(raised.value)
         assert "dispatch-payload" not in raised.value.json()
 
 
@@ -212,8 +214,11 @@ async def test_user_and_project_config_dispatch_tables_are_rejected(
     ]:
         builder = ConfigBuilder(ChartreuxConfigSchema)
         builder.add_layers([DefaultConfigLayer(schema=ChartreuxConfigSchema), layer])
-        with pytest.raises(ValidationError, match="models\\.toml"):
+        with pytest.raises(
+            ValidationError, match="The \\[dispatch\\] table is retired"
+        ) as raised:
             await builder.build()
+        assert "[orchestration.routes.<purpose>]" in str(raised.value)
 
 
 async def test_runtime_dispatch_table_is_rejected_and_keeps_accepted_state() -> None:
@@ -225,8 +230,11 @@ async def test_runtime_dispatch_table_is_rejected_and_keeps_accepted_state() -> 
     )
     before = orch.config, orch.accepted_token
     session._data["dispatch"] = {"mode": "standalone"}
-    with pytest.raises(ValidationError, match="models\\.toml"):
+    with pytest.raises(
+        ValidationError, match="The \\[dispatch\\] table is retired"
+    ) as raised:
         await orch.reload()
+    assert "[orchestration.routes.<purpose>]" in str(raised.value)
     assert (orch.config, orch.accepted_token) == before
 
 
@@ -237,7 +245,8 @@ async def test_environment_dispatch_path_is_rejected(
     layer = EnvironmentLayer(schema=ChartreuxConfigSchema)
     with pytest.raises(LayerImplementationError) as raised:
         await layer.load()
-    assert "models.toml" in str(raised.value.__cause__)
+    assert "The [dispatch] table is retired" in str(raised.value.__cause__)
+    assert "[orchestration.routes.<purpose>]" in str(raised.value.__cause__)
     assert layer.cached_data is None
 
 
@@ -254,19 +263,26 @@ async def test_dispatch_patch_attempt_is_rejected_without_mutating_disk(
         layers=[DefaultConfigLayer(schema=ChartreuxConfigSchema), user, session],
         default_layer_resolver=lambda: session,
     )
-    with pytest.raises(ConfigPatchValidationError, match="models\\.toml"):
+    with pytest.raises(
+        ConfigPatchValidationError, match="The \\[dispatch\\] table is retired"
+    ):
         await orch.set_field("/dispatch", {"mode": "standalone"})
     assert path.read_bytes() == before_bytes
 
 
-async def test_project_profiles_stay_valid_but_never_carry_dispatch_authority(
+async def test_retired_profile_files_are_detected_and_never_load(
     tmp_path: Path,
 ) -> None:
-    agents_dir = tmp_path / "agents"
-    agents_dir.mkdir()
+    # agents/*.toml profiles are retired (package 16a): the directory is
+    # detected loudly and the file is left untouched, but nothing loads it —
+    # a [dispatch] table inside a profile file can never reach a config
+    # source (dispatch authority lives only in the user models.toml overlay).
+    project_root = tmp_path / "project"
+    agents_dir = project_root / ".chartreux" / "agents"
+    agents_dir.mkdir(parents=True)
     profile_path = agents_dir / "dispatching.toml"
-    profile_path.write_text('[dispatch]\nmode = "standalone"\n')
-    profile = AgentProfile.from_toml(profile_path)
+    profile_bytes = b'[dispatch]\nmode = "standalone"\n'
+    profile_path.write_bytes(profile_bytes)
     session = OverridesLayer(data={})
     orch = await ConfigOrchestrator.create(
         schema=ChartreuxConfigSchema,
@@ -274,12 +290,11 @@ async def test_project_profiles_stay_valid_but_never_carry_dispatch_authority(
         default_layer_resolver=lambda: session,
     )
 
-    with pytest.raises(ValidationError, match="models\\.toml"):
-        apply_profile_overrides(orch, profile.overrides, role=profile.role)
-
-    # Trusted project profiles remain valid as profile definitions.
-    plain_path = agents_dir / "plain.toml"
-    plain_path.write_text('description = "plain profile"\nrole = "plain-role"\n')
-    plain = AgentProfile.from_toml(plain_path)
-    apply_profile_overrides(orch, plain.overrides, role=plain.role)
-    assert orch.config.active_model == "@plain-role"
+    manager = HarnessFilesManager(
+        sources=("user",), cwd=project_root, _additional_dirs=(project_root,)
+    )
+    assert agents_dir in manager.retired_agent_dirs
+    assert profile_path.read_bytes() == profile_bytes
+    # The orchestrator built cleanly: the profile file was never consulted, so
+    # its dispatch table smuggled no authority into the merged config.
+    assert "dispatch" not in orch.config.model_dump()

@@ -205,7 +205,6 @@ class WorkbenchOperations:
             allowed_models=self._host.allowed_models,
             thinking_overrides=self._host.thinking_overrides,
         )
-        roster_before = self._host._bound_roster_identities(self._host.snapshot)
         write = asyncio.create_task(
             asyncio.to_thread(self._host.catalog_writer.apply_changes, changes)
         )
@@ -236,7 +235,7 @@ class WorkbenchOperations:
                 result.snapshot, state.provider_id
             )
             if result.changed:
-                self._host._notify_models_saved(previously_usable, roster_before)
+                self._host._notify_models_saved(previously_usable, frozenset())
             if create:
                 self._host._stage = None
                 self._host._add = None

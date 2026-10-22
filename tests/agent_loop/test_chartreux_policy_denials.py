@@ -561,7 +561,7 @@ async def test_child_current_snapshot_deny_wins(
     parent = build_test_agent_loop(
         config=build_test_vibe_config(tools={"read_file": {"permission": "never"}})
     )
-    child = await AgentRuntimeFactory().create_child(parent, "worker")
+    child = await AgentRuntimeFactory().create_child(parent, "coder")
     try:
         assert child.config_orchestrator is not parent.config_orchestrator
         assert (

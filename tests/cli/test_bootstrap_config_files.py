@@ -74,11 +74,28 @@ def test_settings_help_describes_effective_limits() -> None:
         "disabled_tools still blocks matching tools"
         in inventory_help["inventory_tools"]
     )
-    for category in ("skills", "agents"):
+    for category in ("skills",):
         assert (
             f"disabled_{category} is ignored then"
             in inventory_help[f"inventory_{category}"]
         )
+    # The identity roster edits the task denylist, never retired agent filters.
+    assert "task identity denylist" in inventory_help["inventory_identities"]
+    assert (
+        "never grants roots or tool authority" in inventory_help["inventory_identities"]
+    )
+
+
+def test_bootstrap_renders_agent_selection_defaults() -> None:
+    content = render_initial_user_config()
+    parsed = tomllib.loads(content)
+    assert parsed["agent"] == {
+        "identity": "coder",
+        "workflow": "minimal",
+        "orchestration_strategy": "none",
+    }
+    assert "[agent]" in content
+    assert "# Identity & Orchestration" in content
 
 
 def test_bootstrap_does_not_overwrite_existing_config() -> None:

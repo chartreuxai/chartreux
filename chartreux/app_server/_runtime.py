@@ -60,7 +60,7 @@ from chartreux.core.agent_loop._transcript_integrity import (
     pop_report_from_metadata,
 )
 from chartreux.core.agents.launch import FrozenPersona, LaunchCandidate, resolve_launch
-from chartreux.core.agents.manager import AgentManager
+from chartreux.core.agents.manager import AgentManager, resolve_identity_candidate
 from chartreux.core.background_jobs import BackgroundJobsPort
 from chartreux.core.config import (
     ChartreuxConfigSchema,
@@ -76,12 +76,14 @@ from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.config.types import ConfigSaveResult
-from chartreux.core.dispatch.session import BoundDispatchPolicy, resume_policy
+from chartreux.core.dispatch.route_models import ReplacementCapability
+from chartreux.core.dispatch.session import SessionPolicyError, resume_policy_bundle
 from chartreux.core.file_state import FileStateStore
 from chartreux.core.hooks.config import load_hooks_from_fs
 from chartreux.core.hooks.models import HookConfigResult
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.paths import WORKTREES_DIR
+from chartreux.core.recovery_models import PackageTier
 from chartreux.core.scratchpad import cleanup_scratchpad
 from chartreux.core.session import last_session_pointer
 from chartreux.core.session.session_id import extract_suffix, generate_session_id
@@ -92,14 +94,16 @@ from chartreux.core.session.session_logger import SessionLogger
 from chartreux.core.session_types import (
     AgentStats,
     CommittedModelIdentity,
+    LaunchMetadata,
     LaunchMetadataV2,
-    LaunchPersonaV1,
+    LaunchPersonaV2,
     SessionMetadata,
 )
 from chartreux.core.skills.models import SkillInfo
 from chartreux.core.subagents import (
     InvalidLaunchConfigError,
     LaunchConfig,
+    TaskArgs,
     UnsupportedChildForkError,
 )
 from chartreux.core.usage import AsyncUsageWriter, UsageReader, UsageService
@@ -110,21 +114,72 @@ from chartreux.utils.cache_store import FileSystemCacheStore
 _SHORT_SESSION_ID_LENGTH = 8
 
 
-def _launch_metadata(candidate: LaunchCandidate) -> LaunchMetadataV2:
+def _launch_metadata(
+    candidate: LaunchCandidate, identity_binding: tuple[str, str]
+) -> LaunchMetadataV2:
+    """The committed launch envelope, persona re-keyed on the identity revision.
+
+    ``identity_binding`` is the child's resolved identity reference and content
+    revision — the loop's committed binding (design §7). Resume re-reads this
+    binding instead of re-deriving identity from the live configuration, so an
+    identity edited between sessions cannot re-posture a resumed child; a
+    disagreement with the persisted policy bundle rejects at resume admission.
+    """
+    identity, identity_revision = identity_binding
     return LaunchMetadataV2(
         version=2,
-        profile=candidate.profile.name,
         overrides=candidate.semantic_overrides.model_copy(deep=True),
-        persona=LaunchPersonaV1(
-            system_prompt_id=candidate.persona.system_prompt_id,
+        persona=LaunchPersonaV2(
+            identity=identity,
+            identity_revision=identity_revision,
             instructions=candidate.persona.instructions,
         ),
         committed_model=candidate.committed_model,
+        # The resolved purpose/tier/capability ride the envelope: resume
+        # restores them instead of re-deriving defaults, and the tier is
+        # the same one the agent record reads from the candidate.
+        purpose=candidate.purpose,
+        package_tier=candidate.effective_tier,
+        replacement_capability=candidate.replacement_capability,
     )
+
+
+def _resume_envelope(envelope: LaunchMetadata) -> LaunchMetadataV2:
+    """The stored launch envelope of a resumable child, or a legacy rejection.
+
+    Package 16a retires the old persisted persona formats: a V1 envelope (or
+    a V2 envelope carrying a V1 persona, keyed on the retired
+    ``system_prompt_id`` axis) is an old persisted format — resume rejects it
+    with the actionable "start a new session" failure and its successor (the
+    identity selection), never a generic version error.
+    """
+    if isinstance(envelope, LaunchMetadataV2) and isinstance(
+        envelope.persona, LaunchPersonaV2
+    ):
+        return envelope
+    raise InvalidLaunchConfigError(
+        "launch_config.persona",
+        "The stored launch persona uses a retired pre-identity format "
+        "(system_prompt_id); the conversation cannot be resumed. Start a new "
+        "session and select the launch identity (the task tool's identity "
+        "field, or [agent] identity in config.toml) — there is no migration "
+        "for the old persisted format.",
+    )
+
+
+def _frozen_persona_for_envelope(envelope: LaunchMetadataV2) -> FrozenPersona:
+    """Bridge a stored launch envelope's persona to a frozen child persona.
+
+    The persona is keyed on the identity revision; the retired prompt-template
+    axis no longer participates — the frozen instructions are the additive
+    per-launch overlay committed at launch.
+    """
+    return FrozenPersona(instructions=envelope.persona.instructions)
 
 
 if TYPE_CHECKING:
     from chartreux.app_server.server import AppServer
+    from chartreux.core.policy.bundle import ActivatedPolicy
     from chartreux.core.tools.mcp.registry import MCPRegistry
 
 
@@ -254,12 +309,23 @@ class _AgentLoopBlueprint:
     session_dir: Path | None = None
     session_lease: SessionLease | None = None
     mcp_registry: MCPRegistry | None = None
-    launch_profile: str | None = None
+    launch_identity: str | None = None
     launch_overrides: LaunchConfig | None = None
-    frozen_system_prompt_id: str | None = None
+    # The purpose label whose route the launch resolved through (None for a
+    # direct launch): the projection's launch-purpose record, never re-derived
+    # from the identity or the model.
+    launch_purpose: str | None = None
+    # The effective package tier and replacement capability the launch
+    # resolved: the agent record reads the tier so the recovery boundary
+    # decides on the package's true tier/capability.
+    launch_package_tier: PackageTier | None = None
+    launch_replacement_capability: ReplacementCapability | None = None
     frozen_instructions: str | None = None
     committed_model: CommittedModelIdentity | None = None
-    bound_dispatch_policy: BoundDispatchPolicy | None = None
+    # The conversation's activated policy bundle (the persisted policy record,
+    # design §10): a resumed conversation is constructed around it, so its
+    # frozen content serves the prompt even when the source files are gone.
+    bound_policy: ActivatedPolicy | None = None
     accounting_owner: RootAccountingOwner | None = None
     background_jobs: BackgroundJobsPort | None = None
     process: HarnessProcess | None = None
@@ -292,12 +358,14 @@ class _AgentLoopBlueprint:
             parent_authority_getter=self.policy.parent_authority_getter,
             parent_authority_revision_getter=self.policy.parent_authority_revision_getter,
             user_input_capability=self.policy.user_input_capability,
-            launch_profile=self.launch_profile,
+            launch_identity=self.launch_identity,
             launch_overrides=self.launch_overrides,
-            frozen_system_prompt_id=self.frozen_system_prompt_id,
+            launch_purpose=self.launch_purpose,
+            launch_package_tier=self.launch_package_tier,
+            launch_replacement_capability=self.launch_replacement_capability,
             frozen_instructions=self.frozen_instructions,
             committed_model=self.committed_model,
-            bound_dispatch_policy=self.bound_dispatch_policy,
+            bound_policy=self.bound_policy,
             mcp_registry=self.mcp_registry,
             cache_store=self.policy.cache_store,
             auto_title_enabled=self.policy.auto_title_enabled,
@@ -351,7 +419,7 @@ class _RootRuntimeBlueprint:
         session_dir: Path | None = None,
         session_lease: SessionLease | None = None,
         committed_model: CommittedModelIdentity | None = None,
-        bound_dispatch_policy: BoundDispatchPolicy | None = None,
+        bound_policy: ActivatedPolicy | None = None,
         accounting_owner: RootAccountingOwner | None = None,
     ) -> AgentLoop:
         policy = AgentRuntimePolicy(
@@ -392,7 +460,7 @@ class _RootRuntimeBlueprint:
             session_dir=session_dir,
             session_lease=session_lease,
             committed_model=committed_model,
-            bound_dispatch_policy=bound_dispatch_policy,
+            bound_policy=bound_policy,
             accounting_owner=accounting_owner,
             process=self.process,
             mcp_registry=self.mcp_registry,
@@ -483,7 +551,9 @@ class AgentRuntimeFactory:
         _require_session_logging(source.config)
         return _find_session_to_continue(source.config, cwd=cwd)
 
-    async def resume_root(self, source: AgentLoop, session_id: str) -> None:
+    async def resume_root(  # noqa: PLR0914 - resume lifecycle boundary
+        self, source: AgentLoop, session_id: str
+    ) -> None:
         """Resume a stored session by rebinding the existing loop in place.
 
         The existing MCP connections, tool registry, git context, and config
@@ -527,6 +597,12 @@ class AgentRuntimeFactory:
             )
             await source.config_orchestrator.reload()
             session_metadata = SessionMetadata.model_validate(metadata)
+            # The persisted bundle is the conversation's policy record
+            # (design §10): resume activates it HERE, at the disk-loading
+            # boundary — a legacy record (no bundle) rejects actionably
+            # before any client or resource is constructed — and hands it
+            # to the rebind, which serves its frozen content.
+            activated_policy = resume_policy_bundle(session_metadata)
             resume_identity = _resume_identity(source.config, session_metadata)
             target_model_applied = True
             await _restore_session_thinking(
@@ -583,6 +659,7 @@ class AgentRuntimeFactory:
                 stats=stats,
                 prepared_scratchpad=prepared_scratchpad,
                 accounting_owner=accounting_owner,
+                bound_policy=activated_policy,
             )
             source.replace_session_lease(lease)
         except BaseException:
@@ -639,13 +716,12 @@ class AgentRuntimeFactory:
         )
         await blueprint.config_orchestrator.reload()
         session_metadata = SessionMetadata.model_validate(metadata)
-        bound_policy = resume_policy(
-            blueprint.config,
-            session_metadata.dispatch_policy,
-            AgentManager(
-                blueprint.config_orchestrator, harness_files=blueprint.harness_files
-            ).available_agents,
-        )
+        # The persisted bundle is the conversation's policy record (design
+        # §10): a fresh runtime activates it at the disk-loading boundary —
+        # a legacy record (no bundle) rejects actionably — and builds the
+        # loop around it, so the frozen content serves the prompt even when
+        # the source resource files are gone.
+        activated_policy = resume_policy_bundle(session_metadata)
         # Blueprint resume (fresh session open) has no interactive recovery:
         # an unusable persisted committed model fails fast as a configuration
         # error instead of loading the session unpinned.
@@ -674,7 +750,7 @@ class AgentRuntimeFactory:
             session_dir=session_path,
             session_lease=session_lease,
             committed_model=resume_identity,
-            bound_dispatch_policy=bound_policy,
+            bound_policy=activated_policy,
             accounting_owner=accounting_owner,
         )
         # Set messages and stats immediately so the UI can render the stored
@@ -703,21 +779,37 @@ class AgentRuntimeFactory:
         *,
         session_id: str | None = None,
         session_dir: Path | None = None,
+        bound_policy: ActivatedPolicy | None = None,
     ) -> AgentLoop:
         if isinstance(candidate, str):
-            candidate = resolve_launch(
-                profile_name=candidate,
-                config=None,
+            # The direct runner resolves through the canonical grammar (11c
+            # cutover): the string IS the launch identity reference (the
+            # retired legacy profile-spelling bridge is gone with the alias —
+            # an unknown name fails loudly in the canonical resolution), and
+            # the canonical resolution selects identity, model, thinking,
+            # and authority — the profile path no longer resolves.
+            candidate = resolve_identity_candidate(
+                TaskArgs(task="", identity=candidate),
                 parent_orchestrator=parent.config_orchestrator,
                 tool_inventory={
                     name: object() for name in parent.tool_manager.registered_tools
                 },
-                authorized_tool_names=frozenset(parent.tool_manager.available_tools),
-                agent_manager=parent.agent_manager,
+                # The admission ceiling is the parent's DELEGATION set, not
+                # its personal inventory: personal posture and delegation are
+                # independent axes (design §8), so a write-restricted
+                # orchestrator parent still admits a writing child here.
+                authorized_tool_names=frozenset(parent.tool_manager.delegable_tools),
+                session_model=parent.config.active_model,
+                user_prompts_dirs=parent.harness_files.user_prompts_dirs,
+                # Purpose routes resolve against the conversation's FROZEN
+                # route table (the bound bundle's captured snapshot), never
+                # the reloaded live config (design §6, §10).
+                routes=parent.frozen_purpose_routes,
             )
         policy = parent.child_runtime_policy
-        agent_profile = candidate.profile
-        agent_name = agent_profile.name
+        # The child's session directory prefix derives from its committed
+        # identity reference (the retired profile name no longer participates).
+        agent_name = candidate.identity.replace(":", "-")
         parent_session_dir = parent.session_logger.session_dir
         orchestrator = candidate.orchestrator.copy()
         session_logging = SessionLoggingConfig(
@@ -755,6 +847,12 @@ class AgentRuntimeFactory:
                 policy=policy,
                 launch_candidate=candidate,
                 accounting_owner=parent.accounting_owner,
+                # A resumed child is constructed around its persisted policy
+                # bundle (design §10): the bundle's frozen content serves the
+                # prompt, so the child never re-derives identity from the live
+                # profile and never fails construction when its custom
+                # identity prompt file is gone.
+                bound_policy=bound_policy,
                 # Spawn handoff: the child starts from a deep copy of the
                 # parent's working set (path -> last-seen revision + outline),
                 # so it never mutates the parent's store and no state leaks
@@ -763,7 +861,12 @@ class AgentRuntimeFactory:
             )
             metadata = child.session_logger.session_metadata
             if metadata is not None:
-                metadata.launch_config = _launch_metadata(candidate)
+                # The envelope records the child's resolved identity reference
+                # and revision (design §7), so resume re-reads the binding
+                # instead of re-deriving identity from the live profile.
+                metadata.launch_config = _launch_metadata(
+                    candidate, child._identity_binding()
+                )
             return child
         except BaseException:
             if lease is not None:
@@ -773,6 +876,7 @@ class AgentRuntimeFactory:
     async def resume_child(
         self, parent: AgentLoop, agent_name: str, session_id: str, session_dir: Path
     ) -> AgentLoop:
+        # The stored link's agent field is the child's canonical identity reference.
         try:
             loaded_messages, raw_metadata = await asyncio.to_thread(
                 SessionLoader.load_session, session_dir
@@ -787,50 +891,92 @@ class AgentRuntimeFactory:
             raise InvalidLaunchConfigError(
                 "launch_config", "Stored launch configuration is malformed"
             ) from exc
-        envelope = metadata.launch_config
-        if envelope is not None and envelope.profile != agent_name:
-            raise InvalidLaunchConfigError(
-                "launch_config.profile", "Stored launch profile does not match its link"
-            )
-        if envelope is not None and envelope.profile is None:
-            raise InvalidLaunchConfigError(
-                "launch_config.profile", "Stored child launch profile is missing"
-            )
-        child_source = parent.config_orchestrator.copy()
-        child_source.bound_dispatch_policy = resume_policy(
-            parent.config,
-            metadata.dispatch_policy,
-            parent.agent_manager.available_agents,
+        # The persisted bundle is the child conversation's policy record
+        # (design §10): resume activates it at the disk-loading boundary — a
+        # legacy record (no bundle) rejects actionably — and the resumed child
+        # is constructed around it.
+        try:
+            activated_policy = resume_policy_bundle(metadata)
+        except SessionPolicyError as exc:
+            raise InvalidLaunchConfigError("launch_config", str(exc)) from exc
+        envelope = (
+            _resume_envelope(metadata.launch_config)
+            if metadata.launch_config is not None
+            else None
         )
+        persona = envelope.persona if envelope is not None else None
+        if (
+            envelope is not None
+            and isinstance(persona, LaunchPersonaV2)
+            and persona.identity != agent_name
+        ):
+            raise InvalidLaunchConfigError(
+                "launch_config.persona",
+                "Stored launch identity does not match its link",
+            )
+        if envelope is not None and isinstance(persona, LaunchPersonaV2):
+            # Resume re-reads the persisted identity binding instead of
+            # re-deriving identity from the live configuration (design §7): a
+            # stored persona that disagrees with the persisted policy bundle
+            # is an incoherent record and rejects at admission.
+            if (
+                persona.identity != activated_policy.manifest.identity.selected
+                or persona.identity_revision
+                != activated_policy.manifest.identity_revision
+            ):
+                raise InvalidLaunchConfigError(
+                    "launch_config.persona",
+                    "Stored launch persona does not match the persisted policy binding",
+                )
+        child_source = parent.config_orchestrator.copy()
         candidate = resolve_launch(
-            profile_name=envelope.profile if envelope is not None else agent_name,
+            identity=(
+                persona.identity if isinstance(persona, LaunchPersonaV2) else agent_name
+            ),
             config=None,
             parent_orchestrator=child_source,
             tool_inventory={
                 name: object() for name in parent.tool_manager.registered_tools
             },
-            authorized_tool_names=frozenset(parent.tool_manager.available_tools),
+            # The admission ceiling is the parent's DELEGATION set, not its
+            # personal inventory (design §8): a stored write-tool override
+            # resumed under a write-restricted orchestrator parent is within
+            # the delegation ceiling and must not be wrongly rejected — the
+            # child's own identity posture still applies below the config
+            # layer inside its ToolManager.
+            authorized_tool_names=frozenset(parent.tool_manager.delegable_tools),
             history=loaded_messages,
-            agent_manager=parent.agent_manager,
             accumulated_overrides=(
                 envelope.overrides if envelope is not None else None
             ),
             frozen_persona=(
-                FrozenPersona(
-                    system_prompt_id=envelope.persona.system_prompt_id,
-                    instructions=envelope.persona.instructions,
-                )
-                if envelope is not None
-                else None
+                _frozen_persona_for_envelope(envelope) if envelope is not None else None
             ),
             committed_model=(
-                envelope.committed_model
-                if isinstance(envelope, LaunchMetadataV2)
-                else None
+                envelope.committed_model if envelope is not None else None
+            ),
+            # The persisted envelope carries the committed purpose/tier/
+            # capability: resume restores them instead of re-deriving
+            # defaults, so a disk-resumed child keeps describing the
+            # package's true purpose/tier/capability.
+            purpose=(envelope.purpose if envelope is not None else None),
+            effective_tier=(
+                envelope.package_tier
+                if envelope is not None and envelope.package_tier is not None
+                else PackageTier.SUBSTANTIVE
+            ),
+            replacement_capability=(
+                envelope.replacement_capability
+                if envelope is not None and envelope.replacement_capability is not None
+                else ReplacementCapability.NONE
             ),
         )
         child = await self.create_child(
-            parent, candidate, session_id=session_id, session_dir=session_dir
+            parent,
+            candidate,
+            session_id=session_id,
+            session_dir=session_dir,
+            bound_policy=activated_policy,
         )
         # Eager message setting: background thread inserts system prompt at position 0
         # when _complete_init finishes, same pattern as resume_blueprint.
@@ -846,31 +992,24 @@ class AgentRuntimeFactory:
                 session_id, session_dir, metadata
             )
             if child.session_logger.session_metadata is not None:
-                child.session_logger.session_metadata.dispatch_policy = (
-                    child.bound_dispatch_policy.model_dump(mode="json")
-                )
-                child.session_logger.session_metadata.dispatch_policy_notes = list(
-                    child.bound_dispatch_policy.diagnostics
-                )
                 child.session_logger.session_metadata.launch_config = (
-                    _launch_metadata(candidate) if envelope is not None else None
+                    _launch_metadata(candidate, child._identity_binding())
+                    if envelope is not None
+                    else None
                 )
             _apply_stored_stats(child, raw_metadata)
-            if envelope is not None and envelope.version == 1:
-                child.stats.has_unknown_cost = True
-                child.stats.known_cost_total = 0.0
         except BaseException:
             await close_agent_loop(child)
             raise
         return child
 
     async def fork(self, source: AgentLoop, message_id: str | None) -> AgentLoop:
-        metadata = source.session_logger.session_metadata
-        if source._is_subagent or (
-            metadata is not None
-            and metadata.launch_config is not None
-            and metadata.launch_config.profile is not None
-        ):
+        # A bounded-child launch cannot be forked: a live subagent carries
+        # both markers, and the launch identity binding is the child
+        # discriminator that replaced the retired envelope profile field
+        # (package 16a). Root and fork loops carry no launch identity and
+        # remain forkable.
+        if source._is_subagent or source.launch_identity is not None:
             raise UnsupportedChildForkError(
                 "session", "Child sessions cannot be forked"
             )
@@ -906,7 +1045,7 @@ class AgentRuntimeFactory:
             await forked.wait_until_ready()
             forked.messages.extend(_messages_for_fork(source, message_id))
             await forked.session_logger.save_interaction(
-                forked.messages, forked.stats, forked.config, forked.tool_manager, None
+                forked.messages, forked.stats, forked.config, forked.tool_manager
             )
         except BaseException:
             if forked is not None:
@@ -928,6 +1067,7 @@ class AgentRuntimeFactory:
         session_lease: SessionLease | None = None,
         policy: AgentRuntimePolicy | None = None,
         launch_candidate: LaunchCandidate | None = None,
+        bound_policy: ActivatedPolicy | None = None,
         accounting_owner: RootAccountingOwner | None = None,
         file_revision_registry: RevisionRegistryPort | None = None,
         parent_file_state: FileStateStore | None = None,
@@ -957,14 +1097,16 @@ class AgentRuntimeFactory:
                 else None
             ),
             process=self._process,
-            launch_profile=(
-                launch_candidate.profile.name if launch_candidate else None
-            ),
+            launch_identity=(launch_candidate.identity if launch_candidate else None),
             launch_overrides=(
                 launch_candidate.semantic_overrides if launch_candidate else None
             ),
-            frozen_system_prompt_id=(
-                launch_candidate.persona.system_prompt_id if launch_candidate else None
+            launch_purpose=(launch_candidate.purpose if launch_candidate else None),
+            launch_package_tier=(
+                launch_candidate.effective_tier if launch_candidate else None
+            ),
+            launch_replacement_capability=(
+                launch_candidate.replacement_capability if launch_candidate else None
             ),
             frozen_instructions=(
                 launch_candidate.persona.instructions if launch_candidate else None
@@ -974,6 +1116,7 @@ class AgentRuntimeFactory:
                 if launch_candidate
                 else source.committed_model
             ),
+            bound_policy=bound_policy,
             mcp_registry=(
                 source.mcp_registry.clone_configuration()
                 if source.mcp_registry is not None

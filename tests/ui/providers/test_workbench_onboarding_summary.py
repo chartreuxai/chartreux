@@ -9,20 +9,15 @@ import tomllib
 import pytest
 from textual.widgets import OptionList
 
-from chartreux.core.dispatch.lint import lint_catalog, roster_shape
-from chartreux.core.dispatch.presets import SHIPPED_PRESETS
-from chartreux.core.dispatch.schema import DispatchMode
 from chartreux.core.model_catalog.loader import load_catalog
-from chartreux.core.model_catalog.resolver import ModelResolver
 from chartreux.ui.providers.management_state import ManagementState
 from tests.integration.test_provider_workbench_boundaries import Services, add_provider
 from tests.ui.providers._workbench_support import Host, press_option, wait_until
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", list(DispatchMode))
 async def test_empty_home_keyless_setup_finishes_without_role_questions(
-    tmp_path: Path, mode: DispatchMode
+    tmp_path: Path,
 ) -> None:
     services = Services(tmp_path)
     screen = services.screen()
@@ -34,10 +29,6 @@ async def test_empty_home_keyless_setup_finishes_without_role_questions(
         rows = screen.query_one("#wb-presets", OptionList)
         assert not any(str(option.id).startswith("preset:") for option in rows.options)
         assert screen.state is not None
-        assert screen.state._dispatch.mode == DispatchMode.STANDALONE
-        assert "Standalone — direct implementation" in str(
-            rows.get_option("mode:standalone").prompt
-        )
         assert all(
             screen.state.preset(role)[0] == "local-wire"
             for role in screen.state.catalog.roles
@@ -45,27 +36,15 @@ async def test_empty_home_keyless_setup_finishes_without_role_questions(
         assert not screen.state.validate(
             mode="onboarding", credential_resolver=lambda _: None
         ).errors
-        await press_option(pilot, rows, f"mode:{mode.value}")
         await press_option(
             pilot, screen.query_one("#wb-presets-actions", OptionList), "finish"
         )
         await wait_until(pilot, lambda: bool(host.results))
         assert host.results[-1].status == "completed"
     saved = load_catalog(tmp_path / "models.toml")
-    assert saved.dispatch.mode == mode
-    assert not [
-        item
-        for item in lint_catalog(saved.dispatch, saved.catalog)
-        if item.severity == "error"
-    ]
-    resolver = ModelResolver(saved)
-    assert roster_shape(
-        resolver.resolve(slot.role) for slot in saved.dispatch.slots.values()
-    ).single_model
-    # No explicit slot assignments are needed for one canonical model.
-    assert "slots" not in tomllib.loads((tmp_path / "models.toml").read_text()).get(
-        "dispatch", {}
-    )
+    assert all(role.model == "local-wire" for role in saved.catalog.roles.values())
+    # The catalog owns connections and presets; it carries no dispatch policy.
+    assert "dispatch" not in tomllib.loads((tmp_path / "models.toml").read_text())
 
 
 @pytest.mark.asyncio
@@ -78,15 +57,15 @@ async def test_summary_customize_cancel_back_and_failed_save(tmp_path: Path) -> 
     async with host.run_test(size=(80, 24)) as pilot:
         await add_provider(pilot, screen, "local")
         assert screen.state is not None
-        original = screen.state.preset("orchestrator")
+        original = screen.state.preset("main")
         rows = screen.query_one("#wb-presets", OptionList)
         await press_option(pilot, rows, "customize")
-        await press_option(pilot, rows, "preset:orchestrator")
+        await press_option(pilot, rows, "preset:main")
         screen._preset_draft = ("local-wire", "low")
         await press_option(
             pilot, screen.query_one("#wb-preset-editor-actions", OptionList), "cancel"
         )
-        assert screen.state.preset("orchestrator") == original
+        assert screen.state.preset("main") == original
         await pilot.press("escape")
         assert rows.get_option("customize")
         assert not any(str(option.id).startswith("preset:") for option in rows.options)
@@ -133,9 +112,7 @@ async def test_back_and_cancel_summary_keep_explicit_provider_saves(
         assert "local" in load_catalog(tmp_path / "models.toml").catalog.providers
 
 
-def test_completion_checks_dispatch_roles_not_unreferenced_drafts(
-    tmp_path: Path,
-) -> None:
+def test_completion_requires_every_defined_preset_role(tmp_path: Path) -> None:
     snapshot = load_catalog(tmp_path / "models.toml")
     roles = dict(snapshot.catalog.roles)
     roles["draft"] = roles["scout"].model_copy(update={"model": "not-configured"})
@@ -143,39 +120,20 @@ def test_completion_checks_dispatch_roles_not_unreferenced_drafts(
         replace(snapshot, catalog=snapshot.catalog.model_copy(update={"roles": roles})),
         "mistral",
     )
-    assert not state.validate(
+    validation = state.validate(
         mode="onboarding", credential_resolver=lambda _: "ready"
-    ).errors
+    )
+    assert "draft" in validation.unresolved_roles
+    assert validation.errors
     state.set_role_preset("scout", "not-configured", "low")
-    assert (
-        "scout"
-        in state.validate(
-            mode="onboarding", credential_resolver=lambda _: "ready"
-        ).unresolved_roles
+    validation = state.validate(
+        mode="onboarding", credential_resolver=lambda _: "ready"
     )
-
-
-def test_mode_save_preserves_custom_slots_and_uses_new_preset(tmp_path: Path) -> None:
-    snapshot = load_catalog(tmp_path / "models.toml")
-    slots = dict(snapshot.dispatch.slots)
-    slots["mechanical"] = slots["mechanical"].model_copy(update={"role": "@heavy"})
-    snapshot = replace(
-        snapshot, dispatch=snapshot.dispatch.model_copy(update={"slots": slots})
-    )
-    state = ManagementState.from_snapshot(snapshot, "mistral")
-    state.dispatch_mode = DispatchMode.ORCHESTRATED
-    changes = state.changes()
-    assert changes.dispatch is not None
-    assert changes.dispatch["mode"] == "orchestrated"
-    assert state._dispatch.slots["mechanical"].role == "@heavy"
-    assert (
-        state._dispatch.instructions
-        == SHIPPED_PRESETS[DispatchMode.ORCHESTRATED].instructions
-    )
+    assert "scout" in validation.unresolved_roles
 
 
 @pytest.mark.asyncio
-async def test_invalid_dispatch_requires_explicit_repair_not_incidental_seeding(
+async def test_legacy_dispatch_table_neither_blocks_nor_rewrites_setup(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "models.toml"
@@ -190,17 +148,8 @@ async def test_invalid_dispatch_requires_explicit_repair_not_incidental_seeding(
         await press_option(
             pilot, screen.query_one("#wb-presets-actions", OptionList), "finish"
         )
-        assert not host.results
-        assert screen._feedback_kind == "error"
-        assert screen._customize_presets
-        assert path.read_text() == '[dispatch]\nmode = "invalid"\n'
-        await press_option(
-            pilot, screen.query_one("#wb-presets", OptionList), "mode:orchestrated"
-        )
-        await press_option(
-            pilot, screen.query_one("#wb-presets-actions", OptionList), "finish"
-        )
         await wait_until(pilot, lambda: bool(host.results))
         assert host.results[-1].status == "completed"
-    assert load_catalog(path).dispatch.mode == DispatchMode.ORCHESTRATED
-    assert not load_catalog(path).dispatch_diagnostics
+    # Setup no longer owns dispatch policy: the legacy table is neither a
+    # completion gate nor silently rewritten by the catalog writer.
+    assert path.read_text() == '[dispatch]\nmode = "invalid"\n'

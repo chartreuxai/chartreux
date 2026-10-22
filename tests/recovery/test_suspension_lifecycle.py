@@ -175,11 +175,7 @@ async def _launch(
     retain: bool | None = None,
     tool_call_id: str = "launch",
 ) -> TaskResult:
-    arguments: dict[str, Any] = {
-        "task": task,
-        "agent_type": "worker",
-        "background": True,
-    }
+    arguments: dict[str, Any] = {"task": task, "identity": "coder", "background": True}
     if retain is not None:
         arguments["retain"] = retain
     return await _background_result(

@@ -32,7 +32,7 @@ async def test_reload_config_picks_up_disk_changes(
         assert app.config.autocopy_to_clipboard is True
         messages = list(app.query(ReloadConfigMessage))
         assert len(messages) == 1
-        assert messages[0].get_content().startswith("Configuration reloaded")
+        assert messages[0].get_content().startswith("Configuration refreshed")
         assert messages[0]._spinner_timer is None
 
 

@@ -6,8 +6,6 @@ from typing import Any
 
 from textual.widgets.option_list import Option
 
-from chartreux.core.dispatch.schema import DispatchMode
-from chartreux.ui.chrome_glyphs import chrome_glyph
 from chartreux.ui.providers.management_state import ManagementState
 from chartreux.ui.providers.workbench_types import WorkbenchView
 from chartreux.ui.providers.workbench_widgets import WorkbenchList
@@ -23,9 +21,9 @@ class WorkbenchPresets:
     ``_customize_presets``) stays on the screen; the controller mutates it
     through the host exactly where the screen's own code did.
 
-    Pinned invariants, moved verbatim: the ``state.dispatch_mode``/
-    ``set_role_preset``/``preset``/``validate*`` calls stay direct on the
-    ManagementState argument (the state does not move). The mode decisions
+    Pinned invariants, moved verbatim: the ``set_role_preset``/``preset``/
+    ``validate*`` calls stay direct on the ManagementState argument (the state
+    does not move). The mode decisions
     route through the flow policy (``host._flow``): ``open_presets`` reaches
     the seeding through ``host._seed_onboarding_presets`` (re-homed to the
     policy at 18.3a), and the summary layout, finish label, finish validation,
@@ -90,36 +88,16 @@ class WorkbenchPresets:
                 )
             )
             rows.add_option(Option("Customize role presets", id="customize"))
-        for dispatch_mode in DispatchMode:
-            label = (
-                "Standalone — direct implementation"
-                if dispatch_mode == DispatchMode.STANDALONE
-                else "Orchestrated — including with one model"
-            )
-            marker = chrome_glyph(
-                "radio_selected"
-                if state._dispatch.mode == dispatch_mode
-                else "radio_empty"
-            )
-            rows.add_option(
-                Option(
-                    self._host._summary(f"{marker} {label}"),
-                    id=f"mode:{dispatch_mode.value}",
-                )
-            )
-        rows.add_option(
-            Option("Mode changes apply next session", id="next-session", disabled=True)
-        )
         ordered_roles = [
             role
-            for role in ("orchestrator", "worker", "scout", "heavy")
+            for role in ("main", "worker", "scout", "heavy")
             if role in state.catalog.roles
         ]
         ordered_roles.extend(sorted(set(state.catalog.roles) - set(ordered_roles)))
         for role in () if summary else ordered_roles:
             model, thinking = state.preset(role)
             title = {
-                "orchestrator": "Main assistant (@orchestrator)",
+                "main": "Main assistant (@main)",
                 "worker": "Worker (@worker)",
                 "scout": "Scout (@scout)",
                 "heavy": "Heavy (@heavy)",
@@ -153,14 +131,7 @@ class WorkbenchPresets:
             return
         if key == "customize":
             self._host._customize_presets = True
-            self.refresh_presets(highlight="preset:orchestrator")
-            return
-        if key.startswith("mode:"):
-            state.dispatch_mode = DispatchMode(key.partition(":")[2])
-            self._host._set_feedback(
-                "preset", "Mode staged; save to apply next session.", "info"
-            )
-            self.refresh_presets(highlight=key)
+            self.refresh_presets(highlight="preset:main")
             return
         if key == "add-another":
             if state.dirty:
@@ -183,7 +154,7 @@ class WorkbenchPresets:
                         "preset", "; ".join(validation.errors), "error"
                     )
                     self.refresh_presets(
-                        highlight=f"preset:{(validation.unresolved_roles or validation.unusable_roles or ('orchestrator',))[0]}"
+                        highlight=f"preset:{(validation.unresolved_roles or validation.unusable_roles or ('main',))[0]}"
                     )
                     self._host.query_one("#wb-presets").focus()
                     return

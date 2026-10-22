@@ -211,7 +211,7 @@ def test_agents_update_carries_evictions() -> None:
         agents=[
             AgentSummaryModel(
                 agent_id="agent-1",
-                profile="worker",
+                identity="coder",
                 name="worker-base-1",
                 availability="evicted",
                 last_run_status="completed",
@@ -253,7 +253,7 @@ def test_agents_update_accepts_legacy_payload_without_evictions() -> None:
         "eventId": 1,
         "sessionId": "session-1",
         "emittedAt": 2,
-        "agents": [{"agentId": "agent-1", "profile": "worker", "availability": "idle"}],
+        "agents": [{"agentId": "agent-1", "availability": "idle"}],
     }
 
     event = projection.consume(Notification(method="agents/update", params=params))
@@ -261,6 +261,19 @@ def test_agents_update_accepts_legacy_payload_without_evictions() -> None:
     assert isinstance(event, AgentsUpdate)
     assert event == AgentsUpdate(event.agents, [])
     assert event.evictions == []
+
+
+def test_agents_update_rejects_payload_with_retired_profile_field() -> None:
+    projection = _projection()
+    params = {
+        "eventId": 1,
+        "sessionId": "session-1",
+        "emittedAt": 2,
+        "agents": [{"agentId": "agent-1", "profile": "worker", "availability": "idle"}],
+    }
+
+    with pytest.raises(ValidationError):
+        projection.consume(Notification(method="agents/update", params=params))
 
 
 def test_turn_queue_update_replaces_public_queue_state() -> None:

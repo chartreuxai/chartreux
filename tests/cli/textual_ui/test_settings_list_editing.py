@@ -37,9 +37,9 @@ def test_draft_tokens_unique_monotonic_and_reconciled_by_occurrence() -> None:
 async def test_list_edit_preserves_identity_and_string_payload() -> None:
     service = FakeService()
     async with Harness(service).run_test(size=(80, 24)) as pilot:
-        await pilot.press(*"agent_paths", "enter")
+        await pilot.press(*"skill_paths", "enter")
         screen = cast(SettingsScreen, pilot.app.screen)
-        item = next(item for item in screen.catalog if item.path == "agent_paths")
+        item = next(item for item in screen.catalog if item.path == "skill_paths")
         screen._list_draft = screen._make_draft(["same", "same"])
         first, second = screen._list_draft
         screen._refresh_options()
@@ -61,7 +61,7 @@ async def test_list_edit_preserves_identity_and_string_payload() -> None:
 @pytest.mark.parametrize("inventory", [False, True])
 async def test_duplicate_deletion_targets_token(position: int, inventory: bool) -> None:
     service = FakeService()
-    path = "inventory_tools" if inventory else "agent_paths"
+    path = "inventory_tools" if inventory else "skill_paths"
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         await pilot.press(*path, "enter")
         screen = cast(SettingsScreen, pilot.app.screen)
@@ -121,7 +121,7 @@ async def test_duplicate_deletion_targets_token(position: int, inventory: bool) 
 @pytest.mark.parametrize("inventory", [False, True])
 async def test_token_changes_alone_are_clean(inventory: bool) -> None:
     service = FakeService()
-    path = "inventory_tools" if inventory else "agent_paths"
+    path = "inventory_tools" if inventory else "skill_paths"
     field = next(
         field
         for field in service.snapshot.fields
@@ -149,14 +149,14 @@ async def test_token_changes_alone_are_clean(inventory: bool) -> None:
 @pytest.mark.parametrize(
     "path,body_id",
     [
-        ("agent_paths", "settings-entries"),
+        ("skill_paths", "settings-entries"),
         ("inventory_tools", "settings-checklist"),
-        ("system_prompt_id", "settings-choices"),
+        ("agent.identity", "settings-choices"),
     ],
 )
 async def test_expanded_groups_and_minimum_size_layout(path: str, body_id: str) -> None:
     service = FakeService()
-    if path == "agent_paths":
+    if path == "skill_paths":
         next(
             field for field in service.snapshot.fields if field.path == path
         ).effective_value = [f"entry-{i}" for i in range(40)]
@@ -204,7 +204,7 @@ async def test_expanded_groups_and_minimum_size_layout(path: str, body_id: str) 
         body.highlighted = body.option_count - 1
         await pilot.pause()
         assert body.scroll_y > 0
-        if path != "system_prompt_id":
+        if path != "agent.identity":
             assert actions.display and actions.option_count == 2
             assert actions.region.bottom <= screen.query_one("#settings-help").region.y
             focus_action(
@@ -232,9 +232,9 @@ async def test_expanded_groups_and_minimum_size_layout(path: str, body_id: str) 
 @pytest.mark.parametrize(
     "path,body_id",
     [
-        ("agent_paths", "settings-entries"),
+        ("skill_paths", "settings-entries"),
         ("inventory_tools", "settings-checklist"),
-        ("system_prompt_id", "settings-choices"),
+        ("agent.identity", "settings-choices"),
     ],
 )
 async def test_empty_collection_state_rows_are_focusable_and_inert(
@@ -242,7 +242,7 @@ async def test_empty_collection_state_rows_are_focusable_and_inert(
 ) -> None:
     service = FakeService()
     service.snapshot.inventories["tools"] = []
-    if path == "system_prompt_id":
+    if path == "agent.identity":
         next(
             item for item in service.snapshot.catalog if item.path == path
         ).choices = ()
@@ -274,7 +274,7 @@ async def test_list_add_edit_delete_discard_and_empty_help() -> None:
     service = FakeService()
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        await pilot.press(*"agent_paths", "enter")
+        await pilot.press(*"skill_paths", "enter")
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
         options = screen.query_one("#settings-entries", OptionList)
@@ -282,7 +282,7 @@ async def test_list_add_edit_delete_discard_and_empty_help() -> None:
             options.highlighted_option
             and options.highlighted_option.id == "state:entries"
         )
-        assert "Empty uses built-in agent locations" in str(
+        assert "Empty uses built-in skill locations" in str(
             screen.query_one("#settings-help", NoMarkupStatic).content
         )
         focus_action(screen, "add-item")
@@ -293,7 +293,7 @@ async def test_list_add_edit_delete_discard_and_empty_help() -> None:
         await pilot.pause()
         assert not service.saved
         assert not screen.query_one("#settings-editor").display
-        assert screen._expanded == "agent_paths"
+        assert screen._expanded == "skill_paths"
         await pilot.press("escape")
         assert screen._expanded is None
         await pilot.press("enter")
@@ -306,14 +306,14 @@ async def test_list_add_edit_delete_discard_and_empty_help() -> None:
         focus_action(screen, "apply")
         await pilot.press("enter")
         await pilot.pause()
-        assert service.saved == [{"agent_paths": ["tool-*"]}]
+        assert service.saved == [{"skill_paths": ["tool-*"]}]
         assert screen._expanded is None
         await pilot.press("enter")
         assert (
             options.highlighted_option
             and screen._list_draft
             and options.highlighted_option.id
-            == f"list:agent_paths:{screen._list_draft[0].token}"
+            == f"list:skill_paths:{screen._list_draft[0].token}"
         )
         focus_action(screen, "add-item")
         await pilot.press("enter")
@@ -325,7 +325,7 @@ async def test_list_add_edit_delete_discard_and_empty_help() -> None:
         focus_action(screen, "apply")
         await pilot.press("enter")
         await pilot.pause()
-        assert service.saved[-1] == {"agent_paths": ["tool-*", "other"]}
+        assert service.saved[-1] == {"skill_paths": ["tool-*", "other"]}
         await pilot.press("enter", "home", "ctrl+d", "down", "enter")
         assert (
             _draft_values(screen._list_draft) == ["other"] and len(service.saved) == 2
@@ -333,7 +333,7 @@ async def test_list_add_edit_delete_discard_and_empty_help() -> None:
         focus_action(screen, "apply")
         await pilot.press("enter")
         await pilot.pause()
-        assert service.saved[-1] == {"agent_paths": ["other"]}
+        assert service.saved[-1] == {"skill_paths": ["other"]}
         await pilot.press("enter", "enter", "ctrl+u", "space", "enter")
         assert screen.query_one("#settings-input", Input).has_class("-invalid")
         assert (
@@ -344,7 +344,7 @@ async def test_list_add_edit_delete_discard_and_empty_help() -> None:
         focus_action(screen, "apply")
         await pilot.press("enter")
         await pilot.pause()
-        assert service.saved[-1] == {"agent_paths": []}
+        assert service.saved[-1] == {"skill_paths": []}
 
 
 @pytest.mark.asyncio
@@ -357,7 +357,7 @@ async def test_apply_list_draft_then_continue_to_highlighted_setting(
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
         options = screen.query_one(SettingsOptionList)
-        options.highlighted = options.get_option_index("agent_paths")
+        options.highlighted = options.get_option_index("skill_paths")
         await pilot.press("enter", "tab", "enter")
         await pilot.press(*"new-entry", "enter")
         await pilot.press("tab")
@@ -373,7 +373,7 @@ async def test_apply_list_draft_then_continue_to_highlighted_setting(
 
         await pilot.press("shift+tab", "down", "enter")
         await pilot.pause()
-        assert service.saved == [{"agent_paths": ["new-entry"]}]
+        assert service.saved == [{"skill_paths": ["new-entry"]}]
         assert options.highlighted_option is not None
         assert options.highlighted_option.id == "ask_confirmation_on_exit"
         await pilot.press("enter")

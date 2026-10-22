@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 import copy
 from functools import lru_cache
-from typing import Annotated, Any, NoReturn, cast
+from typing import Annotated, Any, LiteralString, NoReturn, cast
 
 from pydantic import (
     AfterValidator,
@@ -35,6 +35,44 @@ _ENVIRONMENT_CONTROLS = frozenset({
     "TEST_DISABLE_KEYRING",
     "TEST_DISABLE_AUTO_TITLE",
 })
+
+# Retired configuration inputs (design §12; package 16a) are recognized BEFORE
+# generic unknown-field handling, each with the successor of the retired
+# capability. The diagnostics never echo the supplied value.
+_RETIRED_FIELD_GUIDANCE: dict[str, str] = {
+    "system_prompt_id": (
+        "system_prompt_id is retired; full-skeleton prompt replacement is "
+        "replaced by identity composition — select [agent] identity (plus "
+        "workflow/orchestration_strategy); a custom identity is a prompt file "
+        "in the user prompts directory"
+    ),
+    "agent_paths": (
+        "agent_paths is retired; agent profiles (agents/*.toml) no longer load "
+        "from any directory — use identities instead ([agent] identity in "
+        "config.toml, or the task tool's identity field); custom identities "
+        "are prompt files in the user prompts directory"
+    ),
+    "enabled_agents": (
+        "enabled_agents is retired; launch-roster filtering moved to the "
+        "identity denylist — block launch identities with [tools.task] "
+        "denylist (Settings > Identities)"
+    ),
+    "disabled_agents": (
+        "disabled_agents is retired; launch-roster filtering moved to the "
+        "identity denylist — block launch identities with [tools.task] "
+        "denylist (Settings > Identities)"
+    ),
+}
+
+
+def _retired_field_error(source: str, field: str) -> InitErrorDetails:
+    return {
+        "type": PydanticCustomError(
+            "retired_setting", cast(LiteralString, _RETIRED_FIELD_GUIDANCE[field])
+        ),
+        "loc": (source, field),
+        "input": None,
+    }
 
 
 @lru_cache(maxsize=256)
@@ -167,6 +205,9 @@ def validate_environment_names(
         if top_level == GRANTS_FIELD:
             errors.append(_source_error("environment", GRANTS_FIELD))
             continue
+        if top_level in _RETIRED_FIELD_GUIDANCE:
+            errors.append(_retired_field_error(source, top_level))
+            continue
         if top_level not in fields:
             errors.append(_source_error(source, field_label, kind="extra_forbidden"))
             continue
@@ -205,7 +246,13 @@ def validate_source(
     for key, value in data.items():
         field = schema.model_fields.get(key)
         if field is None:
-            if (
+            if key in _RETIRED_FIELD_GUIDANCE and schema.__name__ == (
+                "ChartreuxConfigSchema"
+            ):
+                # Retired inputs are recognized before generic unknown-field
+                # handling so the diagnostic names the successor.
+                errors.append(_retired_field_error(source, key))
+            elif (
                 key in {"models", "providers"}
                 and schema.__name__ == "ChartreuxConfigSchema"
             ):

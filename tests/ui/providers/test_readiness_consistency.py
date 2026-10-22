@@ -327,7 +327,7 @@ def test_persistence_path_readiness_matches_staged_candidate(tmp_path: Path) -> 
     resolver = lambda env: "key" if env == "ZAI_API_KEY" else None
     staged_scout = draft.validate_preset("scout", resolver)
     staged_missing = draft.validate_preset("scout", lambda env: None)
-    staged_orchestrator = draft.validate_preset("orchestrator", resolver)
+    staged_main = draft.validate_preset("main", resolver)
     staged_finish = draft.validate(credential_resolver=resolver)
     staged_selected = _runtime_selected(candidate, "scout")
     staged_usable = usable_canonical_models(candidate, resolver)
@@ -342,7 +342,7 @@ def test_persistence_path_readiness_matches_staged_candidate(tmp_path: Path) -> 
     saved_state = ManagementState.from_snapshot(saved, "zai")
     assert saved_state.validate_preset("scout", resolver) == staged_scout
     assert saved_state.validate_preset("scout", lambda env: None) == staged_missing
-    assert saved_state.validate_preset("orchestrator", resolver) == staged_orchestrator
+    assert saved_state.validate_preset("main", resolver) == staged_main
     assert (
         saved_state.validate(credential_resolver=resolver).unusable_roles
         == staged_finish.unusable_roles
@@ -364,9 +364,9 @@ def test_persistence_path_readiness_matches_staged_candidate(tmp_path: Path) -> 
         "scout", resolver, allowed_models=allowed, thinking_overrides=overrides
     )
     assert draft.validate_preset(
-        "orchestrator", resolver, allowed_models=allowed, thinking_overrides=overrides
+        "main", resolver, allowed_models=allowed, thinking_overrides=overrides
     ) == saved_state.validate_preset(
-        "orchestrator", resolver, allowed_models=allowed, thinking_overrides=overrides
+        "main", resolver, allowed_models=allowed, thinking_overrides=overrides
     )
 
 
@@ -391,7 +391,7 @@ def test_glm_style_two_deployment_credential_matrix() -> None:
     both = lambda env: "key"
 
     # Runtime selection order keeps the shipped Mistral deployment first.
-    selected = ModelResolver(snapshot).resolve("@orchestrator")
+    selected = ModelResolver(snapshot).resolve("@main")
     assert (selected.deployment.provider, selected.deployment.name) == (
         "mistral",
         "zai-glm-5-3",
@@ -399,14 +399,14 @@ def test_glm_style_two_deployment_credential_matrix() -> None:
 
     # Only the ZAI credential: the runtime-selected Mistral deployment has no
     # credential, so the preset must not report ready.
-    reason = draft.validate_preset("orchestrator", only_zai)
+    reason = draft.validate_preset("main", only_zai)
     assert reason is not None and "MISTRAL_API_KEY" in reason
-    assert "orchestrator" in draft.validate(credential_resolver=only_zai).unusable_roles
+    assert "main" in draft.validate(credential_resolver=only_zai).unusable_roles
     assert "glm-5-3" not in usable_canonical_models(snapshot, only_zai)
 
     # Both credentials: ready, and the Mistral deployment stays selected.
-    assert draft.validate_preset("orchestrator", both) is None
+    assert draft.validate_preset("main", both) is None
     assert not draft.validate(credential_resolver=both).unusable_roles
     assert "glm-5-3" in usable_canonical_models(snapshot, both)
-    resolved = ModelResolver(draft._candidate_snapshot()).resolve("@orchestrator")
+    resolved = ModelResolver(draft._candidate_snapshot()).resolve("@main")
     assert resolved.deployment.provider == "mistral"

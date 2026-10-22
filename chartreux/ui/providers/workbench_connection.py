@@ -12,14 +12,12 @@ from typing import Any, Literal, cast
 from textual.widgets import Input, Label, SelectionList
 from textual.widgets.option_list import Option
 
-from chartreux.core.dispatch.session import bind_snapshot_policy
 from chartreux.core.model_catalog.contracts import (
     DiscoveryError,
     DiscoveryItem,
     DiscoveryResult,
     ProviderDraft,
 )
-from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.matching import match_discovered_model
 from chartreux.core.model_catalog.presets import (
     FULLY_CUSTOM,
@@ -864,12 +862,6 @@ class WorkbenchConnection:  # noqa: PLR0904 - connection controller interface
             return None
         return self._host._credential_value(env_var)
 
-    def bound_roster_identities(self, snapshot: CatalogSnapshot) -> frozenset[str]:
-        """Distinct canonical identities the snapshot's slots would bind."""
-        return bind_snapshot_policy(
-            snapshot, allowed_models=self._host.allowed_models
-        ).bound_canonical_identities
-
     def notify_models_saved(
         self, previously_usable: frozenset[str], roster_before: frozenset[str]
     ) -> None:
@@ -880,10 +872,11 @@ class WorkbenchConnection:  # noqa: PLR0904 - connection controller interface
                 allowed_models=self._host.allowed_models,
                 thinking_overrides=self._host.thinking_overrides,
             )
+            # The dispatch roster is retired with package 16b: the preserved
+            # callback receives empty rosters (its handler is a no-op).
+            _ = roster_before
             self._host.on_models_saved(
-                roster_before,
-                self.bound_roster_identities(self._host.snapshot),
-                usable - previously_usable,
+                frozenset(), frozenset(), usable - previously_usable
             )
 
     def save_key(self, value: str) -> None:
@@ -893,7 +886,7 @@ class WorkbenchConnection:  # noqa: PLR0904 - connection controller interface
             allowed_models=self._host.allowed_models,
             thinking_overrides=self._host.thinking_overrides,
         )
-        roster_before = self.bound_roster_identities(self._host.snapshot)
+        roster_before = frozenset[str]()
         state = self._host.state
         env = (
             self._host._add.api_key_env_var

@@ -2,7 +2,7 @@
 
 Covers the three WP3 surfaces:
 
-- Names (design §5): the ``{profile}-{model}-{number}`` derivation helper,
+- Names (design §5): the ``{identity}-{model}-{number}`` derivation helper,
   its projection onto ``AgentSummary``/``AgentSummaryModel``/launch
   acknowledgments/completion notifications, and non-relabeling refusals.
 - Guarded release (design §3.1, §8): the ``release_agent_guarded`` registry
@@ -18,6 +18,7 @@ Covers the three WP3 surfaces:
 from __future__ import annotations
 
 import asyncio
+import importlib
 from pathlib import Path
 import re
 from typing import Any, cast
@@ -56,13 +57,13 @@ from chartreux.app_server.session import AppServerSession
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop.errors import EmptyLLMResponseError
-from chartreux.core.agents.models import AgentProfile
+from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.message_list import MessageList
 from chartreux.core.recovery_models import RecoveryEligibility
 from chartreux.core.subagents import (
     AgentAvailability,
-    AgentProfileMismatchError,
+    AgentIdentityMismatchError,
     AgentSummary,
     EffectVerification,
     ReconcileOutcome,
@@ -123,9 +124,9 @@ async def _until(predicate: Any, timeout: float = 3.0) -> None:
 def test_derive_agent_name_prefers_canonical_base_model() -> None:
     assert (
         derive_agent_name(
-            "agent-15", "worker", None, "mistral/mistral-large-4", "provider/wire"
+            "agent-15", "coder", None, "mistral/mistral-large-4", "provider/wire"
         )
-        == "worker-mistral-large-4-15"
+        == "coder-mistral-large-4-15"
     )
 
 
@@ -142,68 +143,76 @@ def test_derive_agent_name_omits_model_segment_when_both_models_none() -> None:
     )
 
 
-def test_derive_agent_name_builtin_profile_uses_profile_name_not_display_name() -> None:
-    # The builtin worker profile's display_name is "Worker"; the name uses the
-    # profile name (design §5).
-    assert derive_agent_name("agent-2", "worker", "Worker", "base", None) == (
-        "worker-base-2"
+def test_derive_agent_name_builtin_identity_uses_identity_not_display_name() -> None:
+    # The builtin coder identity's shipped display name is "Coder"; the name
+    # uses the identity reference (design §5).
+    assert derive_agent_name("agent-2", "coder", "Coder", "base", None) == (
+        "coder-base-2"
     )
     assert derive_agent_name("agent-4", "advisor", "Advisor", None, None) == (
         "advisor-4"
     )
 
 
-def test_derive_agent_name_custom_profile_collapses_display_label_whitespace() -> None:
+def test_derive_agent_name_user_identity_collapses_display_label_whitespace() -> None:
     assert (
-        derive_agent_name("agent-12", "scout", "Deep  Scout\tTeam", None, "gpt-6-luna")
+        derive_agent_name(
+            "agent-12", "user:scout", "Deep  Scout\tTeam", None, "gpt-6-luna"
+        )
         == "Deep-Scout-Team-gpt-6-luna-12"
     )
 
 
-def test_derive_agent_name_custom_profile_without_label_uses_profile_name() -> None:
+def test_derive_agent_name_custom_identity_without_label_uses_identity_reference() -> (
+    None
+):
     assert derive_agent_name("agent-5", "scout", None, None, None) == "scout-5"
 
 
 def test_derive_agent_name_uses_handle_sequence_digits() -> None:
-    assert derive_agent_name("agent-15", "worker", None, None, None) == "worker-15"
+    assert derive_agent_name("agent-15", "coder", None, None, None) == "coder-15"
 
 
 @pytest.mark.parametrize(
-    ("agent_id", "profile", "label", "base_model", "effective_model"),
+    ("agent_id", "identity", "label", "base_model", "effective_model"),
     [
-        ("agent-1", "worker", None, None, None),
-        ("agent-2", "worker", "Worker", "base", "provider/wire"),
+        ("agent-1", "coder", None, None, None),
+        ("agent-2", "coder", "Coder", "base", "provider/wire"),
         ("agent-3", "scout", "Deep  Scout  Team", None, "mistral/zai-glm-5-3"),
         ("agent-15", "reviewer", "Reviewer", "glm-5.3", None),
-        # Adversarial: a profile (or display label) of exactly "agent" would
+        # Adversarial: an identity (or display label) of exactly "agent" would
         # derive the handle shape when no model is known.
         ("agent-7", "agent", None, None, None),
         ("agent-7", "agent", "agent", "gpt-6-luna", None),
-        ("agent-7", "scout", "agent", None, None),
+        ("agent-7", "user:agent", "agent", None, None),
         ("agent-9", "agent", None, None, "mistral/zai-glm-5-3"),
         ("agent-9", "agent", "  agent  ", None, None),
     ],
 )
 def test_derived_names_never_parse_as_handles(
     agent_id: str,
-    profile: str,
+    identity: str,
     label: str | None,
     base_model: str | None,
     effective_model: str | None,
 ) -> None:
     # Names are presentation only: the ``agent-\d+`` handle namespace stays
     # disjoint from derived names (design §5).
-    name = derive_agent_name(agent_id, profile, label, base_model, effective_model)
+    name = derive_agent_name(agent_id, identity, label, base_model, effective_model)
     assert _HANDLE_PATTERN.fullmatch(name) is None
     assert name != agent_id
 
 
-def test_derive_agent_name_breaks_the_handle_shape_for_agent_profiles() -> None:
+def test_derive_agent_name_breaks_the_handle_shape_for_agent_identities() -> None:
     # The derivation sanitizes the one configuration that would otherwise
-    # collide with the handle namespace: prefixing the profile segment makes
+    # collide with the handle namespace: prefixing the identity segment makes
     # the result non-handle-shaped deterministically.
     assert derive_agent_name("agent-7", "agent", None, None, None) == "agent-agent-7"
-    assert derive_agent_name("agent-7", "scout", "agent", None, None) == "agent-agent-7"
+    # The display-label path (user:-qualified identities) is sanitized the
+    # same way when the label is exactly "agent".
+    assert derive_agent_name("agent-7", "user:agent", "agent", None, None) == (
+        "agent-agent-7"
+    )
     # A known model segment already breaks the shape on its own.
     assert (
         derive_agent_name("agent-7", "agent", None, "gpt-6-luna", None)
@@ -211,14 +220,21 @@ def test_derive_agent_name_breaks_the_handle_shape_for_agent_profiles() -> None:
     )
 
 
-def test_profile_named_like_a_handle_is_reserved_at_discovery(tmp_path: Path) -> None:
-    # The ``agent-\d+`` profile-name reservation keeps discovery disjoint from
-    # the handle namespace (core/agents/models.py). A bare "agent" profile is
-    # NOT reserved — it is allowed at discovery and sanitized at derivation.
-    profile_path = tmp_path / "agent-3.toml"
-    profile_path.write_text('description = "handle-shaped"\n')
-    with pytest.raises(ValueError, match="reserved for agent instance handles"):
-        AgentProfile.from_toml(profile_path)
+def test_handle_shaped_agent_toml_is_retired_never_parsed(config_dir: Path) -> None:
+    # The ``agent-\d+`` profile-name reservation retired with AgentProfile:
+    # agents/*.toml is no longer parsed at all. A handle-shaped file is
+    # reported through the retired agents directory and left untouched.
+    agents_dir = config_dir / "agents"
+    agents_dir.mkdir()
+    profile_path = agents_dir / "agent-3.toml"
+    original = b'description = "handle-shaped"\n'
+    profile_path.write_bytes(original)
+    manager = HarnessFilesManager(sources=("user",))
+    assert agents_dir in manager.retired_agent_dirs
+    # The AgentProfile module retired with it: no loader surface remains.
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("chartreux.core.agents.models")
+    assert profile_path.read_bytes() == original
 
 
 # ---------------------------------------------------------------------------
@@ -231,18 +247,18 @@ def _resident_record(
     agent_id: str,
     *,
     clock: _ManualClock,
-    profile: str = "worker",
-    profile_display_label: str | None = None,
+    identity: str = "coder",
+    identity_display_label: str | None = None,
     base_model: str | None = None,
     effective_model: str | None = None,
     latest_run_id: str | None = "run-1",
 ) -> AgentRecord:
     record = _idle_record(agent_id, clock=clock)
-    record.profile = profile
+    record.identity = identity
     # The attached-root tests bind a root with session id "root" and
     # generation 0; resident records belong to it (design §8 authority).
     record.parent_session_id = "root"
-    record.profile_display_label = profile_display_label
+    record.identity_display_label = identity_display_label
     record.base_model = base_model
     record.effective_model = effective_model
     record.latest_run_id = latest_run_id
@@ -254,23 +270,18 @@ def _resident_record(
 async def _scout_registry(
     monkeypatch: pytest.MonkeyPatch,
     backend: FakeBackend,
-    tmp_path: Path,
     *,
-    profile_name: str = "scout",
-    display_name: str | None = "Deep  Scout  Team",
+    identity_name: str = "scout",
 ) -> tuple[SessionRuntimeRegistry, AgentLoop, list[str]]:
-    """A registry whose parent discovers a custom profile TOML."""
-    lines = ['agent_type = "subagent"']
-    if display_name is not None:
-        lines.append(f'display_name = "{display_name}"')
-    lines.append('enabled_tools = ["todo"]')
-    (tmp_path / f"{profile_name}.toml").write_text("\n".join(lines), encoding="utf-8")
+    """A registry whose parent resolves a custom identity prompt.
+
+    The custom identity's prompt file is installed by the autouse conftest
+    fixture; agents/*.toml discovery is retired (16a).
+    """
     monkeypatch.setattr(
         "chartreux.core.agent_loop._loop.create_backend", lambda **_: backend
     )
-    config = _config(enabled_tools=["task", "todo"]).model_copy(
-        update={"agent_paths": [tmp_path]}
-    )
+    config = _config(enabled_tools=["task", "todo"])
     parent = build_test_agent_loop(config=config, backend=FakeBackend())
     registry = _retention_registry()
     root = registry._build_child_runtime(parent)
@@ -300,16 +311,16 @@ async def test_agent_summaries_project_derived_names() -> None:
         registry,
         "agent-1",
         clock=clock,
-        profile="scout",
-        profile_display_label="Deep  Scout  Team",
+        identity="user:scout",
+        identity_display_label="Deep  Scout  Team",
         effective_model="mistral/zai-glm-5-3",
     )
     _resident_record(
         registry,
         "agent-2",
         clock=clock,
-        profile="worker",
-        profile_display_label="Worker",
+        identity="coder",
+        identity_display_label="Coder",
         base_model="mistral/mistral-large-4",
         effective_model="mistral/mistral-large-4-wire",
     )
@@ -319,8 +330,8 @@ async def test_agent_summaries_project_derived_names() -> None:
 
     assert [summary.name for summary in summaries] == [
         "Deep-Scout-Team-zai-glm-5-3-1",
-        "worker-mistral-large-4-2",
-        "worker-3",
+        "coder-mistral-large-4-2",
+        "coder-3",
     ]
     # The name is a required wire field on every emitted summary.
     notify = AsyncMock()
@@ -347,17 +358,17 @@ async def test_tombstone_name_survives_metadata_expiry_window() -> None:
     )
 
     summary = (await registry.check_agents())[0]
-    assert summary.name == "worker-glm-5.3-1"
+    assert summary.name == "coder-glm-5.3-1"
 
     assert registry._close_unretained_locked(record, None, name="test-close")
     closed = (await registry.check_agents())[0]
     assert closed.availability is AgentAvailability.CLOSED
-    assert closed.name == "worker-glm-5.3-1"
+    assert closed.name == "coder-glm-5.3-1"
 
     # Within the metadata window the Recent row keeps its frozen name; past
     # the tombstone TTL the row behaves as absent (never a stale name).
     clock.advance(registry._retention_policy.tombstone_ttl_seconds - 1)
-    assert (await registry.check_agents())[0].name == "worker-glm-5.3-1"
+    assert (await registry.check_agents())[0].name == "coder-glm-5.3-1"
     clock.advance(2)
     assert await registry.check_agents() == []
     await registry.drain_children()
@@ -365,32 +376,29 @@ async def test_tombstone_name_survives_metadata_expiry_window() -> None:
 
 @pytest.mark.asyncio
 async def test_launch_acknowledgment_carries_name_alongside_handle_and_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend = BlockingBackend()
-    registry, parent, _notifications = await _scout_registry(
-        monkeypatch, backend, tmp_path
-    )
+    registry, parent, _notifications = await _scout_registry(monkeypatch, backend)
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(
-                task="scout work", agent_type="scout", background=True, retain=True
-            ),
+            TaskArgs(task="scout work", identity="scout", background=True, retain=True),
             InvokeContext(tool_call_id="scout", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None
         record = registry._agent_records[launch.agent_id]
-        assert record.profile == "scout"
-        assert record.profile_display_label == "Deep  Scout  Team"
+        assert record.identity == "scout"
+        # A custom identity prompt carries no explicit display name.
+        assert record.identity_display_label is None
         expected_name = derive_agent_name(
             record.agent_id,
-            record.profile,
-            record.profile_display_label,
+            record.identity,
+            record.identity_display_label,
             record.base_model,
             record.effective_model,
         )
-        assert expected_name.startswith("Deep-Scout-Team-")
+        assert expected_name.startswith("scout-")
         # The launch acknowledgment carries the name as a top-level field and
         # in the acknowledgment text alongside agent_id/run_id.
         assert launch.name == expected_name
@@ -435,9 +443,7 @@ async def test_completion_notification_derives_from_its_own_run_record(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(
-                task="notify me", agent_type="worker", background=True, retain=True
-            ),
+            TaskArgs(task="notify me", identity="coder", background=True, retain=True),
             InvokeContext(tool_call_id="launch", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None
@@ -448,8 +454,8 @@ async def test_completion_notification_derives_from_its_own_run_record(
         record = registry._agent_records[launch.agent_id]
         expected_name = derive_agent_name(
             record.agent_id,
-            record.profile,
-            record.profile_display_label,
+            record.identity,
+            record.identity_display_label,
             record.base_model,
             record.effective_model,
         )
@@ -485,7 +491,7 @@ async def test_failed_background_run_carries_envelope_and_last_failure(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="fail", agent_type="worker", background=True, retain=True),
+            TaskArgs(task="fail", identity="coder", background=True, retain=True),
             InvokeContext(tool_call_id="launch", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None
@@ -563,7 +569,7 @@ async def test_suspended_failure_projects_recovery_state_on_the_wire(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="fail", agent_type="worker", background=True, retain=True),
+            TaskArgs(task="fail", identity="coder", background=True, retain=True),
             InvokeContext(tool_call_id="launch", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None
@@ -623,32 +629,28 @@ async def test_suspended_failure_projects_recovery_state_on_the_wire(
 
 @pytest.mark.asyncio
 async def test_refused_reuse_never_relabels_the_resident_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend = FakeBackend([[mock_llm_chunk(content="scout done")]])
-    registry, parent, _notifications = await _scout_registry(
-        monkeypatch, backend, tmp_path
-    )
+    registry, parent, _notifications = await _scout_registry(monkeypatch, backend)
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(
-                task="scout work", agent_type="scout", background=True, retain=True
-            ),
+            TaskArgs(task="scout work", identity="scout", background=True, retain=True),
             InvokeContext(tool_call_id="scout", session_id=parent.session_id),
         )
         assert launch.agent_id is not None
         await _wait_result(registry, launch.agent_id, launch.run_id)
         before = (await registry.check_agents())[0]
-        assert before.name.startswith("Deep-Scout-Team-")
+        assert before.name.startswith("scout-")
 
-        # A refused reuse (profile mismatch) must not relabel the record.
-        with pytest.raises(AgentProfileMismatchError):
+        # A refused reuse (identity mismatch) must not relabel the record.
+        with pytest.raises(AgentIdentityMismatchError):
             await _background_result(
                 registry,
                 TaskArgs(
-                    task="wrong profile",
-                    agent_type="reviewer",
+                    task="wrong identity",
+                    identity="reviewer",
                     agent_id=launch.agent_id,
                     background=True,
                 ),
@@ -663,54 +665,37 @@ async def test_refused_reuse_never_relabels_the_resident_record(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("display_name", "expected_label", "expected_name_prefix"),
-    [
-        (None, None, "my-scout-"),
-        ("Deep  Scout  Team", "Deep  Scout  Team", "Deep-Scout-Team-"),
-    ],
-    ids=["without-display-name", "with-explicit-display-name"],
-)
-async def test_custom_profile_name_uses_display_name_only_when_explicit(
-    display_name: str | None,
-    expected_label: str | None,
-    expected_name_prefix: str,
-    tmp_path: Path,
+async def test_custom_identity_name_uses_the_identity_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Design §5: the profile segment is the display name only when the TOML
-    # provided one explicitly. Without a display_name the title-case synthesis
-    # stays picker-facing and the derivation falls back to the profile name,
-    # so a my-scout.toml profile derives my-scout-… (not My-Scout-…).
+    # Design §5: a custom identity prompt carries no explicit display name,
+    # so the derivation always falls back to the identity reference — a
+    # my-scout prompt derives my-scout-… (not My-Scout-…).
     backend = BlockingBackend()
     registry, parent, _notifications = await _scout_registry(
-        monkeypatch,
-        backend,
-        tmp_path,
-        profile_name="my-scout",
-        display_name=display_name,
+        monkeypatch, backend, identity_name="my-scout"
     )
     try:
         launch = await _background_result(
             registry,
             TaskArgs(
-                task="scout work", agent_type="my-scout", background=True, retain=True
+                task="scout work", identity="my-scout", background=True, retain=True
             ),
             InvokeContext(tool_call_id="scout", session_id=parent.session_id),
         )
         assert launch.agent_id is not None
         record = registry._agent_records[launch.agent_id]
-        assert record.profile == "my-scout"
-        # The admission capture stores the label only when it was explicit.
-        assert record.profile_display_label == expected_label
+        assert record.identity == "my-scout"
+        # The admission capture stores no label for a custom identity prompt.
+        assert record.identity_display_label is None
         expected_name = derive_agent_name(
             record.agent_id,
-            record.profile,
-            record.profile_display_label,
+            record.identity,
+            record.identity_display_label,
             record.base_model,
             record.effective_model,
         )
-        assert expected_name.startswith(expected_name_prefix)
+        assert expected_name.startswith("my-scout-")
         assert launch.name == expected_name
         assert (await registry.check_agents())[0].name == expected_name
     finally:
@@ -758,7 +743,7 @@ def _running_record(
     run = RunRecord(
         run_id=run_id,
         agent_id=agent_id,
-        profile="worker",
+        identity="coder",
         status=RunStatus.RUNNING,
         completion_task=asyncio.get_running_loop().create_future(),
         started_at=clock(),
@@ -828,7 +813,7 @@ async def test_guarded_release_conflict_never_stops_the_new_run() -> None:
     new_run = RunRecord(
         run_id="run-2",
         agent_id="agent-1",
-        profile="worker",
+        identity="coder",
         status=RunStatus.RUNNING,
         completion_task=asyncio.get_running_loop().create_future(),
     )
@@ -920,7 +905,7 @@ async def test_guarded_release_unknown_for_foreign_tombstone(
     registry._evicted_agents["agent-1"] = _AgentTombstone(
         summary=AgentSummary(
             agent_id="agent-1",
-            profile="worker",
+            identity="coder",
             availability=AgentAvailability.EVICTED,
             current_run_id="run-1",
             current_run_status=RunStatus.COMPLETED,
@@ -1337,7 +1322,7 @@ async def test_wait_pins_run_identity_across_a_replacement_race() -> None:
     newer_run = RunRecord(
         run_id="run-2",
         agent_id="agent-1",
-        profile="worker",
+        identity="coder",
         status=RunStatus.RUNNING,
         completion_task=asyncio.get_running_loop().create_future(),
     )
@@ -1435,7 +1420,7 @@ async def test_wait_lease_protects_result_from_count_expiry() -> None:
     target = RunRecord(
         run_id="run-1",
         agent_id="agent-1",
-        profile="worker",
+        identity="coder",
         status=RunStatus.RUNNING,
         completion_task=asyncio.get_running_loop().create_future(),
     )
@@ -1472,11 +1457,11 @@ async def test_wait_evicted_agent_with_retained_result_succeeds() -> None:
     registry._evicted_agents[stored.agent_id] = _AgentTombstone(
         summary=AgentSummary(
             agent_id=stored.agent_id,
-            profile="worker",
+            identity="coder",
             availability=AgentAvailability.EVICTED,
             current_run_id=stored.run_id,
             current_run_status=RunStatus.COMPLETED,
-            name=derive_agent_name(stored.agent_id, "worker", None, None, None),
+            name=derive_agent_name(stored.agent_id, "coder", None, None, None),
         ),
         child_session_id=f"session-{stored.agent_id}",
         parent_identity=("root", 0),
@@ -1518,11 +1503,11 @@ async def test_wait_tool_serializes_still_running_as_a_normal_result() -> None:
     manager = FakeSubagentManager([
         AgentSummary(
             agent_id="agent-1",
-            profile="worker",
+            identity="coder",
             availability=AgentAvailability.RUNNING,
             current_run_id="run-1",
             current_run_status=RunStatus.RUNNING,
-            name=derive_agent_name("agent-1", "worker", None, None, None),
+            name=derive_agent_name("agent-1", "coder", None, None, None),
         )
     ])
     tool = WaitForAgent(
@@ -1574,8 +1559,8 @@ def test_agents_update_accepts_legacy_nameless_payload() -> None:
         "sessionId": "session-1",
         "emittedAt": 2,
         "agents": [
-            {"agentId": "agent-1", "profile": "worker", "availability": "idle"},
-            {"agentId": "agent-2", "profile": "worker", "availability": "idle"},
+            {"agentId": "agent-1", "availability": "idle"},
+            {"agentId": "agent-2", "availability": "idle"},
         ],
     }
 
@@ -1593,18 +1578,13 @@ def test_agents_update_preserves_name_when_present() -> None:
         "sessionId": "session-1",
         "emittedAt": 2,
         "agents": [
-            {
-                "agentId": "agent-1",
-                "profile": "worker",
-                "name": "worker-base-1",
-                "availability": "idle",
-            }
+            {"agentId": "agent-1", "name": "coder-base-1", "availability": "idle"}
         ],
     }
 
     event = projection.consume(Notification(method="agents/update", params=params))
 
     assert isinstance(event, AgentsUpdate)
-    assert event.agents[0].name == "worker-base-1"
+    assert event.agents[0].name == "coder-base-1"
     # The server payload is not mutated by the client-side normalization.
     assert "name" in params["agents"][0]

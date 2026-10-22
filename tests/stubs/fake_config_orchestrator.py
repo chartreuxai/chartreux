@@ -33,8 +33,8 @@ class FakeConfigOrchestrator[C: ChartreuxConfigSchema](ConfigOrchestrator[C]):
     layer stay session-local.
 
     The verbatim config is treated as the base layer; additional in-memory
-    layers (e.g. the agent-profile layer) may be inserted and are folded onto it
-    by ``rebuild`` using production merge semantics.
+    layers (e.g. a runtime-override layer) may be inserted and are folded onto
+    it by ``rebuild`` using production merge semantics.
     """
 
     def __init__(self, config: C) -> None:
@@ -45,14 +45,12 @@ class FakeConfigOrchestrator[C: ChartreuxConfigSchema](ConfigOrchestrator[C]):
         self._policy_owner = uuid4()
         self._accepted_token = uuid4()
         self._availability_registry = AvailabilityRegistry()
-        self.bound_dispatch_policy = config.bound_dispatch_policy
 
     def copy(self, *, config: C | None = None) -> FakeConfigOrchestrator[C]:
         base_config = self._base_config if config is None else config
         clone = FakeConfigOrchestrator(base_config.model_copy(deep=True))
         clone._policy_owner = self._policy_owner
         clone._availability_registry = self._availability_registry
-        clone.bound_dispatch_policy = self.bound_dispatch_policy
         clone._extra_layers = [copy.deepcopy(layer) for layer in self._extra_layers]
         clone.rebuild()
         return clone
@@ -85,7 +83,7 @@ class FakeConfigOrchestrator[C: ChartreuxConfigSchema](ConfigOrchestrator[C]):
         builder.add_layer(base)
         builder.add_layers(list(self._extra_layers))
         # This test double supplies a fixture for the actual builtin layer; it
-        # does not grant catalog authority to runtime or profile overrides.
+        # does not grant catalog authority to runtime or launch overrides.
         result = run_sync(
             builder.build(
                 layer_overrides={
@@ -114,7 +112,6 @@ class FakeConfigOrchestrator[C: ChartreuxConfigSchema](ConfigOrchestrator[C]):
 
     @property
     def config(self) -> C:
-        self._config.attach_dispatch_policy(self.bound_dispatch_policy)
         return self._config
 
     @property

@@ -79,7 +79,9 @@ async def test_act_flushes_batched_messages_with_injection_middleware() -> None:
         Role.user,
         Role.assistant,
     ]
-    assert observed[0][1] == "You are Chartreux, a super useful programming assistant."
+    assert (observed[0][1] or "").startswith(
+        "You are Chartreux, an independently maintained CLI coding agent."
+    )
     assert observed[1][1] == "How can you help?"
     assert observed[2][1] == InjectBeforeMiddleware.injected_message
     assert observed[3][1] == "I can write very efficient code."
@@ -100,7 +102,9 @@ async def test_stop_action_flushes_user_msg_before_returning() -> None:
     assert len(observed) == 2
     # user's message should have been flushed before returning
     assert [r for r, _ in observed] == [Role.system, Role.user]
-    assert observed[0][1] == "You are Chartreux, a super useful programming assistant."
+    assert (observed[0][1] or "").startswith(
+        "You are Chartreux, an independently maintained CLI coding agent."
+    )
     assert observed[1][1] == "Greet."
 
 

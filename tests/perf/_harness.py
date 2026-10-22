@@ -107,7 +107,7 @@ async def create_subagent_harness(model_names: Sequence[str]) -> SubagentHarness
             "providers": providers,
             "models": models,
             "roles": {
-                "orchestrator": {
+                "main": {
                     "description": "Performance harness main preset",
                     "model": model_names[0],
                     "thinking": "high",

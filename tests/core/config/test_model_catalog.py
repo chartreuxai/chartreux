@@ -7,22 +7,19 @@ import warnings
 from pydantic import ValidationError
 import pytest
 
+from chartreux.core.config.builder import ConfigBuilder
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.layers.default import DefaultConfigLayer
 from chartreux.core.config.layers.overrides import OverridesLayer
+from chartreux.core.config.layers.user import UserConfigLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
-from chartreux.core.dispatch import (
-    DEFAULT_DISPATCH_MODE,
-    ORCHESTRATED_PRESET,
-    SHIPPED_PRESETS,
-)
+from chartreux.core.dispatch.routes import shipped_routes
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import (
     CatalogLoadError,
     CatalogSnapshot,
     load_catalog,
     merge_catalog_overlay,
-    merge_dispatch_overlay,
 )
 from chartreux.core.model_catalog.resolver import ModelResolutionError, ModelResolver
 from chartreux.core.model_catalog.schema import ModelCatalog, Prices, ProviderDefinition
@@ -268,11 +265,11 @@ def test_16_shipped_defaults_validate_and_have_verified_wire_names() -> None:
         "glm-5-3": "high",
         "mistral-large-4": "high",
     }
-    assert catalog.roles["orchestrator"].model == "glm-5-3"
+    assert catalog.roles["main"].model == "glm-5-3"
     assert {
         name: (role.model, role.thinking) for name, role in catalog.roles.items()
     } == {
-        "orchestrator": ("glm-5-3", "high"),
+        "main": ("glm-5-3", "high"),
         "worker": ("glm-5-3", "medium"),
         "scout": ("glm-5-3", "low"),
         "heavy": ("mistral-large-4", "high"),
@@ -311,7 +308,7 @@ def test_shipped_catalog_json_dump_round_trips() -> None:
 @pytest.mark.parametrize(
     ("preset", "base_model", "thinking"),
     [
-        ("orchestrator", "glm-5-3", "high"),
+        ("main", "glm-5-3", "high"),
         ("worker", "glm-5-3", "medium"),
         ("scout", "glm-5-3", "low"),
         ("heavy", "mistral-large-4", "high"),
@@ -480,8 +477,24 @@ def test_resolver_unknown_role_lists_valid_roles() -> None:
     with pytest.raises(ModelResolutionError) as error:
         resolver.resolve("@not-a-role")
     assert error.value.code == "unknown_role"
-    assert "@orchestrator" in str(error.value)
+    assert "@main" in str(error.value)
     assert "@worker" in str(error.value)
+
+
+def test_retired_orchestrator_role_fails_loudly_with_rename_guidance() -> None:
+    """The shipped main preset is @main; @orchestrator has no alias (§12)."""
+    resolver = ModelResolver(CatalogSnapshot(SHIPPED_CATALOG, "test"))
+    with pytest.raises(ModelResolutionError) as error:
+        resolver.resolve("@orchestrator")
+    assert error.value.code == "retired_role"
+    assert "renamed to '@main'" in str(error.value)
+    assert "[roles.orchestrator]" in str(error.value)
+    # A catalog that explicitly defines an orchestrator role resolves its own
+    # name; the retirement only concerns the shipped preset.
+    raw = _minimal()
+    raw["roles"] = {"orchestrator": {"model": "base", "thinking": "medium"}}
+    own = ModelResolver(CatalogSnapshot(ModelCatalog.model_validate(raw), "test"))
+    assert own.resolve("@orchestrator").base_model == "base"
 
 
 def test_deployment_priority_disabled_skip_and_all_disabled() -> None:
@@ -627,19 +640,38 @@ async def test_orchestrator_copy_reattaches_supplied_and_source_catalog_snapshot
 
 def test_role_overlay_merges_per_key_and_rejects_legacy_names() -> None:
     catalog = merge_catalog_overlay(
-        SHIPPED_CATALOG, {"roles": {"orchestrator": {"thinking": "medium"}}}
+        SHIPPED_CATALOG, {"roles": {"main": {"thinking": "medium"}}}
     )
-    assert catalog.roles["orchestrator"].model == "glm-5-3"
-    assert catalog.roles["orchestrator"].thinking == "medium"
+    assert catalog.roles["main"].model == "glm-5-3"
+    assert catalog.roles["main"].thinking == "medium"
     assert (
-        catalog.roles["orchestrator"].description
-        == SHIPPED_CATALOG.roles["orchestrator"].description
+        catalog.roles["main"].description == SHIPPED_CATALOG.roles["main"].description
     )
     assert catalog.roles["heavy"] == SHIPPED_CATALOG.roles["heavy"]
     with pytest.raises(ValueError, match=r"migration required.*\[roles\]"):
         merge_catalog_overlay(SHIPPED_CATALOG, {"tags": {}})
     with pytest.raises(ValueError, match="remove aliases"):
         merge_catalog_overlay(SHIPPED_CATALOG, {"models": {"glm-5-3": {"aliases": []}}})
+
+
+def test_legacy_orchestrator_role_overlay_fails_loudly(tmp_path: Path) -> None:
+    """A [roles.orchestrator] overlay no longer binds a shipped role (§12).
+
+    The old overlay patched the shipped orchestrator preset; after the @main
+    rename it would silently create a new custom role, so the load fails
+    loudly with rename guidance and the file is never rewritten.
+    """
+    with pytest.raises(ValueError, match="renamed to roles.main") as error:
+        merge_catalog_overlay(
+            SHIPPED_CATALOG, {"roles": {"orchestrator": {"thinking": "medium"}}}
+        )
+    assert "[roles.main]" in str(error.value)
+
+    path = tmp_path / "models.toml"
+    path.write_text('[roles.orchestrator]\nthinking = "medium"\n')
+    with pytest.raises(CatalogLoadError, match="renamed to roles.main"):
+        load_catalog(path)
+    assert path.read_text() == '[roles.orchestrator]\nthinking = "medium"\n'
 
 
 def test_disabled_preset_model_does_not_fall_back_to_another_model() -> None:
@@ -725,13 +757,17 @@ def test_catalog_overlay_accepts_dispatch_table_without_catalog_authority() -> N
         merge_catalog_overlay(SHIPPED_CATALOG, {"dispatching": {}})
 
 
-def test_snapshot_default_dispatch_is_the_shipped_default() -> None:
+def test_snapshot_carries_no_dispatch_state() -> None:
+    # The retired [dispatch] READ path is gone: a snapshot carries no
+    # dispatch policy at all, only the loud-report diagnostics channel.
     snapshot = CatalogSnapshot(SHIPPED_CATALOG, "test")
-    assert snapshot.dispatch == SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE]
+    assert not hasattr(snapshot, "dispatch")
     assert snapshot.dispatch_diagnostics == ()
 
 
-def test_load_catalog_resolves_dispatch_and_revision(tmp_path: Path) -> None:
+def test_load_catalog_reports_legacy_dispatch_and_keeps_the_revision(
+    tmp_path: Path,
+) -> None:
     plain = tmp_path / "plain.toml"
     plain.write_text('[roles.scout]\nthinking = "low"\n')
     dispatched = tmp_path / "dispatched.toml"
@@ -742,17 +778,41 @@ def test_load_catalog_resolves_dispatch_and_revision(tmp_path: Path) -> None:
     base = load_catalog(plain)
     selected = load_catalog(dispatched)
 
+    # The retired table is reported loudly and never merged; the revision
+    # covers the served catalog alone, so it does not move.
     assert base.catalog == selected.catalog
-    assert base.dispatch == SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE]
-    assert selected.dispatch == ORCHESTRATED_PRESET
-    assert selected.dispatch.mode == DEFAULT_DISPATCH_MODE.ORCHESTRATED
-    assert selected.revision != base.revision
-    assert selected.dispatch_diagnostics == ()
+    assert base.revision == selected.revision
+    assert base.dispatch_diagnostics == ()
+    assert not hasattr(selected, "dispatch")
+    assert len(selected.dispatch_diagnostics) == 1
+    report = selected.dispatch_diagnostics[0]
+    assert "[dispatch]" in report and "retired" in report
+    assert "[orchestration.routes.<purpose>]" in report
 
 
-def test_dispatch_overlay_sparse_merge_inherits_shipped_preset() -> None:
-    policy = merge_dispatch_overlay({"slots": {"implementor": {"role": "@scout"}}})
-    assert policy.slots["implementor"].role == "@scout"
-    assert policy.slots["implementor"].purposes == ("implementation",)
-    assert policy.slots["advisor"].role == "@heavy"
-    assert policy.identity == SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE].identity
+@pytest.mark.asyncio
+async def test_orchestration_routes_come_from_the_configuration_contract(
+    tmp_path: Path,
+) -> None:
+    """[orchestration.routes.*] is the config surface for launch bindings (§12)."""
+    toml_path = tmp_path / "config.toml"
+    toml_path.write_text(
+        """\
+[[orchestration.routes.research.targets]]
+model = "glm-5-3"
+identity = "coder"
+tier = "mechanical"
+"""
+    )
+    builder = ConfigBuilder(ChartreuxConfigSchema)
+    builder.add_layers([
+        DefaultConfigLayer(schema=ChartreuxConfigSchema),
+        UserConfigLayer(path=toml_path, name="user"),
+    ])
+    config = await builder.build()
+    routes = config.purpose_routes.routes
+    assert set(routes) == set(shipped_routes())
+    assert routes["research"].targets[0].model == "glm-5-3"
+    assert routes["research"].targets[0].identity == "coder"
+    # Untouched purposes keep the shipped default through the same table.
+    assert routes["implementation"] == shipped_routes()["implementation"]

@@ -13,6 +13,21 @@ class SkillSource(StrEnum):
     LOCAL = auto()
 
 
+class SkillWorkflowClass(StrEnum):
+    """The harness-side workflow classification of a shipped skill (design §5).
+
+    The classification is a HARNESS-SIDE TABLE
+    (``chartreux/core/skills/compatibility.py``) — it is never encoded in
+    SKILL.md frontmatter. ``IDENTITY_NEUTRAL`` skills are eligible in every
+    workflow; ``CEREMONY_BEARING`` skills load only in conversations whose
+    frozen workflow carries the ceremony (the minimal default loads only
+    identity-neutral skills).
+    """
+
+    IDENTITY_NEUTRAL = auto()
+    CEREMONY_BEARING = auto()
+
+
 class SkillScope(StrEnum):
     BUILTIN = auto()
     GLOBAL = auto()

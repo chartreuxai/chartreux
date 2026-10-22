@@ -3497,7 +3497,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             # resumed terminal summary is not a newly consumed attempt.
             key = f"{self.app_server.session_id}:{agent.agent_id}:{run_id}"
             if agent.current_run_status == "running":
-                if "implementation" in agent.slot_purposes:
+                if "implementation" in agent.launch_purposes:
                     self._graduation_live_attempts[key] = (
                         f"{self.app_server.session_id}:{agent.agent_id}:{task}"
                     )
@@ -3526,19 +3526,15 @@ class ChartreuxApp(App):  # noqa: PLR0904
         roster_after: frozenset[str],
         saved_models: frozenset[str],
     ) -> None:
-        # The session-bound roster is the authoritative pre-save side: saved
-        # edits apply next session, so the live policy still reflects the
-        # roster this session dispatches to. An attached policy with an empty
-        # roster stays empty — a live 0->2 transition never latches — and only
-        # a missing policy falls back to the workbench's pre-save resolution.
-        bound_roster = getattr(self.config, "bound_roster", None)
-        before = roster_before if bound_roster is None else frozenset(bound_roster)
-        self._graduation.state.model_saved(before, roster_after, saved_models)
+        # The dispatch roster is retired with package 16b: the callback still
+        # receives the pre/post rosters (empty — the workbench no longer
+        # computes them) and the graduation handler records the transition.
+        self._graduation.state.model_saved(roster_before, roster_after, saved_models)
         self._graduation.save()
 
     def _maybe_show_graduation(self) -> None:
         notice = self._graduation_notice
-        if notice is None or self.config.dispatch_mode is None:
+        if notice is None:
             return
         idle = (
             not self._is_busy()
@@ -3546,16 +3542,14 @@ class ChartreuxApp(App):  # noqa: PLR0904
             and self._active_callback is None
             and not any(agent_is_active(agent) for agent in self._agent_summaries)
         )
-        if not self._graduation.state.eligible(
-            mode=self.config.dispatch_mode, idle=idle, headless=False
-        ):
+        if not self._graduation.state.eligible(idle=idle, headless=False):
             return
         self._graduation.state.shown = True
         if not self._graduation.save():
             return
         notice.update(
             Text.from_markup(
-                "More models can share the work. "
+                "Budgeted implementation attempts failed repeatedly. "
                 "[@click=app.graduation_customize]Customize[/] · "
                 "[@click=app.graduation_dismiss]Dismiss[/] (applies next session)"
             )

@@ -173,7 +173,7 @@ class AgentTranscriptViewer(Vertical):
         source: AgentTranscriptSource,
         agent_id: str,
         *,
-        profile: str = "unknown",
+        identity: str | None = None,
         name: str = "",
         metadata: str = "",
         live: bool = False,
@@ -183,12 +183,12 @@ class AgentTranscriptViewer(Vertical):
         super().__init__(id="agent-transcript-viewer")
         self._source = source
         self._agent_id = agent_id
-        self._profile = profile
+        self._identity = identity
         self._name = name
         self._metadata = metadata
         # NoMarkupStatic renders the metadata literally: the derived name (and
         # the other full_metadata fields) may contain markup-looking characters
-        # from a custom profile's display name.
+        # from a custom identity's display name.
         self._metadata_widget: NoMarkupStatic | None = None
         self._header_widget: NoMarkupStatic | None = None
         self._live = live
@@ -225,18 +225,19 @@ class AgentTranscriptViewer(Vertical):
         return self._agent_id
 
     def _header_text(self) -> str:
-        # NoMarkupStatic renders the label literally: a custom profile's
+        # NoMarkupStatic renders the label literally: a custom identity's
         # display name may contain markup-looking characters.
+        segment = self._identity if self._identity is not None else "unknown"
         if self._name:
-            return f"Subagent: {self._name} ({self._agent_id}) · {self._profile}"
-        return f"Subagent: {self._agent_id} · {self._profile}"
+            return f"Subagent: {self._name} ({self._agent_id}) · {segment}"
+        return f"Subagent: {self._agent_id} · {segment}"
 
-    def set_header(self, name: str, profile: str) -> None:
+    def set_header(self, name: str, identity: str | None = None) -> None:
         """Refresh the identity header in place (a re-task reuses the viewer)."""
-        if name == self._name and profile == self._profile:
+        if name == self._name and identity == self._identity:
             return
         self._name = name
-        self._profile = profile
+        self._identity = identity
         if self._header_widget is not None:
             self._header_widget.update(self._header_text())
 

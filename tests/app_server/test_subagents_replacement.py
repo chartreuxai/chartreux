@@ -11,11 +11,14 @@ import pytest
 
 from chartreux.app_server._sessions import SessionRuntimeRegistry, _AgentState
 from chartreux.app_server.server import AppServer
+from chartreux.core.agents.identity_launch import InvalidChildIdentityError
+from chartreux.core.config.models import RecoveryConfig
 from chartreux.core.middleware import AutoCompactMiddleware
+from chartreux.core.recovery_models import PackageTier
 from chartreux.core.session.session_loader import SessionLoader
 from chartreux.core.subagents import (
     AgentBusyError,
-    AgentProfileMismatchError,
+    AgentIdentityMismatchError,
     LaunchConfig,
     LaunchConfigError,
     LaunchOutcome,
@@ -38,6 +41,7 @@ from tests.app_server._subagent_test_support import (
     _GatedWakeup,
     _ManualClock,
     _persistent_dynamic_registry,
+    _retention_registry,
     _task_call,
     _wait_for_turn_completion,
     _wait_result,
@@ -45,6 +49,14 @@ from tests.app_server._subagent_test_support import (
 )
 from tests.conftest import build_test_agent_loop
 from tests.mock.utils import mock_llm_chunk
+from tests.recovery.test_replacement_policy import (
+    _claim_config,
+    _EndpointTimeout,
+    _launch,
+    _launch_failed_package,
+    _replacement_registry,
+    _WriteThenFaultBackend,
+)
 from tests.stubs.app_server import (
     attach_test_app_server_session,
     legacy_backend,
@@ -360,7 +372,7 @@ async def test_retask_handoff_revalidates_revocation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("restriction", ["owner", "profile", "config", "permission"])
+@pytest.mark.parametrize("restriction", ["owner", "identity", "config", "permission"])
 async def test_retask_validation_precedes_stop(
     monkeypatch: pytest.MonkeyPatch, restriction: str
 ) -> None:
@@ -384,19 +396,19 @@ async def test_retask_validation_precedes_stop(
         }
         if restriction == "owner":
             record.parent_session_id = "another-parent"
-        elif restriction == "profile":
-            values["agent_type"] = "reviewer"
+        elif restriction == "identity":
+            values["identity"] = "reviewer"
         elif restriction == "config":
             values["config"] = {}
         else:
             monkeypatch.setattr(
                 registry,
-                "_require_task_profile_allowed",
+                "_require_task_identity_allowed",
                 MagicMock(side_effect=ToolPermissionError("disabled")),
             )
         with pytest.raises((
             ToolPermissionError,
-            AgentProfileMismatchError,
+            AgentIdentityMismatchError,
             LaunchConfigError,
         )):
             await _background_result(registry, TaskArgs(**values), ctx)
@@ -890,7 +902,7 @@ async def test_concurrent_background_reuse_admits_exactly_one_run(monkeypatch) -
 
         ctx = InvokeContext(tool_call_id="reuse", session_id=session.session_id)
         args = TaskArgs(
-            task="reuse", agent_type="worker", agent_id="agent-1", background=True
+            task="reuse", identity="coder", agent_id="agent-1", background=True
         )
         await _consume(session.act("reuse"))
         await asyncio.wait_for(second_started.wait(), timeout=1)
@@ -1379,4 +1391,359 @@ async def test_retask_accumulation_round_trips_and_failed_patch_keeps_disk_state
         assert record.latest_run_id != first.run_id
     finally:
         await registry.close()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reuse_rejects_a_conflicting_requested_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """11c end-to-end: a retained continuation naming a different canonical
+    identity raises AgentIdentityMismatchError (the record's resolved
+    identity is compared on both sides); the matching identity reuses the
+    instance and preserves the record's identity revision.
+    """
+    backend = FakeBackend([[mock_llm_chunk(content="done")] for _ in range(4)])
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: backend
+    )
+    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    ctx = InvokeContext(tool_call_id="reuse", session_id=parent.session_id)
+    try:
+        # The instance is reused below, so the first launch opts into
+        # retention explicitly instead of closing on completion.
+        first = await _background_result(
+            registry, TaskArgs(task="old work", background=True, retain=True), ctx
+        )
+        assert first.agent_id is not None
+        record = registry._agent_records[first.agent_id]
+        await registry.wait_for_agent(first.agent_id, first.run_id)
+        assert record.state is _AgentState.IDLE
+        assert record.identity == "coder"
+        revision = record.identity_revision
+        assert revision is not None
+        with pytest.raises(
+            AgentIdentityMismatchError,
+            match="Requested identity reviewer does not match retained agent identity coder",
+        ):
+            await _background_result(
+                registry,
+                TaskArgs(
+                    task="conflicting retask",
+                    agent_id=first.agent_id,
+                    identity="reviewer",
+                    background=True,
+                ),
+                ctx,
+            )
+        # A matching canonical identity reuses the instance and preserves the
+        # record's identity revision (no re-resolution, no persona change).
+        second = await _background_result(
+            registry,
+            TaskArgs(
+                task="matching retask",
+                agent_id=first.agent_id,
+                identity="coder",
+                background=True,
+            ),
+            ctx,
+        )
+        assert second.agent_id == first.agent_id
+        assert second.agent_id is not None
+        await registry.wait_for_agent(second.agent_id, second.run_id)
+        assert record.identity == "coder"
+        assert record.identity_revision == revision
+        assert record.runtime.agent_loop._identity_binding() == ("coder", revision)
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_busy_replacement_rejects_a_conflicting_requested_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A busy replacement (replace_run) cannot change the instance identity:
+    a structured or shorthand selection naming another identity raises
+    AgentIdentityMismatchError before the run is interrupted.
+    """
+    backend = BlockingBackend()
+    registry, parent, _notifications = await _zero_retention_registry(
+        monkeypatch, backend
+    )
+    registry._retention_policy = RetentionPolicy(
+        idle_ttl_seconds=1000, max_idle_agents=10, retain_agents=True
+    )
+    ctx = InvokeContext(tool_call_id="retask", session_id=parent.session_id)
+    try:
+        old = await _background_result(
+            registry, TaskArgs(task="old work", background=True), ctx
+        )
+        assert old.agent_id is not None
+        record = registry._agent_records[old.agent_id]
+        run = record.current_run
+        assert run is not None
+        await backend.started.wait()
+        for args in (
+            TaskArgs(
+                task="replacement",
+                agent_id=old.agent_id,
+                replace_run=True,
+                background=True,
+                identity="reviewer",
+            ),
+            TaskArgs(
+                task="replacement",
+                agent_id=old.agent_id,
+                replace_run=True,
+                background=True,
+                model="@scout:researcher",
+            ),
+        ):
+            with pytest.raises(
+                AgentIdentityMismatchError,
+                match="Requested identity .* does not match retained agent identity coder",
+            ):
+                await _background_result(registry, args, ctx)
+        assert run.requested_stop_reason is None
+        assert not record.reserved_for_replacement
+        assert not backend.stopped.is_set()
+    finally:
+        backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_busy_replacement_rejects_a_top_level_model_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A busy replacement reuses the SAME instance: the canonical top-level
+    model field is launch configuration, so naming it is rejected exactly
+    like a nested config — the retained launch path resolves it.
+    """
+    backend = BlockingBackend()
+    registry, parent, _notifications = await _zero_retention_registry(
+        monkeypatch, backend
+    )
+    registry._retention_policy = RetentionPolicy(
+        idle_ttl_seconds=1000, max_idle_agents=10, retain_agents=True
+    )
+    ctx = InvokeContext(tool_call_id="retask", session_id=parent.session_id)
+    try:
+        old = await _background_result(
+            registry, TaskArgs(task="old work", background=True), ctx
+        )
+        assert old.agent_id is not None
+        record = registry._agent_records[old.agent_id]
+        run = record.current_run
+        assert run is not None
+        await backend.started.wait()
+        with pytest.raises(LaunchConfigError) as raised:
+            await _background_result(
+                registry,
+                TaskArgs(
+                    task="new",
+                    agent_id=old.agent_id,
+                    replace_run=True,
+                    background=True,
+                    model="glm-5-3",
+                ),
+                ctx,
+            )
+        assert (
+            raised.value.field == "Busy replacement cannot change launch configuration"
+        )
+        assert run.requested_stop_reason is None
+        assert not record.reserved_for_replacement
+        assert not backend.stopped.is_set()
+    finally:
+        backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_claim_with_an_invalid_identity_leaves_recovery_and_budget_intact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 2 (A2): a replacement claim whose launch identity is INVALID
+    (the orchestrator identity requires delegation and cannot be a child)
+    fails at canonical identity resolution BEFORE the claim validation
+    mutates replacement state — the predecessor's recovery stays intact,
+    the per-package budget is unconsumed, and no replacement is admitted.
+    """
+    registry, parent = await _replacement_registry(
+        monkeypatch,
+        RecoveryConfig(),
+        [
+            _WriteThenFaultBackend(_EndpointTimeout("https://beta.test/v1")),
+            FakeBackend(mock_llm_chunk(content="replacement done")),
+        ],
+    )
+    try:
+        agent_id, _run_id, failed = await _launch_failed_package(registry, parent)
+        envelope = failed.failure
+        assert envelope is not None
+        assert envelope.recovery.eligibility.value == "eligible"
+        predecessor = registry._agent_records[agent_id]
+        chain_id = predecessor.recovery_chain_id
+        suspended_at = predecessor.suspended_at
+        assert chain_id is not None and suspended_at is not None
+        before = set(registry._agent_records)
+        with pytest.raises(InvalidChildIdentityError, match="requires delegation"):
+            await _background_result(
+                registry,
+                TaskArgs(
+                    task="package work",
+                    identity="orchestrator",
+                    background=True,
+                    retain=True,
+                    config=LaunchConfig(
+                        model="alt-model",
+                        work_package_id="wp-1",
+                        predecessor_agent_id=agent_id,
+                        package_tier=PackageTier.SUBSTANTIVE,
+                    ),
+                ),
+                InvokeContext(tool_call_id="claim", session_id=parent.session_id),
+            )
+        # Zero side effects: no new agent, recovery intact, budget unconsumed.
+        assert set(registry._agent_records) == before
+        assert registry._package_replacements == {}
+        assert predecessor.recovery_superseded is False
+        assert predecessor.reserved_for_replacement is False
+        assert predecessor.recovery_chain_id == chain_id
+        assert predecessor.suspended_at == suspended_at
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_claim_with_a_denied_identity_leaves_recovery_and_budget_intact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 2 (A2): a replacement claim whose launch identity is DENIED
+    by the task denylist fails at admission BEFORE the claim validation
+    mutates replacement state — the predecessor's recovery stays intact,
+    the per-package budget is unconsumed, and no replacement is admitted.
+    """
+    registry, parent = await _replacement_registry(
+        monkeypatch,
+        RecoveryConfig(),
+        [
+            _WriteThenFaultBackend(_EndpointTimeout("https://beta.test/v1")),
+            FakeBackend(mock_llm_chunk(content="replacement done")),
+        ],
+    )
+    try:
+        agent_id, _run_id, failed = await _launch_failed_package(registry, parent)
+        envelope = failed.failure
+        assert envelope is not None
+        assert envelope.recovery.eligibility.value == "eligible"
+        predecessor = registry._agent_records[agent_id]
+        chain_id = predecessor.recovery_chain_id
+        suspended_at = predecessor.suspended_at
+        assert chain_id is not None and suspended_at is not None
+        tools = dict(parent.tool_manager._config.tools)
+        tools["task"] = {**tools["task"], "denylist": ["research*"]}
+        denied_config = parent.tool_manager._config.model_copy(update={"tools": tools})
+        monkeypatch.setattr(
+            parent.tool_manager, "_config_getter", lambda: denied_config
+        )
+        accepted_revision = object()
+        monkeypatch.setattr(
+            parent.tool_manager, "_accepted_token_getter", lambda: accepted_revision
+        )
+        before = set(registry._agent_records)
+        with pytest.raises(
+            ToolPermissionError, match="Task denied for launch identity: researcher"
+        ):
+            await _background_result(
+                registry,
+                TaskArgs(
+                    task="package work",
+                    identity="researcher",
+                    background=True,
+                    retain=True,
+                    config=LaunchConfig(
+                        model="alt-model",
+                        work_package_id="wp-1",
+                        predecessor_agent_id=agent_id,
+                        package_tier=PackageTier.SUBSTANTIVE,
+                    ),
+                ),
+                InvokeContext(tool_call_id="claim", session_id=parent.session_id),
+            )
+        # Zero side effects: no new agent, recovery intact, budget unconsumed.
+        assert set(registry._agent_records) == before
+        assert registry._package_replacements == {}
+        assert predecessor.recovery_superseded is False
+        assert predecessor.reserved_for_replacement is False
+        assert predecessor.recovery_chain_id == chain_id
+        assert predecessor.suspended_at == suspended_at
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_valid_claim_supersedes_once_and_preserves_the_identity_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 2 (A2) valid path: a well-formed claim whose identity
+    resolves and is admitted behaves exactly as before — the predecessor is
+    superseded, the per-package budget is consumed ONCE, and the new record
+    carries the launch-resolved identity binding (11c contract).
+    """
+    registry, parent = await _replacement_registry(
+        monkeypatch,
+        RecoveryConfig(),
+        [
+            _WriteThenFaultBackend(_EndpointTimeout("https://beta.test/v1")),
+            FakeBackend(mock_llm_chunk(content="replacement done")),
+        ],
+    )
+    try:
+        agent_id, _run_id, failed = await _launch_failed_package(registry, parent)
+        envelope = failed.failure
+        assert envelope is not None
+        assert envelope.recovery.eligibility.value == "eligible"
+        ack = await _launch(
+            registry,
+            parent,
+            tool_call_id="claim",
+            config=_claim_config(
+                model="alt-model", work_package_id="wp-1", predecessor_agent_id=agent_id
+            ),
+        )
+        # A NEW agent_id with the predecessor/package lineage.
+        assert ack.agent_id is not None and ack.agent_id != agent_id
+        assert ack.work_package_id == "wp-1"
+        assert ack.predecessor_agent_id == agent_id
+        assert ack.replacement is not None
+        assert ack.replacement.disposition == "selected"
+        # The old recovery is disabled by the handoff; the budget is
+        # consumed exactly once.
+        predecessor = registry._agent_records[agent_id]
+        assert predecessor.recovery_superseded is True
+        assert registry._package_replacements["wp-1"] == 1
+        # The replacement record carries the launch-resolved identity binding
+        # (11c): the committed identity reference and its revision.
+        record = registry._agent_records[ack.agent_id]
+        assert record.identity == "coder"
+        assert record.identity_revision is not None
+        child_runtime = registry._children[record.session_id]
+        assert child_runtime.agent_loop._identity_binding() == (
+            record.identity,
+            record.identity_revision,
+        )
+    finally:
+        await registry.drain_children()
         await parent.aclose()

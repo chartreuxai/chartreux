@@ -1,32 +1,98 @@
 # Instructions and skills
 
-Chartreux combines a selected system prompt with project instructions and optional skills. Project-provided material is loaded only from trusted folders; see [Tools and safety](tools-safety.md).
+Chartreux composes the agent's instructions from three selections — an
+**identity**, a **workflow**, and an **orchestration strategy** — layered with
+project instructions and optional skills. Project-provided material is loaded
+only from trusted folders; see [Tools and safety](tools-safety.md). The
+selection model, its precedence, and the frozen per-conversation lifecycle are
+documented in the [identity architecture](../reference/identity-architecture.md).
 
 ## Project instructions: `AGENTS.md`
 
 Use `~/.chartreux/AGENTS.md` for instructions that apply to your projects. Put `AGENTS.md` in a project directory for repository or subtree-specific guidance. Chartreux collects project files from the trust root toward the working directory, so more local instructions take precedence. Instructions attached to a file in a subdirectory are considered when that file is used.
 
-`AGENTS.md` does not replace the selected system prompt. Its content is appended as a higher-priority instructions section. This makes it suitable for repository conventions, required checks, and directory-scoped constraints.
+`AGENTS.md` does not replace the composed agent instructions. Its content is appended as a higher-priority instructions section. This makes it suitable for repository conventions, required checks, and directory-scoped constraints.
 
-## Custom system prompts
+## Custom identities, workflows, and strategies
 
-The built-in system prompt IDs are `cli`, `explore`, `tests`, `minimal`, `worker`, `advisor`, and `reviewer`. Select one, or select a custom bare filename:
+The three selections resolve from shipped built-ins or from custom files in
+your user directories:
+
+| Resource | User directory | Selection |
+| --- | --- | --- |
+| Identity prompt | `~/.chartreux/prompts/` | `identity = "user:foo"` or bare `"foo"` → `prompts/foo.md` |
+| Workflow body | `~/.chartreux/workflows/` | `workflow = "user:foo"` or bare `"foo"` → `workflows/foo.md` |
+| Orchestration strategy | `~/.chartreux/orchestration_strategies/` | `orchestration_strategy = "user:foo"` or bare `"foo"` → `orchestration_strategies/foo.md` |
+
+A new prompt file in `~/.chartreux/prompts/` becomes a selectable identity:
+`identity = "my-reviewer"` (or `"user:my-reviewer"`) resolves to
+`prompts/my-reviewer.md`. The prompt is the whole contract for a custom
+identity — no metadata, no enforced posture, and no `extends` or inheritance
+between identities.
 
 ```toml
-system_prompt_id = "my-review-prompt"
+[agent]
+identity = "user:release-auditor"     # prompts/release-auditor.md
+workflow = "ceremony"                 # built-in workflow
+orchestration_strategy = "none"       # no strategy body
 ```
 
-Store custom prompt files as `my-review-prompt.md` in `.chartreux/prompts/` for a trusted project or in `~/.chartreux/prompts/` for the user. Project directories are searched before user directories, and custom prompt files are considered before built-in IDs; a local `cli.md`, for example, shadows the built-in `cli` prompt.
+```toml
+[agent]
+workflow = "user:ship-it"             # workflows/ship-it.md
+orchestration_strategy = "user:two-phase"  # orchestration_strategies/two-phase.md
+```
+
+New-conversation precedence is CLI flag (`--identity`, `--workflow`,
+`--orchestration-strategy`) > environment (`CHARTREUX_AGENT__IDENTITY`,
+`CHARTREUX_AGENT__WORKFLOW`, `CHARTREUX_AGENT__ORCHESTRATION_STRATEGY`) >
+`config.toml` > shipped default, and the Settings > Identity & Orchestration
+group edits the same keys. Selection **and content** freeze per conversation:
+saved changes apply to new conversations only, and `/reload` reports them as
+pending.
+
+One strict loading contract governs all three kinds:
+
+- Ids are plain file stems — letters, digits, `_`, and `-`, starting with a
+  letter or digit. No traversal, nested, or extra-colon forms; malformed
+  qualifications fail loudly.
+- Files must be non-empty UTF-8 no larger than 64 KiB.
+- `builtin:` and `user:` qualification must be well-formed.
+- Reserved shipped names — the five built-in identities (`coder`,
+  `orchestrator`, `researcher`, `reviewer`, `advisor`), the workflows
+  (`minimal`, `ceremony`), and the strategy (`default`) — cannot be shadowed:
+  a custom file reusing a shipped name is rejected with a rename instruction,
+  never silently preferred.
+- Custom files exist only in the user directories above. Project-level
+  resource directories do not supply identities, workflows, or strategies;
+  a project `.chartreux/prompts/` directory does not make a prompt selectable,
+  and retired directories are detected and reported, never consumed.
+
+Identity selection precedence: a bare built-in name, a `builtin:`-qualified
+built-in, a `user:`-qualified custom id, or — for identity only, where the
+prompt file is the whole contract — a bare custom name that resolves to a
+prompt file in the user prompts directory. Unknown or malformed selections fail
+at conversation start with actionable errors, and `chartreux doctor` resolves
+them offline.
+
+The retired `system_prompt_id` key no longer selects the composed prompt — the
+`[agent]` selections do. Full-skeleton prompt replacement is replaced by a
+custom identity plus workflow/strategy composition; `chartreux doctor` reports
+the key with successor guidance.
 
 ## Custom compaction prompts
 
-Compaction uses the built-in `compact` prompt by default; custom prompt IDs remain available. Prompt lookup and precedence are the same as for system prompts.
+Compaction uses the built-in `compact` prompt by default; a custom id remains
+available and resolves to a `.md` file in the user prompts directory
+(`~/.chartreux/prompts/`), through the same strict loader as identities —
+reserved built-in names cannot be shadowed, and project prompt directories no
+longer supply prompts:
 
 ```toml
 compaction_prompt_id = "project-summary"
 ```
 
-Place `project-summary.md` in one of the prompt directories above. Extra text passed to `/compact` is appended after the configured compaction prompt.
+Place `project-summary.md` in `~/.chartreux/prompts/`. Extra text passed to `/compact` is appended after the configured compaction prompt.
 
 ## Skills
 

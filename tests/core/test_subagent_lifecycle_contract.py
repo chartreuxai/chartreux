@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from dataclasses import FrozenInstanceError
+import importlib
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -20,9 +21,10 @@ from pydantic import ValidationError
 import pytest
 
 from chartreux.app_server._sessions import SessionRuntimeRegistry
+from chartreux.core.agents.identities import builtin_identities
 from chartreux.core.agents.manager import AgentManager
-from chartreux.core.agents.models import ADVISOR, REVIEWER, WORKER, AgentProfile
 from chartreux.core.config import ChartreuxConfigSchema
+from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.config.models import SubagentsConfig
 from chartreux.core.subagents import (
     AgentAvailability,
@@ -194,76 +196,49 @@ class TestSubagentsConfigContract:
             SubagentsConfig.model_validate({"retain_agent": True})
 
 
-class TestAgentProfileRetainParsing:
-    @pytest.mark.parametrize(("raw", "expected"), [("true", True), ("false", False)])
-    def test_retain_parses_as_a_strict_bool(
-        self, tmp_path: Path, raw: str, expected: bool
+class TestRetiredProfileTomlSurface:
+    """The agents/*.toml profile axis is retired (package 16a).
+
+    Profile TOML files are detected loudly and never parsed or consumed:
+    the typing shim carries no parser, and the harness manager reports the
+    directories as retired inputs while leaving the files untouched.
+    """
+
+    def test_profile_toml_parsing_is_retired(self) -> None:
+        # The AgentProfile module retired with the profile axis (16a/16b):
+        # no TOML parser surface remains anywhere.
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("chartreux.core.agents.models")
+
+    @pytest.mark.parametrize("raw", ["true", "false", "1"])
+    def test_agents_toml_is_detected_loudly_and_never_consumed(
+        self, config_dir: Path, raw: str
     ) -> None:
-        profile_path = tmp_path / "retained.toml"
-        profile_path.write_text(f"retain = {raw}\n", encoding="utf-8")
-
-        profile = AgentProfile.from_toml(profile_path)
-
-        assert profile.retain is expected
-        assert profile.overrides == {}
-
-    def test_retain_defaults_to_none(self, tmp_path: Path) -> None:
-        profile_path = tmp_path / "plain.toml"
-        profile_path.write_text(
-            'description = "No retention setting"\n', encoding="utf-8"
-        )
-
-        assert AgentProfile.from_toml(profile_path).retain is None
-
-    @pytest.mark.parametrize("raw", ["1", "0", '"true"', '"yes"', "1.0"])
-    def test_non_bool_retain_is_rejected(self, tmp_path: Path, raw: str) -> None:
-        profile_path = tmp_path / "invalid.toml"
-        profile_path.write_text(f"retain = {raw}\n", encoding="utf-8")
-
-        with pytest.raises(ValueError, match="retain must be a boolean"):
-            AgentProfile.from_toml(profile_path)
-
-    @pytest.mark.parametrize("raw", ["true", "false", "-1", '"invalid"'])
-    def test_bool_and_range_violations_are_rejected_for_int_fields(
-        self, tmp_path: Path, raw: str
-    ) -> None:
-        # TOML booleans are rejected where integers are expected.
-        profile_path = tmp_path / "invalid.toml"
-        profile_path.write_text(f"idle_ttl_seconds = {raw}\n", encoding="utf-8")
-
-        with pytest.raises(ValueError, match="idle_ttl_seconds must be an integer"):
-            AgentProfile.from_toml(profile_path)
-
-    @pytest.mark.parametrize("raw", ["1", '"true"'])
-    def test_non_bool_retain_is_rejected_at_discovery(
-        self,
-        tmp_path: Path,
-        build_config: ConfigBuilder,
-        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
-        raw: str,
-    ) -> None:
-        agents_dir = tmp_path / "agents"
+        agents_dir = config_dir / "agents"
         agents_dir.mkdir()
-        (agents_dir / "invalid.toml").write_text(f"retain = {raw}\n", encoding="utf-8")
+        profile_file = agents_dir / "retained.toml"
+        profile_file.write_text(f"retain = {raw}\n", encoding="utf-8")
 
-        manager = AgentManager(
-            load_orchestrator(build_config(agent_paths=[agents_dir]))
-        )
+        manager = HarnessFilesManager(sources=("user",))
 
-        with pytest.raises(ValueError, match="not found"):
-            manager.get_agent("invalid")
+        # The retired directory is reported; the file is left untouched and
+        # is never parsed into an identity or a config layer.
+        assert manager.retired_agent_dirs == [agents_dir]
+        assert profile_file.read_text(encoding="utf-8") == f"retain = {raw}\n"
 
 
-class TestShippedProfileDefaults:
-    def test_advisor_is_retained_with_a_long_idle_ttl(self) -> None:
-        assert ADVISOR.retain is True
-        assert ADVISOR.idle_ttl_seconds == 3600
+class TestShippedIdentitySurface:
+    def test_shipped_profile_registry_is_retired(self) -> None:
+        # The shipped profile objects (WORKER/ADVISOR/REVIEWER,
+        # BUILTIN_SUBAGENTS) are gone with the registry module; retention is
+        # config-driven (SubagentsConfig), never profile-driven.
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("chartreux.core.agents.models")
 
-    def test_worker_and_reviewer_inherit_the_global_default(self) -> None:
-        assert WORKER.retain is None
-        assert WORKER.idle_ttl_seconds is None
-        assert REVIEWER.retain is None
-        assert REVIEWER.idle_ttl_seconds is None
+    def test_builtin_identities_carry_no_retention_defaults(self) -> None:
+        for identity in builtin_identities():
+            assert not hasattr(identity, "retain")
+            assert not hasattr(identity, "idle_ttl_seconds")
 
 
 class TestRetentionPolicy:

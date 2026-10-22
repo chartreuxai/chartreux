@@ -507,7 +507,7 @@ class WorkbenchPresentation:
             if self._host._view == WorkbenchView.DEPLOYMENTS
             else f"Choose {self._host._preset_field} for {self._host._preset_role}"
             if self._host._preset_field and self._host._preset_role
-            else f"Edit {self._host._preset_role.replace('orchestrator', 'Main assistant').title()} preset"
+            else f"Edit {self._host._preset_role.replace('main', 'Main assistant').title()} preset"
             if self._host._view == WorkbenchView.PRESET_EDITOR
             and self._host._preset_role
             else "Choose a default preset"

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from chartreux.core.events import CompactStartEvent
@@ -32,6 +34,16 @@ Active agent/run handles: agent-7 (run-3, idle), agent-9 (run-5, running)
 Outstanding dependencies: agent-9's findings feed the plan; run-3's result is uncollected
 Next step: present the plan to the user and wait for explicit plan acceptance
 """
+
+# The same handoff extended with the package-14 precedent fields: the frozen
+# policy binding and the actual delegation precedent with its explicit absence
+# clause (design section 10; findings item 2).
+PRECEDENT_HANDOFF = PENDING_APPROVAL_HANDOFF + (
+    "Bound policy bundle: identity coder; workflow minimal; "
+    "orchestration strategy none; frozen policy hash blake2b-128:0123456789abcdef\n"
+    "Delegation precedent: agent-7 (research, resident), agent-9 (run-5, pending); "
+    "no other agents were launched\n"
+)
 
 
 @pytest.mark.asyncio
@@ -147,7 +159,7 @@ async def test_compaction_handoff_reaches_next_request_with_pending_approval(
 
 
 @pytest.mark.asyncio
-async def test_repeated_compaction_transports_dispatch_handoff(
+async def test_repeated_compaction_transports_bound_bundle_handoff(
     mistral_api: MistralAPI,
 ) -> None:
     mistral_api.reply(
@@ -159,7 +171,11 @@ async def test_repeated_compaction_transports_dispatch_handoff(
     agent = build_e2e_agent_loop(
         config=build_test_vibe_config(models=COMPACTION_MODELS)
     )
-    bound = agent.bound_dispatch_policy
+    # The frozen policy bundle is bound at startup and survives repeated
+    # compactions unchanged (the legacy bound_dispatch_policy attribute is
+    # retired with the session-policy bind).
+    bound = agent._bound_policy
+    assert bound is not None
     agent.stats.context_tokens = 5
     [_ async for _ in agent.act("first ask")]
     agent.stats.context_tokens = 5
@@ -174,4 +190,70 @@ async def test_repeated_compaction_transports_dispatch_handoff(
         "state: consumed",
     ):
         assert fragment in sent
-    assert agent.bound_dispatch_policy == bound
+    assert agent._bound_policy is bound
+
+
+@pytest.mark.asyncio
+async def test_compaction_request_carries_bound_bundle_section(
+    mistral_api: MistralAPI,
+) -> None:
+    mistral_api.reply(
+        mistral_completion("<summary>a summary of what happened so far</summary>"),
+        mistral_completion("final answer"),
+    )
+    agent = build_e2e_agent_loop(
+        config=build_test_vibe_config(models=COMPACTION_MODELS)
+    )
+    activated = agent._ensure_bound_policy()
+    agent.compaction_manager._bound_policy_getter = lambda: activated
+    agent.stats.context_tokens = 5
+
+    [_ async for _ in agent.act("Investigate the bug")]
+
+    # The summarizer request carries the frozen bundle binding verbatim.
+    summarizer_request = mistral_api.model_facing_text(0)
+    manifest = activated.manifest
+    assert f"Bound policy bundle: identity {manifest.identity.selected}" in (
+        summarizer_request
+    )
+    assert f"workflow {manifest.workflow.selected}" in summarizer_request
+    assert manifest.frozen_policy_hash in summarizer_request
+    assert "do not adopt saved selection or resource edits" in summarizer_request
+    # The captured post-compaction request still opens with the full system
+    # prompt: the frozen policy's composed text, resolved contract included.
+    body = json.loads(mistral_api.route.calls[1].request.content)
+    messages = body["messages"]
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"] == agent.messages[0].content
+    assert "## Resolved contract" in messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_compaction_transports_precedent_handoff(
+    mistral_api: MistralAPI,
+) -> None:
+    mistral_api.reply(
+        mistral_completion(f"<summary>{PRECEDENT_HANDOFF}</summary>"),
+        mistral_completion("reply one"),
+        mistral_completion(f"<summary>{PRECEDENT_HANDOFF}</summary>"),
+        mistral_completion("reply two"),
+    )
+    agent = build_e2e_agent_loop(
+        config=build_test_vibe_config(models=COMPACTION_MODELS)
+    )
+    agent.stats.context_tokens = 5
+    [_ async for _ in agent.act("first ask")]
+    agent.stats.context_tokens = 5
+    [_ async for _ in agent.act("continue the same scope")]
+    sent = mistral_api.model_facing_text(3)
+    for fragment in (
+        "Bound policy bundle: identity coder",
+        "orchestration strategy none",
+        "frozen policy hash",
+        "Delegation precedent: agent-7 (research, resident)",
+        "no other agents were launched",
+        "Plan acceptance state: pending",
+        "state: consumed",
+        "used=2; remaining=0",
+    ):
+        assert fragment in sent

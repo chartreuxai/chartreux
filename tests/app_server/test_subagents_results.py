@@ -32,7 +32,7 @@ from chartreux.core.llm_models import FunctionCall, LLMMessage, Role, ToolCall
 from chartreux.core.subagents import (
     AgentBusyError,
     AgentEvictedError,
-    AgentProfileMismatchError,
+    AgentIdentityMismatchError,
     AgentResultExpiredError,
     CancelOutcome,
     RetentionPolicy,
@@ -717,10 +717,8 @@ async def _wait_for_agents_update(session: AppServerSession) -> AgentsUpdate:
 async def test_child_final_response_outcome_through_app_server(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, background: bool, empty_final: bool
 ) -> None:
-    (tmp_path / "final-response.toml").write_text(
-        "\n".join(['agent_type = "subagent"', 'enabled_tools = ["todo"]']),
-        encoding="utf-8",
-    )
+    # The custom "final-response" identity is a user prompt file installed by
+    # the autouse conftest fixture; agents/*.toml discovery is retired (16a).
     final = mock_llm_chunk(content="Child completed")
     if empty_final:
         final = mock_llm_chunk(content="").model_copy(
@@ -741,9 +739,7 @@ async def test_child_final_response_outcome_through_app_server(
     monkeypatch.setattr(
         "chartreux.core.agent_loop._loop.create_backend", lambda **_: child_backend
     )
-    config = _config(enabled_tools=["task", "todo"]).model_copy(
-        update={"agent_paths": [tmp_path]}
-    )
+    config = _config(enabled_tools=["task", "todo"])
     parent_backend = FakeBackend([
         [
             mock_llm_chunk(
@@ -1008,7 +1004,7 @@ async def test_expiry_keeps_resident_agent_but_marks_requested_run_expired() -> 
     run = RunRecord(
         run_id=expired.run_id,
         agent_id=expired.agent_id,
-        profile="worker",
+        identity="coder",
         status=RunStatus.COMPLETED,
         completion_task=asyncio.get_running_loop().create_future(),
         result=expired.result,
@@ -1080,7 +1076,7 @@ async def test_wait_and_expiry_race_keeps_a_leased_run_until_delivery() -> None:
     target = RunRecord(
         run_id=key[1],
         agent_id=key[0],
-        profile="worker",
+        identity="coder",
         status=RunStatus.RUNNING,
         completion_task=asyncio.get_running_loop().create_future(),
     )
@@ -1136,9 +1132,9 @@ async def test_reuse_lifecycle_errors_are_typed_and_do_not_substitute_agents() -
         "evicted", run_id=None, status=None
     )
 
-    def reuse_args(agent_id: str, agent: str = "worker") -> TaskArgs:
+    def reuse_args(agent_id: str, identity: str = "coder") -> TaskArgs:
         return TaskArgs(
-            task="reuse", agent_type=agent, agent_id=agent_id, background=True
+            task="reuse", identity=identity, agent_id=agent_id, background=True
         )
 
     def reuse_context(agent_id: str) -> InvokeContext:
@@ -1158,9 +1154,9 @@ async def test_reuse_lifecycle_errors_are_typed_and_do_not_substitute_agents() -
         )
     with pytest.raises(AgentBusyError):
         await _background_result(registry, reuse_args("busy"), reuse_context("busy"))
-    with pytest.raises(AgentProfileMismatchError):
+    with pytest.raises(AgentIdentityMismatchError):
         await _background_result(
-            registry, reuse_args("mismatch", "review"), reuse_context("mismatch")
+            registry, reuse_args("mismatch", "reviewer"), reuse_context("mismatch")
         )
     assert set(registry._agent_records) == {"busy", "mismatch"}
 

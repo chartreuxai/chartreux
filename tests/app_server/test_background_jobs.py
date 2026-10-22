@@ -191,7 +191,7 @@ async def test_factory_resumed_child_cannot_adopt_previous_incarnation_jobs(
 ) -> None:
     root = await make_root(tmp_path)
     factory = AgentRuntimeFactory()
-    child = await factory.create_child(root, "worker")
+    child = await factory.create_child(root, "coder")
     resumed = None
     try:
         await child.wait_until_ready()
@@ -201,9 +201,7 @@ async def test_factory_resumed_child_cannot_adopt_previous_incarnation_jobs(
         assert child.background_jobs is not None
         started = await child.background_jobs.start(BashStartArgs(command="sleep 60"))
         await child.aclose()
-        resumed = await factory.resume_child(
-            root, "worker", child.session_id, directory
-        )
+        resumed = await factory.resume_child(root, "coder", child.session_id, directory)
         await resumed.wait_until_ready()
         assert resumed.background_jobs is not None
         assert not resumed.background_jobs.list().jobs

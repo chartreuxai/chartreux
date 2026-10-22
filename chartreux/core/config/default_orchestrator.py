@@ -16,7 +16,6 @@ from chartreux.core.config.layer import (
     RawConfig,
     UntrustedLayerError,
 )
-from chartreux.core.config.layers.agent_profile import AgentProfileLayer
 from chartreux.core.config.layers.default import DefaultConfigLayer
 from chartreux.core.config.layers.environment import EnvironmentLayer
 from chartreux.core.config.layers.overrides import OverridesLayer
@@ -37,8 +36,9 @@ async def build_default_orchestrator(
     bootstrap and reload.
 
     Priority order (lowest to highest): schema defaults, user TOML, project
-    TOML, CHARTREUX_* env vars, agent profile overrides, and runtime overrides.
-    The agent-profile slot ships empty and is filled in place by AgentManager.
+    TOML, CHARTREUX_* env vars, and runtime overrides. The profile-layer
+    install path is retired with the profile axis (package 16a): a child's
+    resolved identity selection rides the launch-override layer instead.
     Enabled user and project TOML layers are installed together, so a trusted
     project config inherits unspecified values from the user config. Ordinary
     edits target session overrides; durable changes require explicit save().
@@ -67,8 +67,6 @@ async def build_default_orchestrator(
         *([user_layer] if user_layer is not None else []),
         *([project_layer] if project_layer is not None else []),
         EnvironmentLayer(schema=ChartreuxConfigSchema),
-        # Empty slot filled in place by AgentManager when a profile is selected
-        AgentProfileLayer(),
         override_layer,
     ]
 

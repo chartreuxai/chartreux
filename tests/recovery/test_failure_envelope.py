@@ -1130,7 +1130,7 @@ async def test_failed_background_run_carries_envelope_round_trip(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="fail", agent_type="worker", background=True),
+            TaskArgs(task="fail", identity="coder", background=True),
             InvokeContext(tool_call_id="t1", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None

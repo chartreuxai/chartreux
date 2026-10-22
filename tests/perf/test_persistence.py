@@ -11,8 +11,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from chartreux.agents import AgentSafety
-from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
 from chartreux.core.llm_models import LLMMessage
 from chartreux.core.session.session_logger import SessionLogger, _TranscriptCursor
@@ -93,7 +91,6 @@ def _instrument_logger(
         messages: list[LLMMessage],
         stats: AgentStats,
         tool_manager: ToolManager,
-        agent_profile: AgentProfile | None,
         session_dir: Path,
         session_metadata: SessionMetadata,
         allow_empty: bool,
@@ -117,7 +114,6 @@ def _instrument_logger(
                 messages,
                 stats,
                 tool_manager,
-                agent_profile,
                 session_dir,
                 session_metadata,
                 allow_empty,
@@ -143,7 +139,6 @@ def _instrument_logger(
         messages: list[LLMMessage],
         stats: AgentStats,
         tool_manager: ToolManager,
-        agent_profile: AgentProfile | None,
         session_dir: Path,
         session_metadata: SessionMetadata,
         launch_config_dirty: bool,
@@ -153,7 +148,6 @@ def _instrument_logger(
             messages,
             stats,
             tool_manager,
-            agent_profile,
             session_dir,
             session_metadata,
             launch_config_dirty,
@@ -186,13 +180,6 @@ async def test_persistence_micro_timing(
     tool_manager = MagicMock(spec=ToolManager)
     tool_manager.available_tools = {}
     tool_manager.available_tool_specs.return_value = []
-    agent_profile = AgentProfile(
-        name="perf-profile",
-        display_name="Performance profile",
-        description="Persistence benchmark profile",
-        safety=AgentSafety.NEUTRAL,
-        overrides={},
-    )
 
     message_counts = (5_000, 20_000)
     approx_tokens = 20_000
@@ -210,11 +197,7 @@ async def test_persistence_micro_timing(
         # The first full save establishes the transcript cursor; the measured
         # saves below then take the cursor-backed warm path.
         await logger.save_interaction(
-            messages,
-            stats=stats,
-            config=config,
-            tool_manager=tool_manager,
-            agent_profile=agent_profile,
+            messages, stats=stats, config=config, tool_manager=tool_manager
         )
         assert logger._transcript_cursor is not None
 
@@ -223,11 +206,7 @@ async def test_persistence_micro_timing(
         for _ in range(20):
             started_at = perf_counter()
             await logger.save_interaction(
-                messages,
-                stats=stats,
-                config=config,
-                tool_manager=tool_manager,
-                agent_profile=agent_profile,
+                messages, stats=stats, config=config, tool_manager=tool_manager
             )
             warm_measurements.awaited_save_ms.append(
                 (perf_counter() - started_at) * 1_000
@@ -242,11 +221,7 @@ async def test_persistence_micro_timing(
         cold_measurements = _instrument_logger(cold_logger, monkeypatch)
         started_at = perf_counter()
         await cold_logger.save_interaction(
-            messages,
-            stats=stats,
-            config=config,
-            tool_manager=tool_manager,
-            agent_profile=agent_profile,
+            messages, stats=stats, config=config, tool_manager=tool_manager
         )
         cold_measurements.awaited_save_ms.append((perf_counter() - started_at) * 1_000)
         cold_save_count = 1
@@ -263,11 +238,7 @@ async def test_persistence_micro_timing(
             memory_measurements = _instrument_logger(traced_logger, monkeypatch)
             memory_measurements.measure_next_worker = True
             await traced_logger.save_interaction(
-                messages,
-                stats=stats,
-                config=config,
-                tool_manager=tool_manager,
-                agent_profile=agent_profile,
+                messages, stats=stats, config=config, tool_manager=tool_manager
             )
             memory_save_count = 1
             assert traced_logger._transcript_cursor is not None

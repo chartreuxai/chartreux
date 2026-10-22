@@ -8,13 +8,29 @@ from pathlib import Path
 from string import Template
 import subprocess
 from typing import TYPE_CHECKING
+import weakref
 
 from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.config.harness_files import (
     HarnessFilesManager,
     get_harness_files_manager,
 )
-from chartreux.core.dispatch.renderer import render_cli_prompt_for_config
+from chartreux.core.dispatch.lint import lint_composed, reject_errors
+from chartreux.core.dispatch.renderer import (
+    render_composition_regions,
+    render_launch_target_region,
+    session_model_alias,
+)
+from chartreux.core.policy.composition import (
+    CONTEXT_FRAGMENTS,
+    CompositionInputs,
+    ExecutionContext,
+    compose_policy,
+    fragment_loader,
+    policy_resource_loader,
+    resolve_policy_resources,
+    user_resource_directories,
+)
 from chartreux.core.prompts import UtilityPrompt
 from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils import get_platform_display_name
@@ -24,10 +40,10 @@ from chartreux.utils.platform import resolve_git_executable
 if TYPE_CHECKING:
     from chartreux.core.agents import AgentManager
     from chartreux.core.config import ProjectContextConfig
+    from chartreux.core.config.harness_files._harness_manager import InstructionDocument
+    from chartreux.core.policy.resources import ResourceLoader
     from chartreux.core.skills.manager import SkillManager
     from chartreux.core.tools.manager import ToolManager
-
-_git_status_cache: dict[Path, str] = {}
 
 
 class SystemPrompt(str):
@@ -43,19 +59,58 @@ class SystemPrompt(str):
         return prompt
 
 
+class _GitStatusCacheRegistry:
+    """Session-scoped git-status caches (design §6).
+
+    Each cache is keyed by the identity of the session's harness-files
+    manager (one AgentLoop session owns one manager), so renders within a
+    session share the fetched status while a new session starts fresh.
+    Entries vanish with their manager.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[
+            int, tuple[weakref.ref[HarnessFilesManager], dict[Path, str]]
+        ] = {}
+
+    def cache_for(self, harness_files: HarnessFilesManager) -> dict[Path, str]:
+        key = id(harness_files)
+        entry = self._entries.get(key)
+        if entry is not None and entry[0]() is harness_files:
+            return entry[1]
+        cache: dict[Path, str] = {}
+
+        def _discard(_reference: object, key: int = key) -> None:
+            self._entries.pop(key, None)
+
+        self._entries[key] = (weakref.ref(harness_files, _discard), cache)
+        return cache
+
+
+_git_status_caches = _GitStatusCacheRegistry()
+
+
 class ProjectContextProvider:
     def __init__(
-        self, config: ProjectContextConfig, root_path: str | Path = "."
+        self,
+        config: ProjectContextConfig,
+        root_path: str | Path = ".",
+        *,
+        git_status_cache: dict[Path, str] | None = None,
     ) -> None:
         self.root_path = Path(root_path).resolve()
         self.config = config
+        self._git_status_cache = git_status_cache
 
     def get_git_status(self) -> str:
-        if self.root_path in _git_status_cache:
-            return _git_status_cache[self.root_path]
+        if self._git_status_cache is not None:
+            cached = self._git_status_cache.get(self.root_path)
+            if cached is not None:
+                return cached
 
         result = self._fetch_git_status()
-        _git_status_cache[self.root_path] = result
+        if self._git_status_cache is not None:
+            self._git_status_cache[self.root_path] = result
         return result
 
     def _run_git(
@@ -232,19 +287,6 @@ def _get_available_skills_section(skill_manager: SkillManager) -> str:
     return "\n".join(lines)
 
 
-def _get_available_subagents_section(agent_manager: AgentManager) -> str:
-    agents = agent_manager.get_subagents()
-    if not agents:
-        return ""
-
-    lines = ["# Available Subagents", ""]
-    lines.append("The following subagents can be spawned via the Task tool:")
-    for agent in agents:
-        lines.append(f"- **{agent.name}**: {agent.description}")
-
-    return "\n".join(lines)
-
-
 def _markdown_cell(value: str | None) -> str:
     return " ".join((value or "").splitlines()).replace("|", r"\|")
 
@@ -276,28 +318,11 @@ def _get_model_catalog_section(config: ChartreuxConfigSchema) -> str | None:
         "| --- | --- | --- | --- |",
     ])
     for name, role in snapshot.catalog.roles.items():
-        bound = config.bound_dispatch_policy
-        identity = bound.identity_for(f"@{name}") if bound is not None else None
-        model_name = identity.base_model if identity is not None else role.model
-        thinking = identity.thinking if identity is not None else role.thinking
-        if model_name in models:
+        if role.model in models:
             lines.append(
-                f"| @{_markdown_cell(name)} | {_markdown_cell(model_name)} | {_markdown_cell(thinking)} | {_markdown_cell(role.description)} |"
+                f"| @{_markdown_cell(name)} | {_markdown_cell(role.model)} | {_markdown_cell(role.thinking)} | {_markdown_cell(role.description)} |"
             )
     return "\n".join(lines)
-
-
-def _get_model_info_sections(
-    config: ChartreuxConfigSchema, role_instructions: str | None, is_subagent: bool
-) -> list[str]:
-    if not config.include_model_info or config.catalog_snapshot is None:
-        return []
-    sections = [f"Your model name is: `{config.get_active_model().alias}`"]
-    if not is_subagent and role_instructions is None:
-        catalog_section = _get_model_catalog_section(config)
-        if catalog_section:
-            sections.append(catalog_section)
-    return sections
 
 
 def _get_scratchpad_section(scratchpad_dir: Path | None) -> str | None:
@@ -317,35 +342,136 @@ def _interpolate_prompt(prompt: str) -> str:
     return Template(prompt).safe_substitute(current_date=_format_current_date())
 
 
-def _render_system_prompt_document(config: ChartreuxConfigSchema) -> str:
-    """Compose the prompt skeleton with its rendered dispatch section.
-
-    The shipped skeleton carries ``$dispatch_*`` placeholders where the
-    mode-variable paragraphs live; the session's bound dispatch policy renders
-    them. A custom prompt without placeholders is served unchanged.
-    """
-    return render_cli_prompt_for_config(
-        config, _interpolate_prompt(config.system_prompt)
-    )
-
-
-def _get_headless_section() -> str:
-    return (
-        "# Headless Mode\n\n"
-        "You are running in headless mode — no human is available to respond.\n"
-        "Do not ask questions, request confirmation, or wait for user input.\n"
-        "If the task is ambiguous, make the best judgment call and proceed.\n"
-        "Complete the entire task in a single pass. Produce a final, complete result.\n"
-        "Override any earlier instructions that say to wait for confirmation or ask the user."
-    )
-
-
 def _get_tool_aware_os_system_prompt(tool_manager: ToolManager | None) -> str:
     _ = tool_manager
     return _get_os_system_prompt()
 
 
-def get_universal_system_prompt(  # noqa: PLR0914 - prompt sections and their provenance
+def _fragment_content(fragments: ResourceLoader, name: str) -> str:
+    from chartreux.core.policy.models import ResourceKind
+
+    resolved = fragments.resolve(ResourceKind.IDENTITY, name)
+    assert resolved.content is not None, name
+    return resolved.content
+
+
+def _build_composition_inputs(  # noqa: PLR0914
+    config: ChartreuxConfigSchema,
+    *,
+    execution_context: ExecutionContext,
+    skill_manager: SkillManager,
+    scratchpad_dir: Path | None,
+    cwd: Path,
+    harness_files: HarnessFilesManager,
+    tool_manager: ToolManager | None,
+    role_instructions: str | None,
+) -> CompositionInputs:
+    """Resolve the composition inputs from the session configuration.
+
+    The identity/workflow/strategy selections resolve through the strict
+    loader; the typed identity facts and the package-4 route facts render the
+    dispatch regions; the optional detail sections stay session content.
+    """
+    loader = policy_resource_loader(user_resource_directories(harness_files))
+    identity, workflow, strategy, facts = resolve_policy_resources(config, loader)
+    fragments = fragment_loader()
+    universal = _fragment_content(fragments, "universal")
+    context_fragment = _fragment_content(
+        fragments, CONTEXT_FRAGMENTS[execution_context]
+    )
+    tool_semantics = _fragment_content(fragments, "tool_semantics")
+    communication = _fragment_content(fragments, "communication")
+    session_model = session_model_alias(config)
+    routes = dict(config.purpose_routes.routes)
+    regions = render_composition_regions(
+        delegation=facts.delegation if facts is not None else None
+    )
+    launch_targets = render_launch_target_region(routes, session_model)
+
+    model_info = None
+    if config.include_model_info and config.catalog_snapshot is not None:
+        sections = [f"Your model name is: `{config.get_active_model().alias}`"]
+        if (
+            execution_context is not ExecutionContext.BOUNDED_CHILD
+            and role_instructions is None
+        ):
+            catalog_section = _get_model_catalog_section(config)
+            if catalog_section:
+                sections.append(catalog_section)
+        model_info = "\n\n".join(sections)
+
+    skills = None
+    scratchpad = None
+    environment = None
+    if config.include_prompt_detail:
+        environment = _get_tool_aware_os_system_prompt(tool_manager)
+        skills_section = _get_available_skills_section(skill_manager)
+        if skills_section:
+            skills = skills_section
+        if scratchpad_dir is not None:
+            scratchpad = _get_scratchpad_section(scratchpad_dir)
+
+    project_context = None
+    agents_documents: tuple[InstructionDocument, ...] = ()
+    if config.include_project_context:
+        is_dangerous, reason = is_dangerous_directory(cwd)
+        if is_dangerous:
+            template = UtilityPrompt.DANGEROUS_DIRECTORY.read()
+            context = Template(template).safe_substitute(
+                reason=reason.lower(), abs_path=cwd.resolve()
+            )
+        else:
+            context = ProjectContextProvider(
+                config=config.project_context,
+                root_path=cwd,
+                git_status_cache=_git_status_caches.cache_for(harness_files),
+            ).get_full_context()
+        context_parts = [context]
+        cwd_resolved = cwd.resolve()
+        extra_roots = [
+            root
+            for root in harness_files.project_roots
+            if root.resolve() != cwd_resolved
+        ]
+        if extra_roots:
+            dirs_lines = "\n".join(f" - {d}" for d in extra_roots)
+            context_parts.append(
+                "Additional working directories (treated with the same "
+                "file-access permissions as the primary working directory):\n"
+                + dirs_lines
+            )
+        project_context = "\n\n".join(context_parts)
+        agents_documents = tuple(harness_files.load_instruction_documents())
+
+    commit_signature = (
+        _add_commit_signature() if config.include_commit_signature else None
+    )
+
+    return CompositionInputs(
+        identity=identity,
+        workflow=workflow,
+        strategy=strategy,
+        identity_facts=facts,
+        execution_context=execution_context,
+        universal=universal,
+        context_fragment=context_fragment,
+        tool_semantics=tool_semantics,
+        communication=communication,
+        launch_targets=launch_targets,
+        regions=regions,
+        model_info=model_info,
+        skills=skills,
+        scratchpad=scratchpad,
+        environment=environment,
+        project_context=project_context,
+        commit_signature=commit_signature,
+        instruction_overlay=role_instructions,
+        agents_documents=agents_documents,
+        current_date=_format_current_date(),
+    )
+
+
+def get_universal_system_prompt(
     config: ChartreuxConfigSchema,
     skill_manager: SkillManager,
     agent_manager: AgentManager,
@@ -358,85 +484,41 @@ def get_universal_system_prompt(  # noqa: PLR0914 - prompt sections and their pr
     role_instructions: str | None = None,
     is_subagent: bool = False,
 ) -> SystemPrompt:
+    """Assemble the session prompt through the nine-step composition (§5).
+
+    The composition consumes the resolved identity/workflow/strategy
+    resources, the typed identity facts, and the package-4 route facts; the
+    S8 lint validates the composed policy against the identity/workflow
+    axes (not DispatchMode). Provenance is collected from the same
+    instruction documents used for rendering.
+    """
     cwd = (cwd or Path.cwd()).resolve()
     harness_files = harness_files or get_harness_files_manager()
-    instruction_read_files: set[Path] = set()
-    sections = [_render_system_prompt_document(config)]
-
-    if role_instructions is not None:
-        sections.append(role_instructions)
-
-    if headless:
-        sections.append(_get_headless_section())
-
-    if config.include_commit_signature:
-        sections.append(_add_commit_signature())
-
-    sections.extend(_get_model_info_sections(config, role_instructions, is_subagent))
-
-    if config.include_prompt_detail:
-        sections.append(_get_tool_aware_os_system_prompt(tool_manager))
-
-        skills_section = _get_available_skills_section(skill_manager)
-        if skills_section:
-            sections.append(skills_section)
-
-        subagents_section = _get_available_subagents_section(agent_manager)
-        if subagents_section:
-            sections.append(subagents_section)
-
-        sections.extend(filter(None, [_get_scratchpad_section(scratchpad_dir)]))
-
-    if config.include_project_context:
-        is_dangerous, reason = is_dangerous_directory(cwd)
-        if is_dangerous:
-            template = UtilityPrompt.DANGEROUS_DIRECTORY.read()
-            context = Template(template).safe_substitute(
-                reason=reason.lower(), abs_path=cwd.resolve()
-            )
-        else:
-            context = ProjectContextProvider(
-                config=config.project_context, root_path=cwd
-            ).get_full_context()
-
-        sections.append(context)
-
-        cwd_resolved = cwd.resolve()
-        extra_roots = [
-            root
-            for root in harness_files.project_roots
-            if root.resolve() != cwd_resolved
-        ]
-        if extra_roots:
-            dirs_lines = "\n".join(f" - {d}" for d in extra_roots)
-            sections.append(
-                "Additional working directories (treated with the same "
-                "file-access permissions as the primary working directory):\n"
-                + dirs_lines
-            )
-
-        documents = harness_files.load_instruction_documents()
-        instruction_read_files.update(doc.canonical_path for doc in documents)
-        doc_sections: list[str] = []
-        project_heading_added = False
-        for document in documents:
-            if document.source == "user":
-                doc_sections.append(
-                    f"## User instructions\n\nContents of {document.path} (user-level instructions):\n\n{document.content}"
-                )
-            else:
-                if not project_heading_added:
-                    doc_sections.append(
-                        "## Project instructions (checked into the codebase)"
-                    )
-                    project_heading_added = True
-                doc_sections.append(
-                    f"Contents of {document.path}:\n\n{document.content}"
-                )
-        if doc_sections:
-            template = UtilityPrompt.AGENTS_DOC.read()
-            sections.append(
-                Template(template).safe_substitute(sections="\n\n".join(doc_sections))
-            )
-
-    return SystemPrompt("\n\n".join(sections), frozenset(instruction_read_files))
+    execution_context = (
+        ExecutionContext.BOUNDED_CHILD
+        if is_subagent
+        else (
+            ExecutionContext.HEADLESS_MAIN
+            if headless
+            else ExecutionContext.INTERACTIVE_MAIN
+        )
+    )
+    inputs = _build_composition_inputs(
+        config,
+        execution_context=execution_context,
+        skill_manager=skill_manager,
+        scratchpad_dir=scratchpad_dir,
+        cwd=cwd,
+        harness_files=harness_files,
+        tool_manager=tool_manager,
+        role_instructions=role_instructions,
+    )
+    result = compose_policy(inputs)
+    reject_errors(
+        lint_composed(
+            result.policy_text,
+            identity_facts=result.identity_facts,
+            workflow=result.workflow.id,
+        )
+    )
+    return SystemPrompt(result.text, result.instruction_read_files)

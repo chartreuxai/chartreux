@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
+    from chartreux.core.config.harness_files import HarnessFilesManager
     from chartreux.core.config.models import MCPHttp, MCPServer, ModelConfig
     from chartreux.core.model_catalog.schema import ProviderDefinition
 
@@ -73,7 +74,9 @@ class InvalidTarget(ValueError):
     pass
 
 
-async def _load_config() -> tuple[ChartreuxConfigSchema, list[Check]]:
+async def _load_config() -> tuple[
+    ChartreuxConfigSchema, HarnessFilesManager, list[Check]
+]:
     from chartreux.core.config.default_orchestrator import build_default_orchestrator
     from chartreux.core.config.harness_files import HarnessFilesManager
     from chartreux.core.config.layers.project import ProjectConfigLayer
@@ -91,7 +94,105 @@ async def _load_config() -> tuple[ChartreuxConfigSchema, list[Check]]:
     ]
     if trust_store.load_error:
         checks.append(Check("trust store", "unverified", trust_store.load_error))
-    return orchestrator.config, checks
+    checks.append(_agent_selections_check(orchestrator.config, manager))
+    return orchestrator.config, manager, checks
+
+
+def _agent_selections_check(
+    config: ChartreuxConfigSchema, manager: HarnessFilesManager
+) -> Check:
+    """Resolve the [agent] selections offline through the strict resolver.
+
+    Config validation alone accepts unknown bare/user selections; they fail
+    later, at conversation binding. Doctor reports them here with the actual
+    resolver error — no live probes, no conversation is started.
+    """
+    from chartreux.core.policy.composition import (
+        policy_resource_loader,
+        resolve_policy_resources,
+        user_resource_directories,
+    )
+
+    try:
+        resolve_policy_resources(
+            config, policy_resource_loader(user_resource_directories(manager))
+        )
+    except ValueError as exc:
+        return Check(
+            "agent selections",
+            "fail",
+            f"{exc} Fix [agent] identity/workflow/orchestration_strategy in "
+            "config.toml (custom identities are prompt files in the user "
+            "prompts directory).",
+        )
+    return Check(
+        "agent selections", "pass", "identity/workflow/strategy selections resolve"
+    )
+
+
+def _retired_inputs_checks(manager: HarnessFilesManager) -> list[Check]:
+    """Report retired on-disk inputs loudly; user files are never touched.
+
+    Retired config.toml fields (``system_prompt_id``, ``agent_paths``,
+    ``enabled_agents``, ``disabled_agents``) fail config load itself with
+    their successor guidance — doctor surfaces that validation message via
+    :func:`_config_failure_check`. What can still load is the retired file
+    surface: agents/*.toml profile directories and project-level prompt
+    directories. They are detected here, never consumed, and never deleted
+    or converted (design §12).
+    """
+    checks: list[Check] = []
+    retired_agents = manager.retired_agent_dirs
+    if retired_agents:
+        checks.append(
+            Check(
+                "retired agent profiles",
+                "fail",
+                "agents/*.toml profile files are retired and no longer load: "
+                f"found {', '.join(str(path) for path in retired_agents)}. Use "
+                "identities instead — select [agent] identity in config.toml or "
+                "pass the task tool's identity field; custom identities are "
+                "prompt files in the user prompts directory. The files are left "
+                "untouched.",
+            )
+        )
+    retired_prompts = manager.retired_project_prompt_dirs
+    if retired_prompts:
+        checks.append(
+            Check(
+                "retired project prompts",
+                "fail",
+                "project-level custom prompt directories are retired and no "
+                f"longer load: found {', '.join(str(path) for path in retired_prompts)}. "
+                "Move custom identity prompts to the user prompts directory; "
+                "workflows and orchestration strategies are user-level too. "
+                "The files are left untouched.",
+            )
+        )
+    return checks
+
+
+def _config_failure_check(exc: BaseException) -> Check:
+    """Surface the loader's own diagnostic instead of a generic one.
+
+    Retired settings fail config load with their successor guidance in the
+    validation message; doctor shows that message (source-aware, values
+    never echoed) so the user learns the successor from the failure itself.
+    """
+    from pydantic import ValidationError
+
+    if isinstance(exc, ValidationError):
+        details = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+            for error in exc.errors(include_url=False, include_input=False)
+        )
+        if details:
+            return Check("config", "fail", details)
+    return Check(
+        "config",
+        "fail",
+        "invalid or unreadable configuration; check TOML syntax and schema",
+    )
 
 
 def _target(config: ChartreuxConfigSchema, args: argparse.Namespace) -> ModelConfig:
@@ -144,17 +245,14 @@ async def _diagnose(args: argparse.Namespace) -> list[Check]:
             )
         )
     try:
-        config, source_checks = await _load_config()
-        checks.extend(source_checks)
-        checks.append(Check("config", "pass", "trusted configuration validated"))
-    except Exception:
-        checks.append(
-            Check(
-                "config",
-                "fail",
-                "invalid or unreadable configuration; check TOML syntax and schema",
-            )
-        )
+        config, manager, source_checks = await _load_config()
+        checks.extend([
+            *source_checks,
+            Check("config", "pass", "trusted configuration validated"),
+            *_retired_inputs_checks(manager),
+        ])
+    except Exception as exc:
+        checks.append(_config_failure_check(exc))
         return checks
     selected = _target(config, args) if args.smoke else None
     providers: set[str] = set()
@@ -169,7 +267,7 @@ async def _diagnose(args: argparse.Namespace) -> list[Check]:
 
                 value = (
                     resolver_for(config)
-                    .resolve("@orchestrator", allowed_models=config.allowed_models)
+                    .resolve("@main", allowed_models=config.allowed_models)
                     .materialize(auto_compact_threshold=config.auto_compact_threshold)
                 )
             config.get_provider_for_model(value)

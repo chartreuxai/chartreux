@@ -96,13 +96,15 @@ class TestAdditionalDirsDiscovery:
         mgr = HarnessFilesManager(sources=("user",), _additional_dirs=(extra,))
         assert skills_dir in mgr.project_skills_dirs
 
-    def test_discovers_agents_from_additional_dir(self, tmp_path: Path) -> None:
+    def test_detects_agents_from_additional_dir_as_retired(
+        self, tmp_path: Path
+    ) -> None:
         extra = tmp_path / "extra_project"
         agents_dir = extra / ".chartreux" / "agents"
         agents_dir.mkdir(parents=True)
 
         mgr = HarnessFilesManager(sources=("user",), _additional_dirs=(extra,))
-        assert agents_dir in mgr.project_agents_dirs
+        assert agents_dir in mgr.retired_agent_dirs
 
     def test_discovers_agents_skills_from_additional_dir(self, tmp_path: Path) -> None:
         extra = tmp_path / "extra_project"
@@ -112,13 +114,16 @@ class TestAdditionalDirsDiscovery:
         mgr = HarnessFilesManager(sources=("user",), _additional_dirs=(extra,))
         assert skills_dir in mgr.project_skills_dirs
 
-    def test_discovers_prompts_from_additional_dir(self, tmp_path: Path) -> None:
+    def test_detects_prompts_from_additional_dir_as_retired(
+        self, tmp_path: Path
+    ) -> None:
         extra = tmp_path / "extra_project"
         prompts_dir = extra / ".chartreux" / "prompts"
         prompts_dir.mkdir(parents=True)
 
         mgr = HarnessFilesManager(sources=("user",), _additional_dirs=(extra,))
-        assert prompts_dir in mgr.project_prompts_dirs
+        assert prompts_dir in mgr.retired_project_prompt_dirs
+        assert mgr.project_prompts_dirs == []
 
     def test_no_dirs_when_additional_dir_has_no_vibe(self, tmp_path: Path) -> None:
         extra = tmp_path / "bare_project"
@@ -127,7 +132,7 @@ class TestAdditionalDirsDiscovery:
         mgr = HarnessFilesManager(sources=("user",), _additional_dirs=(extra,))
         assert mgr.project_tools_dirs == []
         assert mgr.project_skills_dirs == []
-        assert mgr.project_agents_dirs == []
+        assert mgr.retired_agent_dirs == []
 
 
 class TestAdditionalDirsAgentsMd:
@@ -338,11 +343,12 @@ class TestHookFilesAdditionalDirs:
 
 
 class TestProjectPromptsDirsAdditionalDirs:
-    def test_project_prompts_dirs_deduplicates_workdir_and_additional_dir(
+    def test_project_prompts_dirs_are_never_consumed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         workdir = tmp_path / "project"
-        (workdir / ".chartreux" / "prompts").mkdir(parents=True)
+        prompts_dir = workdir / ".chartreux" / "prompts"
+        prompts_dir.mkdir(parents=True)
         monkeypatch.chdir(workdir)
         trusted_folders_manager.trust_for_session(workdir)
 
@@ -350,7 +356,8 @@ class TestProjectPromptsDirsAdditionalDirs:
             sources=("user", "project"), _additional_dirs=(workdir.resolve(),)
         )
 
-        assert len(mgr.project_prompts_dirs) == 1
+        assert mgr.project_prompts_dirs == []
+        assert mgr.retired_project_prompt_dirs == [prompts_dir]
 
 
 class TestProjectRootsNestedDedup:

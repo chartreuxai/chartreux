@@ -86,7 +86,8 @@ def test_generic_tool_projection_preserves_json_input() -> None:
 @pytest.mark.parametrize(
     "value",
     [
-        TaskArgs(task="Inspect", agent_type="reviewer"),
+        TaskArgs(task="Inspect", identity="reviewer"),
+        {"task": "Inspect", "identity": "reviewer"},
         {"task": "Inspect", "agent_type": "reviewer"},
         {"task": "Inspect", "agent": "reviewer"},
     ],
@@ -101,13 +102,13 @@ def test_task_projection_retains_public_agent_field(value) -> None:
     assert detail.input.model_dump() == {"task": "Inspect", "agent": "reviewer"}
 
 
-def test_default_task_model_projects_worker_profile() -> None:
+def test_default_task_model_projects_coder_identity() -> None:
     detail = project_effect_detail(
         "task", TaskArgs(task="Inspect"), _presentation(ToolEffectKind.SUBAGENT)
     )
     assert isinstance(detail, SubagentEffectDetail)
     assert detail.input is not None
-    assert detail.input.agent == "worker"
+    assert detail.input.agent == "coder"
 
 
 def test_stored_effect_args_missing_required_field_degrade_to_generic() -> None:

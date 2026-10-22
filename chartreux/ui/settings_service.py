@@ -13,6 +13,7 @@ from chartreux.app_server.protocol import (
     ConfigWriteResponse,
     SettingsReadResponse,
 )
+from chartreux.app_server.protocol.config import TASK_IDENTITY_DENYLIST_PATH
 
 
 class SettingsConfigResource(Protocol):
@@ -123,11 +124,10 @@ class SettingsService:
                 backing = before.backing_settings.get(path)
                 if path in web_search_paths:
                     pass  # The app server validates the complete merged search config.
-                elif backing is None or not path.startswith((
-                    "enabled_",
-                    "disabled_",
-                    "status_line.",
-                )):
+                elif backing is None or not (
+                    path.startswith(("enabled_", "disabled_", "status_line."))
+                    or path == TASK_IDENTITY_DENYLIST_PATH
+                ):
                     raise ValueError(f"Unknown settings leaf: {path}")
                 elif value is not None:
                     backing.validate_value(value)

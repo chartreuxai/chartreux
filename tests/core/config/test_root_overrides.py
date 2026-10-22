@@ -10,7 +10,6 @@ from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.config._restrictions import SourceRestrictions
 from chartreux.core.config._root_authority import ROOTS_FIELD
 from chartreux.core.config.layer import ConfigLayer, RawConfig
-from chartreux.core.config.layers.agent_profile import AgentProfileLayer
 from chartreux.core.config.layers.default import DefaultConfigLayer
 from chartreux.core.config.layers.overrides import OverridesLayer
 from chartreux.core.config.layers.user import UserConfigLayer
@@ -99,7 +98,7 @@ async def test_overlay_survives_all_rebuilds_without_writes(
             )
         ])
         orchestrator.replace_or_append_layer(
-            "agent-profile", AgentProfileLayer(data={"theme": "dark"})
+            "extra", OverridesLayer(name="extra", data={"theme": "dark"})
         )
         orchestrator.rebuild()
         assert orchestrator.config.authorized_roots_by_project == expected

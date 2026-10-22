@@ -650,12 +650,12 @@ async def test_transcript_defers_incoming_decision_until_close() -> None:
             AgentsUpdate([
                 AgentSummaryModel(
                     agent_id="one",
-                    profile="worker",
+                    identity="coder",
                     availability="idle",
                     name=derive_agent_name(
                         agent_id="one",
-                        profile="worker",
-                        profile_display_label=None,
+                        identity="coder",
+                        identity_display_label=None,
                         base_model=None,
                         effective_model=None,
                     ),
@@ -1388,12 +1388,12 @@ async def test_inspection_rejected_while_question_draft_is_visible() -> None:
             AgentsUpdate([
                 AgentSummaryModel(
                     agent_id="one",
-                    profile="worker",
+                    identity="coder",
                     availability="idle",
                     name=derive_agent_name(
                         agent_id="one",
-                        profile="worker",
-                        profile_display_label=None,
+                        identity="coder",
+                        identity_display_label=None,
                         base_model=None,
                         effective_model=None,
                     ),
@@ -1545,13 +1545,13 @@ async def test_confirmed_stop_calls_client_with_pinned_run_only(
             await _wait_until(pilot, lambda: app.app_server.turn_active)
         target = AgentSummaryModel(
             agent_id="one",
-            profile="worker",
+            identity="coder",
             availability="running",
             current_run_id="r1",
             name=derive_agent_name(
                 agent_id="one",
-                profile="worker",
-                profile_display_label=None,
+                identity="coder",
+                identity_display_label=None,
                 base_model=None,
                 effective_model=None,
             ),
@@ -1612,13 +1612,13 @@ async def test_stop_failure_surfaces_toast_and_restores_browser(
             AgentsUpdate([
                 AgentSummaryModel(
                     agent_id="one",
-                    profile="worker",
+                    identity="coder",
                     availability="running",
                     current_run_id="r1",
                     name=derive_agent_name(
                         agent_id="one",
-                        profile="worker",
-                        profile_display_label=None,
+                        identity="coder",
+                        identity_display_label=None,
                         base_model=None,
                         effective_model=None,
                     ),
@@ -1657,13 +1657,13 @@ async def test_escape_dismisses_stop_confirmation_before_browser_and_parent(
             AgentsUpdate([
                 AgentSummaryModel(
                     agent_id="one",
-                    profile="worker",
+                    identity="coder",
                     availability="running",
                     current_run_id="r1",
                     name=derive_agent_name(
                         agent_id="one",
-                        profile="worker",
-                        profile_display_label=None,
+                        identity="coder",
+                        identity_display_label=None,
                         base_model=None,
                         effective_model=None,
                     ),

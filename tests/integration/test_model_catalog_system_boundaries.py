@@ -11,12 +11,10 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from chartreux.agents import AgentSafety, AgentType
 from chartreux.app_server._runtime import AgentRuntimeFactory
 from chartreux.app_server._sessions import SessionRuntime, SessionRuntimeRegistry
 from chartreux.core.agent_loop._loop import AgentLoop
 from chartreux.core.agents.launch import resolve_launch
-from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.layers.default import DefaultConfigLayer
 from chartreux.core.config.layers.overrides import OverridesLayer
@@ -26,6 +24,7 @@ from chartreux.core.config.models import (
     SessionLoggingConfig,
 )
 from chartreux.core.config.orchestrator import ConfigOrchestrator
+from chartreux.core.dispatch.session import validate_stored_policy_bundle
 from chartreux.core.llm.failures import RequestRetryBudget
 from chartreux.core.llm_models import LLMChunk, LLMMessage, Role
 from chartreux.core.model_catalog.loader import CatalogSnapshot, load_catalog
@@ -33,7 +32,7 @@ from chartreux.core.model_catalog.migration import apply_migration, plan_migrati
 from chartreux.core.model_catalog.resolver import ModelResolutionError, ModelResolver
 from chartreux.core.model_catalog.schema import ModelCatalog, RoleDefinition
 from chartreux.core.session.session_loader import SessionLoader
-from chartreux.core.session_types import CommittedModelIdentity
+from chartreux.core.session_types import POLICY_STORAGE_VERSION, CommittedModelIdentity
 from chartreux.core.subagents import (
     LaunchConfig,
     RetentionPolicy,
@@ -97,16 +96,6 @@ async def _orchestrator(
     )
 
 
-def _profile() -> AgentProfile:
-    return AgentProfile(
-        name="worker",
-        display_name="Worker",
-        description="test",
-        safety=AgentSafety.NEUTRAL,
-        agent_type=AgentType.SUBAGENT,
-    )
-
-
 class _ModelTrackingBackend(FakeBackend):
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
@@ -142,7 +131,7 @@ async def test_reload_patch_new_child_preserves_old_child_catalog_snapshot() -> 
 async def test_role_bound_child_uses_its_role_instead_of_parent_committed_model() -> (
     None
 ):
-    """A profile role is an explicit model choice, not inherited parent state."""
+    """A child launch resolves from the session role, not the parent's commit."""
     snapshot = _snapshot("A")
     config = ChartreuxConfigSchema.model_validate(
         {"active_model": "@ordered"}, context={"catalog_snapshot": snapshot}
@@ -155,15 +144,11 @@ async def test_role_bound_child_uses_its_role_instead_of_parent_committed_model(
         catalog_revision="A",
     )
     parent_loop.committed_model = committed
-    parent_loop.agent_manager._discovered["worker"] = AgentProfile(**{
-        **_profile().__dict__,
-        "role": "ordered",
-    })
     registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
 
     candidate = registry._resolve_launch_candidate(
         cast(SessionRuntime, SimpleNamespace(agent_loop=parent_loop)),
-        TaskArgs(task="role-bound", agent_type="worker", background=True),
+        TaskArgs(task="role-bound", identity="coder", background=True),
     )
 
     assert candidate.committed_model != committed
@@ -186,16 +171,14 @@ async def test_snapshotted_child_keeps_binding_and_new_session_resolves_current_
         context={"catalog_snapshot": snapshot},
     ).attach_catalog_snapshot(snapshot)
     parent = build_test_agent_loop(config=config, backend=FakeBackend())
-    profile = AgentProfile(**{**_profile().__dict__, "role": "ordered"})
-    parent.agent_manager._discovered["worker"] = profile
     try:
         await parent.persist_empty_session()
         candidate = resolve_launch(
-            profile_name="worker",
+            identity="coder",
             config=None,
             parent_orchestrator=parent.config_orchestrator,
             tool_inventory={},
-            profile_lookup=lambda _name: profile,
+            authorized_tool_names=frozenset(),
         )
         child = await AgentRuntimeFactory().create_child(parent, candidate)
         await child.wait_until_ready()
@@ -203,13 +186,21 @@ async def test_snapshotted_child_keeps_binding_and_new_session_resolves_current_
         child_id = child.session_id
         child_dir = child.session_logger.session_dir
         assert child_dir is not None
-        saved_policy = child.bound_dispatch_policy
+        saved_policy = child._ensure_bound_policy()
         saved_identity = child.committed_model
         assert saved_identity is not None
         assert saved_identity.base_model == "first"
         await child.aclose()
         metadata = SessionLoader.load_metadata(child_dir)
-        assert metadata.dispatch_policy == saved_policy.model_dump(mode="json")
+        # The persisted policy record is the version-2 frozen bundle (the
+        # legacy dispatch-policy record is retired with the session bind).
+        assert metadata.policy_storage_version == POLICY_STORAGE_VERSION
+        assert metadata.policy_bundle is not None
+        stored_bundle = validate_stored_policy_bundle(metadata.policy_bundle)
+        assert (
+            stored_bundle.manifest.frozen_policy_hash == saved_policy.frozen_policy_hash
+        )
+        assert stored_bundle.manifest.identity.selected == "coder"
 
         updated_catalog = snapshot.catalog.model_copy(
             update={
@@ -225,20 +216,22 @@ async def test_snapshotted_child_keeps_binding_and_new_session_resolves_current_
         updated_snapshot = CatalogSnapshot(updated_catalog, "B")
         parent.config.attach_catalog_snapshot(updated_snapshot)
         resumed = await AgentRuntimeFactory().resume_child(
-            parent, "worker", child_id, child_dir
+            parent, "coder", child_id, child_dir
         )
         try:
-            assert resumed.config.active_model == "@ordered"
+            # The resumed child materializes the committed base model; the
+            # role expression is not rebound from the live catalog.
+            assert resumed.config.active_model == "first"
             assert resumed.committed_model is not None
             # Revalidate the same deployment against B without rebinding @ordered.
             assert resumed.committed_model == saved_identity.model_copy(
                 update={"catalog_revision": "B"}
             )
-            assert resumed.bound_dispatch_policy == saved_policy
-            assert not any(
-                "Legacy session" in note
-                for note in resumed.bound_dispatch_policy.diagnostics
-            )
+            # The resumed child serves the same frozen bundle: the persisted
+            # version-2 record activates cleanly, with no pending changes
+            # (the legacy bound-policy diagnostics are retired).
+            assert resumed._bound_policy == saved_policy
+            assert resumed.pending_policy_changes == ()
         finally:
             await resumed.aclose()
 
@@ -247,15 +240,14 @@ async def test_snapshotted_child_keeps_binding_and_new_session_resolves_current_
             context={"catalog_snapshot": updated_snapshot},
         ).attach_catalog_snapshot(updated_snapshot)
         fresh_parent = build_test_agent_loop(config=fresh_config, backend=FakeBackend())
-        fresh_parent.agent_manager._discovered["worker"] = profile
         try:
             await fresh_parent.persist_empty_session()
             fresh_candidate = resolve_launch(
-                profile_name="worker",
+                identity="coder",
                 config=None,
                 parent_orchestrator=fresh_parent.config_orchestrator,
                 tool_inventory={},
-                profile_lookup=lambda _name: profile,
+                authorized_tool_names=frozenset(),
             )
             fresh_child = await AgentRuntimeFactory().create_child(
                 fresh_parent, fresh_candidate
@@ -278,11 +270,11 @@ def test_role_thinking_resolves_base_and_rejects_v0_1_expressions() -> None:
     snapshot = _snapshot("A")
     parent = asyncio.run(_orchestrator(snapshot))
     candidate = resolve_launch(
-        profile_name="worker",
+        identity="coder",
         config=LaunchConfig(model="@ordered", thinking="low"),
         parent_orchestrator=parent,
         tool_inventory={},
-        profile_lookup=lambda _name: _profile(),
+        authorized_tool_names=frozenset(),
     )
 
     assert (candidate.committed_model.base_model, candidate.effective_model.name) == (
@@ -407,7 +399,6 @@ async def test_failover_terminal_identity_survives_eviction_and_result_serializa
         "chartreux.core.agent_loop._loop.create_backend", create_backend
     )
     parent = build_test_agent_loop(config=config, backend=FakeBackend())
-    parent.agent_manager._discovered["worker"] = _profile()
     registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
     root = registry._build_child_runtime(parent)
     root.turns._projector = MagicMock()
@@ -473,7 +464,6 @@ async def test_parallel_explicit_tasks_survive_failover_and_share_root_cooldown(
         "chartreux.core.agent_loop._loop.create_backend", create_backend
     )
     parent = build_test_agent_loop(config=config, backend=FakeBackend())
-    parent.agent_manager._discovered["worker"] = _profile()
     registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
     root = registry._build_child_runtime(parent)
     root.turns._projector = MagicMock()
@@ -596,7 +586,6 @@ async def test_reload_while_background_child_runs_keeps_child_snapshot_isolated(
         backend=FakeBackend(),
         mcp_registry=FakeMCPRegistry(),
     )
-    parent.agent_manager._discovered["worker"] = _profile()
     child_backend = _BlockingCompletionBackend()
     monkeypatch.setattr(
         "chartreux.core.agent_loop._loop.create_backend", lambda **_: child_backend
@@ -609,9 +598,7 @@ async def test_reload_while_background_child_runs_keeps_child_snapshot_isolated(
     try:
         launch = await _task_result(
             registry,
-            TaskArgs(
-                task="snapshot", agent_type="worker", background=True, retain=True
-            ),
+            TaskArgs(task="snapshot", identity="coder", background=True, retain=True),
             InvokeContext(tool_call_id="background", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None

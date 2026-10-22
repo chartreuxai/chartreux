@@ -55,16 +55,16 @@ def _capture_registry():
     run = RunRecord(
         "run",
         "agent",
-        "worker",
         RunStatus.RUNNING,
         asyncio.get_running_loop().create_future(),
+        "coder",
     )
     record = AgentRecord(
         "agent",
-        "worker",
         child.session_id,
         runtime,
         child._session_generation,
+        "coder",
         state=_AgentState.RUNNING,
         current_run=run,
     )

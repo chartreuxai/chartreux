@@ -1,5 +1,11 @@
 # 0007 Extension Mechanisms
 
+> **Note (v0.5.7):** the agent-profile mechanism named in the Decision below is
+> retired; custom identity prompt files in `~/.chartreux/prompts/` (selected
+> through the `[agent]` identity) replace it. The remaining mechanisms are
+> unchanged. See the [identity
+> architecture](../reference/identity-architecture.md).
+
 ## Decision
 
 Chartreux extends through explicit local mechanisms: agent profiles and subagents,

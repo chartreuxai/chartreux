@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from chartreux.app_server._projection import project_launch_purposes
 from chartreux.app_server._runtime import AgentRuntimeFactory
 from chartreux.app_server._sessions import (
     RunRecord,
@@ -26,11 +27,24 @@ from chartreux.app_server.models import (
 from chartreux.app_server.protocol import AppServerResponseError, ProtocolErrorCode
 from chartreux.app_server.server import AppServer
 from chartreux.core.agent_loop import AgentLoop
+from chartreux.core.agents.identity_launch import (
+    InvalidChildIdentityError,
+    InvalidLaunchPurposeError,
+)
 from chartreux.core.config import SessionLoggingConfig
+from chartreux.core.config.chartreux_schema import OrchestrationConfig
+from chartreux.core.dispatch.route_models import (
+    PackageTier as RoutePackageTier,
+    PurposeRoute,
+    ReplacementCapability,
+    RouteTarget,
+)
 from chartreux.core.message_list import MessageList
+from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.recovery_models import PackageTier
 from chartreux.core.session.session_loader import SessionLoader
 from chartreux.core.session.session_logger import SessionLogger
-from chartreux.core.session_types import ChildSessionLink
+from chartreux.core.session_types import ChildSessionLink, LaunchMetadataV2
 from chartreux.core.subagents import (
     CancelOutcome,
     LaunchConfig,
@@ -46,7 +60,6 @@ from chartreux.core.tools.base import InvokeContext
 from chartreux.core.tools.models import ToolPermission, ToolPermissionError
 from chartreux.utils.tool_presentation import ToolEffectKind
 from tests.app_server._subagent_test_support import (
-    _DYNAMIC_PROFILE,
     BlockingBackend,
     GatedSequenceBackend,
     _background_result,
@@ -67,7 +80,12 @@ from tests.app_server._subagent_test_support import (
     _task_call,
     _wait_result,
 )
-from tests.conftest import build_test_agent_loop, set_agent_config
+from tests.conftest import (
+    build_test_agent_loop,
+    build_test_vibe_config,
+    set_agent_config,
+    single_model_catalog,
+)
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.app_server import (
     attach_test_app_server_session,
@@ -104,7 +122,7 @@ async def test_running_subagent_cap_excludes_idle_and_frees_capacity(
     ctx = InvokeContext(tool_call_id="cap", session_id=parent.session_id)
     # The first agent is reused below, so its launch opts into retention
     # explicitly instead of relying on the ephemeral-by-default global.
-    args = TaskArgs(task="work", agent_type="worker", background=True, retain=True)
+    args = TaskArgs(task="work", identity="coder", background=True, retain=True)
     create_child = AsyncMock(wraps=registry._runtime_factory.create_child)
     monkeypatch.setattr(registry._runtime_factory, "create_child", create_child)
     try:
@@ -180,7 +198,7 @@ async def test_foreground_subagent_consumes_cap_until_completion(
         with pytest.raises(RuntimeError, match="cap 1"):
             await _background_result(
                 registry,
-                TaskArgs(task="more", agent_type="worker", background=True),
+                TaskArgs(task="more", identity="coder", background=True),
                 InvokeContext(tool_call_id="more", session_id=parent.session_id),
             )
         if cancel:
@@ -220,7 +238,7 @@ async def test_subagent_cap_reserves_pending_creation_and_rolls_back_failure(
         raise RuntimeError("creation failed")
 
     monkeypatch.setattr(registry._runtime_factory, "create_child", fail_creation)
-    args = TaskArgs(task="work", agent_type="worker", background=True)
+    args = TaskArgs(task="work", identity="coder", background=True)
     ctx = InvokeContext(tool_call_id="cap", session_id=parent.session_id)
     launch = asyncio.create_task(_background_result(registry, args, ctx))
     try:
@@ -287,7 +305,7 @@ async def test_subagent_cap_root_config_replacement_and_override_precedence(
         AsyncMock(), AsyncMock(), lambda _: 0, max_running_subagents=override
     )
     registry.bind_root(registry._build_child_runtime(parent))
-    args = TaskArgs(task="work", agent_type="worker", background=True)
+    args = TaskArgs(task="work", identity="coder", background=True)
     ctx = InvokeContext(tool_call_id="config-cap", session_id=parent.session_id)
     try:
         first = await _background_result(registry, args, ctx)
@@ -337,7 +355,7 @@ async def test_bare_registry_subagent_cap_defaults_to_sixteen(
         yield TaskResult(completed=True, response="done", turns_used=1)
 
     monkeypatch.setattr(SessionRuntimeRegistry, "_run_admitted", admitted)
-    args = TaskArgs(task="work", agent_type="worker", background=True)
+    args = TaskArgs(task="work", identity="coder", background=True)
     ctx = InvokeContext(tool_call_id="bare", session_id="bare")
     launches = [
         asyncio.create_task(_background_result(registry, args, ctx)) for _ in range(16)
@@ -412,7 +430,7 @@ async def test_reused_launch_failure_restores_idle_bookkeeping_and_rearms_reaper
         await _background_result(
             registry,
             TaskArgs(
-                task="retry", agent_type="worker", agent_id="agent-1", background=True
+                task="retry", identity="coder", agent_id="agent-1", background=True
             ),
             InvokeContext(tool_call_id="retry", session_id="root"),
         )
@@ -457,7 +475,7 @@ async def test_child_creation_cancellation_at_publication_lock_closes_orphan(
     launch = asyncio.create_task(
         registry._create_registered_child(
             root,
-            TaskArgs(task="new", agent_type="worker", background=True),
+            TaskArgs(task="new", identity="coder", background=True),
             InvokeContext(tool_call_id="new", session_id="root"),
         )
     )
@@ -501,13 +519,13 @@ async def test_child_creation_generation_change_discards_orphan_without_registra
     create = asyncio.create_task(
         registry._create_registered_child(
             root,
-            TaskArgs(task="new", agent_type="worker", background=True),
+            TaskArgs(task="new", identity="coder", background=True),
             InvokeContext(tool_call_id="new", session_id="root"),
         )
     )
     await entered.wait()
     resolve.assert_called_once_with(
-        root, TaskArgs(task="new", agent_type="worker", background=True)
+        root, TaskArgs(task="new", identity="coder", background=True)
     )
     root.agent_loop._session_generation = 2
     registry.begin_root_generation()
@@ -602,7 +620,7 @@ async def test_post_commit_launch_cancellation_keeps_the_monitor_and_exact_resul
     launch = asyncio.create_task(
         _background_result(
             registry,
-            TaskArgs(task="work", agent_type="worker", background=True),
+            TaskArgs(task="work", identity="coder", background=True),
             InvokeContext(tool_call_id="launch", session_id=parent.session_id),
         )
     )
@@ -720,7 +738,7 @@ async def test_post_commit_update_failure_does_not_cancel_busy_child(
     try:
         acknowledgement = await _background_result(
             registry,
-            TaskArgs(task="work", agent_type="worker", background=True),
+            TaskArgs(task="work", identity="coder", background=True),
             InvokeContext(tool_call_id="launch", session_id=parent.session_id),
         )
         assert acknowledgement.agent_id == "agent-1"
@@ -729,8 +747,8 @@ async def test_post_commit_update_failure_does_not_cancel_busy_child(
         record = registry._agent_records[acknowledgement.agent_id]
         expected_name = derive_agent_name(
             record.agent_id,
-            record.profile,
-            record.profile_display_label,
+            record.identity,
+            record.identity_display_label,
             record.base_model,
             record.effective_model,
         )
@@ -778,7 +796,7 @@ async def test_cancel_in_aborted_launch_rollback_window_is_not_accepted() -> Non
         run = RunRecord(
             run_id="attempt",
             agent_id=record.agent_id,
-            profile=record.profile,
+            identity=record.identity,
             status=RunStatus.RUNNING,
             completion_task=asyncio.get_running_loop().create_future(),
             initial_turn_id=turn_id,
@@ -1061,7 +1079,7 @@ async def test_background_creation_fences_live_identity_at_each_admission_bounda
     launch = asyncio.create_task(
         _background_result(
             registry,
-            TaskArgs(task="work", agent_type="worker", background=True),
+            TaskArgs(task="work", identity="coder", background=True),
             InvokeContext(tool_call_id="launch", session_id=parent.session_id),
         )
     )
@@ -1088,14 +1106,17 @@ async def test_background_creation_fences_live_identity_at_each_admission_bounda
 
 
 @pytest.mark.asyncio
-async def test_real_child_creation_carries_profile_idle_ttl(
+async def test_real_child_creation_uses_global_idle_ttl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, parent, record, _context, _first, _backends = await _dynamic_registry(
         monkeypatch
     )
     try:
-        assert record.idle_ttl_seconds == 300
+        # Policy reversal: a per-agent idle TTL no longer reaches the record.
+        assert record.idle_ttl_seconds is None
+        global_ttl = registry._retention_policy.idle_ttl_seconds
+        assert record.effective_idle_ttl(global_ttl) == global_ttl
     finally:
         await registry.drain_children()
         await parent.aclose()
@@ -1129,7 +1150,7 @@ async def test_direct_runner_enforces_effective_task_admission(
         with pytest.raises(ToolPermissionError, match=f"Task tool .*{admission}"):
             await _background_result(
                 registry,
-                TaskArgs(task="blocked", agent_type="dynamic", background=False),
+                TaskArgs(task="blocked", identity="user:dynamic", background=False),
                 InvokeContext(
                     tool_call_id=f"direct-{admission}", session_id=parent.session_id
                 ),
@@ -1158,7 +1179,7 @@ async def test_foreground_dynamic_launch_uses_resolver_and_rejects_retained_hand
             registry,
             TaskArgs(
                 task="foreground",
-                agent_type="dynamic",
+                identity="user:dynamic",
                 background=False,
                 config=cast(LaunchConfig, {"model": "large", "thinking": "high"}),
             ),
@@ -1167,6 +1188,327 @@ async def test_foreground_dynamic_launch_uses_resolver_and_rejects_retained_hand
             ),
         )
         assert result.agent_id is None
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_retained_launch_consumes_the_top_level_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retained launch goes through the same canonical model resolution as
+    a fresh launch: the top-level model field selects the reused child's
+    model (the legacy nested config.model is the promoted equivalent).
+    """
+    registry, parent, record, context, _first, backends = await _dynamic_registry(
+        monkeypatch
+    )
+    try:
+        child = record.runtime.agent_loop
+        assert child.committed_model is not None
+        assert child.committed_model.base_model == "small"
+        result = await _background_result(
+            registry,
+            TaskArgs(
+                task="top-level model",
+                agent_id=record.agent_id,
+                model="other",
+                background=True,
+            ),
+            context,
+        )
+        assert result.run_id is not None
+        await registry.wait_for_agent(record.agent_id, result.run_id)
+        assert child.config.active_model == "other"
+        assert child.committed_model is not None
+        assert child.committed_model.base_model == "other"
+        assert child.committed_model.provider == "two"
+        assert backends[-1][0] == "two"
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_retained_launch_validates_the_purpose_seat_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retained launch accepts only a valid purpose/seat binding: an
+    unknown purpose, a multi-seat purpose without a seat, and an unknown
+    seat all fail loudly instead of being accepted unvalidated.
+    """
+    registry, parent, record, context, _first, _backends = await _dynamic_registry(
+        monkeypatch
+    )
+    try:
+        for args in (
+            TaskArgs(
+                task="unknown purpose",
+                agent_id=record.agent_id,
+                purpose="no-such-purpose",
+                background=True,
+            ),
+            TaskArgs(
+                task="missing seat",
+                agent_id=record.agent_id,
+                purpose="review.deep",
+                background=True,
+            ),
+            TaskArgs(
+                task="unknown seat",
+                agent_id=record.agent_id,
+                purpose="review.deep",
+                seat="chair",
+                background=True,
+            ),
+        ):
+            with pytest.raises(InvalidLaunchPurposeError):
+                await _background_result(registry, args, context)
+        # The retained instance is untouched: still idle on its committed
+        # model, with no new run recorded.
+        child = record.runtime.agent_loop
+        assert child.committed_model is not None
+        assert child.committed_model.base_model == "small"
+        assert record.state is _AgentState.IDLE
+        assert record.current_run is None
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_retained_launch_installs_its_own_purpose_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retask's own purpose label installs on the reused loop — never
+    copied from the previous run: a routed retask carries its purpose, and
+    a bare continuation carries none. The retained identity/model stay
+    pinned (the route's own defaults are validated, never adopted).
+    """
+    registry, parent, record, context, _first, _backends = await _dynamic_registry(
+        monkeypatch
+    )
+    try:
+        child = record.runtime.agent_loop
+        assert child.launch_purpose is None  # the first launch was direct
+        routed = await _background_result(
+            registry,
+            TaskArgs(
+                task="routed retask",
+                agent_id=record.agent_id,
+                purpose="research",
+                background=True,
+            ),
+            context,
+        )
+        assert routed.run_id is not None
+        await registry.wait_for_agent(record.agent_id, routed.run_id)
+        assert child.launch_purpose == "research"
+        assert project_launch_purposes(child) == ["research"]
+        assert child._bound_identity == "user:dynamic"
+        assert child.committed_model is not None
+        assert child.committed_model.base_model == "small"
+        bare = await _background_result(
+            registry,
+            TaskArgs(
+                task="bare continuation", agent_id=record.agent_id, background=True
+            ),
+            context,
+        )
+        assert bare.run_id is not None
+        await registry.wait_for_agent(record.agent_id, bare.run_id)
+        assert child.launch_purpose is None
+        assert project_launch_purposes(child) == []
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_retained_launch_normalizes_the_model_shorthand_like_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-2 delta D2 (Ab3 residual): the retained path promoted the raw
+    top-level model field into the retained semantic config, so a shorthand
+    model ('@main:user:dynamic') reached model resolution as one opaque
+    expression and raised InvalidLaunchModelError while the fresh path
+    resolved it. The retained model selection must parse/normalize the
+    shorthand exactly like fresh resolution: the model component selects the
+    model, and the identity component matches the retained record's
+    committed identity.
+    """
+    backends: list[tuple[str, FakeBackend]] = []
+
+    def create_backend(*, provider, **_kwargs):
+        backend = FakeBackend([mock_llm_chunk(content=provider.name)])
+        backends.append((provider.name, backend))
+        return backend
+
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", create_backend
+    )
+    parent = build_test_agent_loop(config=_dynamic_config(), backend=FakeBackend())
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    context = InvokeContext(tool_call_id="dynamic", session_id=parent.session_id)
+    try:
+        first = await _background_result(
+            registry,
+            TaskArgs(
+                task="first",
+                identity="user:dynamic",
+                background=True,
+                retain=True,
+                config=LaunchConfig(
+                    model="small",
+                    enabled_tools=["read_file"],
+                    instructions="Retained role instruction.",
+                ),
+            ),
+            context,
+        )
+        assert first.agent_id is not None and first.run_id is not None
+        await registry.wait_for_agent(first.agent_id, first.run_id)
+        record = registry._agent_records[first.agent_id]
+        child = record.runtime.agent_loop
+        assert child.committed_model is not None
+        assert child.committed_model.base_model == "small"
+
+        # The fresh control resolves the shorthand through canonical
+        # resolution: the model component selects the model, the identity
+        # component selects the identity.
+        fresh = await _background_result(
+            registry,
+            TaskArgs(
+                task="shorthand fresh",
+                model="@main:user:dynamic",
+                background=True,
+                retain=True,
+            ),
+            context,
+        )
+        assert fresh.agent_id is not None and fresh.run_id is not None
+        await registry.wait_for_agent(fresh.agent_id, fresh.run_id)
+
+        # The retained re-task normalizes the same shorthand: the model
+        # component selects the reused child's model; the identity component
+        # matches the retained record's committed identity.
+        retained = await _background_result(
+            registry,
+            TaskArgs(
+                task="shorthand retask",
+                agent_id=record.agent_id,
+                model="@main:user:dynamic",
+                background=True,
+            ),
+            context,
+        )
+        assert retained.run_id is not None
+        await registry.wait_for_agent(record.agent_id, retained.run_id)
+        assert child.config.active_model == "@main"
+        assert child.committed_model is not None
+        assert child.committed_model.base_model == "glm-5-3"
+        assert child._bound_identity == "user:dynamic"
+        assert backends[-1][0] == "mistral"
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_retained_launch_enforces_purpose_diversity_like_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-2 delta D2 (Ab3 residual): the retained path validated a
+    purpose/seat binding with the route's distinct-model requirement
+    disabled, so on a single-model catalog a retained review.deep launch
+    succeeded where the fresh launch fails InvalidLaunchPurposeError. The
+    retained purpose validation must enforce the same canonical-model
+    diversity rule a fresh launch enforces (design §9).
+    """
+    backends: list[tuple[str, FakeBackend]] = []
+
+    def create_backend(*, provider, **_kwargs):
+        backend = FakeBackend([mock_llm_chunk(content=provider.name)])
+        backends.append((provider.name, backend))
+        return backend
+
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", create_backend
+    )
+    config = build_test_vibe_config(
+        active_model="@main",
+        include_project_context=False,
+        include_prompt_detail=False,
+        enabled_tools=["task", "read_file"],
+        tools={"task": {"permission": "always"}, "read_file": {"permission": "always"}},
+    ).attach_catalog_snapshot(CatalogSnapshot(single_model_catalog(), "test"))
+    parent = build_test_agent_loop(config=config, backend=FakeBackend())
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    context = InvokeContext(tool_call_id="dynamic", session_id=parent.session_id)
+    try:
+        first = await _background_result(
+            registry,
+            TaskArgs(
+                task="first",
+                identity="user:dynamic",
+                background=True,
+                retain=True,
+                config=LaunchConfig(
+                    model="@main",
+                    enabled_tools=["read_file"],
+                    instructions="Retained role instruction.",
+                ),
+            ),
+            context,
+        )
+        assert first.agent_id is not None and first.run_id is not None
+        await registry.wait_for_agent(first.agent_id, first.run_id)
+        record = registry._agent_records[first.agent_id]
+
+        # The fresh control fails: the shipped review.deep route requires 3
+        # distinct canonical models and the single-model catalog resolves 1.
+        with pytest.raises(InvalidLaunchPurposeError):
+            await _background_result(
+                registry,
+                TaskArgs(
+                    task="fresh deep review",
+                    purpose="review.deep",
+                    seat="analytical",
+                    background=True,
+                ),
+                context,
+            )
+        # The retained re-task fails the SAME way: the purpose/seat binding
+        # is validated through the same canonical route grammar, diversity
+        # included — never accepted unvalidated.
+        with pytest.raises(InvalidLaunchPurposeError):
+            await _background_result(
+                registry,
+                TaskArgs(
+                    task="retained deep review",
+                    agent_id=record.agent_id,
+                    purpose="review.deep",
+                    seat="analytical",
+                    background=True,
+                ),
+                context,
+            )
+        # The retained instance is untouched: still idle on its committed
+        # model, with no new run recorded.
+        child = record.runtime.agent_loop
+        assert child.committed_model is not None
+        assert child.committed_model.base_model == "solo-model"
+        assert record.state is _AgentState.IDLE
+        assert record.current_run is None
     finally:
         await registry.drain_children()
         await parent.aclose()
@@ -1209,7 +1551,7 @@ async def test_foreground_turn_start_failure_rolls_back_persisted_child(
         with pytest.raises(RuntimeError, match="foreground turn start failed"):
             await _background_result(
                 registry,
-                TaskArgs(task="fail", agent_type="dynamic", background=False),
+                TaskArgs(task="fail", identity="user:dynamic", background=False),
                 InvokeContext(
                     tool_call_id="foreground-failure", session_id=parent.session_id
                 ),
@@ -1364,18 +1706,14 @@ async def test_resume_reconstructs_accumulated_launch_state_from_disk(
 
         # A normal turn save must retain the committed dedicated envelope.
         await child.session_logger.save_interaction(
-            child.messages,
-            child.stats,
-            child.config,
-            child.tool_manager,
-            _DYNAMIC_PROFILE,
+            child.messages, child.stats, child.config, child.tool_manager
         )
         assert SessionLoader.load_metadata(child_dir).launch_config == persisted
 
         child_id = child.session_id
         await registry.drain_children()
         resumed = await AgentRuntimeFactory().resume_child(
-            parent, "dynamic", child_id, child_dir
+            parent, "user:dynamic", child_id, child_dir
         )
         try:
             await resumed.wait_until_ready()
@@ -1391,20 +1729,118 @@ async def test_resume_reconstructs_accumulated_launch_state_from_disk(
 
 
 @pytest.mark.asyncio
+async def test_resume_restores_the_committed_purpose_tier_and_capability_from_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The persisted launch envelope carries the resolved purpose/tier/
+    capability, and a disk-resumed child restores them instead of
+    re-deriving defaults (before the envelope carried them, a resumed
+    mechanical-edit child came back substantive and purpose-less).
+    """
+    logging = SessionLoggingConfig(
+        enabled=True, save_dir=str(tmp_path / "sessions"), session_prefix="session"
+    )
+    routes = OrchestrationConfig(
+        routes={
+            "mechanical-edit": PurposeRoute(
+                targets=(
+                    RouteTarget(
+                        model="small",
+                        identity="user:dynamic",
+                        tier=RoutePackageTier.MECHANICAL,
+                        replacement_capability=ReplacementCapability.MECHANICAL,
+                    ),
+                )
+            )
+        }
+    )
+    config = _dynamic_config().model_copy(
+        update={"session_logging": logging, "orchestration": routes}
+    )
+
+    def create_backend(*, provider, **_kwargs):
+        return FakeBackend([mock_llm_chunk(content=provider.name)])
+
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", create_backend
+    )
+    parent = build_test_agent_loop(
+        config=config,
+        backend=FakeBackend([mock_llm_chunk(content="Notification received")]),
+    )
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    context = InvokeContext(tool_call_id="dynamic", session_id=parent.session_id)
+    try:
+        first = await _background_result(
+            registry,
+            TaskArgs(
+                task="mechanical package",
+                purpose="mechanical-edit",
+                background=True,
+                retain=True,
+            ),
+            context,
+        )
+        assert first.agent_id is not None and first.run_id is not None
+        await registry.wait_for_agent(first.agent_id, first.run_id)
+        record = registry._agent_records[first.agent_id]
+        child = record.runtime.agent_loop
+        child_dir = child.session_logger.session_dir
+        assert child_dir is not None
+        # The launch resolved through the mechanical-tier route.
+        assert child.launch_purpose == "mechanical-edit"
+        assert child.launch_package_tier is PackageTier.MECHANICAL
+        assert child.launch_replacement_capability is ReplacementCapability.MECHANICAL
+        # The persisted envelope carries the committed purpose/tier/capability.
+        persisted = SessionLoader.load_metadata(child_dir).launch_config
+        assert isinstance(persisted, LaunchMetadataV2)
+        assert persisted.purpose == "mechanical-edit"
+        assert persisted.package_tier is PackageTier.MECHANICAL
+        assert persisted.replacement_capability is ReplacementCapability.MECHANICAL
+
+        child_id = child.session_id
+        await registry.drain_children()
+        resumed = await AgentRuntimeFactory().resume_child(
+            parent, "user:dynamic", child_id, child_dir
+        )
+        try:
+            await resumed.wait_until_ready()
+            # The resumed child keeps the committed purpose/tier/capability.
+            assert resumed.launch_purpose == "mechanical-edit"
+            assert resumed.launch_package_tier is PackageTier.MECHANICAL
+            assert (
+                resumed.launch_replacement_capability
+                is ReplacementCapability.MECHANICAL
+            )
+        finally:
+            await resumed.aclose()
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("mutation", "field"),
     [
         (
-            lambda metadata: metadata["launch_config"]["persona"].update(
-                system_prompt_id="gone"
+            # The retired pre-identity persona format (keyed on
+            # system_prompt_id) still parses, but resume rejects it with
+            # the actionable "start a new session" failure — there is no
+            # migration for the old persisted format.
+            lambda metadata: metadata["launch_config"].update(
+                persona={"system_prompt_id": "gone", "instructions": None}
             ),
-            "config.system_prompt_id",
+            "launch_config.persona",
         ),
         (
             lambda metadata: metadata["launch_config"].update(version=99),
             "launch_config",
         ),
-        (lambda metadata: metadata.update(launch_config=None), "launch_config"),
     ],
 )
 async def test_ensure_child_fails_closed_for_invalid_persisted_envelopes(
@@ -1436,7 +1872,7 @@ async def test_ensure_child_fails_closed_for_invalid_persisted_envelopes(
             ChildSessionLink(
                 session_id=child_id,
                 tool_call_id="persisted",
-                agent="dynamic",
+                agent="user:dynamic",
                 relative_path=str(child_dir.relative_to(parent_dir)),
             )
         ]
@@ -1470,7 +1906,6 @@ async def test_persisted_child_launch_error_is_reported_as_protocol_diagnostic(
         }
     )
     resumed_loop = build_test_agent_loop(config=resumed_config, backend=FakeBackend())
-    resumed_loop.agent_manager._discovered[_DYNAMIC_PROFILE.name] = _DYNAMIC_PROFILE
     with pytest.raises(AppServerResponseError) as exc_info:
         await attach_test_app_server_session(
             start_test_app_server(resumed_loop), resume_session_id=parent.session_id
@@ -1479,10 +1914,13 @@ async def test_persisted_child_launch_error_is_reported_as_protocol_diagnostic(
 
 
 @pytest.mark.asyncio
-async def test_legacy_no_config_child_resume_uses_profile_defaults(
+async def test_legacy_no_config_child_resume_uses_identity_defaults(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An absent (legacy) envelope is distinct from a malformed present one."""
+    """An absent (legacy) envelope is distinct from a malformed present one:
+    resume admits it with identity defaults — no committed overrides, the
+    session's default model.
+    """
     registry, parent, record, _context, _first, _ = await _persistent_dynamic_registry(
         tmp_path, monkeypatch
     )
@@ -1589,39 +2027,13 @@ async def test_ensure_child_rejects_corrupt_present_envelope_as_typed_error(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("keep_envelope", [True, False])
-async def test_ensure_child_rejects_deleted_profile_without_worker_substitution(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keep_envelope: bool
-) -> None:
-    registry, parent, record, _context, _first, _ = await _persistent_dynamic_registry(
-        tmp_path, monkeypatch
-    )
-    child = record.runtime.agent_loop
-    child_dir = child.session_logger.session_dir
-    assert child_dir is not None
-    try:
-        if not keep_envelope:
-            raw = json.loads((child_dir / "meta.json").read_text(encoding="utf-8"))
-            raw.pop("launch_config")
-            (child_dir / "meta.json").write_text(json.dumps(raw), encoding="utf-8")
-        child_id = child.session_id
-        parent.agent_manager._discovered.pop("dynamic")
-        await registry.drain_children()
-
-        with pytest.raises(LaunchConfigError) as raised:
-            await registry.ensure_child(child_id)
-        assert raised.value.field == "agent_type"
-        assert "dynamic" in str(raised.value)
-        assert registry._children == {}
-    finally:
-        await registry.close()
-        await parent.aclose()
-
-
-@pytest.mark.asyncio
-async def test_ensure_child_rejects_removed_builtin_explore_profile(
+async def test_ensure_child_rejects_mismatched_identity_without_worker_substitution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A link naming a different identity rejects instead of substituting
+    defaults: the retired profile name "worker" bridges onto the coder
+    identity, which does not match the child's committed launch identity.
+    """
     registry, parent, record, _context, _first, _ = await _persistent_dynamic_registry(
         tmp_path, monkeypatch
     )
@@ -1630,9 +2042,45 @@ async def test_ensure_child_rejects_removed_builtin_explore_profile(
     parent_dir = parent.session_logger.session_dir
     assert child_dir is not None and parent_dir is not None
     try:
-        raw = json.loads((child_dir / "meta.json").read_text(encoding="utf-8"))
-        raw.pop("launch_config")
-        (child_dir / "meta.json").write_text(json.dumps(raw), encoding="utf-8")
+        child_id = child.session_id
+        metadata = parent.session_logger.session_metadata
+        assert metadata is not None
+        metadata.child_sessions = [
+            ChildSessionLink(
+                session_id=child_id,
+                tool_call_id="persisted",
+                agent="worker",
+                relative_path=str(child_dir.relative_to(parent_dir)),
+            )
+        ]
+        await registry.drain_children()
+
+        with pytest.raises(LaunchConfigError) as raised:
+            await registry.ensure_child(child_id)
+        assert raised.value.field == "launch_config.persona"
+        assert "does not match its link" in str(raised.value)
+        assert registry._children == {}
+    finally:
+        await registry.close()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_ensure_child_rejects_link_naming_a_different_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link naming an unrelated identity ("explore") rejects: the stored
+    launch identity is re-read from the persisted envelope, never re-derived
+    from the link.
+    """
+    registry, parent, record, _context, _first, _ = await _persistent_dynamic_registry(
+        tmp_path, monkeypatch
+    )
+    child = record.runtime.agent_loop
+    child_dir = child.session_logger.session_dir
+    parent_dir = parent.session_logger.session_dir
+    assert child_dir is not None and parent_dir is not None
+    try:
         child_id = child.session_id
         metadata = parent.session_logger.session_metadata
         assert metadata is not None
@@ -1648,8 +2096,8 @@ async def test_ensure_child_rejects_removed_builtin_explore_profile(
 
         with pytest.raises(LaunchConfigError) as raised:
             await registry.ensure_child(child_id)
-        assert raised.value.field == "agent_type"
-        assert "explore" in str(raised.value)
+        assert raised.value.field == "launch_config.persona"
+        assert "does not match its link" in str(raised.value)
         assert registry._children == {}
     finally:
         await registry.close()
@@ -1738,11 +2186,7 @@ async def test_postacceptance_launch_envelope_write_failure_keeps_accepted_retas
         # The next ordinary save repairs the dirty accepted envelope.
         monkeypatch.setattr(SessionLogger, "persist_metadata", persist_metadata)
         await child.session_logger.save_interaction(
-            child.messages,
-            child.stats,
-            child.config,
-            child.tool_manager,
-            _DYNAMIC_PROFILE,
+            child.messages, child.stats, child.config, child.tool_manager
         )
         persisted = SessionLoader.load_metadata(child_dir).launch_config
         assert persisted is not None and persisted.overrides.model == "large"
@@ -1813,3 +2257,243 @@ def test_legacy_fan_out_is_rejected_with_task_guidance() -> None:
         TaskArgs.model_validate({"task": "panel", "fan_out": True})
 
     assert "fan_out" not in TaskArgs.model_json_schema()["properties"]
+
+
+@pytest.mark.asyncio
+async def test_identity_keyed_launch_resolves_canonically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """11c cutover: a structured identity launch resolves through the
+    canonical grammar — the child binds the researcher identity with its
+    read-only posture, the record carries (identity, revision), and the
+    model is the session's committed binding, not a profile role preset.
+    """
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend",
+        lambda **_: FakeBackend([mock_llm_chunk(content="done")]),
+    )
+    parent = build_test_agent_loop(
+        config=_config(enabled_tools=["task", "read_file", "edit", "bash"]),
+        backend=FakeBackend(),
+    )
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    ctx = InvokeContext(tool_call_id="identity-launch", session_id=parent.session_id)
+    try:
+        launch = await _background_result(
+            registry,
+            TaskArgs(
+                task="research the codebase",
+                identity="researcher",
+                background=True,
+                retain=True,
+            ),
+            ctx,
+        )
+        assert launch.agent_id is not None
+        record = registry._agent_records[launch.agent_id]
+        assert record.identity == "researcher"
+        assert record.identity_revision is not None
+        child = record.runtime.agent_loop
+        assert child._bound_identity == "researcher"
+        assert child.launch_identity == "researcher"
+        # The researcher posture: non-mutating personal tool set.
+        assert "edit" not in child.tool_manager.available_tools
+        assert "read_file" in child.tool_manager.available_tools
+        # The session default is the committed session binding.
+        assert child.committed_model is not None
+        assert parent.committed_model is not None
+        assert child.committed_model.base_model == parent.committed_model.base_model
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_default_launch_binds_the_coder_identity_with_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launch naming no target binds the default coder identity: the
+    record carries the canonical identity and its content revision.
+    """
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend",
+        lambda **_: FakeBackend([mock_llm_chunk(content="done")]),
+    )
+    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    ctx = InvokeContext(tool_call_id="default-launch", session_id=parent.session_id)
+    try:
+        launch = await _background_result(
+            registry, TaskArgs(task="plain work", background=True), ctx
+        )
+        assert launch.agent_id is not None
+        record = registry._agent_records[launch.agent_id]
+        assert record.identity == "coder"
+        assert record.identity_revision is not None
+        run = record.current_run or record.run_history[-1]
+        assert run.identity == "coder"
+        assert run.identity_revision == record.identity_revision
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("background", [True, False])
+async def test_identity_denylist_applies_after_final_resolution(
+    monkeypatch: pytest.MonkeyPatch, background: bool
+) -> None:
+    """The launch admission denylist keys on the RESOLVED identity — a
+    structured, shorthand, or default selection is checked against its final
+    identity (the same surface the task tool enforces) before any child
+    resource is constructed.
+    """
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend",
+        lambda **_: FakeBackend([mock_llm_chunk(content="done")]),
+    )
+    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    tools = dict(parent.tool_manager._config.tools)
+    tools["task"] = {**tools["task"], "denylist": ["research*"]}
+    denied_config = parent.tool_manager._config.model_copy(update={"tools": tools})
+    monkeypatch.setattr(parent.tool_manager, "_config_getter", lambda: denied_config)
+    accepted_revision = object()
+    monkeypatch.setattr(
+        parent.tool_manager, "_accepted_token_getter", lambda: accepted_revision
+    )
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    ctx = InvokeContext(tool_call_id="denied-launch", session_id=parent.session_id)
+    try:
+        for args in (
+            TaskArgs(task="research", identity="researcher", background=background),
+            TaskArgs(task="research", model="@scout:researcher", background=background),
+        ):
+            with pytest.raises(
+                ToolPermissionError, match="Task denied for launch identity: researcher"
+            ):
+                await _background_result(registry, args, ctx)
+        assert registry._children == {}
+        assert registry._agent_records == {}
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("denylist", "identity"),
+    [
+        (["coder"], "builtin:coder"),
+        (["builtin:coder"], "coder"),
+        (["user:noisy"], "noisy"),
+        (["noisy"], "user:noisy"),
+    ],
+    ids=[
+        "bare-builtin-pattern-blocks-builtin-qualified",
+        "builtin-qualified-pattern-blocks-bare-builtin",
+        "user-qualified-pattern-blocks-bare-custom",
+        "bare-custom-pattern-blocks-user-qualified",
+    ],
+)
+async def test_identity_denylist_matches_every_equivalent_spelling(
+    monkeypatch: pytest.MonkeyPatch, denylist: list[str], identity: str
+) -> None:
+    """The launch admission denylist is SYMMETRIC across spellings (finding
+    1): a pattern written in any equivalent spelling blocks the launch
+    identity in every spelling — denying "coder" blocks "builtin:coder",
+    denying "builtin:coder" blocks "coder", denying "user:noisy" blocks the
+    bare custom id "noisy", and denying "noisy" blocks "user:noisy".
+    """
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend",
+        lambda **_: FakeBackend([mock_llm_chunk(content="done")]),
+    )
+    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    tools = dict(parent.tool_manager._config.tools)
+    tools["task"] = {**tools["task"], "denylist": denylist}
+    denied_config = parent.tool_manager._config.model_copy(update={"tools": tools})
+    monkeypatch.setattr(parent.tool_manager, "_config_getter", lambda: denied_config)
+    accepted_revision = object()
+    monkeypatch.setattr(
+        parent.tool_manager, "_accepted_token_getter", lambda: accepted_revision
+    )
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    ctx = InvokeContext(tool_call_id="denied-launch", session_id=parent.session_id)
+    try:
+        with pytest.raises(
+            ToolPermissionError, match="Task denied for launch identity"
+        ):
+            await _background_result(
+                registry, TaskArgs(task="work", identity=identity, background=True), ctx
+            )
+        assert registry._children == {}
+        assert registry._agent_records == {}
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_direct_runner_string_launches_resolve_canonically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The direct runner's string path resolves through the canonical
+    identity grammar: create_child('coder') binds coder and commits the
+    session's model binding, while a legacy profile name ('worker') fails
+    loudly with identity guidance — the retired alias bridges nothing.
+    """
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend",
+        lambda **_: FakeBackend([mock_llm_chunk(content="done")]),
+    )
+    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    child = None
+    try:
+        child = await AgentRuntimeFactory().create_child(parent, "coder")
+        await child.wait_until_ready()
+        assert child._bound_identity == "coder"
+        assert child.committed_model is not None
+        assert parent.committed_model is not None
+        assert child.committed_model.base_model == parent.committed_model.base_model
+    finally:
+        if child is not None:
+            await child.aclose()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_direct_runner_string_rejects_a_legacy_profile_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The direct runner's string path carries no legacy profile bridge
+    (finding 3): a legacy 'worker' spelling is not an identity and fails
+    loudly with identity successor guidance.
+    """
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend",
+        lambda **_: FakeBackend([mock_llm_chunk(content="done")]),
+    )
+    parent = build_test_agent_loop(config=_config(), backend=FakeBackend())
+    try:
+        with pytest.raises(
+            InvalidChildIdentityError, match="Unknown identity 'worker'"
+        ):
+            await AgentRuntimeFactory().create_child(parent, "worker")
+    finally:
+        await parent.aclose()

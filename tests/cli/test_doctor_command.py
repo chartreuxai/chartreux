@@ -97,7 +97,7 @@ def test_dotenv_loading_is_opt_in(
     env_path.write_text(f"{env}={token}\n")
     env_path.chmod(0o644)
     monkeypatch.delenv(env, raising=False)
-    config, checks = asyncio.run(doctor._load_config())
+    config, manager, checks = asyncio.run(doctor._load_config())
     snapshot = config.catalog_snapshot
     base, definition = next(iter(snapshot.catalog.models.items()))
     deployment = definition.deployments[0]
@@ -123,7 +123,7 @@ def test_dotenv_loading_is_opt_in(
     )
     config = config.model_copy(update={"mcp_servers": [server]})
     monkeypatch.setattr(
-        doctor, "_load_config", AsyncMock(return_value=(config, checks))
+        doctor, "_load_config", AsyncMock(return_value=(config, manager, checks))
     )
     load = Mock(side_effect=lambda: _original_load_dotenv(env_path=env_path))
     if mode != "bare":
@@ -205,7 +205,86 @@ def test_bare_local_checks_and_json_purity(capsys: pytest.CaptureFixture[str]) -
     for name in ("config", "catalog", "default model", "active model"):
         assert checks[name]["status"] == "pass"
     assert "project config" not in checks
+    # Retired-input checks appear only when retired inputs are present.
+    assert "retired agent profiles" not in checks
+    assert "retired project prompts" not in checks
     assert any(c["status"] == "skipped" for c in checks.values())
+
+
+@pytest.mark.parametrize(
+    ("line", "guidance"),
+    [
+        ('system_prompt_id = "retired-value-abc"\n', "identity composition"),
+        ('agent_paths = ["retired-value-abc"]\n', "no longer load from any directory"),
+        ('enabled_agents = ["retired-value-abc"]\n', "identity denylist"),
+        ('disabled_agents = ["retired-value-abc"]\n', "identity denylist"),
+    ],
+    ids=["system_prompt_id", "agent_paths", "enabled_agents", "disabled_agents"],
+)
+def test_retired_config_field_fails_with_successor_guidance(
+    config_dir: Path, capsys: pytest.CaptureFixture[str], line: str, guidance: str
+) -> None:
+    """Retired config.toml fields fail config load with their successor (16a).
+
+    Doctor surfaces the loader's own source-aware validation message instead
+    of a generic one; the supplied value is never echoed.
+    """
+    (config_dir / "config.toml").write_text(line)
+    code, result = invoke(capsys)
+    assert code == 1
+    checks = {c["name"]: c for c in result["checks"]}
+    check = checks["config"]
+    assert check["status"] == "fail"
+    assert "is retired" in check["reason"]
+    assert guidance in check["reason"]
+    # Source-aware: the failing source file is named.
+    assert "config.toml" in check["reason"]
+    assert "retired-value-abc" not in json.dumps(result)
+
+
+def test_retired_agent_dirs_are_reported_loudly_and_untouched(
+    config_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    agents_dir = config_dir / "agents"
+    agents_dir.mkdir()
+    profile_file = agents_dir / "old-profile.toml"
+    original = b'display_name = "Old Profile"\n'
+    profile_file.write_bytes(original)
+    code, result = invoke(capsys)
+    assert code == 1
+    checks = {c["name"]: c for c in result["checks"]}
+    assert checks["config"]["status"] == "pass"
+    check = checks["retired agent profiles"]
+    assert check["status"] == "fail"
+    assert (
+        "agents/*.toml profile files are retired and no longer load" in check["reason"]
+    )
+    assert str(agents_dir) in check["reason"]
+    assert "task tool's identity field" in check["reason"]
+    # The profile file is detected, never deleted or converted.
+    assert profile_file.read_bytes() == original
+
+
+def test_retired_project_prompt_dirs_are_reported_loudly_and_untouched(
+    config_dir: Path, tmp_working_directory: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prompts_dir = tmp_working_directory / ".chartreux" / "prompts"
+    prompts_dir.mkdir(parents=True)
+    prompt_file = prompts_dir / "custom.md"
+    original = b"# custom prompt\n"
+    prompt_file.write_bytes(original)
+    (config_dir / "trusted_folders.toml").write_text(
+        f'trusted = ["{tmp_working_directory}"]\n'
+    )
+    code, result = invoke(capsys)
+    assert code == 1
+    checks = {c["name"]: c for c in result["checks"]}
+    check = checks["retired project prompts"]
+    assert check["status"] == "fail"
+    assert "project-level custom prompt directories are retired" in check["reason"]
+    assert str(prompts_dir) in check["reason"]
+    assert "user prompts directory" in check["reason"]
+    assert prompt_file.read_bytes() == original
 
 
 def test_credential_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -249,7 +328,7 @@ def test_untrusted_project_ignored(
 async def test_model_resolution_failure_does_not_hide_mcp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config, checks = await doctor._load_config()
+    config, manager, checks = await doctor._load_config()
     broken = config.model_copy(
         update={
             "active_model": "does-not-exist",
@@ -259,7 +338,7 @@ async def test_model_resolution_failure_does_not_hide_mcp(
         }
     )
     monkeypatch.setattr(
-        doctor, "_load_config", AsyncMock(return_value=(broken, checks))
+        doctor, "_load_config", AsyncMock(return_value=(broken, manager, checks))
     )
     results = await doctor._diagnose(argparse.Namespace(smoke=False, live=False))
     assert any(c.name == "active model" and c.status == "fail" for c in results)
@@ -422,7 +501,7 @@ def test_smoke_results(
 
 @pytest.mark.asyncio
 async def test_ambiguous_model_lists_candidates() -> None:
-    config, _ = await doctor._load_config()
+    config, _, _ = await doctor._load_config()
     base, definition = next(iter(SHIPPED_CATALOG.models.items()))
     catalog = _ambiguous_catalog(base, definition)
     config.attach_catalog_snapshot(CatalogSnapshot(catalog, "test"))
@@ -434,7 +513,7 @@ async def test_ambiguous_model_lists_candidates() -> None:
 async def test_live_failure_isolated_and_unused_shipped_providers_ignored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config, checks = await doctor._load_config()
+    config, manager, checks = await doctor._load_config()
     active = config.get_active_model().provider
     other = "other"
     catalog = config.catalog_snapshot.catalog.model_copy(
@@ -461,7 +540,7 @@ async def test_live_failure_isolated_and_unused_shipped_providers_ignored(
         }
     )
     monkeypatch.setattr(
-        doctor, "_load_config", AsyncMock(return_value=(config, checks))
+        doctor, "_load_config", AsyncMock(return_value=(config, manager, checks))
     )
     listing = AsyncMock(
         side_effect=[RuntimeError("secret"), doctor.Check("other", "pass", "listed")]
@@ -558,12 +637,12 @@ def test_ambiguous_cli_exits_two_with_candidates(
 ) -> None:
     import asyncio
 
-    config, checks = asyncio.run(doctor._load_config())
+    config, manager, checks = asyncio.run(doctor._load_config())
     base, definition = next(iter(config.catalog_snapshot.catalog.models.items()))
     catalog = _ambiguous_catalog(base, definition)
     config.attach_catalog_snapshot(replace(config.catalog_snapshot, catalog=catalog))
     monkeypatch.setattr(
-        doctor, "_load_config", AsyncMock(return_value=(config, checks))
+        doctor, "_load_config", AsyncMock(return_value=(config, manager, checks))
     )
     with pytest.raises(SystemExit) as exc:
         doctor.run_doctor_cli(["--smoke", "--model", base])
@@ -586,7 +665,7 @@ async def test_trust_store_load_is_read_only(
     if contents is not None:
         path.write_text(contents)
     monkeypatch.setattr(type(TRUSTED_FOLDERS_FILE), "path", property(lambda _: path))
-    _, checks = await doctor._load_config()
+    _, _, checks = await doctor._load_config()
     assert any(c.name == "trust store" and c.status == "unverified" for c in checks)
     if contents is None:
         assert not path.exists()
@@ -643,12 +722,12 @@ async def test_listing_unsupported_uses_structured_attribute(
 async def test_smoke_uses_configured_system_trust(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config, checks = await doctor._load_config()
+    config, manager, checks = await doctor._load_config()
     config = config.model_copy(update={"enable_system_trust_store": True})
     base, definition = next(iter(config.catalog_snapshot.catalog.models.items()))
     deployment = definition.deployments[0]
     monkeypatch.setattr(
-        doctor, "_load_config", AsyncMock(return_value=(config, checks))
+        doctor, "_load_config", AsyncMock(return_value=(config, manager, checks))
     )
     probe = AsyncMock(
         return_value=ProviderSmokeResult(
@@ -673,7 +752,7 @@ async def test_smoke_uses_configured_system_trust(
 def test_bare_validates_runtime_provider_config(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], invalid: bool
 ) -> None:
-    config, checks = asyncio.run(doctor._load_config())
+    config, manager, checks = asyncio.run(doctor._load_config())
     if invalid:
         snapshot = config.catalog_snapshot
         provider = config.get_active_model().provider
@@ -691,7 +770,7 @@ def test_bare_validates_runtime_provider_config(
         with pytest.raises(ValueError):
             config.get_active_provider()
     monkeypatch.setattr(
-        doctor, "_load_config", AsyncMock(return_value=(config, checks))
+        doctor, "_load_config", AsyncMock(return_value=(config, manager, checks))
     )
     code, result = invoke(capsys)
     assert code == int(invalid)

@@ -50,7 +50,7 @@ async def test_factory_copy_and_equal_assertion_have_distinct_owners(
     loops: list[AgentLoop] = []
     try:
         factory = AgentRuntimeFactory()
-        child = await factory.create_child(parent, "worker")
+        child = await factory.create_child(parent, "coder")
         loops.append(child)
         await child.wait_until_ready()
         parent_source = source(parent)
@@ -72,7 +72,7 @@ async def test_factory_copy_and_equal_assertion_have_distinct_owners(
             assert child_identity is not None
             assert child_identity.owner == child.config_orchestrator.policy_owner
         child_source = source(child)
-        grandchild = await factory.create_child(child, "worker")
+        grandchild = await factory.create_child(child, "coder")
         loops.append(grandchild)
         await grandchild.wait_until_ready()
         assert source(grandchild).identity == child_source.identity
@@ -119,7 +119,7 @@ async def test_preview_and_staging_do_not_claim_live_copied_sources(
     )
     child = None
     try:
-        child = await AgentRuntimeFactory().create_child(parent, "worker")
+        child = await AgentRuntimeFactory().create_child(parent, "coder")
         await child.wait_until_ready()
         orchestrator = child.config_orchestrator
         before = orchestrator.restrictions

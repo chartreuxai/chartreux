@@ -11,7 +11,6 @@ from typing import IO, Any
 
 import pytest
 
-from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session.session_loader import SessionLoader
@@ -19,7 +18,6 @@ from chartreux.core.session.session_logger import SessionLogger
 from chartreux.core.session_types import AgentStats
 from chartreux.core.tools.manager import ToolManager
 from tests.session.persistence._session_persistence_support import (
-    mock_agent_profile as mock_agent_profile,
     mock_tool_manager as mock_tool_manager,
     mock_vibe_config as mock_vibe_config,
     session_config as session_config,
@@ -34,7 +32,6 @@ class TestTranscriptCursor:
         messages: list[LLMMessage],
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
         *,
         allow_empty: bool = False,
     ) -> None:
@@ -43,7 +40,6 @@ class TestTranscriptCursor:
             AgentStats(steps=1),
             mock_vibe_config,
             mock_tool_manager,
-            mock_agent_profile,
             allow_empty=allow_empty,
         )
 
@@ -53,7 +49,6 @@ class TestTranscriptCursor:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         logger = SessionLogger(session_config, "cursor-invalidation-race")
@@ -81,13 +76,7 @@ class TestTranscriptCursor:
         )
 
         save_task = asyncio.create_task(
-            self._save(
-                logger,
-                messages,
-                mock_vibe_config,
-                mock_tool_manager,
-                mock_agent_profile,
-            )
+            self._save(logger, messages, mock_vibe_config, mock_tool_manager)
         )
         if not await asyncio.to_thread(started.wait, 5):
             release.set()
@@ -104,7 +93,6 @@ class TestTranscriptCursor:
             [*messages, LLMMessage(role=Role.assistant, content="next")],
             mock_vibe_config,
             mock_tool_manager,
-            mock_agent_profile,
         )
 
         assert len(reads) == 2
@@ -116,7 +104,6 @@ class TestTranscriptCursor:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         logger = SessionLogger(session_config, "cursor-tail")
@@ -179,17 +166,11 @@ class TestTranscriptCursor:
         )
 
         messages = [LLMMessage(role=Role.user, content="one")]
-        await self._save(
-            logger, messages, mock_vibe_config, mock_tool_manager, mock_agent_profile
-        )
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
         messages.append(LLMMessage(role=Role.assistant, content="two"))
-        await self._save(
-            logger, messages, mock_vibe_config, mock_tool_manager, mock_agent_profile
-        )
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
         messages.append(LLMMessage(role=Role.user, content="three"))
-        await self._save(
-            logger, messages, mock_vibe_config, mock_tool_manager, mock_agent_profile
-        )
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
 
         assert append_sizes == [1, 1]
         assert len(overwrite_calls) == 1
@@ -202,15 +183,12 @@ class TestTranscriptCursor:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         logger = SessionLogger(session_config, "cursor-interior-insert")
         repeated = LLMMessage(role=Role.user, content="C")
         messages = [LLMMessage(role=Role.user, content="A"), repeated, repeated]
-        await self._save(
-            logger, messages, mock_vibe_config, mock_tool_manager, mock_agent_profile
-        )
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
         cursor = logger._transcript_cursor
         assert cursor is not None
         assert cursor.count == 3
@@ -247,9 +225,7 @@ class TestTranscriptCursor:
         )
         logger.invalidate_transcript_cursor()
 
-        await self._save(
-            logger, messages, mock_vibe_config, mock_tool_manager, mock_agent_profile
-        )
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
 
         expected = [
             message.model_dump(exclude_none=True, mode="json") for message in messages
@@ -269,21 +245,16 @@ class TestTranscriptCursor:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         logger = SessionLogger(session_config, "cursor-external-append")
         messages = [LLMMessage(role=Role.user, content="kept")]
-        await self._save(
-            logger, messages, mock_vibe_config, mock_tool_manager, mock_agent_profile
-        )
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
         assert logger.session_dir is not None
         SessionLogger._persist_messages_sync(
             [{"role": "user", "content": "external"}], logger.session_dir
         )
 
-        await self._save(
-            logger, messages, mock_vibe_config, mock_tool_manager, mock_agent_profile
-        )
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
 
         records = [
             json.loads(line)
@@ -297,7 +268,6 @@ class TestTranscriptCursor:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
@@ -309,9 +279,7 @@ class TestTranscriptCursor:
             LLMMessage(role=Role.assistant, content="middle"),
             LLMMessage(role=Role.user, content="last"),
         ]
-        await self._save(
-            logger, messages, mock_vibe_config, mock_tool_manager, mock_agent_profile
-        )
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
         assert logger.session_dir is not None
         messages_path = logger.session_dir / "messages.jsonl"
         original_size = messages_path.stat().st_size
@@ -319,9 +287,7 @@ class TestTranscriptCursor:
         messages_path.write_text(changed)
         assert messages_path.stat().st_size == original_size
 
-        await self._save(
-            logger, messages, mock_vibe_config, mock_tool_manager, mock_agent_profile
-        )
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
 
         records = [json.loads(line) for line in messages_path.read_text().splitlines()]
         assert [record["content"] for record in records] == ["first", "middle", "last"]
@@ -332,7 +298,6 @@ class TestTranscriptCursor:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         logger = SessionLogger(session_config, "cursor-boundary-edit")
@@ -351,20 +316,10 @@ class TestTranscriptCursor:
             LLMMessage(role=Role.assistant, content="middle"),
             LLMMessage(role=Role.user, content="last"),
         ]
-        await self._save(
-            logger, messages, mock_vibe_config, mock_tool_manager, mock_agent_profile
-        )
-        await self._save(
-            logger,
-            messages[:2],
-            mock_vibe_config,
-            mock_tool_manager,
-            mock_agent_profile,
-        )
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
+        await self._save(logger, messages[:2], mock_vibe_config, mock_tool_manager)
         edited = [messages[0], LLMMessage(role=Role.assistant, content="edited")]
-        await self._save(
-            logger, edited, mock_vibe_config, mock_tool_manager, mock_agent_profile
-        )
+        await self._save(logger, edited, mock_vibe_config, mock_tool_manager)
 
         assert len(overwrite_calls) == 3
         assert logger.session_dir is not None
@@ -380,14 +335,11 @@ class TestTranscriptCursor:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         logger = SessionLogger(session_config, "cursor-metadata-failure")
         messages = [LLMMessage(role=Role.user, content="first")]
-        await self._save(
-            logger, messages, mock_vibe_config, mock_tool_manager, mock_agent_profile
-        )
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
         prior_cursor = logger._transcript_cursor
         messages.append(LLMMessage(role=Role.assistant, content="second"))
         original_persist_metadata = SessionLogger._persist_metadata_sync
@@ -404,18 +356,10 @@ class TestTranscriptCursor:
             SessionLogger, "_persist_metadata_sync", staticmethod(fail_once)
         )
         with pytest.raises(RuntimeError, match="injected metadata failure"):
-            await self._save(
-                logger,
-                messages,
-                mock_vibe_config,
-                mock_tool_manager,
-                mock_agent_profile,
-            )
+            await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
         assert logger._transcript_cursor == prior_cursor
 
-        await self._save(
-            logger, messages, mock_vibe_config, mock_tool_manager, mock_agent_profile
-        )
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
 
         assert logger.session_dir is not None
         records = [
@@ -432,17 +376,10 @@ class TestTranscriptCursor:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         logger = SessionLogger(session_config, "cursor-reset")
         old_messages = [LLMMessage(role=Role.user, content="old session")]
-        await self._save(
-            logger,
-            old_messages,
-            mock_vibe_config,
-            mock_tool_manager,
-            mock_agent_profile,
-        )
+        await self._save(logger, old_messages, mock_vibe_config, mock_tool_manager)
         old_session_dir = logger.session_dir
         assert old_session_dir is not None
         old_path = old_session_dir / "messages.jsonl"
@@ -451,26 +388,14 @@ class TestTranscriptCursor:
         logger.reset_session("new-session-id")
         assert logger._transcript_cursor is None
         new_messages = [LLMMessage(role=Role.user, content="new session")]
-        await self._save(
-            logger,
-            new_messages,
-            mock_vibe_config,
-            mock_tool_manager,
-            mock_agent_profile,
-        )
+        await self._save(logger, new_messages, mock_vibe_config, mock_tool_manager)
         assert logger.session_dir != old_session_dir
         assert old_path.read_text() == old_content
 
         resumed_metadata = SessionLoader.load_metadata(old_session_dir)
         logger.apply_resumed_session("cursor-reset", old_session_dir, resumed_metadata)
         assert logger._transcript_cursor is None
-        await self._save(
-            logger,
-            old_messages,
-            mock_vibe_config,
-            mock_tool_manager,
-            mock_agent_profile,
-        )
+        await self._save(logger, old_messages, mock_vibe_config, mock_tool_manager)
         assert old_path.read_text() == old_content
 
     @pytest.mark.asyncio
@@ -479,18 +404,11 @@ class TestTranscriptCursor:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         original_logger = SessionLogger(session_config, "cursor-resume")
         messages = [LLMMessage(role=Role.user, content="persisted")]
-        await self._save(
-            original_logger,
-            messages,
-            mock_vibe_config,
-            mock_tool_manager,
-            mock_agent_profile,
-        )
+        await self._save(original_logger, messages, mock_vibe_config, mock_tool_manager)
         assert original_logger.session_dir is not None
         resumed_logger = SessionLogger(
             session_config, "cursor-resume", session_dir=original_logger.session_dir
@@ -505,22 +423,10 @@ class TestTranscriptCursor:
         monkeypatch.setattr(
             SessionLogger, "_read_persisted_messages", staticmethod(read)
         )
-        await self._save(
-            resumed_logger,
-            messages,
-            mock_vibe_config,
-            mock_tool_manager,
-            mock_agent_profile,
-        )
+        await self._save(resumed_logger, messages, mock_vibe_config, mock_tool_manager)
         assert len(reads) == 1
         messages.append(LLMMessage(role=Role.assistant, content="incremental"))
-        await self._save(
-            resumed_logger,
-            messages,
-            mock_vibe_config,
-            mock_tool_manager,
-            mock_agent_profile,
-        )
+        await self._save(resumed_logger, messages, mock_vibe_config, mock_tool_manager)
 
         assert len(reads) == 1
         assert resumed_logger.session_dir is not None

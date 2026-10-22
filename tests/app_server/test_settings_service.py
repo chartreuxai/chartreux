@@ -12,7 +12,11 @@ from chartreux.app_server.protocol import (
     SettingLeafWire,
     SettingsReadResponse,
 )
-from chartreux.core.config.settings_catalog import VISIBLE_SETTINGS
+from chartreux.core.config.settings_catalog import (
+    TASK_DENYLIST_SETTING,
+    TASK_IDENTITY_DENYLIST_PATH,
+    VISIBLE_SETTINGS,
+)
 from chartreux.ui.settings_service import SettingsService
 
 
@@ -246,6 +250,35 @@ async def test_inventory_batch_writes_both_backing_leaves_in_one_revision() -> N
         await service.save({"session_logging.enabled": False}, "old")
     ).error == "view_only"
     config.write.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_identity_denylist_save_uses_backing_descriptor() -> None:
+    config = AsyncMock()
+    before, after = snapshot(), snapshot()
+    for snap in (before, after):
+        snap.backing_settings[TASK_IDENTITY_DENYLIST_PATH] = (
+            SettingDescriptorWire.model_validate(asdict(TASK_DENYLIST_SETTING))
+        )
+    config.read_settings.side_effect = [before, after]
+    config.write.return_value.persistence = "saved"
+    config.write.return_value.application = "applied"
+    service = SettingsService(cast(ConfigResource, config))
+    outcome = await service.save(
+        {TASK_IDENTITY_DENYLIST_PATH: ["coder", "re:^rev*"]}, "one"
+    )
+    assert outcome.persistence == "saved"
+    ops = config.write.await_args.args[0]
+    assert len(ops) == 1
+    assert ops[0].path == "/tools/task/denylist"
+    assert ops[0].value == ["coder", "re:^rev*"]
+    with pytest.raises(ValueError, match="Unknown settings leaf"):
+        await SettingsService(
+            cast(
+                ConfigResource,
+                AsyncMock(read_settings=AsyncMock(return_value=snapshot())),
+            )
+        ).save({TASK_IDENTITY_DENYLIST_PATH: ["coder"]}, "one")
 
 
 @pytest.mark.asyncio

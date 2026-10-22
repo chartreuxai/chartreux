@@ -50,8 +50,7 @@ async def test_compact_presets_and_forward_actions_fit_without_scrolling(size) -
         await pilot.pause()
         rows = screen.query_one("#wb-presets", OptionList)
         ids = [str(option.id) for option in rows.options]
-        assert len(ids) == 10
-        assert {"mode:standalone", "mode:orchestrated", "next-session"} <= set(ids)
+        assert len(ids) == 7
         assert all(f"preset:{role}" in ids for role in catalog["roles"])
         actions = screen.query_one("#wb-presets-actions", OptionList)
         assert [option.id for option in actions.options] == ["finish", "add-another"]

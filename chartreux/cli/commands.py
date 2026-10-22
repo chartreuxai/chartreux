@@ -57,7 +57,10 @@ class CommandRegistry:
             ),
             "reload": Command(
                 aliases=frozenset(["/reload"]),
-                description="Reload configuration, agent instructions, and skills from disk",
+                description=(
+                    "Refresh AGENTS.md, skills, and catalogs; frozen policy "
+                    "stays bound, edits reported as pending"
+                ),
                 handler="_reload_config",
             ),
             "open-config-file": Command(

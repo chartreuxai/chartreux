@@ -81,10 +81,10 @@ async def test_detail_view_contains_selected_description_and_can_scroll() -> Non
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
-        await pilot.press(*"agent_paths", "enter", "f1")
+        await pilot.press(*"skill_paths", "enter", "f1")
         detail = screen.query_one("#settings-help", NoMarkupStatic)
         assert detail.has_focus and detail.can_focus
-        assert "Empty uses built-in agent locations" in str(detail.content)
+        assert "Empty uses built-in skill locations" in str(detail.content)
         await pilot.press("down", "escape")
         assert screen.query_one("#settings-entries").has_focus
 
@@ -115,7 +115,7 @@ async def test_checklist_action_rows_have_no_membership_and_hints_follow_cursor(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["agent_paths", "inventory_tools"])
+@pytest.mark.parametrize("path", ["skill_paths", "inventory_tools"])
 async def test_wp4_pointer_add_help_delete_reset_and_back(path: str) -> None:
     service = FakeService()
     async with Harness(service).run_test(size=(80, 24)) as pilot:

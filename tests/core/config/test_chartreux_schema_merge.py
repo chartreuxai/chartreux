@@ -34,7 +34,7 @@ async def test_sparse_nested_config_documents_merge_keys_and_replace_lists(
     lower = tmp_path / "lower.toml"
     lower.write_text(
         """
-enabled_agents = ["lower-a", "lower-b"]
+allowed_models = ["lower-a", "lower-b"]
 
 [project_context]
 default_commit_count = 9
@@ -51,7 +51,7 @@ idle_ttl_seconds = 90
     higher = tmp_path / "higher.toml"
     higher.write_text(
         """
-enabled_agents = ["higher"]
+allowed_models = ["higher"]
 
 [project_context]
 timeout_seconds = 0
@@ -79,4 +79,4 @@ max_idle_agents = 0
     assert config.session_logging.enabled is False
     assert config.subagents.idle_ttl_seconds == 90
     assert config.subagents.max_idle_agents == 0
-    assert config.enabled_agents == ["higher"]
+    assert config.allowed_models == ["higher"]

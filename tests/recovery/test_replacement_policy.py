@@ -32,6 +32,7 @@ from typing import Any, cast, get_args
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
+from pydantic import ValidationError
 import pytest
 
 from chartreux.app_server._sessions import (
@@ -42,10 +43,16 @@ from chartreux.app_server._sessions import (
 from chartreux.app_server._subagent_results import ResultsStateView, RunResults
 from chartreux.core.agent_loop.errors import EmptyLLMResponseError
 from chartreux.core.agents.manager import AgentManager
+from chartreux.core.config.chartreux_schema import OrchestrationConfig
 from chartreux.core.config.models import RecoveryConfig, RecoverySectionConfig
 from chartreux.core.deferred_questions import DeferredQuestionStore
-from chartreux.core.dispatch.presets import ORCHESTRATED_PRESET
-from chartreux.core.dispatch.session import bind_snapshot_policy
+from chartreux.core.dispatch.route_models import (
+    PackageTier as RoutePackageTier,
+    PurposeRoute,
+    ReplacementCapability,
+    RouteTarget,
+)
+from chartreux.core.dispatch.routes import SESSION_MODEL, shipped_routes
 from chartreux.core.llm.exceptions import (
     BackendError,
     IncompleteStreamError,
@@ -73,13 +80,18 @@ from chartreux.core.recovery_policy import (
     candidates_from_catalog,
     eligible_replacement_candidates,
     is_infrastructure_failure,
-    mechanical_base_models_from_policy,
+    mechanical_base_models_from_routes,
     parked_decision,
+    route_recovery_facts,
     validate_replacement_selection,
 )
 from chartreux.core.subagents import LaunchConfig, ResumeOutcome, TaskArgs, TaskResult
 from chartreux.core.tools.base import BaseToolState, InvokeContext, ToolError
-from chartreux.core.tools.builtins.task import Task, TaskToolConfig
+from chartreux.core.tools.builtins.task import (
+    Task,
+    TaskToolConfig,
+    _validate_replacement_claim_args,
+)
 from chartreux.questions import (
     QuestionKind,
     UnansweredQuestion,
@@ -349,6 +361,292 @@ def test_luna_rejected_for_substantive_packages() -> None:
         config=RecoveryConfig(),
     )
     assert decision.disposition == "selected"
+
+
+# ---------------------------------------------------------------------------
+# Package 8: the replacement-capability axis is SEPARATE from the package
+# tier (interfaces.md settled decision; identity_launch resolution)
+# ---------------------------------------------------------------------------
+
+
+def _capability_candidate(
+    base_model: str,
+    provider: str,
+    endpoint: str | None,
+    *,
+    tier: PackageTier = PackageTier.SUBSTANTIVE,
+    capability: ReplacementCapability | None = None,
+    wire: str | None = None,
+    price: float | None = None,
+) -> ReplacementCandidate:
+    return ReplacementCandidate(
+        base_model=base_model,
+        provider=provider,
+        wire_name=wire or f"{base_model}-wire",
+        endpoint=endpoint,
+        tier=tier,
+        capability=capability,
+        output_price_per_million=price,
+    )
+
+
+def test_capability_is_a_separate_axis_from_the_package_tier() -> None:
+    """A substantive-tier-LABELED candidate explicitly marked
+    mechanical-capable is rejected for a substantive package: eligibility is
+    the intrinsic model-level capability, evaluated separately from the
+    package tier — the tier label alone never confers eligibility.
+    """
+    envelope = _envelope()
+    marked = _capability_candidate(
+        "alt-model",
+        "gamma",
+        "https://gamma.test/v1",
+        tier=PackageTier.SUBSTANTIVE,
+        capability=ReplacementCapability.MECHANICAL,
+        price=5.0,
+    )
+    decision = validate_replacement_selection(
+        envelope=envelope,
+        package_tier=PackageTier.SUBSTANTIVE,
+        claimed=marked,
+        candidates=[marked],
+        config=RecoveryConfig(),
+    )
+    assert decision.disposition == "rejected"
+    assert "candidate_capability_below_package_tier" in decision.reason_codes
+
+    # The package tier remains a separate constraint: a mechanical-tier-
+    # labeled candidate is rejected for a substantive package even when
+    # marked substantive-capable.
+    labeled = _capability_candidate(
+        "luna-model",
+        "alpha",
+        "https://alpha.test/v1",
+        tier=PackageTier.MECHANICAL,
+        capability=ReplacementCapability.SUBSTANTIVE,
+        price=0.5,
+    )
+    decision = validate_replacement_selection(
+        envelope=envelope,
+        package_tier=PackageTier.SUBSTANTIVE,
+        claimed=labeled,
+        candidates=[labeled],
+        config=RecoveryConfig(),
+    )
+    assert decision.disposition == "rejected"
+    assert "mechanical_tier_rejected_for_substantive_package" in decision.reason_codes
+
+
+def test_unmarked_candidate_is_not_execution_capable() -> None:
+    """Eligibility requires an explicit model-level capability marking."""
+    envelope = _envelope()
+    unmarked = _capability_candidate(
+        "alt-model",
+        "gamma",
+        "https://gamma.test/v1",
+        tier=PackageTier.SUBSTANTIVE,
+        capability=ReplacementCapability.NONE,
+        price=5.0,
+    )
+    decision = validate_replacement_selection(
+        envelope=envelope,
+        package_tier=PackageTier.MECHANICAL,
+        claimed=unmarked,
+        candidates=[unmarked],
+        config=RecoveryConfig(),
+    )
+    assert decision.disposition == "rejected"
+    assert "candidate_capability_not_execution_marked" in decision.reason_codes
+
+    decision = validate_replacement_selection(
+        envelope=envelope,
+        package_tier=PackageTier.SUBSTANTIVE,
+        claimed=unmarked,
+        candidates=[unmarked],
+        config=RecoveryConfig(),
+    )
+    assert decision.disposition == "rejected"
+    assert "candidate_capability_below_package_tier" in decision.reason_codes
+
+
+def test_capabilities_mapping_marks_one_canonical_capability_per_model() -> None:
+    """The capability marking is model-keyed: a model bound on both mechanical
+    and substantive route targets carries ONE canonical capability, and route
+    duplication never upgrades a model.
+    """
+    candidates = candidates_from_catalog(
+        SHIPPED_CATALOG,
+        mechanical_base_models=frozenset({"glm-5-3"}),
+        capabilities={
+            "glm-5-3": ReplacementCapability.SUBSTANTIVE,
+            "mistral-large-4": ReplacementCapability.MECHANICAL,
+        },
+    )
+    by_model = {candidate.base_model: candidate for candidate in candidates}
+    # glm-5-3 keeps its mechanical tier LABEL but carries the marked
+    # capability: one canonical capability, not two target-derived identities.
+    assert by_model["glm-5-3"].tier is PackageTier.MECHANICAL
+    assert by_model["glm-5-3"].capability is ReplacementCapability.SUBSTANTIVE
+    assert by_model["glm-5-3"].effective_capability is ReplacementCapability.SUBSTANTIVE
+    # mistral-large-4 is marked mechanical-capable: not eligible for a
+    # substantive package even though its tier label is substantive.
+    assert by_model["mistral-large-4"].tier is PackageTier.SUBSTANTIVE
+    assert (
+        by_model["mistral-large-4"].effective_capability
+        is ReplacementCapability.MECHANICAL
+    )
+    envelope = _envelope(endpoint="https://beta.test/v1")
+    # For a substantive package BOTH are rejected — each on its own axis:
+    # glm-5-3 on the tier label, mistral-large-4 on the capability marking.
+    assert (
+        eligible_replacement_candidates(
+            envelope=envelope,
+            package_tier=PackageTier.SUBSTANTIVE,
+            candidates=candidates,
+            config=RecoveryConfig(),
+        )
+        == []
+    )
+    # For a mechanical package both are eligible (execution-capable markings,
+    # endpoint-independent of the failed call).
+    mechanical_eligible = eligible_replacement_candidates(
+        envelope=envelope,
+        package_tier=PackageTier.MECHANICAL,
+        candidates=candidates,
+        config=RecoveryConfig(),
+    )
+    assert {candidate.base_model for candidate in mechanical_eligible} == {
+        "glm-5-3",
+        "mistral-large-4",
+    }
+    # A model absent from the marking map is marked NONE (an explicit marking
+    # is required): it is not execution-capable for either tier.
+    unmarked = candidates_from_catalog(
+        SHIPPED_CATALOG, capabilities={"glm-5-3": ReplacementCapability.SUBSTANTIVE}
+    )
+    by_unmarked = {candidate.base_model: candidate for candidate in unmarked}
+    assert by_unmarked["mistral-large-4"].capability is ReplacementCapability.NONE
+    assert (
+        by_unmarked["mistral-large-4"].effective_capability
+        is ReplacementCapability.NONE
+    )
+
+
+def test_legacy_tier_label_derivation_is_unchanged_without_markings() -> None:
+    """Without a capabilities mapping the capability derives from the tier
+    label (the legacy slot-purpose inference path): existing behavior —
+    budgets, endpoint independence, and the tier guard — is unchanged.
+    """
+    candidates = candidates_from_catalog(
+        SHIPPED_CATALOG, mechanical_base_models=frozenset({"glm-5-3"})
+    )
+    by_model = {candidate.base_model: candidate for candidate in candidates}
+    assert by_model["glm-5-3"].capability is None
+    assert by_model["glm-5-3"].effective_capability is ReplacementCapability.MECHANICAL
+    assert by_model["mistral-large-4"].capability is None
+    assert (
+        by_model["mistral-large-4"].effective_capability
+        is ReplacementCapability.SUBSTANTIVE
+    )
+    envelope = _envelope()
+    decision = validate_replacement_selection(
+        envelope=envelope,
+        package_tier=PackageTier.SUBSTANTIVE,
+        claimed=by_model["glm-5-3"],
+        candidates=candidates,
+        config=RecoveryConfig(),
+    )
+    assert decision.disposition == "rejected"
+    assert "mechanical_tier_rejected_for_substantive_package" in decision.reason_codes
+    decision = validate_replacement_selection(
+        envelope=envelope,
+        package_tier=PackageTier.MECHANICAL,
+        claimed=by_model["glm-5-3"],
+        candidates=candidates,
+        config=RecoveryConfig(),
+    )
+    assert decision.disposition == "selected"
+
+
+def test_route_recovery_facts_canonicalize_presets_and_markings() -> None:
+    """The recovery facts canonicalize preset references through the
+    catalog mapping and carry the explicit capability markings keyed by
+    canonical base model; targets without a marking contribute no marking
+    (with no marking anywhere the legacy tier-label derivation applies).
+    """
+    routes = {
+        "mechanical-edit": PurposeRoute(
+            targets=(
+                RouteTarget(
+                    model="@scout", identity="coder", tier=RoutePackageTier.MECHANICAL
+                ),
+            )
+        ),
+        "session-bound": PurposeRoute(
+            targets=(
+                RouteTarget(
+                    model=SESSION_MODEL,
+                    identity="coder",
+                    tier=RoutePackageTier.MECHANICAL,
+                ),
+            )
+        ),
+        "heavy-work": PurposeRoute(
+            targets=(
+                RouteTarget(
+                    model="alt-model",
+                    identity="coder",
+                    tier=RoutePackageTier.SUBSTANTIVE,
+                    replacement_capability=ReplacementCapability.MECHANICAL,
+                ),
+            )
+        ),
+    }
+    mechanical, capabilities = route_recovery_facts(
+        routes,
+        session_model="main-model",
+        canonical_models={
+            "luna-model": "luna-model",
+            "main-model": "main-model",
+            "alt-model": "alt-model",
+            "@scout": "luna-model",
+            "@main": "main-model",
+        },
+    )
+    # The preset reference and the $session binding both canonicalize to
+    # their base models; the explicit marking is keyed by canonical base.
+    assert mechanical == frozenset({"luna-model", "main-model"})
+    assert capabilities == {"alt-model": ReplacementCapability.MECHANICAL}
+    # No explicit marking anywhere: no markings are reported (the legacy
+    # tier-label derivation applies unchanged).
+    assert route_recovery_facts(
+        _MECHANICAL_LUNA_ROUTES.routes,
+        session_model="main-model",
+        canonical_models={"luna-model": "luna-model", "main-model": "main-model"},
+    ) == (frozenset({"luna-model"}), {})
+
+
+def test_capability_marking_never_overrides_endpoint_independence() -> None:
+    """The capability axis composes with — never replaces — the endpoint-
+    independence and budget checks.
+    """
+    envelope = _envelope(endpoint="https://beta.test/v1")
+    same_endpoint = _capability_candidate(
+        "alt-model",
+        "beta",
+        "https://beta.test/v1",
+        tier=PackageTier.SUBSTANTIVE,
+        capability=ReplacementCapability.SUBSTANTIVE,
+    )
+    decision = validate_replacement_selection(
+        envelope=envelope,
+        package_tier=PackageTier.SUBSTANTIVE,
+        claimed=same_endpoint,
+        candidates=[same_endpoint],
+        config=RecoveryConfig(),
+    )
+    assert decision.disposition == "rejected"
+    assert "same_endpoint_substitution_rejected" in decision.reason_codes
 
 
 def test_every_substitution_emits_a_milestone_notice_with_honest_cost() -> None:
@@ -638,7 +936,7 @@ async def test_task_tool_claim_shape_guards(
             task.run(
                 TaskArgs(
                     task="work",
-                    agent_type="worker",
+                    identity="coder",
                     background=True,
                     agent_id="agent-1",
                     config=LaunchConfig(
@@ -655,7 +953,7 @@ async def test_task_tool_claim_shape_guards(
             task.run(
                 TaskArgs(
                     task="work",
-                    agent_type="worker",
+                    identity="coder",
                     background=False,
                     config=LaunchConfig(
                         model="alt-model",
@@ -666,12 +964,12 @@ async def test_task_tool_claim_shape_guards(
                 ctx,
             )
         )
-    with pytest.raises(ToolError, match="requires config.model"):
+    with pytest.raises(ToolError, match="requires the replacement model"):
         await collect_result(
             task.run(
                 TaskArgs(
                     task="work",
-                    agent_type="worker",
+                    identity="coder",
                     background=True,
                     config=LaunchConfig(
                         work_package_id="wp-1", predecessor_agent_id="agent-0"
@@ -685,7 +983,7 @@ async def test_task_tool_claim_shape_guards(
             task.run(
                 TaskArgs(
                     task="work",
-                    agent_type="worker",
+                    identity="coder",
                     background=True,
                     config=LaunchConfig(
                         model="alt-model", predecessor_agent_id="agent-0"
@@ -693,6 +991,32 @@ async def test_task_tool_claim_shape_guards(
                 ),
                 ctx,
             )
+        )
+
+
+def test_task_tool_claim_guard_accepts_the_top_level_model() -> None:
+    """The task tool's claim-shape guard accepts the canonical top-level
+    model field (the legacy nested config.model is the promoted
+    equivalent); a dual supply stays a schema validation error.
+    """
+    _validate_replacement_claim_args(
+        TaskArgs(
+            task="work",
+            model="alt-model",
+            background=True,
+            config=LaunchConfig(work_package_id="wp-1", predecessor_agent_id="agent-0"),
+        )
+    )
+    with pytest.raises(ValidationError, match="supplied both"):
+        TaskArgs(
+            task="work",
+            model="alt-model",
+            background=True,
+            config=LaunchConfig(
+                model="main-model",
+                work_package_id="wp-1",
+                predecessor_agent_id="agent-0",
+            ),
         )
 
 
@@ -745,7 +1069,7 @@ def _replacement_catalog() -> ModelCatalog:
             },
         },
         "roles": {
-            "orchestrator": {
+            "main": {
                 "model": "main-model",
                 "thinking": "medium",
                 "description": "main assistant preset",
@@ -769,21 +1093,97 @@ def _replacement_catalog() -> ModelCatalog:
     })
 
 
-def _replacement_config(recovery: RecoveryConfig):
+def _replacement_config(
+    recovery: RecoveryConfig, routes: OrchestrationConfig | None = None
+):
     config = _config(enabled_tools=["task", "todo"])
-    config = config.model_copy(
-        update={
-            "recovery": RecoverySectionConfig(subagents=recovery),
-            "subagents": config.subagents.model_copy(
-                update={"idle_ttl_seconds": 0, "max_idle_agents": 0}
-            ),
-        }
-    )
+    update: dict[str, Any] = {
+        "recovery": RecoverySectionConfig(subagents=recovery),
+        "subagents": config.subagents.model_copy(
+            update={"idle_ttl_seconds": 0, "max_idle_agents": 0}
+        ),
+    }
+    if routes is not None:
+        update["orchestration"] = routes
+    config = config.model_copy(update=update)
     return config.attach_catalog_snapshot(
-        CatalogSnapshot(
-            _replacement_catalog(), "wp5-test", dispatch=ORCHESTRATED_PRESET
-        )
+        CatalogSnapshot(_replacement_catalog(), "wp5-test")
     )
+
+
+# A mechanical-tier purpose route binding the luna-class model explicitly:
+# under the successor semantics the mechanical set is the set of models the
+# configured mechanical-tier routes bind, not a slot roster.
+_MECHANICAL_LUNA_ROUTES = OrchestrationConfig(
+    routes={
+        "mechanical-edit": PurposeRoute(
+            targets=(
+                RouteTarget(
+                    model="luna-model",
+                    identity="coder",
+                    tier=RoutePackageTier.MECHANICAL,
+                ),
+            )
+        )
+    }
+)
+
+# Two mechanical-tier routes on distinct endpoints: the package launches
+# through "mechanical-edit" (luna-model@alpha) and the claim names the
+# mechanical "search" model (alt-model@gamma) — endpoint-independent.
+_TIER_ROUTES = OrchestrationConfig(
+    routes={
+        "mechanical-edit": PurposeRoute(
+            targets=(
+                RouteTarget(
+                    model="luna-model",
+                    identity="coder",
+                    tier=RoutePackageTier.MECHANICAL,
+                ),
+            )
+        ),
+        "search": PurposeRoute(
+            targets=(
+                RouteTarget(
+                    model="alt-model",
+                    identity="researcher",
+                    tier=RoutePackageTier.MECHANICAL,
+                ),
+            )
+        ),
+    }
+)
+
+# A substantive-tier route target explicitly marking alt-model
+# mechanical-CAPABLE at the model level (a separate axis from the tier).
+_CAPABILITY_ROUTES = OrchestrationConfig(
+    routes={
+        "heavy-work": PurposeRoute(
+            targets=(
+                RouteTarget(
+                    model="alt-model",
+                    identity="coder",
+                    tier=RoutePackageTier.SUBSTANTIVE,
+                    replacement_capability=ReplacementCapability.MECHANICAL,
+                ),
+            )
+        )
+    }
+)
+
+# A mechanical-tier route bound via the @scout PRESET: the recovery facts
+# canonicalize the preset reference to its canonical base (luna-model).
+_PRESET_MECHANICAL_ROUTES = OrchestrationConfig(
+    routes={
+        "mechanical-edit": PurposeRoute(
+            targets=(
+                RouteTarget(
+                    model="@scout", identity="coder", tier=RoutePackageTier.MECHANICAL
+                ),
+            )
+        )
+    }
+)
 
 
 class _EndpointTimeout(TimeoutError):
@@ -862,11 +1262,14 @@ class _LoopBackends:
 
 
 async def _replacement_registry(
-    monkeypatch: pytest.MonkeyPatch, recovery: RecoveryConfig, backends: list[Any]
+    monkeypatch: pytest.MonkeyPatch,
+    recovery: RecoveryConfig,
+    backends: list[Any],
+    routes: OrchestrationConfig | None = None,
 ) -> tuple[SessionRuntimeRegistry, Any]:
     _LoopBackends(monkeypatch, backends)
     parent = build_test_agent_loop(
-        config=_replacement_config(recovery), backend=FakeBackend()
+        config=_replacement_config(recovery, routes), backend=FakeBackend()
     )
     registry = SessionRuntimeRegistry(
         AsyncMock(),
@@ -890,15 +1293,18 @@ async def _launch(
     task: str = "package work",
     tool_call_id: str = "launch",
     config: dict[str, Any] | None = None,
+    model: str | None = None,
 ) -> TaskResult:
     arguments: dict[str, Any] = {
         "task": task,
-        "agent_type": "worker",
+        "identity": "coder",
         "background": True,
         "retain": True,
     }
     if config is not None:
         arguments["config"] = config
+    if model is not None:
+        arguments["model"] = model
     return await _background_result(
         registry,
         TaskArgs(**arguments),
@@ -1064,7 +1470,7 @@ class _WriterTokenView:
 def _package_record(agent_id: str, package_id: str | None) -> AgentRecord:
     return AgentRecord(
         agent_id=agent_id,
-        profile="worker",
+        identity="coder",
         session_id=f"session-{agent_id}",
         runtime=cast(Any, MagicMock()),
         root_generation=0,
@@ -1178,13 +1584,14 @@ async def test_claim_rejected_for_luna_on_substantive_package(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A claim naming the mechanical-tier (luna-class) model for a
-    substantive package is rejected; the mechanical set comes from the bound
-    dispatch policy's mechanical slot.
+    substantive package is rejected; the mechanical set comes from the
+    configured purpose routes' mechanical-tier targets.
     """
     registry, parent = await _replacement_registry(
         monkeypatch,
         RecoveryConfig(),
         [_WriteThenFaultBackend(_EndpointTimeout("https://beta.test/v1"))],
+        routes=_MECHANICAL_LUNA_ROUTES,
     )
     try:
         agent_id, _run_id, _failed = await _launch_failed_package(registry, parent)
@@ -1203,6 +1610,259 @@ async def test_claim_rejected_for_luna_on_substantive_package(
             "mechanical_tier_rejected_for_substantive_package"
             in excinfo.value.reason_codes
         )
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_claim_observes_the_launch_resolved_package_tier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The launch-resolved effective tier reaches the recovery boundary: a
+    package launched through a mechanical-tier route is recorded mechanical,
+    so a claim naming no package_tier is judged against the TRUE tier and a
+    mechanical replacement is selectable (before the tier reached the
+    boundary the package defaulted to substantive and the claim was
+    rejected as a mechanical-for-substantive substitution).
+    """
+    registry, parent = await _replacement_registry(
+        monkeypatch,
+        RecoveryConfig(),
+        [
+            _WriteThenFaultBackend(_EndpointTimeout("https://alpha.test/v1")),
+            FakeBackend(mock_llm_chunk(content="replacement done")),
+        ],
+        routes=_TIER_ROUTES,
+    )
+    try:
+        # The package launches through the mechanical-tier route: the child
+        # commits the route's luna-model and the record carries the tier.
+        launch = await _background_result(
+            registry,
+            TaskArgs(
+                task="package work",
+                identity="coder",
+                purpose="mechanical-edit",
+                background=True,
+                retain=True,
+            ),
+            InvokeContext(tool_call_id="launch", session_id=parent.session_id),
+        )
+        assert launch.agent_id is not None and launch.run_id is not None
+        failed = await _wait_result(registry, launch.agent_id, launch.run_id)
+        assert not failed.completed
+        envelope = failed.failure
+        assert envelope is not None
+        assert envelope.deployment.base_model == "luna-model"
+        assert envelope.deployment.endpoint == "alpha.test"
+        assert envelope.recovery.eligibility.value == "eligible"
+        record = registry._agent_records[launch.agent_id]
+        assert record.package_tier is PackageTier.MECHANICAL
+        # A claim naming no package_tier: the boundary reads the record's
+        # launch-resolved tier, so the mechanical alt-model is selectable.
+        ack = await _launch(
+            registry,
+            parent,
+            tool_call_id="claim",
+            config={
+                "model": "alt-model",
+                "work_package_id": "wp-1",
+                "predecessor_agent_id": launch.agent_id,
+            },
+        )
+        assert ack.agent_id is not None and ack.agent_id != launch.agent_id
+        assert ack.replacement is not None
+        assert ack.replacement.disposition == "selected"
+        assert ack.replacement.candidate is not None
+        assert ack.replacement.candidate.base_model == "alt-model"
+        assert ack.replacement.candidate.tier is PackageTier.MECHANICAL
+        assert "package tier mechanical" in ack.response
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_claim_without_a_tier_carries_it_into_the_successor_record_and_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An omitted-tier claim is validated against the predecessor's
+    established tier, and the successor carries that tier end to end: the
+    agent record AND the child loop's launch metadata both observe the
+    package's true tier (before the inheritance the successor was recorded
+    with the direct-launch substantive default, so later lineage checks
+    observed the wrong tier).
+    """
+    registry, parent = await _replacement_registry(
+        monkeypatch,
+        RecoveryConfig(),
+        [
+            _WriteThenFaultBackend(_EndpointTimeout("https://alpha.test/v1")),
+            FakeBackend(mock_llm_chunk(content="replacement done")),
+        ],
+        routes=_TIER_ROUTES,
+    )
+    try:
+        # The mechanical package fails on the alpha endpoint.
+        launch = await _background_result(
+            registry,
+            TaskArgs(
+                task="package work",
+                identity="coder",
+                purpose="mechanical-edit",
+                background=True,
+                retain=True,
+            ),
+            InvokeContext(tool_call_id="launch", session_id=parent.session_id),
+        )
+        assert launch.agent_id is not None and launch.run_id is not None
+        failed = await _wait_result(registry, launch.agent_id, launch.run_id)
+        assert not failed.completed
+        assert (
+            registry._agent_records[launch.agent_id].package_tier
+            is PackageTier.MECHANICAL
+        )
+        # The claim names no package_tier: admission validates it against
+        # the predecessor's established mechanical tier.
+        ack = await _launch(
+            registry,
+            parent,
+            tool_call_id="claim",
+            config={
+                "model": "alt-model",
+                "work_package_id": "wp-1",
+                "predecessor_agent_id": launch.agent_id,
+            },
+        )
+        assert ack.agent_id is not None and ack.agent_id != launch.agent_id
+        assert ack.replacement is not None
+        assert ack.replacement.disposition == "selected"
+        # The successor's record and loop carry that same tier.
+        successor = registry._agent_records[ack.agent_id]
+        assert successor.predecessor_agent_id == launch.agent_id
+        assert successor.package_tier is PackageTier.MECHANICAL
+        assert (
+            successor.runtime.agent_loop.launch_package_tier is PackageTier.MECHANICAL
+        )
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_claim_observes_the_route_replacement_capability_marking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The model-level replacement-capability marking reaches the recovery
+    boundary: a route target explicitly marking alt-model mechanical-capable
+    makes a claim for it on a substantive package fail the capability guard
+    (before the marking reached the boundary the tier label alone decided
+    and the claim was selected).
+    """
+    registry, parent = await _replacement_registry(
+        monkeypatch,
+        RecoveryConfig(),
+        [_WriteThenFaultBackend(_EndpointTimeout("https://beta.test/v1"))],
+        routes=_CAPABILITY_ROUTES,
+    )
+    try:
+        agent_id, _run_id, failed = await _launch_failed_package(registry, parent)
+        assert failed.failure is not None
+        assert failed.failure.deployment.endpoint == "beta.test"
+        record = registry._agent_records[agent_id]
+        assert record.package_tier is PackageTier.SUBSTANTIVE
+        with pytest.raises(ReplacementPolicyError) as excinfo:
+            await _launch(
+                registry,
+                parent,
+                tool_call_id="claim",
+                config=_claim_config(
+                    model="alt-model",
+                    work_package_id="wp-1",
+                    predecessor_agent_id=agent_id,
+                ),
+            )
+        assert "candidate_capability_below_package_tier" in excinfo.value.reason_codes
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_claim_canonicalizes_preset_bound_mechanical_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preset references are canonicalized in the candidates: a
+    mechanical-tier route target bound via the ``@scout`` preset labels its
+    canonical base (luna-model) mechanical, so a claim for it on a
+    substantive package is rejected (before canonicalization the preset
+    string never matched a candidate and the claim was selected).
+    """
+    registry, parent = await _replacement_registry(
+        monkeypatch,
+        RecoveryConfig(),
+        [_WriteThenFaultBackend(_EndpointTimeout("https://beta.test/v1"))],
+        routes=_PRESET_MECHANICAL_ROUTES,
+    )
+    try:
+        agent_id, _run_id, _failed = await _launch_failed_package(registry, parent)
+        with pytest.raises(ReplacementPolicyError) as excinfo:
+            await _launch(
+                registry,
+                parent,
+                tool_call_id="claim",
+                config=_claim_config(
+                    model="luna-model",
+                    work_package_id="wp-1",
+                    predecessor_agent_id=agent_id,
+                ),
+            )
+        assert (
+            "mechanical_tier_rejected_for_substantive_package"
+            in excinfo.value.reason_codes
+        )
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_claim_with_the_top_level_model_is_admitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement claim names the replacement model at the canonical
+    top-level field (the legacy nested config.model is the promoted
+    equivalent): the claim is admitted and the new agent commits the
+    claimed model.
+    """
+    registry, parent = await _replacement_registry(
+        monkeypatch,
+        RecoveryConfig(),
+        [
+            _WriteThenFaultBackend(_EndpointTimeout("https://beta.test/v1")),
+            FakeBackend(mock_llm_chunk(content="replacement done")),
+        ],
+    )
+    try:
+        agent_id, _run_id, _failed = await _launch_failed_package(registry, parent)
+        ack = await _launch(
+            registry,
+            parent,
+            tool_call_id="claim",
+            model="alt-model",
+            config={"work_package_id": "wp-1", "predecessor_agent_id": agent_id},
+        )
+        assert ack.agent_id is not None and ack.agent_id != agent_id
+        assert ack.replacement is not None
+        assert ack.replacement.disposition == "selected"
+        assert ack.replacement.candidate is not None
+        assert ack.replacement.candidate.base_model == "alt-model"
+        replacement = registry._agent_records[ack.agent_id]
+        child = replacement.runtime.agent_loop
+        assert child.committed_model is not None
+        assert child.committed_model.base_model == "alt-model"
+        assert child.committed_model.provider == "gamma"
     finally:
         await registry.drain_children()
         await parent.aclose()
@@ -1646,7 +2306,7 @@ async def test_recurrence_counter_migrates_to_the_package_key_on_claim(
         # A's successor fails too: the episode budget (1) is exhausted.
         await _until(lambda: controller._episodes == {})
         await _until(lambda: record_a.state is _AgentState.SUSPENDED)
-        assert controller._lineage == {"brief:worker:package work": 1}
+        assert controller._lineage == {"brief:coder:package work": 1}
 
         # The claim: a NEW agent B carrying the package identity wp-1.
         ack = await _launch(
@@ -1689,7 +2349,7 @@ async def test_replacement_migration_never_steals_a_same_brief_lineage_count(
 ) -> None:
     """Round-2 V5: the R7 lineage-key migration moves only the count the
     PREDECESSOR lineage itself contributed. A brief key
-    (``brief:{profile}:{summary}``) can be shared by an UNRELATED lineage
+    (``brief:{identity}:{summary}``) can be shared by an UNRELATED lineage
     with the same brief; the migration must never pop that other lineage's
     count into the package key.
 
@@ -1705,7 +2365,7 @@ async def test_replacement_migration_never_steals_a_same_brief_lineage_count(
     FAILS pre-fix: the migration popped the whole shared brief-keyed
     count (2) — C's count was stolen into the package key
     (``{"pkg:wp-1": 2}``, with B refused at the gate, instead of
-    ``{"brief:worker:package work": 1, "pkg:wp-1": 1}`` with B scheduled).
+    ``{"brief:coder:package work": 1, "pkg:wp-1": 1}`` with B scheduled).
     """
     registry, parent = await _replacement_registry(
         monkeypatch,
@@ -1747,7 +2407,7 @@ async def test_replacement_migration_never_steals_a_same_brief_lineage_count(
         assert successor_c is not None
         done_c = await _wait_result(registry, agent_c, successor_c)
         assert done_c.completed
-        await _until(lambda: controller._lineage == {"brief:worker:package work": 1})
+        await _until(lambda: controller._lineage == {"brief:coder:package work": 1})
 
         # Agent A (the SAME brief — the shared brief key): admitted once
         # (brief count 2); A's successor fails and is refused at the
@@ -1771,7 +2431,7 @@ async def test_replacement_migration_never_steals_a_same_brief_lineage_count(
         assert not failed_successor.completed
         await _until(lambda: controller._episodes == {})
         await _until(lambda: record_a.state is _AgentState.SUSPENDED)
-        assert controller._lineage == {"brief:worker:package work": 2}
+        assert controller._lineage == {"brief:coder:package work": 2}
 
         # The claim: agent B carries the package identity wp-1 with
         # predecessor A. B fails (same fault shape) and suspends.
@@ -1795,9 +2455,9 @@ async def test_replacement_migration_never_steals_a_same_brief_lineage_count(
         # The migration folded ONLY A's own count into the package key:
         # C's same-brief count survives under the brief key (1), and the
         # package key carries exactly A's migrated count (1).
-        assert controller._lineage == {"brief:worker:package work": 1, "pkg:wp-1": 1}
+        assert controller._lineage == {"brief:coder:package work": 1, "pkg:wp-1": 1}
         assert controller._lineage_agent_counts == {
-            (agent_c, "brief:worker:package work"): 1
+            (agent_c, "brief:coder:package work"): 1
         }
         # B's gate sees the honest package count (1 < 2): B is scheduled,
         # not refused — the package budget was not inflated by the theft.
@@ -1819,12 +2479,9 @@ async def test_replacement_migration_never_steals_a_same_brief_lineage_count(
 
 
 def _shipped_mechanical_models() -> frozenset[str]:
-    bound = bind_snapshot_policy(
-        CatalogSnapshot(SHIPPED_CATALOG, "wp5-zero-ask", dispatch=ORCHESTRATED_PRESET)
-    )
-    return mechanical_base_models_from_policy(
-        bound.render_policy, bound.roster.slot_bindings
-    )
+    # The shipped mechanical-tier route targets bind the session model, so
+    # the mechanical set is the session model under the shipped defaults.
+    return mechanical_base_models_from_routes(shipped_routes(), session_model="glm-5-3")
 
 
 def test_unattended_resilience_zero_ask_under_repeated_infrastructure_failure() -> None:
@@ -1849,7 +2506,7 @@ def test_unattended_resilience_zero_ask_under_repeated_infrastructure_failure() 
         )
 
     mechanical = _shipped_mechanical_models()
-    # The shipped @scout slot binds glm-5-3: the mechanical-tier model.
+    # The shipped mechanical-tier routes bind the session model (glm-5-3).
     assert "glm-5-3" in mechanical
     candidates = candidates_from_catalog(
         SHIPPED_CATALOG, mechanical_base_models=mechanical

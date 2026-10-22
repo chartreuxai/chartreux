@@ -160,7 +160,6 @@ async def test_unknown_nested_model_field_is_rejected_without_raw_value() -> Non
 async def test_valid_empty_environment_values_are_preserved() -> None:
     env = {
         "CHARTREUX_ACTIVE_MODEL": "",
-        "CHARTREUX_ENABLED_AGENTS": "[]",
         "CHARTREUX_SESSION_LOGGING__SESSION_PREFIX": "",
     }
     with patch.dict(os.environ, env, clear=True):
@@ -168,7 +167,6 @@ async def test_valid_empty_environment_values_are_preserved() -> None:
 
     assert data.model_dump() == {
         "active_model": "",
-        "enabled_agents": [],
         "session_logging": {"session_prefix": ""},
     }
 

@@ -22,25 +22,35 @@ from typing import TYPE_CHECKING, Any
 
 from chartreux.core.agent_loop.backend_lifetime import BackendPublish
 from chartreux.core.agent_loop.errors import AgentLoopStateError
-from chartreux.core.agents.launch import LaunchCandidate
+from chartreux.core.agents.launch import (
+    LaunchCandidate,
+    _child_personal_posture,
+    _validate_tools,
+)
 from chartreux.core.agents.manager import AgentManager
 from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.config._restrictions import SourceRestrictions
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.dispatch.renderer import task_description_for_config
+from chartreux.core.dispatch.route_models import ReplacementCapability
+from chartreux.core.dispatch.session import pending_policy_changes
 from chartreux.core.hooks.manager import HooksManager
 from chartreux.core.hooks.models import HookConfigResult
 from chartreux.core.llm.types import BackendLike
 from chartreux.core.llm_models import LLMMessage, Role
+from chartreux.core.recovery_models import PackageTier
 from chartreux.core.session_types import CommittedModelIdentity
+from chartreux.core.skills.compatibility import ConversationPolicyFacts
 from chartreux.core.skills.manager import SkillManager
 from chartreux.core.subagents import LaunchConfig
 from chartreux.core.tools import secret_redaction
 from chartreux.core.tools.manager import ToolManager
 from chartreux.core.workspace import Workspace
+from chartreux.observability.logging import logger
 
 if TYPE_CHECKING:
     from chartreux.core.agent_loop import AgentLoop
+    from chartreux.core.policy.bundle import ActivatedPolicy
     from chartreux.core.tools.mcp.registry import MCPRegistry
 
 
@@ -106,6 +116,9 @@ class _PreparedLaunchReconfiguration:
     previous_instruction_read_files: frozenset[Path]
     previous_prices: tuple[float, float, float | None]
     previous_launch_overrides: LaunchConfig | None
+    previous_launch_purpose: str | None
+    previous_launch_package_tier: PackageTier | None
+    previous_launch_replacement_capability: ReplacementCapability | None
     previous_committed_model: CommittedModelIdentity | None
     session_generation: int
     parent_authority_revision: int | None
@@ -294,6 +307,9 @@ async def prepare_launch_reconfiguration(
             if loop.launch_overrides is not None
             else None
         ),
+        previous_launch_purpose=loop.launch_purpose,
+        previous_launch_package_tier=loop.launch_package_tier,
+        previous_launch_replacement_capability=loop.launch_replacement_capability,
         previous_committed_model=loop.committed_model,
         session_generation=expected_session_generation,
         parent_authority_revision=parent_revision,
@@ -309,7 +325,6 @@ def _prepare_launch_consumers(
     reuse_backend: bool,
 ) -> _PreparedReload:
     """Build the narrow consumer set required by a retained re-task."""
-    target_config.attach_dispatch_policy(loop.bound_dispatch_policy)
     config_source = _SwappableConfigSource(lambda: target_config)
     tool_manager = loop.tool_manager
     if replace_tools:
@@ -317,6 +332,7 @@ def _prepare_launch_consumers(
             config_source.get,
             mcp_registry=loop.mcp_registry,
             defer_mcp=True,
+            bound_identity=loop._bound_identity,
             discovery_source=loop.tool_manager,
             restriction_getter=lambda: loop.config_orchestrator.restrictions,
             accepted_token_getter=lambda: (
@@ -330,7 +346,12 @@ def _prepare_launch_consumers(
             cwd=loop.cwd,
             harness_files=loop.harness_files,
             scratchpad_dir=loop.scratchpad_dir,
-            task_description=task_description_for_config(target_config),
+            # The rebuilt manager serves the conversation's FROZEN route
+            # table — the same source launch admission resolves against —
+            # never the retask target config's live routes (design §6, §10).
+            task_description=task_description_for_config(
+                target_config, routes=loop.frozen_purpose_routes
+            ),
             session_root_grants=loop._session_root_grants,
             dangerous_command_authority_provider=loop._dangerous_command_grants,
         )
@@ -350,6 +371,44 @@ def _prepare_launch_consumers(
     )
 
 
+def _revalidate_launch_tool_ceilings(
+    loop: AgentLoop, candidate: LaunchCandidate
+) -> None:
+    """Fail closed when the live parent authority no longer admits a retask.
+
+    Resolve-time admission validated the candidate's tool overrides against
+    the parent's delegation ceiling at that moment. This publish-time re-check
+    re-derives BOTH ceilings from the LIVE authority chain — the parent's
+    delegation set (never its personal inventory: personal posture and
+    delegation are independent axes, design §8) and the child identity's
+    personal posture — so a parent authority change that does not bump the
+    loop's authority revision (an in-place config edit, a refresh) can never
+    publish a beyond-ceiling child, and an unavailable ancestor aborts the
+    retask instead of opening it. The launch module's own validators are
+    reused verbatim so the publish-time rule cannot drift from admission.
+
+    Only loops with a parent authority chain are re-checked: production
+    retask/replacement targets are always child runtimes (depth limit one),
+    and a parentless loop's staged candidate is admitted by its own resolve.
+    """
+    if loop._parent_authority_getter is None:
+        return
+    try:
+        ceiling_manager = loop._parent_authority_getter()
+    except Exception:
+        ceiling_manager = None
+    if ceiling_manager is None:
+        raise AgentLoopStateError(
+            "Parent authority unavailable during launch reconfiguration"
+        )
+    _validate_tools(
+        candidate.semantic_overrides,
+        candidate.authority_inputs.known_tool_names,
+        frozenset(ceiling_manager.delegable_tools),
+        _child_personal_posture(candidate.identity),
+    )
+
+
 def publish_launch_reconfiguration(
     loop: AgentLoop, prepared: _PreparedLaunchReconfiguration
 ) -> BackendPublish:
@@ -366,6 +425,10 @@ def publish_launch_reconfiguration(
         or prepared.parent_authority_revision != parent_revision
     ):
         raise AgentLoopStateError("Stale launch reconfiguration")
+    # Authority hardening across the lifecycle: re-derive the admission
+    # ceilings from the live parent chain before any state becomes visible,
+    # so a retask can never widen authority past the current delegation set.
+    _revalidate_launch_tool_ceilings(loop, prepared.candidate)
     loop._guard_job_authority_config(prepared.orchestrator.config)
     backend_publish = loop._backend_lifetime.publish_reversible(
         prepared.consumers.backend
@@ -382,6 +445,13 @@ def publish_launch_reconfiguration(
         model.input_price, model.output_price, model.cached_input_price
     )
     loop.launch_overrides = prepared.candidate.semantic_overrides.model_copy(deep=True)
+    # The retask's own launch metadata installs with the reconfiguration:
+    # the purpose label is the retask's (never copied from the previous run),
+    # and the committed tier/capability keep describing the package's true
+    # tier for the recovery boundary.
+    loop.launch_purpose = prepared.candidate.purpose
+    loop.launch_package_tier = prepared.candidate.effective_tier
+    loop.launch_replacement_capability = prepared.candidate.replacement_capability
     loop.committed_model = prepared.candidate.committed_model
     loop.config.attach_committed_model(loop.committed_model)
     return backend_publish
@@ -408,6 +478,9 @@ def rollback_launch_reconfiguration(
         )
     loop.stats.update_pricing(*prepared.previous_prices)
     loop.launch_overrides = prepared.previous_launch_overrides
+    loop.launch_purpose = prepared.previous_launch_purpose
+    loop.launch_package_tier = prepared.previous_launch_package_tier
+    loop.launch_replacement_capability = prepared.previous_launch_replacement_capability
     loop.committed_model = prepared.previous_committed_model
     loop.config.attach_committed_model(loop.committed_model)
 
@@ -463,8 +536,9 @@ def _prepare_reload(
                 }
             )
         )
-    # Load both configured prompts before any runtime mutation or client IO.
-    _ = target_config.system_prompt, target_config.compaction_prompt
+    # Load the configured utility prompt before any runtime mutation or
+    # client IO (the full-skeleton prompt axis is retired with 16a).
+    _ = target_config.compaction_prompt
     # The candidate trust policy is carried by the backend being prepared.
     return loop._prepare_reload_consumers(
         target_config, reload_hooks, mcp_registry=mcp_registry
@@ -480,12 +554,43 @@ def _thinking_for_committed_reload(
     if loop._is_subagent and identity.thinking is not None:
         return identity.thinking
     catalog = config.catalog_snapshot.catalog
-    selection = config.active_model or "@orchestrator"
+    selection = config.active_model or "@main"
     if selection.startswith("@"):
         role = catalog.roles.get(selection[1:])
         if role is not None and role.model == identity.base_model:
             return role.thinking
     return catalog.models[identity.base_model].thinking
+
+
+def _policy_facts_from_bundle(activated: ActivatedPolicy) -> ConversationPolicyFacts:
+    """The frozen identity/workflow selections a bound bundle committed.
+
+    The single frozen source every SkillManager rebuild derives its
+    eligibility facts from: the bound bundle's manifest selections (design
+    §3, §6) — never the pending saved selections a bound conversation
+    reports as applying to new conversations only.
+    """
+    return ConversationPolicyFacts(
+        identity=activated.manifest.identity.selected,
+        workflow=activated.manifest.workflow.selected,
+    )
+
+
+def _frozen_policy_facts(loop: AgentLoop) -> ConversationPolicyFacts:
+    """The conversation's frozen policy facts for a rebuilt SkillManager.
+
+    Reload rebuilds the skill manager around the RELOADED config, but skill
+    eligibility reads the conversation's FROZEN facts — the bound bundle's
+    committed identity/workflow selections, the same source the loop
+    reports pending changes against — never the pending saved selections
+    the reload just loaded: a pending selection applies to new
+    conversations only (design §3, §6). Before the first render binds the
+    bundle, the loop's existing frozen facts are the source.
+    """
+    activated = loop._bound_policy
+    if activated is not None:
+        return _policy_facts_from_bundle(activated)
+    return loop.skill_manager.policy_facts
 
 
 def _prepare_reload_consumers(
@@ -499,12 +604,12 @@ def _prepare_reload_consumers(
     hooks_loader: Callable[[], HookConfigResult],
 ) -> _PreparedReload:
     skills_adopted = loop._skills_adopted
-    target_config.attach_dispatch_policy(loop.bound_dispatch_policy)
     config_source = _SwappableConfigSource(lambda: target_config)
     tool_manager = ToolManager(
         config_source.get,
         mcp_registry=mcp_registry if mcp_registry is not None else loop.mcp_registry,
         defer_mcp=discovery_source is not None,
+        bound_identity=loop._bound_identity,
         discovery_source=discovery_source,
         restriction_getter=lambda: loop.config_orchestrator.restrictions,
         accepted_token_getter=lambda: (
@@ -518,11 +623,22 @@ def _prepare_reload_consumers(
         cwd=loop.cwd,
         harness_files=loop.harness_files,
         scratchpad_dir=loop.scratchpad_dir,
-        task_description=task_description_for_config(target_config),
+        # The task-tool description is conversation-owned policy like the
+        # prompt: it renders from the conversation's FROZEN route table —
+        # the same source launch admission resolves against — never the
+        # reloaded live config, so a saved route edit stays pending instead
+        # of half-applying to the model-facing table (design §6, §10).
+        task_description=task_description_for_config(
+            target_config, routes=loop.frozen_purpose_routes
+        ),
         session_root_grants=loop._session_root_grants,
         dangerous_command_authority_provider=loop._dangerous_command_grants,
     )
-    skill_manager = SkillManager(config_source.get, harness_files=loop.harness_files)
+    skill_manager = SkillManager(
+        config_source.get,
+        harness_files=loop.harness_files,
+        policy_facts=_frozen_policy_facts(loop),
+    )
     candidate_orchestrator = loop._config_orchestrator.copy(config=target_config)
     agent_manager = AgentManager(
         candidate_orchestrator, harness_files=loop.harness_files
@@ -581,7 +697,6 @@ async def reload_with_initial_messages(
         loop.stats,
         session_save_config if session_save_config is not None else loop.config,
         loop.tool_manager,
-        None,
     )
 
     # A newer reload superseded us while we were saving; don't mutate state.
@@ -664,7 +779,7 @@ def _commit_reload(  # noqa: PLR0915
         identity = None
     else:
         identity = resolver.resolve(
-            prepared.config.active_model or "@orchestrator",
+            prepared.config.active_model or "@main",
             allowed_models=prepared.config.allowed_models,
         ).identity.model_copy(
             update={"thinking": prepared.config.get_active_model().thinking}
@@ -695,8 +810,8 @@ def _commit_reload(  # noqa: PLR0915
     )
     # The prepared backend owns its candidate trust policy; publishing it
     # requires no process-global TLS mutation.
-    # Now that the profile is live, the prepared managers should track the live
-    # config so later refreshes (refresh_config) propagate to them.
+    # Now that the identity is live, the prepared managers should track the
+    # live config so later refreshes (refresh_config) propagate to them.
     prepared.config_source.point_to(lambda: loop.config)
     prepared.agent_manager._orchestrator = loop._config_orchestrator
     previous_identity = loop.committed_model
@@ -759,6 +874,20 @@ def _commit_reload(  # noqa: PLR0915
     # The value cache remains process-wide; reload invalidates stored/keyring
     # values. Already inherited child environments require pool retirement.
     secret_redaction.reset_cache()
+    # A reload never re-postures: the conversation's frozen policy bundle
+    # stays bound (design §10). Report what the reloaded saved state WOULD
+    # change for new conversations — [agent] selection diffs and
+    # resource-content diffs against the frozen manifest — without applying
+    # any of it (the live reread here is for REPORTING only, never for prompt
+    # refresh).
+    activated = loop._bound_policy
+    if activated is not None:
+        pending = pending_policy_changes(
+            prepared.config, activated, harness_files=loop.harness_files
+        )
+        loop.pending_policy_changes = pending
+        for note in pending:
+            logger.warning("Pending policy change after reload: %s", note)
 
 
 # Policy replacement transactions.
@@ -857,6 +986,7 @@ def _prepare_policy_manager(
         lambda: authority().config,
         mcp_registry=loop.mcp_registry,
         defer_mcp=True,
+        bound_identity=loop._bound_identity,
         discovery_source=previous_manager,
         restriction_getter=lambda: authority().restrictions,
         accepted_token_getter=lambda: authority().accepted_token,
@@ -868,7 +998,13 @@ def _prepare_policy_manager(
         cwd=loop.cwd,
         harness_files=loop.harness_files,
         scratchpad_dir=loop.scratchpad_dir,
-        task_description=task_description_for_config(authority().config),
+        # The replacement manager keeps serving the conversation's FROZEN
+        # route table — the bound bundle's snapshot, the same source launch
+        # admission resolves against — never the staged live config's
+        # routes (design §6, §10).
+        task_description=task_description_for_config(
+            authority().config, routes=loop.frozen_purpose_routes
+        ),
         session_root_grants=loop._session_root_grants,
         dangerous_command_authority_provider=loop._dangerous_command_grants,
     )

@@ -46,7 +46,7 @@ def write_e2e_config(
             'name = "mock-model"',
             "supports_images = false",
             "",
-            '[roles."orchestrator"]',
+            '[roles."main"]',
             'description = "E2E main assistant preset"',
             'model = "mock-model"',
             'thinking = "high"',

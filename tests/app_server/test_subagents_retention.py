@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from chartreux.agents import AgentSafety, AgentType
 from chartreux.app_server._sessions import (
     RunRecord,
     SessionRuntime,
@@ -18,7 +17,6 @@ from chartreux.app_server._sessions import (
     _AgentTombstone,
 )
 from chartreux.app_server.models import PublicTurn, PublicTurnStatus
-from chartreux.core.agents.models import AgentProfile
 from chartreux.core.events import AssistantEvent
 from chartreux.core.message_list import MessageList
 from chartreux.core.subagents import (
@@ -60,7 +58,7 @@ async def test_run_duration_clock_completion_and_eviction(reason: str) -> None:
     run = RunRecord(
         run_id="run-1",
         agent_id=record.agent_id,
-        profile="worker",
+        identity="coder",
         status=RunStatus.RUNNING,
         completion_task=asyncio.get_running_loop().create_future(),
         started_at=clock(),
@@ -140,7 +138,7 @@ async def test_dispatch_and_eviction_race_has_a_deterministic_winner() -> None:
     registry._children[record.session_id] = record.runtime
     args = TaskArgs(
         task="reuse",
-        agent_type="worker",
+        identity="coder",
         agent_id=record.agent_id,
         background=True,
         retain=True,
@@ -215,7 +213,7 @@ async def test_eviction_tombstone_contains_no_runtime_reference() -> None:
         RunRecord(
             run_id=result.run_id,
             agent_id=result.agent_id,
-            profile="worker",
+            identity="coder",
             status=RunStatus.COMPLETED,
             completion_task=asyncio.get_running_loop().create_future(),
             result=result.result,
@@ -302,16 +300,13 @@ async def test_reaper_ttl_ages_from_completion_not_observation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reaper_uses_profile_ttl_before_global_ttl() -> None:
+async def test_reaper_uses_record_ttl_before_global_ttl() -> None:
     clock = _ManualClock()
     wakeup = _GatedWakeup()
     registry, _root = _reaper_registry(clock, ttl=10, wakeup=wakeup)
-    profile = _idle_record("profile", clock=clock, idle_ttl_seconds=5)
+    record = _idle_record("profile", clock=clock, idle_ttl_seconds=5)
     global_ttl = _idle_record("global", clock=clock)
-    registry._agent_records = {
-        profile.agent_id: profile,
-        global_ttl.agent_id: global_ttl,
-    }
+    registry._agent_records = {record.agent_id: record, global_ttl.agent_id: global_ttl}
 
     await _rearm(registry)
     assert await wakeup.arrivals.get() == 5
@@ -326,7 +321,7 @@ async def test_reaper_uses_profile_ttl_before_global_ttl() -> None:
 
 
 @pytest.mark.asyncio
-async def test_zero_profile_ttl_disables_ttl_eviction_but_not_cap_eviction() -> None:
+async def test_zero_record_ttl_disables_ttl_eviction_but_not_cap_eviction() -> None:
     clock = _ManualClock()
     wakeup = _GatedWakeup()
     registry, _root = _reaper_registry(clock, ttl=10, cap=1, wakeup=wakeup)
@@ -423,7 +418,7 @@ async def test_eviction_injects_parent_notification() -> None:
     messages = root.agent_loop._pending_injected_messages
     assert len(messages) == 1
     assert messages[0].content == (
-        "Background agent worker-1 (agent-1) evicted (ttl, idle 10s); "
+        "Background agent coder-1 (agent-1) evicted (ttl, idle 10s); "
         "launch a new agent for further work."
     )
     await registry.drain_children()
@@ -452,8 +447,8 @@ async def test_reaper_batches_eviction_parent_notification() -> None:
     messages = root.agent_loop._pending_injected_messages
     assert len(messages) == 1
     assert messages[0].content == (
-        "Background agents evicted: worker-a (agent-a, idle_cap, idle 10s); "
-        "worker-b (agent-b, idle_cap, idle 10s); "
+        "Background agents evicted: coder-a (agent-a, idle_cap, idle 10s); "
+        "coder-b (agent-b, idle_cap, idle 10s); "
         "launch a new agent for further work."
     )
     await registry.drain_children()
@@ -654,7 +649,7 @@ async def test_notification_failure_still_idles_agent_and_cleans_pending_markers
         # run completes, so the reuse opts into retention explicitly.
         TaskArgs(
             task="work",
-            agent_type="worker",
+            identity="coder",
             agent_id="agent-1",
             background=True,
             retain=True,
@@ -765,7 +760,7 @@ async def test_reaper_batch_evicts_all_required_victims_despite_close_failure() 
         run = RunRecord(
             run_id=f"{record.agent_id}-run",
             agent_id=record.agent_id,
-            profile=record.profile,
+            identity=record.identity,
             status=RunStatus.COMPLETED,
             completion_task=asyncio.get_running_loop().create_future(),
             result=_stored_result(record.agent_id, f"{record.agent_id}-run").result,
@@ -802,48 +797,46 @@ async def test_reaper_batch_evicts_all_required_victims_despite_close_failure() 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("idle_ttl_seconds", [300, 0])
-async def test_profile_ttl_overrides_zero_global_retention_at_completion(
-    monkeypatch: pytest.MonkeyPatch, idle_ttl_seconds: int
+@pytest.mark.parametrize("global_ttl", [0, 10])
+async def test_record_ttl_falls_back_to_global_retention_at_completion(
+    monkeypatch: pytest.MonkeyPatch, global_ttl: int
 ) -> None:
+    # The custom "persistent" identity is a user prompt file installed by the
+    # autouse conftest fixture; agents/*.toml discovery is retired (16a).
     clock = _ManualClock()
     wakeup = _GatedWakeup()
     registry, parent, _notifications = await _zero_retention_registry(
         monkeypatch, FakeBackend([mock_llm_chunk(content="done")])
     )
-    parent.agent_manager._discovered["persistent"] = AgentProfile(
-        name="persistent",
-        display_name="Persistent",
-        description="Retained under zero global retention.",
-        safety=AgentSafety.NEUTRAL,
-        agent_type=AgentType.SUBAGENT,
-        idle_ttl_seconds=idle_ttl_seconds,
-        # A profile TTL alone no longer implies retention; the profile opts
-        # in explicitly so the launch stays resident for the reaper checks.
-        retain=True,
+    registry._retention_policy = RetentionPolicy(
+        idle_ttl_seconds=global_ttl, max_idle_agents=0, retain_agents=False
     )
     registry._clock = clock
     registry._wakeup = wakeup
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="persist", agent_type="persistent", background=True),
+            TaskArgs(
+                task="persist", identity="persistent", background=True, retain=True
+            ),
             InvokeContext(tool_call_id="persistent", session_id=parent.session_id),
         )
         assert launch.agent_id is not None and launch.run_id is not None
         record = registry._agent_records[launch.agent_id]
-        assert record.idle_ttl_seconds == idle_ttl_seconds
+        # A launch carries no per-record TTL: the global policy is the fallback.
+        assert record.idle_ttl_seconds is None
+        assert record.effective_idle_ttl(global_ttl) == global_ttl
         completion = record.current_run.completion_task if record.current_run else None
         assert isinstance(completion, asyncio.Task)
         await completion
         assert record.state is _AgentState.IDLE
 
-        if idle_ttl_seconds == 0:
+        if global_ttl == 0:
             assert registry._reaper_task is None
             assert launch.agent_id in registry._agent_records
         else:
-            assert await wakeup.arrivals.get() == 300
-            clock.advance(300)
+            assert await wakeup.arrivals.get() == global_ttl
+            clock.advance(global_ttl)
             wakeup.gates[0].set()
             reaper = registry._reaper_task
             assert reaper is not None
@@ -875,7 +868,7 @@ async def _assert_default_ephemeral_outcome(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="default ephemeral", agent_type="worker", background=True),
+            TaskArgs(task="default ephemeral", identity="coder", background=True),
             InvokeContext(
                 tool_call_id="default-ephemeral", session_id=parent.session_id
             ),
@@ -941,7 +934,7 @@ async def _assert_default_ephemeral_outcome(
                 registry,
                 TaskArgs(
                     task="reuse",
-                    agent_type="worker",
+                    identity="coder",
                     agent_id=launch.agent_id,
                     background=True,
                 ),
@@ -987,7 +980,7 @@ async def test_launch_reuse_resets_duration_with_registry_clock(
     clock = _ManualClock(10)
     registry._clock = clock
     try:
-        args = TaskArgs(task="first", agent_type="worker", background=True)
+        args = TaskArgs(task="first", identity="coder", background=True)
         context = InvokeContext(tool_call_id="first", session_id=parent.session_id)
         launch = await _background_result(registry, args, context)
         assert launch.agent_id is not None
@@ -1007,7 +1000,7 @@ async def test_launch_reuse_resets_duration_with_registry_clock(
             registry,
             TaskArgs(
                 task="second",
-                agent_type="worker",
+                identity="coder",
                 agent_id=launch.agent_id,
                 background=True,
             ),

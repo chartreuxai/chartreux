@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.loop import ScheduledLoop
@@ -18,7 +17,6 @@ from chartreux.core.session_types import AgentStats, SessionMetadata, WorktreeCo
 from chartreux.core.tools.manager import ToolManager
 from tests.session.persistence._session_persistence_support import (
     disabled_session_config as disabled_session_config,
-    mock_agent_profile as mock_agent_profile,
     mock_tool_manager as mock_tool_manager,
     mock_vibe_config as mock_vibe_config,
     session_config as session_config,
@@ -99,7 +97,6 @@ class TestPersistLoops:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         logger = SessionLogger(session_config, "test-session-loops")
         await logger.save_interaction(
@@ -111,7 +108,6 @@ class TestPersistLoops:
             stats=AgentStats(steps=1),
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         assert logger.session_metadata is not None
@@ -182,7 +178,6 @@ class TestPersistLoops:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         logger = SessionLogger(session_config, "loops-vs-save")
         messages = [
@@ -195,7 +190,6 @@ class TestPersistLoops:
             stats=AgentStats(steps=1),
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         assert logger.session_metadata is not None
@@ -218,7 +212,6 @@ class TestPersistLoops:
             stats=AgentStats(steps=2),
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         assert logger.session_dir is not None
@@ -249,7 +242,6 @@ class TestPersistActiveModel:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
     ) -> None:
         logger = SessionLogger(session_config, "active-model-session")
         active_model = mock_vibe_config.get_active_model().alias
@@ -270,7 +262,6 @@ class TestPersistActiveModel:
             stats=AgentStats(steps=1),
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
         second_change = await logger.persist_active_model("changed-model")
         repeated_after_save = await logger.persist_active_model("changed-model")
@@ -303,7 +294,6 @@ class TestPersistCreatedWorktree:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
         worktree: WorktreeContext,
     ) -> None:
         # The worktree is recorded before the session has a message, so there is
@@ -325,7 +315,6 @@ class TestPersistCreatedWorktree:
             stats=AgentStats(steps=1),
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         reloaded = SessionLoader.load_metadata(logger.session_dir)
@@ -337,7 +326,6 @@ class TestPersistCreatedWorktree:
         session_config: SessionLoggingConfig,
         mock_vibe_config: ChartreuxConfigSchema,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
         worktree: WorktreeContext,
     ) -> None:
         logger = SessionLogger(session_config, "worktree-resumed")
@@ -349,7 +337,6 @@ class TestPersistCreatedWorktree:
             stats=AgentStats(steps=1),
             config=mock_vibe_config,
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         await logger.persist_created_worktree(worktree)

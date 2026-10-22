@@ -6,7 +6,11 @@ import pytest
 
 from chartreux.app_server.protocol import AppServerResponseError, ProtocolErrorCode
 from chartreux.core.config import SessionLoggingConfig
-from tests.conftest import build_test_agent_loop, build_test_vibe_config
+from tests.conftest import (
+    build_test_agent_loop,
+    build_test_vibe_config,
+    set_agent_config,
+)
 from tests.stubs.app_server import create_test_app_server_session
 
 
@@ -59,5 +63,38 @@ async def test_clear_history_preserves_scheduled_loops(tmp_path: Path) -> None:
         metadata = agent_loop.session_logger.session_metadata
         assert metadata is not None
         assert [scheduled.id for scheduled in metadata.loops] == [loop.id]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_clear_through_the_public_handler_rebinds_effective_authority(
+    tmp_path: Path,
+) -> None:
+    # Round-2 Ab1: the public clear entrypoint (session/history/clear ->
+    # the handler's AgentLoop.clear_history) rebinds the loop's identity
+    # AND the ToolManager's bound identity in the same transaction — a
+    # coder cleared into reviewer loses coder-only tools personally AND
+    # as a delegation ceiling.
+    config = build_test_vibe_config(
+        session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path))
+    )
+    agent_loop = build_test_agent_loop(config=config)
+    session = await create_test_app_server_session(agent_loop)
+    try:
+        assert agent_loop._bound_identity == "coder"
+        assert "edit" in agent_loop.tool_manager.available_tools
+        assert "edit" in agent_loop.tool_manager.delegable_tools
+
+        set_agent_config(
+            agent_loop, build_test_vibe_config(agent={"identity": "reviewer"})
+        )
+        await session.clear_history()
+
+        assert agent_loop._bound_identity == "reviewer"
+        assert agent_loop.tool_manager._bound_identity == "reviewer"
+        assert "edit" not in agent_loop.tool_manager.available_tools
+        assert "edit" not in agent_loop.tool_manager.delegable_tools
+        assert "read_file" in agent_loop.tool_manager.available_tools
     finally:
         await session.close()

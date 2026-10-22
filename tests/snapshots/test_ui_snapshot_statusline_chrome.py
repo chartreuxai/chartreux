@@ -76,11 +76,11 @@ class ChromeSnapshotApp(App[None]):
             tuple(
                 AgentSummaryModel.model_validate({
                     "agent_id": agent_id,
-                    "profile": "reviewer",
+                    "identity": "reviewer",
                     "name": derive_agent_name(
                         agent_id=agent_id,
-                        profile="reviewer",
-                        profile_display_label=None,
+                        identity="reviewer",
+                        identity_display_label=None,
                         base_model=None,
                         effective_model=None,
                     ),
@@ -164,7 +164,7 @@ def test_agent_duration_details(
         bar.update_agents((
             AgentSummaryModel(
                 agent_id="agent-review",
-                profile="reviewer",
+                identity="reviewer",
                 availability=availability,
                 current_run_id="run-1" if availability == "running" else None,
                 latest_run_id="run-1",
@@ -177,8 +177,8 @@ def test_agent_duration_details(
                 turns_used=2,
                 name=derive_agent_name(
                     agent_id="agent-review",
-                    profile="reviewer",
-                    profile_display_label=None,
+                    identity="reviewer",
+                    identity_display_label=None,
                     base_model="glm-5.3",
                     effective_model=None,
                 ),

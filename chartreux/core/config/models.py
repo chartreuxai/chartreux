@@ -26,8 +26,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from chartreux.config_values import THINKING_LEVELS as THINKING_LEVELS, ThinkingLevel
 from chartreux.core.config._defaults import DEFAULT_AUTO_COMPACT_THRESHOLD
+from chartreux.core.config.agent_selection import (
+    AgentSelectionConfig as AgentSelectionConfig,
+)
 from chartreux.core.config.schema import WithDeepMerge
 from chartreux.core.dangerous_commands import OPERATION_REGISTRY
+from chartreux.core.dispatch.route_models import PurposeRoute
 from chartreux.core.llm_models import Backend
 from chartreux.core.paths import SESSION_LOG_DIR
 from chartreux.utils.paths import get_chartreux_home_literal
@@ -452,6 +456,20 @@ type StatusLineSegment = Literal[
     "spend-month",
     "background-jobs",
 ]
+
+
+def _default_purpose_routes() -> dict[str, PurposeRoute]:
+    from chartreux.core.dispatch.routes import shipped_routes
+
+    return dict(shipped_routes())
+
+
+class PurposeRouteDefaultsConfig(BaseModel):
+    """Typed purpose-route defaults, overridable by explicit route entries."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    routes: dict[str, PurposeRoute] = Field(default_factory=_default_purpose_routes)
 
 
 class StatusLineConfig(BaseModel):

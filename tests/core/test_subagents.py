@@ -6,20 +6,21 @@ from pathlib import Path
 from pydantic import ValidationError
 import pytest
 
+from chartreux.core import subagents as subagents_module
 from chartreux.core.events import AssistantEvent, ToolResultEvent
 from chartreux.core.subagents import (
     AgentAvailability,
     AgentBusyError,
     AgentEvictedError,
     AgentEviction,
-    AgentProfileMismatchError,
+    AgentIdentityMismatchError,
     AgentResultExpiredError,
     AgentSummary,
     CancelOutcome,
     CancelResult,
     EmptySubagentResponseError,
+    InvalidLaunchConfigError,
     LaunchConfigError,
-    MissingAgentProfileError,
     RunStatus,
     RunStopReason,
     SubagentManagementError,
@@ -52,32 +53,43 @@ def test_cancel_result_contract_roundtrips(outcome: CancelOutcome) -> None:
     assert json.loads(task.model_dump_json())["stop_reason"] == "user_cancelled"
 
 
-def test_task_profile_name_schema_has_no_agent_alias() -> None:
+def test_task_identity_schema_has_no_agent_aliases() -> None:
     properties = TaskArgs.model_json_schema()["properties"]
     assert "agent" not in properties
-    assert properties["agent_type"]["type"] == "string"
-    assert "agent_id" in properties["agent_type"]["description"]
-    assert "agent_type" in properties["agent_id"]["description"]
+    assert "agent_type" not in properties
+    assert {"type": "string"} in properties["identity"].get("anyOf", [])
+    assert "identity field" in properties["agent_id"]["description"]
+    # The canonical launch fields ride on the schema.
+    assert {"model", "identity", "purpose", "seat"} <= set(properties)
     with pytest.raises(ValidationError) as error:
         TaskArgs.model_validate({"task": "work", "agent": "worker"})
     assert error.value.errors()[0]["loc"] == ("agent",)
     assert error.value.errors()[0]["type"] == "extra_forbidden"
 
 
-@pytest.mark.parametrize("handle", ["agent-0", "agent-1", "agent-123"])
-def test_task_profile_rejects_instance_handles(handle: str) -> None:
-    with pytest.raises(
-        ValidationError, match="agent_type takes a profile name"
-    ) as error:
-        TaskArgs(task="work", agent_type=handle)
-    assert "agent_id (with background: true)" in str(error.value)
+def test_identity_mismatch_error_is_the_sole_public_name() -> None:
+    assert issubclass(AgentIdentityMismatchError, SubagentManagementError)
+    # The legacy profile spelling retired with the profile axis (package
+    # 16a): AgentIdentityMismatchError is the sole public name.
+    assert not hasattr(subagents_module, "AgentProfileMismatchError")
+    assert not hasattr(subagents_module, "MissingAgentProfileError")
+
+
+def test_task_agent_type_bridge_is_retired_with_successor_guidance() -> None:
+    # The legacy bridge (package 11b) is gone with the profile axis: any
+    # agent_type value — including a handle-shaped one — fails with the
+    # successor guidance instead of being bridged or misread as a handle.
+    with pytest.raises(ValidationError, match="agent_type is retired") as error:
+        TaskArgs.model_validate({"task": "work", "agent_type": "agent-1"})
+    assert "identity field" in str(error.value)
+    assert "worker -> coder" in str(error.value)
 
 
 @pytest.mark.parametrize(
-    "profile", ["worker", "custom-worker", "agent-helper", "agent-1-extra"]
+    "identity", ["coder", "reviewer", "user:custom-worker", "custom-worker"]
 )
-def test_task_profile_accepts_non_handle_names(profile: str) -> None:
-    assert TaskArgs(task="work", agent_type=profile).agent_type == profile
+def test_task_identity_accepts_valid_references(identity: str) -> None:
+    assert TaskArgs(task="work", identity=identity).identity == identity
 
 
 def test_replace_run_default_and_schema() -> None:
@@ -94,7 +106,7 @@ def test_replace_run_default_and_schema() -> None:
 def test_summary_keeps_last_recorded_context_and_terminal_outcome() -> None:
     summary = AgentSummary(
         agent_id="agent",
-        profile="worker",
+        identity="coder",
         availability=AgentAvailability.EVICTED,
         current_run_id="run",
         current_run_status=RunStatus.COMPLETED,
@@ -170,11 +182,12 @@ def test_task_args_supports_background_launch_and_agent_reuse() -> None:
 def test_task_args_defaults_to_background() -> None:
     args = TaskArgs.model_validate({
         "task": "inspect the repository",
-        "agent_type": "worker",
+        "identity": "coder",
     })
 
     assert args.background is True
     assert args.agent_id is None
+    assert args.identity == "coder"
 
 
 def test_task_args_launch_config_json_string_decodes_before_validation() -> None:
@@ -220,7 +233,7 @@ def test_task_args_launch_config_preserves_supplied_fields() -> None:
         "enabled_tools": [],
         "tools": {"bash": {"permission": "always"}},
     }
-    assert "agent_type" not in args.model_fields_set
+    assert "identity" not in args.model_fields_set
     assert "config" in args.model_fields_set
 
 
@@ -269,7 +282,7 @@ def test_task_args_treats_explicit_launch_config_nulls_as_omitted(
 
 
 def test_launch_config_errors_expose_safe_field_paths() -> None:
-    error = MissingAgentProfileError("config.model")
+    error = InvalidLaunchConfigError("config.model")
 
     assert isinstance(error, LaunchConfigError)
     assert error.field == error.field_path == "config.model"
@@ -354,14 +367,14 @@ def test_background_subagent_handle_types() -> None:
     ]
     summary = AgentSummary(
         agent_id="agent-1",
-        profile="worker",
+        identity="coder",
         availability=AgentAvailability.RUNNING,
         current_run_id="run-1",
         current_run_status=RunStatus.RUNNING,
     )
     assert summary == AgentSummary(
         agent_id="agent-1",
-        profile="worker",
+        identity="coder",
         availability=AgentAvailability.RUNNING,
         current_run_id="run-1",
         current_run_status=RunStatus.RUNNING,
@@ -424,7 +437,7 @@ def test_lifecycle_errors_and_eviction_metadata_are_distinguishable() -> None:
     errors = [
         AgentEvictedError(),
         AgentBusyError(),
-        AgentProfileMismatchError(),
+        AgentIdentityMismatchError(),
         AgentResultExpiredError(),
         UnknownAgentError(),
     ]

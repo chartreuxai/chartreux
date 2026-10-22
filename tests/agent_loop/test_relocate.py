@@ -177,16 +177,11 @@ async def test_agent_discovery_follows_the_move(tmp_path: Path) -> None:
     agent_loop = _session_in(repo)
 
     try:
-        assert (
-            repo / ".chartreux" / "agents"
-            in agent_loop.agent_manager._registry.search_paths
-        )
+        assert agent_loop.agent_manager._harness_files.cwd == repo
 
         await agent_loop.relocate(worktree)
 
-        paths = agent_loop.agent_manager._registry.search_paths
-        assert worktree / ".chartreux" / "agents" in paths
-        assert repo / ".chartreux" / "agents" not in paths
+        assert agent_loop.agent_manager._harness_files.cwd == worktree
     finally:
         trusted_folders_manager.revoke_session_trust(worktree)
         await agent_loop.aclose()

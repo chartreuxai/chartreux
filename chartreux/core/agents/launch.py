@@ -8,38 +8,45 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
-from chartreux.core.agents.models import AgentProfile
+from chartreux.core.agents.identities import ToolPosture, get_builtin_identity
 from chartreux.core.agents.registry import build_child_orchestrator
+from chartreux.core.config.agent_selection import AgentSelectionConfig
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 from chartreux.core.config.models import ModelConfig, ThinkingLevel
 from chartreux.core.config.orchestrator import ConfigOrchestrator
+from chartreux.core.dispatch.route_models import ReplacementCapability
 from chartreux.core.llm.backend.anthropic import REASONING_BLOCK_TYPES
 from chartreux.core.llm.thinking_levels import get_thinking_levels
 from chartreux.core.llm_models import LLMMessage
-from chartreux.core.prompts import load_system_prompt
+from chartreux.core.recovery_models import PackageTier
 from chartreux.core.session_types import CommittedModelIdentity
 from chartreux.core.subagents import (
     ImmutableLaunchPersonaError,
     InvalidLaunchModelError,
-    InvalidLaunchPromptError,
     InvalidLaunchThinkingError,
     InvalidLaunchToolError,
     LaunchConfig,
     LaunchToolOverride,
-    MissingAgentProfileError,
 )
+from chartreux.core.tools.manager import posture_allows_name
+from chartreux.core.tools.models import ToolPermission
 from chartreux.core.utils import name_matches
 
 if TYPE_CHECKING:
-    from chartreux.core.agents.manager import AgentManager
     from chartreux.core.tools.base import BaseTool
 
 
 @dataclass(frozen=True, slots=True)
 class FrozenPersona:
-    """The prompt identity and role instructions fixed for a child conversation."""
+    """The instruction overlay fixed for a child conversation.
 
-    system_prompt_id: str
+    The persona is keyed on the identity revision (design §7): the identity
+    binding and its revision are committed at launch (``LaunchPersonaV2``),
+    and the frozen instructions are the additive per-launch overlay (plus the
+    matched route's overlay body). The retired ``system_prompt_id`` axis no
+    longer participates.
+    """
+
     instructions: str | None
 
 
@@ -54,7 +61,7 @@ class LaunchAuthorityInputs:
 class LaunchCandidate:
     """Validated, resource-free input for child construction or reconfiguration."""
 
-    profile: AgentProfile
+    identity: str
     config_inputs: Mapping[str, Any]
     orchestrator: ConfigOrchestrator[ChartreuxConfigSchema]
     semantic_overrides: LaunchConfig
@@ -63,6 +70,15 @@ class LaunchCandidate:
     committed_model: CommittedModelIdentity
     effective_thinking: ThinkingLevel
     authority_inputs: LaunchAuthorityInputs
+    purpose: str | None = None
+    """The purpose label whose route was resolved; None for a direct launch."""
+    effective_tier: PackageTier = PackageTier.SUBSTANTIVE
+    """The effective package tier resolved for the launch (the route target's
+    explicit tier, or the identity/purpose default for a direct launch); the
+    recovery boundary reads it through the child loop's launch metadata."""
+    replacement_capability: ReplacementCapability = ReplacementCapability.NONE
+    """The model-level replacement-capability marking resolved for the launch
+    (the route target's explicit marking) — a separate axis from the tier."""
 
 
 def _freeze(value: Any) -> Any:
@@ -130,15 +146,6 @@ def _resolved_model(
 
         try:
             resolver = resolver_for(config)
-            if committed is None and config.bound_dispatch_policy is not None:
-                committed = config.bound_dispatch_policy.identity_for(expression)
-                if committed is None and any(
-                    slot.role == expression
-                    for slot in config.bound_dispatch_policy.policy.slots.values()
-                ):
-                    raise InvalidLaunchModelError(
-                        "config.model", "Bound dispatch slot is unavailable"
-                    )
             resolved = (
                 resolver.resolve_committed(
                     committed, allowed_models=config.allowed_models
@@ -289,18 +296,40 @@ def _validate_tool_patterns(
 
 
 def _validate_tools(
-    overrides: LaunchConfig, names: frozenset[str], authorized_names: frozenset[str]
+    overrides: LaunchConfig,
+    names: frozenset[str],
+    authorized_names: frozenset[str],
+    personal_posture: ToolPosture | None = None,
 ) -> None:
+    """Validate launch tool overrides against two independent ceilings.
+
+    The first ceiling is the parent's delegated authority (``authorized_names``):
+    granted authority never widens. The second ceiling is the CHILD identity's
+    personal posture: a launch override can never loosen it (v0.5.7 policy
+    reversal — overrides used to be able to widen against profile-level
+    restrictions; the ToolManager enforces the posture below the config layer,
+    and this guard rejects loosening attempts at admission). Narrowing
+    overrides (``disabled_tools``, ``permission = "never"`` patches) stay
+    allowed on both axes.
+    """
     if "enabled_tools" in overrides.model_fields_set:
         patterns = overrides.enabled_tools or []
         _validate_tool_patterns(patterns, names, "config.enabled_tools")
         for pattern in patterns:
             for name in names:
-                if name_matches(name, [pattern]) and name not in authorized_names:
-                    raise InvalidLaunchToolError(
-                        "config.enabled_tools",
-                        f"Tool '{name}' exceeds parent authority",
-                    )
+                if name_matches(name, [pattern]):
+                    if name not in authorized_names:
+                        raise InvalidLaunchToolError(
+                            "config.enabled_tools",
+                            f"Tool '{name}' exceeds parent authority",
+                        )
+                    if personal_posture is not None and not posture_allows_name(
+                        personal_posture, name
+                    ):
+                        raise InvalidLaunchToolError(
+                            "config.enabled_tools",
+                            f"Tool '{name}' exceeds the child identity posture",
+                        )
     if "disabled_tools" in overrides.model_fields_set:
         _validate_tool_patterns(
             overrides.disabled_tools or [], names, "config.disabled_tools"
@@ -314,6 +343,16 @@ def _validate_tools(
             raise InvalidLaunchToolError(
                 f"config.tools.{name}", f"Tool '{name}' exceeds parent authority"
             )
+        if (
+            personal_posture is not None
+            and patch.permission is not None
+            and patch.permission != ToolPermission.NEVER
+            and not posture_allows_name(personal_posture, name)
+        ):
+            raise InvalidLaunchToolError(
+                f"config.tools.{name}",
+                f"Tool '{name}' exceeds the child identity posture",
+            )
         # Re-validate the narrow public schema here so this boundary remains safe
         # when semantic state is reconstructed outside TaskArgs.
         try:
@@ -326,65 +365,47 @@ def _validate_tools(
             ) from exc
 
 
-def _resolve_profile(
-    profile_name: str | None,
-    retained_profile: AgentProfile | None,
-    agent_manager: AgentManager | None,
-    profile_lookup: Callable[[str], AgentProfile] | None,
-) -> AgentProfile:
-    if retained_profile is not None:
-        if profile_name is None:
-            return retained_profile
-        if profile_name != retained_profile.name:
-            raise MissingAgentProfileError(
-                "agent_type",
-                f"Requested profile '{profile_name}' differs from retained agent",
-            )
-        return retained_profile
-    if profile_name is None:
-        profile_name = "worker"
-    try:
-        if profile_lookup is not None:
-            return profile_lookup(profile_name)
-        if agent_manager is None:
-            raise ValueError
-        return agent_manager.get_agent(profile_name)
-    except ValueError as exc:
-        raise MissingAgentProfileError(
-            "agent_type", f"Selected agent profile '{profile_name}' is unavailable"
-        ) from exc
+def _child_personal_posture(identity: str) -> ToolPosture | None:
+    """The child identity's personal posture selector (None = unrestricted).
+
+    The admission ceiling and the enforced posture derive from the SAME
+    resolved identity binding the launch committed, so they always agree. The
+    runtime normalizes a ``builtin:`` qualification before its identity lookup
+    (``ToolManager._identity_posture``); admission applies the same
+    normalization, so an explicitly qualified selection cannot widen the
+    admission ceiling while the runtime enforces the builtin posture (S2
+    round 2: admission builtin: normalization).
+    """
+    builtin = get_builtin_identity(identity.removeprefix("builtin:"))
+    return builtin.personal_tools if builtin is not None else None
 
 
 def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     *,
-    profile_name: str | None,
+    identity: str,
     config: LaunchConfig | None,
     tool_inventory: Mapping[str, type[BaseTool]] | Mapping[str, object],
     parent_orchestrator: ConfigOrchestrator[ChartreuxConfigSchema] | None = None,
-    authorized_tool_names: frozenset[str] | None = None,
+    authorized_tool_names: frozenset[str],
     history: Sequence[LLMMessage] = (),
-    agent_manager: AgentManager | None = None,
-    profile_lookup: Callable[[str], AgentProfile] | None = None,
-    retained_profile: AgentProfile | None = None,
     accumulated_overrides: LaunchConfig | None = None,
     frozen_persona: FrozenPersona | None = None,
     committed_model: CommittedModelIdentity | None = None,
+    purpose: str | None = None,
+    effective_tier: PackageTier = PackageTier.SUBSTANTIVE,
+    replacement_capability: ReplacementCapability = ReplacementCapability.NONE,
 ) -> LaunchCandidate:
     """Resolve launch semantics without constructing any child-owned resource.
 
     ``config`` and ``accumulated_overrides`` are copied; neither caller object is
-    modified.  A retained call is selected by supplying ``retained_profile``.
+    modified. ``identity`` is the resolved identity reference the launch
+    committed (fresh launches: package-8 resolution; retained launches: the
+    record's committed binding) — admission validates it and the runtime
+    enforces it, so the installed selection and the validated binding can
+    never disagree (S2 identity disagreement).
     """
-    profile = _resolve_profile(
-        profile_name, retained_profile, agent_manager, profile_lookup
-    )
     semantic = _merge_semantic_overrides(accumulated_overrides, config)
     explicit_model = config is not None and "model" in config.model_fields_set
-    # A restored persona identifies an existing conversation, not a new profile
-    # assignment: preserve its committed model even if the profile role changed.
-    explicit_profile = (
-        retained_profile is None and profile.role is not None and frozen_persona is None
-    )
     inputs = semantic.model_dump(exclude_unset=True, mode="python")
     # Persona is loop-owned rather than a mutable configuration-layer concern.
     inputs.pop("instructions", None)
@@ -398,8 +419,22 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     inputs.pop("package_tier", None)
     if "model" in inputs:
         inputs["active_model"] = inputs.pop("model")
-    if committed_model is not None and not explicit_model and not explicit_profile:
+    if committed_model is not None and not explicit_model:
         inputs["active_model"] = committed_model.base_model
+    # The child's resolved identity selection rides the launch-override layer:
+    # the child never inherits the parent's identity selection (the builder
+    # strips inherited runtime selections before this layer is installed).
+    # The child likewise resolves its OWN workflow/strategy selections (the
+    # shipped defaults) instead of inheriting the parent's conversation
+    # workflow/strategy (design §7): the bounded-child composition omits the
+    # workflow/strategy bodies, so an inherited ceremony selection would make
+    # the S8 lint validate the child as ceremony and reject the launch.
+    child_selection = AgentSelectionConfig()
+    inputs["agent"] = {
+        "identity": identity,
+        "workflow": child_selection.workflow,
+        "orchestration_strategy": child_selection.orchestration_strategy,
+    }
     selected_thinking = inputs.pop("thinking", None)
 
     source = parent_orchestrator
@@ -407,15 +442,13 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
         raise InvalidLaunchModelError(
             "config", "Authoritative parent configuration assembly is unavailable"
         )
-    profile_overrides = None if retained_profile is not None else profile.overrides
-    profile_role = None if retained_profile is not None else profile.role
-    if profile_role is not None and not explicit_model:
-        inputs["active_model"] = f"@{profile_role}"
+    # The child identity's personal posture is the second admission ceiling
+    # for tool overrides, independent of the parent's delegation set.
+    child_personal_posture = _child_personal_posture(identity)
     orchestrator = build_child_orchestrator(
-        source, profile_overrides, inputs, profile_role=profile_role
+        source, inputs, strip_runtime_thinking=explicit_model
     )
     staged_config = orchestrator.config
-    profile_prompt = staged_config.system_prompt_id
     if frozen_persona is not None:
         if (
             "instructions" in semantic.model_fields_set
@@ -424,49 +457,24 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
             raise ImmutableLaunchPersonaError(
                 "config.instructions", "Retained persona cannot be changed"
             )
-        if (
-            "system_prompt_id" in semantic.model_fields_set
-            and semantic.system_prompt_id != frozen_persona.system_prompt_id
-        ):
-            raise ImmutableLaunchPersonaError(
-                "config.system_prompt_id", "Retained persona cannot be changed"
-            )
         persona = frozen_persona
     else:
         persona = FrozenPersona(
-            system_prompt_id=(
-                semantic.system_prompt_id
-                if (
-                    "system_prompt_id" in semantic.model_fields_set
-                    and semantic.system_prompt_id is not None
-                )
-                else profile_prompt
-            ),
             instructions=(
                 semantic.instructions
                 if "instructions" in semantic.model_fields_set
-                else profile.instructions
-            ),
+                else None
+            )
         )
 
-    try:
-        load_system_prompt(persona.system_prompt_id)
-    except (OSError, ValueError) as exc:
-        raise InvalidLaunchPromptError(
-            "config.system_prompt_id", "System prompt is unavailable"
-        ) from exc
-
-    # The frozen persona, rather than changed parent/profile defaults, is the
-    # prompt identity consumed by both the retained loop and staged renderer.
-    inputs["system_prompt_id"] = persona.system_prompt_id
     orchestrator = build_child_orchestrator(
-        source, profile_overrides, inputs, profile_role=profile_role
+        source, inputs, strip_runtime_thinking=explicit_model
     )
     staged_config = orchestrator.config
 
     selected_alias = staged_config.active_model
     if not selected_alias:
-        selected_alias = "@orchestrator"
+        selected_alias = "@main"
     explicit_thinking = "thinking" in semantic.model_fields_set
 
     def assignment_candidate(candidate: Any) -> bool:
@@ -499,14 +507,12 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
             is None
         )
 
-    model, identity = _resolved_model(
+    model, resolved_identity = _resolved_model(
         staged_config,
         selected_alias,
-        committed_model
-        if committed_model is not None and not explicit_model and not explicit_profile
-        else None,
+        committed_model if committed_model is not None and not explicit_model else None,
         None
-        if committed_model is not None and not explicit_model and not explicit_profile
+        if committed_model is not None and not explicit_model
         else assignment_candidate,
         selected_thinking,
     )
@@ -515,7 +521,7 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     if selected_thinking is not None:
         inputs["thinking_overrides"] = {model.alias: selected_thinking}
         orchestrator = build_child_orchestrator(
-            source, profile_overrides, inputs, profile_role=profile_role
+            source, inputs, strip_runtime_thinking=explicit_model
         )
         staged_config = orchestrator.config
     thinking = model.thinking
@@ -524,25 +530,30 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
         staged_config,
         model,
         thinking,
-        explicit=explicit_thinking or identity.thinking is not None,
+        explicit=explicit_thinking or resolved_identity.thinking is not None,
     )
     _validate_history(staged_config, model, history)
 
     known_tools = frozenset(tool_inventory)
-    authorized_tools = (
-        known_tools if authorized_tool_names is None else authorized_tool_names
+    # The admission ceiling is REQUIRED: it is the parent's delegation set,
+    # passed explicitly by every production caller. Defaulting to "all known
+    # tools" here would be a latent fail-open (S2 round 2 INFO).
+    _validate_tools(
+        semantic, known_tools, authorized_tool_names, child_personal_posture
     )
-    _validate_tools(semantic, known_tools, authorized_tools)
     effective_thinking = _effective_thinking(staged_config, model, thinking, history)
-    staged_config.attach_committed_model(identity)
+    staged_config.attach_committed_model(resolved_identity)
     return LaunchCandidate(
-        profile=profile,
+        identity=identity,
         config_inputs=_freeze(inputs),
         orchestrator=orchestrator,
         semantic_overrides=semantic.model_copy(deep=True),
         persona=persona,
         effective_model=model,
-        committed_model=identity,
+        committed_model=resolved_identity,
         effective_thinking=effective_thinking,
         authority_inputs=LaunchAuthorityInputs(known_tool_names=known_tools),
+        purpose=purpose,
+        effective_tier=effective_tier,
+        replacement_capability=replacement_capability,
     )

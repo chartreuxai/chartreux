@@ -1342,7 +1342,10 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
         )
 
     def full_metadata(self, agent: AgentSummaryModel | None = None) -> str:
-        """Unclipped public metadata for Main or a child, in a scrollable view."""
+        """Unclipped public metadata for Main or a child, in a scrollable view.
+
+        A child record presents its canonical identity and revision.
+        """
         if agent is None:
             lines = ["Identity: Main agent"]
             lines.extend(
@@ -1359,10 +1362,13 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
             )
             lines.append(f"Compacting: {self._main_compacting}")
             return "\n".join(lines)
-        fields = [
-            ("Name", agent.name or None),
-            ("Agent ID", agent.agent_id),
-            ("Profile", agent.profile),
+        fields = [("Name", agent.name or None), ("Agent ID", agent.agent_id)]
+        if agent.identity is not None:
+            fields.extend((
+                ("Identity", agent.identity),
+                ("Identity revision", agent.identity_revision),
+            ))
+        fields.extend((
             ("Availability", agent.availability),
             ("Current run status", agent.current_run_status),
             ("Last run status", agent.last_run_status),
@@ -1397,7 +1403,7 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
                 if agent.ttl_remaining_seconds is not None
                 else None,
             ),
-        ]
+        ))
         eviction = self._evictions.get(agent.agent_id)
         if eviction is not None:
             fields.extend([

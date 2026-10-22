@@ -1,287 +1,235 @@
+"""The frozen-bundle session policy surface (the legacy bind's successor).
+
+Package 16b retired the legacy session-policy bind (``BoundDispatchPolicy``,
+``bind_snapshot_policy``, ``bind_policy``, ``resume_policy``): the successor is
+the frozen-bundle surface package 10 shipped in
+``chartreux.core.dispatch.session``. These tests pin that surface: the
+validate/activate round trip, the legacy-record rejection, the corrupt-record
+rejection at load, the identity binding, the fresh-bind validation, the
+pending-change report, the session-logger round trip, and the identity
+registry every built-in binds through.
+"""
+
 from __future__ import annotations
 
-from dataclasses import replace
+from pathlib import Path
+from typing import Literal
 
 from pydantic import ValidationError
 import pytest
 
-from chartreux.core.agents.models import BUILTIN_SUBAGENTS
-from chartreux.core.dispatch.presets import STANDALONE_PRESET
+from chartreux.core.agents.identities import (
+    UnknownIdentityError,
+    builtin_identities,
+    builtin_identity_names,
+    get_builtin_identity,
+)
+from chartreux.core.config import SessionLoggingConfig
+from chartreux.core.config.harness_files import get_harness_files_manager
 from chartreux.core.dispatch.session import (
-    BoundDispatchPolicy,
     SessionPolicyError,
-    bind_policy,
-    bind_snapshot_policy,
-    resume_policy,
+    bind_policy_bundle,
+    bound_identity_reference,
+    pending_policy_changes,
+    resume_policy_bundle,
+    validate_stored_policy_bundle,
 )
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import CatalogSnapshot
-from chartreux.core.model_catalog.resolver import ModelResolver
-from chartreux.core.model_catalog.schema import ModelCatalog, RoleDefinition
-from tests.conftest import build_test_vibe_config
+from chartreux.core.policy.composition import ExecutionContext
+from chartreux.core.session.session_loader import SessionLoader
+from chartreux.core.session_types import POLICY_STORAGE_VERSION, SessionMetadata
+from chartreux.core.skills.manager import SkillManager
+from tests.conftest import build_test_agent_loop, build_test_vibe_config
+
+ORCHESTRATED_SELECTION = {
+    "identity": "orchestrator",
+    "workflow": "ceremony",
+    "orchestration_strategy": "builtin:default",
+}
 
 
-def config_for_policy():
+def _config(selection: dict[str, str] | None = None):
     return build_test_vibe_config(
-        catalog_snapshot=CatalogSnapshot(SHIPPED_CATALOG, "original")
+        agent=selection or ORCHESTRATED_SELECTION
+    ).attach_catalog_snapshot(CatalogSnapshot(SHIPPED_CATALOG, "original"))
+
+
+def _bind(config):
+    return bind_policy_bundle(
+        config,
+        execution_context=ExecutionContext.INTERACTIVE_MAIN,
+        skill_manager=SkillManager(lambda: config),
+        scratchpad_dir=None,
+        cwd=Path.cwd(),
+        harness_files=get_harness_files_manager(),
+        role_instructions=None,
     )
 
 
-def test_snapshot_round_trip_is_resolved_and_immutable():
-    bound = bind_policy(config_for_policy())
-    assert bound.bindings
-    restored = BoundDispatchPolicy.model_validate_json(bound.model_dump_json())
-    assert restored == bound
-    assert restored.roster == bound.roster
-    with pytest.raises(TypeError):
-        restored.bindings["new"] = next(iter(bound.bindings.values()))  # type: ignore[index]
-    with pytest.raises(ValidationError):
-        restored.version = 2  # type: ignore[assignment]
-
-
-def test_bound_canonical_identities_counts_wire_names_and_thinking_once():
-    # One canonical model served through two providers under different wire
-    # names, bound by every slot at different thinking levels, is one identity
-    # (ADR 0018-G.4: a single-model roster is one canonical model).
-    catalog = ModelCatalog.model_validate({
-        "providers": {
-            "one": {"api_base": "https://one.test"},
-            "two": {"api_base": "https://two.test"},
-        },
-        "models": {
-            "a": {
-                "deployments": [
-                    {"provider": "one", "name": "wire-one"},
-                    {"provider": "two", "name": "wire-two"},
-                ]
-            }
-        },
-        "roles": {
-            "worker": {"model": "a", "thinking": "medium"},
-            "scout": {"model": "a", "thinking": "low"},
-            "heavy": {"model": "a", "thinking": "high"},
-        },
-    })
-    bound = bind_snapshot_policy(CatalogSnapshot(catalog, "wires"))
-    assert len(bound.bindings) == len(STANDALONE_PRESET.slots)
-    assert bound.bound_canonical_identities == frozenset({"a"})
-
-
-def test_bound_canonical_identities_distinguishes_canonical_models():
-    config = config_for_policy()
-    bound = bind_policy(config)
-    # The shipped roster binds glm-5-3 through several slots and
-    # mistral-large-4 through the rest: exactly two identities.
-    assert bound.bound_canonical_identities == frozenset({"glm-5-3", "mistral-large-4"})
-
-
-def test_bound_canonical_identities_excludes_unbound_slots():
-    snapshot = CatalogSnapshot(SHIPPED_CATALOG, "original")
-    models = dict(snapshot.catalog.models)
-    models.pop("mistral-large-4")
-    snapshot = replace(
-        snapshot, catalog=snapshot.catalog.model_copy(update={"models": models})
-    )
-    bound = bind_snapshot_policy(snapshot)
-    # @heavy no longer resolves: those slots stay unbound and out of the
-    # identity set, exactly as identity_for skips them.
-    assert bound.bound_canonical_identities == frozenset({"glm-5-3"})
-    assert bound.identity_for("@heavy") is None
-    assert all(identity.base_model == "glm-5-3" for identity in bound.bindings.values())
-
-
-def test_bind_snapshot_policy_resolves_the_runtime_roster():
-    config = config_for_policy()
-    bound = bind_policy(config)
-    resolved = bind_snapshot_policy(
-        config.catalog_snapshot,
-        allowed_models=config.allowed_models,
-        auto_compact_threshold=config.auto_compact_threshold,
-    )
-    assert resolved.bindings == bound.bindings
-    assert resolved.diagnostics == bound.diagnostics
-    assert resolved.bound_canonical_identities == bound.bound_canonical_identities
-
-
-def test_catalog_edit_does_not_rebind_resumed_slots():
-    config = config_for_policy()
-    bound = bind_policy(config)
-    snapshot = config.catalog_snapshot
-    roles = dict(snapshot.catalog.roles)
-    roles["worker"] = RoleDefinition(model="glm-5-3", thinking="off")
-    config.attach_catalog_snapshot(
-        replace(
-            snapshot,
-            catalog=snapshot.catalog.model_copy(update={"roles": roles}),
-            dispatch=STANDALONE_PRESET,
-        )
-    )
-    restored = resume_policy(config, bound.model_dump(mode="json"), BUILTIN_SUBAGENTS)
-    assert restored.policy == bound.policy
-    assert restored.bindings == bound.bindings
-    fresh = bind_policy(config)
-    assert fresh.policy == STANDALONE_PRESET
-    assert fresh.bindings != bound.bindings
-
-
-def test_legacy_session_resolves_live_with_visible_note():
-    config = config_for_policy()
-    bound = resume_policy(config, None, BUILTIN_SUBAGENTS)
-    config.attach_dispatch_policy(bound)
-    assert any("Legacy session" in note for note in config.validation_warnings)
-    from chartreux.app_server._projection import project_config_view
-
-    assert any(
-        "Legacy session" in note
-        for note in project_config_view(config).validation_warnings
+def _metadata(
+    bundle,
+    *,
+    session_id: str = "s1",
+    storage_version: Literal[2] | None = POLICY_STORAGE_VERSION,
+) -> SessionMetadata:
+    return SessionMetadata(
+        session_id=session_id,
+        start_time="2026-01-01T00:00:00Z",
+        end_time=None,
+        git_commit=None,
+        git_branch=None,
+        username="tester",
+        environment={},
+        policy_bundle=bundle,
+        policy_storage_version=storage_version,
     )
 
 
-def test_unsupported_snapshot_version_fails_closed():
-    saved = bind_policy(config_for_policy()).model_dump(mode="json")
-    saved["version"] = 2
-    with pytest.raises(SessionPolicyError, match="Unsupported"):
-        resume_policy(config_for_policy(), saved, BUILTIN_SUBAGENTS)
+def test_validate_and_resume_round_trip_preserves_hash_and_identity() -> None:
+    bundle, activated = _bind(_config())
+    # The storage boundary revalidates the persisted payload structurally and
+    # carries the same frozen-policy hash.
+    reparsed = validate_stored_policy_bundle(bundle.model_dump(mode="json"))
+    assert reparsed.manifest.frozen_policy_hash == activated.frozen_policy_hash
+    # Resume activates the persisted record: same frozen hash, same identity
+    # binding, served from the carried content.
+    resumed = resume_policy_bundle(_metadata(bundle.model_dump(mode="json")))
+    assert resumed.frozen_policy_hash == activated.frozen_policy_hash
+    assert bound_identity_reference(resumed) == bound_identity_reference(activated)
+    assert resumed.policy_text == activated.policy_text
 
 
-@pytest.mark.parametrize("removed", ["role", "profile"])
-def test_removed_bound_reference_is_explicit_error(removed):
-    config = config_for_policy()
-    saved = bind_policy(config).model_dump(mode="json")
-    profiles = dict(BUILTIN_SUBAGENTS)
-    slot = next(iter(BoundDispatchPolicy.model_validate(saved).policy.slots.values()))
-    if removed == "role":
-        snapshot = config.catalog_snapshot
-        roles = dict(snapshot.catalog.roles)
-        roles.pop(slot.role[1:])
-        config.attach_catalog_snapshot(
-            replace(
-                snapshot, catalog=snapshot.catalog.model_copy(update={"roles": roles})
-            )
-        )
-    else:
-        profiles.pop(slot.profile)
-    with pytest.raises(SessionPolicyError, match="removed"):
-        resume_policy(config, saved, profiles)
-
-
-def test_pre_upgrade_policy_with_removed_roles_fails_resume_without_substitution():
-    # A policy saved before the roster rename binds the removed tier roles:
-    # resume fails explicitly (ADR 0018-H forbids substitution), while the
-    # committed model identities are role-free and still resolve.
-    config = config_for_policy()
-    legacy_roles = (
-        "@small",
-        "@medium",
-        "@medium",
-        "@large",
-        "@medium",
-        "@large",
-        "@large",
-        "@medium",
+def test_legacy_record_without_bundle_fails_with_start_a_new_session() -> None:
+    legacy = SessionMetadata(
+        session_id="legacy",
+        start_time="2026-01-01T00:00:00Z",
+        end_time=None,
+        git_commit=None,
+        git_branch=None,
+        username="tester",
+        environment={},
     )
-    slots = {
-        name: slot.model_copy(update={"role": role})
-        for (name, slot), role in zip(
-            STANDALONE_PRESET.slots.items(), legacy_roles, strict=True
-        )
-    }
-    saved = bind_policy(config).model_dump(mode="json")
-    saved["policy"] = STANDALONE_PRESET.model_copy(update={"slots": slots}).model_dump(
-        mode="json"
-    )
-    with pytest.raises(SessionPolicyError, match="Bound dispatch role removed"):
-        resume_policy(config, saved, BUILTIN_SUBAGENTS)
-    resolver = ModelResolver(CatalogSnapshot(SHIPPED_CATALOG, "committed"))
-    for identity in BoundDispatchPolicy.model_validate(saved).bindings.values():
-        assert resolver.resolve_committed(identity).base_model
+    with pytest.raises(SessionPolicyError, match="Start a new session"):
+        resume_policy_bundle(legacy)
 
 
-def test_deployment_unavailable_degrades_without_substitution():
-    config = config_for_policy()
-    bound = bind_policy(config)
-    snapshot = config.catalog_snapshot
-    config.attach_catalog_snapshot(
-        replace(snapshot, catalog=snapshot.catalog.model_copy(update={"models": {}}))
-    )
-    restored = resume_policy(config, bound.model_dump(mode="json"), BUILTIN_SUBAGENTS)
-    assert restored.render_policy.mode.value == "standalone"
-    assert restored.bindings == bound.bindings
-    config.attach_dispatch_policy(restored)
-    for name in bound.bindings:
-        assert any(f"slot {name!r}:" in note for note in config.validation_warnings)
-    assert not restored.roster.bindings
+def test_mismatched_storage_version_fails_with_start_a_new_session() -> None:
+    bundle, _activated = _bind(_config())
+    metadata = _metadata(bundle.model_dump(mode="json"), storage_version=None)
+    with pytest.raises(SessionPolicyError, match="older harness format"):
+        resume_policy_bundle(metadata)
 
 
-def test_resume_repair_clears_degradation_diagnostics(monkeypatch):
-    from chartreux.app_server._projection import project_config_view
-    from chartreux.core.dispatch.renderer import render_routing_region
+def test_tampered_bundle_fails_resume_without_substitution() -> None:
+    bundle, _activated = _bind(_config())
+    payload = bundle.model_dump(mode="json")
+    frozen_key = next(
+        key
+        for key, value in payload["frozen"].items()
+        if isinstance(value, str) and len(value) > 100
+    )
+    payload["frozen"][frozen_key] += " tampered."
+    with pytest.raises(SessionPolicyError, match="unreadable persisted policy bundle"):
+        resume_policy_bundle(_metadata(payload))
 
-    monkeypatch.setattr(
-        "chartreux.utils.api_keys.resolve_api_key", lambda _: "test-key"
-    )
-    config = config_for_policy()
-    snapshot = config.catalog_snapshot
-    models = dict(snapshot.catalog.models)
-    models["secondary"] = models["glm-5-3"]
-    roles = dict(snapshot.catalog.roles)
-    roles["scout"] = RoleDefinition(model="secondary", thinking="low")
-    healthy = replace(
-        snapshot,
-        catalog=snapshot.catalog.model_copy(update={"models": models, "roles": roles}),
-    )
-    config.attach_catalog_snapshot(healthy)
-    bound = bind_policy(config)
-    assert not bound.roster.single_model
 
-    broken_models = dict(models)
-    broken_models.pop("secondary")
-    config.attach_catalog_snapshot(
-        replace(
-            healthy,
-            catalog=healthy.catalog.model_copy(update={"models": broken_models}),
-        )
-    )
-    degraded = resume_policy(config, bound.model_dump(mode="json"), BUILTIN_SUBAGENTS)
-    config.attach_dispatch_policy(degraded)
-    assert "mechanical" in degraded.roster.failures
-    assert any(
-        "slot 'mechanical':" in note
-        for note in project_config_view(config).validation_warnings
-    )
-    assert "unavailable" in render_routing_region(
-        degraded.render_policy, degraded.roster
-    )
+def test_corrupt_bundle_fails_at_metadata_load() -> None:
+    with pytest.raises(ValidationError, match="unsupported bundle format version"):
+        SessionMetadata.model_validate({
+            "session_id": "corrupt",
+            "start_time": "2026-01-01T00:00:00Z",
+            "end_time": None,
+            "git_commit": None,
+            "git_branch": None,
+            "username": "tester",
+            "environment": {},
+            "policy_bundle": {"version": 99},
+            "policy_storage_version": POLICY_STORAGE_VERSION,
+        })
 
-    config.attach_catalog_snapshot(healthy)
-    repaired = resume_policy(
-        config, degraded.model_dump(mode="json"), BUILTIN_SUBAGENTS
+
+def test_bound_identity_reference_is_the_validated_selection() -> None:
+    _bundle, activated = _bind(_config())
+    assert bound_identity_reference(activated) == "orchestrator"
+
+
+def test_fresh_bind_validates_the_identity_selection() -> None:
+    # A bare custom identity with no user prompt file passes config schema
+    # validation but fails the NEW binding's identity validation, closed.
+    config = _config({**ORCHESTRATED_SELECTION, "identity": "no-such-custom"})
+    with pytest.raises(UnknownIdentityError, match="no-such-custom"):
+        _bind(config)
+
+
+def test_pending_policy_changes_reports_never_applies() -> None:
+    bundle, activated = _bind(_config())
+    harness_files = get_harness_files_manager()
+    # The bound selections match the saved state: nothing is pending.
+    assert (
+        pending_policy_changes(_config(), activated, harness_files=harness_files) == ()
     )
-    config.attach_dispatch_policy(repaired)
-    assert repaired.bindings == bound.bindings
-    assert repaired.roster == bound.roster
-    assert repaired.diagnostics == ()
-    assert project_config_view(config).validation_warnings == []
-    assert render_routing_region(
-        repaired.render_policy, repaired.roster
-    ) == render_routing_region(bound.render_policy, bound.roster)
-    assert bind_policy(config).diagnostics == ()
+    # A saved selection change is REPORTED against the bound bundle and never
+    # applied to the conversation.
+    changed = _config({**ORCHESTRATED_SELECTION, "identity": "coder"})
+    notes = pending_policy_changes(changed, activated, harness_files=harness_files)
+    assert len(notes) == 1
+    assert "identity" in notes[0]
+    assert "'orchestrator'" in notes[0]
+    assert "'coder'" in notes[0]
+    assert "new conversations only" in notes[0]
+
+
+def test_identity_registry_is_the_builtin_subagent_surface() -> None:
+    # BUILTIN_SUBAGENTS' successor: the identity registry's five built-ins.
+    assert builtin_identity_names() == (
+        "advisor",
+        "coder",
+        "orchestrator",
+        "researcher",
+        "reviewer",
+    )
+    assert len(builtin_identities()) == 5
+    for name in builtin_identity_names():
+        identity = get_builtin_identity(name)
+        assert identity is not None
+        assert identity.id == name
+
+
+@pytest.mark.parametrize("identity", builtin_identity_names())
+def test_every_builtin_identity_binds_a_valid_bundle(identity: str) -> None:
+    config = _config({**ORCHESTRATED_SELECTION, "identity": identity})
+    bundle, activated = _bind(config)
+    assert bound_identity_reference(activated) == identity
+    reparsed = validate_stored_policy_bundle(bundle.model_dump(mode="json"))
+    assert reparsed.manifest.frozen_policy_hash == activated.frozen_policy_hash
+    resumed = resume_policy_bundle(_metadata(bundle.model_dump(mode="json")))
+    assert resumed.frozen_policy_hash == activated.frozen_policy_hash
+    assert bound_identity_reference(resumed) == identity
 
 
 @pytest.mark.asyncio
-async def test_session_logger_loader_round_trip_binding(tmp_path):
-    from chartreux.core.session.session_loader import SessionLoader
-    from tests.conftest import build_test_agent_loop
-
-    config = config_for_policy()
-    config.session_logging.enabled = True
-    config.session_logging.save_dir = str(tmp_path)
+async def test_session_logger_round_trip_persists_the_bound_bundle(tmp_path) -> None:
+    config = build_test_vibe_config(
+        agent=ORCHESTRATED_SELECTION,
+        session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path)),
+    ).attach_catalog_snapshot(CatalogSnapshot(SHIPPED_CATALOG, "original"))
     agent = build_test_agent_loop(config=config)
-    await agent._save_messages(allow_empty=True)
-    assert agent.session_logger.session_dir is not None
-    metadata = SessionLoader.load_metadata(agent.session_logger.session_dir)
-    assert metadata.dispatch_policy == agent.bound_dispatch_policy.model_dump(
-        mode="json"
-    )
-    resumed = resume_policy(config, metadata.dispatch_policy, BUILTIN_SUBAGENTS)
-    assert resumed.bindings == agent.bound_dispatch_policy.bindings
+    try:
+        bound = agent._bound_policy
+        assert bound is not None
+        await agent.persist_empty_session()
+        session_dir = agent.session_logger.session_dir
+        assert session_dir is not None
+        metadata = SessionLoader.load_metadata(session_dir)
+        assert metadata.policy_storage_version == POLICY_STORAGE_VERSION == 2
+        assert metadata.policy_bundle is not None
+        # The persisted record validates at the storage boundary and carries
+        # the loop's bound frozen-policy hash and identity binding.
+        reparsed = validate_stored_policy_bundle(metadata.policy_bundle)
+        assert reparsed.manifest.frozen_policy_hash == bound.frozen_policy_hash
+        resumed = resume_policy_bundle(metadata)
+        assert resumed.frozen_policy_hash == bound.frozen_policy_hash
+        assert bound_identity_reference(resumed) == bound_identity_reference(bound)
+    finally:
+        await agent.aclose()

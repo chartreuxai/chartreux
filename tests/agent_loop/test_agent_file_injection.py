@@ -316,7 +316,6 @@ async def test_staged_instruction_manifest_installs_only_on_publish_and_rolls_ba
         LaunchAuthorityInputs,
         LaunchCandidate,
     )
-    from chartreux.core.agents.models import BUILTIN_SUBAGENTS
     from chartreux.core.config.harness_files import HarnessFilesManager
     from chartreux.core.subagents import LaunchConfig
 
@@ -348,11 +347,11 @@ async def test_staged_instruction_manifest_installs_only_on_publish_and_rolls_ba
         target = loop.config_orchestrator.copy()
         assert loop.committed_model is not None
         candidate = LaunchCandidate(
-            profile=next(iter(BUILTIN_SUBAGENTS.values())),
+            identity="coder",
             config_inputs={},
             orchestrator=target,
             semantic_overrides=overrides,
-            persona=FrozenPersona(loop.config.system_prompt_id, None),
+            persona=FrozenPersona(None),
             effective_model=target.config.get_active_model(),
             committed_model=loop.committed_model,
             effective_thinking=target.config.get_active_model().thinking,

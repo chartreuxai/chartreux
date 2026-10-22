@@ -30,7 +30,7 @@ from chartreux.app_server.protocol import (
 from chartreux.app_server.server import CallbackDelivery, InitializationState
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.config import SessionLoggingConfig
-from chartreux.core.subagents import LaunchConfigError, MissingAgentProfileError
+from chartreux.core.subagents import InvalidLaunchConfigError, LaunchConfigError
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.stubs.app_server import build_test_app_server, legacy_backend
 
@@ -59,7 +59,13 @@ def test_json_rpc_envelopes_reject_malformed_shapes(message: dict[str, object]) 
     ("error", "field_path"),
     [
         (LaunchConfigError("config.model"), "config.model"),
-        (MissingAgentProfileError("agent_type"), "agent_type"),
+        (
+            InvalidLaunchConfigError(
+                "launch_config.persona",
+                "Stored launch identity does not match its link",
+            ),
+            "launch_config.persona",
+        ),
     ],
 )
 async def test_launch_config_errors_have_stable_protocol_diagnostics(

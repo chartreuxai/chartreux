@@ -97,7 +97,7 @@ class MergeFieldMetadata:
 
     Usage::
 
-        active_model: Annotated[str, WithReplaceMerge()] = "@orchestrator"
+        active_model: Annotated[str, WithReplaceMerge()] = "@main"
         models: Annotated[list[M], WithUnionMerge(merge_key="alias")]
 
     Use the concrete subclasses (``WithReplaceMerge``, ``WithConcatMerge``, etc.)

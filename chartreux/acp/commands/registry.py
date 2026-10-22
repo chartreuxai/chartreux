@@ -56,7 +56,10 @@ def _build_commands() -> dict[str, AcpCommand]:
         ),
         "reload": AcpCommand(
             name="reload",
-            description="Reload configuration, agent instructions, and skills from disk",
+            description=(
+                "Refresh AGENTS.md, skills, and catalogs; frozen policy "
+                "stays bound, edits reported as pending"
+            ),
             kind=AcpCommandKind.RELOAD,
         ),
         "log": AcpCommand(

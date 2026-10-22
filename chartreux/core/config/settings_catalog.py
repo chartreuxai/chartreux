@@ -21,6 +21,9 @@ from chartreux.core.config.models import (
     StatusLineConfig,
 )
 
+IDENTITY_SETTINGS_GROUP = "Identity & Orchestration"
+TASK_IDENTITY_DENYLIST_PATH = "tools.task.denylist"
+
 
 @dataclass(frozen=True)
 class SettingDescriptor:
@@ -35,7 +38,7 @@ class SettingDescriptor:
         Literal["checklist", "toggle_inventory", "status_line", "shell_permissions"]
         | None
     ) = None
-    inventory: Literal["tools", "skills", "agents"] | None = None
+    inventory: Literal["tools", "skills", "identities"] | None = None
     minimum: int | float | None = None
     exclusive_minimum: bool = False
     empty: str = "Empty text is a saved value; use Remove User Override for Not Set."
@@ -391,12 +394,39 @@ EDITABLE_SETTINGS: tuple[SettingDescriptor, ...] = (
         "Network",
         risk="needs-confirmation",
     ),
-    SettingDescriptor(
-        "system_prompt_id",
-        "System Prompt",
-        "Prompt used for conversations.",
-        "enum",
-        "Prompts & Compaction",
+    *(
+        SettingDescriptor(
+            path,
+            label,
+            description,
+            "enum",
+            IDENTITY_SETTINGS_GROUP,
+            timing="next-conversation",
+            timing_verified=True,
+        )
+        for path, label, description in (
+            (
+                "agent.identity",
+                "Identity",
+                "Who performs the work: the main prompt and execution posture "
+                "for new conversations (built-in coder/orchestrator/researcher/"
+                "reviewer/advisor; custom prompt files select as bare names).",
+            ),
+            (
+                "agent.workflow",
+                "Workflow",
+                "What process and approval stages apply to new conversations "
+                "(minimal default; ceremony built in; custom bodies in "
+                "~/.chartreux/workflows).",
+            ),
+            (
+                "agent.orchestration_strategy",
+                "Orchestration Strategy",
+                "How delegated work is packaged and routed (none default; "
+                "builtin:default shipped; custom bodies in "
+                "~/.chartreux/orchestration_strategies).",
+            ),
+        )
     ),
     SettingDescriptor(
         "compaction_prompt_id",
@@ -417,32 +447,11 @@ EDITABLE_SETTINGS: tuple[SettingDescriptor, ...] = (
         )
         for path, label, description, item_kind, empty in (
             (
-                "agent_paths",
-                "Agent Paths",
-                "Additional agent directories (paths).",
-                "path",
-                "Empty uses built-in agent locations.",
-            ),
-            (
                 "skill_paths",
                 "Skill Paths",
                 "Additional skill directories (paths).",
                 "path",
                 "Empty uses built-in skill locations.",
-            ),
-            (
-                "enabled_agents",
-                "Enabled Agents",
-                "Allowed agent names, globs, or re: patterns.",
-                "pattern",
-                "Empty allows all agents (subject to disabled_agents).",
-            ),
-            (
-                "disabled_agents",
-                "Disabled Agents",
-                "Blocked agent names, globs, or re: patterns.",
-                "pattern",
-                "Empty blocks none; ignored when enabled_agents is nonempty.",
             ),
             (
                 "enabled_skills",
@@ -515,12 +524,39 @@ SHELL_PERMISSIONS_SETTING = SettingDescriptor(
     control="shell_permissions",
 )
 
+# Backing descriptor for the identity roster (design §12): roster filtering
+# edits the task tool's identity denylist, never a retired agent filter. It is
+# deliberately not an editable row (three-level paths do not render in the
+# bootstrap file); the identities inventory is its only editing surface, and a
+# denylist write can only block launches — never grant roots or tool
+# authority.
+TASK_DENYLIST_SETTING = SettingDescriptor(
+    TASK_IDENTITY_DENYLIST_PATH,
+    "Task Identity Denylist",
+    "Blocked launch identities (name, glob, or re: patterns).",
+    "list",
+    "Advanced & Tools",
+    item_kind="pattern",
+    empty="Empty blocks no identities.",
+)
+
 VISIBLE_SETTINGS: tuple[SettingDescriptor, ...] = (
     *(
         STATUS_LINE_SETTING if item.path == "status_line.segments" else item
         for item in EDITABLE_SETTINGS
         if not item.path.startswith(("enabled_", "disabled_"))
         and (item.path not in STATUS_LINE_PATHS or item.path == "status_line.segments")
+    ),
+    SettingDescriptor(
+        "inventory_identities",
+        "Identities",
+        "All identities are launchable by default; uncheck to block the task "
+        "tool from launching one. Blocking writes the task identity denylist "
+        "(tools.task.denylist); it never grants roots or tool authority.",
+        "list",
+        "Advanced & Tools",
+        control="toggle_inventory",
+        inventory="identities",
     ),
     *(
         SettingDescriptor(
@@ -536,9 +572,9 @@ VISIBLE_SETTINGS: tuple[SettingDescriptor, ...] = (
             "list",
             "Advanced & Tools",
             control="toggle_inventory",
-            inventory=cast(Literal["tools", "skills", "agents"], category),
+            inventory=cast(Literal["tools", "skills", "identities"], category),
         )
-        for category in ("agents", "skills", "tools")
+        for category in ("skills", "tools")
     ),
     SHELL_PERMISSIONS_SETTING,
 )
@@ -606,8 +642,9 @@ def render_initial_user_config() -> str:
         "# built-in default changes will not apply until you edit this file.",
         "# Configuration is layered, lowest to highest precedence:",
         "# built-in defaults, this file, a trusted project `.chartreux/config.toml`,",
-        "# `CHARTREUX_` environment variables, the active agent profile, and runtime",
-        "# overrides. Higher layers can override values in this file.",
+        "# `CHARTREUX_` environment variables, and runtime overrides. Higher layers",
+        "# can override values in this file. The `[agent]` selections bind per",
+        "# conversation: edits apply to new conversations only.",
     ]
 
     # TOML root keys must precede the first table. Keep sections in first-seen

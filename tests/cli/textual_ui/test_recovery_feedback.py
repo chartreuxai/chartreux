@@ -131,14 +131,14 @@ async def test_no_output_completion_distinguishes_active_agents(
         # The agent list remains owned by the app rather than by turn completion.
         agent = AgentSummaryModel(
             agent_id="agent-1",
-            profile="worker",
+            identity="coder",
             availability="running",
             current_run_status="running",
             compacting=compacting,
             name=derive_agent_name(
                 agent_id="agent-1",
-                profile="worker",
-                profile_display_label=None,
+                identity="coder",
+                identity_display_label=None,
                 base_model=None,
                 effective_model=None,
             ),

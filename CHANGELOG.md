@@ -2,6 +2,136 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.5.7 (2026-10-22)
+
+### Added
+
+- Identity-based agent architecture: the profile/slot/prompt-ID
+  configuration axes are replaced by three orthogonal `[agent]` selections —
+  `identity` (default `coder`), `workflow` (default `minimal`), and
+  `orchestration_strategy` (default `none`) — with five built-in identities
+  (coder, orchestrator, researcher, reviewer, advisor) carrying typed
+  delegation and tool-posture metadata. A single-model setup needs no agent
+  configuration at all, and default routing is identical with one model or
+  ten: every shipped purpose route binds the session model, never a
+  roster-size guess. Selecting the orchestrator is one line (`[agent]
+  identity = "orchestrator"` or `chartreux --identity orchestrator`): it must
+  delegate — non-mutating personal tools, full-granted delegation — and is
+  self-sufficient without a strategy body; the delegation obligation lives
+  in the identity, never in a selectable strategy. Custom identities are new
+  prompt files in the user prompts directory (`user:`-qualified or bare);
+  workflow bodies live in `~/.chartreux/workflows/` and orchestration
+  strategies in `~/.chartreux/orchestration_strategies/`, all under one
+  strict loader contract (plain file stems, non-empty UTF-8, 64 KiB cap, no
+  traversal, `builtin:`/`user:` qualification, reserved shipped names cannot
+  be shadowed).
+- Deterministic startup prompt assembly in a fixed nine-step order: the
+  identity opening at character zero, harness-guaranteed universal critical
+  instructions and instruction hierarchy (a custom identity cannot drop
+  them), identity behavior, execution context (interactive main, headless
+  main, bounded child), the workflow body, the strategy body (absent for
+  `none`), shared references, AGENTS.md layers with canonical-file
+  deduplication (the surviving entry keeps the project label with both
+  provenance positions recorded), and a short closing re-anchor. Gate and
+  acceptance ceremony moved wholly into the `ceremony` workflow — the
+  composed default carries none of it — and shipped workflow skills align
+  with the axis: ceremony-bearing skills load only for workflow/identity
+  combinations that carry the ceremony, and the minimal default loads only
+  identity-neutral skills.
+- Frozen per-conversation policy bundle: selection AND resource content
+  freeze at conversation start, a deliberate behavior change — `/reload`
+  refreshes the tool list, skills catalog, model catalog, and AGENTS.md
+  while keeping the frozen identity/workflow/strategy bodies byte-for-byte,
+  and reports pending selection and content changes explicitly (edits apply
+  to new conversations only). Resume restores the persisted content, so a
+  conversation resumes identically after the underlying files are edited or
+  removed. Compaction summaries preserve the bound identity/workflow/strategy
+  ids and revisions, the actual delegation precedent (never invented), the
+  current phase and approval evidence, resident and pending agents with
+  their dependencies, and settled decisions with consumed budgets.
+- Canonical task grammar: `model`, `identity`, `purpose`, and `seat` are
+  top-level task fields; `model` also accepts the
+  `@<preset-or-canonical-model>[:<identity>]` shorthand (`@fast:researcher`,
+  `@fast:user:foo`). Missing components are never guessed: dual
+  `model`/`config.model` supply, shorthand/structured identity conflicts,
+  and a seat without a purpose are validation errors with no precedence
+  guess. The default child is `coder` with the bounded-child context and the
+  session model; children never inherit the parent's workflow or strategy;
+  required-delegation identities (orchestrator) are rejected as children with
+  an actionable error; `agent_id` remains the only instance handle and
+  nested spawning stays depth-limited to one.
+- Purpose routes, seats, and diversity: `[orchestration.routes.<purpose>]` in
+  `config.toml` carries
+  `targets = [{ model, identity, tier, seat?, overlay?, replacement_capability? }]`
+  and `requires_distinct_models`; sparse entries override shipped routes and
+  new keys introduce custom purposes; `research` joins the purpose
+  vocabulary. Multi-seat purposes require an explicit seat (`review.deep`:
+  the analytical and peer seats bind the read-only reviewer; the execution
+  seat runs coder with the shipped `review-execution` overlay, which rides
+  the frozen persona instructions and grants no authority). Diversity is
+  validated over canonical-model cardinality — the same model on two
+  providers counts once, and A/A/B fails a requirement of 3 — and unmet
+  requirements are reported instead of faked.
+- Per-axis authority enforcement: granted, personal, and delegation tool
+  axes with a harness-owned mutating/non-mutating tool classification (bash
+  mutating regardless of command text, custom and MCP tools mutating by
+  default, no classification-by-name inheritance, reclassification
+  invalidates child authority caches). A child's effective tools are the
+  granted ceiling intersected with every ancestor's delegation set and the
+  child's personal set, enforced below the configuration layer: a researcher
+  cannot obtain a writing coder through any path, an orchestrator cannot
+  write personally but can delegate writes within the granted ceiling, and
+  an explicit root denial still blocks delegated writes.
+- Identity denylist and invocation selections: `tools.task.denylist` blocks
+  launches by resolved identity (exact names, globs, or `re:` patterns;
+  shorthand, route, and retained launches are all checked post-resolution;
+  the Settings > Identities inventory is its denylist-only editing surface —
+  it can only block). The `--identity`, `--workflow`, and
+  `--orchestration-strategy` CLI flags and the `CHARTREUX_AGENT__*`
+  environment variables carry new-conversation selections with CLI > env >
+  config > default precedence and omission distinguished from explicit
+  selection; `chartreux doctor` resolves the selections offline and reports
+  retired settings with their successors.
+
+### Changed
+
+- The saved main-assistant preset is `@main` (was `@orchestrator`):
+  selecting `@orchestrator` fails with rename guidance and no alias, a
+  `[roles.orchestrator]` overlay over the shipped base fails loudly at load
+  (rename the table to `[roles.main]`; the catalog file is never rewritten),
+  and `active_model` in `config.toml` is rejected with guidance to edit
+  `[roles.main]`.
+- The task tool's default allowlist is `["coder"]` and its denylist keys on
+  the resolved launch identity; agent records, names, and browser surfaces
+  present identity-keyed fields. The legacy `profile` record field, task
+  `agent_type` argument bridge, and `AgentProfileMismatchError` alias are
+  removed; the error is now identity-mismatch-specific.
+- The `agents/*.toml` agent-profile directory convention is retired; those
+  files are detected and reported, but are never loaded.
+- `[subagents]` retention is the global default plus the per-launch
+  `retain` argument only — profile-level retain and idle-TTL settings are
+  gone.
+
+### Removed
+
+- Breaking (pre-release alpha; loud, actionable errors; no silent
+  migration): `system_prompt_id` no longer selects the composed prompt (the
+  `[agent]` selections do; a custom identity plus workflow/strategy
+  composition replaces full-skeleton prompt replacement), and together with
+  `agent_paths`, `enabled_agents`, and `disabled_agents` it is retired from
+  the settings catalog and flagged by `chartreux doctor` with successor
+  guidance — block launchable identities with `tools.task.denylist` instead.
+  Project-level prompt directories no longer supply identities; custom
+  resources are user-level only. The `[dispatch]` catalog overlay is
+  superseded: it no longer appears in the catalog template or the presets
+  editor, orchestration is selected through identity/workflow/strategy and
+  configured through `[orchestration.routes.*]`, and a legacy `[dispatch]`
+  table's values are preserved by catalog writes (comments and formatting are
+  not preserved), never rewritten. Sessions
+  persisted before v0.5.7 — including any persisted with
+  `active_model = "@orchestrator"` — fail resume with a diagnostic that says
+  to start a new session.
+
 ## 0.5.6 (2026-10-17)
 
 ### Added

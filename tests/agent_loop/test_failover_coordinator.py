@@ -1154,7 +1154,7 @@ def test_failover_visibility_is_accepted_by_task_results_and_agent_summaries() -
     result = TaskResult(response="ok", turns_used=1, completed=True, metadata=metadata)
     summary = AgentSummary(
         agent_id="agent",
-        profile="worker",
+        identity="coder",
         availability=AgentAvailability.IDLE,
         current_run_id=None,
         current_run_status=None,

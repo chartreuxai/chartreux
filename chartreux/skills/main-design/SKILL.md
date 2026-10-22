@@ -12,19 +12,19 @@ allowed-tools:
 
 # Main Design
 
-Own the what and why before implementation. The main agent gathers context and frames the design question; the advisor profile does the deep design analysis. The main agent synthesizes and owns the final design.
+Own the what and why before implementation. The main agent gathers context and frames the design question; the advisor identity does the deep design analysis. The main agent synthesizes and owns the final design.
 
 ## Process
 
 1. **Gather context.** Read applicable AGENTS.md files, relevant existing artifacts, and the code the design will touch. Grep for interfaces, contracts, and dependencies.
 2. **Frame the design question.** Define: the problem, constraints, preserved behavior, and what a good design must address. This is the input you pass to the advisor.
-3. **Dispatch the advisor for design analysis.** Request `design-analysis`; use the eligible slot the rendered slot table lists for that purpose and pass its profile and launch binding explicitly:
+3. **Dispatch the advisor for design analysis.** Request the `design-analysis` purpose; the launch resolves the advisor identity and the model binding from the purpose route — pass the purpose as a top-level field:
 
 ```text
-task(task="Design analysis for: <problem>. Context: <relevant code, interfaces, constraints>. Requirements: <what the design must address, preserved behavior, non-goals>. Return a recommended approach with rationale, alternatives rejected, risks, and assumptions.", agent_type="<slot.profile>", config={model="<slot launch binding>"})
+task(task="Design analysis for: <problem>. Context: <relevant code, interfaces, constraints>. Requirements: <what the design must address, preserved behavior, non-goals>. Return a recommended approach with rationale, alternatives rejected, risks, and assumptions.", purpose="design-analysis")
 ```
 
-For large or cross-cutting changes, dispatch the `advisor` profile (or `worker`) with `sub-architecture-mapper` first to map the affected subsystems, then use that output to frame the design question.
+For large or cross-cutting changes, first dispatch a bounded exploration child (`purpose="exploration"`) that loads `sub-architecture-mapper` to map the affected subsystems, then use that output to frame the design question.
 
 4. **Synthesize.** Review the advisor's analysis. The main agent owns the final design — accept, adjust, or reject the advisor's recommendation. If the advisor's design misses something the user asked for, fix it.
 5. **Present to the user.** Share the design inline in the conversation. Obtain the user's explicit design acceptance before proceeding; continued discussion, questions, or silence are not acceptance.

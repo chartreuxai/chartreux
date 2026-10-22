@@ -1,17 +1,17 @@
 """Full-TUI graduation integration at the compaction-event boundary.
 
-The second model starts disabled and is enabled and saved through the workbench.
-Every slot role binds the mock model except ``@heavy``, which binds the disabled
-second model, so the bound roster is single-model until that save transitions
-it. A typed compaction event is injected instead of forcing real token overflow;
-the signal truth tables live in tests/ui/providers/test_graduation.py. Here the
-real app handles the event, idle boundary, clickable notice, persisted dismissal
-and presets navigation. A second journey pins a fresh two-model install (the
-shipped roster binds both default models), where no save latches and no nudge
-appears. A third journey binds a session whose live roster is empty while the
-workbench snapshot pre-save roster has one identity: the live empty roster
-wins and a 0->2 transition never latches. This is an in-process Textual
-journey, not a real-model or manual live pass.
+The second model starts disabled and is enabled and saved through the workbench;
+no roster shape drives a suggestion anymore. A typed compaction event is
+injected instead of forcing real token overflow; the signal truth tables live in
+tests/ui/providers/test_graduation.py. Here the real app handles the event, idle
+boundary, clickable notice, persisted dismissal and presets navigation. A
+second journey pins a fresh two-model install (the shipped roster binds both
+default models), where key entry and catalog saves never signal and only the
+compaction does. A third journey binds a session whose live roster is empty
+while the workbench snapshot pre-save roster has one identity: the live empty
+roster stays authoritative and the roster-transitioning save still never
+signals. This is an in-process Textual journey, not a real-model or manual
+live pass.
 """
 
 from __future__ import annotations
@@ -61,17 +61,25 @@ async def test_graduation_idle_notice_and_persistent_actions(
         + 'name = "second-model"\ndisabled = true\n'
         + '\n[dispatch]\nmode = "standalone"\n'
     )
-    assert not GraduationStore().state.second_model_saved
+    assert not GraduationStore().state.need_signal
     config = (await build_default_orchestrator()).config
     app = build_test_chartreux_app(config=config)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
         notice = app.query_one("#graduation-notice")
         assert not notice.display
-        assert app.config.dispatch_mode == "standalone"
-        # The session-bound roster is single-model while the second model is
-        # disabled: @heavy stays unbound.
-        assert app.config.bound_roster == ["mock-model"]
+        # The dispatch posture is retired from the config view (package 16b);
+        # the legacy [dispatch] table in models.toml is reported loudly at
+        # load and never merged.
+        assert not hasattr(app.config, "dispatch_mode")
+        assert not hasattr(app.config, "bound_roster")
+        diagnostics = "\n".join(config.catalog_snapshot.dispatch_diagnostics)
+        assert "The legacy [dispatch] table in" in diagnostics
+        assert "[orchestration.routes.<purpose>]" in diagnostics
+        # The roster is single-model while the second model is disabled:
+        # @heavy stays unbound until the workbench save enables it.
+        deployments = config.catalog_snapshot.catalog.models["second-model"].deployments
+        assert deployments[0].disabled
         # A modal is a non-idle boundary even when the model is not streaming.
         await app._show_providers()
         await pilot.pause()
@@ -113,11 +121,11 @@ async def test_graduation_idle_notice_and_persistent_actions(
         operations.focus()
         await pilot.press("enter")
         await pilot.pause()
-        assert GraduationStore().state.second_model_saved
+        assert not GraduationStore().state.need_signal
         assert not tomllib.loads(catalog_path.read_text())["models"]["second-model"][
             "deployments"
         ][0]["disabled"]
-        assert not notice.display  # second-model save alone is not enough
+        assert not notice.display  # a roster-transitioning save alone is not enough
         # Inject a typed live compaction notification, not a mocked UI action.
         app._refresh_status_for_event(
             SessionCompacted(
@@ -147,11 +155,12 @@ async def test_graduation_idle_notice_and_persistent_actions(
         app._maybe_show_graduation()
         assert app.screen.focused is focused
         # Rich click spans in the actual 80-column TUI notice.
-        await pilot.click("#graduation-notice", offset=(36 if customize else 48, 0))
+        await pilot.click("#graduation-notice", offset=(56 if customize else 66, 0))
         await pilot.pause()
         assert not notice.display
         assert GraduationStore().state.dismissed
-        assert app.config.dispatch_mode == "standalone"
+        assert not hasattr(app.config, "dispatch_mode")
+        # Catalog writes preserve the legacy [dispatch] table byte-for-byte.
         assert (
             tomllib.loads(catalog_path.read_text())["dispatch"]["mode"] == "standalone"
         )
@@ -159,7 +168,7 @@ async def test_graduation_idle_notice_and_persistent_actions(
             screen = app.screen
             assert isinstance(screen, ProviderWorkbenchScreen)
             assert screen.view == WorkbenchView.PRESETS
-            assert "preset:orchestrator" in {
+            assert "preset:main" in {
                 option.id
                 for option in screen.query_one("#wb-presets", OptionList).options
             }
@@ -176,10 +185,10 @@ async def test_graduation_idle_notice_and_persistent_actions(
 
 
 @pytest.mark.asyncio
-async def test_fresh_two_model_install_never_latches(
+async def test_fresh_two_model_install_never_signals_from_saves(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A fresh R1 install binds both default models; no save latches, no nudge."""
+    """A fresh R1 install binds both default models; only compaction signals."""
     home = tmp_path / "fresh-home"
     monkeypatch.setenv("CHARTREUX_HOME", str(home))
     monkeypatch.setenv("MISTRAL_API_KEY", "fake-key")
@@ -187,18 +196,23 @@ async def test_fresh_two_model_install_never_latches(
     home.mkdir(parents=True)
     (home / "config.toml").write_text("disable_welcome_banner_animation = true\n")
     # No models.toml: the shipped catalog binds glm-5-3 and mistral-large-4.
-    assert not GraduationStore().state.second_model_saved
+    assert not GraduationStore().state.need_signal
     config = (await build_default_orchestrator()).config
     app = build_test_chartreux_app(config=config)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
         notice = app.query_one("#graduation-notice")
         assert not notice.display
-        assert app.config.dispatch_mode == "standalone"
-        # The projection sorts; a non-None list means a policy is attached.
-        assert app.config.bound_roster == ["glm-5-3", "mistral-large-4"]
+        # The dispatch posture is retired from the config view (package 16b).
+        assert not hasattr(app.config, "dispatch_mode")
+        assert not hasattr(app.config, "bound_roster")
+        # The shipped catalog's role bindings cover both default models.
+        role_models = {
+            role.model for role in config.catalog_snapshot.catalog.roles.values()
+        }
+        assert role_models == {"glm-5-3", "mistral-large-4"}
         # Entering the provider key in Provider Settings makes both default
-        # models usable at once, but the roster already bound two identities.
+        # models usable at once, but no save ever drives a suggestion.
         monkeypatch.delenv("MISTRAL_API_KEY")
         await app._show_providers()
         await pilot.pause()
@@ -207,13 +221,14 @@ async def test_fresh_two_model_install_never_latches(
         screen.state = ManagementState.from_snapshot(screen.snapshot, "mistral")
         screen._save_key("fake-key")
         await pilot.pause()
-        assert not GraduationStore().state.second_model_saved
+        assert not GraduationStore().state.need_signal
         for _ in range(5):
             if len(app.screen_stack) == 1:
                 break
             await pilot.press("escape")
             await pilot.pause()
-        # A compaction after the key entry still cannot show the nudge.
+        # A compaction after the key entry is the failure-driven signal: the
+        # nudge appears once the app is idle.
         app._refresh_status_for_event(
             SessionCompacted(
                 SessionCompactedParams(
@@ -228,17 +243,16 @@ async def test_fresh_two_model_install_never_latches(
             )
         )
         await pilot.pause()
-        assert not notice.display
-        assert not GraduationStore().state.shown
-        assert not GraduationStore().state.second_model_saved
         assert app._graduation.state.need_signal
+        assert notice.display
+        assert GraduationStore().state.shown
 
 
 @pytest.mark.asyncio
-async def test_empty_live_roster_never_latches(
+async def test_empty_live_roster_save_never_signals(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A session bound with no slots keeps its live empty roster: no 0->2 latch."""
+    """A session bound with no slots keeps its live empty roster; saves never signal."""
     home = tmp_path / "empty-roster-home"
     monkeypatch.setenv("CHARTREUX_HOME", str(home))
     monkeypatch.setenv("MISTRAL_API_KEY", "fake-key")
@@ -252,7 +266,7 @@ async def test_empty_live_roster_never_latches(
         '[models."mock-model"]\nthinking = "off"\ntemperature = 0.2\n\n'
         '[[models."mock-model".deployments]]\nprovider = "mock-provider"\n'
         'name = "mock-model"\nsupports_images = false\n\n'
-        '[roles."orchestrator"]\ndescription = "E2E main assistant preset"\n'
+        '[roles."main"]\ndescription = "E2E main assistant preset"\n'
         'model = "mock-model"\nthinking = "high"\n'
     )
     # At session start no slot role resolves: the live policy attaches with an
@@ -270,8 +284,20 @@ async def test_empty_live_roster_never_latches(
         await pilot.pause()
         notice = app.query_one("#graduation-notice")
         assert not notice.display
-        assert app.config.dispatch_mode == "standalone"
-        assert app.config.bound_roster == []
+        # The dispatch posture is retired from the config view (package 16b);
+        # the legacy [dispatch] table is reported loudly, never merged.
+        assert not hasattr(app.config, "dispatch_mode")
+        assert not hasattr(app.config, "bound_roster")
+        diagnostics = "\n".join(config.catalog_snapshot.dispatch_diagnostics)
+        assert "The legacy [dispatch] table in" in diagnostics
+        # At session start no dispatch-slot role resolves: the slot roles all
+        # bind a model the catalog does not define.
+        catalog = config.catalog_snapshot.catalog
+        slot_role_models = {
+            catalog.roles[name].model for name in ("scout", "worker", "heavy")
+        }
+        assert slot_role_models == {"missing-model"}
+        assert "missing-model" not in catalog.models
         # The catalog gains one bound identity before the workbench opens, so
         # the workbench snapshot pre-save roster has one identity while the
         # live roster stays empty.
@@ -289,18 +315,22 @@ async def test_empty_live_roster_never_latches(
         await pilot.pause()
         assert isinstance(app.screen, ProviderWorkbenchScreen)
         screen = app.screen
-        assert screen._bound_roster_identities(screen.snapshot) == frozenset({
-            "mock-model"
-        })
+        # The workbench snapshot's pre-save roster has one bound identity
+        # (the bound-roster surface itself is retired with package 16b): the
+        # slot roles bind the mock model, and the second model is disabled.
+        snapshot_catalog = screen.snapshot.catalog
+        role_models = {role.model for role in snapshot_catalog.roles.values()}
+        assert role_models == {"mock-model", "second-model"}
+        assert snapshot_catalog.models["second-model"].deployments[0].disabled
         screen.state = ManagementState.from_snapshot(screen.snapshot, "mock-provider")
         state = screen.state
         assert state is not None
         state.toggle("second-model", True)
         await screen._commit(state.changes(), state, create=False)
         await pilot.pause()
-        # The live roster is empty: a 0->2 transition never latches, even
-        # though the workbench snapshot pre-save roster had one identity.
-        assert not GraduationStore().state.second_model_saved
+        # The live roster is empty: the roster-transitioning save still never
+        # signals, whatever the workbench snapshot pre-save roster held.
+        assert not GraduationStore().state.need_signal
         for _ in range(5):
             if len(app.screen_stack) == 1:
                 break
@@ -320,9 +350,9 @@ async def test_empty_live_roster_never_latches(
             )
         )
         await pilot.pause()
-        assert not notice.display
-        assert not GraduationStore().state.shown
-        assert not GraduationStore().state.second_model_saved
+        assert app._graduation.state.need_signal
+        assert notice.display
+        assert GraduationStore().state.shown
 
 
 @pytest.mark.asyncio
@@ -332,9 +362,7 @@ async def test_empty_live_roster_never_latches(
 async def test_limit_stops_require_implementation_slot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_kind: str
 ) -> None:
-    from dataclasses import replace
-
-    from chartreux.app_server._projection import project_launch_slot_purposes
+    from chartreux.app_server._projection import project_launch_purposes
     from chartreux.app_server.events import AgentsUpdate, ClientProjection
     from chartreux.app_server.protocol import (
         AgentSummaryModel,
@@ -342,8 +370,6 @@ async def test_limit_stops_require_implementation_slot(
         Notification,
         RunStopReason,
     )
-    from chartreux.core.dispatch.presets import STANDALONE_PRESET
-    from chartreux.core.launch_types import LaunchConfig
     from chartreux.core.subagents import derive_agent_name
     from tests.conftest import build_test_agent_loop
 
@@ -352,23 +378,18 @@ async def test_limit_stops_require_implementation_slot(
     monkeypatch.setenv("MISTRAL_API_KEY", "fake-key")
     write_e2e_config(home, "http://127.0.0.1:1/v1")
     config = (await build_default_orchestrator()).config
-    # Keep @worker unambiguous for the positive control; the shared-role overlay
-    # then intentionally makes verification indistinguishable from implementation.
-    slots = dict(STANDALONE_PRESET.slots)
-    if launch_kind == "shared-role":
-        slots["mechanical"] = slots["mechanical"].model_copy(update={"role": "@worker"})
-    config.attach_catalog_snapshot(
-        replace(
-            config.catalog_snapshot,
-            dispatch=STANDALONE_PRESET.model_copy(update={"slots": slots}),
-        )
-    )
     loop = build_test_agent_loop(config=config)
-    loop.launch_overrides = LaunchConfig(
-        model="@scout" if launch_kind == "verification" else "@worker"
-    )
+    # The launch purpose recorded at resolution drives the projection (the
+    # dispatch slot purposes are retired with package 16b): a verification
+    # launch carries its mechanical purpose, a direct launch carries none,
+    # and an implementation launch carries the implementation purpose.
+    loop.launch_purpose = {
+        "verification": "verification",
+        "shared-role": None,
+        "implementation": "implementation",
+    }[launch_kind]
     try:
-        purposes = project_launch_slot_purposes(loop, "worker")
+        purposes = project_launch_purposes(loop)
         if launch_kind == "shared-role":
             assert purposes == []
         app = build_test_chartreux_app(config=config)
@@ -378,16 +399,16 @@ async def test_limit_stops_require_implementation_slot(
             for run_id in ("run-1", "run-2"):
                 agent = AgentSummaryModel(
                     agent_id="worker-1",
-                    profile="worker",
+                    identity="coder",
                     availability="running",
                     current_run_id=run_id,
                     current_run_status="running",
                     current_task_summary="same task",
-                    slot_purposes=purposes,
+                    launch_purposes=purposes,
                     name=derive_agent_name(
                         agent_id="worker-1",
-                        profile="worker",
-                        profile_display_label=None,
+                        identity="coder",
+                        identity_display_label=None,
                         base_model=None,
                         effective_model=None,
                     ),

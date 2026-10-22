@@ -10,6 +10,7 @@ from pydantic import (
     AfterValidator,
     BaseModel,
     BeforeValidator,
+    ConfigDict,
     Field,
     PrivateAttr,
     ValidationError,
@@ -33,17 +34,21 @@ from chartreux.core.config._defaults import (
 # (vibe_schema.py imports from chartreux.observability.logging). The constant
 # lives in chartreux.config_values.
 from chartreux.core.config.models import (
+    AgentSelectionConfig,
     MCPServer,
     MissingAPIKeyError,
     ModelConfig,
     ProjectContextConfig,
     ProviderConfig,
+    PurposeRoute,
+    PurposeRouteDefaultsConfig,
     RecoverySectionConfig,
     SessionLoggingConfig,
     StatusLineConfig,
     SubagentsConfig,
     ThinkingLevel,
     UserQuestionsConfig,
+    _default_purpose_routes,
     normalize_authorized_roots,
     normalize_dangerous_command_grants,
 )
@@ -59,12 +64,7 @@ from chartreux.core.config.schema import (
 )
 from chartreux.core.llm_models import Backend
 from chartreux.core.paths import GLOBAL_ENV_FILE
-from chartreux.core.prompts import (
-    SystemPrompt,
-    UtilityPrompt,
-    load_prompt,
-    load_system_prompt,
-)
+from chartreux.core.prompts import UtilityPrompt, load_prompt
 from chartreux.utils.api_keys import resolve_api_key
 from chartreux.utils.private_paths import restrict_private_file
 
@@ -89,6 +89,14 @@ def load_dotenv_values(
             # An explicit non-empty process/shell value wins over the .env file.
             continue
         environ[key] = value
+
+
+class OrchestrationConfig(BaseModel):
+    """The ``[orchestration]`` section: purpose-route launch bindings."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    routes: dict[str, PurposeRoute] = Field(default_factory=_default_purpose_routes)
 
 
 # The catalog is deliberately not a field of ChartreuxConfigSchema.  It is loaded
@@ -227,23 +235,6 @@ class ChartreuxConfigSchema(ConfigSchema):
     _validation_warnings: list[str] = PrivateAttr(default_factory=list)
     _catalog_snapshot: Any = PrivateAttr(default=None)
     _committed_model: Any = PrivateAttr(default=None)
-    _bound_dispatch_policy: Any = PrivateAttr(default=None)
-    _dispatch_activation_diagnostics: tuple[str, ...] = PrivateAttr(default=())
-
-    def attach_dispatch_diagnostics(
-        self, diagnostics: tuple[str, ...]
-    ) -> ChartreuxConfigSchema:
-        """Replace registry activation notes with the current validation result."""
-        object.__setattr__(self, "_dispatch_activation_diagnostics", diagnostics)
-        return self
-
-    @property
-    def bound_dispatch_policy(self) -> Any:
-        return self._bound_dispatch_policy
-
-    def attach_dispatch_policy(self, policy: Any) -> ChartreuxConfigSchema:
-        object.__setattr__(self, "_bound_dispatch_policy", policy)
-        return self
 
     @property
     def catalog_snapshot(self) -> Any:
@@ -267,19 +258,7 @@ class ChartreuxConfigSchema(ConfigSchema):
             if self._catalog_snapshot
             else ()
         )
-        session_notes = (
-            self._bound_dispatch_policy.diagnostics
-            if self._bound_dispatch_policy
-            else ()
-        )
-        return tuple(
-            dict.fromkeys((
-                *self._validation_warnings,
-                *catalog_notes,
-                *self._dispatch_activation_diagnostics,
-                *session_notes,
-            ))
-        )
+        return tuple(dict.fromkeys((*self._validation_warnings, *catalog_notes)))
 
     # Models
     active_model: Annotated[str, WithReplaceMerge()] = UNPINNED_ACTIVE_MODEL
@@ -381,29 +360,6 @@ class ChartreuxConfigSchema(ConfigSchema):
         default_factory=list, description="Preferred MCP server configuration entries."
     )
 
-    # Agents
-    agent_paths: Annotated[list[Path], WithReplaceMerge()] = Field(
-        default_factory=list,
-        description=(
-            "Additional directories to search for custom agent profiles. "
-            "Each path may be absolute or relative to the current working directory."
-        ),
-    )
-    enabled_agents: Annotated[list[str], WithReplaceMerge()] = Field(
-        default_factory=list,
-        description=(
-            "An explicit list of agent names/patterns to enable. If set, only these"
-            " agents will be available. Supports glob patterns (e.g., 'custom-*')"
-            " and regex with 're:' prefix."
-        ),
-    )
-    disabled_agents: Annotated[list[str], WithReplaceMerge()] = Field(
-        default_factory=list,
-        description=(
-            "A list of agent names/patterns to disable. Ignored if 'enabled_agents'"
-            " is set. Supports glob patterns and regex with 're:' prefix."
-        ),
-    )
     # Skills
     skill_paths: Annotated[
         list[Path], WithReplaceMerge(), BeforeValidator(_expand_paths)
@@ -444,7 +400,6 @@ class ChartreuxConfigSchema(ConfigSchema):
     )
     ascii_chrome: Annotated[bool, WithReplaceMerge()] = False
     raise_on_compaction_failure: Annotated[bool, WithReplaceMerge()] = False
-    system_prompt_id: Annotated[str, WithReplaceMerge()] = SystemPrompt.CLI
     compaction_prompt_id: Annotated[str, WithReplaceMerge()] = UtilityPrompt.COMPACT
     include_commit_signature: Annotated[bool, WithReplaceMerge()] = True
     include_model_info: Annotated[bool, WithReplaceMerge()] = True
@@ -466,6 +421,12 @@ class ChartreuxConfigSchema(ConfigSchema):
     ] = None
 
     # Nested configs (DEEP_MERGE — sparse layers preserve unspecified keys)
+    agent: Annotated[AgentSelectionConfig, WithDeepMerge()] = Field(
+        default_factory=AgentSelectionConfig
+    )
+    orchestration: Annotated[OrchestrationConfig, WithDeepMerge()] = Field(
+        default_factory=OrchestrationConfig
+    )
     project_context: Annotated[ProjectContextConfig, WithDeepMerge()] = Field(
         default_factory=ProjectContextConfig
     )
@@ -493,13 +454,13 @@ class ChartreuxConfigSchema(ConfigSchema):
         default_factory=UserQuestionsConfig
     )
 
-    def _resolve_orchestrator_model(self) -> ResolvedModel:
+    def _resolve_main_model(self) -> ResolvedModel:
         """Resolve the one configured default model and thinking level."""
         from chartreux.core.model_catalog.resolver import resolver_for
 
-        role = self.catalog_snapshot.catalog.roles.get("orchestrator")
+        role = self.catalog_snapshot.catalog.roles.get("main")
         return resolver_for(self).resolve(
-            "@orchestrator",
+            "@main",
             allowed_models=self.allowed_models,
             thinking_override=(
                 self.thinking_overrides.get(role.model) if role is not None else None
@@ -507,7 +468,12 @@ class ChartreuxConfigSchema(ConfigSchema):
         )
 
     def resolve_default_model_alias(self) -> str:
-        return self._resolve_orchestrator_model().base_model
+        return self._resolve_main_model().base_model
+
+    @property
+    def purpose_routes(self) -> PurposeRouteDefaultsConfig:
+        """The purpose-route bindings carried by ``[orchestration.routes]``."""
+        return PurposeRouteDefaultsConfig(routes=self.orchestration.routes)
 
     def available_models(self) -> dict[str, ModelConfig]:
         from chartreux.core.model_catalog.resolver import (
@@ -532,13 +498,13 @@ class ChartreuxConfigSchema(ConfigSchema):
         from chartreux.core.model_catalog.resolver import resolver_for
 
         resolver = resolver_for(self)
-        expression = self.active_model or "@orchestrator"
+        expression = self.active_model or "@main"
         if self._committed_model is not None:
             resolved = resolver.resolve_committed(
                 self._committed_model, allowed_models=self.allowed_models
             )
-        elif expression == "@orchestrator":
-            resolved = self._resolve_orchestrator_model()
+        elif expression == "@main":
+            resolved = self._resolve_main_model()
         else:
             role = (
                 self.catalog_snapshot.catalog.roles.get(expression[1:])
@@ -640,10 +606,6 @@ class ChartreuxConfigSchema(ConfigSchema):
         merged = sorted(allowlist + new_patterns)
         self.tools.setdefault(tool_name, {})["allowlist"] = merged
         return {"tools": {tool_name: {"allowlist": merged}}}
-
-    @property
-    def system_prompt(self) -> str:
-        return load_system_prompt(self.system_prompt_id)
 
     @property
     def compaction_prompt(self) -> str:

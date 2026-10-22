@@ -13,6 +13,7 @@ if TYPE_CHECKING:
         DEFAULT_THEME,
         FALLBACK_THEME,
     )
+    from chartreux.core.config.agent_selection import AgentSelectionConfig
     from chartreux.core.config.chartreux_schema import (
         ChartreuxConfigSchema,
         create_default_config,
@@ -34,7 +35,6 @@ if TYPE_CHECKING:
         TrustResolutionError,
         UntrustedLayerError,
     )
-    from chartreux.core.config.layers.agent_profile import AgentProfileLayer
     from chartreux.core.config.layers.default import DefaultConfigLayer
     from chartreux.core.config.models import (
         THINKING_LEVELS,
@@ -95,7 +95,7 @@ __all__ = [
     "MISSING_BACKING_STORE_DATA_FINGERPRINT",
     "THINKING_LEVELS",
     "AddOperationPatch",
-    "AgentProfileLayer",
+    "AgentSelectionConfig",
     "ChartreuxConfigSchema",
     "ChartreuxConfigSchemaType",
     "ConfigChangeCallback",
@@ -192,9 +192,9 @@ _MAPPING: dict[str, tuple[str, str]] = {
     "RawConfig": ("chartreux.core.config.layer", "RawConfig"),
     "TrustResolutionError": ("chartreux.core.config.layer", "TrustResolutionError"),
     "UntrustedLayerError": ("chartreux.core.config.layer", "UntrustedLayerError"),
-    "AgentProfileLayer": (
-        "chartreux.core.config.layers.agent_profile",
-        "AgentProfileLayer",
+    "AgentSelectionConfig": (
+        "chartreux.core.config.agent_selection",
+        "AgentSelectionConfig",
     ),
     "DefaultConfigLayer": (
         "chartreux.core.config.layers.default",

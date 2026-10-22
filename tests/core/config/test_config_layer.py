@@ -16,7 +16,6 @@ from chartreux.core.config.layer import (
     RawConfig,
     UntrustedLayerError,
 )
-from chartreux.core.config.layers.agent_profile import AgentProfileLayer
 from chartreux.core.config.layers.default import DefaultConfigLayer
 from chartreux.core.config.patch import (
     ConfigPatch,
@@ -133,47 +132,6 @@ async def test_default_config_layer_is_read_only() -> None:
                 fingerprint=fingerprint,
             )
         )
-
-
-@pytest.mark.asyncio
-async def test_agent_profile_layer_replaces_full_payload() -> None:
-    layer = AgentProfileLayer(
-        data={
-            "enabled_tools": ["grep"],
-            "tools": {"write_file": {"permission": "never"}},
-        }
-    )
-
-    await layer.load()
-    fingerprint = layer.fingerprint
-    assert fingerprint is not None
-    await layer.apply(
-        ConfigPatch(
-            ReplaceOperationPatch(path="", value={"disabled_tools": ["write_file"]}),
-            fingerprint=fingerprint,
-            reason="agent profile changed",
-        )
-    )
-
-    assert (await layer.load()).model_dump() == {"disabled_tools": ["write_file"]}
-
-
-@pytest.mark.asyncio
-async def test_agent_profile_layer_clear_removes_profile_overrides() -> None:
-    layer = AgentProfileLayer(data={"disabled_tools": ["write_file"]})
-
-    await layer.load()
-    fingerprint = layer.fingerprint
-    assert fingerprint is not None
-    await layer.apply(
-        ConfigPatch(
-            ReplaceOperationPatch(path="", value={}),
-            fingerprint=fingerprint,
-            reason="agent profile cleared",
-        )
-    )
-
-    assert (await layer.load()).model_dump() == {}
 
 
 @pytest.mark.asyncio

@@ -328,7 +328,7 @@ async def _launch(
     """Launch a retained background worker child."""
     return await _background_result(
         harness.registry,
-        TaskArgs(task=task, agent_type="worker", background=True, retain=True),
+        TaskArgs(task=task, identity="coder", background=True, retain=True),
         InvokeContext(tool_call_id=tool_call_id, session_id=harness.parent.session_id),
     )
 
@@ -1334,7 +1334,7 @@ async def test_transient_launch_failure_gets_one_bounded_startup_retry(
         assert len(_events_of(caplog, "success")) == 1
         assert _events_of(caplog, "exhaustion") == []
         assert record.same_agent_resumes_used == 1
-        assert harness.controller._lineage == {"brief:worker:fix the launch": 1}
+        assert harness.controller._lineage == {"brief:coder:fix the launch": 1}
     finally:
         await harness.registry.drain_children()
         await harness.parent.aclose()
@@ -1448,7 +1448,7 @@ async def test_recurrence_counter_spans_replacements(
         exhaustion = _events_of(caplog, "exhaustion")
         assert len(exhaustion) == 1
         assert exhaustion[0]["detail"] == "auto_retries_exhausted"
-        assert harness.controller._lineage == {"brief:worker:pkg-x": 1}
+        assert harness.controller._lineage == {"brief:coder:pkg-x": 1}
 
         # The replacement: a NEW agent with the SAME brief (package identity).
         agent_b, run_b, failed_b, record_b = await _suspend_child(
@@ -1467,7 +1467,7 @@ async def test_recurrence_counter_spans_replacements(
         exhaustion = _events_of(caplog, "exhaustion")
         assert len(exhaustion) == 2
         assert exhaustion[1]["detail"] == "package_recurrence_exhausted"
-        assert harness.controller._lineage == {"brief:worker:pkg-x": 1}
+        assert harness.controller._lineage == {"brief:coder:pkg-x": 1}
     finally:
         await harness.registry.drain_children()
         await harness.parent.aclose()

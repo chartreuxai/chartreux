@@ -33,7 +33,6 @@ from typing import Any
 from pydantic import ValidationError
 import tomli_w
 
-from chartreux.core.dispatch import DEFAULT_DISPATCH_MODE, SHIPPED_PRESETS
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import (
     CatalogSnapshot,
@@ -63,10 +62,9 @@ def render_default_template() -> str:
     """Render the editable default ``models.toml`` template.
 
     The template carries the shipped default setup — both model tables with
-    their deployments, the four role presets, and sparse ``[dispatch]`` slot
-    role bindings — and no provider tables.
+    their deployments and the four role presets — and no provider tables and
+    no dispatch policy: the catalog file owns models and presets only.
     """
-    policy = SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE]
     overlay: dict[str, Any] = {
         "models": {
             name: definition.model_dump(
@@ -79,12 +77,6 @@ def render_default_template() -> str:
                 mode="json", exclude_defaults=True, exclude_none=True
             )
             for name, definition in SHIPPED_CATALOG.roles.items()
-        },
-        # Sparse dispatch: the mode plus slot role bindings only; prose and
-        # slot metadata inherit from the shipped preset.
-        "dispatch": {
-            "mode": DEFAULT_DISPATCH_MODE.value,
-            "slots": {name: {"role": slot.role} for name, slot in policy.slots.items()},
         },
     }
     return _TEMPLATE_HEADER + tomli_w.dumps(overlay)
@@ -127,9 +119,9 @@ def _validate_round_trip(template: str) -> None:
     """Refuse to publish a template that diverges from the shipped defaults.
 
     The rendered template must load through the ordinary overlay path to
-    exactly what the runtime serves without a file: the same catalog, the
-    same dispatch policy, and the same revision (materialization is
-    revision-neutral), with no dispatch diagnostics and no overlaid providers.
+    exactly what the runtime serves without a file: the same catalog and
+    the same revision (materialization is revision-neutral), with no load
+    diagnostics and no overlaid providers.
     """
     try:
         overlay = tomllib.loads(template)
@@ -144,7 +136,6 @@ def _validate_round_trip(template: str) -> None:
         field
         for field, actual, expected in (
             ("catalog", snapshot.catalog, shipped.catalog),
-            ("dispatch", snapshot.dispatch, shipped.dispatch),
             ("revision", snapshot.revision, shipped.revision),
         )
         if actual != expected

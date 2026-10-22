@@ -10,7 +10,12 @@ from chartreux.acp.agent import ChartreuxAcpAgent, SessionStarter
 from chartreux.app_server.local import LocalHarnessOptions, ResumeSessionIntent
 from chartreux.app_server.session import AppServerSession
 from chartreux.core.config import ModelConfig, SessionLoggingConfig
+from chartreux.core.config.harness_files import get_harness_files_manager
+from chartreux.core.dispatch.session import bind_policy_bundle
 from chartreux.core.llm_models import LLMChunk, LLMMessage, LLMUsage, Role, StopInfo
+from chartreux.core.policy.composition import ExecutionContext
+from chartreux.core.session_types import POLICY_STORAGE_VERSION
+from chartreux.core.skills.manager import SkillManager
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.stubs.app_server import start_test_app_server
 from tests.stubs.fake_backend import FakeBackend
@@ -144,6 +149,22 @@ def create_test_session():
         }
         if parent_session_id is not None:
             metadata["parent_session_id"] = parent_session_id
+        # Package 10: the persisted policy record of a conversation is its
+        # frozen policy bundle (design §10) — resume rejects bundle-less
+        # legacy records actionably, so the fixture composes the same
+        # current-format record production writes.
+        config = build_test_vibe_config()
+        bundle, _activated = bind_policy_bundle(
+            config,
+            execution_context=ExecutionContext.INTERACTIVE_MAIN,
+            skill_manager=SkillManager(lambda: config),
+            scratchpad_dir=None,
+            cwd=Path(cwd),
+            harness_files=get_harness_files_manager(),
+            role_instructions=None,
+        )
+        metadata["policy_bundle"] = bundle.model_dump(mode="json")
+        metadata["policy_storage_version"] = POLICY_STORAGE_VERSION
 
         metadata_file = session_folder / "meta.json"
         with metadata_file.open("w", encoding="utf-8") as f:

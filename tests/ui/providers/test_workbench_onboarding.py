@@ -61,7 +61,7 @@ async def test_onboarding_presets_use_configured_custom_model_without_mistral() 
         assert screen.state is not None
         assert all(
             screen.state.preset(role)[0] == "other-model"
-            for role in ("orchestrator", "worker", "scout", "heavy")
+            for role in ("main", "worker", "scout", "heavy")
         )
         assert screen.state.preset("custom-review") == ("other-model", "low")
         screen.state.set_role_preset("heavy", "my-model", "low")
@@ -88,7 +88,7 @@ async def test_onboarding_presets_use_configured_custom_model_without_mistral() 
         assert services.writes[-1].roles is not None
         assert all(
             services.writes[-1].roles[role]["model"] == "other-model"
-            for role in ("orchestrator", "worker", "scout")
+            for role in ("main", "worker", "scout")
         )
         assert services.writes[-1].roles["heavy"]["model"] == "my-model"
 

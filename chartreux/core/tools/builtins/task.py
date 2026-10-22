@@ -6,7 +6,10 @@ from typing import cast
 
 from pydantic import Field, JsonValue
 
-from chartreux.core.agents.models import AgentType
+from chartreux.core.agents.identity_launch import (
+    DEFAULT_CHILD_IDENTITY,
+    parse_model_shorthand,
+)
 from chartreux.core.events import ToolCallEvent, ToolResultEvent, ToolStreamEvent
 from chartreux.core.subagents import LaunchOutcome, TaskArgs, TaskResult
 from chartreux.core.tools.base import (
@@ -60,6 +63,40 @@ def _result_display_names(result: TaskResult) -> list[str]:
     )
 
 
+def _requested_identity(args: TaskArgs) -> str | None:
+    """The canonical launch identity this call names, if any (design §7).
+
+    The structured ``identity`` field wins; a model shorthand carrying an
+    identity component (``@fast:researcher``) names the identity too. The
+    retired ``agent_type`` field is rejected by TaskArgs itself with the
+    successor guidance, so it needs no handling here.
+    """
+    if args.identity is not None:
+        return args.identity
+    if args.model is not None:
+        shorthand = parse_model_shorthand(args.model)
+        if shorthand is not None and shorthand.identity is not None:
+            return shorthand.identity
+    return None
+
+
+def _launch_target(args: TaskArgs) -> str:
+    """The identity the task denylist and displays key on (design §12).
+
+    Precedence: the canonical identity (structured or shorthand), then the
+    default child identity.
+    """
+    requested = _requested_identity(args)
+    if requested is not None:
+        return requested
+    return DEFAULT_CHILD_IDENTITY
+
+
+def _retained_reuse_without_target(args: TaskArgs) -> bool:
+    """A retained-instance continuation that names no launch target."""
+    return args.agent_id is not None and _requested_identity(args) is None
+
+
 def _validate_replacement_claim_args(args: TaskArgs) -> None:
     """WP5 claim-shape guards: a cross-model replacement claim
     (``config.predecessor_agent_id``) launches a NEW agent in the background
@@ -75,9 +112,13 @@ def _validate_replacement_claim_args(args: TaskArgs) -> None:
         )
     if not args.background:
         raise ToolError("a replacement claim requires background mode")
-    if args.config.model is None:
+    if args.model is None and args.config.model is None:
+        # The canonical top-level model field and the legacy nested
+        # config.model are the same selection (the schema promotes the
+        # nested form; a dual supply is a validation error).
         raise ToolError(
-            "a replacement claim requires config.model (the replacement model)"
+            "a replacement claim requires the replacement model "
+            "(the top-level model field or config.model)"
         )
     if args.config.work_package_id is None:
         raise ToolError(
@@ -88,7 +129,7 @@ def _validate_replacement_claim_args(args: TaskArgs) -> None:
 
 class TaskToolConfig(BaseToolConfig):
     permission: ToolPermission = ToolPermission.ALWAYS
-    allowlist: list[str] = Field(default=["worker"])
+    allowlist: list[str] = Field(default=["coder"])
 
 
 class Task(
@@ -102,7 +143,7 @@ class Task(
         args = event.args
         if isinstance(args, TaskArgs):
             background = " (background)" if args.background else ""
-            message = f"{args.agent_type} agent{background}: {args.task}"
+            message = f"{_launch_target(args)} agent{background}: {args.task}"
             return ToolCallDisplay(
                 summary=f"Running {message}",
                 verb="Running",
@@ -190,17 +231,17 @@ class Task(
         return "Running subagent"
 
     def resolve_permission(self, args: TaskArgs) -> PermissionContext | None:
-        if args.agent_id is not None and "agent_type" not in args.model_fields_set:
-            # The retained profile is resolved by the runner before resources.
+        if _retained_reuse_without_target(args):
+            # The retained identity is resolved by the runner before resources.
             return None
-        agent_name = args.agent_type
+        target = _launch_target(args)
 
         for pattern in self.config.denylist:
-            if fnmatch.fnmatch(agent_name, pattern):
+            if fnmatch.fnmatch(target, pattern):
                 return PermissionContext(permission=ToolPermission.NEVER)
 
         for pattern in self.config.allowlist:
-            if fnmatch.fnmatch(agent_name, pattern):
+            if fnmatch.fnmatch(target, pattern):
                 return PermissionContext(permission=ToolPermission.ALWAYS)
 
         return None
@@ -208,10 +249,8 @@ class Task(
     async def run(
         self, args: TaskArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | TaskResult, None]:
-        if not ctx or not ctx.agent_manager:
-            raise ToolError("Task tool requires agent_manager in context")
-
-        agent_manager = ctx.agent_manager
+        if ctx is None:
+            raise ToolError("Task tool requires an invoke context")
         if ctx.is_subagent:
             if args.background:
                 raise ToolError("Background agents cannot be spawned from subagents")
@@ -230,29 +269,17 @@ class Task(
         # package explicitly; launch admission validates the rest at failure
         # time.
         _validate_replacement_claim_args(args)
-        if args.agent_id is not None and "agent_type" not in args.model_fields_set:
+        if _retained_reuse_without_target(args):
             if ctx.subagent_runner is None:
                 raise ToolError("Task tool requires a subagent runner in context")
             async for event in ctx.subagent_runner.run(args, ctx):
                 yield event
             return
 
-        try:
-            agent_profile = agent_manager.get_agent(args.agent_type)
-        except ValueError as e:
-            raise ToolError(f"Unknown agent_type profile: {args.agent_type}") from e
-
-        if agent_profile.agent_type != AgentType.SUBAGENT:
-            raise ToolError(
-                f"Agent '{args.agent_type}' is a {agent_profile.agent_type.value} agent. "
-                f"Only subagents can be used with the task tool. "
-                f"This is a security constraint to prevent recursive spawning."
-            )
-        if any(
-            fnmatch.fnmatch(agent_profile.name, pattern)
-            for pattern in self.config.denylist
-        ):
-            raise ToolError(f"Task denied for agent profile: {agent_profile.name}")
+        # The task denylist keys on the resolved launch identity (design §12).
+        target = _launch_target(args)
+        if any(fnmatch.fnmatch(target, pattern) for pattern in self.config.denylist):
+            raise ToolError(f"Task denied for launch identity: {target}")
         if ctx.subagent_runner is None:
             raise ToolError("Task tool requires a subagent runner in context")
 

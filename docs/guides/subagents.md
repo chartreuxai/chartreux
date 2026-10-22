@@ -4,113 +4,220 @@ Use subagents to delegate bounded work or run independent investigations in
 parallel. The primary agent remains responsible for the conversation and can
 continue working while subagents run.
 
+Delegation is identity-based: the `task` tool launches a child **identity** —
+who performs the work — under a purpose **route** that binds the launch's
+model and work class. The model behind the whole design, including the frozen
+per-conversation lifecycle, lives in the [identity
+architecture](../reference/identity-architecture.md); this guide shows how to
+use it day to day.
+
 ## Launching work
 
-The `task` tool selects an agent type by profile name through `agent_type` and
-creates a new agent instance when `agent_id` is omitted. Chartreux ships three
-built-in agent types: `worker`, `advisor`, and `reviewer`. A new task without an
-`agent_type` name uses the default `worker` profile. There is no built-in
-`explore` profile; `explore` remains a system-prompt ID.
+The `task` tool creates a new agent instance when `agent_id` is omitted. A
+launch is selected with four optional top-level fields — `model`, `identity`,
+`purpose`, and `seat` — and every one of them is validated before dispatch:
+
+```text
+task(task="Implement the bounded change in the issue", identity="coder")
+task(task="Recommend an approach and identify risks", identity="advisor")
+task(task="Review the authentication changes", purpose="review.standard")
+task(task="Investigate the parser's callers", purpose="research")
+task(task="Audit the retry logic", model="@heavy", identity="reviewer")
+```
+
+- **`identity`** names who performs the work: a bare built-in (`coder`,
+  `researcher`, `reviewer`, `advisor`, `orchestrator`), a `builtin:`- or
+  `user:`-qualified id, or a bare custom prompt id. The identity's prompt body
+  is the child's contract.
+- **`model`** takes one model expression: a canonical model name, an `@role`
+  preset, or the `@<model>[:<identity>]` shorthand — `@heavy:advisor` selects
+  the `heavy` preset for an advisor child. In the shorthand, the identity
+  component accepts a bare built-in or a `user:`-qualified id.
+- **`purpose`** selects a configured launch route (see [Purpose
+  routes](#purpose-routes)); **`seat`** picks one target of a multi-seat
+  purpose and is meaningless without one.
+
+Missing components are never guessed. A new child defaults to the `coder`
+identity under the bounded-child execution context, runs the session model, and
+inherits neither the parent's workflow nor its orchestration strategy — children
+never restart the parent's process. Conflicts are rejected instead of resolved
+by precedence: supplying `model` together with `config.model` is a validation
+error (the top-level field is the canonical location), a shorthand identity
+component together with the structured `identity` field is rejected, and a
+`seat` without a `purpose` is rejected.
 
 An agent instance's retained identity is its `agent_id`. Handles of the form
-`agent-N` (digits after `agent-`) are reserved for instances and cannot be profile
-names; supplying one as `agent_type` is rejected before dispatch. Unknown profile
-names report `Unknown agent_type profile`, while unknown retained handles report
-`Unknown agent_id instance handle`. The old Task field `agent` is not accepted.
-
-For the built-in role profiles, dispatch the task directly. Their role prompts
-already contain the noninteractive subagent contract and role guidance:
-
-```text
-task(task="Implement the bounded change in the issue", agent_type="worker")
-task(task="Recommend an approach and identify risks", agent_type="advisor")
-task(task="Review the authentication changes", agent_type="reviewer")
-```
-
-Workers dispatch skill-first. When the task names a skill, the worker loads it
-first and follows its methodology and output format; otherwise the worker
-selects the applicable task skill itself (`sub-implementor` for edits,
-`sub-finder` for searches, `sub-verifier` for verification, `sub-explorer` for
-exploration). Name a skill only when a specific methodology or output format is
-required; the role profile and the task skill serve different purposes:
-
-```text
-task(task="Load the sub-finder skill and locate all callers of the parser.", agent_type="worker")
-```
+`agent-N` (digits after `agent-`) are reserved for instances and rejected as
+launch targets; an unknown retained handle reports `Unknown agent_id instance
+handle`. The retired `agent_type` field fails validation with successor
+guidance (the shipped profile names map onto identities: `worker` → `coder`,
+`advisor` → `advisor`, `reviewer` → `reviewer`; a custom profile name becomes a
+`user:<name>` custom identity prompt), and the old `fan_out: true` flag is
+rejected with guidance to launch separate tasks.
 
 A task launches in the background by default (`background: true`). Prefer
 background launches even when you need the result: background agents stay
 inspectable in the agent browser and can be amended mid-flight, and you collect
-the outcome with `wait_for_agent`. Set `background: false` only when blocking is
-truly required. The call returns a successful launch acknowledgment with
+the outcome with `wait_for_agent`. Set `background: false` only when blocking
+is truly required. The call returns a successful launch acknowledgment with
 `status: "launched"`, non-empty guidance, and stable `agent_id` and `run_id`
 handles rather than waiting for the answer; it is not the subagent's terminal
 result. The acknowledgment also carries the instance's human-facing `name` and
 states whether the agent is retained or closes on completion. Subagents cannot
-launch other subagents.
+launch other subagents: child launches are depth-limited to one, and background
+agents cannot be launched from subagents.
 
-Background agents are ephemeral by default: pass `retain: true` to keep the
-instance resident after the run completes, or set `retain` on a profile or via
-`[subagents].retain_agents` globally. `retain` is only valid for background
-launches. See [Lifecycle and results](#lifecycle-and-results).
+The `coder` identity dispatches skill-first. When the task names a skill, the
+child loads it first and follows its methodology and output format; otherwise
+the child selects the applicable task skill itself (`sub-implementor` for edits,
+`sub-finder` for searches, `sub-verifier` for verification, `sub-explorer` for
+exploration). Name a skill only when a specific methodology or output format is
+required:
 
-## Built-in profiles and role prompts
-
-The built-in profiles are presets for common delegated work:
-
-| Profile | Model role | Prompt ID | Use it for |
-| --- | --- | --- | --- |
-| `worker` | `worker` | `worker` | General-purpose bounded implementation. |
-| `advisor` | `heavy` | `advisor` | Independent architectural guidance, second opinions, and risk analysis. |
-| `reviewer` | `worker` | `reviewer` | Independent read-only reviews of code, documentation, specifications, and plans. |
-
-`advisor` is restricted to the read-only tools `read_file`, `grep`,
-`web_search`, `web_fetch`, and `skill`. The profile ships retained
-(`retain = true`) with a 3,600-second idle TTL so an advisor stays resident
-across related design and planning iterations; the `worker` and `reviewer`
-profiles inherit the global default and are ephemeral unless retained. The
-normal idle cap and explicit `release_agent` lifecycle still apply to a
-retained advisor.
-
-Each role prompt includes the shared noninteractive contract plus guidance for
-that role. A profile's built-in prompt can be customized by placing a prompt
-file with the same ID in a trusted project prompt directory or the user prompt
-directory: custom prompts take precedence over the shipped prompt, with the
-project prompt taking precedence over the user prompt. Likewise, a local TOML
-profile with a built-in name overrides that built-in profile according to
-profile discovery precedence. This lets users replace a profile or its prompt
-without changing Chartreux's shipped defaults.
-
-Profiles and dispatch slots are different concepts. A profile supplies an agent's
-prompt, tools, and defaults; a slot names a launch binding (profile plus a model
-role) and the purposes it serves. Roles remain saved model-and-thinking pairs.
-Fresh sessions default to `standalone`: the main assistant implements within
-approved scope, while verification and independent review remain delegated.
-All approval gates still apply. Select `orchestrated` explicitly in user
-`models.toml` (or the presets screen):
-
-```toml
-[dispatch]
-mode = "orchestrated"
+```text
+task(task="Load the sub-finder skill and locate all callers of the parser.", identity="coder")
 ```
 
-This delegates implementation too, even with one model. Legacy tier entries do
-not select a mode. The rendered slot table and purpose vocabulary are
-authoritative for routing. A
-single-model roster renders task-kind routing without tier names; multi-model
-orchestrated routing retains the compatibility guidance. Saved dispatch changes
-apply to the next session, not the running session.
+Background agents are ephemeral by default: pass `retain: true` to keep the
+instance resident after the run completes, or set
+`[subagents].retain_agents` globally. `retain` is only valid for background
+launches. See [Retention](#retention).
+
+## Built-in identities and postures
+
+Chartreux ships five built-in identities. Each carries a harness-known posture
+that validation and the tool layer both enforce:
+
+| Identity | Delegation | Personal tools | Delegation tools | Posture |
+| --- | --- | --- | --- | --- |
+| `coder` | optional | all granted | all granted | Direct execution; may delegate |
+| `orchestrator` | required | non-mutating only | all granted | Must orchestrate from the root session |
+| `researcher` | optional | non-mutating only | non-mutating only | Read-only analysis |
+| `reviewer` | optional | non-mutating only | non-mutating only | Read-only analysis |
+| `advisor` | optional | non-mutating only | non-mutating only | Read-only analysis |
+
+The read-only postures are honest: `bash` classifies as mutating regardless of
+command text, and unclassified or custom tools (including MCP tools) classify
+as mutating by default, so a read-only identity genuinely excludes them. A
+required-delegation identity (`orchestrator`) is rejected as a child with an
+actionable error — it must orchestrate from the root session. Custom identities
+carry no harness-known posture: their prompt file is the whole contract, and
+their delegation set is the full granted ceiling of the session.
+
+Three independent axes govern a child's tools, and narrowing is monotonic down
+the tree:
+
+- **Granted authority** — the session's configured tool ceiling; it never
+  widens down the agent tree.
+- **Personal tool set** — what the identity may execute itself, enforced below
+  the configuration layer: launch-level tool overrides cannot loosen an
+  identity's personal posture.
+- **Delegation tool set** — what an identity may pass to children.
+
+A child's effective tools are the granted ceiling intersected with every
+ancestor's delegation set intersected with the child's personal set. The
+consequences are exercised at the root, since children cannot launch at all: a
+`researcher` cannot obtain a writing `coder` through `task` or a direct launch,
+while an `orchestrator` cannot write personally but can delegate writes within
+the granted ceiling.
+
+## Purpose routes
+
+Routes are the executable launch bindings for `task` purposes, configured in
+`[orchestration.routes.*]` in `config.toml` (full syntax in the [configuration
+reference](../reference/configuration.md#orchestration-routes)):
+
+```toml
+[orchestration.routes.research]
+targets = [{ model = "$session", identity = "researcher", tier = "substantive" }]
+```
+
+Each route carries `targets` — a required, non-empty list of
+`{ model, identity, tier, seat?, overlay?, replacement_capability? }` bindings
+— and `requires_distinct_models` (default 1). `$session` binds the session
+model, and every shipped route target uses it, which is why one configured
+model and ten produce identical default routing: multi-model routing exists only
+through explicit route overrides.
+
+For one launch, precedence is: structured explicit fields (`model`, `identity`)
+override the selected route's corresponding fields; a shorthand expression sits
+between them; conflicts between shorthand and structured fields are rejected.
+The effective tier (`mechanical` or `substantive`) is the route target's and
+feeds the failure-time replacement policy; `replacement_capability` is marked
+separately. A direct unrouted launch takes the identity/purpose default tier.
+An unavailable model binding fails with an error telling you to configure it
+explicitly — another canonical model is never substituted.
+
+Multi-seat purposes require an explicit `seat` selector; there is no implicit
+fan-out. The shipped example is `review.deep`:
+
+| Seat | Identity | Notes |
+| --- | --- | --- |
+| `analytical` | `reviewer` | Read-only analysis seat |
+| `peer` | `reviewer` | Read-only analysis seat |
+| `execution` | `coder` | The executing seat, with the `review-execution` overlay |
+
+```text
+task(task="Deep-review the identity launch module", purpose="review.deep", seat="execution")
+```
+
+The execution seat runs as `coder` with the shipped `review-execution` overlay —
+full-artifact review with `file:line` citations and declared check-only
+verification — because it was never read-only in spirit. Overlay bodies are
+harness-owned: there is no user overlay directory, and an unknown overlay
+reference fails loudly. The overlay rides the frozen persona instructions at
+launch; it grants no authority and never rewrites the identity binding.
+
+`review.deep` declares `requires_distinct_models = 3`. Diversity is evaluated
+over **canonical-model cardinality** — the same base model on two providers
+counts once — counting partial duplication (A/A/B fails a requirement of 3).
+An unmet requirement is reported instead of pretending diversity; a
+fresh-context reviewer on the same model is context separation, honestly
+labeled. Configure distinct models explicitly via per-seat model fields.
+
+The shipped routes are `implementation` (coder), `mechanical-edit` (coder,
+mechanical), `research` (researcher), `search` (researcher, mechanical),
+`exploration` (researcher), `verification` (coder, mechanical),
+`design-analysis` (advisor), `planning-analysis` (advisor),
+`implementation-demanding-settled` (coder), `review.quick` (reviewer),
+`review.standard` (reviewer), and `review.deep` as above. Route keys may also
+introduce custom purposes. Purpose labels organize work; they never grant
+permission.
+
+## The task allowlist and denylist
+
+Launch admission enforces an identity allowlist and denylist under
+`[tools.task]`:
+
+```toml
+[tools.task]
+allowlist = ["coder", "reviewer"]
+denylist = ["user:contractor"]
+```
+
+The allowlist (default `["coder"]`) merely auto-permits launches of matching
+identities. The denylist is an absolute veto, applied **after** resolution —
+shorthand, route, and retained-instance launches are all checked against the
+resolved identity, not the raw spelling. Entries are exact names, shell-style
+globs, or `re:`-prefixed regular expressions, and matching is symmetric across
+equivalent spellings: denying `coder` also blocks `builtin:coder`, and denying
+`user:foo` also blocks the bare `foo`. A denied launch reports `Task denied for
+launch identity`.
+
+The Settings > Identities inventory is denylist-only: unchecking an identity
+writes this denylist. It can only block launches; it never grants roots or tool
+authority.
 
 ## Dynamic launch configuration
 
-The following example uses a runtime configuration override rather than a
+The nested `config` argument carries per-launch overrides rather than a
 profile-specific default:
 
 ```text
 task(
   task="Review the authentication changes",
+  identity="reviewer",
   config={
-    model="example-model",
     thinking="max",
     instructions="Focus on authorization boundaries.",
     enabled_tools=["read_file", "grep"]
@@ -118,14 +225,17 @@ task(
 )
 ```
 
-At launch or when retasking an idle subagent, `config` can override the model,
+At launch or when retasking an idle subagent, `config` can override the
 thinking level, enabled and disabled tools, and a tool's permission or
-allowlist. Additional instructions are passed at the task level. Overrides are
-session-local; they do not modify a profile or `config.toml`. The launch persona
-(system prompt and base instructions) is immutable for a retained subagent, so
-a changed persona requires launching a new subagent. A subagent cannot gain
-tool authority beyond its parent. Retasking is available only for background
-subagents.
+allowlist; `instructions` is an additive per-launch instruction overlay on the
+identity's prompt body. Supply the model at exactly one level — the top-level
+`model` field is canonical; `config.model` is the legacy nested location, and a
+dual supply is a validation error. Overrides are session-local; they do not
+modify the resolved identity or `config.toml`. The launch persona (the identity
+prompt and base instructions) is immutable for a retained subagent, so a changed
+persona requires launching a new subagent. A subagent cannot gain tool authority
+beyond its parent's delegation ceiling. Retasking is available only for
+background subagents.
 
 Subagents can reread exact instruction files injected into their context,
 including `AGENTS.md`, using `read_file` or exact-file `grep` even outside the
@@ -133,11 +243,38 @@ workspace roots. This does not grant directory searches or write access, and
 tool denials and sensitive-file protections still apply. See
 [Privacy](../project/privacy.md#instruction-file-access) for the data boundary.
 
-Subagents inherit access to the session scratchpad through their parent-authority
-chain rather than receiving a new workspace grant. File tools and shell checks
-resolve that access against the ancestor scratchpad roots. Broken authority
-chains, symlink escapes, and retargeted roots fail closed; tool denials and
-sensitive-file protections still apply.
+Subagents inherit access to the session scratchpad through their
+parent-authority chain rather than receiving a new workspace grant. File tools
+and shell checks resolve that access against the ancestor scratchpad roots.
+Broken authority chains, symlink escapes, and retargeted roots fail closed; tool
+denials and sensitive-file protections still apply.
+
+## Retention
+
+Retention is opt-in and layered: an explicit `task` `retain` argument wins over
+the global `[subagents].retain_agents` default (off). There are no per-identity
+retention settings. `retain` is only valid for background launches; reuse with
+`agent_id` inherits the instance's committed retention policy unless `retain`
+is passed.
+
+Retained idle agents are kept for `idle_ttl_seconds` (default 300) with at most
+`max_idle_agents` (default 4) resident; `0` disables each limit, so a retained
+agent with both limits at zero stays resident without a time or count bound.
+TTL and idle-cap eviction remove the runtime but preserve terminal metadata and
+stored results, so `get_agent_result` remains usable after eviction.
+
+Terminal metadata feeds the browser's bounded **Recent** group: it expires after
+`tombstone_ttl_seconds` (default 900) and is capped at `max_tombstones`
+(default 32, oldest first); `tombstone_ttl_seconds = 0` retains no terminal
+metadata, and `max_tombstones` must stay positive. Reads do not extend the
+deadline. Metadata expiry is independent of result expiry: an expired record's
+result can remain retrievable after its metadata disappears. Release is the
+opposite: it discards the record, stored results, expiry markers, and wait
+leases immediately, so a released handle has nothing left to retrieve. Because
+ephemeral agents leave no idle row and the status line counts active work only,
+completion and eviction notifications — which carry the agent name, handle,
+run, and outcome — are the primary failure surface for ephemeral agents.
+Release subagents when you are done.
 
 ## Lifecycle and results
 
@@ -162,14 +299,14 @@ Empty model responses get at most one bounded replay; terminal failures use
 output is never replayed automatically.
 
 If the parent is only waiting on subagents, submitting a new message in the TUI
-cancels its waits, not the child runs, and steers the same parent turn immediately.
-See [Input and queueing](terminal.md#input-and-queueing).
+cancels its waits, not the child runs, and steers the same parent turn
+immediately. See [Input and queueing](terminal.md#input-and-queueing).
 
-A subagent's `ask_user_question` calls never expire: unattended-expiry admission
-is limited to the root agent in an interactive session, so a background agent's
-question waits for an explicit answer (or the run's cancellation) instead of
-deferring on a timer. Only the root agent's explicitly defaultable questions
-can expire unanswered; see
+A subagent's `ask_user_question` calls never expire: unattended-expiry
+admission is limited to the root agent in an interactive session, so a
+background agent's question waits for an explicit answer (or the run's
+cancellation) instead of deferring on a timer. Only the root agent's
+explicitly defaultable questions can expire unanswered; see
 [User questions and unattended expiry](configuration.md#user-questions-and-unattended-expiry).
 
 - `check_agents` lists resident and Recent subagents with their names, handles,
@@ -190,9 +327,9 @@ can expire unanswered; see
   indefinitely.
 - Pass a retained idle instance's `agent_id` to
   `task(agent_id=..., background=true, task=...)` to give it another assignment;
-  omit `agent_type` to retain its profile. Omitting `retain` preserves the
-  instance's committed policy; pass `retain: false` for a final continuation
-  that closes afterward. Both launch acknowledgments and
+  omit the launch fields to keep its committed identity. Omitting `retain`
+  preserves the instance's committed policy; pass `retain: false` for a final
+  continuation that closes afterward. Both launch acknowledgments and
   `check_agents.reuse_guidance` include this reuse guidance. Reusing a closed
   handle is rejected with guidance to launch a new task (use `retain: true` when
   a resident continuation is required); an evicted handle is rejected as
@@ -200,30 +337,6 @@ can expire unanswered; see
 - `release_agent(agent_id)` closes and removes a subagent — resident or
   terminal — when it is no longer useful, purging its stored results and wait
   leases.
-
-Retention is opt-in and layered: an explicit `task` `retain` argument wins over
-the profile's `retain` setting, which wins over the global
-`[subagents].retain_agents` default (off). A profile's `idle_ttl_seconds` alone
-does not opt into retention. Retained idle agents are kept for
-`idle_ttl_seconds` (default 300) with at most `max_idle_agents` (default 4)
-resident; `0` disables each limit, so a retained agent with both limits at zero
-stays resident without a time or count bound. TTL and idle-cap eviction remove
-the runtime but preserve terminal metadata and stored results, so
-`get_agent_result` remains usable after eviction.
-
-Terminal metadata feeds the browser's bounded **Recent** group: it expires after
-`tombstone_ttl_seconds` (default 900) and is capped at `max_tombstones` (default
-32, oldest first); `tombstone_ttl_seconds = 0` retains no terminal metadata, and
-`max_tombstones` must stay positive. Reads do not extend the deadline. Metadata
-expiry is independent of result expiry: each root generation retains at most 32
-unreferenced stored results, and an expired record's result can remain
-retrievable after its metadata disappears. Release is the opposite: it discards
-the record, stored results, expiry markers, and wait leases immediately, so a
-released handle has nothing left to retrieve. Because ephemeral agents leave no
-idle row and the status line counts active work only, completion and eviction
-notifications — which carry the agent name, handle, run, and outcome — are the
-primary failure surface for ephemeral agents. Release subagents when you are
-done.
 
 ### Failure recovery, suspension, and resume
 
@@ -295,8 +408,8 @@ Recovery is enabled in stages, and the release default is automatic:
 ### Cancelling and replacing background work
 
 The orchestrator can stop one run with `cancel_agent(agent_id, run_id=None)`.
-Omitting `run_id` targets the current run; supplying it pins the request to that
-run and cannot stop a newer assignment. This tool manages only the
+Omitting `run_id` targets the current run; supplying it pins the request to
+that run and cannot stop a newer assignment. This tool manages only the
 orchestrator's own background agents. Foreground work uses the normal parent
 interruption controls.
 
@@ -308,19 +421,20 @@ target. Use `wait_for_agent` to wait for the terminal result. Cancellation does
 not interrupt the parent or sibling agents and does not release the agent.
 
 Cancelled results carry `completed: false`, accumulator partial output, and a
-`stop_reason`: `user_cancelled`, `orchestrator_cancelled`, or `retasked` for these
-operations. The first accepted stop reason wins. A genuine completion or error
-is not rewritten by a late stop. Stopping does not undo file, shell, or remote
-side effects, generate a summary, or salvage additional output.
+`stop_reason`: `user_cancelled`, `orchestrator_cancelled`, or `retasked` for
+these operations. The first accepted stop reason wins. A genuine completion or
+error is not rewritten by a late stop. Stopping does not undo file, shell, or
+remote side effects, generate a summary, or salvage additional output.
 
-The conversation, transcript, partial result, and existing waits remain available
-subject to the retention policy: an unretained agent closes at finalization (the
-cancelled run's result stays retrievable), while a retained agent stays idle and
-may later be evicted on TTL or idle-cap limits. Eviction keeps terminal metadata
-within the Recent bounds and stored results until separate result expiry. Saved
-transcript inspection depends on session logging and disk availability, and only
-within the metadata window. Explicit `release_agent` removes the agent and
-purges its stored results and wait leases.
+The conversation, transcript, partial result, and existing waits remain
+available subject to the retention policy: an unretained agent closes at
+finalization (the cancelled run's result stays retrievable), while a retained
+agent stays idle and may later be evicted on TTL or idle-cap limits. Eviction
+keeps terminal metadata within the Recent bounds and stored results until
+separate result expiry. Saved transcript inspection depends on session
+logging and disk availability, and only within the metadata window. Explicit
+`release_agent` removes the agent and purges its stored results and wait
+leases.
 
 To replace a busy assignment in the same retained conversation:
 
@@ -332,41 +446,71 @@ task(agent_id="<agent-id>", task="Investigate the revised requirement", replace_
 run with reason `retasked`, waits for its cleanup, and launches the replacement
 without overlapping execution. The replacement prompt states that it supersedes
 the interrupted task; the acknowledgment metadata includes both run IDs.
-Busy replacement cannot change the profile or launch configuration. It preserves
-the instance's committed retention policy and rejects a conflicting `retain`
-override before stopping anything. An idle target uses ordinary reuse, which
-still permits runtime configuration overrides. Ordinary reuse of a busy agent
-without `replace_run=True` is rejected. Already stopping or finishing targets are
-not replaced; if replacement admission fails after the old run was stopped, an
-unretained instance still closes rather than lingering resident, and the error is
-reported.
+Busy replacement cannot change the identity or launch configuration. It
+preserves the instance's committed retention policy and rejects a conflicting
+`retain` override before stopping anything. An idle target uses ordinary reuse,
+which still permits runtime configuration overrides. Ordinary reuse of a busy
+agent without `replace_run=True` is rejected. Already stopping or finishing
+targets are not replaced; if replacement admission fails after the old run was
+stopped, an unretained instance still closes rather than lingering resident, and
+the error is reported.
 
 A user stop notifies the parent as an injected message **without starting a
 parent turn**. An idle parent learns of the cancellation on its next turn. The
 notification attributes the cancellation to the user; orchestrator cancellation
 and retask are attributed separately.
 
+For a cross-model replacement after a failure, omit `agent_id` (the
+replacement gets a NEW handle) and claim the lineage through `config`: the model
+goes in the top-level `model` field (or the legacy nested `config.model` —
+supply exactly one), plus `config.work_package_id`,
+`config.predecessor_agent_id`, and `config.package_tier` (`mechanical` or
+`substantive`). Launch admission validates the claim at failure time —
+endpoint independence from the attempted failed endpoint, the reconciliation
+barrier, and the per-package replacement budget — and rejects it with a typed
+reason otherwise. Budgets and recurrence counters span replacements and are
+never reset.
+
+## Frozen lifecycle for children
+
+Every child is its own conversation with its own frozen policy bundle. The
+child's identity prompt content is captured at launch — the frozen persona is
+re-keyed on the identity's content revision — so later edits to a custom
+identity's prompt file apply to new launches only, and a child keeps its
+committed identity even if the underlying file is edited or removed. A route
+overlay rides the frozen persona instructions at launch and never rewrites the
+identity binding. Children never inherit the parent's workflow or strategy
+bodies: they run the bounded-child execution context under their own identity.
+
+The parent's `/reload` refreshes the parent's reloadable machinery — AGENTS.md,
+the skills catalog, and the model catalog — and reports policy edits as pending;
+it never rewrites a child's frozen identity content, and a child's committed
+model and concrete provider deployment are revalidated on resume rather than
+re-resolved from current configuration. See [Frozen
+lifecycle](../reference/identity-architecture.md#frozen-lifecycle).
+
 ## Agent names
 
-Every instance gets a human-facing name of the form `{profile}-{model}-{number}`
-— for example `worker-mistral-large-4-3` or `reviewer-glm-5-3-7`. The profile
-segment is the profile name (a custom profile uses its display name with
-whitespace runs collapsed to hyphens), the model segment is the canonical base
-model, and the number is the handle's sequence digits (`agent-15` ↔ `...-15`).
-Names appear in browser rows, the details panel, the transcript header,
-completion and eviction notifications, the launch acknowledgment, and
-`check_agents` output. Names are display-only: `agent_id` is the only
-programmatic handle, there is no name-to-handle lookup, and a name never parses
-as a handle.
+Every instance gets a human-facing name of the form
+`{identity}-{model}-{number}` — for example `coder-mistral-large-4-3` or
+`reviewer-glm-5-3-7`. The identity segment is the resolved identity reference
+(a custom identity uses its display label with whitespace runs collapsed to
+hyphens), the model segment is the canonical base model, and the number is the
+handle's sequence digits (`agent-15` ↔ `...-15`). Names appear in browser rows,
+the details panel, the transcript header, completion and eviction notifications,
+the launch acknowledgment, and `check_agents` output. Names are display-only:
+`agent_id` is the only programmatic handle, there is no name-to-handle lookup,
+and a name never parses as a handle.
 
 ## Managed shell jobs
 
 Managed shell jobs (`bash_start`, `bash_read`, `bash_stop`, `bash_list`) are
 processes, not background agent runs. `cancel_agent`, `wait_for_agent`, and the
 agent browser manage agent runs, not these jobs. A child can access only jobs
-created by its own runtime incarnation; guessing a root or sibling job ID grants
-no access. A resumed child does not inherit its previous incarnation's job access.
-The root can list, read, and stop all jobs, including those created by children.
+created by its own runtime incarnation; guessing a root or sibling job ID
+grants no access. A resumed child does not inherit its previous incarnation's
+job access. The root can list, read, and stop all jobs, including those created
+by children.
 
 All children share the root's eight job allocations; there is no separate
 per-child capacity pool. Completion metadata carries bounded, redacted job
@@ -380,18 +524,19 @@ shell policy/filter, workspace/scratchpad, credential-environment, and relevant
 retained-child reconfiguration changes are rejected before publication. Jobs
 whose creator was evicted still count. Finished retained records do not impose
 this restriction; unrelated display/model/status-line edits remain available.
-Stop active jobs before reducing authority. The root's lifetime, not the child's
-retention policy, controls job cleanup; see [Tools and safety](tools-safety.md#managed-shell-jobs).
+Stop active jobs before reducing authority. The root's lifetime, not the
+child's retention policy, controls job cleanup; see [Tools and
+safety](tools-safety.md#managed-shell-jobs).
 
 ## Active-work admission cap
 
 By default, at most 16 subagent runs can be active under a root session. The cap
 counts foreground and background work, including retasking idle agents and
 pending child creation; idle retained agents do not count. A new launch or idle
-reuse at capacity is rejected immediately rather than queued. A busy replacement
-with `replace_run=True` proceeds at capacity: it reserves the old run's existing
-slot through cleanup and transfers it to the replacement, adding no concurrency.
-Unrelated launches cannot take that reserved slot.
+reuse at capacity is rejected immediately rather than queued. A busy
+replacement with `replace_run=True` proceeds at capacity: it reserves the old
+run's existing slot through cleanup and transfers it to the replacement, adding
+no concurrency. Unrelated launches cannot take that reserved slot.
 
 Set the cap in `config.toml`:
 
@@ -414,11 +559,12 @@ Recent-metadata limits above; see the
 
 ## Parallel tasks
 
-A role selects one model and thinking level. To run independent investigations
-in parallel, make separate background `task` calls with explicit roles or
-models. Each launched agent has its own handle and result. The old
-`fan_out: true` flag is rejected with guidance to launch separate tasks. See
-the [configuration reference](../reference/configuration.md) for role presets.
+To run independent investigations in parallel, make separate background `task`
+calls with explicit identities, purposes, or models. Each launched agent has its
+own handle and result. The old `fan_out: true` flag is rejected with guidance to
+launch separate tasks. See the [models guide](models.md) for role presets and
+the [identity architecture](../reference/identity-architecture.md) for route
+diversity semantics.
 
 ## TUI monitoring
 
@@ -441,7 +587,7 @@ Idle), **Active**, **Idle**, **Recent**, and **All** show truthful counts;
 Resident view is empty but Recent entries exist, the browser shows the Recent
 group with a note — never an empty screen. Its ten-row sheet scrolls internally.
 Rows show the agent's name with the `agent_id` handle dimmed beside it, the
-profile, and a static state marker: **Running**, **Compacting**, **Stopping**,
+identity, and a static state marker: **Running**, **Compacting**, **Stopping**,
 **Finishing** (with the run outcome), **Idle**, **Failed**, **Cancelled**,
 **Budget stopped**, **Closed**, or **Evicted**. Compacting is a presentation
 substate of active work, not a separate lifecycle state. Expired metadata and
@@ -494,7 +640,7 @@ entries. Both confirmations use the same keyboard pattern (`Tab` or arrow keys t
 choose, `Enter` to activate, `Escape` to dismiss).
 
 Selecting an agent replaces the conversation area with a bordered pane titled
-`Subagent: <name> (<agent_id>) · <profile>`. Running or finalizing agents show a
+`Subagent: <name> (<agent_id>) · <identity>`. Running or finalizing agents show a
 live, append-only transcript refreshed about once per second; the view uses the
 same entry structure as the saved transcript, so it converges when the run
 finishes. Older pages do not jump during refresh: use `PageUp` to paginate and
@@ -508,42 +654,22 @@ transcript is available.
 Completion notifications still arrive in the parent session; use the result
 tools to consume the machine-readable outcome.
 
-## TOML profiles
+## Upgrading from the retired profile axis
 
-Dynamic `task` configuration and TOML profiles coexist. The task tool creates
-subagents dynamically and accepts runtime overrides; profiles provide defaults
-that the orchestrator can apply when a named profile is launched.
+The v0.5.6 profile surfaces are retired and fail loudly with successor
+guidance; nothing is silently migrated:
 
-Chartreux discovers `*.toml` profiles from configured `agent_paths`, trusted
-project agent directories, and user agent directories. A custom profile may
-override the `worker` name. For example, save this as
-`~/.chartreux/agents/reviewer.toml`:
+- The `agents/*.toml` profile directory convention is retired: those files are
+  detected and reported by `chartreux doctor`, never loaded. Custom identities
+  are prompt files in `~/.chartreux/prompts/` instead.
+- The task tool's `agent_type` field is removed; use `identity` (the shipped
+  profile names map onto identities: `worker` → `coder`, `advisor` →
+  `advisor`, `reviewer` → `reviewer`).
+- Profile-level `retain` and `idle_ttl_seconds` settings are gone; retention is
+  the global `[subagents].retain_agents` default plus the per-launch `retain`
+  argument.
+- Project-level prompt directories no longer supply identities; custom
+  resources are user-level only.
 
-```toml
-display_name = "Reviewer"
-description = "Read-only review work"
-agent_type = "subagent"
-instructions = "Report concrete findings with file and line references."
-role = "medium"
-disabled_tools = ["edit", "write_file"]
-
-[tools.bash]
-permission = "always"
-```
-
-The TOML `agent_type = "subagent"` field classifies the profile internally; it is
-not the Task `agent_type` argument, which takes the profile name (`reviewer` in
-this example). Profile names matching `agent-N` are reserved and rejected during
-discovery.
-
-Profile fields are validated during discovery; an invalid profile is not made
-available. Use `role` to bind a profile to a role; `active_model` is rejected in
-profile TOML. A profile can set `retain` (strict boolean) to keep its instances
-resident after completion, and `idle_ttl_seconds` (integer seconds, at least 0)
-to bound how long they stay idle; `retain` is what opts a profile into
-retention — `idle_ttl_seconds` alone does not. A retained subagent keeps its
-committed model and thinking level when reused, even if its profile's role has
-since been edited, unless the task supplies an explicit model or thinking
-override. Project profiles are subject to the same trusted-project rules as
-other local configuration. See [configuration](configuration.md) for the
-configuration model and [tools and safety](tools-safety.md) for tool policy.
+See [Upgrading from 0.5.6](../reference/identity-architecture.md#upgrading-from-056)
+for the full retirement list.

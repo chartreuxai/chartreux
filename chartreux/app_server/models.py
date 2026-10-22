@@ -16,7 +16,6 @@ from pydantic import (
     model_validator,
 )
 
-from chartreux.agents import AgentSafety, AgentType
 from chartreux.app_server._effect_models import (
     EffectDetail as EffectDetail,
     FileEditEffectBatchInput as FileEditEffectBatchInput,
@@ -545,14 +544,6 @@ class DebugLogPage(ProtocolModel):
     entries: list[DebugLogEntry]
     has_more: bool
     cursor: int | None = None
-
-
-class AgentSummary(ProtocolModel):
-    name: str
-    display_name: str
-    description: str
-    safety: AgentSafety
-    agent_type: AgentType
 
 
 # --- Agent failure envelope (WP1) -------------------------------------------

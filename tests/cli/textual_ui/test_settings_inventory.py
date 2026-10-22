@@ -17,6 +17,7 @@ from chartreux.cli.textual_ui.screens.settings import (
     inventory_name_matches,
     toggle_inventory_name,
 )
+from chartreux.core.config.settings_catalog import TASK_IDENTITY_DENYLIST_PATH
 from chartreux.core.utils.matching import name_matches
 from chartreux.ui.settings_service import SettingsSaveOutcome
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
@@ -28,16 +29,22 @@ from tests.cli.textual_ui._settings_app_support import (
 )
 
 
-@pytest.mark.parametrize("category", ["tools", "skills", "agents"])
+@pytest.mark.parametrize("category", ["tools", "skills", "identities"])
 @pytest.mark.asyncio
 async def test_checklist_glyphs_do_not_rely_on_color(
-    category: Literal["tools", "skills", "agents"],
+    category: Literal["tools", "skills", "identities"],
 ) -> None:
     service = FakeService()
-    for field in service.snapshot.fields:
-        if field.path == f"disabled_{category}":
-            field.saved_value = [service.snapshot.inventories[category][1]]
-            field.saved_explicit = True
+    if category == "identities":
+        field = next(
+            f for f in service.snapshot.fields if f.path == TASK_IDENTITY_DENYLIST_PATH
+        )
+    else:
+        field = next(
+            f for f in service.snapshot.fields if f.path == f"disabled_{category}"
+        )
+    field.saved_value = [service.snapshot.inventories[category][1]]
+    field.saved_explicit = True
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
         await pilot.press(*f"inventory_{category}", "enter")
@@ -61,7 +68,7 @@ async def test_checklist_glyphs_do_not_rely_on_color(
 def test_inventory_matcher_agrees_with_server(name: str, entries: list[str]) -> None:
     assert inventory_name_matches(name, entries) == name_matches(name, entries)
     state = _inventory_item_states(
-        {"tools": [name], "skills": [], "agents": []}, {"enabled_tools": entries}
+        {"tools": [name], "skills": [], "identities": []}, {"enabled_tools": entries}
     )["tools"][name]
     assert inventory_item_state(name, entries, []) == (
         state.effective,
@@ -84,7 +91,7 @@ def test_toggle_inventory_mode_and_last_item() -> None:
         ["read_file", "bash"],
         [],
     )
-    for category in ("skills", "agents"):
+    for category in ("skills",):
         assert toggle_inventory_name(
             "bash", ["bash"], ["bash"], is_enabled=True, category=category
         ) == ([], ["bash"])
@@ -98,7 +105,7 @@ def test_toggle_inventory_mode_and_last_item() -> None:
     )
 
 
-@pytest.mark.parametrize("category", ["tools", "skills", "agents"])
+@pytest.mark.parametrize("category", ["tools", "skills", "identities"])
 @pytest.mark.parametrize(
     ("enabled", "disabled", "effective", "pattern_driven"),
     [
@@ -112,27 +119,40 @@ def test_toggle_inventory_mode_and_last_item() -> None:
     ],
 )
 def test_inventory_overlapping_filters_agree_with_server(
-    category: Literal["tools", "skills", "agents"],
+    category: Literal["tools", "skills", "identities"],
     enabled: list[str],
     disabled: list[str],
     effective: bool,
     pattern_driven: bool,
 ) -> None:
-    if category != "tools":
+    if category == "identities":
+        effective = not inventory_name_matches("bash", disabled)
+        pattern_driven = any(
+            entry.lower() != "bash" and inventory_name_matches("bash", [entry])
+            for entry in disabled
+        )
+    elif category != "tools":
         effective = inventory_name_matches("bash", enabled)
         pattern_driven = any(
             entry.lower() != "bash" and inventory_name_matches("bash", [entry])
             for entry in enabled
         )
-    state = _inventory_item_states(
-        {category: ["bash"]},
-        {f"enabled_{category}": enabled, f"disabled_{category}": disabled},
-    )[category]["bash"]
-    assert (state.effective, state.pattern_driven) == (effective, pattern_driven)
-    assert inventory_item_state("bash", enabled, disabled, category=category) == (
-        effective,
-        pattern_driven,
+    settings: dict[str, object] = (
+        {TASK_IDENTITY_DENYLIST_PATH: disabled}
+        if category == "identities"
+        else {f"enabled_{category}": enabled, f"disabled_{category}": disabled}
     )
+    state = _inventory_item_states({category: ["bash"]}, settings)[category]["bash"]
+    assert (state.effective, state.pattern_driven) == (effective, pattern_driven)
+    widget_category: Literal["tools", "skills", "agents"] = (
+        "tools" if category == "identities" else category
+    )
+    assert inventory_item_state(
+        "bash",
+        [] if category == "identities" else enabled,
+        disabled,
+        category=widget_category,
+    ) == (effective, pattern_driven)
 
 
 @pytest.mark.parametrize(
@@ -233,36 +253,29 @@ async def test_inventory_toggle_commit_discard_and_pattern_lock() -> None:
 @pytest.mark.asyncio
 async def test_inventory_last_allowed_item_restores_default() -> None:
     service = FakeService()
-    for field in service.snapshot.fields:
-        if field.path == "enabled_agents":
-            field.effective_value = ["worker"]
-            field.saved_value = ["worker"]
-            field.saved_explicit = True
-        if field.path == "disabled_agents":
-            field.effective_value = ["worker"]
-            field.saved_value = ["worker"]
-            field.saved_explicit = True
-    service.snapshot.inventory_states["agents"]["worker"].effective = True
-    service.snapshot.inventory_states["agents"]["worker"].default_effective = False
-    service.snapshot.inventory_states["agents"]["reviewer"].effective = False
-    service.snapshot.inventory_states["agents"]["reviewer"].default_effective = True
+    field = next(
+        f for f in service.snapshot.fields if f.path == TASK_IDENTITY_DENYLIST_PATH
+    )
+    field.effective_value = ["coder"]
+    field.saved_value = ["coder"]
+    field.saved_explicit = True
+    service.snapshot.inventory_states["identities"]["coder"].effective = False
+    service.snapshot.inventory_states["identities"]["coder"].default_effective = True
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        await pilot.press(*"inventory_agents", "enter")
+        await pilot.press(*"inventory_identities", "enter")
         await pilot.pause()
         checklist = cast(SettingsScreen, pilot.app.screen).query_one(SettingsChecklist)
-        assert checklist.selected == ["worker"]
+        assert checklist.selected == ["researcher"]
         await pilot.press("space")
-        assert checklist.selected == ["reviewer"]
+        assert checklist.selected == ["coder", "researcher"]
         focus_action(cast(SettingsScreen, pilot.app.screen), "apply")
         await pilot.press("enter")
         await pilot.pause()
-        assert service.saved == [{"enabled_agents": []}]
-        service.snapshot.inventory_states["agents"]["worker"].effective = False
-        service.snapshot.inventory_states["agents"]["reviewer"].effective = True
+        assert service.saved == [{TASK_IDENTITY_DENYLIST_PATH: []}]
         await pilot.press("enter")
         await pilot.pause()
-        assert checklist.selected == ["reviewer"]
+        assert checklist.selected == ["coder", "researcher"]
 
 
 @pytest.mark.asyncio
@@ -529,7 +542,7 @@ async def test_inventory_save_failure_visible_in_help() -> None:
     )
     async with Harness(service).run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        await pilot.press(*"inventory_agents", "enter")
+        await pilot.press(*"inventory_identities", "enter")
         screen = cast(SettingsScreen, pilot.app.screen)
         focus_action(screen, "add-pattern")
         await pilot.press("enter")
@@ -539,7 +552,7 @@ async def test_inventory_save_failure_visible_in_help() -> None:
         await pilot.press("enter")
         await pilot.pause()
         screen = cast(SettingsScreen, pilot.app.screen)
-        assert service.saved == [{"disabled_agents": ["re:["]}]
+        assert service.saved == [{TASK_IDENTITY_DENYLIST_PATH: ["re:["]}]
         assert "invalid re: pattern" in str(
             screen.query_one("#settings-help", NoMarkupStatic).content
         )

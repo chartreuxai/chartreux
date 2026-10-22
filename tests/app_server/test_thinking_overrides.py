@@ -375,7 +375,7 @@ async def test_thinking_choice_survives_session_resume_without_changing_preset(
         backend=FakeBackend(mock_llm_chunk(content="Thinking choice remembered.")),
         cwd=tmp_path,
     )
-    default_preset = saved.config.catalog_snapshot.catalog.roles["orchestrator"]
+    default_preset = saved.config.catalog_snapshot.catalog.roles["main"]
     await saved.persist_empty_session()
     session_id = saved.session_id
     session = await create_test_app_server_session(saved)
@@ -383,10 +383,7 @@ async def test_thinking_choice_survives_session_resume_without_changing_preset(
         await session.resources.config.set_thinking("high")
         _ = [event async for event in session.act("remember the thinking choice")]
         assert saved.config.get_active_model().thinking == "high"
-        assert (
-            saved.config.catalog_snapshot.catalog.roles["orchestrator"]
-            == default_preset
-        )
+        assert saved.config.catalog_snapshot.catalog.roles["main"] == default_preset
     finally:
         await session.close()
 
@@ -477,7 +474,7 @@ async def test_set_thinking_escapes_model_alias_pointer() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", ["system_prompt_id", "compaction_prompt_id"])
+@pytest.mark.parametrize("field", ["compaction_prompt_id"])
 @pytest.mark.parametrize("value", ["missing-synthetic-prompt", "../synthetic-prompt"])
 async def test_prompt_preflight_rejects_without_replacing_runtime(
     field: str, value: str

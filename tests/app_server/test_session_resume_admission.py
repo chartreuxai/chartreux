@@ -39,6 +39,7 @@ from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.compaction import select_model_context
 from chartreux.core.config import ModelConfig, SessionLoggingConfig
+from chartreux.core.dispatch.session import SessionPolicyError
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session.session_lease import SessionLease
 from chartreux.core.session.session_loader import SessionLoader
@@ -983,3 +984,38 @@ def test_envelope_less_root_marks_historical_cost_incomplete() -> None:
 
     assert stats.has_unknown_cost is True
     assert stats.known_cost_total == 0.0
+
+
+@pytest.mark.asyncio
+async def test_legacy_record_without_bundle_says_start_a_new_session(
+    tmp_path: Path,
+) -> None:
+    # Package 10: a record persisted by the old harness format carries no
+    # frozen policy bundle. Resume rejects it actionably — "start a new
+    # session", no migration — and the source loop keeps its own session.
+    config = build_test_vibe_config(
+        session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path))
+    )
+    saved = build_test_agent_loop(config=config)
+    await saved.persist_empty_session()
+    saved_session_id = saved.session_id
+    session_dir = saved.session_logger.session_dir
+    assert session_dir is not None
+    await saved.aclose()
+
+    meta_path = session_dir / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta.pop("policy_bundle", None)
+    meta.pop("policy_storage_version", None)
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    source = build_test_agent_loop(config=config)
+    source_session_id = source.session_id
+    try:
+        with pytest.raises(SessionPolicyError, match="Start a new session"):
+            await AgentRuntimeFactory().resume_root(source, saved_session_id)
+        # The rejected resume leaves the source bound to its own session.
+        assert source.session_id == source_session_id
+        assert source.session_id != saved_session_id
+    finally:
+        await source.aclose()

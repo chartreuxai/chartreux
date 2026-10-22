@@ -388,7 +388,7 @@ class TestSharedCooldownRootChild:
         monkeypatch.setattr(
             "chartreux.core.agent_loop._loop.create_backend", lambda **_: child_backend
         )
-        child = await AgentRuntimeFactory().create_child(parent, "worker")
+        child = await AgentRuntimeFactory().create_child(parent, "coder")
         try:
             await child.wait_until_ready()
             # The child shares the root-owned registry object itself.
@@ -445,7 +445,7 @@ class TestSharedCooldownRootChild:
         monkeypatch.setattr(
             "chartreux.core.agent_loop._loop.create_backend", lambda **_: child_backend
         )
-        child = await AgentRuntimeFactory().create_child(parent, "worker")
+        child = await AgentRuntimeFactory().create_child(parent, "coder")
         try:
             await child.wait_until_ready()
 

@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from chartreux.core.config import ChartreuxConfigSchema, ModelConfig
     from chartreux.core.llm_models import AvailableTool, LLMChunk, StrToolChoice
     from chartreux.core.message_list import MessageList
+    from chartreux.core.policy.bundle import ActivatedPolicy
     from chartreux.core.session_types import AgentStats
 
 _COMPACTION_PTL_RETRIES = 3
@@ -81,6 +82,7 @@ class CompactionManager:
         save: Callable[[], Awaitable[None]],
         file_state_getter: Callable[[], FileStateStore] | None = None,
         deferred_questions_getter: Callable[[], DeferredQuestionStore] | None = None,
+        bound_policy_getter: Callable[[], ActivatedPolicy] | None = None,
     ) -> None:
         self._messages = messages
         self._stats = stats_getter
@@ -91,6 +93,7 @@ class CompactionManager:
         self._save = save
         self._file_state_getter = file_state_getter
         self._deferred_questions_getter = deferred_questions_getter
+        self._bound_policy_getter = bound_policy_getter
 
     async def compact(self, extra_instructions: str = "") -> str:
         summary_prefix = UtilityPrompt.COMPACT_SUMMARY_PREFIX.read()
@@ -145,12 +148,21 @@ class CompactionManager:
     ) -> str:
         config = self._config()
         request = config.compaction_prompt
-        if (bound := config.bound_dispatch_policy) is not None:
-            policy = bound.policy
+        if self._bound_policy_getter is not None:
+            # The frozen bundle binding (design §10): the bound selections AND
+            # their content revisions are session-bound facts the summarizer
+            # cannot see anywhere else in the transcript, so they ride the
+            # request verbatim — saved selection or resource edits never apply.
+            manifest = self._bound_policy_getter().manifest
             request += (
-                f"\n\nBound dispatch policy identity: {policy.identity}; policy version: {policy.version}; "
-                f"snapshot version: {bound.version}; session mode: {bound.render_policy.mode.value}. "
-                "Copy these session-bound fields into the handoff; do not adopt saved policy edits."
+                f"\n\nBound policy bundle: identity {manifest.identity.selected} "
+                f"(revision {manifest.identity.revision}); workflow "
+                f"{manifest.workflow.selected} (revision {manifest.workflow.revision}); "
+                f"orchestration strategy {manifest.strategy.selected} "
+                f"(revision {manifest.strategy.revision or 'none'}); "
+                f"frozen policy hash {manifest.frozen_policy_hash}. "
+                "Copy these session-bound fields into the handoff; do not adopt "
+                "saved selection or resource edits."
             )
         if extra_instructions:
             request += f"\n\n## Additional Instructions\n{extra_instructions}"

@@ -35,7 +35,7 @@ from tests.app_server._subagent_test_support import (
 
 def _reuse_args(agent_id: str, **extra: Any) -> TaskArgs:
     return TaskArgs(
-        task="reuse", agent_type="worker", agent_id=agent_id, background=True, **extra
+        task="reuse", identity="coder", agent_id=agent_id, background=True, **extra
     )
 
 
@@ -307,7 +307,7 @@ async def test_eviction_notification_carries_run_id_and_outcome() -> None:
     messages = root.agent_loop._pending_injected_messages
     assert len(messages) == 1
     assert messages[0].content == (
-        "Background agent worker-1 (agent-1, run run-1) evicted "
+        "Background agent coder-1 (agent-1, run run-1) evicted "
         "(ttl, idle 10s, last run completed); "
         "launch a new agent for further work."
     )
@@ -344,8 +344,8 @@ async def test_batched_eviction_notification_identifies_each_run_and_outcome() -
     assert len(messages) == 1
     assert messages[0].content == (
         "Background agents evicted: "
-        "worker-a (agent-a, run run-a, idle_cap, idle 10s, last run completed); "
-        "worker-b (agent-b, run run-b, idle_cap, idle 10s, last run failed); "
+        "coder-a (agent-a, run run-a, idle_cap, idle 10s, last run completed); "
+        "coder-b (agent-b, run run-b, idle_cap, idle 10s, last run failed); "
         "launch a new agent for further work."
     )
     await registry.drain_children()

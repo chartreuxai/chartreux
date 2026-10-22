@@ -1,4 +1,12 @@
-"""Graduation eligibility, independent of UI focus and session policy mutation."""
+"""Graduation eligibility, independent of UI focus and session policy mutation.
+
+The original v0.5.6 latch — suggest orchestration once a second model is
+saved — is retired: orchestration is never inferred from the roster size
+(v0.5.7 design invariant). What remains is the failure-driven signal: after
+repeated budgeted implementation attempts fail, the harness may suggest
+reviewing model presets or delegating differently. The onboarding callback
+signature is preserved so external callers are unaffected.
+"""
 
 from __future__ import annotations
 
@@ -12,13 +20,11 @@ import tomllib
 
 from chartreux.utils.paths import get_chartreux_home
 
-MIN_USABLE_MODELS = 2
 FAILURE_THRESHOLD = 2
 
 
 @dataclass
 class GraduationState:
-    second_model_saved: bool = False
     need_signal: bool = False
     shown: bool = False
     dismissed: bool = False
@@ -33,23 +39,13 @@ class GraduationState:
         succeeded: bool = True,
         linked: bool = False,
     ) -> None:
-        """Names are canonical identities; saved_models includes newly ready models.
+        """Record a roster transition; it never drives a suggestion.
 
-        The latch is a bound-roster transition, not a usable-model count: it
-        sets only when the roster the runtime would select moves from exactly
-        one distinct canonical identity to two or more, and a saved identity
-        is part of the multi-model post-save roster. A save against a roster
-        that already bound several identities, or from an empty roster, does
-        not latch.
+        The roster-size latch was removed with the ``@main`` rename: provider
+        setup must not suggest orchestration based on how many models are
+        configured. The callback stays so existing callers are unaffected.
         """
-        if (
-            succeeded
-            and not linked
-            and len(roster_before) == 1
-            and len(roster_after) >= MIN_USABLE_MODELS
-            and bool(saved_models & roster_after)
-        ):
-            self.second_model_saved = True
+        del roster_before, roster_after, saved_models, succeeded, linked
 
     def compacted(self, *, replayed: bool = False) -> None:
         if not replayed:
@@ -76,13 +72,11 @@ class GraduationState:
             attempts.add(attempt_id)
         self.need_signal |= len(attempts) >= FAILURE_THRESHOLD
 
-    def eligible(self, *, mode: str, idle: bool, headless: bool) -> bool:
+    def eligible(self, *, idle: bool, headless: bool) -> bool:
         return (
-            self.second_model_saved
-            and self.need_signal
+            self.need_signal
             and not self.shown
             and not self.dismissed
-            and mode == "standalone"
             and idle
             and not headless
         )
@@ -98,7 +92,7 @@ class GraduationStore:
         try:
             with self.path.open("rb") as stream:
                 data = tomllib.load(stream)
-            for key in ("second_model_saved", "shown", "dismissed"):
+            for key in ("shown", "dismissed"):
                 value = data.get(key, False)
                 if not isinstance(value, bool):
                     raise ValueError("Invalid graduation state")
@@ -134,7 +128,7 @@ class GraduationStore:
                     self.load_error = True
                     self.state.shown = True
                     return False
-                for key in ("second_model_saved", "shown", "dismissed"):
+                for key in ("shown", "dismissed"):
                     setattr(
                         self.state,
                         key,
@@ -144,7 +138,7 @@ class GraduationStore:
                     mode="w", dir=self.path.parent, prefix=".graduation-", delete=False
                 ) as stream:
                     temporary = Path(stream.name)
-                    for key in ("second_model_saved", "shown", "dismissed"):
+                    for key in ("shown", "dismissed"):
                         stream.write(
                             f"{key} = {str(getattr(self.state, key)).lower()}\n"
                         )

@@ -206,6 +206,21 @@ class TestCommandRegistry:
         assert "http|streamable-http" not in command.description
         assert "--transport streamable-http" in command.description
 
+    def test_reload_command_description_matches_the_frozen_lifecycle(self) -> None:
+        # EF8 (final release review): the shipped /reload description must
+        # not promise that agent instructions reload from disk — under the
+        # frozen lifecycle (design §10) identity/workflow/strategy content
+        # stays bound to the conversation and edits are reported as
+        # pending; the refreshable sections are AGENTS.md, skills, and
+        # catalogs (the built-in skill's own /reload description).
+        registry = CommandRegistry()
+        command = registry.commands["reload"]
+
+        assert command.description == (
+            "Refresh AGENTS.md, skills, and catalogs; frozen policy "
+            "stays bound, edits reported as pending"
+        )
+
     def test_loop_command_registration(self) -> None:
         registry = CommandRegistry()
         assert registry.get_command_name("/loop") == "loop"
@@ -351,6 +366,34 @@ class TestBuiltinSkillCommandDrift:
             f"context, so the model will recommend commands that do not exist. "
             f"Either register them or delete them from the skill text."
         )
+
+    def test_builtin_skill_documents_identity_routing_and_retention(self) -> None:
+        prompt = VIBE_SKILL.prompt
+        for phrase in (
+            "use `identity` rather than the retired profile `agent_type` axis",
+            "default child identity is `coder`",
+            "`[orchestration.routes.*]`",
+            "review execution uses coder with the shipped review overlay",
+            "global `[subagents]` settings",
+            "`tombstone_ttl_seconds`",
+            "`max_tombstones`",
+            "background agents close when their run completes unless they are retained",
+            "precedence is the launch argument, then the global `[subagents].retain_agents` setting",
+            "omit `retain` to inherit the instance's committed retention policy",
+            "no identity-specific retention setting",
+            "The `/agents` browser shows identity",
+        ):
+            assert phrase in prompt, phrase
+        subagents = prompt.split("### Subagents\n", maxsplit=1)[1].split(
+            "## Built-in Slash Commands", maxsplit=1
+        )[0]
+        for retired in (
+            "`[dispatch]`",
+            "`agent_paths`, `enabled_agents`, and `disabled_agents`",
+            "profile default (`retain = true`)",
+            "review.deep",
+        ):
+            assert retired not in subagents, retired
 
     def test_builtin_skill_documents_dynamic_authorized_roots(self) -> None:
         prompt = VIBE_SKILL.prompt

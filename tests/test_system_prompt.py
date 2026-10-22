@@ -6,21 +6,99 @@ from pathlib import Path
 import pytest
 
 from chartreux.core.agents import AgentManager
+from chartreux.core.agents.identities import (
+    UnknownIdentityError,
+    validate_identity_selection,
+)
 from chartreux.core.config import ChartreuxConfigSchema
-from chartreux.core.dispatch import ORCHESTRATED_PRESET, SHIPPED_PURPOSES
+from chartreux.core.dispatch import SHIPPED_PURPOSES
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.schema import ModelCatalog
-from chartreux.core.prompts import (
-    MissingPromptFileError,
-    SystemPrompt,
-    UtilityPrompt,
-    load_system_prompt,
+from chartreux.core.policy.resources import ResourceResolutionError
+from chartreux.core.prompts import PROMPTS_DIR, UtilityPrompt, load_prompt
+from chartreux.core.recovery_policy import (
+    UNATTENDED_RESILIENCE_MARKER,
+    UNATTENDED_RESILIENCE_RULE,
 )
 from chartreux.core.scratchpad import init_scratchpad
 from chartreux.core.skills.manager import SkillManager
 from chartreux.core.system_prompt import get_universal_system_prompt
 from tests.conftest import ConfigBuilder, OrchestratorLoader, multi_model_catalog
+
+_PROMPTS_ROOT = Path(__file__).parents[1] / "chartreux" / "core" / "prompts"
+_TASK_PROMPT = (
+    Path(__file__).parents[1] / "chartreux/core/tools/builtins/prompts/task.md"
+)
+
+# The retired SystemPrompt enum ids (package 16b): the enum, its loader, and
+# the seven enum-mapped bodies are gone; their content lives on in the
+# composition corpus (identities/fragments/workflows).
+_RETIRED_ENUM_IDS = (
+    "cli",
+    "explore",
+    "tests",
+    "minimal",
+    "worker",
+    "advisor",
+    "reviewer",
+)
+_UNKNOWN_PROMPT_IDS = ("cli_2026-07_v2", "cli_2026-08_v3")
+
+# The surviving load path takes its built-in bodies from an explicit map —
+# here the utility prompts — never by scanning the prompts directory.
+_UTILITY_BUILTINS = {prompt.value: prompt.path for prompt in UtilityPrompt}
+
+
+def _identity_body(name: str) -> str:
+    return (_PROMPTS_ROOT / "identities" / f"{name}.md").read_text(encoding="utf-8")
+
+
+def _fragment(name: str) -> str:
+    return (_PROMPTS_ROOT / "fragments" / f"{name}.md").read_text(encoding="utf-8")
+
+
+def _workflow(name: str) -> str:
+    return (_PROMPTS_ROOT / "workflows" / f"{name}.md").read_text(encoding="utf-8")
+
+
+def _compose_child_prompt(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+    identity: str,
+) -> str:
+    config = build_config(
+        agent={"identity": identity},
+        include_model_info=False,
+        include_commit_signature=False,
+    )
+    return get_universal_system_prompt(
+        config,
+        SkillManager(lambda: config),
+        AgentManager(load_orchestrator(config)),
+        is_subagent=True,
+    )
+
+
+def _compose_orchestrator_prompt(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+) -> str:
+    config = build_config(
+        agent={
+            "identity": "orchestrator",
+            "workflow": "ceremony",
+            "orchestration_strategy": "builtin:default",
+        },
+        include_model_info=False,
+        include_commit_signature=False,
+    )
+    config.attach_catalog_snapshot(
+        CatalogSnapshot(multi_model_catalog(), "routing-test")
+    )
+    return get_universal_system_prompt(
+        config, SkillManager(lambda: config), AgentManager(load_orchestrator(config))
+    )
 
 
 def test_system_prompt_reports_resolved_model_when_unpinned(
@@ -49,7 +127,6 @@ def test_model_catalog_section_renders_thin_descriptions_and_routes_by_vocabular
     load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
 ) -> None:
     config = build_config(
-        system_prompt_id="cli",
         active_model="base",
         include_prompt_detail=False,
         include_project_context=False,
@@ -107,11 +184,14 @@ def test_model_catalog_section_renders_thin_descriptions_and_routes_by_vocabular
     assert "| @quick | base | low | quick preset |" in prompt
     assert "| disabled |" not in prompt
     assert "@unavailable" not in prompt
-    # The routing prose renders from the bound dispatch policy: every slot
-    # binds the single canonical model `base`, so the rendering is task-kind
-    # and role-free rather than role-routed.
-    assert "route by purpose through the configured slots" in prompt
-    assert "| `mechanical` | `worker` |" in prompt
+    # The routing renders from the package-4 route facts: the launch-target
+    # table binds every shipped default target to the session model `base`,
+    # so the rendering is model-bound and role-free rather than role-routed.
+    assert "### Launch targets" in prompt
+    assert "| Purpose | Identity | Tier | Seat | Model |" in prompt
+    assert "| `implementation` | `coder` | substantive | — | `base` |" in prompt
+    assert "### Purpose meanings" in prompt
+    assert "| `mechanical` | `worker` |" not in prompt
     assert "`@scout` for search" not in prompt
     assert "$dispatch" not in prompt
 
@@ -125,12 +205,11 @@ def test_model_catalog_section_renders_thin_descriptions_and_routes_by_vocabular
     assert "| @worker | base | high | worker preset |" in restricted_prompt
 
 
-def test_worker_profile_child_omits_model_catalog_without_role_instructions(
+def test_subagent_child_omits_model_catalog_without_role_instructions(
     build_config: ConfigBuilder,
     load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
 ) -> None:
     config = build_config(
-        system_prompt_id="worker",
         include_prompt_detail=False,
         include_project_context=False,
         include_commit_signature=False,
@@ -259,7 +338,7 @@ def test_shipped_catalog_role_descriptions_are_thin_and_vocabulary_carries_routi
 
     # Role descriptions are thin preset labels; the task-routing vocabulary
     # renders from the developer-owned dispatch purposes, not from the catalog.
-    assert roles["orchestrator"].description == "main assistant preset"
+    assert roles["main"].description == "main assistant preset"
     assert roles["worker"].description == "worker preset"
     assert roles["scout"].description == "scout preset"
     assert roles["heavy"].description == "heavy preset"
@@ -268,6 +347,7 @@ def test_shipped_catalog_role_descriptions_are_thin_and_vocabulary_carries_routi
         assert "capacity preset" not in role.description
     # The routing semantics live in the purpose vocabulary.
     assert set(SHIPPED_PURPOSES) == {
+        "research",
         "search",
         "exploration",
         "verification",
@@ -362,8 +442,11 @@ def test_headless_section_included_when_enabled(
         config, skill_manager, agent_manager, headless=True
     )
 
-    assert "# Headless Mode" in prompt
-    assert "no human is available to respond" in prompt
+    # The headless execution context is step 4 of the composition.
+    assert "## Execution context — headless main session" in prompt
+    assert "non-interactive (headless) session" in prompt
+    assert "interactive approval prompt" in prompt
+    assert "no user watching the loop" in prompt
 
 
 def test_headless_section_absent_by_default(
@@ -377,15 +460,15 @@ def test_headless_section_absent_by_default(
     prompt = get_universal_system_prompt(config, skill_manager, agent_manager)
 
     assert "Headless Mode" not in prompt
+    assert "## Execution context — headless main session" not in prompt
+    assert "## Execution context — interactive main session" in prompt
 
 
 def test_current_date_placeholder_substituted_in_prompt(
     build_config: ConfigBuilder,
     load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
 ) -> None:
-    config = build_config(
-        system_prompt_id="cli", include_model_info=False, include_commit_signature=False
-    )
+    config = build_config(include_model_info=False, include_commit_signature=False)
     skill_manager = SkillManager(lambda: config)
     agent_manager = AgentManager(load_orchestrator(config))
 
@@ -397,116 +480,145 @@ def test_current_date_placeholder_substituted_in_prompt(
     assert "$current_date" not in prompt
 
 
-def test_default_prompt_renders_delegation_protocol(
+def test_default_prompt_composes_the_coder_minimal_selection(
     build_config: ConfigBuilder,
     load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
 ) -> None:
-    config = build_config(
-        system_prompt_id="cli", include_model_info=False, include_commit_signature=False
-    )
+    config = build_config(include_model_info=False, include_commit_signature=False)
     prompt = get_universal_system_prompt(
         config, SkillManager(lambda: config), AgentManager(load_orchestrator(config))
     )
 
-    assert "## Delegation protocol" in prompt
+    # The composed default opens at character zero with the coder identity.
+    assert prompt.startswith(
+        "You are Chartreux, an independently maintained CLI coding agent."
+    )
+    assert "## Coder identity" in prompt
+    # The minimal workflow body is step 5.
+    assert "# Workflow: minimal" in prompt
+    assert "run the relevant checks yourself" in prompt
+    # The legacy skeleton's delegation protocol section is gone: the
+    # direct-tool posture line renders in step 3 instead.
+    assert "## Delegation protocol" not in prompt
     assert "## Orchestration" not in prompt
     assert "## Background subagents" not in prompt
-    assert "re-sent on every call" in prompt
-    assert 'task(agent_type="worker", task=...)' in prompt
-    assert "write_file/edit — repo files within the approved scope" in prompt
-    assert "read_file — files the task names or cites" in prompt
-    assert "bash — orchestration metadata only, always with timeouts" in prompt
-    assert "delegate searches, exploration, tests, and builds" in prompt
-    assert (
-        "Pass the model and thinking explicitly; unavailable slots fail closed"
-        in prompt
-    )
+    assert "**Delegation posture.** Delegation is optional:" in prompt
+    assert "Direct tools: the full granted tool set." in prompt
+    # Routing is the launch-target table, not a slot table.
+    assert "### Launch targets" in prompt
+    assert "### Authoritative active slot bindings" not in prompt
+    # The closing re-anchor is last.
+    assert prompt.rstrip().endswith("this closing note adds no new rules.")
     assert "$role" not in prompt
-    # The delegation protocol's mode-variable regions render from the bound
-    # dispatch policy at assembly; the standalone preset renders task-kind
-    # routing regardless of roster size, so no placeholder or role name leaks.
-    assert "route by purpose through the configured slots" in prompt
     assert "$dispatch" not in prompt
     assert "`@scout` for search" not in prompt
-    # The delegation paragraph documents the implemented lifecycle semantics:
-    # close-on-completion default, display-only names, and the still_running
-    # turn-yield wait outcome.
-    assert "Background launches close on completion by default" in prompt
-    assert "display-only `{profile}-{model}-{number}` name" in prompt
-    assert "`still_running` timeout result is a normal outcome" in prompt
 
 
-def test_system_prompt_builtin_ids_and_default_are_explicit() -> None:
-    assert {prompt.value for prompt in SystemPrompt} == {
-        "cli",
-        "explore",
-        "tests",
-        "minimal",
-        "worker",
-        "advisor",
-        "reviewer",
-    }
-    assert ChartreuxConfigSchema.model_fields["system_prompt_id"].annotation is str
-    assert ChartreuxConfigSchema.model_fields["system_prompt_id"].default == "cli"
+def test_system_prompt_enum_and_enum_loader_are_retired() -> None:
+    from chartreux.core import prompts
+
+    # Package 16b retired the enum-based full-skeleton prompt axis: the
+    # SystemPrompt enum, load_system_prompt, and the seven enum-mapped
+    # bodies are gone (their case-insensitive enum lookup went with them).
+    # What survives is the utility/custom load path.
+    assert not hasattr(prompts, "SystemPrompt")
+    assert not hasattr(prompts, "load_system_prompt")
+    for retired in _RETIRED_ENUM_IDS:
+        assert not (PROMPTS_DIR / f"{retired}.md").exists()
+    for survivor in (
+        "PROMPTS_DIR",
+        "Prompt",
+        "UtilityPrompt",
+        "MissingPromptFileError",
+        "custom_prompt_ids",
+        "load_prompt",
+    ):
+        assert hasattr(prompts, survivor)
 
 
-@pytest.mark.parametrize(
-    "prompt_id", ["cli", "explore", "tests", "minimal", "worker", "advisor", "reviewer"]
-)
-def test_explicit_builtin_system_prompt_selection(
-    mock_prompts_dirs: tuple[Path, Path], build_config: ConfigBuilder, prompt_id: str
+@pytest.mark.parametrize("prompt_id", [*_RETIRED_ENUM_IDS, *_UNKNOWN_PROMPT_IDS])
+def test_retired_and_unknown_prompt_ids_have_no_builtin_body(
+    mock_prompts_dirs: tuple[Path, Path], prompt_id: str
 ) -> None:
-    expected = SystemPrompt(prompt_id).read()
-    assert build_config(system_prompt_id=prompt_id).system_prompt == expected
-    assert load_system_prompt(prompt_id.upper()) == expected
+    # The retired enum ids (and unknown ids) resolve to no built-in body:
+    # the surviving load path finds neither a shipped file (the builtins map
+    # is explicit) nor a user custom file.
+    with pytest.raises(ResourceResolutionError, match="cannot read resource"):
+        load_prompt(
+            prompt_id, setting_name="system_prompt_id", builtins=_UTILITY_BUILTINS
+        )
+    assert not (PROMPTS_DIR / f"{prompt_id}.md").exists()
 
 
-_NON_SYSTEM_PROMPT_IDS = [
-    "cli_2026-07_v2",
-    "cli_2026-08_v3",
-    *(prompt.value for prompt in UtilityPrompt),
-]
-
-
-@pytest.mark.parametrize("prompt_id", _NON_SYSTEM_PROMPT_IDS)
-def test_retired_and_utility_ids_are_not_builtin_system_prompts(
-    mock_prompts_dirs: tuple[Path, Path], build_config: ConfigBuilder, prompt_id: str
+@pytest.mark.parametrize("prompt_id", [prompt.value for prompt in UtilityPrompt])
+def test_utility_prompt_ids_load_through_the_surviving_path(
+    mock_prompts_dirs: tuple[Path, Path], prompt_id: str
 ) -> None:
-    config = build_config(system_prompt_id=prompt_id)
-    with pytest.raises(MissingPromptFileError) as exc_info:
-        _ = config.system_prompt
-
-    assert exc_info.value.setting_name == "system_prompt_id"
-    assert exc_info.value.prompt_id == prompt_id
+    # Utility/compaction prompts survive the enum retirement untouched: every
+    # built-in utility id loads through the strict loader branch.
     assert (
-        'available prompts ("cli", "explore", "tests", "minimal", "worker", "advisor", "reviewer")'
-        in str(exc_info.value)
+        load_prompt(
+            prompt_id, setting_name="compaction_prompt_id", builtins=_UTILITY_BUILTINS
+        )
+        == UtilityPrompt(prompt_id).read()
     )
 
 
-@pytest.mark.parametrize(
-    "prompt_id", ["custom_selection", "cli", *_NON_SYSTEM_PROMPT_IDS]
-)
-def test_custom_system_prompt_selection_preserves_precedence(
-    mock_prompts_dirs: tuple[Path, Path], build_config: ConfigBuilder, prompt_id: str
+@pytest.mark.parametrize("prompt_id", ["custom_selection", "cli", *_UNKNOWN_PROMPT_IDS])
+def test_custom_prompt_files_load_from_the_user_directory(
+    mock_prompts_dirs: tuple[Path, Path], prompt_id: str
 ) -> None:
     project_prompts, user_prompts = mock_prompts_dirs
-    config = build_config(system_prompt_id=prompt_id)
     (user_prompts / f"{prompt_id}.md").write_text(
         "  User custom prompt\n", encoding="utf-8"
     )
-    assert config.system_prompt == "User custom prompt"
+    assert (
+        load_prompt(
+            prompt_id, setting_name="system_prompt_id", builtins=_UTILITY_BUILTINS
+        )
+        == "User custom prompt"
+    )
 
+    # Project prompt directories are retired (package 16a): a file written
+    # there is reported through the retired-dirs surface and never consumed,
+    # so the user prompt keeps winning.
     (project_prompts / f"{prompt_id}.md").write_text(
         "  Project custom prompt\n", encoding="utf-8"
     )
-    assert config.system_prompt == "Project custom prompt"
+    assert (
+        load_prompt(
+            prompt_id, setting_name="system_prompt_id", builtins=_UTILITY_BUILTINS
+        )
+        == "User custom prompt"
+    )
 
 
-@pytest.mark.parametrize("prompt_id", ["worker", "advisor", "reviewer"])
-def test_role_prompts_contain_subagent_contract(prompt_id: str) -> None:
-    prompt = load_system_prompt(prompt_id)
+@pytest.mark.parametrize("prompt_id", [prompt.value for prompt in UtilityPrompt])
+def test_builtin_utility_prompts_cannot_be_shadowed_by_user_files(
+    mock_prompts_dirs: tuple[Path, Path], prompt_id: str
+) -> None:
+    # Reserved built-in names cannot be shadowed: a user file reusing a
+    # built-in utility id never wins over the shipped body.
+    _, user_prompts = mock_prompts_dirs
+    (user_prompts / f"{prompt_id}.md").write_text("user shadow\n", encoding="utf-8")
+    assert (
+        load_prompt(
+            prompt_id, setting_name="compaction_prompt_id", builtins=_UTILITY_BUILTINS
+        )
+        == UtilityPrompt(prompt_id).read()
+    )
 
+
+@pytest.mark.parametrize("identity", ["coder", "advisor", "reviewer"])
+def test_composed_child_prompts_contain_the_bounded_child_contract(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+    identity: str,
+) -> None:
+    prompt = _compose_child_prompt(build_config, load_orchestrator, identity)
+
+    # The retired role prompts' shared subagent contract survives as the
+    # bounded-child fragment, composed into every child prompt.
     for clause in (
         "Perform one bounded assignment",
         "return a structured blocker",
@@ -518,20 +630,19 @@ def test_role_prompts_contain_subagent_contract(prompt_id: str) -> None:
     ):
         assert clause in prompt
 
-    if prompt_id in {"advisor", "reviewer"}:
+    if identity == "advisor":
+        # The read-only advisor body keeps its report-in-result denials
+        # variant alongside the shared contract.
         assert (
-            "report denied commands and the runtime's rejection reason in your result"
-            in prompt
+            "report denied commands and the runtime's rejection reason "
+            "in your result" in prompt
         )
         assert "do not persist them to task-note files" in prompt
         assert "do not modify files to reconcile them" in prompt
-        assert "persist failed commands" not in prompt
-        assert "maintain a cumulative record" not in prompt
 
 
-@pytest.mark.parametrize("prompt_id", ["worker", "reviewer", "advisor"])
-def test_role_prompts_retire_stop_rule_and_failure_retries(prompt_id: str) -> None:
-    prompt = load_system_prompt(prompt_id)
+def test_bounded_child_fragment_retires_stop_rule_and_failure_retries() -> None:
+    prompt = _fragment("bounded_child")
 
     # ADR 0020: the whole-assignment stop rule never fired in the six audited
     # mistral-large-4 sessions; the strategy-switch rule replaces it.
@@ -545,8 +656,8 @@ def test_role_prompts_retire_stop_rule_and_failure_retries(prompt_id: str) -> No
     assert "Do not run verification reserved to the parent" not in prompt
 
 
-def test_worker_prompt_operational_discipline_has_strategy_switch() -> None:
-    prompt = SystemPrompt.WORKER.read()
+def test_bounded_child_fragment_carries_the_operational_discipline() -> None:
+    prompt = _fragment("bounded_child")
 
     # Denials rule: persistent recording, consult-before-next-call, and
     # hardened permission/policy refusal language.
@@ -628,26 +739,22 @@ def test_worker_prompt_operational_discipline_has_strategy_switch() -> None:
     assert "Read each file at most once per session" not in prompt
 
 
-def test_worker_prompt_output_format_disclosure_covers_every_layer() -> None:
-    prompt = SystemPrompt.WORKER.read()
+def test_bounded_child_output_format_discloses_denials_and_touched_paths() -> None:
+    prompt = _fragment("bounded_child")
 
-    # Every layer of the format resolution — task-specified, skill-specified,
-    # and the JSON fallback — must disclose the denial record and the complete
-    # cumulative touched-path set, including in a structured blocker report.
+    # The output-format resolution — task-specified format, skill-specified
+    # format, JSON fallback — must disclose the denial record and the
+    # complete cumulative touched-path set in the final report.
     assert (
-        "Every layer of that resolution — the task-specified format, the "
-        "skill-specified format, and the JSON fallback below — must disclose "
-        "two things in the final report, including in a structured blocker "
-        "report: the denial record (each denied command and the runtime's stated "
-        "reason, or an empty list when there were none) and the complete "
-        "cumulative touched-path set (every repository path you created, edited, "
-        "renamed, or deleted, including edits later reverted; the record is "
-        "cumulative and is never rewritten to exclude reverts)." in prompt
+        "Return the format the task specifies when it names one; otherwise the "
+        "loaded skill's specified format; otherwise the JSON fallback below." in prompt
     )
     assert (
-        "A task- or skill-specified format that omits either disclosure is "
-        "incomplete: add the denial record and the touched-path set to it in "
-        "that format's own terms." in prompt
+        "Every report form must disclose two things: the denial record (each "
+        "denied command and the runtime's stated reason, or an empty list when "
+        "there were none) and the complete cumulative touched-path set (every "
+        "repository path you created, edited, renamed, or deleted, including "
+        "edits later reverted)." in prompt
     )
     # The JSON fallback gains an explicit denials field, and files_touched is
     # documented as the cumulative record, not a clean-diff projection.
@@ -662,11 +769,8 @@ def test_worker_prompt_output_format_disclosure_covers_every_layer() -> None:
     )
 
 
-@pytest.mark.parametrize("prompt_id", ["reviewer", "advisor"])
-def test_read_only_role_prompts_have_rewritten_denials_strategy_switch_and_denials_slot(
-    prompt_id: str,
-) -> None:
-    prompt = load_system_prompt(prompt_id)
+def test_advisor_identity_carries_the_read_only_denials_variant() -> None:
+    prompt = _identity_body("advisor")
 
     # Rewritten denials rule (read-only variant): report-in-result recording
     # with the pinned clauses and hardened refusal language, no stop rule.
@@ -680,7 +784,7 @@ def test_read_only_role_prompts_have_rewritten_denials_strategy_switch_and_denia
         "requirement and continue only independent authorized work." in prompt
     )
     # Same-effect retry clarification (ADR 0020 amendment), same sentence as
-    # in the worker prompt.
+    # in the bounded-child fragment.
     assert (
         "The refused action's identity is its effect on the same files or "
         "state, not the command spelling: producing the same refused effect "
@@ -707,10 +811,14 @@ def test_read_only_role_prompts_have_rewritten_denials_strategy_switch_and_denia
         "**Denials encountered:** {denied commands and the runtime's stated "
         "reasons, or none}" in prompt
     )
+    # The read-only variant never asks for task-note persistence or path
+    # bookkeeping: those stay with the shared bounded-child contract.
+    assert "persist failed commands" not in prompt
+    assert "maintain a cumulative record" not in prompt
 
 
 def test_reviewer_denials_slot_follows_coverage_line() -> None:
-    prompt = load_system_prompt("reviewer")
+    prompt = _identity_body("reviewer")
 
     assert prompt.index(
         "**Coverage:** {what was reviewed and excluded}"
@@ -718,7 +826,7 @@ def test_reviewer_denials_slot_follows_coverage_line() -> None:
 
 
 def test_advisor_denials_slot_covers_every_output_form() -> None:
-    prompt = load_system_prompt("advisor")
+    prompt = _identity_body("advisor")
 
     # Every permitted output form can carry the denials slot: the Advice
     # template, the concise paragraph, and the Blocker form.
@@ -729,33 +837,53 @@ def test_advisor_denials_slot_covers_every_output_form() -> None:
     )
 
 
-def test_subagent_contract_block_is_byte_identical_across_role_prompts() -> None:
-    def contract_block(prompt_id: str) -> str:
-        prompt = load_system_prompt(prompt_id)
-        start = prompt.index("## Subagent contract")
+def test_bounded_child_fragment_is_byte_identical_across_composed_child_prompts(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+) -> None:
+    fragment = _fragment("bounded_child").strip()
+
+    def contract_block(identity: str) -> str:
+        prompt = _compose_child_prompt(build_config, load_orchestrator, identity)
+        # The shared bounded-child fragment lands verbatim in every child.
+        assert fragment in prompt
+        start = prompt.index("## Execution context — bounded child")
         end = prompt.index("\n## ", start)
         return prompt[start:end]
 
-    blocks = [
-        contract_block(prompt_id) for prompt_id in ("worker", "reviewer", "advisor")
-    ]
-    # ADR 0020 leaves the shared contract block untouched; it stays
-    # byte-identical across the three role prompts.
+    blocks = [contract_block(identity) for identity in ("coder", "advisor", "reviewer")]
+    # ADR 0020 left the shared contract untouched: it survives as the one
+    # bounded-child fragment, byte-identical across the composed child prompts.
     assert blocks[0] == blocks[1] == blocks[2]
     assert "Perform one bounded assignment" in blocks[0]
     assert "Return the requested result format exactly." in blocks[0]
 
 
-def test_user_prompt_overrides_builtin_role_prompt_by_id(
+def test_user_prompt_file_stays_a_custom_prompt_without_shadowing_the_builtin_identity(
     mock_prompts_dirs: tuple[Path, Path],
 ) -> None:
     _, user_prompts = mock_prompts_dirs
     (user_prompts / "advisor.md").write_text("User advisor prompt", encoding="utf-8")
 
-    assert load_system_prompt("advisor") == "User advisor prompt"
+    # The user file loads through the surviving custom-prompt path...
+    assert (
+        load_prompt(
+            "advisor", setting_name="system_prompt_id", builtins=_UTILITY_BUILTINS
+        )
+        == "User advisor prompt"
+    )
+    # ...but it never shadows the built-in identity of the same name: the
+    # bare selection still resolves to the shipped definition, and the
+    # user-qualified form is rejected as a reserved name.
+    assert (
+        validate_identity_selection("advisor", user_prompts_dirs=[user_prompts])
+        == "advisor"
+    )
+    with pytest.raises(UnknownIdentityError, match="cannot shadow built-in identities"):
+        validate_identity_selection("user:advisor", user_prompts_dirs=[user_prompts])
 
 
-def test_bundled_file_alone_does_not_make_system_prompt_selectable(
+def test_bundled_file_alone_does_not_make_a_prompt_selectable(
     mock_prompts_dirs: tuple[Path, Path],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -763,24 +891,36 @@ def test_bundled_file_alone_does_not_make_system_prompt_selectable(
     bundled_prompts = tmp_path / "bundled_prompts"
     bundled_prompts.mkdir()
     (bundled_prompts / "synthetic_bundled_only.md").write_text(
-        "Not a selectable system prompt", encoding="utf-8"
+        "Not a selectable prompt", encoding="utf-8"
     )
     monkeypatch.setattr("chartreux.core.prompts.PROMPTS_DIR", bundled_prompts)
 
-    with pytest.raises(MissingPromptFileError):
-        load_system_prompt("synthetic_bundled_only")
+    # The strict loader resolves built-ins from the explicit builtins map,
+    # never by scanning the prompts directory: a bundled-only file is not
+    # loadable through the surviving utility/custom path...
+    with pytest.raises(ResourceResolutionError, match="cannot read resource"):
+        load_prompt(
+            "synthetic_bundled_only",
+            setting_name="system_prompt_id",
+            builtins=_UTILITY_BUILTINS,
+        )
+    # ...and it is not a selectable identity either.
+    with pytest.raises(UnknownIdentityError, match="Unknown identity"):
+        validate_identity_selection("synthetic_bundled_only", user_prompts_dirs=[])
 
 
 @pytest.mark.parametrize("prompt_id", ["", ".", "..", "../cli", "dir/cli", "dir\\cli"])
-def test_system_prompt_selection_rejects_non_bare_ids(
+def test_prompt_selection_rejects_non_bare_ids(
     mock_prompts_dirs: tuple[Path, Path], prompt_id: str
 ) -> None:
     with pytest.raises(ValueError, match="must be a bare filename"):
-        load_system_prompt(prompt_id)
+        load_prompt(
+            prompt_id, setting_name="system_prompt_id", builtins=_UTILITY_BUILTINS
+        )
 
 
-def test_cli_prompt_opening_gate_stops_before_mutating_work() -> None:
-    prompt = SystemPrompt.CLI.read()
+def test_ceremony_workflow_opening_gate_stops_before_mutating_work() -> None:
+    prompt = _workflow("ceremony")
 
     # The opening gate stops before mutating or authoritative work and names it.
     assert (
@@ -835,8 +975,8 @@ def test_cli_prompt_opening_gate_stops_before_mutating_work() -> None:
     assert "when unsure, treat the task as non-trivial" in prompt
 
 
-def test_cli_prompt_acceptance_lattice_fails_closed() -> None:
-    prompt = SystemPrompt.CLI.read()
+def test_ceremony_workflow_acceptance_lattice_fails_closed() -> None:
+    prompt = _workflow("ceremony")
 
     # Design acceptance permits planning, not implementation.
     assert "Design acceptance permits planning, not implementation." in prompt
@@ -877,53 +1017,49 @@ def test_rendered_orchestrated_multi_model_prompt_routes_by_task_not_difficulty(
     build_config: ConfigBuilder,
     load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
 ) -> None:
-    # The routing prose is no longer baked into the prompt skeleton: it
-    # renders from the bound dispatch policy at assembly. A multi-model
-    # roster keeps the tier routing, now named for the roster roles.
+    # The composed orchestrator prompt routes by purpose: the launch-target
+    # table binds every shipped default target to the session model, and the
+    # routing prose rejects difficulty-based escalation.
     config = build_config(
-        system_prompt_id="cli", include_model_info=False, include_commit_signature=False
+        agent={
+            "identity": "orchestrator",
+            "workflow": "ceremony",
+            "orchestration_strategy": "builtin:default",
+        },
+        include_model_info=False,
+        include_commit_signature=False,
     )
     config.attach_catalog_snapshot(
-        CatalogSnapshot(
-            multi_model_catalog(), "routing-test", dispatch=ORCHESTRATED_PRESET
-        )
+        CatalogSnapshot(multi_model_catalog(), "routing-test")
     )
     prompt = get_universal_system_prompt(
         config, SkillManager(lambda: config), AgentManager(load_orchestrator(config))
     )
 
+    # The launch-target table binds the session model of the catalog.
+    assert "### Launch targets" in prompt
+    assert "| Purpose | Identity | Tier | Seat | Model |" in prompt
+    assert "| `implementation` | `coder` | substantive | — | `beta-model` |" in prompt
     assert (
-        "`@scout` for search, grep, exploration, verification, and mechanical "
-        "single-file edits" in prompt
+        "| `review.deep` | `reviewer` | substantive | analytical | `beta-model` |"
+        in prompt
     )
-    assert "`@worker` for all substantive implementation, however demanding" in prompt
     assert (
-        "`@heavy` for architecture, cross-subsystem design, design and planning "
-        "analysis, and deep review, plus demanding execution with a settled "
-        "approach through the escalation-implementor route — never routine "
-        "implementation. The worker and reviewer profiles use `@worker` by "
-        "default; the advisor profile uses `@heavy` for architecture, design, "
-        "planning, and destructive-operation analysis only; it never implements. "
-        "Demanding execution with a settled approach runs through the "
-        "worker-profile escalation-implementor route." in prompt
+        "| `review.deep` | `coder` | substantive | execution | `beta-model` |" in prompt
     )
-    # The reviewer profile stays @worker; deep review at @heavy is a model override.
+    # Unmet model-diversity requirements are reported, never faked.
+    assert "`review.deep`: 3 distinct canonical models" in prompt
+    # The routing prose rides in the orchestrator identity body.
+    assert "Route by purpose: the launch-target table" in prompt
     assert (
-        'The reviewer profile stays `@worker`; "deep review at `@heavy`" means '
-        "the reviewer profile with a `@heavy` model override." in prompt
+        "uncertainty, file count, session length, or wanting a better answer "
+        "are not escalation criteria" in prompt
     )
-    # Failed implementation is retried at @worker or analyzed by a @heavy
-    # advisor; the advisor seat never implements.
-    assert "never re-dispatch implementation to the `@heavy` advisor" in prompt
-    # The tier is passed explicitly: mechanical work carries a @scout override,
-    # substantive implementation launches at the @worker default.
-    assert "the profile default is not the routing decision" in prompt
-    assert 'config={"model": "@scout"}' in prompt
-    assert 'task="Rename add to plus in utils.py and update its call sites."' in prompt
-    assert (
-        'task="Add a retry helper with exponential backoff to utils.py and use '
-        'it in app.py."' in prompt
-    )
+    # One configured model and ten produce identical routing: no roster
+    # roles leak into the composed prompt.
+    assert "`@scout` for search" not in prompt
+    assert "`@worker` for all substantive implementation" not in prompt
+    assert "$dispatch" not in prompt
     # ADR 0018-G.1's byte-equality baseline is superseded: the roster rename
     # rewrote the curated prose, so the regenerated active goldens are the
     # byte baseline now and the WP0 legacy bytes no longer appear.
@@ -931,32 +1067,30 @@ def test_rendered_orchestrated_multi_model_prompt_routes_by_task_not_difficulty(
         Path(__file__).parent / "fixtures/dispatch/legacy-orchestrated/cli-routing.md"
     ).read_text()
     assert legacy.rstrip("\n") not in prompt
-    assert "`@scout` for search" in prompt
 
 
-def test_cli_prompt_uses_ascii_tree_and_arrow_characters() -> None:
-    prompt = SystemPrompt.CLI.read()
+def test_communication_fragment_uses_ascii_tree_and_arrow_characters() -> None:
+    prompt = _fragment("communication")
 
     # Tree and flow diagrams are ASCII-only; no Unicode box-drawing or arrows.
     for character in ("├", "└", "│", "┌", "┐", "┘", "─", "→"):
         assert character not in prompt
     assert "`|--`" in prompt
-    assert "`-- `" in prompt
+    assert "`-- " in prompt
     assert "A -> B -> C" in prompt
 
 
-def test_cli_prompt_carries_unattended_resilience_rule() -> None:
-    """WP5: the unattended-resilience rule is in the orchestrator prompt with
-    its greppable marker, right after the asking paragraph it complements
-    (never contradicts): infrastructure/harness failures never ask, genuine
-    authorization decisions still do.
+def test_composed_orchestrator_prompt_carries_the_unattended_resilience_rule(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+) -> None:
+    """WP5: the unattended-resilience rule is findable from the composed
+    orchestrator prompt — the orchestrator identity body carries the rule with
+    its greppable marker — and the asking paragraph it complements (never
+    contradicts) coexists in the shared tool-semantics fragment: infrastructure/
+    harness failures never ask, genuine authorization decisions still do.
     """
-    from chartreux.core.recovery_policy import (
-        UNATTENDED_RESILIENCE_MARKER,
-        UNATTENDED_RESILIENCE_RULE,
-    )
-
-    prompt = SystemPrompt.CLI.read()
+    prompt = _compose_orchestrator_prompt(build_config, load_orchestrator)
 
     # The greppable marker and the rule's core sentences.
     assert UNATTENDED_RESILIENCE_MARKER in prompt
@@ -976,63 +1110,45 @@ def test_cli_prompt_carries_unattended_resilience_rule() -> None:
     # The deferred-records surfacing is named in the consolidated report.
     assert "distinguishing deferred preferences from actual blockers" in prompt
     assert "still-open authorization decisions" in prompt
-    # U's asking paragraph is untouched: both rules coexist.
+    # The asking paragraph coexists with the rule (it now rides in the shared
+    # tool-semantics fragment, step 7, after the identity behavior, step 3).
     assert "**Asking the user.**" in prompt
     assert "`requires_user` questions (the default) always wait for an answer" in prompt
-    asking_at = prompt.index("**Asking the user.**")
-    rule_at = prompt.index(UNATTENDED_RESILIENCE_MARKER)
-    assert rule_at > asking_at
     # The module-level rule sentence matches the prompt's behavior.
     assert "never produce ask_user_question" in UNATTENDED_RESILIENCE_RULE
 
 
-def test_cli_prompt_carries_failure_time_replacement_policy() -> None:
-    """WP5: the delegation protocol names the failure-time replacement
-    policy: choice at failure time, endpoint independence, luna rejection
-    for substantive packages, the claim shape, and park-and-continue.
+def test_orchestrator_identity_carries_the_failure_time_replacement_paragraph() -> None:
+    """WP5: the orchestrator identity body names the failure-time replacement
+    policy: choice at failure time, endpoint independence, mechanical-tier
+    rejection for substantive packages, and park-and-continue. The claim shape
+    (config lineage, reconciliation barrier, budget) is pinned on the task
+    tool prompt by test_task_prompt_documents_replacement_claim, and the
+    same-endpoint / luna-class rejections are pinned behaviorally in
+    tests/recovery/test_replacement_policy.py.
     """
-    prompt = SystemPrompt.CLI.read()
+    prompt = _identity_body("orchestrator")
 
     assert "**Failure-time replacement.**" in prompt
     assert (
-        "choose its replacement AT FAILURE TIME from the validated eligible set"
+        "choose its replacement at failure time from the validated eligible set"
         in prompt
     )
     assert (
         "no dispatch-time substitution table and no automatic cross-model fallback"
         in prompt
     )
-    assert "independent of the ATTEMPTED failed endpoint" in prompt
-    assert (
-        "same-endpoint aliases and same-endpoint different-model substitutions are rejected"
-        in prompt
-    )
-    assert (
-        "never route a substantive package to a mechanical-tier (luna-class) model"
-        in prompt
-    )
+    assert "independent of the attempted failed endpoint" in prompt
+    assert "never route a substantive package to a mechanical-tier model" in prompt
     assert "A HEAD/branch/workspace preflight stop stays a stop" in prompt
-    assert "`config.predecessor_agent_id`" in prompt
-    assert "`config.work_package_id`" in prompt
-    assert "`config.package_tier`" in prompt
-    assert "submit `reconcile_result` first" in prompt
-    assert "per-package replacement budget" in prompt
-    assert "milestone notice with its honest cost implication" in prompt
-    assert (
-        "Budgets and recurrence counters span replacements and are never reset"
-        in prompt
-    )
     assert "park it and continue independent work" in prompt
-    assert "the root orchestrator is never autonomously replaced" in prompt
 
 
 def test_task_prompt_documents_replacement_claim() -> None:
     """WP5: the task tool prompt documents the cross-model replacement claim
     shape (NEW agent_id + config lineage) next to the replace_run paragraph.
     """
-    task = (
-        Path(__file__).parents[1] / "chartreux/core/tools/builtins/prompts/task.md"
-    ).read_text()
+    task = _TASK_PROMPT.read_text()
 
     assert "For a cross-model replacement after a failure, omit `agent_id`" in task
     assert "`config.predecessor_agent_id` (the failed agent)" in task
@@ -1049,94 +1165,51 @@ def test_task_prompt_documents_replacement_claim() -> None:
     assert replace_at < claim_at < cancel_at
 
 
-def test_rendered_failure_routes_carry_unattended_resilience_marker(
+def test_composed_orchestrator_and_task_prompts_retire_implementation_escalation(
     build_config: ConfigBuilder,
     load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
 ) -> None:
-    """WP5: the unattended-resilience rule is findable from the rendered
-    prompt — the cli skeleton paragraph carries the greppable marker in every
-    mode, and the rendered failure paragraph (standalone / single-model
-    rosters and the task description) carries it too.
-    """
-    from chartreux.core.dispatch.renderer import (
-        _failure_paragraph,
-        render_routing_region,
-        roster_for,
-    )
-    from chartreux.core.recovery_policy import UNATTENDED_RESILIENCE_MARKER
-    from tests.conftest import single_model_catalog
+    prompt = _compose_orchestrator_prompt(build_config, load_orchestrator)
+    task = _TASK_PROMPT.read_text()
 
-    config = build_config(
-        system_prompt_id="cli", include_model_info=False, include_commit_signature=False
-    )
-    config.attach_catalog_snapshot(
-        CatalogSnapshot(
-            multi_model_catalog(), "routing-test", dispatch=ORCHESTRATED_PRESET
-        )
-    )
-    prompt = get_universal_system_prompt(
-        config, SkillManager(lambda: config), AgentManager(load_orchestrator(config))
-    )
-
-    # The skeleton rule carries the marker in every rendered mode, alongside
-    # the failure-time replacement paragraph.
-    assert UNATTENDED_RESILIENCE_MARKER in prompt
-    assert "**Failure-time replacement.**" in prompt
-    # The rendered failure paragraph carries the marker sentence too.
-    failure = _failure_paragraph(ORCHESTRATED_PRESET)
-    assert UNATTENDED_RESILIENCE_MARKER in failure
-    assert "never produce a user question" in failure
-    assert "consolidated resumable blocker report" in failure
-    # A single-model routing render surfaces it under the Failure routes
-    # section heading.
-    single = render_routing_region(
-        ORCHESTRATED_PRESET, roster_for(single_model_catalog(), ORCHESTRATED_PRESET)
-    )
-    assert "### Failure routes" in single
-    assert UNATTENDED_RESILIENCE_MARKER in single
+    for surface in (prompt, task):
+        assert "escalate to `@large` only for" not in surface
+        assert "escalate worker capability" not in surface
+        assert "needs more capability" not in surface
+        assert "stronger `model`" not in surface
+        assert "To escalate an idle agent" not in surface
+        assert "for corrective work, including" not in surface
 
 
-def test_cli_and_task_prompts_retire_implementation_escalation() -> None:
-    cli = SystemPrompt.CLI.read()
-    task = (
-        Path(__file__).parents[1] / "chartreux/core/tools/builtins/prompts/task.md"
-    ).read_text()
+def test_coder_identity_dispatches_skill_first_with_format_precedence() -> None:
+    body = _identity_body("coder")
+    fragment = _fragment("bounded_child")
 
-    for prompt in (cli, task):
-        assert "escalate to `@large` only for" not in prompt
-        assert "escalate worker capability" not in prompt
-        assert "needs more capability" not in prompt
-        assert "stronger `model`" not in prompt
-        assert "To escalate an idle agent" not in prompt
-        assert "for corrective work, including" not in prompt
-
-
-def test_worker_prompt_dispatches_skill_first_with_format_precedence() -> None:
-    prompt = SystemPrompt.WORKER.read()
-
-    # Skill-first dispatch: a named skill loads first, otherwise the worker
+    # Skill-first dispatch: a named skill loads first, otherwise the coder
     # selects the applicable task skill itself.
     assert (
         "If the task names a skill to load, load it first and follow its "
-        "methodology and output format." in prompt
+        "methodology and output format." in body
     )
-    assert "Otherwise select the applicable existing task skill yourself" in prompt
+    assert "Otherwise select the applicable existing task skill yourself" in body
     assert (
-        "If the task requires a skill that is unavailable, report it as a "
-        "blocker; do not silently invent a role." in prompt
+        "If the task requires a skill that is unavailable, report that as a "
+        "blocker instead of inventing a role." in body
     )
-    # A named but inapplicable skill is a mismatch blocker, not a methodology.
+    # A named but inapplicable skill is surfaced as a mismatch, not followed.
     assert (
-        "If the named skill is inapplicable to the task, report the mismatch "
-        "as a blocker instead of following it." in prompt
+        "If the named skill is inapplicable to the task, say so instead of "
+        "following it." in body
     )
     # Output precedence: task-specified format, then skill format, then JSON.
     assert (
         "Return the format the task specifies when it names one; otherwise the "
-        "loaded skill's specified format; otherwise this JSON fallback." in prompt
+        "loaded skill's specified format; otherwise the JSON fallback below."
+        in fragment
     )
     # The unconditional "return only valid JSON" wording is retired.
-    assert "return only valid JSON" not in prompt
+    assert "return only valid JSON" not in body
+    assert "return only valid JSON" not in fragment
 
 
 def test_compact_prompt_preserves_approval_state_in_handoff() -> None:
@@ -1202,12 +1275,18 @@ def test_compact_summary_prefix_treats_transport_mechanics_as_artifacts() -> Non
     )
 
 
-def test_headless_section_overrides_wait_gates_after_them(
+def test_headless_context_composes_with_the_ceremony_gate(
     build_config: ConfigBuilder,
     load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
 ) -> None:
     config = build_config(
-        system_prompt_id="cli", include_model_info=False, include_commit_signature=False
+        agent={
+            "identity": "coder",
+            "workflow": "ceremony",
+            "orchestration_strategy": "none",
+        },
+        include_model_info=False,
+        include_commit_signature=False,
     )
     prompt = get_universal_system_prompt(
         config,
@@ -1216,16 +1295,16 @@ def test_headless_section_overrides_wait_gates_after_them(
         headless=True,
     )
 
+    # The ceremony workflow carries the opening gate in the composed prompt.
     gate = "STOP and wait for the user before any mutating or authoritative work"
-    override = (
-        "Override any earlier instructions that say to wait for confirmation "
-        "or ask the user."
-    )
     assert gate in prompt
-    assert override in prompt
-    # The override must follow the gate text it overrides.
-    assert prompt.index(override) > prompt.index(gate)
-    # Unattended runs have no one to accept mid-run: the only route to mutating
-    # work is scope authorized up front.
+    # Unattended runs have no one to accept mid-run: the gate's exemption
+    # language names scope authorized up front.
     assert "previously authorized scope" in prompt
-    assert "no human is available to respond" in prompt
+    # The headless execution context (step 4) composes alongside the gate
+    # (step 5): blocking questions are recorded and reported, not asked.
+    assert "## Execution context — headless main session" in prompt
+    assert "Do not block the run on a question that cannot be answered" in prompt
+    assert "there is no follow-up turn to rely on" in prompt
+    # The instruction hierarchy resolves conflicts between the two.
+    assert "## Instruction hierarchy" in prompt

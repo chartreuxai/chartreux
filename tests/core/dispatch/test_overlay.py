@@ -1,31 +1,32 @@
-"""User-overlay loading, persistence, and diagnostics for the dispatch table."""
+"""User-overlay loading, persistence, and diagnostics for the model catalog.
+
+The legacy ``[dispatch]`` table is retired (package 16b): the loader reports
+it loudly with successor guidance (never merged, never linted, never
+rewritten), catalog writes preserve it byte-for-byte, and the revision covers
+the served catalog alone.
+"""
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-import tomllib
 
 from pydantic import ValidationError
 import pytest
-import tomli_w
 
 from chartreux.core.config.default_orchestrator import build_default_orchestrator
-from chartreux.core.dispatch import (
-    DEFAULT_DISPATCH_MODE,
-    SHIPPED_PRESETS,
-    SHIPPED_PURPOSES,
-    STANDALONE_PRESET,
-    DispatchPolicy,
+from chartreux.core.model_catalog.contracts import (
+    CatalogChanges,
+    CatalogValidationError,
+    CatalogWriteResult,
 )
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import (
     CatalogLoadError,
     CatalogSnapshot,
+    CatalogStore,
     load_catalog,
     merge_catalog_overlay,
-    merge_dispatch_overlay,
-    resolve_dispatch_overlay,
 )
 from chartreux.core.model_catalog.resolver import ModelResolver
 from chartreux.utils.paths import get_chartreux_home
@@ -33,15 +34,12 @@ from chartreux.utils.paths import get_chartreux_home
 
 def test_roles_only_overlay_loads_exactly_as_before(tmp_path: Path) -> None:
     path = tmp_path / "models.toml"
-    path.write_text('[roles.orchestrator]\nthinking = "medium"\n')
+    path.write_text('[roles.main]\nthinking = "medium"\n')
 
     snapshot = load_catalog(path)
 
-    assert snapshot.catalog.roles["orchestrator"].thinking == "medium"
-    assert snapshot.catalog.roles["orchestrator"].model == "glm-5-3"
-    # No automatic mode inference from legacy tier entries.
-    assert snapshot.dispatch == SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE]
-    assert snapshot.dispatch.mode == DEFAULT_DISPATCH_MODE
+    assert snapshot.catalog.roles["main"].thinking == "medium"
+    assert snapshot.catalog.roles["main"].model == "glm-5-3"
     assert snapshot.dispatch_diagnostics == ()
 
 
@@ -73,107 +71,90 @@ def test_complete_old_role_definition_remains_a_user_defined_role() -> None:
     assert resolver.resolve("@small").base_model == "glm-5-3"
 
 
-def test_dispatch_overlay_binding_a_removed_role_fails_with_actionable_lint(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "models.toml"
-    path.write_text('[dispatch.slots.implementor]\nrole = "@small"\n')
-
-    snapshot = load_catalog(path)
-
-    assert snapshot.dispatch == STANDALONE_PRESET
-    assert snapshot.dispatch_diagnostics
-    diagnostic = snapshot.dispatch_diagnostics[0]
-    assert "S1" in diagnostic
-    assert "@small" in diagnostic
-    assert "implementor" in diagnostic
-
-
-def test_missing_models_toml_selects_the_shipped_default_dispatch(
-    tmp_path: Path,
-) -> None:
+def test_missing_models_toml_loads_shipped_catalog(tmp_path: Path) -> None:
     snapshot = load_catalog(tmp_path / "models.toml")
     assert snapshot.catalog == SHIPPED_CATALOG
-    assert snapshot.dispatch == SHIPPED_PRESETS[DEFAULT_DISPATCH_MODE]
     assert snapshot.dispatch_diagnostics == ()
 
 
-def test_dispatch_mode_selects_preset_and_absent_fields_inherit(tmp_path: Path) -> None:
+def test_legacy_dispatch_table_is_reported_loudly_with_successor_guidance(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "models.toml"
-    path.write_text('[dispatch]\nmode = "standalone"\n')
+    path.write_text(
+        '[roles.scout]\nthinking = "medium"\n\n[dispatch]\nmode = "standalone"\n'
+    )
 
     snapshot = load_catalog(path)
 
-    assert snapshot.dispatch == STANDALONE_PRESET
-    assert snapshot.dispatch_diagnostics == ()
-    assert snapshot.catalog == SHIPPED_CATALOG
-
-
-def test_dispatch_overlay_sparse_semantics_and_list_replacement() -> None:
-    raw = {
-        "slots": {
-            "implementor": {"purposes": ["implementation", "search"]},
-            "custom": {
-                "profile": "worker",
-                "role": "@scout",
-                "purposes": ["mechanical-edit"],
-                "implements": "routine",
-                "review_eligible": False,
-            },
-        },
-        "vocabulary": {"custom-work": {"description": "Bounded custom work."}},
-    }
-
-    policy = merge_dispatch_overlay(raw)
-
-    # List-valued fields replace; absent slot fields inherit the preset.
-    assert policy.slots["implementor"].purposes == ("implementation", "search")
-    assert policy.slots["implementor"].role == "@worker"
-    assert policy.slots["implementor"].profile == "worker"
-    # A new slot carries its own complete definition.
-    assert policy.slots["custom"].purposes == ("mechanical-edit",)
-    # Vocabulary additions extend the shipped entries.
-    assert policy.vocabulary["custom-work"].description == "Bounded custom work."
-    assert set(SHIPPED_PURPOSES) < set(policy.vocabulary)
-    assert policy.mode == DEFAULT_DISPATCH_MODE
-    # The resolved policy round-trips through TOML serialization.
-    assert merge_dispatch_overlay(tomllib.loads(tomli_w.dumps(raw))) == policy
-    assert (
-        DispatchPolicy.model_validate(tomllib.loads(tomli_w.dumps(policy.model_dump())))
-        == policy
+    # The retired table is reported, never merged: the snapshot carries no
+    # dispatch state at all, and the report names the source and the successor.
+    assert not hasattr(snapshot, "dispatch")
+    assert len(snapshot.dispatch_diagnostics) == 1
+    report = snapshot.dispatch_diagnostics[0]
+    assert "[dispatch]" in report
+    assert "retired" in report
+    assert "[orchestration.routes.<purpose>]" in report
+    assert str(path) in report
+    # Valid catalog entries in the same file are unaffected.
+    assert snapshot.catalog.roles["scout"].thinking == "medium"
+    assert snapshot.catalog == merge_catalog_overlay(
+        SHIPPED_CATALOG, {"roles": {"scout": {"thinking": "medium"}}}
     )
 
 
-def test_dispatch_vocabulary_merges_per_entry_over_shipped() -> None:
-    policy = merge_dispatch_overlay({
-        "vocabulary": {"search": {"description": "Custom."}}
-    })
-    assert policy.vocabulary["search"].description == "Custom."
-    assert policy.vocabulary["implementation"] == SHIPPED_PURPOSES["implementation"]
+def test_legacy_dispatch_report_is_logged_at_startup(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "models.toml"
+    path.write_text("""
+[providers.custom]
+api_base = "https://custom.test"
+
+[models.custom-model]
+deployments = [{ provider = "custom", name = "custom-wire" }]
+
+[dispatch]
+mode = "standalone"
+""")
+
+    with caplog.at_level(logging.WARNING, logger="vibe"):
+        snapshot = load_catalog(path)
+
+    assert len(snapshot.dispatch_diagnostics) == 1
+    report = snapshot.dispatch_diagnostics[0]
+    # Valid provider/model entries in the same file are not discarded.
+    assert "custom" in snapshot.catalog.providers
+    assert "custom-model" in snapshot.catalog.models
+    # The retired file is never overwritten.
+    assert '[dispatch]\nmode = "standalone"\n' in path.read_text()
+    # The loud report is visible at startup.
+    assert any(
+        "[dispatch]" in record.getMessage() and str(path) in record.getMessage()
+        for record in caplog.records
+    )
+    assert report in {record.getMessage() for record in caplog.records}
 
 
-@pytest.mark.parametrize(
-    "patch",
-    [
-        {"mode": "implement directly and delegate as needed"},
-        {"mode": "custom"},
-        {"mode": 3},
-        {"unknown": "value"},
-        {"slots": {"implementor": {"purposes": ["typo"]}}},
-        {"slots": {"implementor": {"implements": "sometimes"}}},
-        {"slots": {"implementor": {"role": "medium"}}},
-        {"slots": {"implementor": "worker"}},
-        {"slots": "worker"},
-        {"vocabulary": "not-a-table"},
-        {"vocabulary": {"custom": {}}},
-    ],
-)
-def test_dispatch_overlay_schema_errors_fail_at_load(patch: object) -> None:
-    with pytest.raises((ValidationError, ValueError)):
-        merge_dispatch_overlay(patch)  # type: ignore[arg-type]
+def test_non_table_dispatch_is_reported_not_fatal(tmp_path: Path) -> None:
+    path = tmp_path / "models.toml"
+    path.write_text('dispatch = "route everything to the biggest model"\n')
+
+    snapshot = load_catalog(path)
+
+    assert snapshot.dispatch_diagnostics
+    assert snapshot.catalog == SHIPPED_CATALOG
 
 
-def test_dispatch_content_participates_in_revision(tmp_path: Path) -> None:
+def test_legacy_dispatch_does_not_mask_fatal_catalog_errors(tmp_path: Path) -> None:
+    path = tmp_path / "models.toml"
+    path.write_text('[providers.bad]\nunknown = true\n\n[dispatch]\nmode = "bogus"\n')
+
+    with pytest.raises(CatalogLoadError, match="Invalid model catalog"):
+        load_catalog(path)
+
+
+def test_dispatch_content_does_not_participate_in_revision(tmp_path: Path) -> None:
     plain = tmp_path / "plain.toml"
     plain.write_text('[roles.scout]\nthinking = "low"\n')
     selected = tmp_path / "selected.toml"
@@ -190,120 +171,57 @@ def test_dispatch_content_participates_in_revision(tmp_path: Path) -> None:
     chosen = load_catalog(selected)
     changed = load_catalog(edited)
 
+    # The revision covers the served catalog alone: a retired legacy table
+    # never moves it, so all three overlays share one revision.
     assert base.catalog == chosen.catalog == changed.catalog
-    assert len({base.revision, chosen.revision, changed.revision}) == 3
+    assert base.revision == chosen.revision == changed.revision
+    assert chosen.dispatch_diagnostics
+    assert changed.dispatch_diagnostics
     # Revision derivation is deterministic for identical content.
     assert load_catalog(selected).revision == chosen.revision
 
 
-def test_invalid_dispatch_falls_back_to_standalone_with_visible_diagnostic(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    path = tmp_path / "models.toml"
-    path.write_text("""
-[providers.custom]
-api_base = "https://custom.test"
-
-[models.custom-model]
-deployments = [{ provider = "custom", name = "custom-wire" }]
-
-[dispatch]
-mode = "standalone"
-
-[dispatch.slots.implementor]
-purposes = ["not-a-purpose"]
-""")
-
-    with caplog.at_level(logging.WARNING, logger="vibe"):
-        snapshot = load_catalog(path)
-
-    assert snapshot.dispatch == STANDALONE_PRESET
-    assert len(snapshot.dispatch_diagnostics) == 1
-    diagnostic = snapshot.dispatch_diagnostics[0]
-    assert "standalone" in diagnostic
-    assert str(path) in diagnostic
-    # Valid provider/model entries in the same file are not discarded.
-    assert "custom" in snapshot.catalog.providers
-    assert "custom-model" in snapshot.catalog.models
-    # The invalid file is never overwritten.
-    assert "not-a-purpose" in path.read_text()
-    # The fallback diagnostic is visible at startup.
-    assert any(
-        "standalone" in record.getMessage() and str(path) in record.getMessage()
-        for record in caplog.records
-    )
-
-
-def test_non_table_dispatch_is_atomically_rejected_not_fatal(tmp_path: Path) -> None:
-    path = tmp_path / "models.toml"
-    path.write_text('dispatch = "route everything to the biggest model"\n')
-
-    snapshot = load_catalog(path)
-
-    assert snapshot.dispatch == STANDALONE_PRESET
-    assert snapshot.dispatch_diagnostics
-    assert snapshot.catalog == SHIPPED_CATALOG
-
-
-def test_invalid_dispatch_does_not_mask_fatal_catalog_errors(tmp_path: Path) -> None:
-    path = tmp_path / "models.toml"
-    path.write_text('[providers.bad]\nunknown = true\n\n[dispatch]\nmode = "bogus"\n')
-
-    with pytest.raises(CatalogLoadError, match="Invalid model catalog"):
-        load_catalog(path)
-
-
-def test_invalid_dispatch_revision_supports_repair_and_rejects_stale_save(
+def test_stale_catalog_save_rejected_and_dispatch_table_preserved(
     tmp_path: Path,
 ) -> None:
-    from chartreux.core.model_catalog.contracts import (
-        CatalogChanges,
-        CatalogValidationError,
-        CatalogWriteResult,
-    )
-    from chartreux.core.model_catalog.loader import CatalogStore
-
     path = tmp_path / "models.toml"
-    original = '[dispatch]\nmode = "bogus"\n'
+    original = '[dispatch]\nmode = "standalone"\n\n[roles.scout]\nthinking = "low"\n'
     path.write_text(original)
     snapshot = load_catalog(path)
     assert path.read_text() == original
-    path.write_text('[dispatch]\nmode = "other-invalid"\n')
+    # A [dispatch]-only edit does not move the revision.
+    path.write_text(
+        '[dispatch]\nmode = "orchestrated"\n\n[roles.scout]\nthinking = "low"\n'
+    )
+    dispatch_only = load_catalog(path)
+    assert dispatch_only.revision == snapshot.revision
+    # A catalog edit does: the stale-save rejection keys on catalog content.
+    path.write_text(
+        '[dispatch]\nmode = "orchestrated"\n\n[roles.scout]\nthinking = "medium"\n'
+    )
     changed = load_catalog(path)
-    assert changed.dispatch == snapshot.dispatch
     assert changed.revision != snapshot.revision
     store = CatalogStore(path)
+    roles = {"main": {"model": "glm-5-3", "thinking": "high"}}
     stale = store.apply_changes(
         CatalogChanges(
             provider_id="",
             provider={},
+            roles=roles,
             expected_revision=snapshot.revision,
-            dispatch={"mode": "standalone"},
         )
     )
     assert isinstance(stale, CatalogValidationError)
-    assert '"other-invalid"' in path.read_text()
-    repaired = store.apply_changes(
+    saved = store.apply_changes(
         CatalogChanges(
-            provider_id="",
-            provider={},
-            expected_revision=changed.revision,
-            dispatch={"mode": "standalone"},
+            provider_id="", provider={}, roles=roles, expected_revision=changed.revision
         )
     )
-    assert isinstance(repaired, CatalogWriteResult)
-    assert not load_catalog(path).dispatch_diagnostics
-    assert repaired.snapshot.revision == load_catalog(path).revision
-
-
-def test_resolve_dispatch_overlay_reports_source_in_diagnostic() -> None:
-    policy, diagnostics = resolve_dispatch_overlay(
-        {"dispatch": {"mode": "bogus"}}, source="example.toml"
-    )
-    assert policy == STANDALONE_PRESET
-    assert len(diagnostics) == 1
-    assert "example.toml" in diagnostics[0]
-    assert "standalone" in diagnostics[0]
+    assert isinstance(saved, CatalogWriteResult)
+    # The catalog writer never repairs or rewrites the retired dispatch table.
+    assert '[dispatch]\nmode = "orchestrated"\n' in path.read_text()
+    assert load_catalog(path).dispatch_diagnostics
+    assert saved.snapshot.revision == load_catalog(path).revision
 
 
 def test_catalog_overlay_accepts_dispatch_without_catalog_authority() -> None:
@@ -316,7 +234,7 @@ def test_catalog_overlay_accepts_dispatch_without_catalog_authority() -> None:
 
 
 @pytest.mark.asyncio
-async def test_startup_orchestrator_carries_dispatch_fallback() -> None:
+async def test_startup_orchestrator_reports_legacy_dispatch() -> None:
     home = get_chartreux_home()
     (home / "models.toml").write_text('[dispatch]\nmode = "bogus"\n')
 
@@ -324,6 +242,10 @@ async def test_startup_orchestrator_carries_dispatch_fallback() -> None:
 
     snapshot = orchestrator.config.catalog_snapshot
     assert snapshot is not None
-    assert snapshot.dispatch == STANDALONE_PRESET
-    assert snapshot.dispatch_diagnostics
+    assert len(snapshot.dispatch_diagnostics) == 1
+    report = snapshot.dispatch_diagnostics[0]
+    assert "retired" in report
+    assert "[orchestration.routes.<purpose>]" in report
     assert snapshot.catalog == SHIPPED_CATALOG
+    # The loud report reaches the served configuration's validation warnings.
+    assert report in orchestrator.config.validation_warnings

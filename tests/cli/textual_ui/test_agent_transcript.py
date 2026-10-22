@@ -1002,15 +1002,18 @@ def test_escape_key_stops_event_and_posts_close_message() -> None:
     event.prevent_default.assert_called_once()
 
 
-def test_header_uses_name_handle_and_profile_and_renders_literally() -> None:
+def test_header_uses_name_handle_and_identity_and_renders_literally() -> None:
     viewer = AgentTranscriptViewer(
-        _FakeSource(), "agent-7", profile="reviewer", name="reviewer-[bold]glm[/bold]-7"
+        _FakeSource(),
+        "agent-7",
+        identity="reviewer",
+        name="reviewer-[bold]glm[/bold]-7",
     )
     assert viewer._header_text() == (
         "Subagent: reviewer-[bold]glm[/bold]-7 (agent-7) · reviewer"
     )
-    # A legacy nameless payload keeps the handle-only header shape.
-    legacy = AgentTranscriptViewer(_FakeSource(), "agent-7", profile="reviewer")
+    # A nameless payload keeps the handle-only header shape.
+    legacy = AgentTranscriptViewer(_FakeSource(), "agent-7", identity="reviewer")
     assert legacy._header_text() == "Subagent: agent-7 · reviewer"
 
 
@@ -1020,7 +1023,7 @@ async def test_header_widget_is_markup_safe_and_refreshes_in_place() -> None:
 
     source = _FakeSource()
     viewer = AgentTranscriptViewer(
-        source, "agent-7", profile="reviewer", name="reviewer-glm-7"
+        source, "agent-7", identity="reviewer", name="reviewer-glm-7"
     )
     app = App()
     async with app.run_test() as pilot:

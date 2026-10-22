@@ -234,24 +234,22 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
         assert "onboarding-mock-model" in catalog["models"]
         assert "Local e2e provider" in catalog["providers"]
         summary_output = strip_ansi(captured.getvalue())
-        assert "(*) Standalone" in summary_output
+        assert "Roles bound automatically to onboarding-mock-model" in summary_output
+        assert "(*) Standalone" not in summary_output
+        assert "Mode changes apply next session" not in summary_output
         assert "Edit Main Assistant preset" not in summary_output
         assert "Choose thinking for" not in summary_output
         assert "Choose model for" not in summary_output
         if customize:
-            _send_and_wait_for_text(
-                child, captured, "\r", "Main assistant (@orchestrator)"
-            )
+            _send_and_wait_for_text(child, captured, "\r", "Main assistant (@main)")
             _send_and_wait_for_text(child, captured, "\r", "Edit Main Assistant preset")
             _send_and_wait_for_text(
-                child, captured, "\x1b[B\r", "Choose thinking for orchestrator"
+                child, captured, "\x1b[B\r", "Choose thinking for main"
             )
             _send_and_wait_for_text(child, captured, "\x1b[H\r", "Thinking  off")
             _send_and_wait_for_text(child, captured, "\t", "▸ Apply model and thinking")
             _send_and_wait_for_text(child, captured, "\r", "Choose default presets")
-            wait_for_rendered_text(
-                child, captured, "Mode changes apply next session", timeout=10
-            )
+            wait_for_rendered_text(child, captured, "Worker (@worker)", timeout=10)
         _send_and_wait_for_text(child, captured, "\t", "▸ Finish setup")
         _send_and_wait_for_text(child, captured, "\r", "Setup complete", timeout=25)
         assert "Choose Exa, Brave or DuckDuckGo" not in strip_ansi(captured.getvalue())
@@ -278,15 +276,16 @@ def test_empty_home_onboarding_reaches_first_streaming_turn(
         deployment = catalog["models"]["onboarding-mock-model"]["deployments"][0]
         assert deployment["provider"] == "Local e2e provider"
         assert deployment["name"] == "onboarding-mock-model"
-        assert set(catalog["roles"]) == {"orchestrator", "worker", "scout", "heavy"}
+        assert set(catalog["roles"]) == {"main", "worker", "scout", "heavy"}
         assert all(
             role["model"] == "onboarding-mock-model"
             for role in catalog["roles"].values()
         )
-        # Fresh setup keeps the standalone default without role questions.
-        assert catalog.get("dispatch", {}).get("mode", "standalone") == "standalone"
+        # Fresh setup writes no dispatch policy: the catalog owns connections
+        # and presets only.
+        assert "dispatch" not in catalog
         if customize:
-            assert catalog["roles"]["orchestrator"]["thinking"] == "off"
+            assert catalog["roles"]["main"]["thinking"] == "off"
         else:
             assert "Choose thinking for" not in strip_ansi(captured.getvalue())
 

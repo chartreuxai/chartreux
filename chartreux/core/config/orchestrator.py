@@ -147,7 +147,6 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
         self._mutation_lock = asyncio.Lock()
         self._accepted_token = uuid4()
         self._can_persist = True
-        self.bound_dispatch_policy: Any = None
 
     @property
     def availability_registry(self) -> AvailabilityRegistry:
@@ -362,7 +361,6 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
             availability_registry=self._availability_registry,
         )
         copied._can_persist = self._can_persist
-        copied.bound_dispatch_policy = self.bound_dispatch_policy
         return copied
 
     @property
@@ -408,10 +406,7 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
 
     @property
     def config(self) -> S:
-        config = self._snapshot.config
-        if isinstance(config, ChartreuxConfigSchema):
-            config.attach_dispatch_policy(self.bound_dispatch_policy)
-        return config
+        return self._snapshot.config
 
     @property
     def restrictions(self) -> tuple[SourceRestrictions, ...]:

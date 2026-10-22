@@ -282,17 +282,17 @@ async def test_children_share_root_ledger_with_nested_attribution_and_independen
         await root.persist_empty_session()
         owner = root.accounting_owner
         assert owner is not None
-        child = await process.runtime_factory.create_child(root, "worker")
+        child = await process.runtime_factory.create_child(root, "coder")
         child_session = await create_test_app_server_session(child)
         sessions.append(child_session)
         async for _event in child_session.act("hello child"):
             pass
-        grandchild = await process.runtime_factory.create_child(child, "worker")
+        grandchild = await process.runtime_factory.create_child(child, "coder")
         grandchild_session = await create_test_app_server_session(grandchild)
         sessions.append(grandchild_session)
         async for _event in grandchild_session.act("hello grandchild"):
             pass
-        sibling = await process.runtime_factory.create_child(root, "worker")
+        sibling = await process.runtime_factory.create_child(root, "coder")
         sibling_session = await create_test_app_server_session(sibling)
         sessions.append(sibling_session)
         assert child.accounting_owner is grandchild.accounting_owner is owner
@@ -322,7 +322,7 @@ async def test_children_share_root_ledger_with_nested_attribution_and_independen
             assert record.root_session_id == root.session_id
             assert record.project_key == owner.project_key
             assert record.agent_role == "subagent"
-            assert record.agent_profile == "worker"
+            assert record.agent_profile == "coder"
         assert list((config_dir / "usage").glob("*/usage.jsonl")) == [path]
     finally:
         for session in reversed(sessions):
@@ -396,7 +396,7 @@ async def test_task_scratchpad_access_and_empty_failure_settle_usage(
             assert permission.permission == ToolPermission.ALWAYS
         stream = registry.run(
             TaskArgs(
-                task="Use the session scratchpad", agent_type="worker", background=False
+                task="Use the session scratchpad", identity="coder", background=False
             ),
             InvokeContext(tool_call_id="merged-task", session_id=root.session_id),
         )
@@ -423,7 +423,7 @@ async def test_task_scratchpad_access_and_empty_failure_settle_usage(
         assert all(record.root_session_id == root.session_id for record in records)
         assert all(record.parent_session_id == root.session_id for record in records)
         assert all(
-            record.agent_role == "subagent" and record.agent_profile == "worker"
+            record.agent_role == "subagent" and record.agent_profile == "coder"
             for record in records
         )
         assert all(record.session_id != root.session_id for record in records)
@@ -455,7 +455,7 @@ async def test_resumed_child_inherits_explicit_root_owner(
     sessions = []
     try:
         await root.persist_empty_session()
-        child = await process.runtime_factory.create_child(root, "worker")
+        child = await process.runtime_factory.create_child(root, "coder")
         child_session = await create_test_app_server_session(child)
         sessions.append(child_session)
         async for _event in child_session.act("original task"):
@@ -465,7 +465,7 @@ async def test_resumed_child_inherits_explicit_root_owner(
         assert child_dir is not None
         await child_session.close()
         resumed = await process.runtime_factory.resume_child(
-            root, "worker", child_id, child_dir
+            root, "coder", child_id, child_dir
         )
         assert resumed.accounting_owner is root.accounting_owner
         resumed_session = await create_test_app_server_session(resumed)
@@ -483,7 +483,7 @@ async def test_resumed_child_inherits_explicit_root_owner(
             assert record.session_id == child_id
             assert record.parent_session_id == root.session_id
             assert record.agent_role == "subagent"
-            assert record.agent_profile == "worker"
+            assert record.agent_profile == "coder"
             assert root.accounting_owner is not None
             assert record.project_key == root.accounting_owner.project_key
     finally:
@@ -515,7 +515,7 @@ async def test_late_child_finalization_keeps_invocation_local_attribution(
     root = await open_test_root(
         process, monkeypatch, tmp_path, backend, logging_enabled=False
     )
-    child = await process.runtime_factory.create_child(root, "worker")
+    child = await process.runtime_factory.create_child(root, "coder")
     original_id = child.session_id
     original_parent = child.parent_session_id
     task = None
@@ -533,7 +533,7 @@ async def test_late_child_finalization_keeps_invocation_local_attribution(
         # Simulate identity moving on without implementing WP6c's rebind lifecycle.
         child.session_id = "later-session"
         child.parent_session_id = "later-parent"
-        child.launch_profile = "later-profile"
+        child.launch_identity = "later-identity"
         backend.release.set()
         await task
         path = config_dir / "usage" / root.session_id / "usage.jsonl"
@@ -545,7 +545,7 @@ async def test_late_child_finalization_keeps_invocation_local_attribution(
         record = records[0]
         assert record.session_id == original_id
         assert record.parent_session_id == original_parent == root.session_id
-        assert record.agent_profile == "worker"
+        assert record.agent_profile == "coder"
         assert record.agent_role == "subagent"
         assert record.root_session_id == root.session_id
         assert root.accounting_owner is not None
@@ -554,14 +554,14 @@ async def test_late_child_finalization_keeps_invocation_local_attribution(
         assert current is not None
         assert current.session_id == "later-session"
         assert current.parent_session_id == "later-parent"
-        assert current.agent_profile == "later-profile"
+        assert current.agent_profile == "later-identity"
     finally:
         backend.release.set()
         if task is not None:
             await task
         child.session_id = original_id
         child.parent_session_id = original_parent
-        child.launch_profile = "worker"
+        child.launch_identity = "coder"
         await runtime.close_agent_loop(child)
         await runtime.close_agent_loop(root)
         await process.retire_root_usage_writer(root.session_id)
@@ -1041,7 +1041,7 @@ async def test_process_shutdown_settles_slow_child_write(
     root = await open_test_root(
         process, monkeypatch, tmp_path, AttemptBackend([]), logging_enabled=False
     )
-    child = await process.runtime_factory.create_child(root, "worker")
+    child = await process.runtime_factory.create_child(root, "coder")
     owner = root.accounting_owner
     assert owner is not None
     record = finalization_record(child, purpose)
@@ -1168,7 +1168,7 @@ async def test_root_retirement_preserves_sibling_writer_and_deleted_session_ledg
         process, monkeypatch, tmp_path, AttemptBackend([]), logging_enabled=True
     )
     sibling = await process.runtime_factory.fork(root, None)
-    child = await process.runtime_factory.create_child(root, "worker")
+    child = await process.runtime_factory.create_child(root, "coder")
     owner = root.accounting_owner
     sibling_owner = sibling.accounting_owner
     assert owner is not None and sibling_owner is not None
@@ -1208,14 +1208,14 @@ async def test_child_teardown_untracks_all_bindings_without_retiring_writer(
     registry = SessionRuntimeRegistry(
         AsyncMock(), AsyncMock(), lambda _: 0, runtime_factory=process.runtime_factory
     )
-    child = await process.runtime_factory.create_child(root, "worker")
+    child = await process.runtime_factory.create_child(root, "coder")
     child_runtime = registry._build_child_runtime(child)
     record = AgentRecord(
         agent_id="agent-1",
-        profile="worker",
         session_id=child.session_id,
         runtime=child_runtime,
         root_generation=root._session_generation,
+        identity="coder",
     )
     registry._agent_records[record.agent_id] = record
     registry._children[child.session_id] = child_runtime
@@ -1256,7 +1256,7 @@ async def test_unsettled_child_cleanup_keeps_tracking_for_retry(
     registry = SessionRuntimeRegistry(
         AsyncMock(), AsyncMock(), lambda _: 0, runtime_factory=process.runtime_factory
     )
-    child = await process.runtime_factory.create_child(root, "worker")
+    child = await process.runtime_factory.create_child(root, "coder")
     child_runtime = registry._build_child_runtime(child)
     release = asyncio.Event()
 

@@ -136,7 +136,13 @@ async def test_release_cancellation_waits_for_cancelled_monitor_cleanup() -> Non
         await close_release.wait()
 
     task = asyncio.create_task(monitor())
-    run = RunRecord("run-1", "agent-1", "worker", RunStatus.RUNNING, task)
+    run = RunRecord(
+        run_id="run-1",
+        agent_id="agent-1",
+        identity="coder",
+        status=RunStatus.RUNNING,
+        completion_task=task,
+    )
     record.current_run = run
     record.runtime.close = close
     cast(Any, record.runtime.turns).active_turn = None

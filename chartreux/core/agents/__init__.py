@@ -4,35 +4,10 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from chartreux.core.agents.manager import AgentManager
-    from chartreux.core.agents.models import (
-        ADVISOR,
-        BUILTIN_SUBAGENTS,
-        REVIEWER,
-        WORKER,
-        AgentProfile,
-        AgentSafety,
-        AgentType,
-    )
 
-__all__ = [
-    "ADVISOR",
-    "BUILTIN_SUBAGENTS",
-    "REVIEWER",
-    "WORKER",
-    "AgentManager",
-    "AgentProfile",
-    "AgentSafety",
-    "AgentType",
-]
+__all__ = ["AgentManager"]
 _MAPPING: dict[str, tuple[str, str]] = {
-    "ADVISOR": ("chartreux.core.agents.models", "ADVISOR"),
-    "AgentManager": ("chartreux.core.agents.manager", "AgentManager"),
-    "AgentProfile": ("chartreux.core.agents.models", "AgentProfile"),
-    "AgentSafety": ("chartreux.core.agents.models", "AgentSafety"),
-    "AgentType": ("chartreux.core.agents.models", "AgentType"),
-    "BUILTIN_SUBAGENTS": ("chartreux.core.agents.models", "BUILTIN_SUBAGENTS"),
-    "REVIEWER": ("chartreux.core.agents.models", "REVIEWER"),
-    "WORKER": ("chartreux.core.agents.models", "WORKER"),
+    "AgentManager": ("chartreux.core.agents.manager", "AgentManager")
 }
 
 

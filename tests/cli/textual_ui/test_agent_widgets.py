@@ -29,14 +29,14 @@ from chartreux.ui.widgets.no_markup_static import NoMarkupStatic
 
 
 def _agent(agent_id: str = "agent-1", **kwargs: Any) -> AgentSummaryModel:
-    values: dict[str, Any] = {"profile": "worker", "availability": "idle"}
+    values: dict[str, Any] = {"identity": "coder", "availability": "idle"}
     values.update(kwargs)
     values.setdefault(
         "name",
         derive_agent_name(
             agent_id=agent_id,
-            profile=values["profile"],
-            profile_display_label=None,
+            identity=values["identity"],
+            identity_display_label=None,
             base_model=values.get("base_model"),
             effective_model=values.get("effective_model"),
         ),
@@ -269,7 +269,7 @@ async def test_statusline_counts_active_only_and_rows_show_names() -> None:
         rendered = _content(app.bar)
         assert "Main agent" in rendered
         # Rows show the derived name primary with the handle as secondary.
-        assert "worker-run" in rendered
+        assert "coder-run" in rendered
         assert "run" in rendered
         assert "turns 2" not in rendered
         app.bar.action_cursor_down()
@@ -364,7 +364,7 @@ async def test_browser_consumes_the_authoritative_inventory() -> None:
             for line in selected.splitlines()
         )
         metadata = app.bar.full_metadata(app.bar.agents[0])
-        assert "Name: worker-old" in metadata
+        assert "Name: coder-old" in metadata
         assert "Agent ID: old" in metadata
         assert "Eviction reason: ttl" in metadata
         assert "Eviction root generation: 1" in metadata
@@ -856,7 +856,7 @@ async def test_widget_local_sheet_budget_footer_and_cell_fitting(
         app.bar.update_agents((
             _agent(
                 "agent-x",
-                profile="reviewer",
+                identity="reviewer",
                 availability="failed",
                 base_model="glm-5.3",
             ),
@@ -1003,10 +1003,41 @@ async def test_closed_tombstone_details_and_duration() -> None:
         expired = agent.model_copy(update={"result_expired": True})
         assert "result expired" in app.bar._agent_details(expired)
         metadata = app.bar.full_metadata(agent)
-        assert "Name: worker-closed-one" in metadata
+        assert "Name: coder-closed-one" in metadata
         assert "Agent ID: closed-one" in metadata
         assert "Availability: closed" in metadata
         assert "State: Closed" in metadata
+
+
+@pytest.mark.asyncio
+async def test_full_metadata_presents_identity_keyed_record() -> None:
+    app = _BrowserApp()
+    async with app.run_test():
+        agent = _agent(
+            "researcher-1",
+            identity="researcher",
+            identity_revision="rev-7",
+            availability="idle",
+        )
+        metadata = app.bar.full_metadata(agent)
+        assert "Identity: researcher" in metadata
+        assert "Identity revision: rev-7" in metadata
+        assert "Profile:" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_full_metadata_omits_identity_rows_without_binding() -> None:
+    app = _BrowserApp()
+    async with app.run_test():
+        # A record carries no identity binding: neither the identity rows
+        # nor the retired legacy profile fallback are presented.
+        agent = _agent("legacy-1", identity=None, name="legacy-1")
+        assert agent.identity is None
+        metadata = app.bar.full_metadata(agent)
+        assert "Name: legacy-1" in metadata
+        assert "Identity:" not in metadata
+        assert "Identity revision:" not in metadata
+        assert "Profile:" not in metadata
 
 
 @pytest.mark.asyncio
@@ -1034,7 +1065,7 @@ async def test_narrow_finishing_outcome_and_ascii_chrome(ascii_mode: bool) -> No
         app.bar.update_agents((
             _agent(
                 "agent-identifier",
-                profile="profile" * 20,
+                identity="profile" * 20,
                 availability="finalizing",
                 stop_reason="budget_exceeded",
             ),
@@ -1480,7 +1511,7 @@ async def test_release_flow_confirmation_and_run_pinned_message() -> None:
         # Cancel is the default action of the confirmation.
         assert app.focused is app.bar.query_one("#agent-release-cancel", Button)
         prompt = str(app.bar.query_one("#agent-release-prompt", Static).render())
-        assert "worker-idle (idle)" in prompt
+        assert "coder-idle (idle)" in prompt
         assert "Retained results and browser access are discarded" in prompt
         assert app.releases == []
         # Confirming posts the run-pinned release request.
@@ -1541,7 +1572,7 @@ async def test_release_confirmation_fences_stale_run_identity() -> None:
 async def test_agent_row_shows_name_primary_with_dim_handle() -> None:
     app = _BrowserApp()
     async with app.run_test(size=(80, 24)) as pilot:
-        agent = _agent("agent-7", profile="reviewer", base_model="glm-5.3")
+        agent = _agent("agent-7", identity="reviewer", base_model="glm-5.3")
         app.bar.update_agents((agent,))
         app.bar.open_browser()
         await pilot.pause()

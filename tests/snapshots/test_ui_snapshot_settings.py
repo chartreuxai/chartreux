@@ -52,11 +52,11 @@ def test_settings_list_draft(snap_compare: SnapCompare) -> None:
     async def before(pilot: Pilot) -> None:
         from tests.cli.textual_ui._settings_app_support import focus_action
 
-        await pilot.press(*"agent_paths", "enter")
+        await pilot.press(*"skill_paths", "enter")
         screen = cast(SettingsScreen, pilot.app.screen)
         focus_action(screen, "add-item")
-        await pilot.press("enter", *"my-agent", "enter")
-        assert screen._list_draft and screen._list_draft[0].value == "my-agent"
+        await pilot.press("enter", *"my-path", "enter")
+        assert screen._list_draft and screen._list_draft[0].value == "my-path"
         await pilot.pause()
 
     assert snap_compare(

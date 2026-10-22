@@ -12,19 +12,19 @@ allowed-tools:
 
 # Main Plan
 
-Plan how to deliver an approved design without expanding scope. The main agent reads the design and frames the planning question; the advisor profile does the deep planning analysis. The main agent synthesizes and owns the final plan.
+Plan how to deliver an approved design without expanding scope. The main agent reads the design and frames the planning question; the advisor identity does the deep planning analysis. The main agent synthesizes and owns the final plan.
 
 ## Process
 
 1. **Read the design.** Read the approved design artifact (inline or workspace `state.md`), applicable AGENTS.md files, and relevant code or configuration.
 2. **Frame the planning question.** Define: the design goal, the files and subsystems involved, any cross-cutting concerns, and what the plan must address (dependencies, parallelism, verification, rollback).
-3. **Dispatch the advisor for planning analysis.** Request `planning-analysis`; use the eligible slot the rendered slot table lists for that purpose and pass its profile and launch binding explicitly:
+3. **Dispatch the advisor for planning analysis.** Request the `planning-analysis` purpose; the launch resolves the advisor identity and the model binding from the purpose route — pass the purpose as a top-level field:
 
 ```text
-task(task="Planning analysis for: <design goal>. Design: <approved approach>. Files and subsystems: <list>. Constraints: <dependencies, shared interfaces, preserved behavior>. Return: bounded work packages, dependency order, safe parallelism, acceptance checks per package, verification commands, and rollback approach.", agent_type="<slot.profile>", config={model="<slot launch binding>"})
+task(task="Planning analysis for: <design goal>. Design: <approved approach>. Files and subsystems: <list>. Constraints: <dependencies, shared interfaces, preserved behavior>. Return: bounded work packages, dependency order, safe parallelism, acceptance checks per package, verification commands, and rollback approach.", purpose="planning-analysis")
 ```
 
-For cross-cutting changes that span multiple subsystems, dispatch the `advisor` profile (or `worker`) with `sub-architecture-mapper` first to map interfaces and dependencies, then use that output to frame the planning question.
+For cross-cutting changes that span multiple subsystems, first dispatch a bounded exploration child (`purpose="exploration"`) that loads `sub-architecture-mapper` to map interfaces and dependencies, then use that output to frame the planning question.
 
 4. **Synthesize.** Review the advisor's plan. The main agent owns the final plan — adjust work package boundaries, fix missing dependencies, and ensure the plan matches the approved design. If the advisor's plan contradicts the design, trust the design.
 5. **Present to the user.** Share the plan inline in the conversation. Obtain the user's explicit plan acceptance before proceeding to implementation; continued discussion, questions, or silence are not acceptance.

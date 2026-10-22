@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 from pathlib import Path
 import sys
 from typing import TYPE_CHECKING
@@ -163,6 +164,32 @@ def _session_cwd(args: argparse.Namespace) -> Path:
     return Path(getattr(args, "session_cwd", Path.cwd())).resolve()
 
 
+# The [agent] selection fields and the CHARTREUX_* environment spellings that
+# carry them into the config environment layer (nested-delimiter form). A CLI
+# selection is published here so it outranks both the environment and every
+# config file; an omitted flag (None) publishes nothing, so omission stays
+# distinguishable from an explicit selection at every precedence level.
+AGENT_SELECTION_ENV = {
+    "identity": "CHARTREUX_AGENT__IDENTITY",
+    "workflow": "CHARTREUX_AGENT__WORKFLOW",
+    "orchestration_strategy": "CHARTREUX_AGENT__ORCHESTRATION_STRATEGY",
+}
+
+
+def apply_invocation_selections(args: argparse.Namespace) -> None:
+    """Publish explicit CLI [agent] selections into the process environment.
+
+    Runs after ``.env`` is loaded (whose values never overwrite an existing
+    process entry) and before any config is built for interactive or headless
+    startup, so the precedence for new conversations is CLI > environment >
+    config > shipped default and all three selections travel one path.
+    """
+    for field, env in AGENT_SELECTION_ENV.items():
+        value = getattr(args, field, None)
+        if value is not None:
+            os.environ[env] = value
+
+
 def _run_programmatic_mode(args: argparse.Namespace, stdin_prompt: str | None) -> None:
     from chartreux.app_server.local import ClientDescriptor, LocalHarnessOptions
     from chartreux.app_server.protocol import (
@@ -303,6 +330,7 @@ def _run_interactive_mode(args: argparse.Namespace, stdin_prompt: str | None) ->
 
 def run_cli(args: argparse.Namespace) -> None:
     load_dotenv_values()
+    apply_invocation_selections(args)
 
     if args.setup:
         bootstrap_config_files()

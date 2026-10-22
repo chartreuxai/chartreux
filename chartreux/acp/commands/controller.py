@@ -189,11 +189,13 @@ class AcpCommandController:
         except Exception as exc:
             return await self._reply(
                 session,
-                "Configuration reloaded, but failed to advertise updated commands: "
+                "Configuration refreshed, but failed to advertise updated commands: "
                 f"{exc}",
             )
         return await self._reply(
-            session, "Configuration reloaded (includes agent instructions and skills)."
+            session,
+            "Configuration refreshed (AGENTS.md, skills, catalogs). "
+            "Frozen policy stays bound; edits reported as pending.",
         )
 
     async def _log(self, session: AcpSession) -> PromptResponse:

@@ -16,15 +16,52 @@ from pydantic import (
     model_validator,
 )
 
+from chartreux.core.dispatch.route_models import ReplacementCapability
 from chartreux.core.launch_types import LaunchConfig
 from chartreux.core.recovery_models import PackageTier
 
+#: The persisted policy-storage version written by this harness (design §6,
+#: §10; package 10). Version 1 records carry no frozen policy bundle — the
+#: snapshot held policy/model bindings but not resource bodies — and cannot
+#: be resumed: the actionable failure tells the user to start a new session.
+POLICY_STORAGE_VERSION: Literal[2] = 2
+
 
 class LaunchPersonaV1(BaseModel):
+    """Legacy launch persona, keyed on the retired ``system_prompt_id`` axis.
+
+    Retained so persisted envelopes written before the identity re-key still
+    PARSE (design §7 parameter-surface successors); new envelopes write
+    :class:`LaunchPersonaV2`. Package 16a retires the legacy format: resume
+    rejects a V1 persona with the actionable "start a new session" failure —
+    there is no migration path for the old persisted format.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     system_prompt_id: str
     instructions: str | None
+
+
+class LaunchPersonaV2(BaseModel):
+    """Launch persona re-keyed on the identity revision (design §7).
+
+    The persona is the conversation's bound identity: ``identity`` is the
+    resolved identity reference the launch committed (the same binding
+    admission validated and the runtime enforces), and ``identity_revision``
+    is the content revision of the identity resource at bind time. Resume
+    re-reads this binding instead of re-deriving identity from the live
+    profile, so a profile edited between sessions cannot re-posture a
+    resumed child; a disagreement with the persisted policy bundle is
+    rejected at resume admission.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[2] = 2
+    identity: str
+    identity_revision: str
+    instructions: str | None = None
 
 
 class CommittedModelIdentity(BaseModel):
@@ -40,7 +77,12 @@ class CommittedModelIdentity(BaseModel):
 
 
 class LaunchMetadataV1(BaseModel):
-    """Versioned, committed semantic launch state for a child session."""
+    """Legacy versioned launch state (the pre-identity-revision envelope).
+
+    Retained so persisted envelopes written before the identity re-key still
+    PARSE; package 16a retires the legacy format: resume rejects a V1
+    envelope with the actionable "start a new session" failure.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -60,9 +102,10 @@ class LaunchMetadataV2(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: Literal[2]
-    profile: str | None = None
     overrides: LaunchConfig = Field(default_factory=LaunchConfig)
-    persona: LaunchPersonaV1
+    # The persona is keyed on the identity revision from this version on
+    # (LaunchPersonaV2); the V1 form parses for legacy envelopes only.
+    persona: LaunchPersonaV1 | LaunchPersonaV2
     committed_model: CommittedModelIdentity
     # WP5 lineage pair + package tier: the failure-time replacement claim,
     # committed with the launch state so a resumed or restarted child keeps its
@@ -70,6 +113,12 @@ class LaunchMetadataV2(BaseModel):
     work_package_id: str | None = None
     predecessor_agent_id: str | None = None
     package_tier: PackageTier | None = None
+    # The resolved purpose label and model-level replacement capability the
+    # launch committed: resume restores them instead of re-deriving defaults,
+    # so a disk-resumed child keeps describing the package's true
+    # purpose/tier/capability.
+    purpose: str | None = None
+    replacement_capability: ReplacementCapability | None = None
 
     @model_validator(mode="after")
     def _lift_lineage_from_overrides(self) -> LaunchMetadataV2:
@@ -269,22 +318,47 @@ class SessionMetadata(BaseModel):
     import_provenance: dict[str, JsonValue] | None = None
     created_worktree: WorktreeContext | None = None
     launch_config: LaunchMetadata | None = None
-    dispatch_policy: dict[str, JsonValue] | None = None
-    dispatch_policy_notes: list[str] = Field(default_factory=list)
+    # The conversation's frozen policy record (design §6, §10; package 10):
+    # the serialized package-7 policy bundle, carried inline so resume works
+    # after the source resource files are edited or removed. Written together
+    # with ``policy_storage_version``; a record without them is a legacy
+    # (version-1) record and cannot be resumed.
+    policy_bundle: dict[str, JsonValue] | None = None
+    policy_storage_version: Literal[2] | None = None
 
-    @field_validator("dispatch_policy", mode="before")
+    @field_validator("policy_bundle", mode="before")
     @classmethod
-    def _validate_dispatch_policy(cls, value: Any) -> Any:
+    def _validate_policy_bundle(cls, value: Any) -> Any:
+        """Structurally validate the persisted bundle; integrity at activation.
+
+        The bundle is the persisted policy record of the conversation, so a
+        corrupt record fails at load with the actionable storage error rather
+        than deep inside a resume. Hash integrity and pin verification happen
+        at ACTIVATION (``activate_bundle``), before any client or resource is
+        constructed.
+        """
         if value is None:
             return value
         from chartreux.core.dispatch.session import (
-            BoundDispatchPolicy,
             SessionPolicyError,
+            validate_stored_policy_bundle,
         )
 
-        if not isinstance(value, dict) or value.get("version") != 1:
-            raise SessionPolicyError("Unsupported dispatch policy snapshot version")
-        return BoundDispatchPolicy.model_validate(value).model_dump(mode="json")
+        if not isinstance(value, dict):
+            raise SessionPolicyError(
+                "The persisted policy bundle is corrupt: expected a JSON object; "
+                "the conversation cannot be resumed — start a new session"
+            )
+        try:
+            validate_stored_policy_bundle(value)
+        except SessionPolicyError:
+            raise
+        except ValueError as exc:
+            raise SessionPolicyError(
+                f"The persisted policy bundle is unreadable: {exc}; the "
+                "conversation cannot be resumed — start a new session"
+            ) from exc
+        return value
 
     @model_serializer(mode="wrap")
     def _omit_absent_launch_config(self, handler: Any) -> dict[str, Any]:

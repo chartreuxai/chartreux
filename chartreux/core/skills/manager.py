@@ -11,6 +11,12 @@ from chartreux.core.config.harness_files import (
     get_harness_files_manager,
 )
 from chartreux.core.skills.builtins import BUILTIN_SKILLS
+from chartreux.core.skills.compatibility import (
+    ConversationPolicyFacts,
+    SkillEligibility,
+    check_skill_eligibility,
+    format_incompatibility_diagnostic,
+)
 from chartreux.core.skills.models import (
     ParsedSkillCommand,
     SkillConfigIssue,
@@ -37,9 +43,25 @@ class SkillManager:
         config_getter: Callable[[], ChartreuxConfigSchema],
         *,
         harness_files: HarnessFilesManager | None = None,
+        policy_facts: ConversationPolicyFacts | None = None,
     ) -> None:
         self._config_getter = config_getter
         self._harness_files = harness_files or get_harness_files_manager()
+        # The conversation's frozen policy facts (design §3, §6): the bound
+        # identity/workflow selections, snapshotted ONCE here. Eligibility
+        # reads these frozen facts — a pending saved selection change (one
+        # that applies to new conversations) never re-derives a bound
+        # conversation's eligibility. Callers that already hold the frozen
+        # facts (the agent loop binding the conversation's policy) pass them
+        # explicitly; otherwise they are read from the bound config here.
+        self._policy_facts = (
+            policy_facts
+            if policy_facts is not None
+            else ConversationPolicyFacts(
+                identity=self._config.agent.identity,
+                workflow=self._config.agent.workflow,
+            )
+        )
         self._search_paths = self._compute_search_paths(self._config)
         self._config_issues: list[SkillConfigIssue] = []
         self._discovered_skills = self._discover_skills()
@@ -59,28 +81,91 @@ class SkillManager:
         return self._config_getter()
 
     @property
+    def policy_facts(self) -> ConversationPolicyFacts:
+        """The conversation's frozen policy facts the eligibility rule reads."""
+        return self._policy_facts
+
+    @property
     def settings_inventory(self) -> list[str]:
-        """Discovered skill names, including those excluded by current filters."""
+        """Discovered skill names, including those excluded by current filters.
+
+        Compatibility filtering is NOT automatic catalog pruning: discovery
+        still lists every skill, including shipped skills that are ineligible
+        under the conversation's frozen workflow (marked via
+        :meth:`skill_eligibility` / :attr:`workflow_incompatibilities`).
+        """
         return sorted(self._discovered_skills)
 
     @property
     def config_issues(self) -> tuple[SkillConfigIssue, ...]:
         return tuple(self._config_issues)
 
+    def skill_eligibility(self, name: str) -> SkillEligibility:
+        """The marked eligibility of any discovered skill (pruned or not)."""
+        info = self._discovered_skills.get(name)
+        if info is None:
+            return SkillEligibility(
+                eligible=False, requirement="the skill is not discovered"
+            )
+        return check_skill_eligibility(
+            name, source=info.source, facts=self._policy_facts
+        )
+
+    @property
+    def workflow_incompatibilities(self) -> Mapping[str, str]:
+        """Discovered skills withheld by the workflow rule, marked by requirement."""
+        marks: dict[str, str] = {}
+        for name, info in self._discovered_skills.items():
+            eligibility = check_skill_eligibility(
+                name, source=info.source, facts=self._policy_facts
+            )
+            if not eligibility.eligible:
+                marks[name] = eligibility.requirement or ""
+        return MappingProxyType(marks)
+
+    def incompatibility_diagnostic(self, name: str) -> str | None:
+        """The actionable diagnostic when an explicit invocation is withheld.
+
+        Returns None when the skill is not discovered or is eligible; the
+        text names the workflow/identity requirement and the remedy.
+        """
+        info = self._discovered_skills.get(name)
+        if info is None:
+            return None
+        eligibility = check_skill_eligibility(
+            name, source=info.source, facts=self._policy_facts
+        )
+        if eligibility.eligible:
+            return None
+        return format_incompatibility_diagnostic(
+            name, source=info.source, facts=self._policy_facts
+        )
+
     def _apply_filters(self, skills: dict[str, SkillInfo]) -> dict[str, SkillInfo]:
+        # The workflow-compatibility rule (design §5): ceremony-bearing
+        # shipped skills are exposed/loaded only in conversations whose
+        # frozen workflow carries the ceremony. One rule, applied here, wires
+        # the skills catalog, the `skill` tool, and slash invocation.
+        workflow_eligible = {
+            name: info
+            for name, info in skills.items()
+            if check_skill_eligibility(
+                name, source=info.source, facts=self._policy_facts
+            ).eligible
+        }
         if self._config.enabled_skills:
             return {
                 name: info
-                for name, info in skills.items()
+                for name, info in workflow_eligible.items()
                 if name_matches(name, self._config.enabled_skills)
             }
         if self._config.disabled_skills:
             return {
                 name: info
-                for name, info in skills.items()
+                for name, info in workflow_eligible.items()
                 if not name_matches(name, self._config.disabled_skills)
             }
-        return dict(skills)
+        return dict(workflow_eligible)
 
     def _compute_search_paths(
         self, config: ChartreuxConfigSchema

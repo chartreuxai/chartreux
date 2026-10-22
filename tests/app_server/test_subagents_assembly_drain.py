@@ -121,7 +121,7 @@ async def _persist_child(
 async def test_root_handoff_updates_live_child_parent_routing() -> None:
     parent = build_test_agent_loop(config=_config())
     registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
-    child = await AgentRuntimeFactory().create_child(parent, "worker")
+    child = await AgentRuntimeFactory().create_child(parent, "coder")
     assert child.enable_streaming is False
     runtime = registry._build_child_runtime(child)
     registry._children[child.session_id] = runtime
@@ -144,7 +144,7 @@ async def test_resumed_child_restores_cumulative_stats(tmp_path: Path) -> None:
     parent = build_test_agent_loop(config=_config(logging))
     await parent.persist_empty_session()
     factory = AgentRuntimeFactory()
-    child = await factory.create_child(parent, "worker")
+    child = await factory.create_child(parent, "coder")
     await child.wait_until_ready()
     child.stats.session_prompt_tokens = 11
     child.stats.session_completion_tokens = 7
@@ -156,7 +156,7 @@ async def test_resumed_child_restores_cumulative_stats(tmp_path: Path) -> None:
     await child.aclose()
 
     resumed = await factory.resume_child(
-        parent, "worker", child_session_id, child_session_dir
+        parent, "coder", child_session_id, child_session_dir
     )
     try:
         assert resumed.stats.session_prompt_tokens == 11
@@ -213,16 +213,9 @@ async def test_child_registration_rolls_back_when_projection_fails(
 
 
 @pytest.mark.asyncio
-async def test_child_callbacks_round_trip_using_child_session_id(
-    tmp_path, monkeypatch
-) -> None:
-    (tmp_path / "interactive.toml").write_text(
-        "\n".join([
-            'agent_type = "subagent"',
-            'enabled_tools = ["todo", "ask_user_question"]',
-        ]),
-        encoding="utf-8",
-    )
+async def test_child_callbacks_round_trip_using_child_session_id(monkeypatch) -> None:
+    # The custom "interactive" identity is a user prompt file installed by
+    # the autouse conftest fixture; agents/*.toml discovery is retired (16a).
     todo_call = ToolCall(
         id="todo-1",
         index=0,
@@ -260,7 +253,6 @@ async def test_child_callbacks_round_trip_using_child_session_id(
         [mock_llm_chunk(content="Parent completed")],
     ])
     config = build_test_vibe_config(
-        agent_paths=[tmp_path],
         enabled_tools=["task", "todo", "ask_user_question"],
         tools={
             "task": {"permission": ToolPermission.ALWAYS.value},
@@ -667,7 +659,7 @@ async def test_drain_cancels_finalizing_monitor_without_stale_notification(
 
     launch = await _background_result(
         registry,
-        TaskArgs(task="work", agent_type="worker", agent_id="agent-1", background=True),
+        TaskArgs(task="work", identity="coder", agent_id="agent-1", background=True),
         InvokeContext(tool_call_id="work", session_id="root"),
     )
     assert launch.run_id is not None
@@ -754,11 +746,11 @@ async def test_agent_summary_projects_live_frozen_and_absent_turn_counts() -> No
 
     assert registry._agent_summaries()[0].turns_used is None
     run = RunRecord(
-        "run-1",
-        "agent-1",
-        "worker",
-        RunStatus.RUNNING,
-        asyncio.get_running_loop().create_future(),
+        run_id="run-1",
+        agent_id="agent-1",
+        status=RunStatus.RUNNING,
+        completion_task=asyncio.get_running_loop().create_future(),
+        identity="coder",
         start_count=1,
     )
     record.state = _AgentState.RUNNING
@@ -815,7 +807,7 @@ async def test_transcript_read_resolution_is_authorized_and_non_perturbing(
         ChildSessionLink(
             session_id=record.session_id,
             tool_call_id="task-1",
-            agent="worker",
+            agent="coder",
             relative_path="children/child-1",
         )
     ]
@@ -847,7 +839,7 @@ async def test_transcript_read_survives_eviction_but_not_release(
         ChildSessionLink(
             session_id=record.session_id,
             tool_call_id="task-1",
-            agent="worker",
+            agent="coder",
             relative_path="children/child-1",
         )
     ]
@@ -887,7 +879,7 @@ async def test_transcript_read_no_saved_and_invalid_links(tmp_path: Path) -> Non
             ChildSessionLink(
                 session_id=record.session_id,
                 tool_call_id="task-1",
-                agent="worker",
+                agent="coder",
                 relative_path=relative_path,
             )
         ]
@@ -908,7 +900,7 @@ async def test_transcript_read_invalidates_on_link_or_parent_change(
         ChildSessionLink(
             session_id=record.session_id,
             tool_call_id="task-1",
-            agent="worker",
+            agent="coder",
             relative_path="child",
         )
     ]
@@ -916,7 +908,7 @@ async def test_transcript_read_invalidates_on_link_or_parent_change(
     metadata.child_sessions[0] = ChildSessionLink(
         session_id=record.session_id,
         tool_call_id="task-2",
-        agent="worker",
+        agent="coder",
         relative_path="child",
     )
     assert not await registry.transcript_read_is_current(snapshot)

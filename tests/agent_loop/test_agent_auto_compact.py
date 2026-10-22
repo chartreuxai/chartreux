@@ -425,8 +425,8 @@ async def test_compact_appends_extra_instructions_to_prompt() -> None:
 async def test_compact_uses_configured_compaction_prompt(
     mock_prompts_dirs: tuple[Path, Path],
 ) -> None:
-    project_prompts, _ = mock_prompts_dirs
-    (project_prompts / "theorem_compact.md").write_text("Summarize theorem progress")
+    _, user_prompts = mock_prompts_dirs
+    (user_prompts / "theorem_compact.md").write_text("Summarize theorem progress")
 
     backend = FakeBackend([[mock_llm_chunk(content="<summary>done</summary>")]])
     cfg = build_test_vibe_config(
@@ -442,7 +442,13 @@ async def test_compact_uses_configured_compaction_prompt(
     compaction_prompt = backend.requests_messages[0][-1].content
     assert compaction_prompt is not None
     assert compaction_prompt.startswith("Summarize theorem progress\n\n")
-    assert "Bound dispatch policy identity:" in compaction_prompt
+    # The frozen bundle binding rides the configured custom prompt (the legacy
+    # "Bound dispatch policy identity:" line is retired with the bind).
+    activated = agent._ensure_bound_policy()
+    assert (
+        f"Bound policy bundle: identity {activated.manifest.identity.selected} "
+        f"(revision {activated.manifest.identity.revision})" in compaction_prompt
+    )
 
 
 @pytest.mark.asyncio
@@ -901,3 +907,167 @@ async def test_compact_fallback_rejects_empty_summary_tags() -> None:
 
     assert exc_info.value.reason == "tool_call"
     assert all(message.context_boundary != "compaction" for message in agent.messages)
+
+
+def test_compact_prompt_text_pins_precedent_fields() -> None:
+    # Prompt-text pin only: the compaction prompt itself carries the package-14
+    # precedent fields (design §10; findings item 2). Separate from the
+    # summary-structure transport tests below.
+    prompt = UtilityPrompt.COMPACT.read()
+
+    # The frozen policy binding: bound IDs, revisions, fail-closed unknowns.
+    assert "frozen policy binding" in prompt
+    assert "copy any bound-policy-bundle section of this request verbatim" in prompt
+    assert "a revision with no carrying evidence stays unknown" in prompt
+    # Actual delegation precedent, explicitly absent when absent.
+    assert "The actual delegation precedent" in prompt
+    assert "resident and pending state of each run" in prompt
+    assert "record that absence explicitly" in prompt
+    assert "inventing or inferring" in prompt
+    # Overflow eviction and repeated compaction cannot manufacture precedent
+    # or drop the binding; missing evidence is absent, never inferred.
+    assert "manufacture delegation precedent" in prompt
+    assert "the bound identity/workflow/strategy binding, and delegation precedent" in (
+        prompt
+    )
+    assert "missing delegation evidence is recorded as absent rather than inferred" in (
+        prompt
+    )
+
+
+@pytest.mark.asyncio
+async def test_compact_request_carries_frozen_bundle_binding() -> None:
+    backend = FakeBackend([[mock_llm_chunk(content="<summary>done</summary>")]])
+    cfg = build_test_vibe_config(models=make_test_models(auto_compact_threshold=999))
+    agent = build_test_agent_loop(config=cfg, backend=backend)
+    # The loop wires the conversation's bound policy into CompactionManager at
+    # construction (the same getter SessionTransitions uses).
+    activated = agent._ensure_bound_policy()
+    agent.messages.append(LLMMessage(role=Role.user, content="Hello"))
+    agent.stats.context_tokens = 100
+
+    await agent.compact()
+
+    request = backend.requests_messages[0][-1].content or ""
+    manifest = activated.manifest
+    assert (
+        f"Bound policy bundle: identity {manifest.identity.selected} "
+        f"(revision {manifest.identity.revision})" in request
+    )
+    assert (
+        f"workflow {manifest.workflow.selected} "
+        f"(revision {manifest.workflow.revision})" in request
+    )
+    assert (
+        f"orchestration strategy {manifest.strategy.selected} "
+        f"(revision {manifest.strategy.revision or 'none'})" in request
+    )
+    assert manifest.frozen_policy_hash in request
+    assert "do not adopt saved selection or resource edits" in request
+
+
+@pytest.mark.asyncio
+async def test_production_compaction_wires_the_bound_policy_bundle() -> None:
+    backend = FakeBackend([
+        [mock_llm_chunk(content="<summary>first</summary>")],
+        [mock_llm_chunk(content="<summary>second</summary>")],
+    ])
+    cfg = build_test_vibe_config(models=make_test_models(auto_compact_threshold=999))
+    agent = build_test_agent_loop(config=cfg, backend=backend)
+    agent.messages.append(LLMMessage(role=Role.user, content="Hello"))
+    agent.stats.context_tokens = 100
+
+    # Production wiring: with no test injection at all, the compaction request
+    # carries the conversation's frozen bundle binding.
+    await agent.compact()
+
+    activated = agent._ensure_bound_policy()
+    request = backend.requests_messages[0][-1].content or ""
+    assert "Bound policy bundle:" in request
+    assert activated.manifest.frozen_policy_hash in request
+    assert "a revision with no carrying evidence stays unknown" in request
+
+    # The manager's getter stays optional: without one, no binding is invented
+    # and the prompt's own fail-closed rule governs revisions.
+    agent.compaction_manager._bound_policy_getter = None
+    agent.stats.context_tokens = 100
+    await agent.compact()
+
+    bare_request = backend.requests_messages[1][-1].content or ""
+    assert "Bound policy bundle:" not in bare_request
+    assert "a revision with no carrying evidence stays unknown" in bare_request
+
+
+@pytest.mark.asyncio
+async def test_overflow_trimmed_retry_keeps_bound_bundle_section() -> None:
+    backend = _ScriptedBackend(
+        [[mock_llm_chunk(content="<summary>ok</summary>")]],
+        raises_at={0: _ctx_too_long_error()},
+    )
+    cfg = build_test_vibe_config(models=make_test_models(auto_compact_threshold=999))
+    agent = build_test_agent_loop(config=cfg, backend=backend)
+    activated = agent._ensure_bound_policy()
+    agent.compaction_manager._bound_policy_getter = lambda: activated
+    agent.messages.append(LLMMessage(role=Role.user, content="oldest ask"))
+    agent.messages.append(LLMMessage(role=Role.assistant, content="work"))
+    agent.messages.append(LLMMessage(role=Role.user, content="newest ask"))
+    agent.stats.context_tokens = 100
+
+    summary = await agent.compact()
+
+    assert summary == "ok"
+    # The PTL-trimmed retry still carries the full precedent instructions:
+    # an overflow eviction must not drop the binding or the fail-closed rules.
+    request = backend.requests_messages[0][-1].content or ""
+    assert "Bound policy bundle:" in request
+    assert activated.manifest.frozen_policy_hash in request
+    assert "never infer a missing approval" in request
+    assert "manufacture delegation precedent" in request
+
+
+@pytest.mark.asyncio
+async def test_fallback_request_keeps_bound_bundle_section() -> None:
+    backend = _ScriptedBackend([
+        [_tool_call_chunk()],
+        [mock_llm_chunk(content="<summary>recovered</summary>")],
+    ])
+    cfg = build_test_vibe_config(models=make_test_models(auto_compact_threshold=999))
+    agent = build_test_agent_loop(config=cfg, backend=backend)
+    activated = agent._ensure_bound_policy()
+    agent.compaction_manager._bound_policy_getter = lambda: activated
+    agent.messages.append(LLMMessage(role=Role.user, content="Hello"))
+    agent.stats.context_tokens = 100
+
+    summary = await agent.compact()
+
+    assert summary == "recovered"
+    fallback_messages = backend.requests_messages[1]
+    assert fallback_messages[0].role == Role.system
+    fallback_request = fallback_messages[1].content or ""
+    assert (
+        f"Bound policy bundle: identity {activated.manifest.identity.selected} "
+        f"(revision {activated.manifest.identity.revision})" in fallback_request
+    )
+    assert activated.manifest.frozen_policy_hash in fallback_request
+    assert "never infer a missing approval" in fallback_request
+    assert "record that absence explicitly" in fallback_request
+
+
+@pytest.mark.asyncio
+async def test_post_compaction_request_retains_full_system_prompt() -> None:
+    backend = FakeBackend([
+        [mock_llm_chunk(content="<summary>done</summary>")],
+        [mock_llm_chunk(content="<final>")],
+    ])
+    cfg = build_test_vibe_config(models=make_test_models(auto_compact_threshold=1))
+    agent = build_test_agent_loop(config=cfg, backend=backend)
+    agent.stats.context_tokens = 2
+
+    [_ async for _ in agent.act("Hello")]
+
+    post = backend.requests_messages[1]
+    assert post[0].role == Role.system
+    assert post[0].content == agent.messages[0].content
+    system_prompt = post[0].content or ""
+    assert "## Resolved contract" in system_prompt
+    assert len(system_prompt) > 1000

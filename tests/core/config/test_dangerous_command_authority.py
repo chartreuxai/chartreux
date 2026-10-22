@@ -19,7 +19,6 @@ import pytest
 from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.config._dangerous_command_authority import GRANTS_FIELD
 from chartreux.core.config._restrictions import SourceRestrictions
-from chartreux.core.config.layers.agent_profile import AgentProfileLayer
 from chartreux.core.config.layers.default import DefaultConfigLayer
 from chartreux.core.config.layers.launch_overrides import LaunchOverridesLayer
 from chartreux.core.config.layers.overrides import OverridesLayer
@@ -43,7 +42,7 @@ def user_source(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["project", "agent-profile", "session", "launch"])
+@pytest.mark.parametrize("kind", ["project", "session", "launch"])
 async def test_non_user_layer_contributions_rejected(tmp_path: Path, kind: str) -> None:
     grants = {GRANTS_FIELD: {str(tmp_path): [PUSH]}}
     layers: list[Any] = [DefaultConfigLayer(schema=ChartreuxConfigSchema)]
@@ -56,8 +55,6 @@ async def test_non_user_layer_contributions_rejected(tmp_path: Path, kind: str) 
         )
         trusted_folders_manager.trust_for_session(config_dir)
         layers.append(ProjectConfigLayer(path=project_dir))
-    elif kind == "agent-profile":
-        layers.append(AgentProfileLayer(data=grants))
     elif kind == "session":
         layers.append(OverridesLayer(name="session", data=grants))
     else:

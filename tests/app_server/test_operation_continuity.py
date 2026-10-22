@@ -330,7 +330,7 @@ async def test_child_waits_for_operation_and_interrupts_successor(cancel: bool) 
             item
             async for item in SessionRuntimeRegistry.run(
                 registry,
-                TaskArgs(task="implement", agent_type="worker", background=False),
+                TaskArgs(task="implement", identity="coder", background=False),
                 context,
             )
         ]

@@ -78,12 +78,12 @@ async def test_docked_agent_sheet_has_fixed_eleven_row_geometry() -> None:
         agents = [
             AgentSummaryModel(
                 agent_id=str(i),
-                profile="worker",
+                identity="coder",
                 availability="running",
                 name=derive_agent_name(
                     agent_id=str(i),
-                    profile="worker",
-                    profile_display_label=None,
+                    identity="coder",
+                    identity_display_label=None,
                     base_model=None,
                     effective_model=None,
                 ),

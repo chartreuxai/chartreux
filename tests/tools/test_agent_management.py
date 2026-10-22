@@ -289,11 +289,11 @@ async def test_wait_tool_returns_cancelled_partial_result() -> None:
     manager = FakeSubagentManager([
         AgentSummary(
             agent_id="agent-1",
-            profile="worker",
+            identity="coder",
             availability=AgentAvailability.IDLE,
             current_run_id=None,
             current_run_status=None,
-            name=derive_agent_name("agent-1", "worker", None, None, None),
+            name=derive_agent_name("agent-1", "coder", None, None, None),
         )
     ])
     expected = TaskResult(
@@ -354,7 +354,7 @@ async def test_check_agents_returns_empty_list_when_no_agents() -> None:
 async def test_check_agents_returns_agent_summaries() -> None:
     summary = AgentSummary(
         agent_id="agent-1",
-        profile="worker",
+        identity="coder",
         availability=AgentAvailability.EVICTED,
         current_run_id=None,
         current_run_status=None,
@@ -370,7 +370,7 @@ async def test_check_agents_returns_agent_summaries() -> None:
         context_window=200_000,
         compacting=False,
         stop_reason=RunStopReason.BUDGET_EXCEEDED,
-        name=derive_agent_name("agent-1", "worker", None, "base", "strong"),
+        name=derive_agent_name("agent-1", "coder", None, "base", "strong"),
     )
     result = await collect_result(
         _check_agents_tool().run(
@@ -381,7 +381,6 @@ async def test_check_agents_returns_agent_summaries() -> None:
     serialized = result.model_dump(mode="json")["agents"][0]
     assert serialized == {
         "agent_id": "agent-1",
-        "profile": "worker",
         "availability": "evicted",
         "current_run_id": None,
         "current_run_status": None,
@@ -410,7 +409,10 @@ async def test_check_agents_returns_agent_summaries() -> None:
         # WP5: the predecessor/package lineage pair defaults to None.
         "work_package_id": None,
         "predecessor_agent_id": None,
-        "name": "worker-base-1",
+        "name": "coder-base-1",
+        # The identity pair carries the committed launch identity.
+        "identity": "coder",
+        "identity_revision": None,
     }
 
 
@@ -426,12 +428,12 @@ async def test_check_agents_carries_last_failure_envelope() -> None:
     )
     summary = AgentSummary(
         agent_id="agent-1",
-        profile="worker",
+        identity="coder",
         availability=AgentAvailability.EVICTED,
         current_run_id=None,
         current_run_status=None,
         last_failure=envelope,
-        name=derive_agent_name("agent-1", "worker", None, "base", "strong"),
+        name=derive_agent_name("agent-1", "coder", None, "base", "strong"),
     )
     result = await collect_result(
         _check_agents_tool().run(
@@ -444,7 +446,7 @@ async def test_check_agents_carries_last_failure_envelope() -> None:
 
     plain = AgentSummary(
         agent_id="agent-2",
-        profile="worker",
+        identity="coder",
         availability=AgentAvailability.IDLE,
         current_run_id=None,
         current_run_status=None,
@@ -535,11 +537,11 @@ async def test_management_tools_map_lifecycle_errors(
 async def test_wait_for_evicted_agent_returns_retained_result() -> None:
     summary = AgentSummary(
         agent_id="agent-1",
-        profile="worker",
+        identity="coder",
         availability=AgentAvailability.EVICTED,
         current_run_id="run-1",
         current_run_status=RunStatus.COMPLETED,
-        name=derive_agent_name("agent-1", "worker", None, None, None),
+        name=derive_agent_name("agent-1", "coder", None, None, None),
     )
     manager = FakeSubagentManager([summary])
     expected = TaskResult(response="done", turns_used=1, completed=True)
@@ -557,11 +559,11 @@ async def test_wait_for_evicted_agent_returns_retained_result() -> None:
     assert result.result == expected
     summary = AgentSummary(
         agent_id="agent-1",
-        profile="worker",
+        identity="coder",
         availability=AgentAvailability.RUNNING,
         current_run_id="run-1",
         current_run_status=RunStatus.RUNNING,
-        name=derive_agent_name("agent-1", "worker", None, None, None),
+        name=derive_agent_name("agent-1", "coder", None, None, None),
     )
     manager = FakeSubagentManager([summary])
     wait = asyncio.create_task(
@@ -589,11 +591,11 @@ async def test_wait_for_agent_timeout_returns_still_running_without_cancelling()
 ):
     summary = AgentSummary(
         agent_id="agent-1",
-        profile="worker",
+        identity="coder",
         availability=AgentAvailability.RUNNING,
         current_run_id="run-1",
         current_run_status=RunStatus.RUNNING,
-        name=derive_agent_name("agent-1", "worker", None, None, None),
+        name=derive_agent_name("agent-1", "coder", None, None, None),
     )
     manager = FakeSubagentManager([summary])
 
@@ -660,11 +662,11 @@ async def test_wait_for_unknown_agent_is_a_tool_error() -> None:
 async def test_release_agent_calls_manager() -> None:
     summary = AgentSummary(
         agent_id="agent-1",
-        profile="worker",
+        identity="coder",
         availability=AgentAvailability.IDLE,
         current_run_id=None,
         current_run_status=None,
-        name=derive_agent_name("agent-1", "worker", None, None, None),
+        name=derive_agent_name("agent-1", "coder", None, None, None),
     )
     manager = FakeSubagentManager([summary])
 
@@ -684,11 +686,11 @@ async def test_release_evicted_agent_succeeds() -> None:
     manager = FakeSubagentManager([
         AgentSummary(
             agent_id="agent-1",
-            profile="worker",
+            identity="coder",
             availability=AgentAvailability.EVICTED,
             current_run_id=None,
             current_run_status=None,
-            name=derive_agent_name("agent-1", "worker", None, None, None),
+            name=derive_agent_name("agent-1", "coder", None, None, None),
         )
     ])
 
@@ -724,10 +726,7 @@ async def test_task_validates_background_agent_id_usage(
         await collect_result(
             task.run(
                 TaskArgs(
-                    task="work",
-                    agent_type="worker",
-                    background=False,
-                    agent_id="agent-1",
+                    task="work", identity="coder", background=False, agent_id="agent-1"
                 ),
                 ctx,
             )
@@ -738,10 +737,7 @@ async def test_task_validates_background_agent_id_usage(
         await collect_result(
             task.run(
                 TaskArgs(
-                    task="work",
-                    agent_type="worker",
-                    background=True,
-                    agent_id="agent-1",
+                    task="work", identity="coder", background=True, agent_id="agent-1"
                 ),
                 ctx,
             )

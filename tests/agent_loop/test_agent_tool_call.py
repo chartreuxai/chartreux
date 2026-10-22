@@ -148,7 +148,6 @@ async def test_missing_tool_response_rewrites_repeated_boundary_transcript(
         agent_loop.stats,
         agent_loop.config,
         agent_loop.tool_manager,
-        None,
     )
     cursor = logger._transcript_cursor
     assert cursor is not None
@@ -172,7 +171,6 @@ async def test_missing_tool_response_rewrites_repeated_boundary_transcript(
         agent_loop.stats,
         agent_loop.config,
         agent_loop.tool_manager,
-        None,
     )
 
     expected = [

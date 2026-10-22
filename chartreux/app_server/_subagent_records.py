@@ -68,9 +68,10 @@ class StoredRunResult:
 class RunRecord:
     run_id: str
     agent_id: str
-    profile: str
     status: RunStatus
     completion_task: asyncio.Future[Any]
+    identity: str
+    identity_revision: str | None = None
     task_summary: str | None = None
     start_count: int = 0
     result: TaskResult | None = None
@@ -94,13 +95,14 @@ class RunRecord:
 @dataclass(slots=True)
 class AgentRecord:
     agent_id: str
-    profile: str
     session_id: str
     runtime: SessionRuntime
     root_generation: int
+    identity: str
+    identity_revision: str | None = None
     idle_ttl_seconds: int | None = None
     retained: bool = False
-    profile_display_label: str | None = None
+    identity_display_label: str | None = None
     parent_session_id: str = ""
     initial_task_summary: str | None = None
     state: _AgentState = _AgentState.IDLE
@@ -236,7 +238,7 @@ class _AgentTombstone:
     (reuse raises :class:`AgentEvictedError`). ``closed_at``/``expires_at`` bound
     the metadata lifetime; ``expires_at`` is always set for a stored tombstone
     (a zero tombstone TTL stores no terminal metadata at all).
-    ``profile_display_label`` is captured at admission for later naming work.
+    ``identity_display_label`` is captured at admission for later naming work.
     """
 
     summary: AgentSummary
@@ -245,7 +247,7 @@ class _AgentTombstone:
     reason: str = "evicted"
     closed_at: float = 0.0
     expires_at: float | None = None
-    profile_display_label: str | None = None
+    identity_display_label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

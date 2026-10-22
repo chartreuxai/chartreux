@@ -49,24 +49,27 @@ def test_tools_inventory_intersects_filters_without_changing_other_categories(
     enabled: list[str], disabled: list[str], pattern_driven: bool
 ) -> None:
     states = _inventory_item_states(
-        {"tools": ["bash"], "skills": ["bash"], "agents": ["bash"]},
+        {"tools": ["bash"], "skills": ["bash"], "identities": ["bash"]},
         {
             f"{side}_{category}": values
-            for category in ("tools", "skills", "agents")
+            for category in ("tools", "skills")
             for side, values in (("enabled", enabled), ("disabled", disabled))
         },
     )
     assert not states["tools"]["bash"].effective
     assert not states["tools"]["bash"].default_effective
     assert states["tools"]["bash"].pattern_driven is pattern_driven
-    for category in ("skills", "agents"):
-        assert states[category]["bash"].effective
-        assert states[category]["bash"].pattern_driven is (enabled != ["bash"])
+    assert states["skills"]["bash"].effective
+    assert states["skills"]["bash"].pattern_driven is (enabled != ["bash"])
+    # The identity roster keys on the task denylist, not on these filters.
+    assert states["identities"]["bash"].effective
+    assert states["identities"]["bash"].pattern_driven is False
+    assert states["identities"]["bash"].default_effective is True
 
 
 def test_curated_registry_is_complete_and_validated() -> None:
-    assert len(EDITABLE_SETTINGS) == len(EDITABLE_BY_PATH) == 48
-    assert len(VISIBLE_SETTINGS) == 43
+    assert len(EDITABLE_SETTINGS) == len(EDITABLE_BY_PATH) == 47
+    assert len(VISIBLE_SETTINGS) == 44
     visible = {item.path: item for item in VISIBLE_SETTINGS}
     assert visible["status_line"].control == "status_line"
     assert "status_line" not in EDITABLE_BY_PATH
@@ -87,6 +90,21 @@ def test_curated_registry_is_complete_and_validated() -> None:
         item.timing and isinstance(item.timing_verified, bool)
         for item in EDITABLE_SETTINGS
     )
+    # The identity settings surface replaces the retired prompt/agent axes.
+    for path in ("agent.identity", "agent.workflow", "agent.orchestration_strategy"):
+        descriptor = EDITABLE_BY_PATH[path]
+        assert descriptor.kind == "enum"
+        assert descriptor.timing == "next-conversation"
+    for retired in (
+        "system_prompt_id",
+        "agent_paths",
+        "enabled_agents",
+        "disabled_agents",
+    ):
+        assert retired not in EDITABLE_BY_PATH
+        assert retired not in visible
+    assert visible["inventory_identities"].inventory == "identities"
+    assert "inventory_agents" not in visible
     assert EDITABLE_BY_PATH["subagents.max_idle_agents"].minimum == 0
     assert EDITABLE_BY_PATH["subagents.idle_ttl_seconds"].minimum == 0
     assert EDITABLE_BY_PATH["subagents.retain_agents"].kind == "bool"
@@ -123,6 +141,11 @@ def test_curated_registry_is_complete_and_validated() -> None:
         EDITABLE_BY_PATH["subagents.max_tombstones"].validate(0)
     EDITABLE_BY_PATH["subagents.tombstone_ttl_seconds"].validate(0)
     EDITABLE_BY_PATH["subagents.retain_agents"].validate(False)
+    from chartreux.core.config.settings_catalog import TASK_DENYLIST_SETTING
+
+    with pytest.raises(ValueError):
+        TASK_DENYLIST_SETTING.validate(["ok", False])
+    TASK_DENYLIST_SETTING.validate(["coder", "re:*"])
 
 
 @pytest.mark.asyncio
@@ -216,17 +239,20 @@ async def test_snapshot_pairs_force_loaded_revision_with_sparse_leaf_values(
 ) -> None:
     from types import SimpleNamespace
 
+    import chartreux.core.config.harness_files as harness_files_module
     import chartreux.core.prompts as prompts
 
     prompts_dir = tmp_path / "prompts"
     prompts_dir.mkdir()
     (prompts_dir / "my-prompt.md").write_text("Custom")
+    isolated_manager = SimpleNamespace(
+        project_prompts_dirs=[prompts_dir], user_prompts_dirs=[]
+    )
+    monkeypatch.setattr(prompts, "get_harness_files_manager", lambda: isolated_manager)
+    # The [agent] choices enumerate through the real harness files manager;
+    # isolate them from the machine's actual user prompts directory too.
     monkeypatch.setattr(
-        prompts,
-        "get_harness_files_manager",
-        lambda: SimpleNamespace(
-            project_prompts_dirs=[prompts_dir], user_prompts_dirs=[]
-        ),
+        harness_files_module, "get_harness_files_manager", lambda: isolated_manager
     )
     source = tmp_path / "config.toml"
     source.write_text("[session_logging]\nenabled = false\n")
@@ -265,36 +291,45 @@ async def test_snapshot_pairs_force_loaded_revision_with_sparse_leaf_values(
             leaf = f"status_line.{path}"
             assert leaf in fields and leaf in response.backing_settings
             assert leaf not in catalog
-        assert catalog["system_prompt_id"].choices == tuple(
-            sorted((
-                "cli",
-                "explore",
-                "tests",
-                "minimal",
-                "worker",
-                "advisor",
-                "reviewer",
-                "my-prompt",
-            ))
+        assert catalog["agent.identity"].choices == (
+            "advisor",
+            "coder",
+            "orchestrator",
+            "researcher",
+            "reviewer",
         )
+        assert catalog["agent.workflow"].choices == ("ceremony", "minimal")
+        assert catalog["agent.orchestration_strategy"].choices == ("none", "default")
         assert catalog["compaction_prompt_id"].choices == ("compact", "my-prompt")
-        assert set(response.inventories) == {"tools", "skills", "agents"}
+        assert set(response.inventories) == {"tools", "skills", "identities"}
         assert response.inventories["tools"] == loop.tool_manager.settings_inventory
         assert response.inventories["skills"] == loop.skill_manager.settings_inventory
-        assert response.inventories["agents"] == loop.agent_manager.settings_inventory
+        assert response.inventories["identities"] == [
+            "advisor",
+            "coder",
+            "orchestrator",
+            "researcher",
+            "reviewer",
+        ]
         assert "bash" in response.inventories["tools"]
         assert response.inventories["skills"]
-        assert response.inventories["agents"]
-        for category in ("tools", "skills", "agents"):
+        denylist = fields["tools.task.denylist"]
+        assert denylist.effective_value == []
+        assert denylist.origin == "default"
+        for category in ("tools", "skills", "identities"):
             descriptor = catalog[f"inventory_{category}"]
             assert descriptor.control == "toggle_inventory"
             assert descriptor.inventory == category
+        for category in ("tools", "skills"):
             assert f"enabled_{category}" in fields
             assert f"disabled_{category}" in fields
             assert f"enabled_{category}" not in catalog
             assert f"disabled_{category}" not in catalog
-        for path in ("agent_paths", "skill_paths", "tool_paths"):
+        assert "tools.task.denylist" in response.backing_settings
+        assert "tools.task.denylist" not in catalog
+        for path in ("skill_paths", "tool_paths"):
             assert catalog[path].control is None
+        assert "agent_paths" not in catalog
         assert fields["enabled_tools"].effective_value == []
         assert response.user_revision != user.fingerprint
         assert fields["session_logging.enabled"].effective_value is True

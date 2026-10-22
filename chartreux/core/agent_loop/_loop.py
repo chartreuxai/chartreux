@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Callable, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 import contextlib
 import copy
 from dataclasses import dataclass, field, replace
@@ -10,6 +10,7 @@ import inspect
 import os
 from pathlib import Path
 import shutil
+from string import Template
 import threading
 import time
 from typing import TYPE_CHECKING, Any, cast
@@ -20,6 +21,7 @@ from pydantic import BaseModel, JsonValue
 from chartreux.core.agent_loop import _config_transactions
 from chartreux.core.agent_loop._completion_coordinator import CompletionCoordinator
 from chartreux.core.agent_loop._config_transactions import (
+    _policy_facts_from_bundle,
     _PreparedLaunchReconfiguration,
     _PreparedPolicyReplacement,
     _PreparedReload,
@@ -85,6 +87,7 @@ from chartreux.core.agent_loop.title_controller import (
     TitleScheduleInputs,
 )
 from chartreux.core.agent_loop_hooks import AgentLoopHooksMixin
+from chartreux.core.agents.identities import validate_identity_selection
 from chartreux.core.agents.launch import LaunchCandidate
 from chartreux.core.agents.manager import AgentManager
 from chartreux.core.background_jobs import (
@@ -112,7 +115,8 @@ from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.dangerous_command_grants import DangerousCommandGrantPersistencePort
 from chartreux.core.deferred_questions import DeferredQuestionStore
 from chartreux.core.dispatch.renderer import task_description_for_config
-from chartreux.core.dispatch.session import BoundDispatchPolicy, bind_policy
+from chartreux.core.dispatch.route_models import PurposeRoute, ReplacementCapability
+from chartreux.core.dispatch.session import bound_identity_reference
 from chartreux.core.errors import ContextTooLongError
 from chartreux.core.events import (
     AssistantEvent,
@@ -163,6 +167,16 @@ from chartreux.core.middleware import (
 )
 from chartreux.core.model_catalog.availability import EligibleDeployment
 from chartreux.core.plan_session import PlanSession
+from chartreux.core.policy.bundle import (
+    ActivatedPolicy,
+    BundleStore,
+    LiveSections,
+    PolicyBundle,
+)
+from chartreux.core.policy.composition import ExecutionContext
+from chartreux.core.policy.manifest import routes_from_snapshot
+from chartreux.core.prompts import UtilityPrompt
+from chartreux.core.recovery_models import PackageTier
 from chartreux.core.review import ReviewManager
 from chartreux.core.rewind import RewindManager
 from chartreux.core.root_grants import RootGrantPort
@@ -171,11 +185,12 @@ from chartreux.core.session.session_id import generate_session_id
 from chartreux.core.session.session_lease import SessionLease
 from chartreux.core.session.session_logger import SessionLogger
 from chartreux.core.session_types import (
+    POLICY_STORAGE_VERSION,
     AgentStats,
     ChildSessionLink,
     CommittedModelIdentity,
     LaunchMetadataV2,
-    LaunchPersonaV1,
+    LaunchPersonaV2,
     SessionMetadata,
 )
 from chartreux.core.skills.manager import SkillManager
@@ -184,7 +199,16 @@ from chartreux.core.subagents import (
     SubagentManagementPort,
     SubagentRunnerPort,
 )
-from chartreux.core.system_prompt import get_universal_system_prompt
+from chartreux.core.system_prompt import (
+    ProjectContextProvider,
+    SystemPrompt,
+    _add_commit_signature,
+    _get_available_skills_section,
+    _get_model_catalog_section,
+    _get_scratchpad_section,
+    _get_tool_aware_os_system_prompt,
+    _git_status_caches,
+)
 from chartreux.core.timing import CompletedTurnTiming, InvocationTiming
 from chartreux.core.tools import secret_redaction
 from chartreux.core.tools.base import BaseTool, InvokeContext, ToolPermission
@@ -203,6 +227,7 @@ from chartreux.core.workspace import Workspace
 from chartreux.observability.logging import logger
 from chartreux.user_content import UserDisplayContent, UserResource
 from chartreux.utils.cache_store import CacheStore, InMemoryCacheStore
+from chartreux.utils.paths import is_dangerous_directory
 
 
 def _is_git_executable_available() -> bool:
@@ -217,6 +242,7 @@ def _is_git_executable_available() -> bool:
 
 
 if TYPE_CHECKING:
+    from chartreux.core.config.harness_files._harness_manager import InstructionDocument
     from chartreux.core.tools.mcp.pool import MCPConnectionPool
     from chartreux.core.tools.mcp.registry import MCPRegistry
 
@@ -280,6 +306,125 @@ def requires_init(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+def _resolve_identity_revision(
+    reference: str, harness_files: HarnessFilesManager
+) -> tuple[str, str]:
+    """Resolve one identity reference to its content revision (a pure read).
+
+    Used for the launch envelope before the startup bind has run: the envelope
+    records the resolved identity reference and its revision so resume never
+    re-derives identity from the live profile (design §7).
+    """
+    from chartreux.core.policy.composition import (
+        policy_resource_loader,
+        user_resource_directories,
+    )
+    from chartreux.core.policy.manifest import resource_revision
+    from chartreux.core.policy.models import ResourceKind
+
+    loader = policy_resource_loader(user_resource_directories(harness_files))
+    resource = loader.resolve(ResourceKind.IDENTITY, reference)
+    if resource.content is None:
+        raise ValueError(f"identity resource {reference!r} resolved without content")
+    return reference, resource_revision(resource.content)
+
+
+def _bundle_from_activated(activated: ActivatedPolicy) -> PolicyBundle:
+    """Reconstruct the persisted bundle of an activated policy (exact)."""
+    return PolicyBundle(manifest=activated.manifest, frozen=activated.frozen)
+
+
+def _live_sections(  # noqa: PLR0914 - one faithful mirror of the composition
+    activated: ActivatedPolicy,
+    config: ChartreuxConfigSchema,
+    skill_manager: SkillManager,
+    *,
+    scratchpad_dir: Path | None,
+    cwd: Path,
+    harness_files: HarnessFilesManager,
+) -> LiveSections:
+    """The refreshable live sections of the served artifact (design §10).
+
+    Mirrors the live-section inputs of the package-6 composition
+    (``chartreux.core.system_prompt._build_composition_inputs``): the model
+    and skills catalogs, the environment block, the scratchpad, the project
+    context, the commit signature, and the AGENTS.md layers. The frozen
+    sections never enter here — they come from the bound bundle. The
+    per-launch instruction overlay and the execution context are FROZEN, so
+    the catalog suppression for bounded children reads them from the bundle.
+    """
+    bounded_child = (
+        activated.manifest.execution_context == ExecutionContext.BOUNDED_CHILD.value
+    )
+    overlay = activated.frozen.instruction_overlay
+
+    model_info = None
+    if config.include_model_info and config.catalog_snapshot is not None:
+        sections = [f"Your model name is: `{config.get_active_model().alias}`"]
+        if not bounded_child and overlay is None:
+            catalog_section = _get_model_catalog_section(config)
+            if catalog_section:
+                sections.append(catalog_section)
+        model_info = "\n\n".join(sections)
+
+    skills = None
+    scratchpad = None
+    environment = None
+    if config.include_prompt_detail:
+        environment = _get_tool_aware_os_system_prompt(None)
+        skills_section = _get_available_skills_section(skill_manager)
+        if skills_section:
+            skills = skills_section
+        if scratchpad_dir is not None:
+            scratchpad = _get_scratchpad_section(scratchpad_dir)
+
+    project_context = None
+    agents_documents: tuple[InstructionDocument, ...] = ()
+    if config.include_project_context:
+        is_dangerous, reason = is_dangerous_directory(cwd)
+        if is_dangerous:
+            template = UtilityPrompt.DANGEROUS_DIRECTORY.read()
+            context = Template(template).safe_substitute(
+                reason=reason.lower(), abs_path=cwd.resolve()
+            )
+        else:
+            context = ProjectContextProvider(
+                config=config.project_context,
+                root_path=cwd,
+                git_status_cache=_git_status_caches.cache_for(harness_files),
+            ).get_full_context()
+        context_parts = [context]
+        cwd_resolved = cwd.resolve()
+        extra_roots = [
+            root
+            for root in harness_files.project_roots
+            if root.resolve() != cwd_resolved
+        ]
+        if extra_roots:
+            dirs_lines = "\n".join(f" - {d}" for d in extra_roots)
+            context_parts.append(
+                "Additional working directories (treated with the same "
+                "file-access permissions as the primary working directory):\n"
+                + dirs_lines
+            )
+        project_context = "\n\n".join(context_parts)
+        agents_documents = tuple(harness_files.load_instruction_documents())
+
+    commit_signature = (
+        _add_commit_signature() if config.include_commit_signature else None
+    )
+
+    return LiveSections(
+        model_info=model_info,
+        skills=skills,
+        scratchpad=scratchpad,
+        environment=environment,
+        project_context=project_context,
+        commit_signature=commit_signature,
+        agents_documents=agents_documents,
+    )
+
+
 class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
     def __init__(  # noqa: PLR0913, PLR0915
         self,
@@ -313,14 +458,20 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         inherited_root_grants: tuple[Path, ...] = (),
         parent_authority_getter: Callable[[], ToolManager] | None = None,
         parent_authority_revision_getter: Callable[[], int] | None = None,
-        launch_profile: str | None = None,
+        launch_identity: str | None = None,
         launch_overrides: LaunchConfig | None = None,
-        frozen_system_prompt_id: str | None = None,
+        launch_purpose: str | None = None,
+        # The effective package tier and the model-level replacement-capability
+        # marking the launch resolved (loop-owned launch metadata, like the
+        # purpose label): the agent record reads the tier so the recovery
+        # boundary decides on the package's true tier.
+        launch_package_tier: PackageTier | None = None,
+        launch_replacement_capability: ReplacementCapability | None = None,
         frozen_instructions: str | None = None,
         committed_model: CommittedModelIdentity | None = None,
         accounting_owner: RootAccountingOwner | None = None,
         background_jobs: BackgroundJobsPort | None = None,
-        bound_dispatch_policy: BoundDispatchPolicy | None = None,
+        bound_policy: ActivatedPolicy | None = None,
         root_grant_port: RootGrantPort | None = None,
         dangerous_command_grant_port: DangerousCommandGrantPersistencePort
         | None = None,
@@ -342,11 +493,20 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._parent_authority_getter = parent_authority_getter
         self._parent_authority_revision_getter = parent_authority_revision_getter
         self._authority_revision = 0
-        self.launch_profile = launch_profile
+        self.launch_identity = launch_identity
         self.launch_overrides = (
             launch_overrides.model_copy(deep=True) if launch_overrides else None
         )
-        self.frozen_system_prompt_id = frozen_system_prompt_id
+        # The purpose label whose route this launch resolved through (None
+        # for a direct launch): the loop-owned launch-purpose record the
+        # projection reports, never re-derived from identity or model.
+        self.launch_purpose = launch_purpose
+        # The effective package tier and replacement capability the launch
+        # resolved: loop-owned launch metadata the agent record reads, so
+        # the failure-time recovery boundary decides on the package's true
+        # tier/capability instead of a default.
+        self.launch_package_tier = launch_package_tier
+        self.launch_replacement_capability = launch_replacement_capability
         self.frozen_instructions = frozen_instructions
         self.committed_model = committed_model
         self._committed_selection: str | None = None
@@ -374,6 +534,36 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._user_input_capability = user_input_capability
         self._headless = headless
         self._is_subagent = is_subagent
+        # The conversation's identity binding (design §3, decision log item 3):
+        # the selection is validated ONCE here — an identity that is neither a
+        # builtin, nor builtin:-qualified-and-existing, nor a resolvable user
+        # resource fails closed with an actionable error (S2 unknown-identity
+        # fail-open) — and frozen for this conversation's lifetime. Every tool
+        # manager this loop builds derives posture from the bound identity, so
+        # a reload or in-place edit that changes [agent] identity is a pending
+        # selection for new conversations and never re-postures an existing
+        # manager or child.
+        #
+        # A loop constructed WITH a bound policy bundle (a resumed or
+        # reconstructed conversation) takes its identity from the persisted
+        # bundle instead: validation applies to NEW bindings only, and resume
+        # consumes the persisted content even when the source resource files
+        # are gone (S2 follow-up: loop-construction identity validation vs
+        # persisted-bundle resume).
+        self._bundle_store = BundleStore()
+        self._policy_bind_lock = threading.Lock()
+        self.pending_policy_changes: tuple[str, ...] = ()
+        if bound_policy is not None:
+            self._bound_identity = bound_identity_reference(bound_policy)
+            self._bound_policy: ActivatedPolicy | None = bound_policy
+        else:
+            self._bound_identity = validate_identity_selection(
+                config_orchestrator.config.agent.identity,
+                user_prompts_dirs=self.harness_files.user_prompts_dirs,
+            )
+            # Bound once at startup: the first prompt render captures the
+            # conversation's frozen policy bundle (design §6, §10).
+            self._bound_policy = None
         self.cache_store = cache_store or InMemoryCacheStore()
 
         self._defer_heavy_init = defer_heavy_init
@@ -411,15 +601,11 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.agent_manager = AgentManager(
             self._config_orchestrator, harness_files=self.harness_files
         )
-        self.bound_dispatch_policy = (
-            bound_dispatch_policy
-            or (self.config_orchestrator.bound_dispatch_policy if is_subagent else None)
-            or bind_policy(self.config)
-        )
-        self.config_orchestrator.bound_dispatch_policy = self.bound_dispatch_policy
         # Configuration parsing is pure; runtime IO is explicit and must precede
-        # construction of any clients, including the MCP pool.
-        _ = self.config.system_prompt, self.config.compaction_prompt
+        # construction of any clients, including the MCP pool. The configured
+        # utility prompt is the surviving prompt pre-warm (the full-skeleton
+        # prompt axis is retired with package 16a).
+        _ = self.config.compaction_prompt
         self.mcp_registry: MCPRegistry | None = (
             mcp_registry
             if defer_heavy_init
@@ -437,7 +623,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if self.committed_model is None and config.catalog_snapshot is not None:
             from chartreux.core.model_catalog.resolver import resolver_for
 
-            selection = config.active_model or "@orchestrator"
+            selection = config.active_model or "@main"
             resolved = resolver_for(config).resolve(
                 selection, allowed_models=config.allowed_models
             )
@@ -446,10 +632,25 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             )
         if self.committed_model is not None:
             config.attach_committed_model(self.committed_model)
+        # The task-tool description is conversation-owned policy like the
+        # prompt: a loop constructed WITH a bound bundle (a reconstructed
+        # conversation) serves the bundle's frozen route table — the same
+        # source launch admission resolves against — never the pending live
+        # config; a fresh conversation IS the current selections, so its
+        # manager reads the live config (the bundle binds from it at the
+        # first render, design §6, §10).
+        if self._bound_policy is not None:
+            task_description = task_description_for_config(
+                config,
+                routes=routes_from_snapshot(self._bound_policy.manifest.route_snapshot),
+            )
+        else:
+            task_description = task_description_for_config(config)
         self.tool_manager = ToolManager(
             lambda: self.config,
             mcp_registry=self.mcp_registry,
             defer_mcp=True,
+            bound_identity=self._bound_identity,
             restriction_getter=lambda: self.config_orchestrator.restrictions,
             accepted_token_getter=lambda: self.config_orchestrator.accepted_token,
             inherited_restrictions=self._inherited_restrictions,
@@ -460,12 +661,24 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             cwd=self.cwd,
             harness_files=self.harness_files,
             scratchpad_dir=self.scratchpad_dir,
-            task_description=task_description_for_config(config),
+            task_description=task_description,
             session_root_grants=self._session_root_grants,
             dangerous_command_authority_provider=self._dangerous_command_grants,
         )
+        # Skill eligibility reads the conversation's frozen selections: a
+        # loop constructed WITH a bound policy bundle (a resumed or
+        # reconstructed conversation) derives them from the bundle's
+        # manifest — the same frozen source the reload path reads — never
+        # the pending saved config; a fresh conversation IS the current
+        # selections, so the manager reads them from the live config.
         self.skill_manager = SkillManager(
-            lambda: self.config, harness_files=self.harness_files
+            lambda: self.config,
+            harness_files=self.harness_files,
+            policy_facts=(
+                _policy_facts_from_bundle(self._bound_policy)
+                if self._bound_policy is not None
+                else None
+            ),
         )
         self._execution_authority_config = self._job_authority_config(self.config)
         self._max_turns = max_turns
@@ -618,7 +831,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             session_id_getter=lambda: self.session_id,
             parent_session_id_getter=lambda: self.parent_session_id,
             is_subagent_getter=lambda: self._is_subagent,
-            launch_profile_getter=lambda: self.launch_profile,
+            launch_identity_getter=lambda: self.launch_identity,
             accounting_owner_getter=lambda: self.accounting_owner,
             accounting_sink_getter=lambda: getattr(self, "_accounting_sink", None),
             usage_attribution_getter=lambda: getattr(self, "_usage_attribution", None),
@@ -687,12 +900,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 session_id
             ),
             render_system_prompt=(
-                lambda skill_manager, config, bound_policy, scratchpad_dir: (
+                lambda skill_manager, config, scratchpad_dir, activated_policy=None: (
                     self._render_system_prompt(
                         skill_manager,
                         config,
-                        bound_policy=bound_policy,
                         scratchpad_dir=scratchpad_dir,
+                        activated_policy=activated_policy,
                     )
                 )
             ),
@@ -701,7 +914,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             session_id_getter=lambda: self.session_id,
             parent_session_id_getter=lambda: self.parent_session_id,
             session_lease_getter=lambda: self._session_lease,
-            bound_dispatch_policy_getter=lambda: self.bound_dispatch_policy,
+            bound_policy_getter=lambda: self._ensure_bound_policy(),
+            bound_identity_getter=lambda: self._bound_identity,
+            bundle_store_getter=lambda: self._bundle_store,
+            cwd_getter=lambda: self.cwd,
+            harness_files_getter=lambda: self.harness_files,
+            execution_context_getter=lambda: self._execution_context(),
             session_logger_getter=lambda: self.session_logger,
             middleware_pipeline_getter=lambda: self.middleware_pipeline,
             reset_session=lambda keep_parent: self._reset_session(
@@ -874,6 +1092,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             save=self._save_messages,
             file_state_getter=lambda: self.file_state_context.store,
             deferred_questions_getter=lambda: self.deferred_questions,
+            bound_policy_getter=lambda: self._ensure_bound_policy(),
         )
 
         if defer_heavy_init:
@@ -1353,6 +1572,86 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if self._mcp_pool is None and self.config.mcp_servers:
             self._mcp_pool = self._create_mcp_pool()
 
+    def _execution_context(self) -> ExecutionContext:
+        """The composed session's execution context (design §5 step 4)."""
+        if self.launch_identity is not None:
+            return ExecutionContext.BOUNDED_CHILD
+        return (
+            ExecutionContext.HEADLESS_MAIN
+            if self._headless
+            else ExecutionContext.INTERACTIVE_MAIN
+        )
+
+    def _ensure_bound_policy(self) -> ActivatedPolicy:
+        """Bind the conversation's frozen policy bundle once (startup capture).
+
+        The first render captures the current selections AND their resource
+        content into the versioned bundle (design §3, §6; decision log items
+        3 and 6). Every later render — refresh, reload, retask — serves the
+        captured bundle and never rereads the frozen policy from disk (the
+        invariant: no live reread of frozen policy during prompt refresh).
+        """
+        with self._policy_bind_lock:
+            if self._bound_policy is None:
+                self._bind_policy_bundle()
+            assert self._bound_policy is not None
+            return self._bound_policy
+
+    def _bind_policy_bundle(self) -> None:
+        """Capture the conversation's policy bundle and install it for persistence.
+
+        The captured bundle becomes the conversation's persisted policy record
+        (design §6, §10): it is installed into the session metadata so the
+        existing save path persists it inline, and into the loop's bounded
+        bundle store (never evicted while the conversation is resumable).
+        """
+        from chartreux.core.dispatch.session import bind_policy_bundle
+
+        bundle, activated = bind_policy_bundle(
+            self.config,
+            execution_context=self._execution_context(),
+            skill_manager=self.skill_manager,
+            scratchpad_dir=self.scratchpad_dir,
+            cwd=self.cwd,
+            harness_files=self.harness_files,
+            role_instructions=self.frozen_instructions,
+        )
+        self._bound_policy = activated
+        self._bundle_store.put(self.session_id, bundle)
+        self._bundle_store.set_resumable(self.session_id, True)
+        metadata = self.session_logger.session_metadata
+        if metadata is not None:
+            metadata.policy_bundle = bundle.model_dump(mode="json")
+            metadata.policy_storage_version = POLICY_STORAGE_VERSION
+
+    def _identity_binding(self) -> tuple[str, str]:
+        """The conversation's resolved identity reference and content revision."""
+        activated = self._bound_policy
+        if activated is not None:
+            return (
+                activated.manifest.identity.selected,
+                activated.manifest.identity_revision,
+            )
+        return _resolve_identity_revision(self._bound_identity, self.harness_files)
+
+    @property
+    def frozen_purpose_routes(self) -> Mapping[str, PurposeRoute]:
+        """The conversation's frozen purpose-route table (design §6, §10).
+
+        The route snapshot the bound bundle's manifest captured at bind
+        time, rebuilt as the executable ``[orchestration.routes]`` table.
+        Launch admission resolves purpose routes against THIS table — the
+        same source the rendered launch-target table carries — never the
+        reloaded live config, so a mid-conversation route edit stays
+        pending (reported by ``pending_policy_changes``) instead of
+        producing a mixed-generation launch. Binding on demand matches the
+        render path: the first reader captures the bundle every later
+        reader serves, so admission and rendering can never diverge.
+        """
+        from chartreux.core.policy.manifest import routes_from_snapshot
+
+        return routes_from_snapshot(self._ensure_bound_policy().manifest.route_snapshot)
+
     def _render_system_prompt(
         self,
         skill_manager: SkillManager,
@@ -1360,31 +1659,38 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         tool_manager: ToolManager | None = None,
         agent_manager: AgentManager | None = None,
         *,
-        bound_policy: BoundDispatchPolicy | None = None,
         scratchpad_dir: Path | None | _PrepareScratchpad = _PREPARE_SCRATCHPAD,
+        activated_policy: ActivatedPolicy | None = None,
     ) -> str:
-        prompt_config = (config or self.config).model_copy()
-        prompt_config.attach_dispatch_policy(bound_policy or self.bound_dispatch_policy)
-        if self.frozen_system_prompt_id is not None:
-            prompt_config = prompt_config.model_copy(
-                update={"system_prompt_id": self.frozen_system_prompt_id}
-            )
-        return get_universal_system_prompt(
+        """Render the served prompt from the conversation's bound policy bundle.
+
+        The frozen sections — identity/workflow/strategy bodies, the universal
+        fragments, the launch-target table, and the per-launch instruction
+        overlay — come from the captured bundle, never reread from disk
+        (design §10). Only the refreshable live sections (model and skills
+        catalogs, environment, scratchpad, project context, commit signature,
+        AGENTS.md layers) are recomputed from the current session state, so a
+        refresh picks up tool/skill/catalog changes without re-posturing the
+        conversation. ``activated_policy`` renders a DIFFERENT conversation's
+        bundle (resume preparation); the default serves this loop's bound one.
+        """
+        _ = tool_manager, agent_manager  # live sections do not read managers
+        activated = activated_policy or self._ensure_bound_policy()
+        prompt_config = config or self.config
+        live = _live_sections(
+            activated,
             prompt_config,
             skill_manager,
-            agent_manager or self.agent_manager,
             scratchpad_dir=(
                 self.scratchpad_dir
                 if isinstance(scratchpad_dir, _PrepareScratchpad)
                 else scratchpad_dir
             ),
-            headless=self._headless,
             cwd=self.cwd,
             harness_files=self.harness_files,
-            tool_manager=tool_manager or self.tool_manager,
-            role_instructions=self.frozen_instructions,
-            is_subagent=self.frozen_system_prompt_id is not None,
         )
+        result = activated.render(live)
+        return SystemPrompt(result.text, result.instruction_read_files)
 
     def _publish_system_prompt(self, prompt: str) -> None:
         """Install text and its loader provenance together, never during staging."""
@@ -1454,28 +1760,39 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
     def _launch_metadata(self) -> LaunchMetadataV2 | None:
         if self.committed_model is None:
             return None
+        identity, identity_revision = self._identity_binding()
         return LaunchMetadataV2(
             version=2,
-            profile=self.launch_profile,
             overrides=self.launch_overrides or LaunchConfig(),
-            persona=LaunchPersonaV1(
-                system_prompt_id=self.frozen_system_prompt_id
-                or self.config.system_prompt_id,
+            # The persona is re-keyed on the identity revision (design §7):
+            # resume re-reads this binding instead of re-deriving identity
+            # from the live configuration.
+            persona=LaunchPersonaV2(
+                identity=identity,
+                identity_revision=identity_revision,
                 instructions=self.frozen_instructions,
             ),
             committed_model=self.committed_model,
+            # The committed purpose/tier/capability ride the envelope: the
+            # loop's re-install keeps the persisted launch state describing
+            # the package's true purpose/tier/capability.
+            purpose=self.launch_purpose,
+            package_tier=self.launch_package_tier,
+            replacement_capability=self.launch_replacement_capability,
         )
 
     def install_launch_metadata(self) -> None:
         """Synchronously install accepted launch state before any lock wait."""
         metadata = self.session_logger.session_metadata
         if metadata is not None:
-            metadata.dispatch_policy = self.bound_dispatch_policy.model_dump(
-                mode="json"
-            )
-            metadata.dispatch_policy_notes = list(
-                self.bound_dispatch_policy.diagnostics
-            )
+            # The bundle is the persisted policy record (design §6, §10):
+            # keep the metadata's bundle in step with the bound policy.
+            activated = self._bound_policy
+            if activated is not None:
+                metadata.policy_bundle = _bundle_from_activated(activated).model_dump(
+                    mode="json"
+                )
+                metadata.policy_storage_version = POLICY_STORAGE_VERSION
         if (metadata := self._launch_metadata()) is not None:
             self.session_logger.install_launch_config(metadata)
 
@@ -1561,12 +1878,17 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._backend_lifetime.replace(self._select_backend(), whole_turn_active=False)
 
     async def _save_messages(self, *, allow_empty: bool = False) -> None:
+        # The persisted policy record is the conversation's bound bundle
+        # (design §6, §10): a save forces the startup capture when no render
+        # has bound it yet (deferred init still warming up), so a record is
+        # never persisted without its frozen bundle — a bundle-less record is
+        # a legacy record and cannot be resumed.
+        self._ensure_bound_policy()
         await self.session_logger.save_interaction(
             self.messages,
             self.stats,
             self.config,
             self.tool_manager,
-            None,
             allow_empty=allow_empty,
         )
 
@@ -2762,8 +3084,25 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._session_generation += 1
         self.session_id = prepared.session_id
         self.parent_session_id = prepared.parent_session_id
-        self.bound_dispatch_policy = prepared.new_policy
-        self.config_orchestrator.bound_dispatch_policy = prepared.new_policy
+        # A root reset binds FRESH resources (a new bundle from the current
+        # selections, design §10); a subagent rewind keeps the child's own
+        # bound bundle. Either way the commit installs the new generation
+        # whole — a failed preparation never reaches here.
+        self._bound_policy = prepared.new_policy_bundle
+        self._bound_identity = prepared.new_identity
+        # The same transaction rebinds the ToolManager's bound identity, so
+        # effective tool authority always matches the loop's current identity
+        # (a cleared conversation never keeps the previous identity's
+        # posture).
+        self.tool_manager._bind_identity(prepared.new_identity)
+        # ...and rebinds the SkillManager to the NEW conversation's frozen
+        # selections, so skill eligibility never keeps the previous
+        # conversation's policy (design §3, §6).
+        self.skill_manager = prepared.new_skill_manager
+        self._bundle_store.put(
+            self.session_id, _bundle_from_activated(prepared.new_policy_bundle)
+        )
+        self._bundle_store.set_resumable(self.session_id, True)
         self.install_launch_metadata()
         self.tool_manager._install_task_description(prepared.new_task_description)
         self._publish_system_prompt(prepared.new_prompt)
@@ -2797,6 +3136,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         stats: AgentStats | None = None,
         prepared_scratchpad: Path | None | _PrepareScratchpad = _PREPARE_SCRATCHPAD,
         accounting_owner: RootAccountingOwner | None = None,
+        bound_policy: ActivatedPolicy | None = None,
     ) -> None:
         """Swap session identity in-place, reusing expensive runtime infrastructure.
 
@@ -2815,12 +3155,18 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         — pure assignments and resets — so a resume either fully applies or leaves
         the loop untouched. A bug in any commit step would leave the loop
         half-rebound; callers should treat an unexpected raise as fatal.
+
+        ``bound_policy`` is the resumed conversation's activated policy bundle
+        (the persisted policy record, design §10): the rebind re-installs the
+        bundle's committed identity binding and serves its frozen content —
+        identity validation applies to NEW bindings only.
         """
         prepared = self._session_transitions.prepare_resume(
             session_id,
             session_metadata=session_metadata,
             prepared_scratchpad=prepared_scratchpad,
             accounting_owner=accounting_owner,
+            bound_policy=bound_policy,
         )
         # Commit — assignments and in-place resets only, from here on infallible.
         if self._background_job_registry is not None:
@@ -2834,14 +3180,28 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.parent_session_id = parent_session_id
         self.scratchpad_dir = prepared.scratchpad_dir
         self.tool_manager.set_scratchpad_dir(prepared.scratchpad_dir)
-        self.bound_dispatch_policy = prepared.resumed_policy
-        self.config_orchestrator.bound_dispatch_policy = prepared.resumed_policy
-        session_metadata.dispatch_policy = prepared.resumed_policy.model_dump(
-            mode="json"
+        # The persisted bundle is the conversation's policy record (design
+        # §10): the rebind re-installs its committed identity binding and
+        # keeps the metadata's bundle in step, so the resumed conversation
+        # serves its frozen content even when the source files are gone.
+        self._bound_policy = prepared.resumed_policy_bundle
+        self._bound_identity = prepared.resumed_identity
+        # The same transaction rebinds the ToolManager's bound identity, so
+        # effective tool authority always matches the resumed conversation's
+        # committed identity binding.
+        self.tool_manager._bind_identity(prepared.resumed_identity)
+        # ...and rebinds the SkillManager to the RESUMED conversation's
+        # frozen selections (the persisted bundle's), so skill eligibility
+        # follows the rebind like the identity binding (design §3, §6).
+        self.skill_manager = prepared.resumed_skill_manager
+        self._bundle_store.put(
+            session_id, _bundle_from_activated(prepared.resumed_policy_bundle)
         )
-        session_metadata.dispatch_policy_notes = list(
-            prepared.resumed_policy.diagnostics
-        )
+        self._bundle_store.set_resumable(session_id, True)
+        session_metadata.policy_bundle = _bundle_from_activated(
+            prepared.resumed_policy_bundle
+        ).model_dump(mode="json")
+        session_metadata.policy_storage_version = POLICY_STORAGE_VERSION
         self.session_logger.apply_resumed_session(
             session_id, session_dir, session_metadata
         )

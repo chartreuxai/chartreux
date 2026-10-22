@@ -212,7 +212,7 @@ def _lineage_key(record: AgentRecord, envelope: FailureEnvelope) -> str:
 
     The authoritative key is the envelope's ``work_package_id`` (WP5
     populates it through the contract-surface lineage fields). Until then
-    the launch identity — profile + initial task summary — is the package
+    the launch identity — identity + initial task summary — is the package
     identity a replacement is re-dispatched with, so the counter spans the
     replacement. Without either, recurrence degrades honestly to the single
     agent (documented; never a silent reset).
@@ -221,7 +221,7 @@ def _lineage_key(record: AgentRecord, envelope: FailureEnvelope) -> str:
         return f"pkg:{envelope.work_package_id}"
     summary = record.initial_task_summary or record.last_task_summary
     if summary:
-        return f"brief:{record.profile}:{summary}"
+        return f"brief:{record.identity}:{summary}"
     return f"agent:{record.agent_id}"
 
 
@@ -254,7 +254,7 @@ class RecoveryController:
         self._episodes: dict[str, _Episode] = {}
         self._lineage: dict[str, int] = {}
         # Round-2 V5: per-(agent, key) attribution of the lineage counts.
-        # A brief key (``brief:{profile}:{summary}``) can be shared by an
+        # A brief key (``brief:{identity}:{summary}``) can be shared by an
         # UNRELATED same-brief lineage, so the R7 key migration may move
         # only a predecessor's OWN contribution, never the shared total.
         self._lineage_agent_counts: dict[tuple[str, str], int] = {}

@@ -52,7 +52,7 @@ SHIPPED_CATALOG = ModelCatalog.model_validate({
         },
     },
     "roles": {
-        "orchestrator": {
+        "main": {
             "description": "main assistant preset",
             "model": "glm-5-3",
             "thinking": "high",

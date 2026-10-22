@@ -151,11 +151,11 @@ class AgentTranscriptViewerSnapshotApp(App[None]):
         self.viewer = AgentTranscriptViewer(
             _SnapshotSource(stamped=self.STAMPED),
             "agent-snapshot",
-            profile="reviewer",
+            identity="reviewer",
             name=derive_agent_name(
                 agent_id="agent-snapshot",
-                profile="reviewer",
-                profile_display_label=None,
+                identity="reviewer",
+                identity_display_label=None,
                 base_model="glm-5.3",
                 effective_model=None,
             ),

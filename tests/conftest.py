@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import replace
+import ipaddress
 import os
 from pathlib import Path
+import shutil
+import socket
 import sys
 import tempfile
 from tempfile import TemporaryDirectory
@@ -48,6 +51,96 @@ from tests.stubs.fake_mcp_registry import FakeMCPRegistry
 collect_ignore = ["perf"]
 
 _TESTS_ROOT = Path(__file__).parent
+_PROVIDER_CREDENTIALS = (
+    "MISTRAL_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "COHERE_API_KEY",
+    "GROQ_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_provider_transport() -> Generator[None]:
+    """Remove real provider credentials and block non-loopback INET sockets."""
+    guard_dir = Path(tempfile.mkdtemp(prefix="chartreux-provider-guard-"))
+    guard = guard_dir / "sitecustomize.py"
+    guard.write_text(
+        "import ipaddress, socket\n"
+        "_connect = socket.socket.connect\n"
+        "_connect_ex = socket.socket.connect_ex\n"
+        "_allowed = {'localhost', '127.0.0.1', '::1', '::', '0.0.0.0'}\n"
+        "def _check(address):\n"
+        "    if not isinstance(address, tuple): return False\n"
+        "    if len(address) != 2: raise OSError('malformed socket address blocked by test isolation')\n"
+        "    host = address[0]\n"
+        "    if host in _allowed: return False\n"
+        "    try: return not ipaddress.ip_address(host).is_loopback\n"
+        "    except ValueError: return True\n"
+        "def _blocked(self, address):\n"
+        "    if _check(address): raise OSError('provider network blocked by test isolation')\n"
+        "    return _connect(self, address)\n"
+        "def _blocked_ex(self, address):\n"
+        "    if _check(address): return 111\n"
+        "    return _connect_ex(self, address)\n"
+        "socket.socket.connect = _blocked\n"
+        "socket.socket.connect_ex = _blocked_ex\n",
+        encoding="utf-8",
+    )
+    original_connect = socket.socket.connect
+    original_connect_ex = socket.socket.connect_ex
+    provider_env = {name: os.environ.get(name) for name in _PROVIDER_CREDENTIALS}
+    original_pythonpath = os.environ.get("PYTHONPATH")
+    for name in _PROVIDER_CREDENTIALS:
+        os.environ.pop(name, None)
+
+    def _is_blocked(address: Any) -> bool:
+        if not isinstance(address, tuple):
+            return False
+        if len(address) != 2:
+            raise OSError("malformed socket address blocked by test isolation")
+        host = address[0]
+        if host in {"localhost", "127.0.0.1", "::1", "::", "0.0.0.0"}:
+            return False
+        try:
+            return not ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return True
+
+    def _blocked(self: socket.socket, address: Any) -> Any:
+        if _is_blocked(address):
+            raise OSError("provider network blocked by test isolation")
+        return original_connect(self, address)
+
+    def _blocked_ex(self: socket.socket, address: Any) -> int:
+        if _is_blocked(address):
+            return 111
+        return original_connect_ex(self, address)
+
+    socket.socket.connect = _blocked
+    socket.socket.connect_ex = _blocked_ex
+    os.environ["PYTHONPATH"] = str(guard_dir) + os.pathsep + (original_pythonpath or "")
+    try:
+        yield
+    finally:
+        socket.socket.connect = original_connect
+        socket.socket.connect_ex = original_connect_ex
+        if original_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = original_pythonpath
+        for name, value in provider_env.items():
+            if value is not None:
+                os.environ[name] = value
+        shutil.rmtree(guard_dir, ignore_errors=True)
+
+
 _LOCAL_XDIST_GROUPS = {
     Path("core/test_history_properties.py"): "history_properties",
     Path("core/test_system_prompt.py"): "git_processes",
@@ -277,7 +370,12 @@ def mock_prompts_dirs(
     class _MockManager(HarnessFilesManager):
         @property
         def project_prompts_dirs(self) -> list[Path]:
-            return [project]
+            # Project prompt directories are retired (package 16a): the
+            # production adapter reports them through retired_project_prompt_dirs
+            # and never consumes them, so the mock mirrors that. The project
+            # directory stays in the fixture so tests can pin that a file
+            # written there is never picked up.
+            return []
 
         @property
         def user_prompts_dirs(self) -> list[Path]:
@@ -414,8 +512,6 @@ def _prepare_test_config_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
             kwargs.setdefault("active_model", next(iter(models)))
         else:
             kwargs.setdefault("active_model", models[0].alias)
-    # Use the lightweight test system prompt unless a test asks for a real one.
-    kwargs.setdefault("system_prompt_id", "tests")
     # Keep the test prompt minimal: skip project-context discovery and prompt
     # detail unless a test opts in.
     kwargs.setdefault("include_project_context", False)
@@ -519,7 +615,7 @@ def multi_model_catalog() -> ModelCatalog:
             },
         },
         "roles": {
-            "orchestrator": {
+            "main": {
                 "model": "beta-model",
                 "thinking": "high",
                 "description": "main assistant preset",
@@ -560,7 +656,7 @@ def single_model_catalog() -> ModelCatalog:
             }
         },
         "roles": {
-            "orchestrator": {
+            "main": {
                 "model": "solo-model",
                 "thinking": "high",
                 "description": "main assistant preset",

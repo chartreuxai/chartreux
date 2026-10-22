@@ -29,7 +29,7 @@ from chartreux.app_server._execution import (
 from chartreux.app_server._model import ProtocolModel
 from chartreux.app_server._projection import (
     project_history,
-    project_launch_slot_purposes,
+    project_launch_purposes,
     project_session_log,
 )
 from chartreux.app_server._recovery_controller import RecoveryController
@@ -113,7 +113,7 @@ from chartreux.app_server.protocol import (
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._loop import _PreparedPolicyReplacement
 from chartreux.core.agents.launch import LaunchCandidate
-from chartreux.core.agents.models import AgentProfile
+from chartreux.core.agents.manager import requested_identity_reference
 from chartreux.core.config._restrictions import (
     SourceRestrictions,
     partition_policy_sources,
@@ -130,6 +130,7 @@ from chartreux.core.subagents import (
     AgentBusyError,
     AgentClosedError,
     AgentEviction,
+    AgentIdentityMismatchError,
     AgentSummary,
     CancelOutcome,
     CancelResult,
@@ -1262,15 +1263,15 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         args: TaskArgs,
         *,
         runtime: SessionRuntime | None = None,
-        profile: str | None = None,
+        identity: str | None = None,
     ) -> LaunchCandidate:
         return self._launch_admission.resolve_candidate(
-            parent, args, runtime=runtime, profile=profile
+            parent, args, runtime=runtime, identity=identity
         )
 
     async def _create_registered_child(
         self, parent: SessionRuntime, args: TaskArgs, ctx: InvokeContext
-    ) -> tuple[SessionRuntime, AgentProfile]:
+    ) -> tuple[SessionRuntime, str]:
         """Delegate to the child launch admission collaborator."""
         return await self._launch_admission.create_registered(parent, args, ctx)
 
@@ -1306,11 +1307,29 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             record, previous_idle_since, apply_policy=apply_policy
         )
 
-    def _require_task_profile_allowed(
-        self, parent: SessionRuntime, profile: str
+    def _require_task_identity_allowed(
+        self, parent: SessionRuntime, identity: str
     ) -> None:
         """Apply effective Task admission before constructing child resources."""
-        self._launch_admission.require_profile_allowed(parent, profile)
+        self._launch_admission.require_identity_allowed(parent, identity)
+
+    def _require_retained_identity_match(
+        self, record: AgentRecord, args: TaskArgs
+    ) -> None:
+        """Compare the requested identity against the record's on BOTH sides of
+        a retained continuation (11c): a canonical identity selection —
+        structured or shorthand — that names a different identity than the
+        retained instance raises the identity-mismatch error; a plain
+        continuation naming no target reuses the instance as-is and keeps
+        the record's identity revision and overlay immutable.
+        """
+        requested_identity = requested_identity_reference(args)
+        retained_identity = record.identity
+        if requested_identity is not None and requested_identity != retained_identity:
+            raise AgentIdentityMismatchError(
+                f"Requested identity {requested_identity} does not "
+                f"match retained agent identity {retained_identity}"
+            )
 
     @staticmethod
     def _replacement_refusal(record: AgentRecord, outcome: LaunchOutcome) -> TaskResult:
@@ -1392,6 +1411,8 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 record.reserved_for_replacement or record.state is not _AgentState.IDLE
             ):
                 raise AgentBusyError("Agent is already running a task")
+            if record is not None:
+                self._require_retained_identity_match(record, args)
         # Check and reserve without awaiting: concurrent creation/reuse attempts
         # consume capacity before they can allocate runtimes or call providers.
         if not hasattr(self, "_active_work_slots"):
@@ -1426,7 +1447,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 if not slot.transferred:
                     self._active_work_slots.discard(slot)
 
-    async def _run_admitted(  # noqa: PLR0914, PLR0915
+    async def _run_admitted(  # noqa: PLR0912, PLR0914, PLR0915
         self,
         args: TaskArgs,
         ctx: InvokeContext,
@@ -1507,8 +1528,10 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             raise ValueError("agent_id is only supported for background tasks")
         if args.retain is not None:
             raise ValueError("retain is only supported for background tasks")
-        self._require_task_profile_allowed(parent, args.agent_type)
-        runtime, _idle_ttl_seconds = await self._create_registered_child(
+        requested_identity = requested_identity_reference(args)
+        if requested_identity is not None:
+            self._require_task_identity_allowed(parent, requested_identity)
+        runtime, _launch_identity = await self._create_registered_child(
             parent, args, ctx
         )
         child = runtime.agent_loop
@@ -1579,7 +1602,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                     link = ChildSessionLink(
                         session_id=child.session_id,
                         tool_call_id=tool_call_id,
-                        agent=child.launch_profile or args.agent_type,
+                        agent=(
+                            child.launch_identity
+                            or requested_identity_reference(args)
+                            or ""
+                        ),
                         relative_path=str(child_dir.relative_to(parent_dir)),
                     )
                     self._stored_children[child.session_id] = StoredChildSession(
@@ -1666,16 +1693,16 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
 
     @staticmethod
     def _record_name(record: AgentRecord) -> str:
-        """Derive the human-facing ``{profile}-{model}-{number}`` name (§5).
+        """Derive the human-facing ``{identity}-{model}-{number}`` name (§5).
 
         The name is derived from the record's committed admission state
-        (profile display label captured at admission, canonical base model
+        (identity display label captured at admission, canonical base model
         with the effective-model fallback) and the handle's sequence digits.
         """
         return derive_agent_name(
             record.agent_id,
-            record.profile,
-            record.profile_display_label,
+            record.identity,
+            record.identity_display_label,
             record.base_model,
             record.effective_model,
         )
@@ -1730,7 +1757,8 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             latest_run = run or (record.run_history[-1] if record.run_history else None)
             summary = AgentSummary(
                 agent_id=record.agent_id,
-                profile=record.profile,
+                identity=record.identity,
+                identity_revision=record.identity_revision,
                 availability=record.availability,
                 current_run_id=run.run_id if run is not None else None,
                 current_run_status=run.status if run is not None else None,
@@ -1869,12 +1897,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             [
                 AgentSummaryModel(
                     agent_id=summary.agent_id,
-                    profile=summary.profile,
+                    identity=summary.identity,
+                    identity_revision=summary.identity_revision,
                     name=summary.name,
-                    slot_purposes=(
-                        project_launch_slot_purposes(
-                            record.runtime.agent_loop, summary.profile
-                        )
+                    launch_purposes=(
+                        project_launch_purposes(record.runtime.agent_loop)
                         if (record := self._agent_records.get(summary.agent_id))
                         is not None
                         else []

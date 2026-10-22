@@ -97,10 +97,11 @@ class WorkbenchFlowPolicy:
         return "Cancel setup" if self.is_onboarding else "Close"
 
     def seed(self, state: ManagementState | None) -> None:
-        """Seed usable roles; shipped dispatch slots resolve through these bindings.
+        """Seed usable role presets from the ready canonical models.
 
         A single canonical model (even at different thinking levels) needs no
-        explicit slot overlay. Keep the saved mode, including one-model orchestration.
+        explicit preset overlay; orchestration is never inferred from the
+        roster size.
         """
         self._host._onboarding_presets_seeded = False
         if state is None:

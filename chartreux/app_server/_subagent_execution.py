@@ -19,6 +19,8 @@ from chartreux.app_server._subagent_records import (
 from chartreux.app_server.models import PublicTurn, PublicTurnStatus, TextContentBlock
 from chartreux.app_server.protocol import TurnInterruptParams, TurnStartParams
 from chartreux.core.agent_loop import AgentLoop
+from chartreux.core.agents.identities import get_builtin_identity
+from chartreux.core.agents.manager import requested_identity_reference
 from chartreux.core.events import BaseEvent, ToolStreamEvent
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.recovery_models import (
@@ -39,7 +41,6 @@ from chartreux.core.subagents import (
     AgentBusyError,
     AgentClosedError,
     AgentEviction,
-    AgentProfileMismatchError,
     LaunchConfig,
     LaunchOutcome,
     RetentionPolicy,
@@ -64,7 +65,6 @@ if TYPE_CHECKING:
     )
     from chartreux.core.agent_loop.backend_lifetime import BackendPublish
     from chartreux.core.agents.launch import LaunchCandidate
-    from chartreux.core.agents.models import AgentProfile
     from chartreux.core.session_types import AgentStats
     from chartreux.core.tools.base import InvokeContext
 
@@ -162,7 +162,7 @@ class ExecutionStateView(Protocol):
     construction — registry state mutated after the collaborator is built
     stays visible,
     and instance patches of the registry delegates (including the background
-    admission validation, the launch-candidate resolution, the profile
+    admission validation, the launch-candidate resolution, the identity
     admission, the child creation + rollback pair, the run-id allocation,
     the clock, the retention policy, the run-outcome resolution, the
     generation check, the result expiry, the write-token registration, the
@@ -198,8 +198,8 @@ class ExecutionStateView(Protocol):
 
     def _validate_replacement_locked(self, claim: _ReplacementClaim) -> None: ...
 
-    def _require_task_profile_allowed(
-        self, parent: SessionRuntime, profile: str
+    def _require_task_identity_allowed(
+        self, parent: SessionRuntime, identity: str
     ) -> None: ...
 
     def _rearm_reaper_locked(self, exclude: frozenset[str] = frozenset()) -> None: ...
@@ -210,14 +210,14 @@ class ExecutionStateView(Protocol):
         args: TaskArgs,
         *,
         runtime: SessionRuntime | None = None,
-        profile: str | None = None,
+        identity: str | None = None,
     ) -> LaunchCandidate: ...
 
     def _issue_agent_id(self, parent: SessionRuntime) -> Coroutine[Any, Any, str]: ...
 
     def _create_registered_child(
         self, parent: SessionRuntime, args: TaskArgs, ctx: InvokeContext
-    ) -> Coroutine[Any, Any, tuple[SessionRuntime, AgentProfile]]: ...
+    ) -> Coroutine[Any, Any, tuple[SessionRuntime, str]]: ...
 
     def _rollback_created_child(
         self, parent: SessionRuntime, runtime: SessionRuntime, tool_call_id: str
@@ -331,7 +331,7 @@ class BackgroundExecutionContext:
     """Per-invocation state for one background execution (ASC area 3).
 
     Carries the exact child runtime, record, and run record with their IDs;
-    the created/reused status and launch profile; the previous idle
+    the created/reused status and launch identity; the previous idle
     timestamp and the generation/authority reservations; the retained
     candidate and prepared reconfiguration; the prior record/retention/
     latest-run/index snapshot the rollback restores; the previous event
@@ -350,7 +350,7 @@ class BackgroundExecutionContext:
     run_id: str
     tool_call_id: str
     created_record: bool
-    launch_profile: AgentProfile | None
+    launch_identity: str | None
     previous_idle_since: float | None
     reserved_child_generation: int | None
     reserved_parent_authority_revision: int | None
@@ -524,13 +524,6 @@ class SubagentExecution:
                     raise UnknownAgentError(
                         f"Unknown agent_id instance handle: {args.agent_id}. Check the agent_id with check_agents"
                     )
-                if (
-                    "agent_type" in args.model_fields_set
-                    and record.profile != args.agent_type
-                ):
-                    raise AgentProfileMismatchError(
-                        f"Agent profile mismatch: expected {record.profile}, got {args.agent_type}"
-                    )
                 if replacement is not None:
                     self._view._validate_replacement_locked(replacement)
                     if record is not replacement.record:
@@ -549,7 +542,7 @@ class SubagentExecution:
                     raise UnknownAgentError(
                         f"Unknown agent_id instance handle: {args.agent_id}. Check the agent_id with check_agents"
                     )
-                self._view._require_task_profile_allowed(parent, record.profile)
+                self._view._require_task_identity_allowed(parent, record.identity)
                 previous_idle_since = record.idle_since
                 reserved_child_generation = (
                     record.runtime.agent_loop._session_generation
@@ -566,7 +559,7 @@ class SubagentExecution:
         else:
             record = None
         created_record = False
-        launch_profile: AgentProfile | None = None
+        launch_identity: str | None = None
         effective_task = summary_task if summary_task is not None else args.task
         prepared_reconfiguration = None
         if record is not None:
@@ -575,7 +568,7 @@ class SubagentExecution:
             ):
                 try:
                     retained_candidate = self._view._resolve_launch_candidate(
-                        parent, args, runtime=record.runtime, profile=record.profile
+                        parent, args, runtime=record.runtime, identity=record.identity
                     )
                 except BaseException:
                     await self._view._rollback_reused_claim(
@@ -635,23 +628,30 @@ class SubagentExecution:
                     raise
             runtime = record.runtime
         else:
-            self._view._require_task_profile_allowed(parent, args.agent_type)
-            runtime, profile = await self._view._create_registered_child(
+            requested_identity = requested_identity_reference(args)
+            if requested_identity is not None:
+                self._view._require_task_identity_allowed(parent, requested_identity)
+            runtime, launch_identity = await self._view._create_registered_child(
                 parent, args, ctx
             )
-            launch_profile = profile
             agent_id = await self._view._issue_agent_id(parent)
             # WP5: a claimed replacement launch (args.agent_id is None with
             # a config.predecessor_agent_id claim) gets a NEW agent_id whose
             # record carries the predecessor/package lineage from the claim.
             claim = args.config
+            # The record carries the launch-resolved identity binding (11c):
+            # the same (identity, revision) pair the launch envelope persists,
+            # read back from the constructed child's committed binding.
+            record_identity, record_identity_revision = (
+                runtime.agent_loop._identity_binding()
+            )
             record = AgentRecord(
                 agent_id=agent_id,
-                profile=runtime.agent_loop.launch_profile or args.agent_type,
+                identity=record_identity,
+                identity_revision=record_identity_revision,
                 session_id=runtime.agent_loop.session_id,
                 runtime=runtime,
                 root_generation=parent.agent_loop._session_generation,
-                idle_ttl_seconds=profile.idle_ttl_seconds,
                 parent_session_id=parent.agent_loop.session_id,
                 initial_task_summary=normalize_task_summary(
                     args.task_summary, fallback=effective_task
@@ -661,7 +661,15 @@ class SubagentExecution:
                 predecessor_agent_id=(
                     claim.predecessor_agent_id if claim is not None else None
                 ),
-                package_tier=claim.package_tier if claim is not None else None,
+                # The claimed tier wins; otherwise the record carries the
+                # launch-resolved effective tier (the route target's explicit
+                # tier), so the recovery boundary decides on the package's
+                # true tier instead of defaulting conservatively.
+                package_tier=(
+                    claim.package_tier
+                    if claim is not None and claim.package_tier is not None
+                    else runtime.agent_loop.launch_package_tier
+                ),
             )
             try:
                 async with self._view._registry_lock:
@@ -710,7 +718,8 @@ class SubagentExecution:
         run_record = RunRecord(
             run_id=run_id,
             agent_id=agent_id,
-            profile=record.profile,
+            identity=record.identity,
+            identity_revision=record.identity_revision,
             status=RunStatus.RUNNING,
             completion_task=completion_placeholder,
             task_summary=normalize_task_summary(
@@ -721,30 +730,28 @@ class SubagentExecution:
         record.latest_run_id = run_id
         self._view._latest_run_ids[agent_id] = run_id
         # Commit the retention policy for this admission. A fresh launch
-        # resolves explicit task arg -> profile setting -> generation
-        # snapshot default; a reuse inherits the committed policy unless
-        # the caller explicitly overrides it (retain=False is a final
-        # continuation that closes after this run).
+        # resolves explicit task arg -> generation snapshot default; a reuse
+        # inherits the committed policy unless the caller explicitly overrides
+        # it (retain=False is a final continuation that closes after this run).
         if created_record:
-            assert launch_profile is not None
+            assert launch_identity is not None
             # Stable first-admission timestamp for deterministic Active
             # ordering; preserved across reuse and run-history pruning.
             record.first_admitted_at = self._view._clock()
-            if args.retain is not None:
-                record.retained = args.retain
-            elif launch_profile.retain is not None:
-                record.retained = launch_profile.retain
-            else:
-                record.retained = self._view._retention_policy.retain_agents
-            # Capture the profile display label only when the profile's
-            # display_name was explicitly provided (design §5): a TOML
-            # profile without display_name synthesizes a title-case
-            # picker label, which must not become the name segment —
-            # the derivation helper falls back to the profile name.
-            record.profile_display_label = (
-                launch_profile.display_name
-                if launch_profile.display_name_explicit
-                else None
+            record.retained = (
+                args.retain
+                if args.retain is not None
+                else self._view._retention_policy.retain_agents
+            )
+            # Capture the identity's display label for later naming work
+            # (design §5): a built-in identity's shipped display name. A
+            # custom identity prompt carries no explicit display name, so
+            # the derivation helper falls back to the identity reference.
+            builtin_identity = get_builtin_identity(
+                record.identity.removeprefix("builtin:")
+            )
+            record.identity_display_label = (
+                builtin_identity.display_name if builtin_identity is not None else None
             )
         elif args.retain is not None:
             record.retained = args.retain
@@ -760,7 +767,7 @@ class SubagentExecution:
             run_id=run_id,
             tool_call_id=ctx.tool_call_id,
             created_record=created_record,
-            launch_profile=launch_profile,
+            launch_identity=launch_identity,
             previous_idle_since=previous_idle_since,
             reserved_child_generation=reserved_child_generation,
             reserved_parent_authority_revision=reserved_parent_authority_revision,
@@ -1341,7 +1348,7 @@ class SubagentExecution:
                 != context.reserved_parent_authority_revision
             ):
                 raise RuntimeError("Agent authority changed before launch")
-            self._view._require_task_profile_allowed(parent, context.record.profile)
+            self._view._require_task_identity_allowed(parent, context.record.identity)
             self._view._register_writer_locked(
                 context.agent_id, context.run_id, context.publication_token
             )

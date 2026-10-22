@@ -838,7 +838,7 @@ class TestS1SaveBoundary:
         ]
         with pytest.raises(TranscriptIntegrityError):
             await logger.save_interaction(
-                poisoned, AgentStats(), build_test_vibe_config(), _tool_manager(), None
+                poisoned, AgentStats(), build_test_vibe_config(), _tool_manager()
             )
         assert not (logger.session_dir / MESSAGES_FILENAME).exists()
 
@@ -855,7 +855,7 @@ class TestS1SaveBoundary:
             _user("steered"),
         ]
         await logger.save_interaction(
-            replaced, AgentStats(), build_test_vibe_config(), _tool_manager(), None
+            replaced, AgentStats(), build_test_vibe_config(), _tool_manager()
         )
         messages_path = logger.session_dir / MESSAGES_FILENAME
         on_disk = messages_path.read_text(encoding="utf-8")

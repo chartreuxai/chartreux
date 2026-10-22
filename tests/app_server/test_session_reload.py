@@ -44,7 +44,11 @@ from tests.app_server._session_runtime_support import (
     _isolate_recovery_registry,  # noqa: F401 - autouse fixture registered via module namespace
     _wire_resume_request,
 )
-from tests.conftest import build_test_agent_loop, build_test_vibe_config
+from tests.conftest import (
+    build_test_agent_loop,
+    build_test_vibe_config,
+    set_agent_config,
+)
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.app_server import (
     attach_test_app_server_session,
@@ -443,6 +447,37 @@ async def test_resume_reports_success_when_post_rebind_refresh_fails(
         assert SessionTurnsListResponse.model_validate(result).items == []
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_reload_reports_pending_identity_change_without_reposturing(
+    tmp_path: Path,
+) -> None:
+    # Design §10: a config reload mid-conversation retains the frozen policy
+    # bytes and reports the pending [agent] selection change — the saved
+    # selection applies to new conversations only.
+    config = build_test_vibe_config(
+        session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path))
+    )
+    agent_loop = build_test_agent_loop(config=config)
+    try:
+        bound = agent_loop._bound_policy
+        assert bound is not None
+        frozen_prompt = agent_loop.messages[0].content
+
+        set_agent_config(
+            agent_loop, build_test_vibe_config(agent={"identity": "researcher"})
+        )
+        await agent_loop.reload_with_initial_messages()
+
+        assert agent_loop._bound_policy is bound
+        assert agent_loop.messages[0].content == frozen_prompt
+        assert any(
+            "identity selection change" in note
+            for note in agent_loop.pending_policy_changes
+        )
+    finally:
+        await agent_loop.aclose()
 
 
 @pytest.mark.asyncio

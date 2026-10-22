@@ -6,7 +6,6 @@ import asyncio
 
 import pytest
 
-from chartreux.core.agents.models import AgentProfile
 from chartreux.core.config import SessionLoggingConfig
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session.session_loader import SessionLoader
@@ -16,7 +15,6 @@ from chartreux.core.tools.manager import ToolManager
 from tests.conftest import build_test_vibe_config
 from tests.session.persistence._session_persistence_support import (
     disabled_session_config as disabled_session_config,
-    mock_agent_profile as mock_agent_profile,
     mock_tool_manager as mock_tool_manager,
     session_config as session_config,
     temp_session_dir as temp_session_dir,
@@ -205,10 +203,7 @@ class TestSessionLoggerTitleManagement:
 
     @pytest.mark.asyncio
     async def test_refresh_auto_title_persists_to_disk(
-        self,
-        session_config: SessionLoggingConfig,
-        mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
+        self, session_config: SessionLoggingConfig, mock_tool_manager: ToolManager
     ) -> None:
         logger = SessionLogger(session_config, "test-session-123")
         await logger.save_interaction(
@@ -216,7 +211,6 @@ class TestSessionLoggerTitleManagement:
             stats=AgentStats(),
             config=build_test_vibe_config(),
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         await logger.refresh_auto_title("Persisted generated title")
@@ -228,10 +222,7 @@ class TestSessionLoggerTitleManagement:
 
     @pytest.mark.asyncio
     async def test_refresh_auto_title_skips_a_title_for_a_reset_session(
-        self,
-        session_config: SessionLoggingConfig,
-        mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
+        self, session_config: SessionLoggingConfig, mock_tool_manager: ToolManager
     ) -> None:
         # A background generation that outlived a /new or /clear reset carries the
         # old session id; the logger (reset in place) must not persist it.
@@ -242,7 +233,6 @@ class TestSessionLoggerTitleManagement:
             stats=AgentStats(),
             config=build_test_vibe_config(),
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         changed = await logger.refresh_auto_title(
@@ -260,7 +250,6 @@ class TestSessionLoggerTitleManagement:
         self,
         session_config: SessionLoggingConfig,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         logger = SessionLogger(session_config, "test-session-123")
@@ -270,7 +259,6 @@ class TestSessionLoggerTitleManagement:
             stats=AgentStats(),
             config=build_test_vibe_config(),
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         async def boom(*_args, **_kwargs):
@@ -293,10 +281,7 @@ class TestSessionLoggerTitleManagement:
 
     @pytest.mark.asyncio
     async def test_save_interaction_keeps_refreshed_title(
-        self,
-        session_config: SessionLoggingConfig,
-        mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
+        self, session_config: SessionLoggingConfig, mock_tool_manager: ToolManager
     ) -> None:
         logger = SessionLogger(session_config, "test-session-123")
         await logger.save_interaction(
@@ -304,7 +289,6 @@ class TestSessionLoggerTitleManagement:
             stats=AgentStats(),
             config=build_test_vibe_config(),
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
         await logger.refresh_auto_title("Generated title")
 
@@ -316,7 +300,6 @@ class TestSessionLoggerTitleManagement:
             stats=AgentStats(),
             config=build_test_vibe_config(),
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         assert logger.session_dir is not None
@@ -345,10 +328,7 @@ class TestSessionLoggerTitleManagement:
 
     @pytest.mark.asyncio
     async def test_apply_manual_title_persists_manual_to_disk(
-        self,
-        session_config: SessionLoggingConfig,
-        mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
+        self, session_config: SessionLoggingConfig, mock_tool_manager: ToolManager
     ) -> None:
         logger = SessionLogger(session_config, "test-session-123")
         await logger.save_interaction(
@@ -356,7 +336,6 @@ class TestSessionLoggerTitleManagement:
             stats=AgentStats(),
             config=build_test_vibe_config(),
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         updated_at = await logger.apply_manual_title("  Reviewed session  ")
@@ -397,7 +376,6 @@ class TestSessionLoggerTitleManagement:
         self,
         session_config: SessionLoggingConfig,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         logger = SessionLogger(session_config, "test-session-123")
@@ -407,7 +385,6 @@ class TestSessionLoggerTitleManagement:
             stats=AgentStats(),
             config=build_test_vibe_config(),
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         async def boom(*_args, **_kwargs):
@@ -433,7 +410,6 @@ class TestSessionLoggerTitleManagement:
         self,
         session_config: SessionLoggingConfig,
         mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         logger = SessionLogger(session_config, "test-session-123")
@@ -443,7 +419,6 @@ class TestSessionLoggerTitleManagement:
             stats=AgentStats(),
             config=build_test_vibe_config(),
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         async def boom(*_args, **_kwargs):
@@ -463,10 +438,7 @@ class TestSessionLoggerTitleManagement:
 
     @pytest.mark.asyncio
     async def test_concurrent_rename_and_auto_refresh_leaves_manual_title(
-        self,
-        session_config: SessionLoggingConfig,
-        mock_tool_manager: ToolManager,
-        mock_agent_profile: AgentProfile,
+        self, session_config: SessionLoggingConfig, mock_tool_manager: ToolManager
     ) -> None:
         # The two-writer invariant: a manual rename always wins a race with the
         # background auto-refresh, on disk and in memory, whichever runs first.
@@ -477,7 +449,6 @@ class TestSessionLoggerTitleManagement:
             stats=AgentStats(),
             config=build_test_vibe_config(),
             tool_manager=mock_tool_manager,
-            agent_profile=mock_agent_profile,
         )
 
         await asyncio.gather(

@@ -64,7 +64,6 @@ async def _save(
         stats=AgentStats(steps=1),
         config=build_test_vibe_config(),
         tool_manager=MagicMock(spec=ToolManager),
-        agent_profile=None,
     )
 
 

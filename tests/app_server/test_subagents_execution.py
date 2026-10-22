@@ -366,12 +366,10 @@ async def test_background_notification_survives_agents_update_failure(
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
 async def test_background_progress_overflow_completes_without_a_consumer(
-    tmp_path: Path, monkeypatch
+    monkeypatch,
 ) -> None:
-    (tmp_path / "noisy.toml").write_text(
-        "\n".join(['agent_type = "subagent"', 'enabled_tools = ["todo"]']),
-        encoding="utf-8",
-    )
+    # The custom "noisy" identity is a user prompt file installed by the
+    # autouse conftest fixture; agents/*.toml discovery is retired (16a).
     progress_count = 65
     child_backend = FakeBackend(
         [
@@ -385,7 +383,6 @@ async def test_background_progress_overflow_completes_without_a_consumer(
     )
     parent = build_test_agent_loop(
         config=build_test_vibe_config(
-            agent_paths=[tmp_path],
             enabled_tools=["task", "todo"],
             tools={
                 "task": {"permission": ToolPermission.ALWAYS.value},
@@ -885,7 +882,7 @@ async def test_foreground_terminal_generator_close_hands_off_teardown(
         monkeypatch, FakeBackend([mock_llm_chunk(content="done")])
     )
     stream = registry.run(
-        TaskArgs(task="foreground", agent_type="worker", background=False),
+        TaskArgs(task="foreground", identity="coder", background=False),
         InvokeContext(tool_call_id="terminal-close", session_id=parent.session_id),
     )
     try:

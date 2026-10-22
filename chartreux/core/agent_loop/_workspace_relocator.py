@@ -253,7 +253,6 @@ class WorkspaceRelocator:
         if (layer := self._project_config_layer()) is not None:
             await layer.reroot(cwd)
             await self._config_orchestrator_getter().reload()
-        self._agent_manager_getter().rebind(harness_files)
         # Rebuilds the tools, skills, prompt and hooks bound to the old
         # directory. Preparing happens off-thread and the commit is synchronous,
         # so that half is not observable partly applied. It runs last so those
@@ -282,7 +281,6 @@ class WorkspaceRelocator:
             if (layer := self._project_config_layer()) is not None:
                 await layer.reroot(cwd)
                 await self._config_orchestrator_getter().reload()
-            self._agent_manager_getter().rebind(harness_files)
         except Exception:
             logger.exception(
                 "Failed to restore the workspace after a rejected move cwd=%s", cwd

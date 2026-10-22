@@ -21,6 +21,7 @@ Chartreux is pre-release alpha software with no stability guarantees; breaking c
 
 ## Highlights
 
+- Identity-based agents: a zero-config solo default, a one-line orchestrator switch, and purpose-routed delegation (see the [identity architecture](https://chartreuxai.github.io/chartreux/docs/reference/identity-architecture/))
 - Async subagents with retention, reuse, and retasking
 - Provider-agnostic model catalog with deployment failover
 - Local-first sessions and workspace support
@@ -55,6 +56,8 @@ chartreux
 ```
 
 Runtime configuration is stored in `~/.chartreux/config.toml`; providers, models, and saved presets live in the user catalog at `~/.chartreux/models.toml`; provider credentials can be stored in `~/.chartreux/.env`. See the [configuration guide](https://chartreuxai.github.io/chartreux/docs/guides/configuration/).
+
+A new conversation needs no agent configuration: the default coder identity runs the minimal workflow with no orchestration strategy, identically with one model or ten. Switch to orchestration with `chartreux --identity orchestrator`, or set `[agent] identity = "orchestrator"`; see the [identity architecture reference](https://chartreuxai.github.io/chartreux/docs/reference/identity-architecture/).
 
 ## Documentation
 

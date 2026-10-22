@@ -8,8 +8,9 @@ Chartreux resolves normal settings in this order, from lower to higher precedenc
 2. User configuration: `$CHARTREUX_HOME/config.toml` (normally `~/.chartreux/config.toml`).
 3. Trusted project configuration: `.chartreux/config.toml`, discovered by searching upward from the working directory.
 4. `CHARTREUX_*` configuration environment variables.
-5. The active agent profile.
-6. Runtime overrides.
+5. Runtime overrides.
+
+The `[agent]` selections — identity, workflow, and orchestration strategy — have their own new-conversation precedence: CLI flag (`--identity`, `--workflow`, `--orchestration-strategy`) > environment (`CHARTREUX_AGENT__IDENTITY`, `CHARTREUX_AGENT__WORKFLOW`, `CHARTREUX_AGENT__ORCHESTRATION_STRATEGY`) > `config.toml` > shipped default. An omitted flag is always distinguished from an explicit selection. The selections and their resource content freeze per conversation; saved changes apply to new conversations only, and `/reload` reports them as pending. See the [identity architecture](../reference/identity-architecture.md).
 
 An untrusted project configuration is not loaded. Project configuration selects catalog entries but cannot define providers or deployments; those belong in the user model catalog. See [Models](models.md).
 
@@ -27,6 +28,8 @@ By default, user-owned files are under `~/.chartreux`:
 
 - `config.toml` holds selections and other general settings.
 - `models.toml` is the optional overlay for the shipped model catalog.
+- `prompts/`, `workflows/`, and `orchestration_strategies/` hold custom identity prompts, workflow bodies, and strategy bodies.
+- `skills/` and `tools/` hold user skills and custom tools.
 - `.env` can hold provider API keys.
 - `logs/` holds local logs.
 
@@ -36,27 +39,53 @@ Set `CHARTREUX_HOME` before starting Chartreux to use another home directory:
 export CHARTREUX_HOME="/path/to/chartreux-home"
 ```
 
-This changes the locations of the files above as well as user prompts, agent profiles, and related user data.
+This changes the locations of the files above as well as user prompts, workflows, orchestration strategies, and related user data.
 
-Dispatch policy is owned only by the user catalog overlay in `models.toml`,
-not `config.toml` or trusted project configuration. Its `[dispatch]` table
-selects a shipped `mode` (`orchestrated` or `standalone`) and may sparsely
-replace named `slots`. Slot fields include `profile`, `role`, `purposes`, and
-`implements`; omitted fields inherit the selected preset, while list-valued
-fields replace the whole list. Invalid dispatch data falls back atomically to
-the standalone preset and emits a visible diagnostic; unrelated valid model
-catalog entries remain available. This fallback does not repair or overwrite
-the invalid file. Absent an explicit selection, fresh sessions use standalone:
-direct implementation with delegated verification and independent review, with
-all approval gates intact. Select orchestration explicitly with:
+## Agent selections and purpose routes
+
+Who performs the work is selected by the `[agent]` table, not by the model
+catalog. The three selections — identity, workflow, and orchestration
+strategy — are documented in the [identity
+architecture](../reference/identity-architecture.md); the accepted values and
+the Settings > Identity & Orchestration group live in the
+[configuration reference](../reference/configuration.md#agent-selections).
+The default conversation runs the `coder` identity under the `minimal`
+workflow with no orchestration strategy, and orchestration is a one-line
+upgrade:
 
 ```toml
-[dispatch]
-mode = "orchestrated"
+[agent]
+identity = "orchestrator"
 ```
 
-Legacy tier entries do not infer a mode. A saved change takes effect in the next session.
-See the [configuration reference](../reference/configuration.md#dispatch-overlay).
+Delegated routing lives in `[orchestration.routes.*]` in `config.toml` — the
+executable launch bindings for `task` purposes and seats. Sparse entries
+override the shipped route of the same purpose, and new keys introduce custom
+purposes. Every shipped target binds `$session` (the session model), so
+default routing behaves identically with one configured model or ten:
+
+```toml
+[orchestration.routes.research]
+targets = [{ model = "$session", identity = "researcher", tier = "substantive" }]
+
+[orchestration.routes."review.deep"]
+requires_distinct_models = 3
+
+[[orchestration.routes."review.deep".targets]]
+model = "$session"
+identity = "reviewer"
+tier = "substantive"
+seat = "analytical"
+```
+
+Routes deep-merge across sparse layers. The retired `[dispatch]` catalog
+overlay is superseded by this section: a legacy `[dispatch]` table in
+`models.toml` is reported loudly at load with successor guidance naming
+`[orchestration.routes.*]` — it is never merged — and catalog writes preserve
+its values (comments and formatting are not preserved), never rewriting it.
+See the [configuration reference](../reference/configuration.md#orchestration-routes)
+for the full field list, seats, and diversity semantics, and
+[Subagents](subagents.md) for the delegation guide.
 
 ## API keys and `.env`
 
@@ -75,17 +104,16 @@ and completes setup; **Customize role presets** opens the existing model/thinkin
 editor for optional changes or repairs. Invalid or unavailable bindings block
 completion with repair guidance.
 
-The presets screen defaults to **Standalone** (direct implementation) for fresh
-users and also offers **Orchestrated**, including orchestration with one canonical
-model. Explicit existing selections are preserved. After saving a second usable
-canonical model, a live compaction event is the primary reliable need signal
-for a passive graduation nudge at an idle boundary. The conservative v1 failure
-trigger counts only two deduplicated, budget-exceeded implementation-purpose
-attempts on the same task by the same retained agent; other failures and
-ambiguous slot identities do not count.
-It opens the presets screen, never changes mode automatically, and
-can be dismissed permanently; headless sessions do not show it. Saved mode
-changes apply next session, not to an already running conversation. Setup uses
+The presets screen edits role presets — one row per role with its model and
+thinking level, and a per-role editor for both fields. It offers no dispatch
+modes: routing is configured by purpose routes and the `[agent]` selections,
+not by the catalog. Explicit existing selections are preserved. After two
+deduplicated, budget-exceeded implementation attempts fail on the same task, a
+passive graduation nudge at an idle boundary suggests reviewing model presets
+or delegating differently. It opens the presets screen, never changes anything
+automatically, and can be dismissed permanently; headless sessions do not show
+it. Saving a second canonical model no longer triggers it — orchestration is
+never inferred from the roster size. Setup uses
 the configured theme (`auto` by default), without asking for a theme choice.
 Web search is not a required setup stage: saved choices remain unchanged, and
 Settings > Web search or `/web-search` remains available later.

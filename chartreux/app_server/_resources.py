@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import asdict
-from typing import Any, Literal
+from typing import Any
 
 from chartreux.app_server._config_introspect import (
     HIDDEN_SETTINGS,
@@ -85,6 +85,7 @@ from chartreux.app_server.protocol import (
     ToolsListParams,
     ToolsListResponse,
 )
+from chartreux.app_server.protocol.config import InventoryCategory
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agent_loop._loop import _PreparedReload
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
@@ -96,11 +97,12 @@ from chartreux.core.config.settings_catalog import (
     EDITABLE_BY_PATH,
     EDITABLE_SETTINGS,
     LINK_SETTINGS,
+    TASK_DENYLIST_SETTING,
     VISIBLE_SETTINGS,
 )
 from chartreux.core.log_reader import LogReader
 from chartreux.core.loop import LoopError, LoopManager
-from chartreux.core.prompts import SystemPrompt, custom_prompt_ids
+from chartreux.core.prompts import custom_prompt_ids
 from chartreux.core.proxy_setup import (
     SUPPORTED_PROXY_VARS,
     ProxySetupError,
@@ -114,13 +116,32 @@ from chartreux.core.utils.matching import name_matches
 
 
 def _inventory_item_states(
-    inventories: dict[Literal["tools", "skills", "agents"], list[str]],
-    setting_values: dict[str, Any],
-) -> dict[Literal["tools", "skills", "agents"], dict[str, InventoryItemStateWire]]:
-    states: dict[
-        Literal["tools", "skills", "agents"], dict[str, InventoryItemStateWire]
-    ] = {}
+    inventories: dict[InventoryCategory, list[str]], setting_values: dict[str, Any]
+) -> dict[InventoryCategory, dict[str, InventoryItemStateWire]]:
+    states: dict[InventoryCategory, dict[str, InventoryItemStateWire]] = {}
     for category, names in inventories.items():
+        if category == "identities":
+            # The identity roster keys on the task denylist (design §12): a
+            # listed identity is blocked, the default roster is all-on, and a
+            # denylist write can only block — never grant.
+            denylist_value = setting_values.get(TASK_DENYLIST_SETTING.path)
+            denylist = (
+                [entry for entry in denylist_value if isinstance(entry, str)]
+                if isinstance(denylist_value, list)
+                else []
+            )
+            states[category] = {
+                name: InventoryItemStateWire(
+                    effective=not name_matches(name, denylist),
+                    default_effective=True,
+                    pattern_driven=any(
+                        entry.lower() != name.lower() and name_matches(name, [entry])
+                        for entry in denylist
+                    ),
+                )
+                for name in names
+            }
+            continue
         enabled_value = setting_values.get(f"enabled_{category}")
         disabled_value = setting_values.get(f"disabled_{category}")
         enabled = (
@@ -157,16 +178,78 @@ def _inventory_item_states(
     return states
 
 
+def agent_selection_choices() -> dict[str, tuple[str, ...]]:
+    """Selectable ``[agent]`` choices, enumerated through the strict resolver.
+
+    The candidates come from the same resolver the conversation binding uses
+    (package 1/6 contract): shipped built-ins plus the user resource
+    directories, filtered to references the strict loader can actually
+    resolve. A broken user resource is therefore absent here — its actionable
+    error surfaces through doctor and through selection validation. The
+    enumeration lives behind the app-server boundary: the settings catalog
+    stays a leaf import (schema and models only).
+    """
+    from chartreux.core.config.harness_files import get_harness_files_manager
+    from chartreux.core.policy.composition import (
+        IDENTITY_IDS,
+        STRATEGY_IDS,
+        WORKFLOW_IDS,
+        policy_resource_loader,
+        user_resource_directories,
+    )
+    from chartreux.core.policy.models import ResourceKind
+    from chartreux.core.policy.resources import ResourceResolutionError
+
+    loader = policy_resource_loader(
+        user_resource_directories(get_harness_files_manager())
+    )
+    shipped = {
+        "agent.identity": sorted(IDENTITY_IDS),
+        "agent.workflow": sorted(WORKFLOW_IDS),
+        "agent.orchestration_strategy": ["none", *sorted(STRATEGY_IDS)],
+    }
+    kinds = {
+        "agent.identity": ResourceKind.IDENTITY,
+        "agent.workflow": ResourceKind.WORKFLOW,
+        "agent.orchestration_strategy": ResourceKind.STRATEGY,
+    }
+    choices: dict[str, tuple[str, ...]] = {}
+    for path, builtin in shipped.items():
+        kind = kinds[path]
+        candidates = [
+            *builtin,
+            *sorted({
+                entry.stem
+                for entry in loader.directories[kind].glob("*.md")
+                if entry.is_file()
+            }),
+        ]
+        resolvable = []
+        for name in candidates:
+            try:
+                loader.resolve(kind, name)
+            except ResourceResolutionError:
+                continue
+            resolvable.append(name)
+        choices[path] = tuple(dict.fromkeys(resolvable))
+    return choices
+
+
+def identity_roster() -> tuple[str, ...]:
+    """The launchable identity roster behind the identities inventory."""
+    return agent_selection_choices()["agent.identity"]
+
+
 def _settings_inventory_data(
     agent_loop: AgentLoop, fields: list[SettingLeafWire]
 ) -> tuple[
-    dict[Literal["tools", "skills", "agents"], list[str]],
-    dict[Literal["tools", "skills", "agents"], dict[str, InventoryItemStateWire]],
+    dict[InventoryCategory, list[str]],
+    dict[InventoryCategory, dict[str, InventoryItemStateWire]],
 ]:
-    inventories: dict[Literal["tools", "skills", "agents"], list[str]] = {
+    inventories: dict[InventoryCategory, list[str]] = {
         "tools": agent_loop.tool_manager.settings_inventory,
         "skills": agent_loop.skill_manager.settings_inventory,
-        "agents": agent_loop.agent_manager.settings_inventory,
+        "identities": list(identity_roster()),
     }
     return inventories, _inventory_item_states(
         inventories, {field.path: field.effective_value for field in fields}
@@ -174,12 +257,9 @@ def _settings_inventory_data(
 
 
 def _settings_catalog_wire() -> list[SettingDescriptorWire]:
-    custom_ids = custom_prompt_ids()
     choices = {
-        "system_prompt_id": tuple(
-            sorted({*(p.value for p in SystemPrompt), *custom_ids})
-        ),
-        "compaction_prompt_id": tuple(sorted({"compact", *custom_ids})),
+        **agent_selection_choices(),
+        "compaction_prompt_id": tuple(sorted({"compact", *custom_prompt_ids()})),
     }
     return [
         SettingDescriptorWire.model_validate(
@@ -189,6 +269,27 @@ def _settings_catalog_wire() -> list[SettingDescriptorWire]:
         )
         for descriptor in (*VISIBLE_SETTINGS, *DEFERRED_SETTINGS, *LINK_SETTINGS)
     ]
+
+
+def _effective_leaf(data: Any, parts: list[str], default: Any) -> Any:
+    """Read a nested leaf that a sparse source may omit (the task denylist)."""
+    value: Any = data
+    for part in parts:
+        if not isinstance(value, Mapping) or part not in value:
+            return default
+        value = value[part]
+    return value
+
+
+def _leaf_effective_value(effective: Mapping[str, Any], descriptor: Any) -> Any:
+    """A descriptor's effective leaf; the denylist tolerates a sparse source."""
+    parts = descriptor.path.split(".")
+    if descriptor is TASK_DENYLIST_SETTING:
+        return _effective_leaf(effective, parts, [])
+    value: Any = effective
+    for part in parts:
+        value = value[part]
+    return value
 
 
 class ResourceRequestHandler:
@@ -670,7 +771,7 @@ class ResourceRequestHandler:
                 fallback = True
         effective = config.model_dump(mode="json")
         fields: list[SettingLeafWire] = []
-        for descriptor in EDITABLE_SETTINGS:
+        for descriptor in (*EDITABLE_SETTINGS, TASK_DENYLIST_SETTING):
             parts = descriptor.path.split(".")
             leaf_values: list[tuple[str, Any]] = []
             for name, data in reversed(layers):
@@ -681,9 +782,7 @@ class ResourceRequestHandler:
                     value = value[part]
                 else:
                     leaf_values.append((name, value))
-            value = effective
-            for part in parts:
-                value = value[part]
+            value = _leaf_effective_value(effective, descriptor)
             saved = next(
                 (entry for entry in leaf_values if entry[0] == user_layer), None
             )
@@ -714,9 +813,14 @@ class ResourceRequestHandler:
             ),
             catalog=_settings_catalog_wire(),
             backing_settings={
-                path: SettingDescriptorWire.model_validate(asdict(descriptor))
-                for path, descriptor in EDITABLE_BY_PATH.items()
-                if path.startswith(("enabled_", "disabled_", "status_line."))
+                **{
+                    path: SettingDescriptorWire.model_validate(asdict(descriptor))
+                    for path, descriptor in EDITABLE_BY_PATH.items()
+                    if path.startswith(("enabled_", "disabled_", "status_line."))
+                },
+                TASK_DENYLIST_SETTING.path: SettingDescriptorWire.model_validate(
+                    asdict(TASK_DENYLIST_SETTING)
+                ),
             },
             inventories=inventory_data[0],
             inventory_states=inventory_data[1],

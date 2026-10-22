@@ -42,12 +42,12 @@ from tests.conftest import build_test_chartreux_app
 def _agent(agent_id: str, availability: str = "idle") -> AgentSummaryModel:
     return AgentSummaryModel(
         agent_id=agent_id,
-        profile="worker",
+        identity="coder",
         availability=availability,
         name=derive_agent_name(
             agent_id=agent_id,
-            profile="worker",
-            profile_display_label=None,
+            identity="coder",
+            identity_display_label=None,
             base_model=None,
             effective_model=None,
         ),
@@ -984,11 +984,11 @@ async def test_transcript_header_refreshes_in_place_on_retask() -> None:
         await pilot.pause()
         viewer = app.query_one(AgentTranscriptViewer)
         header = str(viewer.query_one("#agent-transcript-header").render())
-        assert header == "Subagent: worker-one (one) · worker"
+        assert header == "Subagent: coder-one (one) · coder"
         # The same handle re-tasks: the reused viewer refreshes its header.
         retasked = AgentSummaryModel(
             agent_id="one",
-            profile="reviewer",
+            identity="reviewer",
             availability="running",
             current_run_id="r2",
             name="reviewer-glm-5-3-1",
@@ -998,6 +998,68 @@ async def test_transcript_header_refreshes_in_place_on_retask() -> None:
         assert app.query_one(AgentTranscriptViewer) is viewer
         header = str(viewer.query_one("#agent-transcript-header").render())
         assert header == "Subagent: reviewer-glm-5-3-1 (one) · reviewer"
+
+
+@pytest.mark.asyncio
+async def test_transcript_header_presents_identity_keyed_record() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        app.app_server.resources.sessions.read_agent_transcript = AsyncMock(
+            return_value=AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+            )
+        )
+        researcher = AgentSummaryModel(
+            agent_id="one",
+            identity="researcher",
+            identity_revision="rev-1",
+            availability="idle",
+            name="researcher-one",
+        )
+        await app._handle_turn_event(AgentsUpdate([researcher]))
+        await pilot.press("ctrl+shift+a", "down", "enter")
+        await pilot.pause()
+        viewer = app.query_one(AgentTranscriptViewer)
+        header = str(viewer.query_one("#agent-transcript-header").render())
+        assert header == "Subagent: researcher-one (one) · researcher"
+        metadata = str(viewer.query_one(".agent-transcript-metadata").render())
+        assert "Identity: researcher" in metadata
+        assert "Identity revision: rev-1" in metadata
+        assert "Profile:" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_transcript_header_retask_without_identity_binding() -> None:
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        app.app_server.resources.sessions.read_agent_transcript = AsyncMock(
+            return_value=AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+            )
+        )
+        researcher = AgentSummaryModel(
+            agent_id="one",
+            identity="researcher",
+            availability="idle",
+            name="researcher-one",
+        )
+        await app._handle_turn_event(AgentsUpdate([researcher]))
+        await pilot.press("ctrl+shift+a", "down", "enter")
+        await pilot.pause()
+        viewer = app.query_one(AgentTranscriptViewer)
+        # The same handle re-tasks into a record with no identity binding:
+        # the header segment degrades to "unknown" (the retired legacy
+        # profile fallback no longer exists).
+        legacy = AgentSummaryModel(
+            agent_id="one",
+            availability="running",
+            current_run_id="r2",
+            name="worker-one",
+        )
+        await app._handle_turn_event(AgentsUpdate([legacy]))
+        await pilot.pause()
+        header = str(viewer.query_one("#agent-transcript-header").render())
+        assert header == "Subagent: worker-one (one) · unknown"
 
 
 @pytest.mark.asyncio
@@ -1011,7 +1073,7 @@ async def test_transcript_header_renders_markup_literally() -> None:
         )
         marked = AgentSummaryModel(
             agent_id="one",
-            profile="worker",
+            identity="coder",
             availability="idle",
             name="worker-[bold]one[/bold]",
         )
@@ -1022,7 +1084,7 @@ async def test_transcript_header_renders_markup_literally() -> None:
         header = viewer.query_one("#agent-transcript-header")
         assert isinstance(header, NoMarkupStatic)
         rendered = str(header.render())
-        assert rendered == "Subagent: worker-[bold]one[/bold] (one) · worker"
+        assert rendered == "Subagent: worker-[bold]one[/bold] (one) · coder"
 
 
 @pytest.mark.asyncio
@@ -1036,7 +1098,7 @@ async def test_transcript_metadata_renders_markup_literally() -> None:
         )
         marked = AgentSummaryModel(
             agent_id="one",
-            profile="worker",
+            identity="coder",
             availability="idle",
             name="worker-[bold]one[/bold]",
         )
@@ -1048,7 +1110,7 @@ async def test_transcript_metadata_renders_markup_literally() -> None:
         assert isinstance(metadata, NoMarkupStatic)
         rendered = str(metadata.render())
         # The derived name renders literally in the metadata area: markup
-        # in a custom profile's display name is never interpreted.
+        # in a custom identity's display name is never interpreted.
         assert "Name: worker-[bold]one[/bold]" in rendered
         # A set_metadata refresh (the AgentsUpdate handler for the same
         # handle) keeps rendering the derived name literally.
@@ -1085,7 +1147,7 @@ async def test_metadata_disappearance_returns_to_main_with_explanation() -> None
             if "no longer available" in message._content
         ]
         assert explanations == [
-            "Background agent worker-one is no longer available; "
+            "Background agent coder-one is no longer available; "
             "returned to the main conversation."
         ]
         # No ghost rows remain in the browser.

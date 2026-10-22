@@ -6,6 +6,7 @@ from typing import Any, ClassVar
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 from chartreux.core.tools.base import BaseTool, BaseToolConfig, BaseToolState
+from chartreux.core.tools.classification import ToolClass
 from chartreux.core.tools.ui import ToolUIData
 
 
@@ -38,6 +39,11 @@ class MCPTool(
 ):
     _server_name: ClassVar[str] = ""
     _remote_name: ClassVar[str] = ""
+
+    @classmethod
+    def get_authority_classification(cls) -> ToolClass:
+        """Remote tools are mutating regardless of remote metadata hints."""
+        return ToolClass.MUTATING
 
     @classmethod
     def get_server_name(cls) -> str | None:

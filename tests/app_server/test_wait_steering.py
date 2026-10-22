@@ -1030,7 +1030,8 @@ async def test_real_child_survives_parent_wait_steering_and_ledger_is_unchanged(
         assert all(r.purpose is UsagePurpose.CONVERSATION for r in records)
         assert all(r.root_session_id == parent.session_id for r in records)
         assert children[0].parent_session_id == parent.session_id
-        assert children[0].agent_profile == "worker"
+        # The kept usage-attribution field carries the child's launch identity.
+        assert children[0].agent_profile == "coder"
         assert len({r.record_id for r in records}) == 3
     finally:
         child_backend.release.set()

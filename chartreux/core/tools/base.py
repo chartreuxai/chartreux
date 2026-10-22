@@ -30,6 +30,11 @@ from chartreux.core.config.harness_files import (
 )
 from chartreux.core.events import ToolStreamEvent, UserInputOrigin
 from chartreux.core.llm_models import ImageAttachment
+from chartreux.core.tools.classification import (
+    ToolClass,
+    classify_tool,
+    registry_builtin_name,
+)
 from chartreux.core.tools.models import (
     ToolPermission,
     ToolPermissionError as ToolPermissionError,
@@ -154,6 +159,29 @@ class BaseToolState(BaseModel):
     )
 
 
+def registry_provenance_classification(tool_class: type[BaseTool]) -> ToolClass:
+    """Authority classification computed from registry provenance — never virtual.
+
+    ``BaseTool.get_authority_classification`` is an overridable classmethod, so
+    authority decisions must not dispatch through it: a custom class can
+    self-declare NON_MUTATING and ride a read-only posture (S2 classification
+    self-declaration blocker). Only the registry's provenance stamp on the
+    exact class confers a reviewed table entry; anything un-stamped (a custom
+    replacement, an MCP proxy, a subclass) fails closed as MUTATING.
+
+    The stamp is consulted in the harness-side side table
+    (``classification.registry_builtin_name``), NEVER in the class namespace:
+    a custom class declaring ``_registry_builtin_name`` in its own body is
+    indistinguishable from a registry-conferred stamp under a ``__dict__``
+    lookup, so a forged declaration would confer the reviewed builtin
+    classification (S2 round 2: forgeable provenance stamp).
+    """
+    stamped = registry_builtin_name(tool_class)
+    if stamped is None:
+        return ToolClass.MUTATING
+    return classify_tool(stamped, builtin=True)
+
+
 class BaseTool[
     ToolArgs: BaseModel,
     ToolResult: BaseModel,
@@ -167,6 +195,14 @@ class BaseTool[
     # Higher wins when several tool classes publish the same name; the active
     # variant is the available one with the greatest priority.
     selection_priority: ClassVar[int] = 0
+
+    # Registry provenance is deliberately NOT a class attribute: the
+    # registry-conferred builtin stamp lives in the harness-side side table
+    # (``chartreux.core.tools.classification.registry_builtin_name``), so a
+    # custom class declaring ``_registry_builtin_name`` in its own body never
+    # confers the reviewed classification (S2 round 2: forgeable provenance
+    # stamp). Custom implementations and MCP proxies are never stamped, and
+    # the stamp is keyed by the exact class, so a subclass never inherits it.
 
     def __init__(
         self,
@@ -549,6 +585,22 @@ class BaseTool[
                         prop_details.pop("title", None)
 
         return schema
+
+    @classmethod
+    def get_authority_classification(cls) -> ToolClass:
+        """Reviewed table class for registered builtins; others fail closed.
+
+        Only the registry's provenance stamp on this exact class confers a
+        builtin entry: a custom implementation reusing a builtin name, or
+        subclassing one, stays MUTATING. The table is read live, so a
+        reviewed reclassification applies immediately.
+
+        This classmethod is a *reporting* interface, not an authority input:
+        it is overridable, so authority decisions compute the classification
+        manager-side via :func:`registry_provenance_classification` instead of
+        dispatching through it.
+        """
+        return registry_provenance_classification(cls)
 
     @classmethod
     def get_name(cls) -> str:

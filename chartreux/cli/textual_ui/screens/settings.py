@@ -79,6 +79,7 @@ class _GroupPosition:
 
 GROUPS = (
     "Interface",
+    "Identity & Orchestration",
     "Prompts & Compaction",
     "Project Context",
     "Subagents",
@@ -1081,12 +1082,21 @@ class SettingsScreen(ModalScreen[str | None]):
                     detail = "\nThis state comes from a pattern entry below. Remove that entry with Ctrl+D to toggle this item."
             help_widget = self.query_one("#settings-help", NoMarkupStatic)
             help_widget.set_class(self._inventory_draft is not None, "inventory-help")
+            roster = item.inventory == "identities"
             help_widget.update(
                 self._help_with_feedback(
-                    "Ctrl+R resets both lists.\n"
-                    + item.description
-                    + "\nEmptying the allow-only list returns to default mode (except disabled entries)."
-                    + "\nPattern-controlled items cannot toggle; Ctrl+D removes the pattern entry."
+                    (
+                        "Ctrl+R resets the denylist.\n"
+                        + item.description
+                        + "\nEmptying the denylist makes every identity launchable."
+                        if roster
+                        else "Ctrl+R resets both lists.\n"
+                        + item.description
+                        + "\nEmptying the allow-only list returns to default mode "
+                        "(except disabled entries)."
+                    )
+                    + "\nPattern-controlled items cannot toggle; Ctrl+D removes the "
+                    "pattern entry."
                     + "\nChanges here are a draft; Apply changes saves to user settings."
                     + detail
                 )
@@ -1417,12 +1427,12 @@ class SettingsScreen(ModalScreen[str | None]):
         return self._collections.inventory_item_state(name)
 
     def _pattern_driven(
-        self, category: Literal["tools", "skills", "agents"], name: str
+        self, category: Literal["tools", "skills", "identities"], name: str
     ) -> bool:
         return self._collections.pattern_driven(category, name)
 
     def _effective_inventory_item(
-        self, category: Literal["tools", "skills", "agents"], name: str
+        self, category: Literal["tools", "skills", "identities"], name: str
     ) -> bool:
         return self._collections.effective_inventory_item(category, name)
 
@@ -1527,11 +1537,14 @@ class SettingsScreen(ModalScreen[str | None]):
                 dirty = self._draft_is_dirty(item)
                 if dirty:
                     self._pending_navigation = None
+                    roster = item.inventory == "identities"
                     self._open_confirmation(
                         "discard",
                         item,
                         None,
-                        f"Discard edits to enabled and disabled {item.inventory} lists? Unsaved inventory changes will be lost. Cancel preserves both saved lists and the current draft.",
+                        "Discard edits to the task identity denylist? Unsaved roster changes will be lost. Cancel preserves the saved denylist and the current draft."
+                        if roster
+                        else f"Discard edits to enabled and disabled {item.inventory} lists? Unsaved inventory changes will be lost. Cancel preserves both saved lists and the current draft.",
                         "Discard edits",
                     )
                     return

@@ -41,7 +41,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from chartreux.agents import AgentSafety, AgentType
 from chartreux.app_server._file_revision_registry import FileRevisionRegistry
 from chartreux.app_server._sessions import (
     AgentRecord,
@@ -51,7 +50,6 @@ from chartreux.app_server._sessions import (
     _AgentTombstone,
 )
 from chartreux.core.agent_loop import AgentLoop
-from chartreux.core.agents.models import AgentProfile
 from chartreux.core.file_revision import FileRevision, full_revision
 from chartreux.core.llm_models import FunctionCall, LLMMessage, Role, ToolCall
 from chartreux.core.subagents import (
@@ -120,7 +118,7 @@ async def test_retained_agent_stays_resident_after_completion(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="work", agent_type="worker", background=True, retain=True),
+            TaskArgs(task="work", identity="coder", background=True, retain=True),
             InvokeContext(tool_call_id="launch", session_id=parent.session_id),
         )
         assert launch.agent_id is not None
@@ -151,7 +149,7 @@ async def test_both_zero_retained_snapshot_keeps_agent_resident_unlimited(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="work", agent_type="worker", background=True),
+            TaskArgs(task="work", identity="coder", background=True),
             InvokeContext(tool_call_id="launch", session_id=parent.session_id),
         )
         assert launch.agent_id is not None
@@ -169,29 +167,16 @@ async def test_both_zero_retained_snapshot_keeps_agent_resident_unlimited(
 
 
 # ---------------------------------------------------------------------------
-# 3. Retention precedence: explicit task arg -> profile -> snapshot default
+# 3. Retention precedence: per-launch retain if set, else global retain_agents
 # ---------------------------------------------------------------------------
 
 
-def _persistent_profile(*, retain: bool | None) -> AgentProfile:
-    return AgentProfile(
-        name="persistent",
-        display_name="Persistent",
-        description="precedence profile",
-        safety=AgentSafety.NEUTRAL,
-        agent_type=AgentType.SUBAGENT,
-        retain=retain,
-    )
-
-
 async def _launch_retained(
-    monkeypatch: pytest.MonkeyPatch, args: TaskArgs, profile: AgentProfile | None
+    monkeypatch: pytest.MonkeyPatch, args: TaskArgs
 ) -> tuple[SessionRuntimeRegistry, Any, AgentRecord]:
     registry, parent, _ = await _zero_retention_registry(
         monkeypatch, FakeBackend([mock_llm_chunk(content="done")]), zero_limits=False
     )
-    if profile is not None:
-        parent.agent_manager._discovered[profile.name] = profile
     launch = await _background_result(
         registry,
         args,
@@ -203,14 +188,13 @@ async def _launch_retained(
 
 
 @pytest.mark.asyncio
-async def test_explicit_task_arg_beats_profile_and_snapshot(
+async def test_explicit_task_arg_beats_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Profile opts in, but an explicit retain=False wins.
+    # The snapshot opts out; an explicit retain=False confirms the default.
     registry, parent, record = await _launch_retained(
         monkeypatch,
-        TaskArgs(task="work", agent_type="persistent", background=True, retain=False),
-        _persistent_profile(retain=True),
+        TaskArgs(task="work", identity="persistent", background=True, retain=False),
     )
     try:
         assert record.retained is False
@@ -226,8 +210,7 @@ async def test_explicit_retain_true_beats_unretained_snapshot(
     # Snapshot defaults to unretained; an explicit retain=True wins.
     registry, parent, record = await _launch_retained(
         monkeypatch,
-        TaskArgs(task="work", agent_type="worker", background=True, retain=True),
-        None,
+        TaskArgs(task="work", identity="coder", background=True, retain=True),
     )
     try:
         assert record.retained is True
@@ -237,17 +220,27 @@ async def test_explicit_retain_true_beats_unretained_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_profile_retain_beats_unretained_snapshot(
+async def test_launch_retain_beats_unretained_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # No explicit arg: profile retain=True beats snapshot retain_agents=False.
+    # An explicit retain arg decides, else the snapshot's retain_agents
+    # default. Explicit retain=True retains despite the unretained snapshot.
     registry, parent, record = await _launch_retained(
         monkeypatch,
-        TaskArgs(task="work", agent_type="persistent", background=True),
-        _persistent_profile(retain=True),
+        TaskArgs(task="work", identity="persistent", background=True, retain=True),
     )
     try:
         assert record.retained is True
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+    # Absent retain arg: the global snapshot default (retain_agents=False)
+    # applies.
+    registry, parent, record = await _launch_retained(
+        monkeypatch, TaskArgs(task="work", identity="persistent", background=True)
+    )
+    try:
+        assert record.retained is False
     finally:
         await registry.drain_children()
         await parent.aclose()
@@ -257,11 +250,9 @@ async def test_profile_retain_beats_unretained_snapshot(
 async def test_snapshot_retain_agents_is_the_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # No explicit arg, profile retain=None: the snapshot default decides.
+    # No explicit arg: the snapshot default decides.
     registry, parent, record = await _launch_retained(
-        monkeypatch,
-        TaskArgs(task="work", agent_type="worker", background=True),
-        _persistent_profile(retain=None),
+        monkeypatch, TaskArgs(task="work", identity="coder", background=True)
     )
     try:
         # Production default snapshot has retain_agents=False.
@@ -294,7 +285,7 @@ async def test_reuse_inherits_committed_retention_policy(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="first", agent_type="worker", background=True, retain=True),
+            TaskArgs(task="first", identity="coder", background=True, retain=True),
             InvokeContext(tool_call_id="first", session_id=parent.session_id),
         )
         assert launch.agent_id is not None
@@ -306,7 +297,7 @@ async def test_reuse_inherits_committed_retention_policy(
             registry,
             TaskArgs(
                 task="second",
-                agent_type="worker",
+                identity="coder",
                 agent_id=launch.agent_id,
                 background=True,
             ),
@@ -341,7 +332,7 @@ async def test_explicit_retain_false_reuse_is_final_continuation(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="first", agent_type="worker", background=True, retain=True),
+            TaskArgs(task="first", identity="coder", background=True, retain=True),
             InvokeContext(tool_call_id="first", session_id=parent.session_id),
         )
         assert launch.agent_id is not None
@@ -353,7 +344,7 @@ async def test_explicit_retain_false_reuse_is_final_continuation(
             registry,
             TaskArgs(
                 task="final",
-                agent_type="worker",
+                identity="coder",
                 agent_id=launch.agent_id,
                 background=True,
                 retain=False,
@@ -390,7 +381,7 @@ async def test_failed_admission_restores_prior_retention_policy(
     try:
         launch = await _background_result(
             registry,
-            TaskArgs(task="first", agent_type="worker", background=True, retain=True),
+            TaskArgs(task="first", identity="coder", background=True, retain=True),
             InvokeContext(tool_call_id="first", session_id=parent.session_id),
         )
         assert launch.agent_id is not None
@@ -409,7 +400,7 @@ async def test_failed_admission_restores_prior_retention_policy(
                 registry,
                 TaskArgs(
                     task="final",
-                    agent_type="worker",
+                    identity="coder",
                     agent_id=launch.agent_id,
                     background=True,
                     retain=False,
@@ -438,7 +429,7 @@ async def _busy_record(
     registry, parent, _ = await _zero_retention_registry(monkeypatch, backend)
     launch = await _background_result(
         registry,
-        TaskArgs(task="work", agent_type="worker", background=True, retain=retain),
+        TaskArgs(task="work", identity="coder", background=True, retain=retain),
         InvokeContext(tool_call_id="launch", session_id=parent.session_id),
     )
     assert launch.agent_id is not None
@@ -461,7 +452,7 @@ async def test_busy_replacement_rejects_conflicting_retain_override(
                 registry,
                 TaskArgs(
                     task="new",
-                    agent_type="worker",
+                    identity="coder",
                     agent_id=launch.agent_id,
                     background=True,
                     replace_run=True,
@@ -493,7 +484,7 @@ async def test_busy_replacement_rejects_retain_true_on_unretained(
                 registry,
                 TaskArgs(
                     task="new",
-                    agent_type="worker",
+                    identity="coder",
                     agent_id=launch.agent_id,
                     background=True,
                     replace_run=True,
@@ -1653,7 +1644,7 @@ async def test_external_bump_from_sibling_reported_in_next_block(
     try:
         # Worker B is created (and seeded with the parent's pre-edit
         # baseline) before worker A runs, so its baseline is deterministic.
-        child_b = await registry._runtime_factory.create_child(parent, "worker")
+        child_b = await registry._runtime_factory.create_child(parent, "coder")
         assert _matches_revision(
             child_b.file_state.known_revision(str(target)), original
         )

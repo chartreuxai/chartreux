@@ -102,9 +102,12 @@ class TurnCompletedParams(EventNotificationParams):
 
 class AgentSummaryModel(ProtocolModel):
     agent_id: str
-    profile: str
+    identity: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    identity_revision: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     name: str
-    slot_purposes: list[str] = Field(default_factory=list)
+    launch_purposes: list[str] = Field(default_factory=list)
     availability: str
     current_run_id: str | None = None
     current_run_status: str | None = None

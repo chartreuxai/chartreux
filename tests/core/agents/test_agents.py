@@ -1,176 +1,175 @@
+"""The identity-surface agent manager and its retired legacy adapters (16a/16b).
+
+The profile registry and the AgentProfile surface are retired with the
+profile axis (package 16a): agents/*.toml discovery, profile lookup, and
+the enabled/disabled agent filters are gone, and custom identities resolve
+from the user prompts directory through the package-1 strict loader. What
+remains is the loop's identity-surface manager — configuration and launch
+facts, and loud detection of retired on-disk inputs (never consumed, never
+deleted or converted). Package 16b retired the dispatch axis outright: the
+shipped profile-name mapping, its identity-keyed inverse, and the dispatch
+activation validation are gone, and a legacy ``[dispatch]`` table in
+``models.toml`` is reported loudly with successor guidance, never merged.
+Review finding 3 removed the last adapter too: the legacy profile-spelling
+bridge is gone from the manager, and a legacy ``worker`` reference fails
+loudly with identity successor guidance — never a profile path.
+"""
+
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
+from pydantic import ValidationError
 import pytest
 
-from chartreux.core.agents.manager import AgentManager
-from chartreux.core.agents.models import (
-    ADVISOR,
-    BUILTIN_SUBAGENTS,
-    REVIEWER,
-    WORKER,
-    AgentProfile,
-    AgentSafety,
-    AgentType,
+from chartreux.core.agents.identity_launch import InvalidChildIdentityError
+from chartreux.core.agents.manager import (
+    AgentManager,
+    identity_denylist_keys,
+    requested_identity_reference,
+    resolve_identity_candidate,
 )
-from chartreux.core.agents.registry import AgentRegistry
 from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.config.harness_files import HarnessFilesManager
-from chartreux.core.dispatch.presets import STANDALONE_PRESET
-from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
-from chartreux.core.model_catalog.loader import CatalogSnapshot, load_catalog
+from chartreux.core.model_catalog.loader import load_catalog
+from chartreux.core.subagents import TaskArgs
+from chartreux.core.trusted_folders import trusted_folders_manager
 from tests.conftest import ConfigBuilder, OrchestratorLoader
 
 
-class TestAgentProfile:
-    @pytest.mark.parametrize("name", ["agent-0", "agent-1", "agent-123"])
-    def test_instance_handle_names_are_reserved(
-        self, tmp_path: Path, name: str
-    ) -> None:
-        path = tmp_path / f"{name}.toml"
-        path.write_text('agent_type = "subagent"\n', encoding="utf-8")
-        with pytest.raises(ValueError, match="reserved for agent instance handles"):
-            AgentProfile.from_toml(path)
+class TestLegacyProfileIdentityRetired:
+    """The legacy profile-spelling bridge is gone (review finding 3).
 
-    @pytest.mark.parametrize("name", ["agent-helper", "agent-1-extra"])
-    def test_non_handle_profile_names_keep_internal_enum(
-        self, tmp_path: Path, name: str
-    ) -> None:
-        path = tmp_path / f"{name}.toml"
-        path.write_text('agent_type = "subagent"\n', encoding="utf-8")
-        profile = AgentProfile.from_toml(path)
-        assert profile.name == name
-        assert profile.agent_type is AgentType.SUBAGENT
+    Package 11b bridged a legacy profile spelling onto its identity at the
+    task boundary; the alias is retired with the profile axis, so the
+    manager carries no bridge and a legacy ``worker`` reference fails
+    loudly with identity successor guidance — never a profile path.
+    """
 
-    @pytest.mark.parametrize(
-        (
-            "profile",
-            "role",
-            "prompt_id",
-            "enabled_tools",
-            "idle_ttl_seconds",
-            "retain",
-            "thinking",
-        ),
-        [
-            (WORKER, "worker", "worker", None, None, None, None),
-            (
-                ADVISOR,
-                "heavy",
-                "advisor",
-                ["read_file", "grep", "web_search", "web_fetch", "skill"],
-                3600,
-                True,
-                None,
-            ),
-            (REVIEWER, "worker", "reviewer", None, None, None, None),
-        ],
-    )
-    def test_builtin_profiles_have_role_prompt_and_tools(
+    def test_bridge_is_gone_from_the_manager(self) -> None:
+        from chartreux.core.agents import manager
+
+        assert not hasattr(manager, "legacy_profile_identity")
+
+    def test_task_boundary_rejects_the_legacy_field_with_successor_guidance(
         self,
-        profile: AgentProfile,
-        role: str,
-        prompt_id: str,
-        enabled_tools: list[str] | None,
-        idle_ttl_seconds: int | None,
-        retain: bool | None,
-        thinking: dict[str, str] | None,
     ) -> None:
-        assert profile.agent_type == AgentType.SUBAGENT
-        assert profile.safety == AgentSafety.NEUTRAL
-        assert profile.role == role
-        assert profile.idle_ttl_seconds == idle_ttl_seconds
-        assert profile.retain is retain
-        assert profile.overrides["system_prompt_id"] == prompt_id
-        assert profile.overrides.get("enabled_tools") == enabled_tools
-        assert profile.overrides.get("thinking_overrides") == thinking
+        with pytest.raises(ValidationError) as raised:
+            TaskArgs.model_validate({"task": "work", "agent_type": "worker"})
+        message = str(raised.value)
+        assert "agent_type is retired" in message
+        assert "worker -> coder" in message
+        assert "identity field" in message
 
-    def test_profile_idle_ttl_is_metadata_not_an_override(self, tmp_path: Path) -> None:
-        profile_path = tmp_path / "persistent.toml"
-        profile_path.write_text("idle_ttl_seconds = 0\n", encoding="utf-8")
-
-        profile = AgentProfile.from_toml(profile_path)
-
-        assert profile.idle_ttl_seconds == 0
-        assert profile.overrides == {}
-
-    @pytest.mark.parametrize(
-        ("toml_body", "expected_display_name", "expected_explicit"),
-        [
-            ('display_name = "Scout Team"\n', "Scout Team", True),
-            ('description = "no display name"\n', "My Scout", False),
-        ],
-        ids=["explicit-display-name", "synthesized-display-name"],
-    )
-    def test_profile_display_name_explicitness_tracks_the_toml(
+    def test_legacy_worker_identity_fails_loudly_in_the_canonical_grammar(
         self,
-        tmp_path: Path,
-        toml_body: str,
-        expected_display_name: str,
-        expected_explicit: bool,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
     ) -> None:
-        # The picker-facing display_name keeps the title-case synthesis, but
-        # the §5 naming fallback keys off explicitness: a synthesized label
-        # must not become the agent-name profile segment (the admission
-        # capture stores the label only when it was explicit).
-        profile_path = tmp_path / "my-scout.toml"
-        profile_path.write_text(toml_body, encoding="utf-8")
+        # A legacy "worker" spelling is not an identity: the canonical
+        # resolution rejects it with the successor identity guidance (no
+        # bridge maps the spelling onto "coder").
+        orchestrator = load_orchestrator(build_config())
+        with pytest.raises(
+            InvalidChildIdentityError, match="Unknown identity 'worker'"
+        ):
+            resolve_identity_candidate(
+                TaskArgs(task="work", identity="worker"),
+                parent_orchestrator=orchestrator,
+                tool_inventory={},
+                authorized_tool_names=frozenset(),
+            )
 
-        profile = AgentProfile.from_toml(profile_path)
 
-        assert profile.display_name == expected_display_name
-        assert profile.display_name_explicit is expected_explicit
+class TestRetiredDispatchAdapters:
+    """The dispatch adapters retired with the 16b dispatch axis."""
 
-    def test_profile_role_is_metadata_not_an_override(self, tmp_path: Path) -> None:
-        profile_path = tmp_path / "worker.toml"
-        profile_path.write_text('role = "custom-worker"\n', encoding="utf-8")
+    def test_dispatch_adapters_are_gone_from_the_manager(self) -> None:
+        from chartreux.core.agents import manager
 
-        profile = AgentProfile.from_toml(profile_path)
+        for retired in (
+            "SHIPPED_LEGACY_PROFILE_NAMES",
+            "legacy_dispatch_profiles",
+            "slot_profile_for_identity",
+            "validate_dispatch_activation",
+            "IDENTITY_SLOT_PROFILES",
+        ):
+            assert not hasattr(manager, retired), retired
 
-        assert profile.role == "custom-worker"
-        assert profile.overrides == {}
 
-    def test_profile_role_with_at_sign_is_rejected(self, tmp_path: Path) -> None:
-        profile_path = tmp_path / "worker.toml"
-        profile_path.write_text('role = "worker@fast"\n', encoding="utf-8")
+class TestIdentityDenylistKeys:
+    """The denylist keys are symmetric across spellings (review finding 1).
 
-        with pytest.raises(ValueError, match="without '@'"):
-            AgentProfile.from_toml(profile_path)
-
-    def test_profile_active_model_is_rejected_with_role_guidance(
-        self, tmp_path: Path
-    ) -> None:
-        profile_path = tmp_path / "worker.toml"
-        profile_path.write_text('active_model = "small"\n', encoding="utf-8")
-
-        with pytest.raises(ValueError, match="use role instead"):
-            AgentProfile.from_toml(profile_path)
-
-    def test_builtin_subagents_contains_role_profiles(self) -> None:
-        assert BUILTIN_SUBAGENTS == {
-            "worker": WORKER,
-            "advisor": ADVISOR,
-            "reviewer": REVIEWER,
-        }
+    A denylist pattern written in any equivalent spelling blocks the
+    identity in every spelling: a ``user:``-qualified custom identity also
+    matches its bare name, a ``builtin:``-qualified identity also matches
+    its bare name, a bare built-in also matches its ``builtin:``-qualified
+    form, and a bare custom id also matches its ``user:``-qualified form.
+    """
 
     @pytest.mark.parametrize(
-        ("profile", "base_model", "thinking"),
+        ("identity", "keys"),
         [
-            (WORKER, "glm-5-3", "medium"),
-            (ADVISOR, "mistral-large-4", "high"),
-            (REVIEWER, "glm-5-3", "medium"),
+            ("user:foo", ("user:foo", "foo")),
+            ("builtin:coder", ("builtin:coder", "coder")),
+            ("coder", ("coder", "builtin:coder")),
+            ("researcher", ("researcher", "builtin:researcher")),
+            ("advisor", ("advisor", "builtin:advisor")),
+            ("reviewer", ("reviewer", "builtin:reviewer")),
+            ("orchestrator", ("orchestrator", "builtin:orchestrator")),
+            ("foo", ("foo", "user:foo")),
         ],
     )
-    def test_builtin_profile_default_roles_resolve_against_the_shipped_catalog(
-        self, profile: AgentProfile, base_model: str, thinking: str
+    def test_equivalent_spellings_match_each_other(
+        self, identity: str, keys: tuple[str, ...]
     ) -> None:
-        from chartreux.core.model_catalog.resolver import ModelResolver
+        assert identity_denylist_keys(identity) == keys
 
-        resolver = ModelResolver(CatalogSnapshot(SHIPPED_CATALOG, "builtin-roles"))
-        resolved = resolver.resolve(f"@{profile.role}")
-        assert (resolved.base_model, resolved.thinking) == (base_model, thinking)
+    @pytest.mark.parametrize(
+        ("denied_pattern", "identity"),
+        [
+            ("coder", "builtin:coder"),
+            ("builtin:coder", "coder"),
+            ("user:foo", "foo"),
+            ("foo", "user:foo"),
+        ],
+        ids=[
+            "bare-builtin-pattern-blocks-builtin-qualified",
+            "builtin-qualified-pattern-blocks-bare-builtin",
+            "user-qualified-pattern-blocks-bare-custom",
+            "bare-custom-pattern-blocks-user-qualified",
+        ],
+    )
+    def test_denying_any_spelling_blocks_every_spelling(
+        self, denied_pattern: str, identity: str
+    ) -> None:
+        # The admission site compares every returned key against each
+        # denylist pattern, so a denied spelling is among the identity's
+        # equivalent spellings (the four directions of finding 1).
+        assert denied_pattern in identity_denylist_keys(identity)
+
+
+class TestRequestedIdentityReference:
+    def test_structured_identity_wins(self) -> None:
+        args = TaskArgs(task="do work", identity="researcher")
+        assert requested_identity_reference(args) == "researcher"
+
+    def test_model_shorthand_identity_component_names_the_target(self) -> None:
+        args = TaskArgs(task="do work", model="@fast:researcher")
+        assert requested_identity_reference(args) == "researcher"
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"task": "do work"},
+            {"task": "do work", "agent_id": "agent-7", "background": True},
+            {"task": "do work", "model": "@fast"},
+        ],
+        ids=["no-target", "retained-continuation", "model-without-identity"],
+    )
+    def test_calls_without_a_launch_target_name_none(self, kwargs: dict) -> None:
+        assert requested_identity_reference(TaskArgs(**kwargs)) is None
 
 
 class TestAgentManager:
@@ -182,220 +181,176 @@ class TestAgentManager:
     ) -> AgentManager:
         return AgentManager(load_orchestrator(build_config()))
 
-    def test_registry_loads_and_rediscovers_without_migrating_profile_files(
+    def test_manager_exposes_the_orchestrator_config(
         self,
-        tmp_path: Path,
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
     ) -> None:
-        agents_dir = tmp_path / "agents"
-        agents_dir.mkdir()
-        old_profile = agents_dir / "old-profile.toml"
-        original = b'display_name = "Old Profile"\n'
-        old_profile.write_bytes(original)
-        registry = AgentRegistry(
-            load_orchestrator(build_config(agent_paths=[agents_dir])),
-            HarnessFilesManager(sources=()),
-        )
-        rediscovered = agents_dir / "rediscovered.toml"
-        rediscovered.write_text(
-            'display_name = "Rediscovered"\ndescription = "A test profile"\n',
-            encoding="utf-8",
-        )
-        registry.rediscover(HarnessFilesManager(sources=()))
-        assert "rediscovered" in registry.discovered
-        assert old_profile.read_bytes() == original
-
-    def test_builtin_explore_is_absent_but_custom_explore_is_discoverable(
-        self,
-        tmp_path: Path,
-        build_config: ConfigBuilder,
-        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
-    ) -> None:
-        agents_dir = tmp_path / "agents"
-        agents_dir.mkdir()
-        (agents_dir / "explore.toml").write_text(
-            'agent_type = "subagent"\ndescription = "Custom explore profile"\n',
-            encoding="utf-8",
-        )
-        manager = AgentManager(
-            load_orchestrator(build_config(agent_paths=[agents_dir]))
-        )
-
-        assert "explore" not in BUILTIN_SUBAGENTS
-        assert manager.get_agent("explore").description == "Custom explore profile"
-
-    def test_get_subagents_includes_role_profiles(self, manager: AgentManager) -> None:
-        assert {agent.name for agent in manager.get_subagents()} >= {
-            "worker",
-            "advisor",
-            "reviewer",
-        }
-
-    @pytest.mark.parametrize("idle_ttl_seconds", ["-1", '"invalid"', "true"])
-    def test_invalid_profile_idle_ttl_is_rejected_at_discovery(
-        self,
-        tmp_path: Path,
-        build_config: ConfigBuilder,
-        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
-        idle_ttl_seconds: str,
-    ) -> None:
-        agents_dir = tmp_path / "agents"
-        agents_dir.mkdir()
-        (agents_dir / "invalid.toml").write_text(
-            f"idle_ttl_seconds = {idle_ttl_seconds}\n", encoding="utf-8"
-        )
-
-        manager = AgentManager(
-            load_orchestrator(build_config(agent_paths=[agents_dir]))
-        )
-
-        with pytest.raises(ValueError, match="not found"):
-            manager.get_agent("invalid")
-
-    @pytest.mark.parametrize("name", ["worker", "advisor", "reviewer"])
-    def test_user_profile_cannot_shadow_builtin_at_activation(
-        self,
-        name: str,
-        tmp_path: Path,
-        build_config: ConfigBuilder,
-        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
-    ) -> None:
-        agents_dir = tmp_path / "agents"
-        agents_dir.mkdir()
-        (agents_dir / f"{name}.toml").write_text(
-            'description = "Custom role profile"\n', encoding="utf-8"
-        )
-        orchestrator = load_orchestrator(build_config(agent_paths=[agents_dir]))
+        orchestrator = load_orchestrator(build_config())
         manager = AgentManager(orchestrator)
-        assert manager.get_agent(name) is BUILTIN_SUBAGENTS[name]
-        assert any("S2" in note for note in orchestrator.config.validation_warnings)
-        snapshot = orchestrator.config.catalog_snapshot
-        assert snapshot.dispatch is STANDALONE_PRESET
+        assert manager.config is orchestrator.config
+
+    def test_profile_lookup_surface_is_retired(self, manager: AgentManager) -> None:
+        # The profile registry is gone: no profile lookup or launch roster.
+        assert not hasattr(manager, "get_agent")
+        assert not hasattr(manager, "get_subagents")
+
+    def test_retired_agent_dirs_are_reported_loudly_and_untouched(
+        self,
+        config_dir: Path,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        agents_dir = config_dir / "agents"
+        agents_dir.mkdir()
+        profile_file = agents_dir / "old-profile.toml"
+        original = b'display_name = "Old Profile"\n'
+        profile_file.write_bytes(original)
+        warning = Mock()
+        monkeypatch.setattr("chartreux.core.agents.manager.logger.warning", warning)
+
+        orchestrator = load_orchestrator(build_config())
+        manager = AgentManager(orchestrator, HarnessFilesManager(sources=("user",)))
+
+        assert manager.config is orchestrator.config
+        # The logger is mocked before %-formatting, so rebuild each message.
+        messages = [
+            call.args[0] % call.args[1:] if call.args else ""
+            for call in warning.call_args_list
+        ]
         assert any(
-            "S2" in item and name in item for item in snapshot.dispatch_diagnostics
+            "Agent profiles are retired and no longer load" in message
+            and str(agents_dir) in message
+            and "task tool's identity field" in message
+            for message in messages
+        )
+        # The profile file is detected, never deleted or converted.
+        assert profile_file.read_bytes() == original
+
+    def test_retired_project_prompt_dirs_are_reported_loudly_and_untouched(
+        self,
+        tmp_working_directory: Path,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        prompts_dir = tmp_working_directory / ".chartreux" / "prompts"
+        prompts_dir.mkdir(parents=True)
+        prompt_file = prompts_dir / "custom.md"
+        original = b"# custom prompt\n"
+        prompt_file.write_bytes(original)
+        trusted_folders_manager.trust_for_session(tmp_working_directory)
+        warning = Mock()
+        monkeypatch.setattr("chartreux.core.agents.manager.logger.warning", warning)
+
+        orchestrator = load_orchestrator(build_config())
+        manager = AgentManager(
+            orchestrator, HarnessFilesManager(sources=("user", "project"))
         )
 
-    def test_dispatch_activation_warning_is_projected_and_recomputed(
+        assert manager.config is orchestrator.config
+        # The logger is mocked before %-formatting, so rebuild each message.
+        messages = [
+            call.args[0] % call.args[1:] if call.args else ""
+            for call in warning.call_args_list
+        ]
+        assert any(
+            "Project-level custom prompt directories are retired" in message
+            and str(prompts_dir) in message
+            and "user prompts directory" in message
+            for message in messages
+        )
+        assert prompt_file.read_bytes() == original
+
+    def test_legacy_dispatch_report_is_projected_and_recomputed(
         self,
+        tmp_path: Path,
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
     ) -> None:
         from chartreux.app_server._projection import project_config_view
 
-        orchestrator = load_orchestrator(build_config())
-        snapshot = orchestrator.config.catalog_snapshot
-        policy = snapshot.dispatch.model_copy(
-            update={
-                "contrasts": "Use slot `mechanical` for purpose `implementation`; use slot `implementor` for purpose `implementation`."
-            }
-        )
-        orchestrator.config.attach_catalog_snapshot(replace(snapshot, dispatch=policy))
-        registry = AgentRegistry(orchestrator, HarnessFilesManager(sources=()))
-        warnings = project_config_view(orchestrator.config).validation_warnings
-        assert any(note.startswith("R3 ") for note in warnings)
-        assert orchestrator.config.catalog_snapshot.dispatch == policy
-        orchestrator.config.attach_catalog_snapshot(snapshot)
-        registry.validate_dispatch()
-        assert not any(
-            note.startswith("R3 ") for note in orchestrator.config.validation_warnings
-        )
-
-    def test_get_builtin_subagent(self, manager: AgentManager) -> None:
-        assert manager.get_agent("worker") is WORKER
-
-    @pytest.mark.parametrize("available", [False, True])
-    def test_dispatch_profile_binding_uses_completed_discovery(
-        self,
-        tmp_path: Path,
-        build_config: ConfigBuilder,
-        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
-        available: bool,
-    ) -> None:
-        agents_dir = tmp_path / "agents"
-        agents_dir.mkdir()
-        if available:
-            (agents_dir / "custom.toml").write_text('role = "scout"\n')
-        orchestrator = load_orchestrator(build_config(agent_paths=[agents_dir]))
-        snapshot = orchestrator.config.catalog_snapshot
-        slots = dict(snapshot.dispatch.slots)
-        slots["mechanical"] = slots["mechanical"].model_copy(
-            update={"profile": "custom"}
-        )
-        policy = snapshot.dispatch.model_copy(
-            update={
-                "slots": slots,
-                "contrasts": "Use slot `mechanical` for searches; use slot `implementor` for implementation.",
-            }
-        )
-        orchestrator.config.attach_catalog_snapshot(replace(snapshot, dispatch=policy))
-        if available:
-            registry = AgentRegistry(orchestrator, HarnessFilesManager(sources=()))
-            assert (
-                registry.discovered["custom"].source_path == agents_dir / "custom.toml"
-            )
-        else:
-            AgentRegistry(orchestrator, HarnessFilesManager(sources=()))
-            recovered = orchestrator.config.catalog_snapshot
-            assert recovered.dispatch is STANDALONE_PRESET
-            assert any(
-                "R1 slots.mechanical.profile" in item and "custom" in item
-                for item in recovered.dispatch_diagnostics
-            )
-            assert policy.slots["mechanical"].profile == "custom"
-
-    @pytest.mark.parametrize("user_overlay", [False, True])
-    def test_activation_falls_back_visibly_without_repair(
-        self,
-        tmp_path: Path,
-        build_config: ConfigBuilder,
-        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
-        monkeypatch: pytest.MonkeyPatch,
-        user_overlay: bool,
-    ) -> None:
-        from unittest.mock import Mock
-
-        warning = Mock()
-        monkeypatch.setattr("chartreux.core.agents.registry.logger.warning", warning)
-        orchestrator = load_orchestrator(build_config())
         path = tmp_path / "models.toml"
-        original = b""
-        if user_overlay:
-            path.write_text(
-                '[dispatch.slots.mechanical]\nprofile = "missing-profile"\n'
-                '[providers.mistral]\napi_base = "https://preserved.example/v1"\n'
-            )
-            original = path.read_bytes()
-            snapshot = load_catalog(path)
-        else:
-            catalog = SHIPPED_CATALOG.model_copy(update={"roles": {}})
-            snapshot = CatalogSnapshot(catalog, "no-tier-roles")
-        orchestrator.config.attach_catalog_snapshot(snapshot)
+        path.write_text('[dispatch]\nmode = "standalone"\n')
+        reported = load_catalog(path)
+        assert len(reported.dispatch_diagnostics) == 1
+        report = reported.dispatch_diagnostics[0]
+        assert "[dispatch]" in report and "retired" in report
 
+        orchestrator = load_orchestrator(build_config())
+        snapshot = orchestrator.config.catalog_snapshot
+        assert snapshot is not None
+        orchestrator.config.attach_catalog_snapshot(reported)
+        # The loud report rides the catalog notes into the served
+        # configuration's validation warnings and the client projection.
+        assert report in orchestrator.config.validation_warnings
+        assert report in project_config_view(orchestrator.config).validation_warnings
+        # Recomputing from a clean snapshot drops the report.
+        orchestrator.config.attach_catalog_snapshot(snapshot)
+        assert report not in orchestrator.config.validation_warnings
+
+    def test_legacy_dispatch_table_and_profile_file_are_reported_never_consumed(
+        self,
+        config_dir: Path,
+        tmp_path: Path,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+    ) -> None:
+        """A legacy ``[dispatch]`` table naming a profile that only exists as
+        agents/*.toml is reported loudly; the profile file is detected as
+        retired input and never consumed or migrated into an identity.
+        """
+        agents_dir = config_dir / "agents"
+        agents_dir.mkdir()
+        profile_file = agents_dir / "custom.toml"
+        original = b'role = "scout"\n'
+        profile_file.write_bytes(original)
+
+        path = tmp_path / "models.toml"
+        path.write_text('[dispatch.slots.mechanical]\nprofile = "custom"\n')
+        snapshot = load_catalog(path)
+
+        orchestrator = load_orchestrator(build_config())
+        orchestrator.config.attach_catalog_snapshot(snapshot)
+        AgentManager(orchestrator, HarnessFilesManager(sources=("user",)))
+
+        # The retired table is reported with successor guidance; the catalog
+        # it sits beside loads normally and the report reaches the config.
+        assert len(snapshot.dispatch_diagnostics) == 1
+        report = snapshot.dispatch_diagnostics[0]
+        assert "[dispatch]" in report and "retired" in report
+        assert "[orchestration.routes.<purpose>]" in report
+        assert report in orchestrator.config.validation_warnings
+        # The profile file is detected as retired input, never consumed.
+        assert profile_file.read_bytes() == original
+
+    def test_legacy_dispatch_load_never_repairs_and_serves_the_catalog(
+        self,
+        tmp_path: Path,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+    ) -> None:
+        path = tmp_path / "models.toml"
+        original = (
+            '[dispatch.slots.mechanical]\nprofile = "missing-profile"\n'
+            '[providers.mistral]\napi_base = "https://preserved.example/v1"\n'
+        )
+        path.write_text(original)
+        snapshot = load_catalog(path)
+
+        orchestrator = load_orchestrator(build_config())
+        orchestrator.config.attach_catalog_snapshot(snapshot)
         AgentManager(orchestrator)
 
-        recovered = orchestrator.config.catalog_snapshot
-        assert recovered.dispatch is STANDALONE_PRESET
-        assert recovered.catalog is snapshot.catalog
-        assert recovered.overlaid_providers == snapshot.overlaid_providers
-        assert recovered.revision == snapshot.revision
-        diagnostic = recovered.dispatch_diagnostics[-1]
-        assert "using the shipped standalone preset" in diagnostic
-        warning.assert_called_with("%s", diagnostic)
-        if user_overlay:
-            assert "R1 slots.mechanical.profile" in diagnostic
-            assert "dispatch config was bypassed" in diagnostic
-            assert (
-                recovered.catalog.providers["mistral"].api_base
-                == "https://preserved.example/v1"
-            )
-            assert snapshot.dispatch.slots["mechanical"].profile == "missing-profile"
-            assert path.read_bytes() == original
-        else:
-            assert "S1 slots.mechanical.role" in diagnostic
-            assert recovered.catalog.roles == {}
-            assert recovered.dispatch.slots["mechanical"].role == "@scout"
-
-    def test_get_nonexistent_agent_raises(self, manager: AgentManager) -> None:
-        with pytest.raises(ValueError, match="not found"):
-            manager.get_agent("nonexistent-agent")
+        # The retired table is reported loudly; the load serves the catalog
+        # beside it and never repairs or rewrites the file.
+        assert len(snapshot.dispatch_diagnostics) == 1
+        report = snapshot.dispatch_diagnostics[0]
+        assert "[dispatch]" in report and "retired" in report
+        assert report in orchestrator.config.validation_warnings
+        assert (
+            snapshot.catalog.providers["mistral"].api_base
+            == "https://preserved.example/v1"
+        )
+        assert path.read_text() == original

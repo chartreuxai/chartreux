@@ -49,7 +49,7 @@ from tests.stubs.fake_backend import FakeBackend, FakeInterruptedStreamingBacken
 
 def make_config(
     *,
-    system_prompt_id: str = "tests",
+    identity: str = "coder",
     active_model: str = "devstral-latest",
     input_price: float = 0.4,
     output_price: float = 2.0,
@@ -104,7 +104,7 @@ def make_config(
     ]
     return build_test_vibe_config(
         session_logging=SessionLoggingConfig(enabled=not disable_logging),
-        system_prompt_id=system_prompt_id,
+        agent={"identity": identity},
         include_project_context=include_project_context,
         include_prompt_detail=include_prompt_detail,
         active_model=active_model,
@@ -579,8 +579,10 @@ class TestReloadPreservesStats:
         self,
     ) -> None:
         backend = FakeBackend(mock_llm_chunk(content="Response"))
-        config1 = make_config(system_prompt_id="tests")
-        config2 = make_config(system_prompt_id="cli")
+        # The composed system prompt is keyed on the [agent] identity
+        # selection, so the reload pair changes the identity.
+        config1 = make_config()
+        config2 = make_config(identity="researcher")
         agent = build_test_agent_loop(config=config1, backend=backend)
         [_ async for _ in agent.act("Hello")]
         original_context_tokens = agent.stats.context_tokens
@@ -668,9 +670,13 @@ class TestReloadPreservesMessages:
         assert agent.messages[2].content == old_assistant_content
 
     @pytest.mark.asyncio
-    async def test_reload_updates_system_prompt_preserves_rest(self) -> None:
+    async def test_reload_retains_frozen_prompt_and_reports_pending_identity(
+        self,
+    ) -> None:
         backend = FakeBackend(mock_llm_chunk(content="Response"))
-        config1 = make_config(system_prompt_id="tests")
+        # The composed system prompt is keyed on the [agent] identity
+        # selection, so the reload pair changes the identity.
+        config1 = make_config()
         agent = build_test_agent_loop(config=config1, backend=backend)
 
         async for _ in agent.act("Hello"):
@@ -678,13 +684,20 @@ class TestReloadPreservesMessages:
 
         old_system = agent.messages[0].content
         old_user = agent.messages[1].content
+        bound = agent._bound_policy
 
-        config2 = make_config(system_prompt_id="cli")
+        config2 = make_config(identity="researcher")
         set_agent_config(agent, config2)
         await agent.reload_with_initial_messages()
 
-        assert agent.messages[0].content != old_system
+        # Design §10: a reload retains the conversation's frozen policy bytes
+        # and reports the pending selection change; it does not re-posture.
+        assert agent.messages[0].content == old_system
         assert agent.messages[1].content == old_user
+        assert agent._bound_policy is bound
+        assert any(
+            "identity selection change" in note for note in agent.pending_policy_changes
+        )
 
     @pytest.mark.asyncio
     async def test_reload_with_no_messages_stays_empty(self) -> None:
@@ -702,8 +715,10 @@ class TestReloadPreservesMessages:
 class TestConcurrentReloads:
     @pytest.mark.asyncio
     async def test_superseded_reload_returns_without_cancelled_error(self) -> None:
-        config_first = make_config(system_prompt_id="tests")
-        config_last = make_config(system_prompt_id="cli")
+        # The composed system prompt is keyed on the [agent] identity
+        # selection, so the reload pair changes the identity.
+        config_first = make_config()
+        config_last = make_config(identity="researcher")
 
         reference = build_test_agent_loop(config=config_first, backend=FakeBackend([]))
         set_agent_config(reference, config_last)
@@ -726,7 +741,7 @@ class TestConcurrentReloads:
 
         assert results == [None, None]
         assert agent.messages[0].content == winning_system_prompt
-        assert agent.config.system_prompt_id == "cli"
+        assert agent.config.agent.identity == "researcher"
 
 
 class TestCompactStatsHandling:
