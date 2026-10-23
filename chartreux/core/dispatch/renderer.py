@@ -18,7 +18,7 @@ those route facts.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import re
 from typing import TYPE_CHECKING
 
@@ -179,13 +179,43 @@ _COMPOSITION_REUSE = (
     "needed, then start a new agent."
 )
 
-_COMPOSITION_REVIEW = (
+# The independent-review guidance: the opening clause is pinned verbatim by
+# tests/core/policy/test_composition.py; the composition sentence renders the
+# configured review seats, so it stays neutral to the configured roster.
+_COMPOSITION_REVIEW_OPENING = (
     "For an independent review, launch a fresh reviewer on the review "
     "purpose — never the author, and never a reused advisor; give a "
     "second-round reviewer no earlier conclusions. Keep an advisor across "
-    "related design refinements. Deep review composes the analytical, peer, "
-    "and execution seats; fail closed when a required seat is unavailable."
+    "related design refinements. "
 )
+_COMPOSITION_REVIEW_FALLBACK = (
+    "Deep review composes the configured seats; fail closed when a required "
+    "seat is unavailable."
+)
+
+
+def composition_review_region(routes: Mapping[str, PurposeRoute]) -> str:
+    """The independent-review guidance, generalized to the configured seats.
+
+    The shipped three-seat composition renders its pinned enumeration; a
+    configured supplementary seat renders with the others, in route order.
+    """
+
+    def names(seats: Sequence[str]) -> str:
+        if len(seats) == 1:
+            return seats[0]
+        return ", ".join(seats[:-1]) + f", and {seats[-1]}"
+
+    route = routes.get("review.deep")
+    seats = [target.seat for target in route.targets if target.seat] if route else []
+    if not seats:
+        return _COMPOSITION_REVIEW_OPENING + _COMPOSITION_REVIEW_FALLBACK
+    sentence = f"Deep review composes the {names(seats)} "
+    if len(seats) == 1:
+        sentence += "seat; fail closed when a required seat is unavailable."
+    else:
+        sentence += "seats; fail closed when a required seat is unavailable."
+    return _COMPOSITION_REVIEW_OPENING + sentence
 
 
 def render_composition_regions(*, delegation: Delegation | None) -> dict[str, str]:
@@ -255,7 +285,7 @@ def render_composition_task_regions(
     return {
         "disclosure": _BRIEF_DISCLOSURE,
         "reuse": _COMPOSITION_REUSE,
-        "review": _COMPOSITION_REVIEW,
+        "review": composition_review_region(routes),
         "routing": render_launch_target_region(routes, session_model),
     }
 

@@ -106,6 +106,7 @@ class FileReadEffectOutput(ProtocolModel):
     requested_limit: int | None = FileReadEffectInput.DEFAULT_LIMIT
     total_lines: int | None = None
     was_truncated: bool = False
+    outline: bool = False
 
 
 class TodoEffectStatus(StrEnum):

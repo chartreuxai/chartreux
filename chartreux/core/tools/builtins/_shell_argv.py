@@ -13,7 +13,9 @@ identity are unchanged by the split.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
+import shlex
 
 # Length of a single-character short option ("-i") and the minimum length of
 # an unambiguous combined short-option cluster ("-ic").
@@ -213,3 +215,107 @@ def _has_short_in_cluster(parsed: _ParsedOptions, names: frozenset[str]) -> bool
         and any(short in names for short in token[1:])
         for token in parsed.options
     )
+
+
+# Glob metacharacters whose quoting matters for pattern-position words.
+# Mirrors the resolver's _SHELL_GLOB_CHARACTERS.
+_GLOB_META_CHARACTERS = frozenset("*?[")
+
+
+class ShellToken(str):
+    """A POSIX shell word with its glob-metacharacter quote provenance.
+
+    The value equals the word ``shlex.split`` produces; the flags classify
+    every glob metacharacter (``*``, ``?``, ``[``) in the word's raw source
+    text: ``meta_quoted`` marks metacharacters protected by quotes or a
+    backslash escape (the shell keeps them literal), ``meta_unquoted`` the
+    ones the shell pathname-expands. Tokens split by other means are plain
+    ``str`` and read as "no provenance".
+    """
+
+    __slots__ = ("meta_quoted", "meta_unquoted")
+
+    def __new__(
+        cls, value: str, *, meta_quoted: bool, meta_unquoted: bool
+    ) -> ShellToken:
+        token = super().__new__(cls, value)
+        token.meta_quoted = meta_quoted
+        token.meta_unquoted = meta_unquoted
+        return token
+
+
+class PatternGlobCandidate(str):
+    """Marks a pattern-position word the shell pathname-expands.
+
+    Grep-family patterns whose glob metacharacters are all unquoted carry
+    this marker through the policy's ``positional_values`` so the permission
+    resolver inspects the expansion's matches instead of applying the
+    blanket path-glob denial. Equality and hashing stay the word's own.
+    """
+
+    __slots__ = ()
+
+
+def _scan_meta_quotes(span: str) -> tuple[bool, bool]:
+    """Classify the glob metacharacters inside one raw shell word.
+
+    Returns ``(meta_quoted, meta_unquoted)`` for the source span between the
+    word's previous and next token boundary, mirroring the POSIX shlex state
+    machine: single quotes protect everything, double quotes protect all but
+    an escaped ``"``/``\\``, and a backslash outside quotes protects the next
+    character. Escaped metacharacters count as quoted — the shell keeps them
+    literal.
+    """
+    quote = ""
+    meta_quoted = False
+    meta_unquoted = False
+    index = 0
+    length = len(span)
+    while index < length:
+        character = span[index]
+        if character == "\\" and quote != "'":
+            # A backslash protects the next character everywhere but inside
+            # single quotes, where it is itself literal.
+            if index + 1 < length and span[index + 1] in _GLOB_META_CHARACTERS:
+                meta_quoted = True
+            index += 2
+            continue
+        if character in _GLOB_META_CHARACTERS and not quote:
+            meta_unquoted = True
+            index += 1
+            continue
+        if quote:
+            if character == quote:
+                quote = ""
+            elif character in _GLOB_META_CHARACTERS:
+                meta_quoted = True
+        elif character in "'\"":
+            quote = character
+        index += 1
+    return meta_quoted, meta_unquoted
+
+
+def split_shell_tokens(text: str) -> list[str]:
+    """Split *text* into shell words carrying glob-quote provenance.
+
+    Token values match ``shlex.split(text)`` exactly (POSIX mode, no comment
+    handling); each word is a :class:`ShellToken` whose flags say whether its
+    glob metacharacters were quote-protected or expandable in the source.
+    Malformed quoting raises the same ``ValueError`` shlex raises, so callers
+    keep their existing error handling.
+    """
+    stream = StringIO(text)
+    lexer = shlex.shlex(stream, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    tokens: list[str] = []
+    while True:
+        start = stream.tell()
+        token = lexer.get_token()
+        if token is None or token == lexer.eof:
+            return tokens
+        end = stream.tell()
+        meta_quoted, meta_unquoted = _scan_meta_quotes(text[start:end])
+        tokens.append(
+            ShellToken(token, meta_quoted=meta_quoted, meta_unquoted=meta_unquoted)
+        )

@@ -818,6 +818,8 @@ def test_session_start_wraps_vibe_configuration_in_agent_config() -> None:
             "maxTurns": None,
             "maxPrice": None,
             "maxSessionTokens": None,
+            "runMaxPrice": None,
+            "runMaxSessionTokens": None,
             "headless": True,
             "trustWorkspace": False,
             "mcpServers": [],

@@ -55,6 +55,7 @@ GLM_5_3_THINKING_LEVELS: dict[str, str | None] = {
 # snapshots on 2026-09-16; unknown future IDs use the provider table.
 MODEL_THINKING_LEVELS: dict[ModelKey, ThinkingLevels] = {
     ("mistral", "zai-glm-5-3"): GLM_5_3_THINKING_LEVELS,
+    ("mistral", "zai-glm-5-3-flash"): GLM_5_3_THINKING_LEVELS,
     ("mistral", "zai-glm-5"): GLM_5_3_THINKING_LEVELS,
     ("mistral", "zai-glm-latest"): GLM_5_3_THINKING_LEVELS,
 }

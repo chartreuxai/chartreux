@@ -83,6 +83,8 @@ def test_runtime_policy_copy_and_child_policy_inherit_capability() -> None:
     loop._max_price = None
     loop._max_tokens = None
     loop._max_session_tokens = None
+    loop._run_max_price = None
+    loop._run_max_session_tokens = None
     loop.enable_streaming = False
     loop.launch_context = None
     loop._headless = False

@@ -2,6 +2,108 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.5.8 (2026-10-23)
+
+### Security
+
+- Redirect targets that contain shell glob characters are denied fail-closed:
+  the shell would pathname-expand an unquoted redirect destination before any
+  later check, so the denial now happens at permission resolution with a
+  message naming the offending target. Quoted redirect targets are restored
+  as literal operands and are never pathname-expanded.
+- Unquoted glob-bearing `find` pattern operands are denied fail-closed: the
+  shell pathname-expands an unquoted pattern word before `find` runs, so a
+  decoy file named `-exec` (or `-a`, `-delete`, ...) in the working directory
+  injected an execution predicate through the pattern-operand carve-out —
+  `find . -name -* printf X ';'` ran the injected `printf` despite the
+  execution-predicate guard. The carve-out now covers quoted and literal
+  pattern operands only; an unquoted glob-bearing operand is denied with the
+  generic path-glob diagnostic, exactly like a redirect target that looks
+  like a glob.
+- The inspection surface of the `grep` family (`grep`, `egrep`, `fgrep`,
+  `rg`) is narrowed: unmodeled options are denied, option-like words are
+  never mistaken for file operands, and file operands are inspected like any
+  other path, quote-aware.
+- `grep` output caps are UTF-8-byte-honest: `max_output_bytes` truncates on
+  encoded byte boundaries and never emits a partial character, in plain,
+  files-only, and path output alike.
+
+### Added
+
+- Per-run budgets for subagent runs: `[subagents].run_max_price` and
+  `[subagents].run_max_session_tokens` (with per-session overrides) arm a
+  per-run budget middleware measured relative to each run's admission
+  baseline; an over-cap run stops with the budget-exceeded outcome and a
+  response with unknown pricing stops with budget-unverifiable — unless the
+  run's admission baseline already carries unknown cost: a reused or
+  replacement run that inherits a latched unknown-cost baseline cannot
+  detect subsequent unknown usage through that latch, so unknown pricing
+  recorded after such a baseline does not stop the run. Run budgets are
+  checkpoints, not reservations: nothing is reserved in advance. The
+  root-loop arming semantics, resume anchor preservation, and the nullable
+  foreground attribution are documented in the subagents guide.
+- Usage ledger schema v2: content-class attribution, an attempt-ordinal axis
+  for replay weighting, and a run-id join key on ledger attribution. v1
+  ledgers still parse.
+- Opt-in tool-output shapes, both default off and identical to the plain
+  modes when off: `read_file` outline mode returns a symbol outline with
+  revision pairing for Python files (falling back to a plain read
+  elsewhere), and `grep` files-only mode returns deduplicated paths under
+  the same byte caps.
+
+### Changed
+
+- Expansion-failure provenance: a denied path glob that failed during
+  expansion inspection names the specific limit it reached — the
+  directory-entry budget, the match-state budget, or unsupported glob
+  syntax — in a bounded, redacted diagnostic field. Denials decided outside
+  the expansion inspection and tokens the inspector never expanded render
+  the generic path-glob message; verdicts and caps are unchanged.
+- Empty-response replay exhaustion propagates through the middleware
+  budget-stop path: an empty model response whose in-call replay the run
+  budget denies now settles as a terminal budget stop (budget-exceeded or
+  budget-unverifiable with a `budget-stopped` parent notification) — not a
+  suspension and not a provider failure.
+- Root run-budget interval semantics are pinned by characterization tests:
+  session options arm the root loop, an unanchored root self-initializes its
+  anchor on the first evaluation, a resume preserves existing anchors, and
+  the subagent defaults alone do not arm the root.
+- Review-system alignment: deep review panels compose all configured seats
+  (the shipped route composes three seats; a configured five-seat panel
+  launches five), no deep authorship substitution — the material-author
+  model-line fallback applies only to quick single-seat reviews — the
+  review-execution overlay pins a receipt policy for consumed versus
+  independent evidence, and rendered purpose guidance is roster-neutral.
+
+### Breaking
+
+- Breaking (pre-release alpha; loud, actionable errors; no silent
+  migration): `zai-glm-5-3-flash` now uses the exact GLM family
+  thinking-level table. Selecting thinking `off` for flash is now a typed
+  launch-time configuration error (`InvalidLaunchThinkingError`) instead of
+  mapping to the provider table's no-thinking value. Selecting thinking
+  `low` now wires real thinking (`reasoning_effort: "low"`): flash runs
+  consume reasoning tokens where the previous mapping sent none — a cost
+  change.
+- The glob-denial message wording changed: a denied path glob that failed
+  expansion inspection now appends the provenance detail described above
+  instead of rendering the generic path-glob message alone. Tooling that
+  matched the exact prior wording must accept the appended detail.
+
+### Retained limitations
+
+- Retained shell-policy trade-offs, each with its fast-follow pointer (see
+  the retained-limitations section of the tools-safety guide): the
+  trailing-`**` over-denial (until the executor shell-option contract
+  lands), the extglob residual hazard (detection and modeling fast-follow
+  behind the same contract), the quoted-variable conservative denial
+  (resolution fast-follow), and the find pattern-operand carve-out, now
+  narrowed to quoted and literal pattern operands (the unquoted-glob
+  predicate-injection hazard is closed in the security group above; the
+  quoted/literal bypass is retained because the shell never expands
+  them). Glob-expansion work-budget caps are unchanged in this release;
+  raising them is deferred and remains a separate decision.
+
 ## 0.5.7 (2026-10-22)
 
 ### Added

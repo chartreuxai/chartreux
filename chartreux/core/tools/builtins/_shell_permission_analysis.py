@@ -7,10 +7,12 @@ import logging
 from pathlib import Path
 import re
 import shlex
+from typing import cast
 
 from tree_sitter import Language, Node, Parser
 import tree_sitter_bash as tsbash
 
+from chartreux.core.tools.builtins._shell_argv import ShellToken, split_shell_tokens
 from chartreux.core.tools.builtins._shell_command_policy import (
     executor_boundary,
     package_argument_indexes,
@@ -711,6 +713,28 @@ def _literal_token(node: Node) -> str | None:
     return values[0] if len(values) == 1 else None
 
 
+def _literal_shell_token(node: Node) -> ShellToken | None:
+    """The quote-provenance literal of a redirect destination, or None.
+
+    Mirrors ``_literal_token`` but tokenizes with ``split_shell_tokens`` so
+    the redirect seam learns which glob metacharacters the shell keeps
+    literal (quoted) and which it pathname-expands (unquoted). Token values
+    match ``shlex.split`` exactly; tokens split by other means are plain
+    ``str`` and read as "no provenance" (fail closed).
+    """
+    if node.type not in _SUPPORTED_COMMAND_PARTS or node.text is None:
+        return None
+    if any(child.type in _DYNAMIC_NODES for child in _descendants(node)):
+        return None
+    try:
+        values = split_shell_tokens(node.text.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    # split_shell_tokens is annotated list[str] (its elements are str
+    # subclasses); the runtime value always carries the provenance flags.
+    return cast("ShellToken | None", values[0] if len(values) == 1 else None)
+
+
 def _assignment_reason(node: Node) -> Diagnostic | None:  # noqa: PLR0911
     # Environment-assignment restrictions are policy decisions: the denial
     # states the blocked requirement and names no alternative.
@@ -778,7 +802,9 @@ def _redirect_reason(  # noqa: PLR0911
     descriptor_text = (
         descriptor.text.decode("ascii") if descriptor and descriptor.text else None
     )
-    destination_text = _literal_token(destination) if destination is not None else None
+    destination_text = (
+        _literal_shell_token(destination) if destination is not None else None
+    )
 
     if operator == ">&" and descriptor_text == "2" and destination_text == "1":
         return None
@@ -829,7 +855,7 @@ def _literal_redirect_target(node: Node) -> str | None:
     destination = node.child_by_field_name("destination")
     if destination is None:
         return None
-    target = _literal_token(destination)
+    target = _literal_shell_token(destination)
     if target is None:
         return None
     duplication = any(child.type in {">&", "<&"} for child in node.children)

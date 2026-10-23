@@ -130,6 +130,13 @@ class GrepArgs(BaseModel):
     use_default_ignore: bool = Field(
         default=True, description="Whether to respect .gitignore and .ignore files."
     )
+    files_only: bool = Field(
+        default=False,
+        description=(
+            "List the distinct matching file paths (sorted, one per line) instead "
+            "of matched lines; match_count still counts matching lines."
+        ),
+    )
 
 
 def _match_line_parts(raw: str) -> tuple[str, int | None] | None:
@@ -504,24 +511,54 @@ def _expand_context(
     return "\n".join(output), list(selected)
 
 
+def _cap_to_bytes(text: str, cap: int) -> str:
+    """Truncate to at most ``cap`` UTF-8 bytes, never emitting a partial char."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= cap:
+        return text
+    return encoded[:cap].decode("utf-8", errors="ignore")
+
+
 def _finish_output(
     kept: list[str],
     max_matches: int,
     pattern: str,
     settings: _GrepSettings,
+    files_only: bool,
     stop: threading.Event,
 ) -> GrepResult:
     _checkpoint(stop)
+    if files_only:
+        # Filename-only mode: the line cap becomes a cap on distinct files;
+        # match_count still counts the matched lines themselves.
+        files: list[str] = []
+        seen: set[str] = set()
+        for line in kept:
+            parts = _match_line_parts(line)
+            if parts is not None and parts[0] not in seen:
+                seen.add(parts[0])
+                files.append(parts[0])
+        selected = sorted(files)[:max_matches]
+        display = "\n".join(selected)
+        return GrepResult(
+            matches=_cap_to_bytes(display, settings.max_output_bytes),
+            match_count=len(kept),
+            match_lines=list(kept),
+            pattern=pattern,
+            was_truncated=len(files) > max_matches
+            or len(display.encode("utf-8")) > settings.max_output_bytes,
+            cwd=str(settings.cwd),
+        )
     selected = kept[:max_matches]
     display, match_lines = _expand_context(selected, settings, stop)
     _checkpoint(stop)
     return GrepResult(
-        matches=display[: settings.max_output_bytes],
+        matches=_cap_to_bytes(display, settings.max_output_bytes),
         match_count=len(selected),
         match_lines=match_lines,
         pattern=pattern,
         was_truncated=len(kept) > max_matches
-        or len(display) > settings.max_output_bytes,
+        or len(display.encode("utf-8")) > settings.max_output_bytes,
         cwd=str(settings.cwd),
     )
 
@@ -532,20 +569,30 @@ def _parse_frozen(
     pattern: str,
     settings: _GrepSettings,
     allows: Callable[[Path], bool],
+    files_only: bool,
     stop: threading.Event,
 ) -> GrepResult:
     # Joining and decoding/parsing large output never run on the event loop.
     stdout = "\n".join(chunks)
     _checkpoint(stop)
     kept: list[str] = []
+    seen: set[str] = set()
     for line in stdout.splitlines():
         _checkpoint(stop)
         match = GrepMatch.from_output_line(line, settings.cwd)
         if match is not None and allows(Path(match.path)):
             kept.append(line)
-            if len(kept) > max_matches:
+            if files_only:
+                # Keep counting a file's later matches; stop once one more
+                # distinct file proves the listing will be capped.
+                parts = _match_line_parts(line)
+                if parts is not None:
+                    seen.add(parts[0])
+                    if len(seen) > max_matches:
+                        break
+            elif len(kept) > max_matches:
                 break
-    return _finish_output(kept, max_matches, pattern, settings, stop)
+    return _finish_output(kept, max_matches, pattern, settings, files_only, stop)
 
 
 class Grep(
@@ -779,11 +826,12 @@ class Grep(
                             args.pattern,
                             settings,
                             allows,
+                            args.files_only,
                             stop=stop,
                         )
                     else:
                         result = await self._parse_live(
-                            chunks, limit, args.pattern, settings, stop
+                            chunks, limit, args.pattern, settings, stop, args.files_only
                         )
                     self._ensure_current(token)
                     # Recheck every published match, not just the search operands.
@@ -962,12 +1010,14 @@ class Grep(
         pattern: str,
         settings: _GrepSettings,
         stop: threading.Event,
+        files_only: bool = False,
     ) -> GrepResult:
         # A custom resolver cannot run in a worker; yield between authorization chunks.
         lines = await self._stage(
             lambda data, event: ("\n".join(data)).splitlines(), chunks, stop=stop
         )
         kept = []
+        seen: set[str] = set()
         started = time.monotonic()
         for index, line in enumerate(lines):
             if index and (
@@ -978,10 +1028,18 @@ class Grep(
             match = GrepMatch.from_output_line(line, settings.cwd)
             if match is not None and self._can_read(Path(match.path)):
                 kept.append(line)
-                if len(kept) > limit:
+                if files_only:
+                    # Count a file's later matches; stop once one more distinct
+                    # file proves the listing will be capped.
+                    parts = _match_line_parts(line)
+                    if parts is not None:
+                        seen.add(parts[0])
+                        if len(seen) > limit:
+                            break
+                elif len(kept) > limit:
                     break
         return await self._stage(
-            _finish_output, kept, limit, pattern, settings, stop=stop
+            _finish_output, kept, limit, pattern, settings, files_only, stop=stop
         )
 
     def _can_read(self, path: Path) -> bool:
@@ -1256,10 +1314,10 @@ class Grep(
 
         was_truncated = (
             len(output_lines) > max_matches
-            or len(truncated_output) > self.config.max_output_bytes
+            or len(truncated_output.encode("utf-8")) > self.config.max_output_bytes
         )
 
-        final_output = truncated_output[: self.config.max_output_bytes]
+        final_output = _cap_to_bytes(truncated_output, self.config.max_output_bytes)
 
         return GrepResult(
             matches=final_output,

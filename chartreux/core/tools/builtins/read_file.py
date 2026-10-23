@@ -5,9 +5,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, final
 
 from humanize import naturalsize
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from chartreux.core.events import ToolStreamEvent
+from chartreux.core.file_outline import (
+    _PYTHON_SUFFIX,
+    MAX_OUTLINE_SOURCE_BYTES,
+    outline_source,
+)
 from chartreux.core.file_revision import (
     ReadTraversal,
     TraversalRegistry,
@@ -29,11 +34,16 @@ from chartreux.core.tools.utils import (
     DEFAULT_SENSITIVE_PATTERNS,
     ToolPath,
     display_file_path,
+    matches_sensitive_pattern,
     resolve_file_tool_permission,
     resolve_tool_path,
 )
 from chartreux.utils import VIBE_WARNING_TAG
-from chartreux.utils.io import WindowReadResult, read_lines_hashed_async
+from chartreux.utils.io import (
+    WindowReadResult,
+    content_revision,
+    read_lines_hashed_async,
+)
 from chartreux.utils.tool_presentation import ToolEffectKind
 
 if TYPE_CHECKING:
@@ -215,6 +225,25 @@ class ReadFileArgs(BaseModel):
             "same traversal; omit it for a fresh read."
         ),
     )
+    outline: bool = Field(
+        default=False,
+        description=(
+            "Serve the file's bounded symbol outline (classes, functions, and "
+            "module-level bindings with line ranges) instead of its content, "
+            "paired with the file's revision. Off by default. Non-Python, "
+            "unparsable, oversized, or sensitive-path files fall back to the "
+            "normal read; pagination args are rejected with outline=true."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _outline_excludes_pagination_args(self) -> ReadFileArgs:
+        if self.outline and self.model_fields_set & {"offset", "limit", "traversal_id"}:
+            raise ValueError(
+                "outline=true cannot be combined with offset, limit, or "
+                "traversal_id: the outline is one bounded result."
+            )
+        return self
 
 
 class ReadFileResult(BaseModel):
@@ -223,7 +252,7 @@ class ReadFileResult(BaseModel):
     num_lines: int
     start_line: int
     requested_offset: int | None = None
-    requested_limit: int = DEFAULT_LINE_LIMIT
+    requested_limit: int | None = DEFAULT_LINE_LIMIT
     total_lines: int | None = None
     was_truncated: bool = False
     end_line: int | None = None
@@ -233,6 +262,7 @@ class ReadFileResult(BaseModel):
     total_chunks: int | None = None
     restarted: bool = False
     line_continues: bool = False
+    outline: bool = False
 
 
 class ReadFileConfig(BaseToolConfig):
@@ -462,6 +492,95 @@ class ReadFile(
                 first_chunk=True,
                 extra_note=None,
             ),
+        )
+
+    async def _outline_request(
+        self, args: ReadFileArgs, file_path: Path, tool_io: ToolIOPort | None
+    ) -> ReadFileResult:
+        """Serve one opt-in symbol outline of the file, or fall back.
+
+        The outline is one bounded, metadata-only result (rendered within
+        :data:`chartreux.core.file_outline.MAX_OUTLINE_RENDER_BYTES`) paired
+        with the file's content revision — never a traversal. Any degradation
+        (non-Python, unparsable, over-cap source, sensitive path,
+        client-mediated read) falls back to the normal read with a one-line
+        note, mirroring the file-state consumer's sensitive skip.
+        """
+        if tool_io is not None and tool_io.supports_read:
+            return await self._outline_fallback(
+                args,
+                file_path,
+                tool_io,
+                note=(
+                    "Outline mode is unavailable for client-mediated reads; "
+                    "serving the normal read."
+                ),
+            )
+        if matches_sensitive_pattern(str(file_path), self.config.sensitive_patterns):
+            return await self._outline_fallback(
+                args,
+                file_path,
+                tool_io,
+                note=(
+                    "Outline mode is skipped for sensitive paths; serving the "
+                    "normal read."
+                ),
+            )
+        # One read feeds both the outline and its paired revision: a second
+        # read could observe a concurrent edit and pair an old outline with a
+        # new revision. The suffix gate and the bounded read keep the guard
+        # order outline_file had: non-Python and over-cap files never load
+        # their full content.
+        note = (
+            "This file does not outline (non-Python, unparsable, or "
+            "over the source cap); serving the normal read."
+        )
+        data: bytes | None = None
+        if file_path.suffix == _PYTHON_SUFFIX:
+            try:
+                with file_path.open("rb") as handle:
+                    bounded = handle.read(MAX_OUTLINE_SOURCE_BYTES + 1)
+            except OSError:
+                bounded = None
+            if bounded is not None and len(bounded) <= MAX_OUTLINE_SOURCE_BYTES:
+                data = bounded
+        if data is None:
+            return await self._outline_fallback(args, file_path, tool_io, note=note)
+        outline = outline_source(data, path=str(file_path))
+        if outline is None:
+            return await self._outline_fallback(args, file_path, tool_io, note=note)
+        content = outline.render()
+        self._check_output_size(content)
+        return ReadFileResult(
+            file_path=str(file_path),
+            content=content,
+            num_lines=len(content.splitlines()),
+            start_line=1,
+            requested_offset=None,
+            requested_limit=None,
+            total_lines=outline.line_count,
+            was_truncated=outline.truncated,
+            outline=True,
+            end_line=None,
+            next_offset=None,
+            traversal_id=None,
+            revision=content_revision(data),
+            total_chunks=None,
+            restarted=False,
+            line_continues=False,
+        )
+
+    async def _outline_fallback(
+        self,
+        args: ReadFileArgs,
+        file_path: Path,
+        tool_io: ToolIOPort | None,
+        *,
+        note: str,
+    ) -> ReadFileResult:
+        result = await self._read_request(args, file_path, tool_io)
+        return result.model_copy(
+            update={"content": f"{_warning(note)}\n{result.content}"}
         )
 
     async def _begin_traversal(
@@ -763,7 +882,9 @@ class ReadFile(
         file_path = self._resolve_path(args.file_path)
         tool_io = ctx.tool_io if ctx is not None else None
 
-        if args.traversal_id is not None:
+        if args.outline:
+            result = await self._outline_request(args, file_path, tool_io)
+        elif args.traversal_id is not None:
             result = await self._continue_traversal(
                 args, file_path, tool_io, traversal_id=args.traversal_id
             )
@@ -803,6 +924,8 @@ class ReadFile(
         extras: list[str] = []
         if args.offset:
             extras.append(f"from line {args.offset}")
+        if args.outline:
+            extras.append("outline")
         if args.limit != DEFAULT_LINE_LIMIT:
             extras.append(f"limit {args.limit} lines")
         if args.traversal_id:

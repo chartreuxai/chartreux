@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted.
+Accepted; superseded in part by v0.5.8 — the redirect-glob statements in
+Consequences (and the F2/F3 fix-round note) are reversed; see
+[Superseded in part by v0.5.8](#superseded-in-part-by-v058) at the end of
+this record.
 
 ## Context
 
@@ -228,3 +231,31 @@ closed without reverting any v0.2 behavior:
 - F5: recorded above as named residual follow-ups (not chased).
 - F6: the cache-key docstring and the residual above state the roots-blind
   truth (false-denial direction only); the cache is not re-keyed.
+
+## Superseded in part by v0.5.8
+
+The redirect-glob statements in this record are reversed in part by the
+v0.5.8 redirect-glob denial (the first security-group entry of the 0.5.8
+release notes):
+
+- The Consequences statement "Also allowed now: literal redirect targets
+  that merely look like globs (`echo x > f[0]`, `echo x > f"*"`,
+  `echo x > "f"[0]`). Bash never performs pathname expansion on a redirect
+  destination" is wrong for UNQUOTED glob-bearing targets. Bash does
+  pathname-expand an unquoted redirect destination (a single match is
+  overwritten, zero matches create the literal name, an ambiguous match is
+  refused), and zsh writes every match — so an unquoted glob-bearing
+  redirect target is denied fail-closed at the synthetic-redirect seam
+  (`append_redirect_operand`), before every later redirect check, with a
+  message naming the offending target. Of the three examples, only the
+  quoted ones (`echo x > f"*"`, `echo x > "f"[0]`) stay allowed: a
+  metacharacter inside a quoted segment is literal data (C2b provenance)
+  and is never pathname-expanded. `echo x > f[0]` — an unclosed bracket —
+  is now denied like any unquoted glob-bearing target.
+- The fix-round F2/F3 note "redirect destinations are exempt from the
+  path-glob heuristic (bash never globs them)" is reversed the same way:
+  the exemption now covers quoted literal destinations only.
+
+Everything else in this record — the occurrence-local cd-chain modeling, the
+scratchpad absolute-target authorization, the metadata-guard ordering, and
+the accepted residuals — stands unchanged.

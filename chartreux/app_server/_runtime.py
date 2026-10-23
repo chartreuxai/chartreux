@@ -344,6 +344,8 @@ class _AgentLoopBlueprint:
             max_price=self.policy.max_price,
             max_tokens=self.policy.max_tokens,
             max_session_tokens=self.policy.max_session_tokens,
+            run_max_price=self.policy.run_max_price,
+            run_max_session_tokens=self.policy.run_max_session_tokens,
             enable_streaming=self.policy.enable_streaming,
             launch_context=self.policy.launch_context,
             is_subagent=self.is_subagent,
@@ -427,6 +429,8 @@ class _RootRuntimeBlueprint:
             max_price=self.options.max_price,
             max_tokens=None,
             max_session_tokens=self.options.max_session_tokens,
+            run_max_price=self.options.run_max_price,
+            run_max_session_tokens=self.options.run_max_session_tokens,
             enable_streaming=True,
             launch_context={
                 "agent_entrypoint": self.client_info.entrypoint,
@@ -1076,12 +1080,30 @@ class AgentRuntimeFactory:
             policy = (
                 source.child_runtime_policy if is_subagent else source.runtime_policy
             )
+        effective_orchestrator = (
+            config_orchestrator or source.config_orchestrator.copy()
+        )
         if is_subagent:
             policy = replace(policy, enable_streaming=False)
+            # B2c: the [subagents] run-budget default arms every subagent
+            # loop. An explicit session-options value rides the inherited
+            # policy and wins when set; the config default fills a None.
+            subagents = effective_orchestrator.config.subagents
+            policy = replace(
+                policy,
+                run_max_price=(
+                    policy.run_max_price
+                    if policy.run_max_price is not None
+                    else subagents.run_max_price
+                ),
+                run_max_session_tokens=(
+                    policy.run_max_session_tokens
+                    if policy.run_max_session_tokens is not None
+                    else subagents.run_max_session_tokens
+                ),
+            )
         replacement = _AgentLoopBlueprint(
-            config_orchestrator=(
-                config_orchestrator or source.config_orchestrator.copy()
-            ),
+            config_orchestrator=effective_orchestrator,
             policy=policy,
             is_subagent=is_subagent,
             parent_session_id=parent_session_id,

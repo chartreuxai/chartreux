@@ -73,6 +73,11 @@ class AgentRuntimePolicy:
     # A dedicated slot, never a synthesized config-source authority, so policy
     # replacement and partitioning never treat session grants as policy.
     inherited_root_grants: tuple[Path, ...] = ()
+    # Per-run budget maxes (anchor-relative to the run-admission baseline).
+    # None means unconfigured: the middleware is omitted and replay admission
+    # ignores the run budget.
+    run_max_price: float | None = None
+    run_max_session_tokens: int | None = None
     parent_authority_getter: Callable[[], ToolManager] | None = None
     parent_authority_revision_getter: Callable[[], int] | None = None
 

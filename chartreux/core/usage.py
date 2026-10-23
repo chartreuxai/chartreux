@@ -105,7 +105,14 @@ class UsageTokens(_ImmutableModel):
 
 
 class UsageAttribution(_ImmutableModel):
-    """Invocation-local identity, frozen before a request can be attempted."""
+    """Invocation-local identity, frozen before a request can be attempted.
+
+    content_class is a work-class identity label (the launch purpose a routed
+    launch declared); None for conversation-local and utility calls. run_id is
+    the subagent run this call belongs to (the join key to the app-side run
+    record); None for root and utility calls. Like every attribution field,
+    neither is ever request/response content or metadata.
+    """
 
     root_session_id: str
     session_id: str
@@ -117,13 +124,21 @@ class UsageAttribution(_ImmutableModel):
     provider: str
     wire_name: str
     project_key: str | None
+    content_class: str | None = None
+    run_id: str | None = None
 
 
 class CallAccountingOutcome(UsageTokens):
-    """Content-free finalization, including partial usage on failure/interruption."""
+    """Content-free finalization, including partial usage on failure/interruption.
+
+    attempt_ordinal is the 1-based position of this finalized attempt within its
+    logical call (a replayed attempt is 2); None for records written before the
+    axis existed. It is bookkeeping, never request/response content.
+    """
 
     outcome: UsageOutcome
     usage_state: UsageState
+    attempt_ordinal: int | None = None
 
     @model_validator(mode="after")
     def _validate_presence(self) -> CallAccountingOutcome:
@@ -138,7 +153,7 @@ class CallAccountingOutcome(UsageTokens):
 
 
 class UsageRecord(UsageAttribution, CallAccountingOutcome):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 2
     record_id: str
     occurred_at: datetime
     prices_usd_per_million: UsagePrices
@@ -591,7 +606,7 @@ class UsageReader:
             warnings.append(warning(CoverageWarningCode.TORN_TAIL))
         records: list[UsageRecord] = []
         for value in parsed.records:
-            if value.get("schema_version", 1) != 1:
+            if value.get("schema_version", 1) not in {1, 2}:
                 warnings.append(warning(CoverageWarningCode.UNSUPPORTED_SCHEMA))
                 continue
             try:

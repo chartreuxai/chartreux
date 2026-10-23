@@ -108,6 +108,8 @@ class CompletionCoordinator:
         parent_session_id_getter: Callable[[], str | None],
         is_subagent_getter: Callable[[], bool],
         launch_identity_getter: Callable[[], str | None],
+        launch_purpose_getter: Callable[[], str | None],
+        run_identity_getter: Callable[[], str | None],
         accounting_owner_getter: Callable[[], RootAccountingOwner | None],
         accounting_sink_getter: Callable[[], AccountingSink | None],
         usage_attribution_getter: Callable[[], UsageAttribution | None],
@@ -154,6 +156,8 @@ class CompletionCoordinator:
         self._parent_session_id_getter = parent_session_id_getter
         self._is_subagent_getter = is_subagent_getter
         self._launch_identity_getter = launch_identity_getter
+        self._launch_purpose_getter = launch_purpose_getter
+        self._run_identity_getter = run_identity_getter
         self._accounting_owner_getter = accounting_owner_getter
         self._accounting_sink_getter = accounting_sink_getter
         self._usage_attribution_getter = usage_attribution_getter
@@ -259,6 +263,8 @@ class CompletionCoordinator:
                 parent_session_id=self._parent_session_id_getter(),
                 agent_role="subagent" if self._is_subagent_getter() else "root",
                 agent_profile=self._launch_identity_getter(),
+                content_class=self._launch_purpose_getter(),
+                run_id=self._run_identity_getter(),
                 project_key=owner.project_key,
                 model=model.alias,
                 provider=model.provider,

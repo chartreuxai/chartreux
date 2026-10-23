@@ -490,18 +490,18 @@ def test_output_authorizes_through_allowed_lookahead(
     assert seen == [line.split(":", 1)[0] for line in lines if ":" in line][:checks]
 
 
-def test_output_size_cap_counts_characters_after_match_selection(grep, monkeypatch):
+def test_output_size_cap_counts_bytes_after_match_selection(grep, monkeypatch):
     monkeypatch.setattr(grep.config, "max_output_bytes", 10)
     result = grep._parse_output("a.py:1:ééé\nb.py:2:ok", max_matches=2)
 
-    assert result.matches == "a.py:1:ééé"
-    assert len(result.matches.encode()) > 10
+    assert result.matches == "a.py:1:é"
+    assert len(result.matches.encode()) <= 10
     assert result.match_count == 2
     assert result.was_truncated
 
 
-def test_output_size_cap_does_not_truncate_at_exact_character_length(grep, monkeypatch):
-    monkeypatch.setattr(grep.config, "max_output_bytes", len("a.py:1:é"))
+def test_output_size_cap_does_not_truncate_at_exact_byte_length(grep, monkeypatch):
+    monkeypatch.setattr(grep.config, "max_output_bytes", len("a.py:1:é".encode()))
     result = grep._parse_output("a.py:1:é", max_matches=1)
 
     assert result.matches == "a.py:1:é"

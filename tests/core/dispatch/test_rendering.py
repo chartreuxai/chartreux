@@ -31,7 +31,8 @@ from chartreux.core.dispatch.renderer import (
     task_description_for_config,
     task_skeleton,
 )
-from chartreux.core.dispatch.routes import shipped_routes
+from chartreux.core.dispatch.route_models import PackageTier, PurposeRoute, RouteTarget
+from chartreux.core.dispatch.routes import SESSION_MODEL, shipped_routes
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.resolver import ModelResolver
@@ -298,6 +299,49 @@ def test_launch_targets_render_deep_review_seats_honestly() -> None:
     assert (
         "- `review.deep`: 3 distinct canonical models (counted by canonical "
         "model, not deployment)." in region
+    )
+
+
+def _five_seat_target(identity: str, seat: str) -> RouteTarget:
+    return RouteTarget(
+        model=SESSION_MODEL, identity=identity, tier=PackageTier.SUBSTANTIVE, seat=seat
+    )
+
+
+def test_composition_review_generalizes_seat_enumeration() -> None:
+    # The independent-review guidance renders the configured review seats,
+    # not a fixed three-seat enumeration: supplementary seats configured on
+    # review.deep render with the shipped seats, in route order. The shipped
+    # three-target control keeps its pinned enumeration.
+    def task_for(routes):
+        return render_task_description_for_composition(
+            routes=routes, session_model="glm-5-3", skeleton=task_skeleton()
+        )
+
+    routes = dict(shipped_routes())
+    routes["review.deep"] = PurposeRoute(
+        targets=(
+            _five_seat_target("reviewer", "analytical"),
+            _five_seat_target("reviewer", "peer"),
+            _five_seat_target("coder", "execution"),
+            _five_seat_target("reviewer", "supplementary-luna"),
+            _five_seat_target("researcher", "supplementary-flash"),
+        ),
+        requires_distinct_models=3,
+    )
+    task = task_for(routes)
+    # The opening clause stays pinned; the enumeration covers every seat.
+    assert "For an independent review, launch a fresh reviewer" in task
+    assert (
+        "Deep review composes the analytical, peer, execution, "
+        "supplementary-luna, and supplementary-flash seats; fail closed when "
+        "a required seat is unavailable." in task
+    )
+    # The shipped three-target control is unchanged.
+    shipped = task_for(shipped_routes())
+    assert (
+        "Deep review composes the analytical, peer, and execution seats; "
+        "fail closed when a required seat is unavailable." in shipped
     )
 
 

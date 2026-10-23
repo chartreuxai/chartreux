@@ -147,6 +147,11 @@ class SubagentsConfig(BaseModel):
     tombstone_ttl_seconds: int = Field(default=900, ge=0, strict=True)
     max_tombstones: int = Field(default=32, ge=1, strict=True)
     max_running_subagents: int = Field(default=16, ge=1, strict=True)
+    # Per-run budget defaults for subagent runs (B2c): spend and token counts
+    # are measured relative to each run's admission baseline. None means
+    # unconfigured: the run-budget middleware is omitted entirely.
+    run_max_price: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
+    run_max_session_tokens: int | None = Field(default=None, ge=1, strict=True)
 
 
 class RecoveryEligibleClass(StrEnum):

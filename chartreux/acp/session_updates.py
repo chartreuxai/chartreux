@@ -571,6 +571,10 @@ def _read_call_location(value: FileReadEffectInput) -> ToolCallLocation:
 
 def _read_result_location(value: FileReadEffectOutput) -> ToolCallLocation:
     path = _resolved_path(value.file_path)
+    if value.outline:
+        # An outline describes the whole file, and its num_lines counts
+        # rendered symbols, not source lines — never publish it as a range.
+        return ToolCallLocation(path=path, field_meta={"type": "file"})
     if (
         value.requested_limit != FileReadEffectInput.DEFAULT_LIMIT
         or value.was_truncated

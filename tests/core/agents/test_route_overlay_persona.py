@@ -194,6 +194,49 @@ def test_shipped_overlay_body_is_reviewer_derived_and_grants_nothing() -> None:
         assert anchor.lower() in body.lower(), anchor
 
 
+def test_receipt_substitution_requires_qualifying_fields() -> None:
+    body = _overlay_body()
+    for anchor in (
+        "revision under review",
+        "exact command",
+        "environment or isolation",
+        "exit status and counts",
+        "retained output location",
+        "is stale",
+        "counts as a check you did not run",
+    ):
+        assert anchor.lower() in body.lower(), anchor
+
+
+def test_receipt_substitution_labels_provenance() -> None:
+    body = _overlay_body()
+    for anchor in (
+        "consumed evidence",
+        "independently established",
+        "never present a receipt as your own run",
+    ):
+        assert anchor.lower() in body.lower(), anchor
+
+
+def test_receipt_gaps_are_reported_as_not_run() -> None:
+    body = _overlay_body()
+    assert "missing checks are not dischargeable by receipts" in body.lower()
+    assert "still runs" in body.lower()
+
+
+def test_receipt_policy_preserves_first_hand_security_probes() -> None:
+    body = _overlay_body()
+    assert "independently choose and run the security probes" in body.lower()
+    assert "a receipt never substitutes for your own security judgment" in body.lower()
+
+
+def test_receipt_policy_expands_no_permissions() -> None:
+    body = _overlay_body()
+    assert "changes what you may accept as evidence, nothing else" in body.lower()
+    assert "grants no new permissions" in body.lower()
+    assert "does not license editing files to make a check pass" in body.lower()
+
+
 # ---------------------------------------------------------------------------
 # The canonical resolver carries the resolved overlay (identity_launch)
 # ---------------------------------------------------------------------------

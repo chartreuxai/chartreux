@@ -106,6 +106,85 @@ class TokenLimitMiddleware:
         pass
 
 
+class RunBudgetMiddleware:
+    """Per-run budget checkpoint over anchor-relative stat deltas.
+
+    Holds only its configured maxes; all consumption figures are read from
+    ``context.stats`` (the single ledger) relative to the run baseline the
+    admission path wrote (``AgentStats.anchor_run_baseline``). The lazy
+    anchor below is fail-safe: an unanchored run defaults the baseline to
+    the current stats, so no budget is consumed and no stop fires.
+    """
+
+    def __init__(
+        self,
+        run_max_price: float | None = None,
+        run_max_session_tokens: int | None = None,
+    ) -> None:
+        self.run_max_price = run_max_price
+        self.run_max_session_tokens = run_max_session_tokens
+
+    async def before_turn(self, context: ConversationContext) -> MiddlewareResult:
+        return self.evaluate(context.stats)
+
+    def evaluate(self, stats: AgentStats) -> MiddlewareResult:
+        if (
+            stats.run_anchor_steps is None
+            or stats.run_anchor_known_cost_total is None
+            or stats.run_anchor_session_tokens is None
+            or stats.run_anchor_has_unknown_cost is None
+        ):
+            stats.anchor_run_baseline()
+
+        if (
+            self.run_max_price is not None
+            and stats.run_anchor_known_cost_total is not None
+        ):
+            run_cost = stats.known_cost_total - stats.run_anchor_known_cost_total
+            if run_cost > self.run_max_price:
+                return MiddlewareResult(
+                    action=MiddlewareAction.STOP,
+                    reason=(
+                        "Run price limit exceeded: "
+                        f"${run_cost:.4f} > ${self.run_max_price:.2f}"
+                    ),
+                )
+
+        if (
+            self.run_max_session_tokens is not None
+            and stats.run_anchor_session_tokens is not None
+        ):
+            run_tokens = (
+                stats.session_total_llm_tokens - stats.run_anchor_session_tokens
+            )
+            if run_tokens > self.run_max_session_tokens:
+                return MiddlewareResult(
+                    action=MiddlewareAction.STOP,
+                    reason=(
+                        "Run token limit exceeded: "
+                        f"{run_tokens:,} > {self.run_max_session_tokens:,}"
+                    ),
+                )
+
+        if stats.has_unknown_cost and stats.run_anchor_has_unknown_cost is False:
+            return MiddlewareResult(
+                action=MiddlewareAction.STOP,
+                reason=(
+                    "Budget unverifiable: usage with unknown pricing was recorded "
+                    "during this run"
+                ),
+                metadata={"code": "budget-unverifiable"},
+            )
+
+        return MiddlewareResult()
+
+    def reset(self, reset_reason: ResetReason = ResetReason.STOP) -> None:
+        # No-op, like the other budget middlewares: reset fires at
+        # resume/compaction boundaries where re-anchoring would corrupt the
+        # run budget (the run re-anchors at admission instead).
+        pass
+
+
 class AutoCompactMiddleware:
     async def before_turn(self, context: ConversationContext) -> MiddlewareResult:
         threshold = context.config.get_active_model().auto_compact_threshold

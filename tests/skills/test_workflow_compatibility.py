@@ -474,6 +474,83 @@ class TestShippedSkillRewrites:
             "not model diversity" in review
         )
 
+    def test_quick_substitution_uses_model_line_families(self) -> None:
+        review = skill_body("main-review")
+
+        assert (
+            "Model-line substitution applies only to quick single-seat reviews"
+            in review
+        )
+        assert "`zai-glm*`" in review
+        assert "`gpt-6*`" in review
+        assert "`mistral*`" in review
+        assert "it never applies to standard or deep reviews" in review
+
+    def test_deep_review_has_no_authorship_substitution(self) -> None:
+        review = skill_body("main-review")
+
+        assert "deep panels use no authorship substitution" in review
+        assert "regardless of the implementor" in review
+        assert (
+            "Dispatch each seat through the route with no per-seat overrides" in review
+        )
+
+    def test_deep_panel_acceptance_requires_all_seat_statuses_and_identities(
+        self,
+    ) -> None:
+        review = skill_body("main-review")
+
+        assert "gate acceptance requires status for every selected seat" in review
+        assert "missing or incomplete reports treated explicitly" in review
+        assert "resolved canonical-model identities" in review
+
+    def test_routed_deep_requires_post_edit_conversation(self) -> None:
+        review = skill_body("main-review")
+
+        assert "FROZEN route table" in review
+        assert "saved config edits apply to new conversations only" in review
+        assert "the frozen snapshot, not a validator defect" in review
+
+    def test_routed_deep_requires_configured_multi_model_route(self) -> None:
+        review = skill_body("main-review")
+
+        assert "binds every seat to the session model" in review
+        assert "routed deep dispatch" in review
+        assert "configured multi-model route" in review
+
+    def test_direct_fallback_inlines_overlay_body(self) -> None:
+        review = skill_body("main-review")
+
+        assert "explicit `model` and `identity` on the launch" in review
+        assert "copied into `config.instructions`" in review
+
+    def test_execution_brief_pins_ranked_probes_bounded_discovery_and_escalation(
+        self,
+    ) -> None:
+        review = skill_body("main-review")
+
+        assert "parent-ranked probe list" in review
+        assert "one hypothesis, or about five turns" in review
+        assert "25-30 turn schedule" in review
+        assert "stop polishing established blockers" in review
+        assert "INCOMPLETE" in review
+        assert "never converted into a pass" in review
+
+    def test_supplementary_seats_are_reviewer_identities(self) -> None:
+        review = skill_body("main-review")
+
+        assert "Supplementary seats" in review
+        assert "`luna`" in review
+        assert "`flash`" in review
+        assert "bind the read-only `reviewer` identity with no shell access" in review
+        assert "intent, regression coverage, and evidence quality" in review
+        assert "negative cases and boundary questions" in review
+
+    def test_flash_seat_final_message_is_report(self) -> None:
+        review = skill_body("main-review")
+
+        assert "flash's final message must be the report itself" in review
+
 
 class TestNoCeremonyInMinimalSessions:
     """Acceptance: no skill silently reinstates retired slots, mandatory

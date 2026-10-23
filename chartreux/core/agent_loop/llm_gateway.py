@@ -5,7 +5,9 @@ from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import aclosing, asynccontextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+import functools
 from http import HTTPStatus
+from itertools import count
 import time
 from typing import ClassVar, Literal, Protocol
 from uuid import uuid4
@@ -17,6 +19,7 @@ from chartreux.core.agent_loop._transcript_integrity import (
 from chartreux.core.agent_loop.errors import (
     AgentLoopLLMResponseError,
     EmptyLLMResponseError,
+    EmptyReplayBudgetStop,
     ImagesNotSupportedError,
 )
 from chartreux.core.compaction.context import (
@@ -220,22 +223,33 @@ class CallFinalizer:
     and utility callers can reuse this primitive with their own accumulated usage.
     """
 
-    def __init__(self, inputs: CompletionInputs, resources: CallResources) -> None:
+    def __init__(
+        self,
+        inputs: CompletionInputs,
+        resources: CallResources,
+        *,
+        attempt_ordinal: int | None = None,
+    ) -> None:
         self.started = False
         self.usage: LLMUsage | None = None
         self.outcome = UsageOutcome.FAILED
         self._settled = False
         self._sink = resources.accounting_sink
+        self._attempt_ordinal = attempt_ordinal
         self._prices = capture_prices(inputs.model)
+        attribution_updates: dict[str, object] = {
+            "model": inputs.model.alias,
+            "provider": inputs.provider_name,
+            "wire_name": inputs.model.name,
+            "purpose": inputs.purpose,
+        }
+        if inputs.purpose is not UsagePurpose.CONVERSATION:
+            # Utility calls (title, compaction, worktree naming) carry no
+            # work-class label and no run identity.
+            attribution_updates["content_class"] = None
+            attribution_updates["run_id"] = None
         self._attribution = (
-            resources.usage_attribution.model_copy(
-                update={
-                    "model": inputs.model.alias,
-                    "provider": inputs.provider_name,
-                    "wire_name": inputs.model.name,
-                    "purpose": inputs.purpose,
-                }
-            )
+            resources.usage_attribution.model_copy(update=attribution_updates)
             if resources.usage_attribution is not None
             else None
         )
@@ -278,6 +292,7 @@ class CallFinalizer:
                 and usage is not None
                 and not usage.is_final
                 else tokens.presence_state,
+                attempt_ordinal=self._attempt_ordinal,
             )
             pricing = price_usage(**tokens.model_dump(), prices=self._prices)
             record = UsageRecord(
@@ -357,14 +372,22 @@ class LLMGateway:
             else None,
         )
         resources = replace(resources, call_evidence=evidence)
+        attempt_ordinals = count(1)
+
+        @functools.wraps(self._complete_attempt)
+        async def measured_attempt() -> LLMChunk:
+            return await self._complete_attempt(
+                inputs, resources, attempt_ordinal=next(attempt_ordinals)
+            )
+
         call = async_retry(
             tries=2,
             budget=resources.retry_budget,
             is_retryable=lambda error: _admit_empty_replay(error, resources),
             on_retry=_empty_retry_observer(resources),
-        )(self._complete_attempt)
+        )(measured_attempt)
         try:
-            return await call(inputs, resources)
+            return await call()
         except BaseException as error:
             # ONE measured evidence per logical call: the empty replay shares
             # it, so the exhausted-logical-call event stays one event.
@@ -376,15 +399,25 @@ class LLMGateway:
                 )
             )
             attach_call_evidence(error, evidence)
+            stop = _replay_budget_stop(error, resources)
+            if stop is not None:
+                # The replay admission denied the bounded replay: surface the
+                # budget-stop signal, chained to the transient empty response.
+                attach_call_evidence(stop, evidence)
+                raise stop from error
             raise
 
     async def _complete_attempt(  # noqa: PLR0915 -- explicit attempt exit paths
-        self, inputs: CompletionInputs, resources: CallResources
+        self,
+        inputs: CompletionInputs,
+        resources: CallResources,
+        *,
+        attempt_ordinal: int | None = None,
     ) -> LLMChunk:
         from chartreux.core.llm.backend.generic import request_start_observer
 
         start_time = time.perf_counter()
-        finalizer = CallFinalizer(inputs, resources)
+        finalizer = CallFinalizer(inputs, resources, attempt_ordinal=attempt_ordinal)
         observer_token = request_start_observer.set(finalizer.start)
         original_error: BaseException | None = None
         response_received = False
@@ -533,15 +566,24 @@ class LLMGateway:
             else None,
         )
         resources = replace(resources, call_evidence=evidence)
+        attempt_ordinals = count(1)
+
+        @functools.wraps(self._stream)
+        def measured_stream() -> AsyncGenerator[LLMChunk, None]:
+            return self._stream(
+                inputs,
+                resources,
+                transcript=transcript,
+                attempt_ordinal=next(attempt_ordinals),
+            )
+
         stream = async_generator_retry(
             tries=2,
             budget=resources.retry_budget,
             is_retryable=lambda error: _admit_empty_replay(error, resources),
             on_retry=_empty_retry_observer(resources),
-        )(self._stream)
-        return self._evidenced_stream(
-            stream(inputs, resources, transcript=transcript), evidence, resources
-        )
+        )(measured_stream)
+        return self._evidenced_stream(stream(), evidence, resources)
 
     async def _evidenced_stream(
         self,
@@ -565,6 +607,12 @@ class LLMGateway:
                 )
             )
             attach_call_evidence(error, evidence)
+            stop = _replay_budget_stop(error, resources)
+            if stop is not None:
+                # The replay admission denied the bounded replay: surface the
+                # budget-stop signal, chained to the transient empty response.
+                attach_call_evidence(stop, evidence)
+                raise stop from error
             raise
 
     async def _stream(  # noqa: PLR0912, PLR0915 -- explicit stream exit/settlement paths
@@ -573,6 +621,7 @@ class LLMGateway:
         resources: CallResources,
         *,
         transcript: TranscriptSink,
+        attempt_ordinal: int | None = None,
     ) -> AsyncGenerator[LLMChunk, None]:
         from chartreux.core.llm.backend.generic import request_start_observer
 
@@ -583,7 +632,7 @@ class LLMGateway:
         published = False
         buffered: list[LLMChunk] = []
         start_time = time.perf_counter()
-        finalizer = CallFinalizer(inputs, resources)
+        finalizer = CallFinalizer(inputs, resources, attempt_ordinal=attempt_ordinal)
         original_error: BaseException | None = None
         try:
             backend_messages = messages_for_backend(inputs.messages, inputs.model)
@@ -839,6 +888,24 @@ def _admit_empty_replay(error: Exception, resources: CallResources) -> bool:
     return isinstance(error, EmptyLLMResponseError) and (
         resources.admit_replay is None or resources.admit_replay()
     )
+
+
+def _replay_budget_stop(
+    error: BaseException, resources: CallResources
+) -> EmptyReplayBudgetStop | None:
+    """Translate a terminal empty response whose replay admission was denied.
+
+    The translation lives at the logical-call terminal boundary, not only in
+    the retry predicate: both retry decorators bypass ``is_retryable`` on the
+    last attempt or an exhausted deadline, and the streaming decorator also
+    stops replaying once an item has been published. No admission callback,
+    or an admitting callback, preserves the original error.
+    """
+    if not isinstance(error, EmptyLLMResponseError):
+        return None
+    if resources.admit_replay is None or resources.admit_replay():
+        return None
+    return EmptyReplayBudgetStop(error)
 
 
 def _empty_retry_observer(resources: CallResources) -> RetryObserver:

@@ -429,6 +429,8 @@ def test_stdio_session_start_maps_agent_config_workdir_to_runtime_cwd() -> None:
         "max_turns": 3,
         "max_price": 2.5,
         "max_session_tokens": 1000,
+        "run_max_price": None,
+        "run_max_session_tokens": None,
         "headless": True,
         "trust_workspace": True,
         "mcp_servers": [],

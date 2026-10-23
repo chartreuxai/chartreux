@@ -175,6 +175,25 @@ An unmet requirement is reported instead of pretending diversity; a
 fresh-context reviewer on the same model is context separation, honestly
 labeled. Configure distinct models explicitly via per-seat model fields.
 
+Deep panels comprise all CONFIGURED seats, and the shipped default differs
+from local policy. The shipped route composes three seats — analytical,
+peer, execution — and binds every seat to `$session`. Supplementary seats
+launch only because the route configures them: a five-seat configured panel
+(for example — the shipped review procedure names the conventional
+supplementary seats `luna` and `flash`) is local policy, not a shipped
+default. Deep panels use no authorship substitution regardless of the
+implementor: the panel's independence is structural, fresh contexts on
+distinct models. Substitution — a fresh reviewer from a different model
+line than the material author — applies only to quick single-seat reviews.
+Routed per-seat dispatch resolves against the conversation's
+FROZEN route table, captured at bind time: a route configured
+mid-conversation stays pending, and a launch rejection naming unmet
+model diversity on a conversation bound before the config edit is that
+frozen snapshot, not a validator defect — it requires a new conversation.
+And because the shipped route binds every seat to `$session`, a fresh
+install needs a configured multi-model route before routed deep dispatch
+works.
+
 The shipped routes are `implementation` (coder), `mechanical-edit` (coder,
 mechanical), `research` (researcher), `search` (researcher, mechanical),
 `exploration` (researcher), `verification` (coder, mechanical),
@@ -337,6 +356,34 @@ explicitly defaultable questions can expire unanswered; see
 - `release_agent(agent_id)` closes and removes a subagent — resident or
   terminal — when it is no longer useful, purging its stored results and wait
   leases.
+
+### Run budgets
+
+Root intervals persist with their anchors: a root session's per-session
+run-budget options (`run_max_price`, `run_max_session_tokens`) arm the root
+loop's run-budget checkpoint, the interval's baseline is written at the
+checkpoint's first evaluation, and that baseline persists in the session
+state — so a resumed root's interval still spans the resume boundary and
+pre-resume consumption counts against the run budget. See the
+[configuration reference](../reference/configuration.md#agents-and-skills).
+
+Run budgets are checkpoints, not reservations: each evaluation compares
+anchor-relative consumption against the cap and stops the run only when
+consumption is already over it; nothing is reserved in advance.
+
+Foreground subagent runs are unanchored and unjoined: the per-run baseline
+anchor and the ledger's run attribution join key are written on the background
+admission path only, so a foreground subagent run's ledger records carry a
+null run_id and its per-run coverage is unattributable. (Armed budgets still
+apply to a foreground run's loop; what is missing is the admission anchor and
+the join key.)
+
+Budget exhaustion surfaces as a terminal budget stop: the run settles through
+the middleware STOP path with the budget-exceeded or budget-unverifiable stop
+reason and a `budget-stopped` parent notification. It is not a suspension —
+no failure envelope, no recovery episode, no pending resume, no successor run
+— and not a provider failure. An empty model response whose in-call replay the
+run budget denies settles the same way.
 
 ### Failure recovery, suspension, and resume
 

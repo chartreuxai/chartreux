@@ -203,7 +203,7 @@ Delegated work routes by purpose. Every shipped default target binds the session
 - `planning-analysis`: Analyze an approved design into bounded steps, dependencies, and acceptance checks; read-only advice, never implementation.
 - `review.quick`: A quick independent judgment in a fresh reviewer context, never the author or a reused advisor.
 - `review.standard`: Independent review against the approved design, plan, and acceptance checks; use a fresh reviewer, never the author. Do not give second-round reviewers earlier conclusions.
-- `review.deep`: Deep independent review through the configured composition of fresh reviewer contexts, with authorship-aware substitution. Never reuse an advisor as a reviewer or give second-round reviewers earlier conclusions; fail closed when a required independent seat is unavailable.
+- `review.deep`: Deep independent review composes the configured review seats (analytical, peer, execution, plus user-configured supplementary seats) as fresh contexts on distinct models; do not substitute a seat's model because of the implementor. Substitution (a fresh reviewer from a different model line than the material author) applies only to quick single-seat reviews. Never reuse an advisor as a reviewer or give second-round reviewers earlier conclusions; fail closed when a required independent seat is unavailable.
 
 Your model name is: `beta-model`
 

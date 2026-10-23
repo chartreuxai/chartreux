@@ -4,8 +4,9 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from functools import lru_cache
-import glob
+import os
 from pathlib import Path
 import re
 import shlex
@@ -21,6 +22,11 @@ from chartreux.core.dangerous_commands import (
     operations_for_ids,
 )
 from chartreux.core.tools.base import ToolPermission
+from chartreux.core.tools.builtins._shell_argv import (
+    PatternGlobCandidate,
+    ShellToken,
+    split_shell_tokens,
+)
 from chartreux.core.tools.builtins._shell_command_policy import (
     ShellCommandPolicy,
     analyze_shell_command_policy,
@@ -179,6 +185,11 @@ class _GuardrailPart:
     access: PathAccess | None = None
     cwd_overrides: tuple[str, ...] = ()
     inspect_executable: bool = False
+    # Original provenance-carrying tokens for argv-wrapper reassemblies:
+    # the synthetic shlex.join text would re-quote unquoted glob
+    # metacharacters, so the wrapper visit carries the source tokens and
+    # downstream tokenization must not re-derive provenance from that text.
+    tokens: tuple[str, ...] | None = None
 
 
 def _has_unrecognized_nested_shell(tokens: list[str]) -> bool:
@@ -194,6 +205,25 @@ def _has_unrecognized_nested_shell(tokens: list[str]) -> bool:
         )
         for index, token in enumerate(tokens[1:], 1)
     )
+
+
+def _visit_tokens(part: str, tokens_override: tuple[str, ...] | None) -> list[str]:
+    """The tokens a guardrail visit analyzes.
+
+    An argv-wrapper reassembly supplies the ORIGINAL tokens so synthetic
+    quoting never re-derives their provenance; real source text is freshly
+    tokenized with its own quote provenance.
+    """
+    if tokens_override is not None:
+        return list(tokens_override)
+    try:
+        return split_shell_tokens(part)
+    except ValueError as exc:
+        raise _UnsafeShellSyntax(
+            "malformed shell quoting",
+            denial_class=DenialClass.SYNTAX,
+            alternative="write the command with well-formed shell quoting",
+        ) from exc
 
 
 def _expand_guardrail_parts(  # noqa: PLR0915
@@ -220,6 +250,22 @@ def _expand_guardrail_parts(  # noqa: PLR0915
         nonlocal byte_count
         if target in _REDIRECTION_DEVICES:
             return  # Device sinks are not filesystem targets.
+        if any(character in target for character in _SHELL_GLOB_CHARACTERS) and (
+            not isinstance(target, ShellToken) or target.meta_unquoted
+        ):
+            # Shells pathname-expand redirect destinations with UNQUOTED glob
+            # metacharacters (zsh writes every match; bash overwrites a single
+            # match or creates the literal name), so the write-target set is
+            # not statically knowable: fail closed (POLICY). A metacharacter
+            # inside a quoted segment stays literal data (C2b provenance) and
+            # a plain str carries no provenance at all, so both deny. Fires
+            # before any later redirect check, so the redirect-glob denial
+            # wins over the git-metadata guard.
+            raise _UnsafeShellSyntax(
+                f"redirect target '{target}' contains shell glob characters; "
+                "the shell pathname-expands redirect targets, so the write "
+                "target set cannot be safely inspected"
+            )
         byte_count += len(target.encode("utf-8"))
         if byte_count > _MAX_ANALYZED_BYTES or len(expanded) >= _MAX_EXPANDED_COMMANDS:
             raise _UnsafeShellSyntax(
@@ -237,6 +283,7 @@ def _expand_guardrail_parts(  # noqa: PLR0915
         *,
         inspect_executable: bool = False,
         redirect_targets: tuple[str, ...] = (),
+        tokens_override: tuple[str, ...] | None = None,
     ) -> None:
         nonlocal byte_count, next_scope
         for target in redirect_targets:
@@ -252,16 +299,10 @@ def _expand_guardrail_parts(  # noqa: PLR0915
                 scope,
                 cwd_overrides=cwd_overrides,
                 inspect_executable=inspect_executable,
+                tokens=tokens_override,
             )
         )
-        try:
-            tokens = shlex.split(part)
-        except ValueError as exc:
-            raise _UnsafeShellSyntax(
-                "malformed shell quoting",
-                denial_class=DenialClass.SYNTAX,
-                alternative="write the command with well-formed shell quoting",
-            ) from exc
+        tokens = _visit_tokens(part, tokens_override)
         try:
             inline_interpreter_switch(tokens)  # Preserve legacy option diagnostics.
             boundary = executor_boundary(tokens, admission=True)
@@ -318,12 +359,16 @@ def _expand_guardrail_parts(  # noqa: PLR0915
                 child_scope = (*scope, next_scope)
             # shlex.join is only a lossless argv serialization for the policy
             # helpers. This argv is NEVER parsed as shell source or an AST.
+            # The original tokens ride along: re-deriving provenance from the
+            # synthetic quoting would classify an unquoted metacharacter as
+            # quoted data and bypass the pattern inspection.
             visit(
                 shlex.join(child_tokens),
                 child_scope,
                 depth + 1,
                 boundary.cwd_overrides,
                 inspect_executable=True,
+                tokens_override=tuple(child_tokens),
             )
 
     for index, part in enumerate(command_parts):
@@ -346,6 +391,67 @@ _WORKING_DIRECTORY_COMMANDS = {"cd", "pushd"}
 _WORKING_DIRECTORY_POP_COMMANDS = {"popd"}
 _WORKING_DIRECTORY_TOKEN_COUNT = 2
 _SHELL_GLOB_CHARACTERS = frozenset("*?[")
+
+# Work budgets for one pathname expansion. _match_glob_atoms is polynomial
+# per enumerated name, but a crafted pattern can still multiply that per-name
+# table by the number of directory entries it enumerates (and a long pattern
+# makes the table itself large), so the expansion fails closed (None) once
+# either budget is exceeded: permission resolution must stay bounded in time.
+_MAX_EXPANSION_ENTRIES = 4096
+_MAX_EXPANSION_MATCH_STATES = 1 << 19
+
+
+class ExpansionFailure(StrEnum):
+    """Why pathname-expansion inspection failed closed (provenance only).
+
+    The kind selects a denial's detail text, never the verdict: every member
+    denies exactly as the bare ``None`` this replaces did. ENTRY_BUDGET,
+    MATCH_STATE_BUDGET, and UNSUPPORTED_SYNTAX name the actual inspection
+    limit reached while expanding. CALLER_DENIED and NOT_INSPECTED cover
+    denials decided outside the expansion inspection — an expansion whose
+    results the caller rejects (an option-like word, a match outside the
+    authorized workspace) and tokens the inspector never expanded (an
+    unknown cwd, a home-relative word, a partially quoted metacharacter) —
+    and render the generic path-glob message: attributing a work budget to
+    them would be wrong.
+    """
+
+    ENTRY_BUDGET = "entry budget"
+    MATCH_STATE_BUDGET = "match-state budget"
+    UNSUPPORTED_SYNTAX = "unsupported glob syntax"
+    CALLER_DENIED = "denied outside the expansion inspection"
+    NOT_INSPECTED = "never pathname-expanded"
+
+
+_EXPANSION_FAILURE_DETAIL = {
+    ExpansionFailure.ENTRY_BUDGET: (
+        "the pathname expansion exceeded its directory-entry budget"
+    ),
+    ExpansionFailure.MATCH_STATE_BUDGET: (
+        "the pathname expansion exceeded its match-state budget"
+    ),
+    ExpansionFailure.UNSUPPORTED_SYNTAX: (
+        "the pathname expansion uses glob syntax this inspector cannot expand"
+    ),
+}
+
+
+def _expansion_denial(
+    token: str, failure: ExpansionFailure, command_part: str
+) -> PermissionContext:
+    """The path-glob denial carrying the expansion-failure provenance.
+
+    The provenance rides the Diagnostic detail, so it passes through the
+    renderer's redaction and bounding like every other diagnostic field.
+    """
+    return _denied(
+        Diagnostic(
+            "path_glob",
+            token,
+            command_part,
+            detail=_EXPANSION_FAILURE_DETAIL.get(failure),
+        )
+    )
 
 
 def _update_guardrail_cwds(tokens: list[str], possible_cwds: set[Path]) -> bool:
@@ -381,6 +487,249 @@ def _update_guardrail_cwds(tokens: list[str], possible_cwds: set[Path]) -> bool:
     return False
 
 
+def _bracket_range_members(
+    low: str, high: str, *, negated: bool
+) -> frozenset[str] | None:
+    """The characters a shell bracket range conservatively matches.
+
+    Only ASCII digit and same-case ASCII letter endpoints are modeled. For a
+    POSITIVE range, letter ranges are broadened to both cases because a
+    collation-ordered range (``[a-z]`` under a UTF-8 locale) also matches the
+    opposite case; the broadening grows the match set, so it only over-denies.
+    A NEGATED range must not be broadened: the model excludes its members, so
+    excluding the broadened set would shrink the modeled complement below
+    every locale's real ``[!a-z]`` (which matches ``A``, ``Z``, ...). The
+    un-broadened range is the narrowest any locale produces, so its
+    complement is a superset of every locale's negated match set. A reversed
+    range under a negated set fails closed: bash matches nothing for
+    ``[c-a]``, so ``[!c-a]`` matches everything and no finite member set
+    over-approximates it. Any other endpoint pair returns None: the caller
+    must fail closed rather than trust the model's expansion.
+    """
+    digits = "0" <= low <= "9" and "0" <= high <= "9"
+    letters = ("a" <= low <= "z" and "a" <= high <= "z") or (
+        "A" <= low <= "Z" and "A" <= high <= "Z"
+    )
+    if not digits and not letters:
+        return None
+    if negated and ord(low) > ord(high):
+        return None
+    first, second = sorted((ord(low), ord(high)))
+    members = {chr(point) for point in range(first, second + 1)}
+    if letters and not negated:
+        members |= {member.upper() for member in members}
+        members |= {member.lower() for member in members}
+    return frozenset(members)
+
+
+def _parse_glob_component(component: str) -> tuple | None:
+    """Parse one pathname component into conservative match atoms.
+
+    Returns None when the component uses syntax this model cannot faithfully
+    expand: POSIX character classes (``[[:alpha:]]``), collating or
+    equivalence symbols, brace expansion, a range with unsupported
+    endpoints, or a run of two or more consecutive stars. None means the
+    caller fails closed.
+    """
+    atoms: list[tuple] = []
+    index = 0
+    length = len(component)
+    while index < length:
+        character = component[index]
+        if character == "*":
+            if index + 1 < length and component[index + 1] == "*":
+                # Two or more consecutive stars are zsh's recursive globstar:
+                # the component spans zero or more DIRECTORY levels, which
+                # this one-component model cannot expand faithfully (parsing
+                # it as two single-level stars would under-model the
+                # expansion and authorize reads the shell really makes).
+                # Fail closed; the over-denial also covers intra-segment
+                # spellings like ``a**b``, matching the brace/POSIX-class
+                # precedent.
+                return None
+            atoms.append(("star",))
+            index += 1
+            continue
+        if character == "?":
+            atoms.append(("question",))
+            index += 1
+            continue
+        if character == "{":
+            # Bash brace-expands before globbing; the model cannot.
+            return None
+        if character != "[":
+            atoms.append(("literal", character))
+            index += 1
+            continue
+        cursor = index + 1
+        negated = cursor < length and component[cursor] in "!^"
+        if negated:
+            cursor += 1
+        members: set[str] = set()
+        first_content = True
+        closed = False
+        while cursor < length:
+            member = component[cursor]
+            if member == "]" and not first_content:
+                closed = True
+                cursor += 1
+                break
+            first_content = False
+            if member == "[" and cursor + 1 < length and component[cursor + 1] in ":.=":
+                return None
+            if (
+                cursor + 2 < length
+                and component[cursor + 1] == "-"
+                and component[cursor + 2] != "]"
+            ):
+                range_members = _bracket_range_members(
+                    member, component[cursor + 2], negated=negated
+                )
+                if range_members is None:
+                    return None
+                members |= range_members
+                cursor += 3
+                continue
+            members.add(member)
+            cursor += 1
+        if not closed:
+            # An unclosed '[' is a literal, matching bash and fnmatch.
+            atoms.append(("literal", "["))
+            index += 1
+            continue
+        atoms.append(("set", frozenset(members), negated))
+        index = cursor
+    return tuple(atoms)
+
+
+def _match_glob_atoms(name: str, atoms: tuple) -> bool:
+    """Whether one filename matches a parsed component (classic glob).
+
+    Memoized dynamic programming over (name index, atom index) states: the
+    previous recursive backtracking re-explored every split point of every
+    star, so a crafted pattern (``*a`` repeated against a long name with an
+    impossible suffix) stalled permission resolution exponentially. Every
+    state is now computed at most once, so matching is polynomial in the
+    name and atom counts.
+    """
+    name_length = len(name)
+    atom_count = len(atoms)
+    # matches[atom_index][name_index]: name[name_index:] matches
+    # atoms[atom_index:]. Atom rows fill from the last atom backwards, and a
+    # star row reads its own next name index, so name indices fill downwards.
+    matches = [[False] * (name_length + 1) for _ in range(atom_count + 1)]
+    matches[atom_count][name_length] = True
+    for atom_index in range(atom_count - 1, -1, -1):
+        atom = atoms[atom_index]
+        kind = atom[0]
+        row = matches[atom_index]
+        next_row = matches[atom_index + 1]
+        for name_index in range(name_length, -1, -1):
+            if kind == "star":
+                # A star matches zero characters (advance past it) or one
+                # more (consume a character and stay on the star).
+                row[name_index] = next_row[name_index] or (
+                    name_index < name_length and row[name_index + 1]
+                )
+            elif name_index >= name_length:
+                row[name_index] = False
+            elif kind == "question":
+                row[name_index] = next_row[name_index + 1]
+            elif kind == "literal":
+                row[name_index] = (
+                    name[name_index] == atom[1] and next_row[name_index + 1]
+                )
+            else:  # set
+                in_set = name[name_index] in atom[1]
+                if atom[2]:
+                    in_set = not in_set
+                row[name_index] = in_set and next_row[name_index + 1]
+    return matches[0][0]
+
+
+def _pattern_expansion(
+    cwd: Path, token: str
+) -> list[tuple[Path, str]] | ExpansionFailure:
+    """A conservative superset of the shell's pathname expansion of *token*.
+
+    Returns ``(path, word)`` pairs: the expanded filesystem path and the
+    command-line word the shell substitutes. The cwd is anchored literally
+    (never pattern-interpreted), and every component is matched against the
+    filesystem with the conservative model above. Returns an
+    :class:`ExpansionFailure` when the pattern uses syntax the model cannot
+    faithfully expand, when the expansion exceeds its work budget, or when
+    the token has no pathname components: the caller must fail closed,
+    never authorize the empty expansion. The failure kind is provenance for
+    the denial message only — every failure denies identically.
+    """
+    items: list[tuple[Path, str]] = [(cwd, "")]
+    if token.startswith("/"):
+        items = [(Path("/"), "/")]
+    components = [component for component in token.split("/") if component]
+    if not components:
+        return ExpansionFailure.NOT_INSPECTED
+    enumerated = 0
+    match_states = 0
+    for index, component in enumerate(components):
+        last = index == len(components) - 1
+        if component in {".", ".."}:
+            items = [
+                (
+                    directory.parent if component == ".." else directory,
+                    f"{word}/{component}"
+                    if word not in {"", "/"}
+                    else word + component,
+                )
+                for directory, word in items
+            ]
+            continue
+        atoms = _parse_glob_component(component)
+        if atoms is None:
+            return ExpansionFailure.UNSUPPORTED_SYNTAX
+        has_meta = any(atom[0] != "literal" for atom in atoms)
+        nxt: list[tuple[Path, str]] = []
+        for directory, word in items:
+            if not has_meta:
+                child_word = (
+                    f"{word}/{component}" if word not in {"", "/"} else word + component
+                )
+                candidate = directory / component
+                if last or candidate.is_dir():
+                    nxt.append((candidate, child_word))
+                continue
+            try:
+                names = sorted(os.listdir(directory))
+            except OSError:
+                continue
+            enumerated += len(names)
+            if enumerated > _MAX_EXPANSION_ENTRIES:
+                # A crafted pattern over a large tree must not turn
+                # permission resolution into an unbounded walk: fail closed.
+                return ExpansionFailure.ENTRY_BUDGET
+            for name in names:
+                # A leading dot must be matched by a literal leading dot.
+                if name.startswith(".") and not (
+                    atoms[0][0] == "literal" and atoms[0][1] == "."
+                ):
+                    continue
+                # The memoized matcher's table is (atoms + 1) x (name + 1)
+                # states; count them so a long pattern cannot stall the
+                # resolution either.
+                match_states += (len(atoms) + 1) * (len(name) + 1)
+                if match_states > _MAX_EXPANSION_MATCH_STATES:
+                    return ExpansionFailure.MATCH_STATE_BUDGET
+                if not _match_glob_atoms(name, atoms):
+                    continue
+                path = directory / name
+                if last or path.is_dir():
+                    match_word = (
+                        f"{word}/{name}" if word not in {"", "/"} else word + name
+                    )
+                    nxt.append((path, match_word))
+        items = nxt
+    return items
+
+
 def _scoped_guardrail_cwds(
     expanded: list[_GuardrailPart], cwd: Path
 ) -> Iterator[tuple[_GuardrailPart, list[str], set[Path], bool]]:
@@ -399,7 +748,11 @@ def _scoped_guardrail_cwds(
                     for parent_cwd in scope_cwds[scope]
                 }
         possible_cwds = scope_cwds[scope]
-        tokens = _split_command_tokens(entry.text)
+        if entry.tokens is not None:
+            # Provenance-carrying tokens from an argv-wrapper reassembly.
+            tokens = list(entry.tokens)
+        else:
+            tokens = _split_command_tokens(entry.text)
         scope_unknown[scope] |= _update_guardrail_cwds(tokens, possible_cwds)
         yield entry, tokens, possible_cwds, scope_unknown[scope]
 
@@ -413,6 +766,8 @@ _READ_ONLY_COMMANDS_POSIX = [
     "diff",
     "dirname",
     "du",
+    "egrep",
+    "fgrep",
     "file",
     "find",
     "fmt",
@@ -429,6 +784,7 @@ _READ_ONLY_COMMANDS_POSIX = [
     "paste",
     "pwd",
     "readlink",
+    "rg",
     "sha1sum",
     "sha256sum",
     "shasum",
@@ -613,7 +969,7 @@ _PATH_COMMANDS = (
 
 def _split_command_tokens(command: str) -> list[str]:
     try:
-        return shlex.split(command)
+        return split_shell_tokens(command)
     except ValueError:
         return command.split()
 
@@ -627,6 +983,24 @@ def _part_command(tokens: list[str]) -> str:
     return Path(tokens[0]).name or tokens[0]
 
 
+def _find_pattern_operand_uninspectable(token: str) -> bool:
+    """Whether a find pattern operand's globs are unquoted, hence injectable.
+
+    The shell pathname-expands an unquoted glob-bearing pattern word before
+    find runs, so the expansion products re-enter find's argv: a decoy file
+    named `-exec` turns ``find . -name -* ...`` into an execution predicate.
+    The inspector cannot expand pattern operands, so the pattern-operand
+    carve-out must not assume the word stays inert — an unquoted glob fails
+    closed at the path-glob rule, exactly like a redirect target that looks
+    like a glob. A metacharacter inside a quoted segment stays literal data
+    (C2b provenance) and a plain str carries no provenance at all, so both
+    deny.
+    """
+    return any(character in token for character in _SHELL_GLOB_CHARACTERS) and (
+        not isinstance(token, ShellToken) or token.meta_unquoted
+    )
+
+
 # Only commands whose modeled operands cannot be output files receive exact
 # instruction-read capabilities. E.g. sort -o, uniq's second operand, sed and
 # archivers are deliberately not classified as readers. The script-loading
@@ -635,10 +1009,13 @@ def _part_command(tokens: list[str]) -> str:
 _INSTRUCTION_READ_COMMANDS = frozenset({
     ".",
     "cat",
+    "egrep",
+    "fgrep",
+    "grep",
+    "rg",
     "head",
     "tail",
     "wc",
-    "grep",
     "nl",
     "tac",
     "stat",
@@ -1118,7 +1495,7 @@ class ShellPermissionResolver:
             return _denied(Diagnostic(hit, token, command_part))
         return None
 
-    def _ls_listing_glob_permitted(
+    def _ls_listing_glob_expansion_failure(
         self,
         *,
         token: str,
@@ -1126,24 +1503,146 @@ class ShellPermissionResolver:
         cwd_unknown: bool,
         access: PathAccess,
         authority: PathAuthority,
-    ) -> bool:
-        """Whether an ls listing glob stays within every scoped cwd."""
+    ) -> ExpansionFailure | None:
+        """Where an ls listing glob would be denied, else None.
+
+        Provenance only: the returned kind never changes the verdict. A
+        token the inspector never expanded (an unknown cwd, a home-relative
+        or absolute word, a glob-bearing parent) reports NOT_INSPECTED; an
+        expansion-inspection failure names its actual limit.
+        """
         if cwd_unknown or Path(token).is_absolute() or token.startswith("~"):
-            return False
+            return ExpansionFailure.NOT_INSPECTED
         parent = str(Path(token).parent)
         if any(character in parent for character in _SHELL_GLOB_CHARACTERS):
-            return False
-        return all(
-            self.workspace.allows(resolve_tool_path(parent, cwd))
-            and authority.allows(resolve_tool_path(parent, cwd), access)
-            and authority.allows(resolve_tool_path(token, cwd), access)
-            and all(
-                self.workspace.allows(Path(match).resolve())
-                and authority.allows(Path(match).resolve(), access)
-                for match in glob.glob(str(cwd / token))
+            return ExpansionFailure.NOT_INSPECTED
+        for cwd in possible_cwds:
+            if not (
+                self.workspace.allows(resolve_tool_path(parent, cwd))
+                and authority.allows(resolve_tool_path(parent, cwd), access)
+                and authority.allows(resolve_tool_path(token, cwd), access)
+            ):
+                return ExpansionFailure.CALLER_DENIED
+            failure = self._expansion_failure(token, {cwd}, authority, access)
+            if failure is not None:
+                return failure
+        return None
+
+    def _pattern_glob_expansion_failure(
+        self,
+        token: str,
+        possible_cwds: set[Path],
+        cwd_unknown: bool,
+        authority: PathAuthority,
+        access: PathAccess,
+    ) -> ExpansionFailure | None:
+        """Where a pattern-position glob would be denied, else None.
+
+        A grep-family pattern word whose glob metacharacters are all unquoted
+        is pathname-expanded by the shell before the command runs, so the
+        expansion's matches join the read-inspected surface. The cwd is
+        anchored literally and the expansion is the conservative model in
+        :func:`_pattern_expansion`: syntax it cannot faithfully evaluate
+        fails closed, never authorizing an empty expansion. An empty match
+        set from expandable syntax passes the literal word through as regex
+        data, which is safe. PREFLIGHT ONLY: the match set checked here is
+        not bound to the shell's subsequent execution, so the model must
+        stay a superset of any plausible expansion. Provenance only: the
+        returned kind never changes the verdict, and a token the inspector
+        never expanded (an unknown cwd or a home-relative word) reports
+        NOT_INSPECTED, not a work budget.
+        """
+        if cwd_unknown or token.startswith("~"):
+            return ExpansionFailure.NOT_INSPECTED
+        return self._expansion_failure(token, possible_cwds, authority, access)
+
+    def _expansion_failure(
+        self,
+        token: str,
+        possible_cwds: set[Path],
+        authority: PathAuthority,
+        access: PathAccess,
+    ) -> ExpansionFailure | None:
+        """Why pathname-expansion inspection would deny *token*, else None.
+
+        Provenance only: the returned kind selects the denial's detail
+        text, never the verdict — every failure here denies exactly as the
+        boolean this method replaces. A failure inside the expansion
+        (unsupported syntax, an exhausted work budget) names its limit; a
+        failure of the expansion's RESULTS (an option-like word, a match
+        outside the authorized workspace) is this caller's own denial and
+        reports CALLER_DENIED, never a budget or syntax attribution.
+        """
+        for cwd in possible_cwds:
+            expansion = _pattern_expansion(cwd, token)
+            if isinstance(expansion, ExpansionFailure):
+                # Unevaluable syntax or an exhausted work budget: fail
+                # closed instead of authorizing an empty expansion the
+                # shell could still fill.
+                return expansion
+            for match, word in expansion:
+                # The shell substitutes the word into the command's argv, so
+                # the command re-parses it: a spelling beginning with '-'
+                # would inject an option (rg --pre, grep -f, ...). Fail
+                # closed; a './'-prefixed spelling is not option-like.
+                if not token.startswith("/") and word.startswith("-"):
+                    return ExpansionFailure.CALLER_DENIED
+                resolved = match.resolve()
+                if not (
+                    self.workspace.allows(resolved)
+                    and authority.allows(resolved, access)
+                ):
+                    return ExpansionFailure.CALLER_DENIED
+        return None
+
+    def _command_operand_glob_denial(
+        self,
+        *,
+        token: str,
+        entry: _GuardrailPart,
+        command: str,
+        possible_cwds: set[Path],
+        cwd_unknown: bool,
+        access: PathAccess,
+        authority: PathAuthority,
+    ) -> PermissionContext | None:
+        """The path-glob denial for one glob-bearing command operand, else None.
+
+        Called only for a read-context operand that is a pattern-position
+        candidate or bears glob characters. None means the operand's globs
+        are fully accounted for and the caller proceeds past the token: a
+        pattern-position candidate whose expansion inspection passed, or an
+        ls listing glob within every scoped cwd. Every other such operand
+        denies here — with the expansion's provenance when the inspection
+        itself failed (a work budget or unsupported syntax), generically
+        when the denial was decided outside it.
+
+        Synthetic redirect operands are WRITE-stamped by
+        append_redirect_operand, so this heuristic never sees them;
+        redirect-target glob denial lives solely at that seam.
+        """
+        if entry.access is None and isinstance(token, PatternGlobCandidate):
+            failure = self._pattern_glob_expansion_failure(
+                token, possible_cwds, cwd_unknown, authority, access
             )
-            for cwd in possible_cwds
-        )
+            if failure is None:
+                return None
+            return _expansion_denial(token, failure, entry.text)
+        # Python glob and shell bracket expressions differ. Dot-leading
+        # patterns may also expand to . or .. in shells.
+        supported_glob = "[" not in token and not Path(token).name.startswith(".")
+        if command == "ls" and supported_glob:
+            failure = self._ls_listing_glob_expansion_failure(
+                token=token,
+                possible_cwds=possible_cwds,
+                cwd_unknown=cwd_unknown,
+                access=access,
+                authority=authority,
+            )
+            if failure is None:
+                return None
+            return _expansion_denial(token, failure, entry.text)
+        return _denied(Diagnostic("path_glob", token, entry.text))
 
     def _resolve_path_permission(
         self, path_parts: list[_GuardrailPart]
@@ -1188,6 +1687,13 @@ class ShellPermissionResolver:
                     continue
                 # Only listing globs with a literal, scoped parent and safe
                 # current matches are modeled; other path globs fail closed.
+                # The find pattern-operand carve-out keeps quoted and literal
+                # pattern operands (the shell never pathname-expands them),
+                # but an unquoted glob-bearing operand is expanded by the
+                # shell into find's argv — a decoy file named `-exec` injects
+                # an execution predicate — so the inspector, which cannot
+                # expand pattern operands, fails closed on it at the
+                # path-glob denial below instead of skipping it.
                 if (
                     command == "find"
                     and token in tokens[2:]
@@ -1196,35 +1702,35 @@ class ShellPermissionResolver:
                         and tokens[index - 1] in {"-name", "-iname", "-path", "-ipath"}
                         for index in range(2, len(tokens))
                     )
+                    and not _find_pattern_operand_uninspectable(token)
                 ):
                     continue
-                # Bash never pathname-expands a redirect destination, so a
-                # literal glob-looking target is a literal filename: the
-                # path-glob heuristic fires for command operands only, where
-                # the shell really globs. Synthetic redirect operands are the
-                # only parts that carry an access classification.
+                # A grep-family pattern position whose glob metacharacters
+                # are all unquoted is pathname-expanded by the shell before
+                # the command runs, so its expansion joins the read-inspected
+                # surface: in-root matches pass, any out-of-root match (or a
+                # cwd the resolver cannot locate) falls through to the
+                # path-glob denial below. Fully quoted metacharacters never
+                # arrive here; partially quoted ones arrive unmarked and deny.
+                # The expansion check is preflight-only: the checked match
+                # set is not bound to the shell's subsequent execution.
                 if entry.access is None and (
-                    any(character in token for character in "*?")
+                    isinstance(token, PatternGlobCandidate)
+                    or any(character in token for character in "*?")
                     or _has_active_bracket_glob(token.encode())
                 ):
-                    # Python glob and shell bracket expressions differ. Dot-
-                    # leading patterns may also expand to . or .. in shells.
-                    supported_glob = "[" not in token and not Path(
-                        token
-                    ).name.startswith(".")
-                    if (
-                        command == "ls"
-                        and supported_glob
-                        and self._ls_listing_glob_permitted(
-                            token=token,
-                            possible_cwds=possible_cwds,
-                            cwd_unknown=cwd_unknown,
-                            access=access,
-                            authority=authority,
-                        )
-                    ):
-                        continue
-                    return _denied(Diagnostic("path_glob", token, entry.text))
+                    denial = self._command_operand_glob_denial(
+                        token=token,
+                        entry=entry,
+                        command=command,
+                        possible_cwds=possible_cwds,
+                        cwd_unknown=cwd_unknown,
+                        access=access,
+                        authority=authority,
+                    )
+                    if denial is not None:
+                        return denial
+                    continue
                 if (
                     cwd_unknown
                     and not Path(token).is_absolute()

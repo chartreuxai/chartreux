@@ -145,6 +145,13 @@ def render_diagnostic(diagnostic: Diagnostic) -> str:  # noqa: PLR0912
                 f"Shell path glob candidate '{token}' in command segment '{part}' "
                 "cannot be safely inspected"
             )
+            # Expansion-inspection provenance (which work budget was
+            # exhausted, or unsupported glob syntax); a caller-side or
+            # never-inspected denial carries no detail and renders exactly
+            # as before. The pre-escaped detail field is used, never the
+            # raw diagnostic value.
+            if diagnostic.detail:
+                message = f"{message} ({detail})"
         case "denylist":
             message = f"Command denied: '{part}' matches denylist pattern '{token}'. Do not attempt to run this command."
         case "dangerous_command":

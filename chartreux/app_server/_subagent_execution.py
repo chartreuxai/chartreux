@@ -705,6 +705,12 @@ class SubagentExecution:
             if resume is not None
             else self._view._new_run_id(agent_id)
         )
+        # B2a: every run admission — fresh, reused, replacement successor,
+        # resume successor — anchors the per-run baseline here, downstream
+        # of the cumulative-stat transfer and the resume stats rebind, so a
+        # replacement's anchor reflects the inherited baseline. The anchor
+        # is per-run state, deliberately outside _CUMULATIVE_STAT_FIELDS.
+        runtime.agent_loop.stats.anchor_run_baseline()
         prior_current_run = record.current_run
         prior_retained = record.retained
         prior_latest_run_id = record.latest_run_id
@@ -729,6 +735,9 @@ class SubagentExecution:
         record.current_run = run_record
         record.latest_run_id = run_id
         self._view._latest_run_ids[agent_id] = run_id
+        # The run's attribution join key: the child loop stamps every ledger
+        # record made during this run with the run id (cleared at run end).
+        runtime.agent_loop.run_identity = run_id
         # Commit the retention policy for this admission. A fresh launch
         # resolves explicit task arg -> generation snapshot default; a reuse
         # inherits the committed policy unless the caller explicitly overrides
@@ -1121,6 +1130,8 @@ class SubagentExecution:
             else:
                 self._view._active_work_slots.discard(slot)
             context.runtime.turns._event_sink = context.previous_event_sink
+            if context.runtime.agent_loop.run_identity == context.run_id:
+                context.runtime.agent_loop.run_identity = None
             if not context.committed:
                 return  # noqa: B012
             context.run_record.completed_at = self._view._clock()

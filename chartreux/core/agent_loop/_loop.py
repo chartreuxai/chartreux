@@ -70,6 +70,7 @@ from chartreux.core.agent_loop.errors import (
     AgentLoopError,
     AgentLoopLLMResponseError as AgentLoopLLMResponseError,
     AgentLoopStateError,
+    EmptyReplayBudgetStop,
     ImagesNotSupportedError,
 )
 from chartreux.core.agent_loop.llm_gateway import (
@@ -136,7 +137,7 @@ from chartreux.core.hooks.config import load_hooks_from_fs
 from chartreux.core.hooks.manager import HooksManager
 from chartreux.core.hooks.models import HookConfigResult, HookEvent, HookSessionContext
 from chartreux.core.llm.backend.factory import create_backend
-from chartreux.core.llm.failures import RequestRetryBudget
+from chartreux.core.llm.failures import RequestRetryBudget, classify
 from chartreux.core.llm.format import APIToolFormatHandler, ResolvedToolCall
 from chartreux.core.llm.types import BackendLike
 from chartreux.core.llm.utility_completion import is_fast_utility_model
@@ -162,6 +163,7 @@ from chartreux.core.middleware import (
     MiddlewareResult,
     PriceLimitMiddleware,
     ResetReason,
+    RunBudgetMiddleware,
     TokenLimitMiddleware,
     TurnLimitMiddleware,
 )
@@ -434,6 +436,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         max_price: float | None = None,
         max_tokens: int | None = None,
         max_session_tokens: int | None = None,
+        run_max_price: float | None = None,
+        run_max_session_tokens: int | None = None,
         backend: BackendLike | None = None,
         enable_streaming: bool = False,
         launch_context: dict[str, object] | None = None,
@@ -507,6 +511,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         # tier/capability instead of a default.
         self.launch_package_tier = launch_package_tier
         self.launch_replacement_capability = launch_replacement_capability
+        # The subagent run this loop is currently executing (set at run
+        # admission, cleared at run end): the attribution join key to the
+        # app-side run record. None for root and utility calls.
+        self.run_identity: str | None = None
         self.frozen_instructions = frozen_instructions
         self.committed_model = committed_model
         self._committed_selection: str | None = None
@@ -685,6 +693,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._max_price = max_price
         self._max_tokens = max_tokens
         self._max_session_tokens = max_session_tokens
+        self._run_max_price = run_max_price
+        self._run_max_session_tokens = run_max_session_tokens
         self._plan_session = PlanSession()
         self._user_plan: str | None = None
 
@@ -832,6 +842,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             parent_session_id_getter=lambda: self.parent_session_id,
             is_subagent_getter=lambda: self._is_subagent,
             launch_identity_getter=lambda: self.launch_identity,
+            launch_purpose_getter=lambda: self.launch_purpose,
+            run_identity_getter=lambda: self.run_identity,
             accounting_owner_getter=lambda: self.accounting_owner,
             accounting_sink_getter=lambda: getattr(self, "_accounting_sink", None),
             usage_attribution_getter=lambda: getattr(self, "_usage_attribution", None),
@@ -1232,6 +1244,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             max_price=self._max_price,
             max_tokens=self._max_tokens,
             max_session_tokens=self._max_session_tokens,
+            run_max_price=self._run_max_price,
+            run_max_session_tokens=self._run_max_session_tokens,
             enable_streaming=self.enable_streaming,
             launch_context=self.launch_context,
             headless=self._headless,
@@ -2066,6 +2080,16 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if self._max_session_tokens is not None:
             pipeline.add(TokenLimitMiddleware(self._max_session_tokens))
 
+        # The run budget sits after the absolute session backstops: pipeline
+        # order is evaluation order and the first STOP wins.
+        if self._run_max_price is not None or self._run_max_session_tokens is not None:
+            pipeline.add(
+                RunBudgetMiddleware(
+                    run_max_price=self._run_max_price,
+                    run_max_session_tokens=self._run_max_session_tokens,
+                )
+            )
+
         pipeline.add(AutoCompactMiddleware())
         if config.context_warnings:
             pipeline.add(ContextWarningMiddleware(0.5))
@@ -2330,7 +2354,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             return False
         return self.messages[-1].role == Role.user
 
-    async def _conversation_loop(  # noqa: PLR0912 - conversation lifecycle
+    async def _conversation_loop(  # noqa: PLR0912, PLR0915 - conversation lifecycle
         self,
         user_msg: str | None,
         client_message_id: str | None = None,
@@ -2379,6 +2403,27 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                                 user_cancelled or is_user_cancellation_event(event)
                             )
                             yield event
+                except EmptyReplayBudgetStop as stop:
+                    # The gateway denied the bounded empty replay at a budget
+                    # checkpoint: re-evaluate the FULL pipeline for the
+                    # authoritative stop reason and terminate through the
+                    # middleware stop path — no replay, failover, compaction,
+                    # retry, step increment, title, hooks, or recovery.
+                    failure = classify(stop)
+                    if failure.retry_eligible or failure.failover_eligible:
+                        raise AgentLoopStateError(
+                            "Empty replay budget stop is retry- or failover-eligible"
+                        ) from stop
+                    result = await self.middleware_pipeline.run_before_turn(
+                        self._get_context()
+                    )
+                    if result.action is not MiddlewareAction.STOP:
+                        raise AgentLoopStateError(
+                            "Empty replay denied without a middleware STOP"
+                        ) from None
+                    async for event in self._handle_middleware_result(result):
+                        yield event
+                    return
                 except ContextTooLongError:
                     if not self._should_self_heal():
                         raise
@@ -2803,6 +2848,16 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             self.stats.session_total_llm_tokens > self._max_session_tokens
         ):
             return False
+        # The run checkpoint guards replay admission too, so an empty replay
+        # cannot bypass the per-run budget. The middleware is stateless, so a
+        # throwaway instance reuses the exact checkpoint logic.
+        if self._run_max_price is not None or self._run_max_session_tokens is not None:
+            run_budget = RunBudgetMiddleware(
+                run_max_price=self._run_max_price,
+                run_max_session_tokens=self._run_max_session_tokens,
+            )
+            if run_budget.evaluate(self.stats).action is MiddlewareAction.STOP:
+                return False
         return self._max_price is None or (
             self.stats.known_cost_total <= self._max_price
             and not self.stats.has_unknown_cost

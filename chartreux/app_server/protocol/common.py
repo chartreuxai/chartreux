@@ -135,6 +135,8 @@ class AgentConfig(ProtocolModel):
     max_turns: int | None = None
     max_price: float | None = None
     max_session_tokens: int | None = None
+    run_max_price: float | None = None
+    run_max_session_tokens: int | None = None
     headless: bool = False
     trust_workspace: bool = False
     mcp_servers: list[SessionMCPServer] = Field(default_factory=list)

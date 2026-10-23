@@ -1737,16 +1737,35 @@ def test_redirect_marker_standalone_and_prefix_semantics_are_preserved(
 @pytest.mark.parametrize(
     "command",
     [
-        # Bash never pathname-expands a redirect destination, so a literal
-        # glob-looking target is a literal filename, not a glob.
+        # Shells pathname-expand redirect destinations (zsh writes every
+        # match; bash overwrites a single match or creates the literal name),
+        # so a target with any UNQUOTED glob metacharacter fails closed.
+        # C2b restores fully quoted targets as literal WRITE operands below.
         "echo x > f[0]",
-        'echo x > f"*"',
         'echo x > "f"[0]',
         'echo x > "sub"/f[0]',
         "echo x > out[1].log",
     ],
 )
-def test_glob_looking_redirect_targets_are_literal_filenames(
+def test_glob_looking_redirect_targets_fail_closed(
+    workspace: Path, command: str
+) -> None:
+    tool = _v02_tool(workspace)
+    assert _v02_verdict(tool, command) is ToolPermission.NEVER, command
+    assert "contains shell glob characters" in _v02_reason(tool, command), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # C2b (D1 exit criterion): every glob metacharacter inside a quoted
+        # segment is literal data — the shell writes the literal name, so the
+        # target resolves as a literal WRITE operand.
+        'echo x > f"*"',
+        'echo x > "f[0]"',
+    ],
+)
+def test_fully_quoted_redirect_targets_are_literal_operands(
     workspace: Path, command: str
 ) -> None:
     tool = _v02_tool(workspace)

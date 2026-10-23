@@ -182,6 +182,14 @@ class AgentStats(BaseModel):
     output_price_per_million: float = 0.0
     cached_input_price_per_million: float | None = None
 
+    # Per-run baseline anchor, written at run admission. None means the run
+    # has not been anchored yet; the anchors are a snapshot of the cumulative
+    # stats, never accumulated themselves, and survive context resets.
+    run_anchor_steps: int | None = None
+    run_anchor_known_cost_total: float | None = None
+    run_anchor_session_tokens: int | None = None
+    run_anchor_has_unknown_cost: bool | None = None
+
     _listeners: dict[str, Callable[[AgentStats], None]] = PrivateAttr(
         default_factory=dict
     )
@@ -249,6 +257,17 @@ class AgentStats(BaseModel):
         self.input_price_per_million = input_price
         self.output_price_per_million = output_price
         self.cached_input_price_per_million = cached_input_price
+
+    def anchor_run_baseline(self) -> None:
+        """Snapshot the current cumulative stats as this run's baseline.
+
+        Written once per run at admission; the anchors are read as
+        ``current - anchor`` by per-run budget middleware, never accumulated.
+        """
+        self.run_anchor_steps = self.steps
+        self.run_anchor_known_cost_total = self.known_cost_total
+        self.run_anchor_session_tokens = self.session_total_llm_tokens
+        self.run_anchor_has_unknown_cost = self.has_unknown_cost
 
     def reset_context_state(self) -> None:
         """Reset context-related fields while preserving cumulative session stats.

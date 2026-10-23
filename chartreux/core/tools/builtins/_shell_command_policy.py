@@ -9,7 +9,10 @@ from chartreux.core.dangerous_commands import (
 )
 from chartreux.core.tools.builtins._shell_argv import (
     _COMBINED_SHORT_OPTION_MIN_LENGTH as _COMBINED_SHORT_OPTION_MIN_LENGTH,
+    _GLOB_META_CHARACTERS as _GLOB_META_CHARACTERS,
     _SHORT_OPTION_LENGTH as _SHORT_OPTION_LENGTH,
+    PatternGlobCandidate,
+    ShellToken,
     _argument_matches as _argument_matches,
     _command_name,
     _has_long,
@@ -186,6 +189,29 @@ from chartreux.core.tools.builtins._shell_policy_types import ShellCommandPolicy
 _CHMOD_MAX_NUMERIC_MODE = 0o7777
 _MAX_LESS_RESUMED_OPTIONS = 256
 
+# egrep/fgrep are grep's -E/-F aliases: the same option surface, and
+# _standard_policy applies the same pattern-position handling to all three.
+_GREP_TABLE = _OptionTable(
+    frozenset({
+        "--after-context",
+        "--before-context",
+        "--binary-files",
+        "--context",
+        "--directories",
+        "--exclude",
+        "--exclude-dir",
+        "--exclude-from",
+        "--file",
+        "--group-separator",
+        "--include",
+        "--label",
+        "--max-count",
+        "--regexp",
+    }),
+    frozenset("ABCDdefm"),
+    boolean_long=frozenset({"--binary"}),
+)
+
 
 _TABLES = {
     "date": _OptionTable(
@@ -231,26 +257,9 @@ _TABLES = {
         frozenset({"--time"}),
     ),
     "wc": _OptionTable(frozenset({"--files0-from"})),
-    "grep": _OptionTable(
-        frozenset({
-            "--after-context",
-            "--before-context",
-            "--binary-files",
-            "--context",
-            "--directories",
-            "--exclude",
-            "--exclude-dir",
-            "--exclude-from",
-            "--file",
-            "--group-separator",
-            "--include",
-            "--label",
-            "--max-count",
-            "--regexp",
-        }),
-        frozenset("ABCDdefm"),
-        boolean_long=frozenset({"--binary"}),
-    ),
+    "grep": _GREP_TABLE,
+    "egrep": _GREP_TABLE,
+    "fgrep": _GREP_TABLE,
     "file": _OptionTable(
         frozenset({
             "--exclude",
@@ -379,23 +388,183 @@ def _date_has_setting_operand(args: list[str]) -> bool:
 # file names, so it does not move the pattern position.
 _GREP_PATTERN_OPTIONS = frozenset({"-e", "--regexp", "-f", "--file"})
 
+# The grep-family commands _standard_policy treats identically: egrep/fgrep
+# are grep's -E/-F aliases.
+_GREP_FAMILY = ("grep", "egrep", "fgrep")
+
+
+def _grep_pattern_disposition(token: str) -> str:
+    """Classify a grep-family pattern-position word's glob metacharacters.
+
+    Returns "data" when every metacharacter is quote-protected (the shell
+    passes the word through literally, so it is pure regex data), "expandable"
+    when none is protected (the shell pathname-expands the word), and "mixed"
+    when quoting splits them (partially quoted: fail closed). A plain ``str``
+    carries no provenance and keeps the legacy regex-data reading.
+    """
+    if not isinstance(token, ShellToken) or not (
+        token.meta_quoted or token.meta_unquoted
+    ):
+        return "data"
+    if token.meta_quoted and token.meta_unquoted:
+        return "mixed"
+    return "expandable" if token.meta_unquoted else "data"
+
 
 def _grep_positional_values(parsed: _ParsedOptions) -> tuple[str, ...]:
     """grep's file operands: every positional after the regex pattern.
 
     Without -e/--regexp/-f/--file, grep's first positional operand is the
-    regex PATTERN, not a path: a quoted pattern such as ``[0-9]`` or ``a.*b``
-    is data for the regex engine, never a pathname the shell expands, so it
-    must not become a path candidate. Only the remaining positionals are
-    file operands. When a pattern option supplies the regex, every
-    positional is a file operand.
+    regex PATTERN, not a path: a fully quoted pattern such as ``[0-9]`` or
+    ``a.*b`` is data for the regex engine, never a pathname the shell
+    expands, so it must not become a path candidate. An unquoted glob
+    metacharacter makes the shell pathname-expand the word, so that pattern
+    joins the candidates as a PatternGlobCandidate for the resolver to
+    inspect; a partially quoted one fails closed by staying a plain
+    candidate, which the resolver's path-glob rule denies. Only the
+    remaining positionals are file operands. When a pattern option supplies
+    the regex, every positional is a file operand.
     """
     supplies_pattern = any(
         option in _GREP_PATTERN_OPTIONS for option, _value in parsed.values
     )
     if supplies_pattern:
         return parsed.positionals
-    return parsed.positionals[1:]
+    if not parsed.positionals:
+        return ()
+    disposition = _grep_pattern_disposition(parsed.positionals[0])
+    if disposition == "data":
+        return parsed.positionals[1:]
+    if disposition == "mixed":
+        return parsed.positionals
+    pattern = PatternGlobCandidate(parsed.positionals[0])
+    return (pattern, *parsed.positionals[1:])
+
+
+def _regexp_value_provenance(value: str, option_word: str) -> str:
+    """An attached -e/--regexp value with its option word's quote provenance.
+
+    shlex yields the whole option word (``-ea*b``, ``--regexp=a*b``) as one
+    token, so the attached value's metacharacter quoting is the option word's:
+    an unquoted word means the shell expands the word and the value's matches
+    join the operands, a quoted word is data, and a mixed word fails closed —
+    all conservative for the value portion.
+    """
+    if not isinstance(option_word, ShellToken):
+        return value
+    return ShellToken(
+        value,
+        meta_quoted=option_word.meta_quoted,
+        meta_unquoted=option_word.meta_unquoted,
+    )
+
+
+def _option_name_glob_expands(token: str, name: str) -> bool:
+    """Whether an unrecognized option word's name portion expands in the shell.
+
+    *name* is the word's name portion: the long name before ``=``, or the
+    short-cluster prefix up to a value-taking short. A glob metacharacter
+    there is expandable when the word's provenance leaves it unquoted
+    (``expandable``) or splits quoting (``mixed``, which fails closed exactly
+    like the C2a pattern-position rule); a word whose metacharacters are all
+    quote-protected — or a plain ``str`` carrying no provenance — reaches the
+    command literally and never expands.
+    """
+    if not any(character in name for character in _GLOB_META_CHARACTERS):
+        return False
+    return _grep_pattern_disposition(token) in {"expandable", "mixed"}
+
+
+def _grep_option_glob_values(args: list[str], table: _OptionTable) -> tuple[str, ...]:
+    """Path candidates for grep-family option words the shell expands.
+
+    An unquoted glob-bearing option value is not just option data: the shell
+    pathname-expands the value word, its first match becomes the option's
+    value, and its remaining matches become file operands. Every value-taking
+    option's separate-token spelling therefore joins the path candidates like
+    the pattern position — an unquoted glob-bearing value as a
+    PatternGlobCandidate for the resolver to inspect, a partially quoted one
+    as a plain candidate (the path-glob rule denies it), and a fully quoted
+    one not at all (pure data). The attached spellings keep their option
+    prefix in every expansion product (``--label=a*`` expands to
+    ``--label=...`` words only, never bare operands), so only -e/--regexp
+    keep their existing attached-form inspection. The walk mirrors
+    ``_scan_options``' option grammar so attached values (``-epat``,
+    ``--regexp=pat``, including an unambiguous long-option prefix) keep
+    their option word's provenance.
+
+    An option word the table does NOT recognize is a second expansion
+    surface: the shell expands the word itself, and a decoy file named
+    exactly like a bare value-taking option (``--file``, ``-f``,
+    ``--exclude-from``) turns the product into that option, which then
+    consumes the next token as its value — a read the walk never sees,
+    because the unrecognized word records no value. When the word's NAME
+    portion (the long name before ``=``, or the short-cluster prefix up to a
+    value-taking short) carries unquoted glob metacharacters, the word fails
+    closed: it joins the candidates as a plain word the resolver's path-glob
+    rule denies, the same mechanism the partially quoted pattern rule uses.
+    """
+    all_long = table.long_values | table.optional_long_values | table.boolean_long
+    value_shorts = table.short_values | table.optional_short_values
+    candidates: list[str] = []
+    fail_closed: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            break
+        if token.startswith("--"):
+            option = _match_long(token, all_long)
+            if option is None and _option_name_glob_expands(
+                token, token.partition("=")[0]
+            ):
+                fail_closed.append(token)
+            if option is not None:
+                _, separator, attached = token.partition("=")
+                if separator:
+                    if option == "--regexp":
+                        candidates.append(_regexp_value_provenance(attached, token))
+                elif (
+                    option in table.long_values
+                    or (
+                        option in table.optional_long_values
+                        and table.optional_long_values_consume_next
+                    )
+                ) and index + 1 < len(args):
+                    candidates.append(args[index + 1])
+                    index += 1
+            index += 1
+            continue
+        if token.startswith("-") and token != "-":
+            chars = token[1:]
+            name_end = len(chars)
+            for offset, short in enumerate(chars):
+                if short not in value_shorts:
+                    continue
+                name_end = offset
+                attached = chars[offset + 1 :]
+                if attached:
+                    if short == "e":
+                        candidates.append(_regexp_value_provenance(attached, token))
+                elif short in table.short_values and index + 1 < len(args):
+                    candidates.append(args[index + 1])
+                    index += 1
+                break
+            if _option_name_glob_expands(token, token[: name_end + 1]):
+                fail_closed.append(token)
+            index += 1
+            continue
+        index += 1
+    return (
+        *(
+            PatternGlobCandidate(value)
+            if _grep_pattern_disposition(value) == "expandable"
+            else value
+            for value in candidates
+            if _grep_pattern_disposition(value) != "data"
+        ),
+        *fail_closed,
+    )
 
 
 def _standard_policy(command: str, args: list[str]) -> ShellCommandPolicy:
@@ -414,7 +583,7 @@ def _standard_policy(command: str, args: list[str]) -> ShellCommandPolicy:
         )
         approval_short = frozenset("oT")
         path_options = ("--random-source",)
-    elif command == "grep":
+    elif command in _GREP_FAMILY:
         path_options = ("--exclude-from", "--file", "-f")
     elif command == "file":
         approval_long = (
@@ -465,16 +634,56 @@ def _standard_policy(command: str, args: list[str]) -> ShellCommandPolicy:
     if command == "date":
         requires_approval = requires_approval or _date_has_setting_operand(args)
     positional_values = parsed.positionals
-    if command == "grep":
-        # The pattern position is regex data, not a path; file operands and
-        # path-option values stay path candidates (see _grep_positional_values).
+    if command in _GREP_FAMILY:
+        # The pattern position is regex data, not a path — unless the shell
+        # pathname-expands it: unquoted glob metacharacters join the path
+        # candidates as PatternGlobCandidate (see _grep_positional_values).
         positional_values = _grep_positional_values(parsed)
+        # The same reading applies to option values: an unquoted glob-bearing
+        # value's expansion joins the file operands (the first match becomes
+        # the option's value, the rest become file operands), so its
+        # expansion is path-inspected (see _grep_option_glob_values).
+        path_values = (*path_values, *_grep_option_glob_values(args, table))
     return ShellCommandPolicy(
         requires_approval=requires_approval,
         inspect_positional_paths=inspect,
         option_path_values=path_values,
         positional_values=positional_values,
     )
+
+
+# ripgrep's option dialect is not modeled: beyond the plain
+# ``rg PATTERN PATH...`` form, every option fails closed — plain flags,
+# value-taking ones, and execution-bearing switches alike (--pre runs a
+# preprocessor command). A leading ``--`` is rejected with them, so
+# end-of-options separation cannot smuggle an option past this guard.
+def _rg_policy(args: list[str]) -> ShellCommandPolicy:
+    for token in args:
+        if token.startswith("-"):
+            return ShellCommandPolicy(
+                requires_approval=True,
+                diagnostic=Diagnostic(
+                    "command",
+                    detail=(
+                        f"rg option '{token}' is not supported: only the plain "
+                        "'rg PATTERN PATH...' form is permitted"
+                    ),
+                ),
+            )
+    if args:
+        disposition = _grep_pattern_disposition(args[0])
+        if disposition == "mixed":
+            # Partially quoted metacharacters: keeping the pattern word in
+            # the positional candidates lets the resolver's path-glob rule
+            # deny it (fail closed).
+            return ShellCommandPolicy(positional_values=tuple(args))
+        if disposition == "expandable":
+            # The shell pathname-expands the pattern word; the resolver
+            # inspects the expansion's matches.
+            return ShellCommandPolicy(
+                positional_values=(PatternGlobCandidate(args[0]), *args[1:])
+            )
+    return ShellCommandPolicy(positional_values=tuple(args[1:]))
 
 
 _CHECKSUM_TABLE = _OptionTable(frozenset({"--check"}))
@@ -815,6 +1024,22 @@ _FIND_SIDE_EFFECTS = frozenset({
 })
 
 
+def _find_pattern_operand_expands(token: str) -> bool:
+    """Whether the shell pathname-expands a find pattern operand.
+
+    A pattern operand whose glob metacharacters are all quote-protected — or
+    that carries none — reaches find literally, so it is pure pattern data
+    the resolver's carve-out may skip. A word with any UNQUOTED glob
+    metacharacter is pathname-expanded before find runs, and the expansion
+    products re-enter find's argv: a decoy file named `-exec` (or `-a`,
+    `-delete`, ...) in the working directory turns ``find . -name -* ...``
+    into predicate injection. The inspector cannot expand pattern operands,
+    so it fails closed on them. A plain ``str`` carries no provenance and
+    keeps the legacy literal reading.
+    """
+    return isinstance(token, ShellToken) and token.meta_unquoted
+
+
 def _find_policy(args: list[str]) -> ShellCommandPolicy:
     index = 0
     while index < len(args) and (
@@ -827,6 +1052,12 @@ def _find_policy(args: list[str]) -> ShellCommandPolicy:
         args[index].startswith("-") or args[index] in {"!", "(", ")"}
     ):
         index += 1
+    # A value-predicate operand the shell pathname-expands joins the path
+    # candidates as a plain word the resolver's path-glob rule denies — the
+    # same fail-closed mechanism the grep option-word rule uses. The naive
+    # positional walk never yields a dash-prefixed operand, so surfacing it
+    # here is the only way the resolver sees the injection shape.
+    uninspectable: list[str] = []
     while index < len(args):
         token = args[index]
         if token in _FIND_SIDE_EFFECTS:
@@ -834,9 +1065,13 @@ def _find_policy(args: list[str]) -> ShellCommandPolicy:
         if token in _FIND_VALUE_PREDICATES or re.fullmatch(
             r"-newer[aBcmt][aBcmt]", token
         ):
+            if index + 1 < len(args) and _find_pattern_operand_expands(args[index + 1]):
+                uninspectable.append(args[index + 1])
             index += 2
         else:
             index += 1
+    if uninspectable:
+        return ShellCommandPolicy(option_path_values=tuple(uninspectable))
     return ShellCommandPolicy()
 
 
@@ -1604,7 +1839,9 @@ _COMMAND_POLICIES = {
     "date": lambda args: _standard_policy("date", args),
     "diff": lambda args: _standard_policy("diff", args),
     "du": lambda args: _standard_policy("du", args),
+    "egrep": lambda args: _standard_policy("egrep", args),
     "file": lambda args: _standard_policy("file", args),
+    "fgrep": lambda args: _standard_policy("fgrep", args),
     "find": _find_policy,
     "git": _git_policy,
     "gsed": _sed_policy,
@@ -1612,6 +1849,7 @@ _COMMAND_POLICIES = {
     "less": _less_policy,
     "md5sum": _checksum_policy,
     "more": _less_policy,
+    "rg": _rg_policy,
     "rm": _rm_policy,
     "sed": _sed_policy,
     "sha1sum": _checksum_policy,

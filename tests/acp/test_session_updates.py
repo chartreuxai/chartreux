@@ -288,6 +288,7 @@ def test_effect_projection_uses_semantic_kind_for_arbitrary_tool_names() -> None
         "requestedLimit": 20,
         "totalLines": 11,
         "wasTruncated": False,
+        "outline": False,
     }
     assert progress.field_meta == {
         "tool_name": "custom__read_anything",
@@ -892,6 +893,31 @@ def test_file_read_locations_describe_the_actual_range() -> None:
         "offset": 10,
         "limit": 3,
     }
+
+    outlined = truncated.model_copy(
+        update={
+            "id": "read-outline",
+            "state": CompletedEffectState(
+                output=FileReadEffectOutput(
+                    file_path="README.md",
+                    content="module symbols",
+                    num_lines=5,
+                    start_line=1,
+                    requested_offset=None,
+                    requested_limit=None,
+                    total_lines=120,
+                    was_truncated=True,
+                    outline=True,
+                ).model_dump(mode="json", by_alias=True),
+                display=EffectResultDisplay(success=True, message="Outlined"),
+            ),
+        }
+    )
+    outline_location = replay_history_entry(outlined)[0].locations
+    assert outline_location is not None
+    # An outline describes the whole file and its num_lines counts rendered
+    # symbols — never publish it as a source-line range, even truncated.
+    assert outline_location[0].field_meta == {"type": "file"}
 
 
 def test_web_effects_project_urls_and_query_metadata() -> None:

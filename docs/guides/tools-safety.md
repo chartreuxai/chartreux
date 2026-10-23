@@ -202,6 +202,63 @@ inspected. Feedback previews are bounded, registered secrets are redacted before
 escaping or truncation, and control characters and markup delimiters are escaped.
 These messages explain existing denials; they do not grant authority.
 
+### Retained shell-policy limitations
+
+Some over-denials and inspection gaps are retained, documented trade-offs in
+this release; each names its fast-follow pointer:
+
+- **Trailing-`**` over-denial.** A run of two or more consecutive stars in a
+  path glob — including a trailing `**` — fails closed even when the shell's
+  own expansion is safe: zsh's recursive globstar spans directory levels the
+  one-component model cannot expand faithfully. The over-denial is retained
+  until the executor shell-option contract (fast-follow) lands.
+- **Extglob residual hazard.** The static model inspects plain POSIX globbing
+  only. The executor's shell normally runs with extended globbing off, but
+  under an extendedglob-active environment (for example one activated in
+  `~/.zshenv`) extended patterns can match more than the static model
+  inspects — an under-inspection hazard. Detection and modeling are
+  fast-follow, behind the executor shell-option contract.
+- **Quoted-variable conservative denial.** Static expansion intentionally
+  resolves only plain unquoted words in provably read-only argument positions
+  of whitelisted commands, bound only by literal assignments proven unchanged
+  through the invocation. A quoted variable — or a variable in any other
+  position — is conservatively denied rather than resolved. Resolution is
+  fast-follow.
+- **Find pattern-operand carve-out.** Quoted or literal `find -name`,
+  `-iname`, `-path`, and `-ipath` operand tokens bypass path-glob inspection:
+  the shell never pathname-expands them, so they remain pure pattern data,
+  and the carve-out is retained for them only. The earlier assessment that
+  the bypass reaches "out-of-root directory names only, never file contents"
+  was wrong: an unquoted glob-bearing pattern operand IS pathname-expanded
+  by the shell before find runs, and the expansion products re-enter find's
+  argv — a decoy file named `-exec` (or `-a`, `-delete`, ...) in the working
+  directory turned `find . -name -* ...` into predicate injection,
+  executing an arbitrary command through an injected `-exec`. The inspector
+  cannot expand pattern operands, so it fails closed: an unquoted
+  glob-bearing pattern operand is denied with the generic path-glob
+  diagnostic, exactly like a redirect target that looks like a glob.
+  Quoting the pattern (`find . -name '*.py'`) or writing a literal operand
+  keeps the command allowed.
+- **Glob-expansion budgets.** Pathname-expansion inspection runs under work
+  budgets — a directory-entry cap and a match-state cap. Exceeding either
+  fails closed; the caps are the accepted fail-closed trade-off that keeps a
+  crafted pattern from turning permission resolution into an unbounded walk.
+  The entry cap binds after enumeration — it caps continued matching work,
+  not enumeration. Cap values are unchanged in this release; cap changes are
+  deferred and remain a separate user decision with a stated bound rationale.
+
+### Expansion-failure provenance
+
+A denied path glob that failed during expansion inspection names the specific
+limit it reached: the directory-entry budget, the match-state budget, or
+unsupported glob syntax this inspector cannot expand. Denials decided outside
+the expansion inspection — a match the caller rejects (an option-like word, a
+match outside the authorized workspace) or a token the inspector never
+expanded (an unknown cwd, a home-relative word, a partially quoted
+metacharacter) — render the generic path-glob message and are never
+attributed to a budget. The provenance detail rides the bounded, redacted
+diagnostic field, and every failure kind denies exactly as before.
+
 ## Interactive questions
 
 `ask_user_question` works only in an interactive UI. Each question requires two or more options; two to four is recommended, not a maximum. An `Other` free-text choice is added unless `hide_other` is true, and questions may permit multiple selections. Programmatic runs deny interactive callbacks rather than displaying them.

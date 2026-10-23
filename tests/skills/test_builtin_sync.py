@@ -97,6 +97,38 @@ class TestBuiltinSkills:
         assert "--config-env" in prompt
         assert "absolute veto" in prompt
         assert "permission authority, not standing intent" in prompt
+        assert (
+            "results carry `exit_code` (canonical; `returncode` is a deprecated alias)"
+            in prompt
+        )
+        assert (
+            "nonzero completion surfaces as a ToolError containing the code" in prompt
+        )
+        assert (
+            "a later invocation cannot see the previous shell's status — "
+            "`$?` probes are unnecessary" in prompt
+        )
+
+    def test_grep_prompt_documents_context_configuration(self) -> None:
+        prompt = (
+            Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/grep.md"
+        ).read_text()
+
+        assert "2 lines of surrounding context by default" in prompt
+        assert (
+            "configurable via `[tools.grep] context_lines` and `default_max_matches`"
+            in prompt
+        )
+
+    def test_grep_prompt_documents_files_only(self) -> None:
+        prompt = (
+            Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/grep.md"
+        ).read_text()
+
+        assert "files_only" in prompt
+        assert "distinct matching file paths" in prompt
+        assert "default OFF" in prompt
+        assert "`match_count` still counts matching lines" in prompt
 
     def test_git_workflow_skill_recommends_switch_and_runtime_approval_push(
         self,

@@ -148,7 +148,7 @@ def test_torn_tail_then_completion(tmp_path: Path) -> None:
 
 def test_malformed_and_unsupported_are_coverage_warnings(tmp_path: Path) -> None:
     future = record().model_dump(mode="json")
-    future["schema_version"] = 2
+    future["schema_version"] = 3
     put(
         tmp_path,
         "root",

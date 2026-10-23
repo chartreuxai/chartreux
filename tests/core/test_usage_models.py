@@ -68,8 +68,11 @@ def test_record_round_trip_has_only_approved_fields() -> None:
         "provider",
         "wire_name",
         "project_key",
+        "content_class",
+        "run_id",
         "outcome",
         "usage_state",
+        "attempt_ordinal",
         "input_tokens",
         "output_tokens",
         "cached_input_tokens",
@@ -80,7 +83,7 @@ def test_record_round_trip_has_only_approved_fields() -> None:
     }
     assert set(payload["prices_usd_per_million"]) == {"input", "output", "cached_input"}
     assert payload["occurred_at"].endswith("Z")
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["currency"] == "USD"
     assert UsageRecord.model_validate_json(serialized) == record
 
@@ -116,7 +119,7 @@ def test_non_utc_timestamps_are_rejected(timestamp: datetime) -> None:
         UsageRecord.model_validate(payload)
 
 
-@pytest.mark.parametrize("field,value", [("schema_version", 2), ("currency", "EUR")])
+@pytest.mark.parametrize("field,value", [("schema_version", 3), ("currency", "EUR")])
 def test_record_version_and_currency_are_fixed(field: str, value: object) -> None:
     payload = make_record().model_dump()
     payload[field] = value

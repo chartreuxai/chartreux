@@ -9,6 +9,9 @@ certifi = "certifi"
 # Additive Increase / Multiplicative Decrease — congestion-control acronym,
 # not the word "aimed".
 AIMD = "AIMD"
+# Pinned test-function name in tests/tools/test_read_file_outline.py; the
+# repo convention is "unparsable", but this identifier is contract-fixed.
+unparseable = "unparseable"
 
 [default.extend-identifiers]
 # macOS pasteboard four-char-code for the PNG flavor — required verbatim

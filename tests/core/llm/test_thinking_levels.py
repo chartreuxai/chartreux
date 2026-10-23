@@ -11,7 +11,9 @@ from chartreux.core.llm.thinking_levels import (
 from chartreux.core.subagents import InvalidLaunchThinkingError
 
 
-@pytest.mark.parametrize("model_name", ["zai-glm-5-3", "zai-glm-5", "zai-glm-latest"])
+@pytest.mark.parametrize(
+    "model_name", ["zai-glm-5-3", "zai-glm-5-3-flash", "zai-glm-5", "zai-glm-latest"]
+)
 def test_glm_5_3_exact_aliases_cannot_disable_thinking(model_name: str) -> None:
     assert get_thinking_levels("mistral", None, model_name) is GLM_5_3_THINKING_LEVELS
     assert "off" not in GLM_5_3_THINKING_LEVELS

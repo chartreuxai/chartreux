@@ -35,7 +35,12 @@ from chartreux.core.llm.backend.mistral import (
 )
 from chartreux.core.llm.exceptions import BackendError, BackendErrorBuilder
 from chartreux.core.llm.failures import FailureCategory, classify_failure
-from chartreux.core.llm.thinking_levels import OPENAI_THINKING_LEVELS
+from chartreux.core.llm.thinking_levels import (
+    GLM_5_3_THINKING_LEVELS,
+    MISTRAL_THINKING_LEVELS,
+    OPENAI_THINKING_LEVELS,
+    get_thinking_levels,
+)
 from chartreux.core.llm.types import BackendLike
 from chartreux.core.llm_models import (
     Backend,
@@ -45,6 +50,8 @@ from chartreux.core.llm_models import (
     Role,
     ToolCall,
 )
+from chartreux.core.model_catalog.resolver import supports_thinking
+from chartreux.core.model_catalog.schema import DeploymentDefinition, ProviderDefinition
 from chartreux.core.subagents import InvalidLaunchThinkingError
 from chartreux.utils.api_keys import ApiKeyOrigin, ApiKeySource
 from chartreux.utils.http import ChartreuxAsyncHTTPClient, get_user_agent
@@ -1633,6 +1640,61 @@ class TestMistralSdkReasoningEffortSerialization:
             assert bodies[0]["reasoning_effort"] == expected_effort
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("thinking", "expected_effort"),
+        [("low", "low"), ("high", "high"), ("max", "max")],
+    )
+    async def test_flash_thinking_levels_use_glm_family_table(
+        self, thinking: Literal["low", "high", "max"], expected_effort: str
+    ) -> None:
+        captured: list[dict[str, object]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content))
+            return httpx.Response(200, json=MISTRAL_SIMPLE_CONVERSATION_PARAMS[0][1])
+
+        backend = self._backend()
+        with self._serving(handler):
+            try:
+                await self._complete(
+                    backend, self._model("zai-glm-5-3-flash", thinking)
+                )
+            finally:
+                await backend.aclose()
+
+        assert len(captured) == 1
+        assert captured[0]["reasoning_effort"] == expected_effort
+
+    @pytest.mark.asyncio
+    async def test_flash_thinking_off_is_a_typed_configuration_error(self) -> None:
+        backend = self._backend()
+        with pytest.raises(InvalidLaunchThinkingError, match="cannot disable"):
+            await self._complete(backend, self._model("zai-glm-5-3-flash", "off"))
+
+    def test_supports_thinking_rejects_off_for_flash(self) -> None:
+        provider = ProviderDefinition(
+            api_base="https://api.mistral.ai/v1", backend="mistral"
+        )
+        deployment = DeploymentDefinition(provider="mistral", name="zai-glm-5-3-flash")
+        assert not supports_thinking(provider, deployment, "off")
+        assert supports_thinking(provider, deployment, "low")
+
+    def test_other_mistral_models_keep_provider_mapping(self) -> None:
+        assert (
+            get_thinking_levels("mistral", None, "mistral-small-latest")
+            is MISTRAL_THINKING_LEVELS
+        )
+        assert (
+            get_thinking_levels("mistral", None, "devstral-small-latest")
+            is MISTRAL_THINKING_LEVELS
+        )
+        assert (
+            get_thinking_levels("mistral", None, "zai-glm-5-3-flash")
+            is GLM_5_3_THINKING_LEVELS
+        )
+        assert MISTRAL_THINKING_LEVELS["low"] == "none"
+
+    @pytest.mark.asyncio
     async def test_direct_glm_5_3_off_is_a_typed_configuration_error(self) -> None:
         backend = self._backend()
         with pytest.raises(InvalidLaunchThinkingError, match="cannot disable thinking"):
@@ -1663,6 +1725,8 @@ class TestMistralSdkReasoningEffortSerialization:
             ("mistral-small-latest", "low", "none"),
             ("mistral-small-latest", "medium", "high"),
             ("mistral-small-latest", None, None),
+            ("zai-glm-5-3-flash", "low", "low"),
+            ("zai-glm-5-3-flash", "max", "max"),
         ],
     )
     async def test_streaming_serializes_reasoning_effort(

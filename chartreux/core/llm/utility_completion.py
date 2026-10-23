@@ -102,6 +102,7 @@ async def run_utility_completion(
             accounting_sink=accounting_sink,
             usage_attribution=usage_attribution,
         ),
+        attempt_ordinal=1,
     )
     observer_token = request_start_observer.set(finalizer.start)
     original_error: BaseException | None = None
