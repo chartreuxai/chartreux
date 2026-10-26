@@ -288,3 +288,76 @@ def test_the_grammar_module_exposes_the_resolution_contract() -> None:
     assert identity_launch.TaskIdentityArgs is TaskIdentityArgs
     assert callable(identity_launch.resolve_identity_launch)
     assert identity_launch.ResolvedIdentityLaunch is ResolvedIdentityLaunch
+
+
+# ---------------------------------------------------------------------------
+# P1-c2: purpose-keyed difficulty admission
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "difficulty", ["novel-algorithm", "concurrency", "subtle-invariant"]
+)
+def test_demanding_route_accepts_a_qualifying_category(difficulty: str) -> None:
+    from chartreux.core.launch_types import DifficultyCategory
+
+    args = TaskIdentityArgs.model_validate({
+        "task": "x",
+        "purpose": "implementation-demanding-settled",
+        "config": {"difficulty": difficulty},
+    })
+    assert args.config is not None
+    assert isinstance(args.config.difficulty, DifficultyCategory)
+    assert args.config.difficulty.value == difficulty
+
+
+@pytest.mark.parametrize("difficulty", ["cross-subsystem", "none-of-these-fit"])
+def test_demanding_route_record_only_category_fails_admission(difficulty: str) -> None:
+    with pytest.raises(ValidationError, match="record-only"):
+        TaskIdentityArgs.model_validate({
+            "task": "x",
+            "purpose": "implementation-demanding-settled",
+            "config": {"difficulty": difficulty},
+        })
+
+
+def test_demanding_route_without_a_category_fails_admission() -> None:
+    with pytest.raises(ValidationError, match="requires config.difficulty"):
+        TaskIdentityArgs.model_validate({
+            "task": "x",
+            "purpose": "implementation-demanding-settled",
+        })
+
+
+@pytest.mark.parametrize("purpose", [None, "research", "implementation"])
+def test_other_purposes_reject_the_difficulty_field(purpose: str | None) -> None:
+    payload: dict[str, object] = {
+        "task": "x",
+        "config": {"difficulty": "novel-algorithm"},
+    }
+    if purpose is not None:
+        payload["purpose"] = purpose
+    with pytest.raises(ValidationError, match="only accepted for"):
+        TaskIdentityArgs.model_validate(payload)
+
+
+def test_task_args_inherits_the_difficulty_admission() -> None:
+    """The task tool's surface is the canonical schema: TaskArgs enforces the
+    same purpose-keyed difficulty admission on every launch path.
+    """
+    from chartreux.core.subagents import TaskArgs
+
+    args = TaskArgs.model_validate({
+        "task": "x",
+        "purpose": "implementation-demanding-settled",
+        "config": {"difficulty": "concurrency"},
+    })
+    assert args.config is not None
+    assert args.config.difficulty is not None
+    assert args.config.difficulty.value == "concurrency"
+    with pytest.raises(ValidationError, match="record-only"):
+        TaskArgs.model_validate({
+            "task": "x",
+            "purpose": "implementation-demanding-settled",
+            "config": {"difficulty": "cross-subsystem"},
+        })

@@ -728,7 +728,7 @@ def test_forward_event_suppresses_click_for_selectable_widget(
         Screen, "_forward_event", lambda self, event: forwarded.append(event)
     )
     monkeypatch.setattr(
-        screen, "get_widget_at", lambda x, y: (widget, Region(0, 0, 10, 10))
+        screen, "get_widget_and_offset_at", lambda x, y: (widget, Offset(0, 0))
     )
 
     screen._forward_event(_make_click(2, 0, chain=1))
@@ -938,7 +938,9 @@ def test_forward_event_dispatches_multi_click_to_interactive_ancestor(
     monkeypatch.setattr(
         Screen, "_forward_event", lambda self, event: super_forwarded.append(event)
     )
-    monkeypatch.setattr(screen, "get_widget_at", lambda x, y: (leaf, Offset(0, 0)))
+    monkeypatch.setattr(
+        screen, "get_widget_and_offset_at", lambda x, y: (leaf, Offset(0, 0))
+    )
 
     screen._forward_event(_make_click(2, 0, chain=2))
     screen._forward_event(_make_click(2, 0, chain=3))
@@ -956,7 +958,9 @@ def test_forward_event_still_suppresses_click_for_pure_text_selectable(
     monkeypatch.setattr(
         Screen, "_forward_event", lambda self, event: super_forwarded.append(event)
     )
-    monkeypatch.setattr(screen, "get_widget_at", lambda x, y: (leaf, Offset(0, 0)))
+    monkeypatch.setattr(
+        screen, "get_widget_and_offset_at", lambda x, y: (leaf, Offset(0, 0))
+    )
 
     screen._forward_event(_make_click(2, 0, chain=1))
     screen._forward_event(_make_click(2, 0, chain=2))

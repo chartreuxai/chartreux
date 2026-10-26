@@ -24,15 +24,18 @@ from chartreux.core.dispatch.route_models import (
     RouteTarget,
 )
 from chartreux.core.dispatch.routes import (
+    COST_TIER_DEFAULT,
     SESSION_MODEL,
     ResolvedTarget,
     RouteResolutionError,
+    cheapest_capable_model,
     resolve_route,
     shipped_routes,
     validate_canonical_diversity,
 )
 
 __all__ = [
+    "COST_TIER_DEFAULT",
     "SESSION_MODEL",
     "SHIPPED_PURPOSES",
     "PackageTier",
@@ -44,6 +47,7 @@ __all__ = [
     "ResolvedTarget",
     "RouteResolutionError",
     "RouteTarget",
+    "cheapest_capable_model",
     "resolve_route",
     "shipped_routes",
     "validate_canonical_diversity",

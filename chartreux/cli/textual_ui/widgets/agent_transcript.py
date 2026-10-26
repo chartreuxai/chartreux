@@ -8,6 +8,7 @@ from typing import ClassVar
 from weakref import WeakKeyDictionary
 
 from textual import __version__ as _TEXTUAL_VERSION, events
+from textual._context import NoActiveAppError
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Vertical, VerticalScroll
@@ -70,7 +71,7 @@ _DISPOSAL_YIELD_BUDGET_SECONDS = 0.03
 _HEARTBEAT_DRIFT_WARNING_SECONDS = 0.25
 
 
-def _detach_for_reparenting(parent: Widget, child: Widget) -> None:
+async def _detach_for_reparenting(parent: Widget, child: Widget) -> None:
     if _TEXTUAL_VERSION != _TEXTUAL_REPARENT_VERSION:
         raise RuntimeError(
             "Textual reparenting internals must be reviewed for this version"
@@ -78,8 +79,23 @@ def _detach_for_reparenting(parent: Widget, child: Widget) -> None:
     # Textual 8.2.8 has no public child-reparent API: Widget.remove() prunes the
     # node from the app. Recheck for a public move API and these internals whenever
     # the exact Textual pin in pyproject.toml changes.
-    parent._nodes._remove(child)
-    child._detach()
+    try:
+        app = child.app
+    except NoActiveAppError:
+        app = None
+    if app is not None and app.is_mounted(child):
+        # A registered child keeps its message pump across a bare detach; the
+        # remount would then start a second pump on the same queue, the queue
+        # breaks under two consumers, and the crashed pump's _message_loop_exit
+        # removes the freshly registered widget again (the remount silently
+        # no-ops). Closing the pump while the child is still attached routes
+        # the teardown through Widget._message_loop_exit, which unregisters
+        # the node (App.is_mounted False), detaches it, and dispatches
+        # Unmount — remove()'s own exit path.
+        await child._close_messages(wait=True)
+    if child._parent is not None or child in parent._nodes:
+        parent._nodes._remove(child)
+        child._detach()
 
 
 @dataclass(slots=True)
@@ -1190,7 +1206,7 @@ class AgentTranscriptViewer(Vertical):
         ]
         incoming_container = incoming_group.content_container
         for child in incoming_children:
-            _detach_for_reparenting(incoming_container, child)
+            await _detach_for_reparenting(incoming_container, child)
 
         if incoming_children:
             if prepend:
@@ -1278,7 +1294,7 @@ class AgentTranscriptViewer(Vertical):
             return
         fresh_container = fresh_group.content_container
         for child in new_children:
-            _detach_for_reparenting(fresh_container, child)
+            await _detach_for_reparenting(fresh_container, child)
         await group.content_container.mount(*new_children, before=old_children[0])
         await self._initialize_streaming_widgets(new_children)
         for child in old_children:

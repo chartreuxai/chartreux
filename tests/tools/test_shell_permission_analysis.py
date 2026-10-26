@@ -131,7 +131,6 @@ def test_recursive_argv_security_checks_without_shell_reparse(
         "POETRY_HOME",
         "POETRY_PYTHON_INSTALLATION_DIR",
         "TRACING_DURATIONS_FILE",
-        "VIRTUAL_ENV",
         "CONDA_PREFIX",
         "XDG_BIN_HOME",
         "XDG_CACHE_HOME",

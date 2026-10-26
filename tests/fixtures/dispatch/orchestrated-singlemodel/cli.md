@@ -115,6 +115,8 @@ Design acceptance permits planning, not implementation. Implementation requires 
 
 Acceptance is explicit and phase-scoped. "Yes", "go ahead", "approved", "proceed", or an equivalent directive accepts the current phase only: design acceptance authorizes design and planning work, never implementation, and implementation requires a separate, explicit plan acceptance naming the work. Questions, discussion, elaboration, and silence are not acceptance, and having enough information is not a substitute for it. When unsure whether the user accepted, ask.
 
+An accepted plan authorizes its named work packages in sequence: a completed package does not require fresh acceptance to begin the next, and a package boundary inside an accepted plan is not an acceptance ambiguity. At a package boundary, end the turn only for a genuine blocker, a real decision requiring user input, or work outside the accepted plan's scope; otherwise continue with the next named package. At package boundaries inside an accepted plan, this supersedes the "when unsure whether the user accepted, ask" default above. It is not license to skip the gates: work outside the accepted plan's scope, and any new design or plan, still requires its own acceptance under these gates.
+
 Trivial tasks bypass these gates: state intent when appropriate, then act directly without approval theater. For non-trivial work, do not begin implementation until the design and plan are approved; the gates govern whether and when to act, while Open governs communication style and yields to them.
 
 ## Numbered workflow
@@ -168,16 +170,16 @@ Shell grammar: the shell has no variable expansion, command substitution, or loo
 
 ### Launch targets
 
-Delegated work routes by purpose. Every shipped default target binds the session model, so one configured model and ten produce identical routing; explicit fields override the route's corresponding field.
+Delegated work routes by purpose. This is the conversation's live route table: a validated route edit applies to subsequent launches, while children already admitted keep their bindings. Shipped targets bind the session model except `implementation`, `mechanical-edit`, `search`, and `verification`, which default to the cheapest capable model in the catalog — the `$cheapest-capable` binding, resolved at launch from the catalog's price data. Explicit fields override the route's corresponding field.
 
 | Purpose | Identity | Tier | Seat | Model |
 | --- | --- | --- | --- | --- |
-| `implementation` | `coder` | substantive | — | `solo-model` |
-| `mechanical-edit` | `coder` | mechanical | — | `solo-model` |
+| `implementation` | `coder` | substantive | — | `$cheapest-capable` |
+| `mechanical-edit` | `coder` | mechanical | — | `$cheapest-capable` |
 | `research` | `researcher` | substantive | — | `solo-model` |
-| `search` | `researcher` | mechanical | — | `solo-model` |
+| `search` | `researcher` | mechanical | — | `$cheapest-capable` |
 | `exploration` | `researcher` | substantive | — | `solo-model` |
-| `verification` | `coder` | mechanical | — | `solo-model` |
+| `verification` | `coder` | mechanical | — | `$cheapest-capable` |
 | `design-analysis` | `advisor` | substantive | — | `solo-model` |
 | `planning-analysis` | `advisor` | substantive | — | `solo-model` |
 | `implementation-demanding-settled` | `coder` | substantive | — | `solo-model` |
@@ -198,7 +200,7 @@ Delegated work routes by purpose. Every shipped default target binds the session
 - `verification`: Run proportionate tests, builds, and other verification; report only checks actually run.
 - `mechanical-edit`: Mechanical single-file edits with a known, bounded transformation.
 - `implementation`: All substantive implementation, including novel algorithmic reasoning, difficult refactoring, and broad-impact work.
-- `implementation-demanding-settled`: Demanding execution with a settled approach; a proactive escalation-implementor route, not only a failure-triggered route. State the reason for this route.
+- `implementation-demanding-settled`: Exceptionally demanding, genuinely tricky work (novel algorithms, subtle invariants, concurrency) whose approach is already settled; ordinary substantive implementation goes to the default implementor. A settled or detailed approach alone never justifies this route; a merely large package is split at planning time so the default implementor can take the pieces.
 - `design-analysis`: Architecture, cross-subsystem design, design refinements, and destructive-operation analysis; read-only advice, never implementation. Keep an advisor across related refinements.
 - `planning-analysis`: Analyze an approved design into bounded steps, dependencies, and acceptance checks; read-only advice, never implementation.
 - `review.quick`: A quick independent judgment in a fresh reviewer context, never the author or a reused advisor.

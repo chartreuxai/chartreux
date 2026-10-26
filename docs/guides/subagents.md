@@ -93,14 +93,18 @@ that validation and the tool layer both enforce:
 | `coder` | optional | all granted | all granted | Direct execution; may delegate |
 | `orchestrator` | required | non-mutating only | all granted | Must orchestrate from the root session |
 | `researcher` | optional | non-mutating only | non-mutating only | Read-only analysis |
-| `reviewer` | optional | non-mutating only | non-mutating only | Read-only analysis |
+| `reviewer` | optional | non-mutating + `bash` carve-out | non-mutating only | Read-only analysis; runs verification |
 | `advisor` | optional | non-mutating only | non-mutating only | Read-only analysis |
 
 The read-only postures are honest: `bash` classifies as mutating regardless of
 command text, and unclassified or custom tools (including MCP tools) classify
-as mutating by default, so a read-only identity genuinely excludes them. A
-required-delegation identity (`orchestrator`) is rejected as a child with an
-actionable error — it must orchestrate from the root session. Custom identities
+as mutating by default, so a read-only identity genuinely excludes them. The
+one reviewed exception is the reviewer's identity-level execution carve-out:
+`bash` is admitted — with its own permission guards intact — so an exit-gate
+review can run non-mutating verification commands itself; the carve-out never
+reaches the reviewer's delegation set. A required-delegation identity
+(`orchestrator`) is rejected as a child with an actionable error — it must
+orchestrate from the root session. Custom identities
 carry no harness-known posture: their prompt file is the whole contract, and
 their delegation set is the full granted ceiling of the session.
 
@@ -185,11 +189,12 @@ default. Deep panels use no authorship substitution regardless of the
 implementor: the panel's independence is structural, fresh contexts on
 distinct models. Substitution — a fresh reviewer from a different model
 line than the material author — applies only to quick single-seat reviews.
-Routed per-seat dispatch resolves against the conversation's
-FROZEN route table, captured at bind time: a route configured
-mid-conversation stays pending, and a launch rejection naming unmet
-model diversity on a conversation bound before the config edit is that
-frozen snapshot, not a validator defect — it requires a new conversation.
+Routed per-seat dispatch resolves against the conversation's LIVE route
+table: a validated route edit applies to subsequent launches in the same
+conversation — the applied notice enumerates each edited purpose's old →
+new target, and children already admitted keep their bindings — while an
+edited table that violates a declared `requires_distinct_models`
+requirement is rejected at reload, leaving the prior table effective.
 And because the shipped route binds every seat to `$session`, a fresh
 install needs a configured multi-model route before routed deep dispatch
 works.

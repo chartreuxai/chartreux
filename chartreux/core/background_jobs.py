@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 import threading
-from typing import Literal
+from typing import Any, Literal
 import uuid
 
 from pydantic import (
@@ -33,6 +33,7 @@ from pydantic import (
     field_validator,
 )
 
+from chartreux.core.env import project_env_for_cwd
 from chartreux.core.events import BackgroundJobsChangedEvent
 from chartreux.core.tools import secret_redaction
 from chartreux.core.tools.secret_redaction import (
@@ -58,6 +59,9 @@ MAX_ALLOCATIONS = 8
 MAX_JOBS = 32
 MAX_RECORDS = 64
 MAX_RECORD_BYTES = 4096
+MIN_READ_BYTES = 4096
+MAX_READ_BYTES = 64000
+MAX_WAIT_SECONDS = 30
 MAX_OUTPUT_BYTES = 256 * 1024
 MAX_COMMAND_BYTES = 64 * 1024  # Existing shell-analysis source budget.
 JobState = Literal["starting", "running", "stopping", "exited", "failed", "stopped"]
@@ -89,10 +93,49 @@ class BashStartArgs(_Args):
 
 
 class BashReadArgs(_Args):
-    job_id: str = Field(min_length=1, max_length=128)
-    cursor: StrictInt = Field(default=0, ge=0)
-    max_bytes: StrictInt = Field(default=4096, ge=4096, le=64000)
-    wait_seconds: float = Field(default=0, ge=0, le=30, allow_inf_nan=False)
+    job_id: str = Field(
+        min_length=1, max_length=128, description="The managed job to read"
+    )
+    cursor: StrictInt = Field(
+        default=0,
+        ge=0,
+        description="Cursor position; start at 0, then pass next_cursor forward",
+    )
+    max_bytes: StrictInt = Field(
+        default=4096,
+        ge=MIN_READ_BYTES,
+        le=MAX_READ_BYTES,
+        description="UTF-8 output bytes; minimum 4096, maximum 64000",
+    )
+    wait_seconds: float = Field(
+        default=0,
+        ge=0,
+        le=MAX_WAIT_SECONDS,
+        allow_inf_nan=False,
+        description="Seconds to wait for new output; maximum 30",
+    )
+
+    @field_validator("max_bytes", mode="before")
+    @classmethod
+    def bounded_max_bytes(cls, value: Any) -> Any:
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value < MIN_READ_BYTES
+        ):
+            raise ValueError("max_bytes must be at least 4096")
+        return value
+
+    @field_validator("wait_seconds", mode="before")
+    @classmethod
+    def bounded_wait_seconds(cls, value: Any) -> Any:
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value > MAX_WAIT_SECONDS
+        ):
+            raise ValueError("wait_seconds must be at most 30")
+        return value
 
 
 class BashStopArgs(_Args):
@@ -133,6 +176,15 @@ class JobSummary(_Result):
 class StartResult(_Result):
     job: JobSummary
     next_cursor: Literal[0] = 0
+    # R7: the started command's write-classified paths (redirect targets,
+    # write-option values, write-classified command operands) and its
+    # unknown-write-surface flag, surfaced so the submission secret scan
+    # collects a started job's write footprint alongside a foreground bash
+    # run's. Excluded from `model_dump`: the projected result and persisted
+    # transcripts keep their shape; the accumulator reads the attributes on
+    # the in-process result.
+    write_paths: list[str] = Field(default_factory=list, exclude=True)
+    write_paths_unknown: bool = Field(default=False, exclude=True)
 
 
 class ReadResult(_Result):
@@ -382,8 +434,16 @@ class BackgroundJobRegistry:
                 task.exception()
 
     async def _launch(self, job_id: str, command: str, cwd: Path | None) -> StartResult:
+        # The trust-gated env injection keys to the caller's cwd — the same
+        # root the session registered its redaction set for. A missing cwd
+        # must not fall back to the harness process's cwd: that root's .env
+        # values would reach the child unmasked, desynchronized from the
+        # session redaction set. Fail-safe, not fail-hang: inject nothing.
+        extra_env = project_env_for_cwd(cwd) if cwd is not None else {}
         spawn = asyncio.create_task(
-            spawn_shell_command(command, cwd=cwd, merge_stderr=True)
+            spawn_shell_command(
+                command, cwd=cwd, merge_stderr=True, extra_env=extra_env
+            )
         )
         try:
             proc = await asyncio.shield(spawn)

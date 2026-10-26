@@ -75,11 +75,16 @@ def test_composition_rendering_matrix(scenario, selection, catalog):
     assert lint_composed(cli, identity_facts=facts, workflow=selection.workflow) == ()
     # The worker disclosure requirement rides in the task description.
     assert "worker disclosure requirement" in task
-    # The launch-target table binds the session model in both documents.
+    # The launch-target table binds the session model in both documents for
+    # session-bound purposes; the cost-tier-aware implementation row renders
+    # the $cheapest-capable marker.
     alias = config.get_active_model().alias
-    row = f"| `implementation` | `coder` | substantive | — | `{alias}` |"
-    assert row in cli
-    assert row in task
+    assert f"| `review.deep` | `reviewer` | substantive | analytical | `{alias}` |" in (
+        cli
+    )
+    cost_row = "| `implementation` | `coder` | substantive | — | `$cheapest-capable` |"
+    assert cost_row in cli
+    assert cost_row in task
     # The composition opens at character zero and re-anchors last.
     assert "Today's date is" in cli.splitlines()[1]
     assert cli.rstrip().endswith("this closing note adds no new rules.")

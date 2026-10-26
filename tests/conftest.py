@@ -680,6 +680,48 @@ def single_model_catalog() -> ModelCatalog:
     })
 
 
+def cost_tier_catalog() -> ModelCatalog:
+    """The P1-c1 catalog fixture: prices pin the capability criterion.
+
+    Three models on one provider: ``budget-model`` is the cheapest priced
+    model, ``premium-model`` is priced higher, and ``mystery-model`` carries
+    no price data. The shipped cost-tier route defaults (``implementation``,
+    ``mechanical-edit``, ``search``, ``verification``) must resolve to
+    ``budget-model`` — the fixture names the concrete per-tier default, so
+    the route tests stay environment-independent (no live catalog, no user
+    configuration), and the unpriced model is never selected.
+    """
+    return ModelCatalog.model_validate({
+        "providers": {"alpha": {"api_base": "https://alpha.test"}},
+        "models": {
+            "budget-model": {
+                "thinking": "medium",
+                "deployments": [
+                    {
+                        "provider": "alpha",
+                        "name": "budget-wire",
+                        "prices": {"input": 0.3, "output": 1.2},
+                    }
+                ],
+            },
+            "premium-model": {
+                "thinking": "high",
+                "deployments": [
+                    {
+                        "provider": "alpha",
+                        "name": "premium-wire",
+                        "prices": {"input": 3.0, "output": 9.0},
+                    }
+                ],
+            },
+            "mystery-model": {
+                "thinking": "medium",
+                "deployments": [{"provider": "alpha", "name": "mystery-wire"}],
+            },
+        },
+    })
+
+
 type ConfigBuilder = Callable[..., ChartreuxConfigSchema]
 
 

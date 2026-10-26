@@ -28,6 +28,7 @@ from chartreux.core.skills.models import ParsedSkillCommand, SkillInfo
 from chartreux.core.subagents import TaskArgs
 from chartreux.core.timing import InvocationTiming, use_elapsed_clock
 from chartreux.core.tools.base import InvokeContext, ToolPermission
+from chartreux.core.tools.builtins.bash import CancelledShellCommand
 from chartreux.core.tools.builtins.task import Task
 from chartreux.core.tools.builtins.todo import TodoItem
 from chartreux.core.tools.manager import NoSuchToolError
@@ -619,6 +620,44 @@ async def test_tool_call_can_be_interrupted() -> None:
     # Agent loop should stop after cancellation — no second LLM turn
     assistant_events = [e for e in events if isinstance(e, AssistantEvent)]
     assert len(assistant_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tool_with_write_footprint_keeps_it_on_the_result() -> None:
+    """A cancelled tool whose cancellation carries a write footprint (as a
+    cancelled bash run's does: the tool attaches its write-classified paths to
+    the raised cancellation) keeps it on the cancelled result event, so the
+    submission scan keeps covering the footprint.
+    """
+    tool_call = ToolCall(
+        id="call_9", index=0, function=FunctionCall(name="stub_tool", arguments="{}")
+    )
+    config = build_test_vibe_config(enabled_tools=["stub_tool"])
+    agent_loop = build_test_agent_loop(
+        config=config,
+        backend=FakeBackend([
+            [mock_llm_chunk(content="Let me use the tool.", tool_calls=[tool_call])],
+            [mock_llm_chunk(content="Tool execution completed.")],
+        ]),
+    )
+    agent_loop.tool_manager._all_tools["stub_tool"] = FakeTool
+    stub_tool_instance = agent_loop.tool_manager.get("stub_tool")
+    assert isinstance(stub_tool_instance, FakeTool)
+    stub_tool_instance._exception_to_raise = CancelledShellCommand(
+        write_paths=["/repo/out.txt"], write_paths_unknown=False
+    )
+
+    events: list[BaseEvent] = []
+    async for ev in agent_loop.act("Execute tool"):
+        events.append(ev)
+
+    tool_result_event = next(
+        (e for e in events if isinstance(e, ToolResultEvent)), None
+    )
+    assert tool_result_event is not None
+    assert tool_result_event.cancelled
+    assert tool_result_event.error_write_paths == ["/repo/out.txt"]
+    assert tool_result_event.error_write_paths_unknown is False
 
 
 class _RecordingHooksManager:

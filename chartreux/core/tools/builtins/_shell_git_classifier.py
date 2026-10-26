@@ -38,6 +38,7 @@ from chartreux.core.tools.builtins._shell_git_support import (
     _scan_classified_git_options,
     _scan_git_config_call,
     _scan_git_globals,
+    _scan_git_symbolic_ref_call,
     canonical_git_command,
     push_destination_operands,
 )
@@ -411,6 +412,26 @@ def _classify_git_hard_guard_subcommand(
     if dangerous:
         return _hard_denied(f"{guard} is a hard guard; no grant can authorize it")
     return _ROUTINE
+
+
+def _classify_git_symbolic_ref(args: list[str]) -> DangerousCommandClassification:
+    """symbolic-ref is modeled by mode: reads stay routine, writes fail closed.
+
+    The read form (exactly one operand, no write marker) carries no
+    dangerous operation; the write forms (a ref update or deletion) are not
+    granted by the read modeling and keep the unmodeled-builtin hard
+    denial, as does any form the strict scan rejects.
+    """
+    call = _scan_git_symbolic_ref_call(args)
+    if call.reads:
+        return _ROUTINE
+    if call.writes:
+        return _hard_denied(
+            "unmodeled git builtin 'symbolic-ref' write form; denied conservatively"
+        )
+    return _hard_denied(
+        "unmodeled git builtin 'symbolic-ref' form; denied conservatively"
+    )
 
 
 def _classify_git_remaining(subcommand: str) -> DangerousCommandClassification:
@@ -971,6 +992,8 @@ def _dispatch_git_subcommand(
         classification = _classify_git_config(args)
     elif subcommand == "remote":
         classification = _classify_git_remote(args)
+    elif subcommand == "symbolic-ref":
+        classification = _classify_git_symbolic_ref(args)
     else:
         classification = _classify_git_remaining(subcommand)
     return classification

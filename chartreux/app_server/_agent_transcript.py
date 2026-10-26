@@ -4,6 +4,7 @@ import base64
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
@@ -415,17 +416,26 @@ def _read_selected_entries(
         candidates = index.descriptors
     candidate_count = len(candidates)
     selected: list[AgentTranscriptEntry] = []
+    selected_sizes: list[int] = []
     for descriptor in reversed(candidates):
         if len(selected) == limit:
             break
         entry = materializer.materialize(descriptor)
         if entry is None:
             continue
-        prospective = [entry, *selected]
-        response = _available_response(prospective, candidate_count > len(prospective))
-        if _wire_size(response) > _RESPONSE_BYTE_LIMIT:
+        entry_size = _entry_wire_size(entry)
+        if (
+            _response_wire_size(
+                selected_sizes,
+                cursor_size=_cursor_wire_size(entry),
+                has_more=candidate_count > len(selected) + 1,
+            )
+            + entry_size
+            > _RESPONSE_BYTE_LIMIT
+        ):
             break
-        selected = prospective
+        selected = [entry, *selected]
+        selected_sizes.append(entry_size)
     return _available_response(selected, candidate_count > len(selected))
 
 
@@ -1167,14 +1177,23 @@ def _page(
     candidates: list[AgentTranscriptEntry], limit: int
 ) -> AgentTranscriptGetResponse:
     selected: list[AgentTranscriptEntry] = []
+    selected_sizes: list[int] = []
     for candidate in reversed(candidates):
         if len(selected) == limit:
             break
-        prospective = [candidate, *selected]
-        response = _available_response(prospective, len(candidates) > len(prospective))
-        if _wire_size(response) > _RESPONSE_BYTE_LIMIT:
+        entry_size = _entry_wire_size(candidate)
+        if (
+            _response_wire_size(
+                selected_sizes,
+                cursor_size=_cursor_wire_size(candidate),
+                has_more=len(candidates) > len(selected) + 1,
+            )
+            + entry_size
+            > _RESPONSE_BYTE_LIMIT
+        ):
             break
-        selected = prospective
+        selected = [candidate, *selected]
+        selected_sizes.append(entry_size)
     # Entry text, structured values, presentations, and attachment names are bounded
     # so one projected entry always fits the fixed response ceiling.
     return _available_response(selected, len(candidates) > len(selected))
@@ -1183,6 +1202,41 @@ def _page(
 def _wire_size(response: AgentTranscriptGetResponse) -> int:
     payload = response.model_dump(mode="json", by_alias=True)
     return len(json.dumps(payload, separators=(",", ":")).encode())
+
+
+@lru_cache(maxsize=1)
+def _empty_response_wire_sizes() -> tuple[int, int]:
+    """Skeleton sizes of an empty page (null cursor) for has_more false/true."""
+    return (
+        _wire_size(_available_response([], False)),
+        _wire_size(_available_response([], True)),
+    )
+
+
+def _entry_wire_size(entry: AgentTranscriptEntry) -> int:
+    """Wire size of one entry as serialized inside a response payload."""
+    return len(
+        json.dumps(
+            entry.model_dump(mode="json", by_alias=True), separators=(",", ":")
+        ).encode()
+    )
+
+
+def _cursor_wire_size(entry: AgentTranscriptEntry) -> int:
+    """Wire size of the JSON-encoded cursor derived from *entry*."""
+    return len(json.dumps(_encode_cursor(entry.entry_id, entry.digest)).encode())
+
+
+def _response_wire_size(
+    selected_sizes: Sequence[int], *, cursor_size: int, has_more: bool
+) -> int:
+    """Byte size of the response for a page whose entries serialize to the given
+    sizes and whose cursor serializes to ``cursor_size``; byte-identical to
+    ``_wire_size(_available_response(...))`` so the selection loop stays O(page)
+    instead of re-serializing the whole page per candidate.
+    """
+    base = _empty_response_wire_sizes()[1 if has_more else 0]
+    return base - 4 + cursor_size + sum(selected_sizes) + len(selected_sizes)
 
 
 def _available_response(

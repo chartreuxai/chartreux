@@ -12,11 +12,12 @@ cutover.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 import json
 from pathlib import Path
 from typing import Literal
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -40,12 +41,13 @@ from chartreux.core.agents.launch import (
     LaunchAuthorityInputs,
     LaunchCandidate,
 )
-from chartreux.core.config import MCPStdio, SessionLoggingConfig
+from chartreux.core.config import ChartreuxConfigSchema, MCPStdio, SessionLoggingConfig
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.dispatch.renderer import task_description_for_config
 from chartreux.core.dispatch.route_models import PackageTier, PurposeRoute, RouteTarget
-from chartreux.core.dispatch.routes import shipped_routes
+from chartreux.core.dispatch.routes import RouteResolutionError, shipped_routes
 from chartreux.core.dispatch.session import SessionPolicyError, resume_policy_bundle
+from chartreux.core.events import RouteTableAppliedEvent
 from chartreux.core.hooks.models import HookConfigResult
 from chartreux.core.policy.bundle import BUNDLE_FORMAT_VERSION, BundleStoreError
 from chartreux.core.session.session_loader import SessionLoader
@@ -57,15 +59,21 @@ from chartreux.core.session_types import (
     LaunchPersonaV2,
 )
 from chartreux.core.subagents import InvalidLaunchConfigError, LaunchConfig, TaskArgs
-from chartreux.core.tools.base import ToolPermission
+from chartreux.core.tools.base import InvokeContext, ToolPermission
 from chartreux.core.tools.builtins.read_file import ReadFile, ReadFileArgs
 from chartreux.core.tools.manager import NoSuchToolError, ToolManager
 from chartreux.utils.cache_store import FileSystemCacheStore
 from tests.agent_loop.test_accepted_source_snapshot import make_orchestrator
+from tests.app_server._subagent_test_support import (
+    BlockingBackend,
+    _background_result,
+    _retention_registry,
+)
 from tests.conftest import (
     build_test_agent_loop,
     build_test_vibe_config,
     set_agent_config,
+    stub_config_reload,
 )
 from tests.stubs.app_server import (
     attach_test_app_server_session,
@@ -225,11 +233,16 @@ async def test_reload_rebuilds_skill_eligibility_from_the_frozen_policy() -> Non
 
 def _research_route_rebound_to_coder() -> dict[str, PurposeRoute]:
     """The final-release-review EF1 repro: research researcher -> coder."""
+    return _research_route_rebound_to("coder")
+
+
+def _research_route_rebound_to(identity: str) -> dict[str, PurposeRoute]:
+    """Rebind the research route to ``identity``; the rest stays shipped."""
     routes = dict(shipped_routes())
     routes["research"] = PurposeRoute(
         targets=(
             RouteTarget(
-                model="$session", identity="coder", tier=PackageTier.SUBSTANTIVE
+                model="$session", identity=identity, tier=PackageTier.SUBSTANTIVE
             ),
         )
     )
@@ -252,16 +265,17 @@ def _admission_registry(
 
 
 @pytest.mark.asyncio
-async def test_reload_keeps_launches_on_the_frozen_route_table_and_reports_the_edit() -> (
+async def test_reload_applies_the_edited_route_to_subsequent_launches_and_reports_it() -> (
     None
 ):
-    # EF1 (final release review): purpose routes are frozen conversation
-    # policy (design §6 route/launch-target snapshot, §10 a reload never
-    # re-postures). A saved route edit — the reviewer's offline repro:
-    # research researcher -> coder — stays PENDING: launch admission keeps
-    # resolving the conversation's frozen route while the reloaded live
-    # config carries the edit, and the edit is reported alongside the
-    # other pending policy changes.
+    # ADR 0022 (P1-i-a), checks 2 and 4: purpose routes are bindings, not
+    # frozen content. A validated route edit — the reviewer's offline
+    # repro: research researcher -> coder — APPLIES at the reload commit:
+    # launch admission resolves the edited table for every subsequent
+    # launch, the applied report enumerates the edit old -> new per purpose,
+    # and the conversation-visible notice is queued for publication. The
+    # route edit is no longer reported as pending, while the identity
+    # selection change (frozen content) still is.
     loop = build_test_agent_loop()
     registry, root = _admission_registry(loop)
     try:
@@ -271,46 +285,167 @@ async def test_reload_keeps_launches_on_the_frozen_route_table_and_reports_the_e
             root, TaskArgs(task="inspect", purpose="research")
         )
         assert before.identity == "researcher"
+        assert loop.live_purpose_routes["research"].targets[0].identity == "researcher"
 
         set_agent_config(
             loop,
             build_test_vibe_config(
-                orchestration={"routes": _research_route_rebound_to_coder()}
+                agent={"identity": "reviewer"},
+                orchestration={"routes": _research_route_rebound_to_coder()},
             ),
         )
         await loop.reload_with_initial_messages()
 
-        # The frozen bundle (and its rendered launch-target table) is
-        # untouched by the reload...
+        # The frozen bundle (and its persisted route snapshot) is untouched
+        # by the reload — it stays the integrity and diff anchor...
         assert loop._bound_policy is bound
-        # ...admission keeps resolving the conversation's FROZEN route...
-        after = registry._launch_admission.resolve_candidate(
-            root, TaskArgs(task="inspect", purpose="research")
-        )
-        assert after.identity == "researcher"
-        assert (
-            loop.frozen_purpose_routes["research"].targets[0].identity == "researcher"
-        )
-        # ...while the live config carries the edit...
+        # ...the live table carries the edit...
         assert (
             loop.config.purpose_routes.routes["research"].targets[0].identity == "coder"
         )
-        # ...and the reload reports the route edit as pending.
+        # ...admission resolves the EDITED route for subsequent launches...
+        after = registry._launch_admission.resolve_candidate(
+            root, TaskArgs(task="inspect", purpose="research")
+        )
+        assert after.identity == "coder"
+        assert loop.live_purpose_routes["research"].targets[0].identity == "coder"
+        # ...the applied report enumerates the edit old -> new...
+        changes = loop.applied_route_changes
+        assert [change.purpose for change in changes] == ["research"]
+        assert "researcher" in changes[0].before
+        assert "coder" in changes[0].after
+        # ...the conversation-visible notice is queued for publication...
+        queued: list[object] = []
+        while not loop._out_of_band_events.empty():
+            queued.append(loop._out_of_band_events.get_nowait())
+        route_events = [
+            event for event in queued if isinstance(event, RouteTableAppliedEvent)
+        ]
+        assert len(route_events) == 1
+        assert route_events[0].session_id == loop.session_id
+        assert route_events[0].changes == changes
+        # ...the identity selection change is still reported as pending
+        # (frozen content)...
         assert any(
-            "[orchestration.routes]" in note and "'research'" in note
-            for note in loop.pending_policy_changes
+            "identity selection change" in note for note in loop.pending_policy_changes
+        )
+        # ...and the route edit is NOT pending: the "applies to new
+        # conversations only" route text is gone.
+        assert not any(
+            "[orchestration.routes]" in note for note in loop.pending_policy_changes
         )
     finally:
         await loop.aclose()
 
 
 @pytest.mark.asyncio
+async def test_in_flight_child_keeps_its_binding_while_a_new_launch_adopts_the_edit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ADR 0022 checks 1 and 2: admission is the binding point. A launch
+    # admitted BEFORE the route edit keeps its committed model and identity
+    # (the T1-pinned record), while a fresh launch after the reload resolves
+    # the edited target (the T2 record) — the distinguishing pair in one
+    # conversation.
+    backends: list[BlockingBackend] = []
+
+    def create_backend(*, provider, **_kwargs):
+        backend = BlockingBackend()
+        backends.append(backend)
+        return backend
+
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", create_backend
+    )
+
+    def launch_config() -> ChartreuxConfigSchema:
+        return build_test_vibe_config(
+            enabled_tools=["task"], tools={"task": {"permission": "always"}}
+        )
+
+    parent = build_test_agent_loop(config=launch_config(), backend=FakeBackend())
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    context = InvokeContext(tool_call_id="route-edit", session_id=parent.session_id)
+    try:
+        # T1: admitted on the shipped research route (researcher).
+        first = await _background_result(
+            registry,
+            TaskArgs(task="first", purpose="research", background=True, retain=True),
+            context,
+        )
+        assert first.agent_id is not None
+        record = registry._agent_records[first.agent_id]
+        assert record.identity == "researcher"
+        assert record.base_model is not None
+
+        # Wait until the child's turn is blocked inside a backend call.
+        # The child may create more than one backend over its lifetime
+        # (the turn's attempt backend), so poll the created set; from
+        # that point the committed model is stable and the pin below is
+        # exact.
+        async def wait_blocked() -> BlockingBackend:
+            for _ in range(500):
+                for backend in backends:
+                    if backend.started.is_set():
+                        return backend
+                await asyncio.sleep(0.01)
+            raise TimeoutError("child never reached a backend call")
+
+        blocked = await asyncio.wait_for(wait_blocked(), timeout=5)
+        assert record.runtime.agent_loop.backend is blocked
+        t1_model = record.runtime.agent_loop.committed_model
+        assert t1_model is not None
+        assert t1_model.base_model == record.base_model
+
+        # The route edit + reload lands while T1 is in flight.
+        edited = build_test_vibe_config(
+            enabled_tools=["task"],
+            tools={"task": {"permission": "always"}},
+            orchestration={"routes": _research_route_rebound_to_coder()},
+        )
+        set_agent_config(parent, edited)
+        await parent.reload_with_initial_messages()
+
+        # Check 1: the in-flight child's record keeps its committed model
+        # and identity across the edit.
+        assert registry._agent_records[first.agent_id] is record
+        assert record.identity == "researcher"
+        assert record.base_model == t1_model.base_model
+        assert record.runtime.agent_loop.committed_model is t1_model
+        assert record.runtime.agent_loop._bound_identity == "researcher"
+
+        # Check 2: a fresh launch after the reload resolves the edited
+        # target — the T2 record in the same conversation.
+        second = await _background_result(
+            registry,
+            TaskArgs(task="second", purpose="research", background=True, retain=True),
+            context,
+        )
+        assert second.agent_id is not None
+        assert second.agent_id != first.agent_id
+        t2 = registry._agent_records[second.agent_id]
+        assert t2.identity == "coder"
+        assert t2.base_model == t1_model.base_model
+        assert t2.runtime.agent_loop.committed_model is not None
+        assert t2.runtime.agent_loop._bound_identity == "coder"
+    finally:
+        for backend in backends:
+            backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
 async def test_clear_binds_the_edited_route_for_the_new_conversation(
     tmp_path: Path,
 ) -> None:
-    # EF1 counterpart: /clear binds a FRESH bundle from the current
-    # selections (design §10), so the edited route is no longer pending —
-    # the new conversation's admission resolves it.
+    # /clear binds a FRESH bundle from the current selections (design §10),
+    # and the new conversation's admission resolves the edited route: the
+    # live table carries the edit from the start.
     config = build_test_vibe_config(
         session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path))
     )
@@ -319,14 +454,12 @@ async def test_clear_binds_the_edited_route_for_the_new_conversation(
     try:
         first_bundle = loop._bound_policy
         assert first_bundle is not None
-        # The OLD conversation launches on its frozen (shipped) route...
+        # The OLD conversation launches on its live (shipped) route...
         before = registry._launch_admission.resolve_candidate(
             root, TaskArgs(task="inspect", purpose="research")
         )
         assert before.identity == "researcher"
-        assert (
-            loop.frozen_purpose_routes["research"].targets[0].identity == "researcher"
-        )
+        assert loop.live_purpose_routes["research"].targets[0].identity == "researcher"
 
         set_agent_config(
             loop,
@@ -339,12 +472,11 @@ async def test_clear_binds_the_edited_route_for_the_new_conversation(
         )
         await loop.clear_history()
 
-        # ...and /clear REBINDS the frozen route table: the new
-        # conversation's frozen source is the freshly captured bundle, not
-        # a stale snapshot of the old conversation's routes.
+        # ...and /clear REBINDS the conversation: the new conversation's
+        # live route table is the edited one, and its admission resolves it.
         assert loop._bound_policy is not first_bundle
         assert loop._bound_policy is not None
-        assert loop.frozen_purpose_routes["research"].targets[0].identity == "coder"
+        assert loop.live_purpose_routes["research"].targets[0].identity == "coder"
         candidate = registry._launch_admission.resolve_candidate(
             root, TaskArgs(task="inspect", purpose="research")
         )
@@ -354,12 +486,12 @@ async def test_clear_binds_the_edited_route_for_the_new_conversation(
 
 
 @pytest.mark.asyncio
-async def test_resume_restores_the_frozen_routes_from_the_persisted_bundle(
-    tmp_path: Path,
-) -> None:
-    # EF1 resume half: the persisted bundle round-trips the route snapshot,
-    # so a resumed conversation keeps launching on its FROZEN routes even
-    # when the current saved configuration carries a different table.
+async def test_resume_adopts_the_current_saved_route_table(tmp_path: Path) -> None:
+    # ADR 0022 resume half (check 5): the persisted bundle round-trips the
+    # route snapshot as the integrity and diff anchor, but a resumed
+    # conversation's ADMISSION resolves the current saved table — the table
+    # the source loop's orchestrator reloaded at resume — not the persisted
+    # snapshot.
     config = build_test_vibe_config(
         orchestration={"routes": _research_route_rebound_to_coder()},
         session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path)),
@@ -382,7 +514,8 @@ async def test_resume_restores_the_frozen_routes_from_the_persisted_bundle(
         await source.wait_until_ready()
         assert source.session_id == saved_session_id
 
-        # The persisted bundle round-trips the frozen route snapshot...
+        # The persisted bundle round-trips the frozen route snapshot (the
+        # diff anchor)...
         resumed = source._bound_policy
         assert resumed is not None
         research_entry = next(
@@ -391,15 +524,17 @@ async def test_resume_restores_the_frozen_routes_from_the_persisted_bundle(
             if entry.purpose == "research"
         )
         assert research_entry.targets[0].identity == "coder"
-        # ...the resumed conversation's frozen route table is the persisted
-        # one...
-        assert source.frozen_purpose_routes["research"].targets[0].identity == "coder"
-        # ...and admission launches on the persisted route, not the current
-        # saved one.
+        # ...but the resumed conversation's live route table is the current
+        # saved one...
+        assert (
+            source.live_purpose_routes["research"].targets[0].identity == "researcher"
+        )
+        # ...and admission launches on the current saved route, not the
+        # persisted snapshot.
         candidate = registry._launch_admission.resolve_candidate(
             root, TaskArgs(task="inspect", purpose="research")
         )
-        assert candidate.identity == "coder"
+        assert candidate.identity == "researcher"
     finally:
         await source.aclose()
 
@@ -420,15 +555,13 @@ def _launch_target_row(description: str, purpose: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_reload_keeps_the_task_tool_description_on_the_frozen_route_table() -> (
+async def test_reload_serves_the_edited_route_table_in_the_task_tool_description() -> (
     None
 ):
-    # DF1 (delta re-review): the model-facing task-tool description is
-    # conversation-owned policy like admission — a reload rebuilds it from
-    # the SAME frozen route table launch admission resolves against, never
-    # from the reloaded live config (design §14 criterion 6: no half-applied
-    # generation). The description and executable admission must AGREE,
-    # both frozen, after a saved route edit + reload.
+    # ADR 0022 check 3 (no divergence): the model-facing task-tool
+    # description is rebuilt from the SAME live route table launch admission
+    # resolves against, in the same synchronous reload commit — the served
+    # launch-target table equals the admission table after the reload.
     loop = build_test_agent_loop()
     registry, root = _admission_registry(loop)
     try:
@@ -436,8 +569,8 @@ async def test_reload_keeps_the_task_tool_description_on_the_frozen_route_table(
             root, TaskArgs(task="inspect", purpose="research")
         )
         assert before.identity == "researcher"
-        frozen_row = _launch_target_row(_served_task_description(loop), "research")
-        assert "`researcher`" in frozen_row
+        initial_row = _launch_target_row(_served_task_description(loop), "research")
+        assert "`researcher`" in initial_row
 
         set_agent_config(
             loop,
@@ -447,33 +580,30 @@ async def test_reload_keeps_the_task_tool_description_on_the_frozen_route_table(
         )
         await loop.reload_with_initial_messages()
 
-        # Admission still launches the conversation's FROZEN route...
+        # Admission launches the EDITED route...
         after = registry._launch_admission.resolve_candidate(
             root, TaskArgs(task="inspect", purpose="research")
         )
-        assert after.identity == "researcher"
-        # ...and the model-facing description advertises the SAME route:
-        # the reload did not re-render it from the live (edited) config.
+        assert after.identity == "coder"
+        # ...and the model-facing description advertises the SAME edited
+        # route: the reload re-rendered it from the live table.
         served_row = _launch_target_row(_served_task_description(loop), "research")
-        assert served_row == frozen_row
-        # Control: the live render of the reloaded config DOES carry the
-        # edit — the divergence this fix removes is observable here.
-        live_row = _launch_target_row(
-            task_description_for_config(loop.config), "research"
-        )
-        assert "`coder`" in live_row
+        assert "`coder`" in served_row
+        assert served_row != initial_row
     finally:
         await loop.aclose()
 
 
 @pytest.mark.asyncio
-async def test_resume_keeps_the_task_tool_description_on_the_persisted_route_table(
+async def test_resume_serves_the_current_saved_route_table_in_the_task_tool_description(
     tmp_path: Path,
 ) -> None:
-    # DF1 resume half: after a disk resume the model-facing task-tool
-    # description is rebuilt from the RESUMED conversation's persisted route
-    # snapshot — the same table admission resolves against — never from the
-    # source loop's current saved config.
+    # ADR 0022 check 3 at the resume boundary: after a disk resume the
+    # model-facing task-tool description renders from the CURRENT SAVED
+    # route table — the same source launch admission resolves against — so
+    # the served launch-target table can never diverge from admission
+    # post-resume. The persisted snapshot stays the integrity and diff
+    # anchor (the resume notice diffs against it), never the served table.
     config = build_test_vibe_config(
         orchestration={"routes": _research_route_rebound_to_coder()},
         session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path)),
@@ -498,30 +628,300 @@ async def test_resume_keeps_the_task_tool_description_on_the_persisted_route_tab
         await source.wait_until_ready()
         assert source.session_id == saved_session_id
 
-        # Admission launches the PERSISTED route...
+        # Admission launches the CURRENT SAVED route (the resumed
+        # conversation adopts the live table)...
         candidate = registry._launch_admission.resolve_candidate(
             root, TaskArgs(task="inspect", purpose="research")
         )
-        assert candidate.identity == "coder"
-        # ...and the model-facing description advertises the SAME persisted
-        # route, not the source loop's saved (shipped) config.
+        assert candidate.identity == "researcher"
+        # ...and the model-facing description advertises the SAME live
+        # route: no divergence post-resume (P1-i-a's check-3 pattern at the
+        # resume boundary).
         served_row = _launch_target_row(_served_task_description(source), "research")
-        assert served_row == persisted_row
-        # Control: the source loop's live config would advertise researcher.
+        assert "`researcher`" in served_row
+        assert served_row != persisted_row
+        # Control: the served row equals the live config's own render.
         live_row = _launch_target_row(
             task_description_for_config(source.config), "research"
         )
-        assert "`researcher`" in live_row
+        assert served_row == live_row
     finally:
         await source.aclose()
 
 
 @pytest.mark.asyncio
-async def test_construction_with_a_bound_bundle_serves_the_bundle_route_table() -> None:
-    # DF1 sweep: a loop constructed WITH a bound policy bundle (a
+async def test_resume_reports_the_route_diff_against_the_persisted_snapshot(
+    tmp_path: Path,
+) -> None:
+    # ADR 0022 check 5's notice half: a resumed conversation adopts the
+    # CURRENT SAVED route table, and the resume notice reports the diff
+    # against the persisted bundle's bind-time snapshot through the same
+    # applied-notice channel the reload commit publishes through.
+    config = build_test_vibe_config(
+        orchestration={"routes": _research_route_rebound_to_coder()},
+        session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path)),
+    )
+    saved = build_test_agent_loop(config=config)
+    await saved.persist_empty_session()
+    saved_session_id = saved.session_id
+    await saved.aclose()
+
+    # The source loop's current saved state carries the SHIPPED research
+    # route (researcher) again.
+    source = build_test_agent_loop(
+        config=build_test_vibe_config(
+            session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path))
+        )
+    )
+    try:
+        await AgentRuntimeFactory().resume_root(source, saved_session_id)
+        await source.wait_until_ready()
+        assert source.session_id == saved_session_id
+
+        # The resumed conversation adopts the CURRENT SAVED route...
+        assert (
+            source.live_purpose_routes["research"].targets[0].identity == "researcher"
+        )
+        # ...and the resume notice reports the diff against the persisted
+        # bundle's bind-time snapshot (coder -> researcher) through the same
+        # applied-notice channel the reload commit publishes through.
+        queued: list[object] = []
+        while not source._out_of_band_events.empty():
+            queued.append(source._out_of_band_events.get_nowait())
+        route_events = [
+            event for event in queued if isinstance(event, RouteTableAppliedEvent)
+        ]
+        assert len(route_events) == 1
+        assert route_events[0].session_id == source.session_id
+        changes = route_events[0].changes
+        assert [change.purpose for change in changes] == ["research"]
+        assert "coder" in changes[0].before
+        assert "researcher" in changes[0].after
+        # The loop's applied report carries the same diff.
+        assert source.applied_route_changes == changes
+    finally:
+        await source.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reload_notices_diff_against_the_previous_live_table() -> None:
+    # R7 (ADR 0022 notice fix): the reload's applied notice diffs against
+    # the previous LIVE table, not the frozen bind-time snapshot. Bind at
+    # the shipped table (A); A -> B reports "A -> B"; B -> C reports
+    # "B -> C"; a reload that leaves the live table unchanged reports
+    # nothing; a revert to A reports "C -> A". The frozen snapshot stays
+    # the integrity anchor and the resume notice's diff base.
+    loop = build_test_agent_loop()
+    try:
+        bound = loop._bound_policy
+        assert bound is not None
+        assert loop._last_seen_purpose_routes is None
+
+        async def reload_with(
+            routes: dict[str, PurposeRoute],
+        ) -> tuple[RouteTableAppliedEvent, ...]:
+            set_agent_config(
+                loop, build_test_vibe_config(orchestration={"routes": routes})
+            )
+            await loop.reload_with_initial_messages()
+            queued: list[object] = []
+            while not loop._out_of_band_events.empty():
+                queued.append(loop._out_of_band_events.get_nowait())
+            return tuple(
+                event for event in queued if isinstance(event, RouteTableAppliedEvent)
+            )
+
+        # A -> B: the first reload diffs against the bind-time table.
+        events = await reload_with(_research_route_rebound_to("coder"))
+        assert len(events) == 1
+        changes = events[0].changes
+        assert [change.purpose for change in changes] == ["research"]
+        assert "researcher" in changes[0].before
+        assert "coder" in changes[0].after
+        assert loop.applied_route_changes == changes
+        assert loop._last_seen_purpose_routes == dict(loop.config.purpose_routes.routes)
+
+        # B -> C: the notice diffs against the previous LIVE table.
+        events = await reload_with(_research_route_rebound_to("reviewer"))
+        assert len(events) == 1
+        changes = events[0].changes
+        assert [change.purpose for change in changes] == ["research"]
+        assert "coder" in changes[0].before
+        assert "reviewer" in changes[0].after
+
+        # A reload that leaves the live table unchanged reports nothing.
+        events = await reload_with(_research_route_rebound_to("reviewer"))
+        assert events == ()
+        assert loop.applied_route_changes == ()
+
+        # C -> A (revert): the notice reports the revert against the
+        # previous live table, never the bind-time snapshot.
+        events = await reload_with(dict(shipped_routes()))
+        assert len(events) == 1
+        changes = events[0].changes
+        assert [change.purpose for change in changes] == ["research"]
+        assert "reviewer" in changes[0].before
+        assert "researcher" in changes[0].after
+
+        # The frozen bundle (and its persisted route snapshot) is untouched
+        # by every reload — it stays the integrity anchor.
+        assert loop._bound_policy is bound
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reload_notice_diffs_against_the_live_table_when_the_last_seen_table_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Round-3 F7: the last-seen live table goes stale when the live table is
+    # swapped without a consumer commit (what refresh_config or a raw
+    # orchestrator reload does). A reload through the orchestrator path
+    # commits BEFORE the orchestrator accepts the candidate, so the live
+    # table at commit time is still the swapped one — the notice must diff
+    # against THAT table, never the stale last-seen one.
+    loop = build_test_agent_loop()
+    try:
+        bound = loop._bound_policy
+        assert bound is not None
+
+        def drain() -> list[RouteTableAppliedEvent]:
+            queued: list[object] = []
+            while not loop._out_of_band_events.empty():
+                queued.append(loop._out_of_band_events.get_nowait())
+            return [
+                event for event in queued if isinstance(event, RouteTableAppliedEvent)
+            ]
+
+        # A -> B through the install-then-catch-up path: the notice diffs
+        # against the last-seen live table (the pinned R7 semantics).
+        set_agent_config(
+            loop,
+            build_test_vibe_config(
+                orchestration={"routes": _research_route_rebound_to("coder")}
+            ),
+        )
+        await loop.reload_with_initial_messages()
+        events = drain()
+        assert len(events) == 1
+        changes = events[0].changes
+        assert [change.purpose for change in changes] == ["research"]
+        assert "coder" in changes[0].after
+        assert loop._last_seen_purpose_routes == dict(loop.config.purpose_routes.routes)
+
+        # B -> C behind the back: the live table is swapped with no consumer
+        # commit, so the last-seen table stays at B while the live table is C.
+        set_agent_config(
+            loop,
+            build_test_vibe_config(
+                orchestration={"routes": _research_route_rebound_to("reviewer")}
+            ),
+        )
+        assert loop._last_seen_purpose_routes != dict(loop.config.purpose_routes.routes)
+
+        # C -> D through the orchestrator path: _commit_reload runs before the
+        # orchestrator accepts the candidate, so the live table at commit time
+        # is still C — the notice must report C -> D, not the stale B -> D.
+        candidate = build_test_vibe_config(
+            orchestration={"routes": _research_route_rebound_to("advisor")}
+        )
+        stub_config_reload(monkeypatch, candidate)
+        await loop.reload_with_initial_messages(reload_config=True)
+        events = drain()
+        assert len(events) == 1
+        changes = events[0].changes
+        assert [change.purpose for change in changes] == ["research"]
+        assert "reviewer" in changes[0].before
+        assert "advisor" in changes[0].after
+        assert loop.applied_route_changes == changes
+        assert loop._last_seen_purpose_routes == dict(loop.config.purpose_routes.routes)
+
+        # The frozen bundle (and its persisted route snapshot) is untouched —
+        # it stays the integrity anchor.
+        assert loop._bound_policy is bound
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resume_seeds_the_last_seen_live_table_for_later_reload_notices(
+    tmp_path: Path,
+) -> None:
+    # R7 (ADR 0022 notice fix, resume half): resume adopts the current
+    # saved table and the resume notice still diffs against the persisted
+    # bind-time snapshot (P1-i-b unchanged); the last-seen LIVE table
+    # starts at the adopted table, so the next reload's notice diffs
+    # against the adopted live table — never the persisted snapshot.
+    config = build_test_vibe_config(
+        orchestration={"routes": _research_route_rebound_to_coder()},
+        session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path)),
+    )
+    saved = build_test_agent_loop(config=config)
+    await saved.persist_empty_session()
+    saved_session_id = saved.session_id
+    await saved.aclose()
+
+    # The source loop's current saved state carries the SHIPPED research
+    # route (researcher) again.
+    source = build_test_agent_loop(
+        config=build_test_vibe_config(
+            session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path))
+        )
+    )
+    try:
+        await AgentRuntimeFactory().resume_root(source, saved_session_id)
+        await source.wait_until_ready()
+        assert source.session_id == saved_session_id
+
+        # The resume notice reports the diff against the persisted
+        # bundle's bind-time snapshot (coder -> researcher), unchanged...
+        queued: list[object] = []
+        while not source._out_of_band_events.empty():
+            queued.append(source._out_of_band_events.get_nowait())
+        route_events = [
+            event for event in queued if isinstance(event, RouteTableAppliedEvent)
+        ]
+        assert len(route_events) == 1
+        resume_changes = route_events[0].changes
+        assert [change.purpose for change in resume_changes] == ["research"]
+        assert "coder" in resume_changes[0].before
+        assert "researcher" in resume_changes[0].after
+        # ...and the last-seen live table is the ADOPTED table.
+        assert source._last_seen_purpose_routes == dict(
+            source.config.purpose_routes.routes
+        )
+
+        # A reload after the resume diffs against the adopted live table
+        # (researcher), not the persisted snapshot (coder).
+        set_agent_config(
+            source,
+            build_test_vibe_config(
+                orchestration={"routes": _research_route_rebound_to("reviewer")}
+            ),
+        )
+        await source.reload_with_initial_messages()
+        queued = []
+        while not source._out_of_band_events.empty():
+            queued.append(source._out_of_band_events.get_nowait())
+        route_events = [
+            event for event in queued if isinstance(event, RouteTableAppliedEvent)
+        ]
+        assert len(route_events) == 1
+        changes = route_events[0].changes
+        assert [change.purpose for change in changes] == ["research"]
+        assert "researcher" in changes[0].before
+        assert "reviewer" in changes[0].after
+    finally:
+        await source.aclose()
+
+
+@pytest.mark.asyncio
+async def test_construction_with_a_bound_bundle_serves_the_live_route_table() -> None:
+    # ADR 0022: a loop constructed WITH a bound policy bundle (a
     # reconstructed conversation) serves the task-tool description from the
-    # BUNDLE's frozen route snapshot, never the pending live config — the
-    # same source its admission resolves against.
+    # LIVE config's route table — the same source its admission resolves
+    # against — never the bundle's frozen snapshot, which stays the diff
+    # anchor.
     source = build_test_agent_loop(
         config=build_test_vibe_config(
             orchestration={"routes": _research_route_rebound_to_coder()}
@@ -530,8 +930,8 @@ async def test_construction_with_a_bound_bundle_serves_the_bundle_route_table() 
     try:
         bundle = source._bound_policy
         assert bundle is not None
-        persisted_row = _launch_target_row(_served_task_description(source), "research")
-        assert "`coder`" in persisted_row
+        live_row = _launch_target_row(_served_task_description(source), "research")
+        assert "`coder`" in live_row
     finally:
         await source.aclose()
 
@@ -543,9 +943,10 @@ async def test_construction_with_a_bound_bundle_serves_the_bundle_route_table() 
             loop.config.purpose_routes.routes["research"].targets[0].identity
             == "researcher"
         )
-        # ...but the served description follows the bound bundle's snapshot.
+        # ...and the served description follows the LIVE table, matching
+        # admission — the bundle's snapshot is only the diff anchor.
         served_row = _launch_target_row(_served_task_description(loop), "research")
-        assert served_row == persisted_row
+        assert "`researcher`" in served_row
         # Control: a fresh construction (no bound bundle) IS the current
         # selections — it serves the live config's table.
         fresh = build_test_agent_loop(config=build_test_vibe_config())
@@ -560,25 +961,24 @@ async def test_construction_with_a_bound_bundle_serves_the_bundle_route_table() 
 
 
 @pytest.mark.asyncio
-async def test_retask_keeps_the_task_tool_description_on_the_frozen_route_table() -> (
+async def test_retask_serves_the_live_route_table_in_the_task_tool_description() -> (
     None
 ):
-    # DF1 sweep: the retained-retask rebuild of the ToolManager (triggered
-    # by a tool-override change) serves the conversation's FROZEN route
-    # table — the same source admission resolves against — never the
-    # retask target config's live routes.
+    # ADR 0022: the retained-retask rebuild of the ToolManager (triggered
+    # by a tool-override change) serves the retask target config's LIVE
+    # route table — the same source admission resolves against once the
+    # retask's orchestrator becomes the loop's live config.
     loop = build_test_agent_loop(
         config=build_test_vibe_config(), parent_authority_revision_getter=lambda: 0
     )
     registry, root = _admission_registry(loop)
     try:
-        frozen_row = _launch_target_row(_served_task_description(loop), "research")
-        assert "`researcher`" in frozen_row
+        initial_row = _launch_target_row(_served_task_description(loop), "research")
+        assert "`researcher`" in initial_row
         assert loop.committed_model is not None
 
-        # The saved config carries the edited route (the edit applies to
-        # NEW conversations only); the retask target config — built from
-        # the parent's current config — carries it too.
+        # The retask target config — built from the parent's current config
+        # — carries the edited route.
         edited = build_test_vibe_config(
             orchestration={"routes": _research_route_rebound_to_coder()}
         )
@@ -604,30 +1004,30 @@ async def test_retask_keeps_the_task_tool_description_on_the_frozen_route_table(
         )
         loop.publish_launch_reconfiguration(prepared)
 
-        # Admission still launches the conversation's FROZEN route...
+        # The retask's live config carries the edit, so admission resolves
+        # the EDITED route...
         after = registry._launch_admission.resolve_candidate(
             root, TaskArgs(task="inspect", purpose="research")
         )
-        assert after.identity == "researcher"
-        # ...and the rebuilt manager advertises the SAME route.
+        assert after.identity == "coder"
+        # ...and the rebuilt manager advertises the SAME edited route.
         served_row = _launch_target_row(_served_task_description(loop), "research")
-        assert served_row == frozen_row
+        assert "`coder`" in served_row
+        assert served_row != initial_row
     finally:
         await loop.aclose()
 
 
 @pytest.mark.asyncio
-async def test_policy_replacement_keeps_the_task_tool_description_frozen(
-    tmp_path: Path,
-) -> None:
-    # DF1 sweep: the policy-replacement rebuild of the ToolManager serves
-    # the conversation's FROZEN route table — the same source admission
-    # resolves against — never the staged live config's routes. The
-    # policy-replacement staging needs the real layer-backed orchestrator
-    # (the fake lacks the mutation lock), so a first loop binds the SHIPPED
-    # bundle (the conversation's frozen policy record) and the test
-    # conversation is reconstructed around it while the saved config
-    # carries the edited route.
+async def test_policy_replacement_serves_the_live_route_table(tmp_path: Path) -> None:
+    # ADR 0022: the policy-replacement rebuild of the ToolManager serves
+    # the conversation's LIVE route table — the same source admission
+    # resolves against — never the staged config's routes diverging from
+    # the live ones. The policy-replacement staging needs the real
+    # layer-backed orchestrator (the fake lacks the mutation lock), so a
+    # first loop binds the SHIPPED bundle (the conversation's frozen policy
+    # record) and the test conversation is reconstructed around it while
+    # the saved config carries the edited route.
     shipped_settings = tmp_path / "shipped-settings.toml"
     shipped_settings.write_text(
         '[tools.read_file]\ndenylist = ["A"]\n', encoding="utf-8"
@@ -662,14 +1062,14 @@ async def test_policy_replacement_keeps_the_task_tool_description_frozen(
     )
     registry, root = _admission_registry(loop)
     try:
-        # The saved config carries the edited route (the edit applies to
-        # NEW conversations only)...
+        # The live config carries the edited route (ADR 0022: the edit
+        # applies to this conversation's subsequent launches)...
         assert (
             loop.config.purpose_routes.routes["research"].targets[0].identity == "coder"
         )
-        # ...while the conversation stays frozen on the shipped bundle.
-        frozen_row = _launch_target_row(_served_task_description(loop), "research")
-        assert "`researcher`" in frozen_row
+        # ...and the served description advertises it, matching admission.
+        live_row = _launch_target_row(_served_task_description(loop), "research")
+        assert "`coder`" in live_row
 
         prepared = await loop._prepare_policy_replacement(
             source="user-toml",
@@ -678,14 +1078,14 @@ async def test_policy_replacement_keeps_the_task_tool_description_frozen(
         )
         loop._commit_policy_replacement(prepared)
 
-        # Admission still launches the conversation's FROZEN route...
+        # Admission launches the LIVE (edited) route...
         after = registry._launch_admission.resolve_candidate(
             root, TaskArgs(task="inspect", purpose="research")
         )
-        assert after.identity == "researcher"
+        assert after.identity == "coder"
         # ...and the rebuilt manager advertises the SAME route.
         served_row = _launch_target_row(_served_task_description(loop), "research")
-        assert served_row == frozen_row
+        assert served_row == live_row
     finally:
         await loop.aclose()
 
@@ -731,15 +1131,13 @@ async def test_clear_rebinds_the_task_tool_description_to_the_new_conversation(
 
 
 @pytest.mark.asyncio
-async def test_subagent_rewind_keeps_the_task_tool_description_on_the_children_bundle(
-    tmp_path: Path,
-) -> None:
-    # DF1 sweep (rewind half): a subagent rewind keeps the CHILD's own bound
-    # bundle, so the rebuilt task-tool description follows that bundle's
-    # frozen route snapshot — the same table the rewound conversation's
-    # admission resolves against — even when the child's reloaded config
-    # carries an edited route. (A root clear binds a FRESH bundle from the
-    # current selections, so its live config and fresh bundle agree by
+async def test_subagent_rewind_serves_the_live_route_table(tmp_path: Path) -> None:
+    # ADR 0022 (rewind half): a subagent rewind keeps the CHILD's own bound
+    # bundle for the frozen identity content, but the served route table is
+    # live: the rewound conversation's admission resolves the child's live
+    # (edited) route, and its model-facing description advertises the SAME
+    # route. (A root clear binds a FRESH bundle from the current
+    # selections, so its live config and fresh bundle agree by
     # construction; the rewind is the divergent reset path.)
     config = build_test_vibe_config(
         session_logging=SessionLoggingConfig(enabled=True, save_dir=str(tmp_path))
@@ -755,12 +1153,11 @@ async def test_subagent_rewind_keeps_the_task_tool_description_on_the_children_b
     try:
         assert loop.is_subagent
         await parent.aclose()
-        frozen_row = _launch_target_row(_served_task_description(loop), "research")
-        assert "`researcher`" in frozen_row
+        initial_row = _launch_target_row(_served_task_description(loop), "research")
+        assert "`researcher`" in initial_row
 
-        # The child reloads a saved route edit: its config carries the edit
-        # while its bound bundle stays frozen (the edit applies to NEW
-        # conversations only).
+        # The child reloads a saved route edit: its live config carries the
+        # edit, so the edit applies to the child's subsequent launches.
         set_agent_config(
             loop,
             build_test_vibe_config(
@@ -775,22 +1172,158 @@ async def test_subagent_rewind_keeps_the_task_tool_description_on_the_children_b
             loop.config.purpose_routes.routes["research"].targets[0].identity == "coder"
         )
 
-        # Rewind (keep the parent): the child's OWN bundle is kept.
+        # Rewind (keep the parent): the child's OWN bundle is kept for the
+        # frozen identity content, but the served route table is live.
         await loop._reset_session()
 
-        # The rewound conversation's admission resolves the child's bundle...
+        # The rewound conversation's admission resolves the child's LIVE
+        # (edited) route...
         candidate = registry._launch_admission.resolve_candidate(
             root, TaskArgs(task="inspect", purpose="research")
         )
-        assert candidate.identity == "researcher"
+        assert candidate.identity == "coder"
         # ...and its model-facing description advertises the SAME route.
         served_row = _launch_target_row(_served_task_description(loop), "research")
-        assert served_row == frozen_row
+        assert "`coder`" in served_row
+        assert served_row != initial_row
     finally:
         await loop.aclose()
 
 
 class _StaticProvider:
+    """An MCP authorization provider returning one canned result."""
+
+    def __init__(self, result: MCPAuthorizationResult) -> None:
+        self._result = result
+
+    async def resolve(self, reference: MCPAuthorizationRef) -> MCPAuthorizationResult:
+        return self._result
+
+    async def reject(
+        self,
+        reference: MCPAuthorizationRef,
+        *,
+        observed_connection_revision: str,
+        reason: Literal["http_unauthorized", "mcp_unauthorized"],
+    ) -> MCPAuthorizationResult:
+        return self._result
+
+
+def _review_deep_single_model_routes() -> dict[str, PurposeRoute]:
+    """review.deep with all three seats on ONE explicit model (invalid).
+
+    The route declares ``requires_distinct_models = 3`` but binds every
+    seat to the same literal model, so the diversity requirement is
+    statically unmet — exactly the edited table the reload must reject.
+    """
+    routes = dict(shipped_routes())
+    routes["review.deep"] = PurposeRoute(
+        targets=(
+            RouteTarget(
+                model="glm-5-3",
+                identity="reviewer",
+                tier=PackageTier.SUBSTANTIVE,
+                seat="analytical",
+            ),
+            RouteTarget(
+                model="glm-5-3",
+                identity="reviewer",
+                tier=PackageTier.SUBSTANTIVE,
+                seat="peer",
+            ),
+            RouteTarget(
+                model="glm-5-3",
+                identity="coder",
+                tier=PackageTier.SUBSTANTIVE,
+                seat="execution",
+            ),
+        ),
+        requires_distinct_models=3,
+    )
+    return routes
+
+
+@pytest.mark.asyncio
+async def test_invalid_edited_route_table_rejects_the_reload_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ADR 0022 check 6: an invalid edited table rejects the WHOLE reload,
+    # fail-closed — requires_distinct_models is validated at reload, not
+    # only at launch. The prior table stays effective, no applied notice is
+    # published, and in-flight children are untouched.
+    backends: list[BlockingBackend] = []
+
+    def create_backend(*, provider, **_kwargs):
+        backend = BlockingBackend()
+        backends.append(backend)
+        return backend
+
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", create_backend
+    )
+    parent = build_test_agent_loop(
+        config=build_test_vibe_config(
+            enabled_tools=["task"], tools={"task": {"permission": "always"}}
+        ),
+        backend=FakeBackend(),
+    )
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    context = InvokeContext(tool_call_id="fail-closed", session_id=parent.session_id)
+    try:
+        # An in-flight child admitted on the shipped research route.
+        first = await _background_result(
+            registry,
+            TaskArgs(task="first", purpose="research", background=True, retain=True),
+            context,
+        )
+        assert first.agent_id is not None
+        record = registry._agent_records[first.agent_id]
+        assert record.identity == "researcher"
+        t1_model = record.runtime.agent_loop.committed_model
+        assert t1_model is not None
+
+        # The edited table violates review.deep's declared diversity: all
+        # three seats bind one explicit model while the route requires 3
+        # distinct canonical models. The reload candidate resolves to this
+        # table, and the reload-time validation rejects it.
+        invalid = build_test_vibe_config(
+            enabled_tools=["task"],
+            tools={"task": {"permission": "always"}},
+            orchestration={"routes": _review_deep_single_model_routes()},
+        )
+        stub_config_reload(monkeypatch, invalid)
+        with pytest.raises(RouteResolutionError, match="distinct canonical models"):
+            await parent.reload_with_initial_messages(reload_config=True)
+
+        # The reload rejected the whole table: the prior table stays
+        # effective...
+        assert (
+            parent.live_purpose_routes["research"].targets[0].identity == "researcher"
+        )
+        candidate = registry._launch_admission.resolve_candidate(
+            root, TaskArgs(task="inspect", purpose="research")
+        )
+        assert candidate.identity == "researcher"
+        # ...the served description still advertises the prior table...
+        served_row = _launch_target_row(_served_task_description(parent), "research")
+        assert "`researcher`" in served_row
+        # ...no applied notice was published...
+        assert parent.applied_route_changes == ()
+        assert parent._out_of_band_events.empty()
+        # ...and the in-flight child is untouched.
+        assert registry._agent_records[first.agent_id] is record
+        assert record.identity == "researcher"
+        assert record.runtime.agent_loop.committed_model is t1_model
+        assert record.runtime.agent_loop._bound_identity == "researcher"
+    finally:
+        for backend in backends:
+            backend.release.set()
+        await registry.drain_children()
+        await parent.aclose()
     """An MCP authorization provider returning one canned result."""
 
     def __init__(self, result: MCPAuthorizationResult) -> None:

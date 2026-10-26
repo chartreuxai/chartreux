@@ -60,10 +60,10 @@ async def ignore(*args: Any, **kwargs: Any) -> None:
 def canonical_specs(specs: list[AvailableFunction]) -> list[AvailableFunction]:
     """The specs with the task description's lines sorted.
 
-    A policy refresh rebuilds the ToolManager around the conversation's
-    FROZEN route table (sorted by purpose), while specs captured before it
-    carry the live configured table's order — the same content, so the
-    stability comparison normalizes the launch-target row order.
+    Every render path reads the conversation's LIVE route table, so the
+    launch-target rows appear in the configured table's order; the
+    stability comparison normalizes that row order so only content
+    differences surface.
     """
     return [
         spec.model_copy(

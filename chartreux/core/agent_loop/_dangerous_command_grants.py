@@ -24,10 +24,13 @@ from chartreux.core.dangerous_commands import (
     OPERATION_REGISTRY,
     DangerousCommandAuthority,
     DangerousCommandProposal,
+    GitRepositoryRelocation,
     GrantChoice,
     RepositoryScope,
     is_grant_choice_valid,
 )
+from chartreux.core.env import project_env_for_cwd
+from chartreux.core.tools.builtins._destination import classify_network_egress
 from chartreux.core.tools.builtins._shell_command_policy import (
     classify_dangerous_git_command,
     resolve_repository_scope,
@@ -280,8 +283,16 @@ def dangerous_command_request(
         # so the question names them all.
         repository_line = f"Repositories: {', '.join(str(repository) for repository in repositories)}\n"
         session_scope = "in these repositories"
+    # The noun follows the operations: git calls keep the historical
+    # wording; a non-git ask-class call (network.egress, v0.5.9 P2-a) is not
+    # a git command and is not described as one.
+    noun = (
+        "dangerous git command"
+        if all(operation.startswith("git.") for operation in proposal.operations)
+        else "dangerous command"
+    )
     question = (
-        f"Allow this dangerous git command?\n\n{shlex.join(proposal.command)}\n\n"
+        f"Allow this {noun}?\n\n{shlex.join(proposal.command)}\n\n"
         f"Project: {proposal.project}\n"
         f"{repository_line}"
         f"Operations: {', '.join(proposal.operations)}\n"
@@ -394,6 +405,7 @@ def derive_call_requirements(
             list(analysis.command_parts),
             scratchpad_roots=scratchpad_roots,
             redirect_operands=analysis.redirect_operands,
+            command_assignments=analysis.command_assignments,
         )
         requirements: set[tuple[str, RepositoryScope]] = set()
         for entry, tokens, possible_cwds, cwd_unknown in _scoped_guardrail_cwds(
@@ -401,6 +413,28 @@ def derive_call_requirements(
         ):
             if entry.access is not None or not tokens:
                 continue  # Synthetic redirect operands are not executable commands.
+            # v0.5.9 P2-a: the modeled network clients re-derive their
+            # network.egress requirement exactly as the resolver classified
+            # it, so an approved once permit or session grant covers the
+            # egress call the proposal named. The injected environment and
+            # the command's own assignments are threaded too (v0.5.9 R1/R4):
+            # a non-loopback proxy in either is part of what makes the
+            # egress call require the operation.
+            egress = classify_network_egress(
+                tokens,
+                project_env_for_cwd(cwd),
+                command_env=dict(entry.assignments) if entry.assignments else None,
+            )
+            if egress.kind == "ask" and "network.egress" in wanted:
+                if cwd_unknown:
+                    return None
+                for possible_cwd in possible_cwds:
+                    scope = resolve_repository_scope(
+                        possible_cwd, GitRepositoryRelocation()
+                    )
+                    if scope is None:
+                        return None
+                    requirements.add(("network.egress", scope))
             classification = classify_dangerous_git_command(tokens)
             if classification.kind != "grantable" or classification.grantable is None:
                 continue

@@ -12,6 +12,10 @@ from typing import cast
 from tree_sitter import Language, Node, Parser
 import tree_sitter_bash as tsbash
 
+from chartreux.core.tools.builtins._destination import (
+    _PROXY_ENV_KEYS,
+    _proxy_value_loopback,
+)
 from chartreux.core.tools.builtins._shell_argv import ShellToken, split_shell_tokens
 from chartreux.core.tools.builtins._shell_command_policy import (
     executor_boundary,
@@ -53,7 +57,11 @@ _REDIRECTION_NODES = {"heredoc_redirect", "herestring_redirect"}
 _REDIRECTION_DEVICES = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
 
 # Assignment names that can alter command lookup, loading, startup, or runtime
-# behavior. Prefix families are checked separately below.
+# behavior. Prefix families are checked separately below. CURL_HOME and
+# WGETRC name the modeled network clients' implicit startup-config
+# discovery — curl reads "$CURL_HOME/.curlrc" first, wget reads the
+# WGETRC startup file — so an agent-set value points the client at an
+# uninspected config whose proxy/output lines control egress and writes.
 DANGEROUS_ENV_NAMES = frozenset({
     "SSH_ASKPASS",
     "SSH_ASKPASS_REQUIRE",
@@ -121,8 +129,8 @@ DANGEROUS_ENV_NAMES = frozenset({
     "UV_OVERRIDE",
     "UV_EXCLUDE",
     "TRACING_DURATIONS_FILE",
-    "VIRTUAL_ENV",
     "CONDA_PREFIX",
+    "CURL_HOME",
     "XDG_BIN_HOME",
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
@@ -183,7 +191,9 @@ DANGEROUS_ENV_NAMES = frozenset({
     "RUBYOPT",
     "SHELL",
     "SYSTEMD_PAGER",
+    "SYSTEM_WGETRC",
     "VISUAL",
+    "WGETRC",
     "ZDOTDIR",
     "PATH",
 })
@@ -418,6 +428,19 @@ def _invalidate_assigned_names(texts: Iterable[str], variables: dict[str, str]) 
             variables.pop(name, None)
 
 
+# The declaration builtins whose NAME=value arguments the shell applies as
+# persistent assignments. A prefix assignment demotes the form to a plain
+# command node (`X=1 export NAME=value`), so the command branch checks its
+# command name against this set too.
+_DECLARATION_COMMAND_NAMES = frozenset({
+    "export",
+    "declare",
+    "typeset",
+    "readonly",
+    "local",
+})
+
+
 def _invalidate_declaration_bindings(node: Node, variables: dict[str, str]) -> None:
     """Invalidate bindings reassigned by an export/typeset/... argument.
 
@@ -438,6 +461,103 @@ def _invalidate_declaration_bindings(node: Node, variables: dict[str, str]) -> N
         literal = _literal_token(child)
         texts = (raw, literal) if literal is not None else (raw,)
         _invalidate_assigned_names(texts, variables)
+
+
+def _record_declaration_binding(
+    name: str,
+    value: str,
+    persistent: dict[str, str],
+    candidates: dict[str, tuple[str, ...]],
+    *,
+    conditional: bool,
+) -> None:
+    """Record one literal NAME=value a declaration argument binds.
+
+    An unconditional declaration binds exactly where the shell applies it
+    and replaces any earlier binding for the name. A conditional declaration
+    (an &&/||-guarded one, whose guard may be false at runtime) must not
+    clear or overwrite a binding an earlier unconditional declaration
+    established — that would let a loopback candidate un-gate a known
+    non-loopback proxy the runtime never replaced. It records an additional
+    CANDIDATE binding instead, and the egress proxy inspection gates when
+    any candidate value in any reachable branch is a non-loopback proxy
+    (union semantics, fail-closed).
+    """
+    if conditional:
+        candidates[name] = (*candidates.get(name, ()), value)
+    else:
+        persistent[name] = value
+        candidates.pop(name, None)
+
+
+def _persist_declaration_bindings(
+    node: Node,
+    persistent: dict[str, str],
+    candidates: dict[str, tuple[str, ...]],
+    *,
+    conditional: bool,
+) -> None:
+    """Bind the persistent env bindings an export/... argument leaves.
+
+    The egress proxy inspection reads statement-level bindings that persist
+    for later parts of the same command text, so an export/declare/... form
+    binds exactly where the shell applies it. A literal ``NAME=value``
+    argument binds — bare or quoted, since ``export 'X=v'`` assigns through
+    its quoting exactly like the bare form. A bare ``export X`` re-exports
+    the current value and changes nothing here. Any other argument
+    (``export $x`` and friends) may overwrite a name at runtime with an
+    unestablishable value; the last known binding stays in force — the
+    fail-closed direction for a gate. variable_assignment arguments are
+    handled by the variable_assignment branch when the walk recurses into
+    them.
+    """
+    for child in node.children:
+        if child.type == "variable_assignment":
+            continue  # Handled by the variable_assignment branch.
+        if child.text is None:
+            continue
+        literal = _literal_token(child)
+        if literal is None:
+            continue
+        name, separator, value = literal.partition("=")
+        if separator and _BINDING_NAME_RE.fullmatch(name) is not None:
+            _record_declaration_binding(
+                name, value, persistent, candidates, conditional=conditional
+            )
+
+
+def _union_binding_pairs(
+    persistent: dict[str, str], candidates: dict[str, tuple[str, ...]]
+) -> tuple[tuple[str, str], ...]:
+    """The statement-level bindings in force, one pair per name.
+
+    A name bound by an unconditional declaration carries its persistent
+    value plus every candidate a conditional declaration recorded since;
+    the egress proxy inspection must gate when ANY of those values is a
+    non-loopback proxy, so a proxy-family name emits its non-loopback
+    value when one exists (union semantics, fail-closed). Every other
+    name carries the persistent value, or its first candidate when no
+    unconditional binding exists. A non-proxy value never gates: the
+    loopback classification applies to proxy-family keys only.
+    """
+    pairs: list[tuple[str, str]] = []
+    for name in persistent.keys() | candidates.keys():
+        values = (persistent[name],) if name in persistent else ()
+        values += candidates.get(name, ())
+        non_loopback = (
+            next(
+                (
+                    value
+                    for value in values
+                    if value and not _proxy_value_loopback(value)
+                ),
+                None,
+            )
+            if name.casefold() in _PROXY_ENV_KEYS
+            else None
+        )
+        pairs.append((name, non_loopback if non_loopback is not None else values[0]))
+    return tuple(pairs)
 
 
 def _within_read_roots(source: str, roots: frozenset[Path]) -> bool:
@@ -1042,6 +1162,15 @@ def argv_permission_diagnostics(
             else len(parts)
         )
         for assignment in parts[1:end]:
+            if assignment.startswith("-"):
+                # An env option operand (the attached spelling --unset=BAR
+                # or --chdir=.), which the boundary engine consumed as an
+                # option, not applied as an assignment: env's operand scan
+                # excludes dash-prefixed operands for exactly this reason
+                # (see _env_assignment_operand), so the attached spelling
+                # is not policy-checked as an assignment either — it
+                # matches its separate counterpart (--unset BAR, --chdir .).
+                continue
             key, separator, value = assignment.partition("=")
             if not separator:
                 continue
@@ -1116,6 +1245,17 @@ class ShellPermissionAnalysis:
     # their command executes, so a redirect attached to a cd resolves against
     # the pre-cd working directory.
     redirect_operands: tuple[tuple[str, ...], ...] = ()
+    # The literal (name, value) environment bindings of command part i,
+    # aligned with command_parts: the statement-level bindings in force
+    # where the part runs (an earlier ``export NAME=value`` or standalone
+    # ``NAME=value`` statement of the same command text) followed by the
+    # part's own command-prefix assignments, which win (POSIX prefix
+    # semantics). The part text drops its assignment children, but the shell
+    # applies all of these to the command's subprocess, so consumers that
+    # must see the command's effective environment (the egress proxy
+    # inspection) read them here. Only provably-literal bindings are
+    # recorded; anything else is denied upstream as uninspectable.
+    command_assignments: tuple[tuple[tuple[str, str], ...], ...] = ()
 
     @property
     def approval_diagnostic(self) -> Diagnostic:
@@ -1165,7 +1305,7 @@ def _get_parser() -> Parser:
     return Parser(Language(tsbash.language()))
 
 
-def _analyze_shell_command(  # noqa: PLR0915
+def _analyze_shell_command(  # noqa: PLR0915, PLR0914
     command: str,
     *,
     nested_source: bool = False,
@@ -1183,6 +1323,7 @@ def _analyze_shell_command(  # noqa: PLR0915
     # statements anchor to the next command, or to the end of the chain).
     redirect_groups: list[list[str]] = []
     pending_targets: list[str] = []
+    command_assignment_groups: list[tuple[tuple[str, str], ...]] = []
     part_index_by_command: dict[tuple[int, int, str], int] = {}
     approval_reasons: set[str] = set()
     reason_diagnostics: dict[str, Diagnostic] = {}
@@ -1198,6 +1339,35 @@ def _analyze_shell_command(  # noqa: PLR0915
     # runtime, a command prefix, a subshell, or a non-literal value) may
     # overwrite the name, so it invalidates the binding instead.
     invocation_variables: dict[str, str] = {}
+    # The statement-level environment bindings in force at each point of
+    # this invocation, in statement order: a top-level standalone
+    # `NAME=value` statement or an `export`/`declare`/... `NAME=value`
+    # argument persists for every LATER part of the same command text, so
+    # the egress proxy inspection gates on it exactly like a command-prefix
+    # assignment. A later literal statement rebinds the name; a
+    # reassignment in any form the collection does not model (an
+    # &&/||-guarded statement, a command prefix, a subshell, `unset`)
+    # leaves the last known binding in force — the fail-closed direction
+    # for a gate, which must never un-gate a known non-loopback proxy.
+    # Residuals, documented: a name whose FIRST binding is an unmodeled
+    # form never enters the map, and bindings across separate commands
+    # are out of scope — each tool call is a fresh subprocess. A nested
+    # shell payload records only its own bindings here; the resolver's
+    # expansion merges the enclosing statement's bindings (and the
+    # wrapper's command-prefix assignments) into the payload's parts, so
+    # the payload's clients see the environment the nested shell passes
+    # on, exactly as the real shell would.
+    persistent_assignments: dict[str, str] = {}
+    # Candidate bindings a CONDITIONAL declaration (an &&/||-guarded
+    # export/declare/... whose guard may be false at runtime) establishes.
+    # A conditional declaration never clears or overwrites a binding an
+    # earlier unconditional declaration established — that would let a
+    # loopback candidate un-gate a known non-loopback proxy the runtime
+    # never replaced. Each part's egress snapshot merges the persistent
+    # bindings with these candidates under union semantics: the gate
+    # fires when ANY value in any reachable branch is a non-loopback
+    # proxy (fail-closed).
+    conditional_candidates: dict[str, tuple[str, ...]] = {}
     # Roots the sed locate-then-print simulation may read inside: the pinned
     # scratchpad roots plus the workspace roots (the ambient workspace when
     # the caller supplies none). The recognizer never reads outside them.
@@ -1262,30 +1432,60 @@ def _analyze_shell_command(  # noqa: PLR0915
             )
         )
 
-    def find_commands(node: Node) -> None:  # noqa: PLR0912, PLR0915
+    def find_commands(  # noqa: PLR0912, PLR0915
+        node: Node, *, conditional: bool = False
+    ) -> None:
         previous_reasons = approval_reasons.copy()
         if node.type == "variable_assignment":
-            if reason := _assignment_reason(node):
+            reason = _assignment_reason(node)
+            if reason is not None:
                 add_reason(reason)
-            elif node.parent is not None and node.parent.type in {
-                "program",
-                "variable_assignments",
-            }:
-                if binding := _assignment_binding(node):
-                    invocation_variables[binding[0]] = binding[1]
+            else:
+                if node.parent is not None and node.parent.type in {
+                    "program",
+                    "variable_assignments",
+                }:
+                    if binding := _assignment_binding(node):
+                        invocation_variables[binding[0]] = binding[1]
+                    elif name := _assignment_name(node):
+                        # A top-level reassignment whose value is not a
+                        # provably-literal token: the collection cannot prove
+                        # an earlier binding unchanged, so it no longer
+                        # resolves.
+                        invocation_variables.pop(name, None)
                 elif name := _assignment_name(node):
-                    # A top-level reassignment whose value is not a
-                    # provably-literal token: the collection cannot prove an
-                    # earlier binding unchanged, so it no longer resolves.
+                    # A reassignment in a form the collection does not model
+                    # — an export/typeset/readonly/declare/local argument, an
+                    # &&/||-guarded statement, a command prefix, a subshell —
+                    # may bind at runtime, so an earlier binding is unproven.
                     invocation_variables.pop(name, None)
-            elif name := _assignment_name(node):
-                # A reassignment in a form the collection does not model —
-                # an export/typeset/readonly/declare/local argument, an
-                # &&/||-guarded statement, a command prefix, a subshell —
-                # may bind at runtime, so an earlier binding is unproven.
-                invocation_variables.pop(name, None)
+                # The persistent environment bindings the egress proxy
+                # inspection reads: a top-level standalone statement or an
+                # export/declare/... argument binds (a later literal
+                # statement rebinds). A command prefix applies to its own
+                # part only, and a reassignment in an unmodeled form
+                # leaves the last known binding in force.
+                if node.parent is not None and node.parent.type in {
+                    "program",
+                    "variable_assignments",
+                    "declaration_command",
+                }:
+                    if binding := _assignment_binding(node):
+                        _record_declaration_binding(
+                            binding[0],
+                            binding[1],
+                            persistent_assignments,
+                            conditional_candidates,
+                            conditional=conditional,
+                        )
         elif node.type == "declaration_command":
             _invalidate_declaration_bindings(node, invocation_variables)
+            _persist_declaration_bindings(
+                node,
+                persistent_assignments,
+                conditional_candidates,
+                conditional=conditional,
+            )
         elif node.type == "file_redirect":
             if reason := _redirect_reason(node, scratchpad_roots=scratchpad_roots):
                 add_reason(reason)
@@ -1316,10 +1516,24 @@ def _analyze_shell_command(  # noqa: PLR0915
                 add_reason(reason)
             if reason := _lookup_mutation_reason(node, nested_source):
                 add_reason(reason)
+            if _command_name(node) in _DECLARATION_COMMAND_NAMES:
+                # A prefix assignment demotes the export/typeset/... form to
+                # a plain command node (`X=1 export NAME=value`), but the
+                # runtime declaration semantics are unchanged: the arguments
+                # bind exactly where a declaration_command's would, so the
+                # walk collects them here.
+                _invalidate_declaration_bindings(node, invocation_variables)
+                _persist_declaration_bindings(
+                    node,
+                    persistent_assignments,
+                    conditional_candidates,
+                    conditional=conditional,
+                )
             replacements = _static_expansion_replacements(
                 node, authorized, add_reason, invocation_variables, read_roots
             )
             parts: list[str] = []
+            prefix_assignments: list[tuple[str, str]] = []
             for child in node.children:
                 replacement = replacements.get((child.start_byte, child.end_byte))
                 if replacement is not None:
@@ -1337,7 +1551,12 @@ def _analyze_shell_command(  # noqa: PLR0915
                     if child.text is not None:
                         parts.append(child.text.decode("utf-8"))
                 elif child.type == "variable_assignment":
-                    pass
+                    # The part text drops command-prefix assignments, but the
+                    # shell applies them to this command's subprocess; record
+                    # the literal bindings so the egress proxy inspection sees
+                    # the command's effective environment.
+                    if binding := _assignment_binding(child):
+                        prefix_assignments.append(binding)
                 elif (
                     child.type not in _DYNAMIC_NODES
                     and not _zsh_sensitive_node_reason(child)
@@ -1367,6 +1586,14 @@ def _analyze_shell_command(  # noqa: PLR0915
                 # working directory in force before this part runs.
                 redirect_groups.append(list(pending_targets))
                 pending_targets.clear()
+                # The part's effective environment: the statement-level
+                # bindings in force where it runs first, then its own
+                # command-prefix assignments, which win (POSIX prefix
+                # semantics — dict() keeps the last binding of a name).
+                command_assignment_groups.append(
+                    _union_binding_pairs(persistent_assignments, conditional_candidates)
+                    + tuple(prefix_assignments)
+                )
 
         for reason in approval_reasons - previous_reasons:
             original = (node.text or b"").decode("utf-8")
@@ -1378,8 +1605,20 @@ def _analyze_shell_command(  # noqa: PLR0915
                 offending_token=original,
                 command_part=(parent.text or b"").decode("utf-8"),
             )
-        for child in node.children:
-            find_commands(child)
+        if node.type == "list":
+            # A statement after an &&/|| connector runs conditionally — the
+            # guard's exit status decides — so its declarations record
+            # candidate bindings instead of overwrites. The first statement
+            # and every `;`/newline-separated statement inherit this walk's
+            # own conditionality.
+            seen_connector = False
+            for child in node.children:
+                find_commands(child, conditional=conditional or seen_connector)
+                if child.type in {"&&", "||"}:
+                    seen_connector = True
+        else:
+            for child in node.children:
+                find_commands(child, conditional=conditional)
 
     find_commands(tree.root_node)
     return ShellPermissionAnalysis(
@@ -1395,6 +1634,7 @@ def _analyze_shell_command(  # noqa: PLR0915
         ),
         redirect_operands=tuple(tuple(group) for group in redirect_groups)
         + (tuple(pending_targets),),
+        command_assignments=tuple(command_assignment_groups),
     )
 
 

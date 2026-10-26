@@ -181,6 +181,9 @@ class ChatTextArea(TextArea):
         # app.clear_selection() and wipe an in-progress selection elsewhere.
         self.set_reactive(TextArea.selection, Selection.cursor(self.cursor_location))
         self.refresh()
+        # A mouse-down captured the mouse; if the matching mouse-up never
+        # arrives, the app-level capture would pin all mouse events here.
+        self.release_mouse()
         if self._app_has_focus and not self._agent_browser_has_focus():
             self.focus()
 

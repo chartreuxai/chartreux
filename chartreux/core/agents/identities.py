@@ -26,6 +26,15 @@ class AgentIdentity:
     delegation_tools: ToolPosture
     safety: str
     display_name: str
+    # Reviewed builtin tool names admitted BEYOND the personal posture's class
+    # set (settlement decision 3, P1-h): an identity-scoped execution carve-out.
+    # The posture table stays untouched — it is shared by every NON_MUTATING
+    # selector (researcher, advisor, the orchestrator's personal axis, and every
+    # delegation axis), so a table change would widen all of them. The carve-out
+    # is personal-axis only (a reviewer cannot delegate its shell) and is
+    # enforced against the shipped-builtin identity of the exact selected
+    # class, so a foreign custom variant of a carved-out name fails closed.
+    execution_carve_out: frozenset[str] = frozenset()
 
 
 # The read-only identities still DELEGATE their non-mutating/control-plane set
@@ -64,6 +73,12 @@ _IDENTITIES = {
         ToolPosture.NON_MUTATING,
         "read-only",
         "Reviewer",
+        # Exit gates verify (settlement decision 3): the reviewer may run
+        # non-mutating verification commands through bash itself. Only the
+        # bash surface is carved out — bash_start is job management, not
+        # verification, and the write tools stay excluded — and bash's own
+        # permission guards remain the mutation boundary.
+        execution_carve_out=frozenset({"bash"}),
     ),
     "advisor": AgentIdentity(
         "advisor",

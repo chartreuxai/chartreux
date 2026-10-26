@@ -23,3 +23,4 @@ These records document design decisions and their rationale. See the [architectu
 - [0019 Dangerous Git Command Permissions](0019-dangerous-git-permissions.md)
 - [0020 Operational-discipline rewrite: strategy switch replaces stop rules](0020-operational-discipline-strategy-switch.md)
 - [0021 Shell policy v0.2: occurrence-local cd chains and scratchpad redirect targets (superseded in part by v0.5.8)](0021-shell-policy-v02-cd-chains-and-scratchpad-redirects.md)
+- [0022 Live route editing](0022-live-route-editing.md)

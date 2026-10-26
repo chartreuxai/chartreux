@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 from typing import Any, cast
@@ -26,7 +27,7 @@ from chartreux.app_server.protocol import TurnStartParams
 from chartreux.app_server.server import AppServer
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.config import SessionLoggingConfig
-from chartreux.core.llm_models import Role
+from chartreux.core.llm_models import FunctionCall, Role, ToolCall
 from chartreux.core.middleware import AutoCompactMiddleware
 from chartreux.core.subagents import (
     AgentAvailability,
@@ -53,6 +54,7 @@ from tests.app_server._subagent_test_support import (
     _foreground_result,
     _read_child,
     _real_reused_background,
+    _retention_registry,
     _task_call,
     _todo_call,
     _wait_for_turn_completion,
@@ -1062,4 +1064,270 @@ async def test_turn_task_creation_failure_closes_run_and_aborts_controller(
         assert record.runtime.execution.active is None
     finally:
         monkeypatch.setattr(asyncio, "create_task", original_create_task)
+        await parent.aclose()
+
+
+# P2-i chunk 2: the submission-boundary secret scan. The gate lives in
+# SubagentRunAccumulator.build_result — the single assembly point for every
+# subagent submission result, on both the foreground path (the generator's
+# final yield) and the background path (the monitor's published result). The
+# accumulator collects the session's touched paths (repo paths created or
+# edited through the file tools) from the tool results it observes.
+
+_GATE_GITHUB_TOKEN = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+_GATE_SECRET_LINE = f"GITHUB_TOKEN = {_GATE_GITHUB_TOKEN}"
+_GATE_SECRET_CONTENT = f"# deploy config\n{_GATE_SECRET_LINE}\n"
+_GATE_CLEAN_CONTENT = (
+    "def add(left: int, right: int) -> int:\n    return left + right\n"
+)
+
+
+def _write_file_call(target: Path, content: str, call_id: str) -> ToolCall:
+    return ToolCall(
+        id=call_id,
+        index=0,
+        function=FunctionCall(
+            name="write_file",
+            arguments=json.dumps({"file_path": str(target), "content": content}),
+        ),
+    )
+
+
+def _edit_call(target: Path, old: str, new: str, call_id: str) -> ToolCall:
+    return ToolCall(
+        id=call_id,
+        index=0,
+        function=FunctionCall(
+            name="edit",
+            arguments=json.dumps({
+                "file_path": str(target),
+                "old_string": old,
+                "new_string": new,
+            }),
+        ),
+    )
+
+
+def _bash_call(command: str, call_id: str) -> ToolCall:
+    return ToolCall(
+        id=call_id,
+        index=0,
+        function=FunctionCall(name="bash", arguments=json.dumps({"command": command})),
+    )
+
+
+async def _gate_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: FakeBackend,
+    *,
+    cwd: Path,
+    enabled_tools: list[str] | None = None,
+) -> tuple[SessionRuntimeRegistry, AgentLoop]:
+    """A retention registry whose children can run the file tools for real."""
+    monkeypatch.setattr(
+        "chartreux.core.agent_loop._loop.create_backend", lambda **_: backend
+    )
+    parent = build_test_agent_loop(
+        config=_config(enabled_tools=enabled_tools or ["task", "write_file", "edit"]),
+        backend=FakeBackend(),
+        cwd=cwd,
+    )
+    registry = _retention_registry()
+    root = registry._build_child_runtime(parent)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    return registry, parent
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_foreground_submission_blocked_by_secret_scan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "deploy_config.py"
+    backend = FakeBackend([
+        [
+            mock_llm_chunk(
+                content="",
+                tool_calls=[_write_file_call(target, _GATE_SECRET_CONTENT, "write-1")],
+            )
+        ],
+        [mock_llm_chunk(content="wrote the config")],
+    ])
+    registry, parent = await _gate_registry(monkeypatch, backend, cwd=tmp_path)
+    try:
+        result = await _foreground_result(registry, parent)
+
+        # The submission is blocked at the boundary: it never surfaces as
+        # final, and the agent's response is replaced by the block message.
+        assert result.completed is False
+        assert "failed the secret scan" in result.response
+        assert str(target) in result.response
+        assert "wrote the config" not in result.response
+        # The agent is informed without disclosure: no secret, no rule id,
+        # no matched line.
+        assert _GATE_GITHUB_TOKEN not in result.response
+        assert "github-token" not in result.response
+        assert _GATE_SECRET_LINE not in result.response
+        # The gate blocks the submission, not the write: the artifact is on
+        # disk (the pre-commit hook is the commit-boundary backstop).
+        assert target.read_text(encoding="utf-8") == _GATE_SECRET_CONTENT
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_foreground_submission_passes_clean_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "clean.py"
+    backend = FakeBackend([
+        [
+            mock_llm_chunk(
+                content="",
+                tool_calls=[_write_file_call(target, _GATE_CLEAN_CONTENT, "write-1")],
+            )
+        ],
+        [mock_llm_chunk(content="wrote the config")],
+    ])
+    registry, parent = await _gate_registry(monkeypatch, backend, cwd=tmp_path)
+    try:
+        result = await _foreground_result(registry, parent)
+
+        # A clean session's submission passes unaffected.
+        assert result.completed is True
+        assert result.response == "wrote the config"
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_background_submission_blocked_by_secret_scan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "settings.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    backend = FakeBackend([
+        [
+            mock_llm_chunk(
+                content="",
+                tool_calls=[
+                    _edit_call(
+                        target, "value = 1", f"value = 2\n{_GATE_SECRET_LINE}", "edit-1"
+                    )
+                ],
+            )
+        ],
+        [mock_llm_chunk(content="edited settings")],
+    ])
+    registry, parent = await _gate_registry(monkeypatch, backend, cwd=tmp_path)
+    try:
+        ctx = InvokeContext(tool_call_id="task-1", session_id=parent.session_id)
+        ack = await _background_result(registry, TaskArgs(task="edit settings"), ctx)
+        assert ack.agent_id is not None and ack.run_id is not None
+
+        # The monitor-built result stored on the run record is blocked.
+        record = registry._agent_records[ack.agent_id]
+        run = record.current_run
+        assert run is not None
+        await run.completion_task
+        assert run.result is not None
+        assert run.result.completed is False
+        assert "failed the secret scan" in run.result.response
+        assert str(target) in run.result.response
+        assert "edited settings" not in run.result.response
+
+        # The result surfaced to a waiter is the blocked one, and it carries
+        # no disclosure: no secret, no rule id, no matched line.
+        waited = await _wait_result(registry, ack.agent_id, ack.run_id)
+        assert waited.response == run.result.response
+        assert waited.completed is False
+        assert _GATE_GITHUB_TOKEN not in waited.response
+        assert "github-token" not in waited.response
+        assert _GATE_SECRET_LINE not in waited.response
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+# R6: bash-write collection at the submission boundary. The bash tool
+# surfaces the write-classified paths its permission analysis extracted on
+# the result, so a child writing a secret through a shell redirect (or any
+# other write-classified operand) produces a touched path and the gate
+# blocks the submission exactly like a file-tool write.
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_foreground_submission_blocked_by_bash_write_scan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The child writes the secret-bearing line through a shell redirect
+    # (the key seeded by concatenation in the fixture above); the bash
+    # result carries the analyzed write path, and the submission is blocked
+    # at the boundary.
+    backend = FakeBackend([
+        [
+            mock_llm_chunk(
+                content="",
+                tool_calls=[
+                    _bash_call(
+                        f'echo "{_GATE_SECRET_LINE}" > deploy_config.py', "bash-1"
+                    )
+                ],
+            )
+        ],
+        [mock_llm_chunk(content="wrote the config")],
+    ])
+    registry, parent = await _gate_registry(
+        monkeypatch, backend, cwd=tmp_path, enabled_tools=["task", "bash"]
+    )
+    try:
+        result = await _foreground_result(registry, parent)
+
+        target = tmp_path / "deploy_config.py"
+        assert result.completed is False
+        assert "failed the secret scan" in result.response
+        assert str(target) in result.response
+        assert "wrote the config" not in result.response
+        # The agent is informed without disclosure: no secret, no rule id,
+        # no matched line.
+        assert _GATE_GITHUB_TOKEN not in result.response
+        assert "github-token" not in result.response
+        assert _GATE_SECRET_LINE not in result.response
+        # The gate blocks the submission, not the write: the artifact is on
+        # disk (the pre-commit hook is the commit-boundary backstop).
+        assert target.read_text(encoding="utf-8") == f"{_GATE_SECRET_LINE}\n"
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_foreground_submission_passes_a_read_only_bash_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A child whose bash command only reads establishes no writes, so the
+    # submission passes unaffected.
+    (tmp_path / "clean.py").write_text(_GATE_CLEAN_CONTENT, encoding="utf-8")
+    backend = FakeBackend([
+        [mock_llm_chunk(content="", tool_calls=[_bash_call("cat clean.py", "bash-1")])],
+        [mock_llm_chunk(content="read the file")],
+    ])
+    registry, parent = await _gate_registry(
+        monkeypatch, backend, cwd=tmp_path, enabled_tools=["task", "bash"]
+    )
+    try:
+        result = await _foreground_result(registry, parent)
+
+        assert result.completed is True
+        assert result.response == "read the file"
+    finally:
+        await registry.drain_children()
         await parent.aclose()

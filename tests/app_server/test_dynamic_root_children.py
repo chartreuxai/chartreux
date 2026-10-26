@@ -1,4 +1,4 @@
-"""Child sessions inherit and originate session root grants end to end."""
+"""Child sessions inherit session root grants end to end and deny the ask."""
 
 from __future__ import annotations
 
@@ -406,9 +406,17 @@ async def test_child_dispatched_before_a_root_grant_stays_frozen_across_retask(
         await parent.aclose()
 
 
-async def test_child_local_grant_applies_only_to_that_child(
+async def test_capable_child_denies_the_ask_but_an_issued_grant_stays_child_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Blanket child denial with the runtime port bound; issued grants stay local.
+
+    The child's gap is locally grantable (the frozen parent ceiling permits
+    the target), yet the child denies with remediation instead of prompting,
+    even with user-input capability and a bound SessionRootGrantPort. An
+    already-issued child-local grant — a parent-directed scope change to this
+    child — still applies, and only to that child.
+    """
     project = tmp_path / "project"
     project.mkdir()
     nested = project / "nested"
@@ -424,7 +432,13 @@ async def test_child_local_grant_applies_only_to_that_child(
         policy = parent.child_runtime_policy
         assert policy.inherited_root_grants == ()
         child = _child_loop(
-            parent, policy, FakeBackend([*_read_turn(target, "child-read")]), cwd=nested
+            parent,
+            policy,
+            FakeBackend([
+                *_read_turn(target, "child-denied"),
+                *_read_turn(target, "child-granted"),
+            ]),
+            cwd=nested,
         )
         sibling = _child_loop(
             parent,
@@ -442,28 +456,118 @@ async def test_child_local_grant_applies_only_to_that_child(
             # The child's own roots stop at its cwd; the frozen ceiling (the
             # parent's workspace) permits the parent project directory.
             assert not child.tool_manager.workspace.allows(target)
+            # The ask is denied outright: no prompt, remediation, no grant.
             events, requests = await _drive_loop(child, "Allow this session")
-            assert len(requests) == 1
+            assert requests == []
+            results = _results(events)
+            assert len(results) == 1
+            assert results[0].skipped
+            assert child._session_root_grants.roots == set()
+            assert any(
+                "authorized_roots_by_project" in text and "config.toml" in text
+                for text in _tool_texts(child)
+            )
+            # An already-issued child-local grant stays effective.
+            assert child.apply_root_grant(project)
+            events, requests = await _drive_loop(child, "Allow this session")
+            assert requests == []
             results = _results(events)
             assert len(results) == 1
             assert not results[0].skipped
             assert results[0].result is not None
             assert "parent project content" in results[0].result.model_dump_json()
-            assert child._session_root_grants.roots == {project.resolve()}
             # The grant is child-local: parent and sibling stores stay empty.
             assert parent._session_root_grants.roots == set()
             assert sibling._session_root_grants.roots == set()
             assert not sibling.tool_manager.workspace.allows(target)
-            # A sibling asks for itself; the parent still receives nothing.
-            events, requests = await _drive_loop(sibling, "Deny")
-            assert len(requests) == 1
+            # A sibling's own ask is denied outright too.
+            events, requests = await _drive_loop(sibling, "Allow this session")
+            assert requests == []
             assert _results(events)[0].skipped
             assert sibling._session_root_grants.roots == set()
-            assert sibling._session_root_grants.denied_roots == {project.resolve()}
             assert parent._session_root_grants.roots == set()
         finally:
             await registry.close()
     finally:
+        await parent.aclose()
+
+
+async def test_paired_main_and_child_for_the_same_out_of_root_ask_class_flow(
+    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same out-of-root read: the main session prompts, a child denies.
+
+    The main half reads a target outside its workspace and surfaces the
+    grant dialog; the grant applies to the calling session only. The child
+    half's target sits under its frozen parent ceiling but outside its own
+    cwd-rooted workspace — an out-of-root gap only the blanket child gate
+    answers — so the child denies with remediation instead of prompting.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "note.txt"
+    target.write_text("granted content")
+    config_path = config_dir / "config.toml"
+    disk = config_path.read_bytes()
+    registries = _capture_registries(monkeypatch)
+    # Main half: the dialog surfaces and the granted call executes.
+    main = build_test_agent_loop(
+        config=_config(),
+        cwd=project,
+        backend=FakeBackend([*_read_turn(target, "main-read")]),
+        user_input_capability=True,
+    )
+    session = await create_test_app_server_session(main)
+    try:
+        callbacks = await _drive(session, "Allow this session")
+        assert len(callbacks) == 1
+        root = registries[0]._root
+        assert root is not None
+        root_loop = root.agent_loop
+        assert root_loop._session_root_grants.roots == {outside.resolve()}
+        assert root_loop.tool_manager.workspace.allows(target)
+        assert any("granted content" in text for text in _tool_texts(root_loop))
+    finally:
+        await session.close()
+        await main.aclose()
+    # Child half: the same ask-class flow, denied outright.
+    nested = project / "nested"
+    nested.mkdir()
+    child_target = project / "note.txt"
+    child_target.write_text("parent project content")
+    parent = build_test_agent_loop(
+        config=_config(), cwd=project, backend=FakeBackend(), user_input_capability=True
+    )
+    registry = SessionRuntimeRegistry(AsyncMock(), AsyncMock(), lambda _: 0)
+    try:
+        registry.bind_root(registry._build_child_runtime(parent))
+        child = _child_loop(
+            parent,
+            parent.child_runtime_policy,
+            FakeBackend([*_read_turn(child_target, "child-read")]),
+            cwd=nested,
+        )
+        registry._children[child.session_id] = registry._build_child_runtime(child)
+        # The gap is under the parent ceiling: the denial is the blanket
+        # child gate, not a ceiling denial.
+        assert not child.tool_manager.workspace.allows(child_target)
+        ceiling = child.tool_manager.workspace.ceiling
+        assert ceiling is not None and ceiling.allows(child_target)
+        events, requests = await _drive_loop(child, "Allow this session")
+        assert requests == []
+        results = _results(events)
+        assert len(results) == 1
+        assert results[0].skipped
+        assert child._session_root_grants.roots == set()
+        assert any(
+            "authorized_roots_by_project" in text and "config.toml" in text
+            for text in _tool_texts(child)
+        )
+        assert config_path.read_bytes() == disk
+    finally:
+        await registry.close()
         await parent.aclose()
 
 

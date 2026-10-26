@@ -201,7 +201,7 @@ class ToolExecutor:
             ):
                 yield ev
 
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             steering = self._is_steering_cancellation(tool_call.call_id)
             timing.finish()
             cancel = str(
@@ -222,6 +222,10 @@ class ToolExecutor:
                     ToolCancellationOrigin.STEERING if steering else None
                 ),
                 duration=timing.duration,
+                error_write_paths=getattr(exc, "write_paths", None) or [],
+                error_write_paths_unknown=bool(
+                    getattr(exc, "write_paths_unknown", False)
+                ),
                 tool_call_id=tool_call.call_id,
             )
             async for ev in self._finalize_cancelled_tool(
@@ -262,6 +266,13 @@ class ToolExecutor:
                 duration=timing.duration,
                 error_display=(
                     f"{failure}{exc.display}" if isinstance(exc, ToolError) else None
+                ),
+                # R7: a failed or timed-out shell run may still have written
+                # files; the tool attaches its write footprint to the raised
+                # error so the submission scan keeps covering it.
+                error_write_paths=getattr(exc, "write_paths", None) or [],
+                error_write_paths_unknown=bool(
+                    getattr(exc, "write_paths_unknown", False)
                 ),
                 tool_call_id=tool_call.call_id,
             )

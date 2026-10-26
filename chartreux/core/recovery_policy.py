@@ -45,7 +45,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from chartreux.core.config.models import RecoveryConfig
 from chartreux.core.deferred_questions import DeferredQuestionStore
 from chartreux.core.dispatch.route_models import PurposeRoute, ReplacementCapability
-from chartreux.core.dispatch.routes import SESSION_MODEL
+from chartreux.core.dispatch.routes import (
+    COST_TIER_DEFAULT,
+    SESSION_MODEL,
+    cheapest_capable_model,
+)
 from chartreux.core.recovery_models import (
     FailureClass,
     FailureEnvelope,
@@ -237,22 +241,53 @@ def is_infrastructure_failure(envelope: FailureEnvelope) -> bool:
     return envelope.failure.failure_class in INFRASTRUCTURE_FAILURE_CLASSES
 
 
+def _route_target_base(
+    target_model: str,
+    *,
+    session_model: str,
+    canonical_models: Mapping[str, str],
+    catalog_prices: Mapping[str, float] | None,
+) -> str:
+    """The canonical base one route-target model binding names.
+
+    ``$session`` resolves to the session model; the cost-tier default
+    resolves to the cheapest capable model when price data is supplied and
+    contributes nothing when it is not (a price-less catalog cannot have
+    resolved the default at launch, so no child ran on it). Any other
+    binding canonicalizes through the catalog mapping.
+    """
+    if target_model == SESSION_MODEL:
+        return session_model
+    if target_model == COST_TIER_DEFAULT:
+        return cheapest_capable_model(catalog_prices) if catalog_prices else ""
+    return canonical_models.get(target_model, target_model)
+
+
 def mechanical_base_models_from_routes(
-    routes: Mapping[str, PurposeRoute], *, session_model: str
+    routes: Mapping[str, PurposeRoute],
+    *,
+    session_model: str,
+    catalog_prices: Mapping[str, float] | None = None,
 ) -> frozenset[str]:
     """The mechanical-tier base models the configured purpose routes bind.
 
     The successor of the retired slot-purpose inference (package 16b): a route
     target is mechanical-tier when its explicit ``tier`` is ``mechanical``,
     and its bound model is the target's model — ``$session`` resolves to the
-    session model. Unbound targets contribute nothing.
+    session model, and the cost-tier default to the cheapest capable model
+    when price data is supplied. Unbound targets contribute nothing.
     """
     models: set[str] = set()
     for route in routes.values():
         for target in route.targets:
             if target.tier != PackageTier.MECHANICAL:
                 continue
-            model = session_model if target.model == SESSION_MODEL else target.model
+            model = _route_target_base(
+                target.model,
+                session_model=session_model,
+                canonical_models={},
+                catalog_prices=catalog_prices,
+            )
             if model:
                 models.add(model)
     return frozenset(models)
@@ -263,6 +298,7 @@ def route_recovery_facts(
     *,
     session_model: str,
     canonical_models: Mapping[str, str],
+    catalog_prices: Mapping[str, float] | None = None,
 ) -> tuple[frozenset[str], dict[str, ReplacementCapability]]:
     """The canonical mechanical-tier set and capability markings of the routes.
 
@@ -273,6 +309,7 @@ def route_recovery_facts(
     base model mechanical, and a target's explicit ``replacement_capability``
     marking reaches the candidates keyed by the same canonical base (one
     canonical capability per model, never two target-derived identities).
+    The cost-tier default resolves through ``catalog_prices`` when supplied.
     Targets without an explicit marking contribute no marking: the
     explicit-marking regime is opt-in, and with no explicit marking anywhere
     the legacy tier-label derivation applies unchanged.
@@ -281,10 +318,11 @@ def route_recovery_facts(
     capabilities: dict[str, ReplacementCapability] = {}
     for route in routes.values():
         for target in route.targets:
-            model = (
-                session_model
-                if target.model == SESSION_MODEL
-                else canonical_models.get(target.model, target.model)
+            model = _route_target_base(
+                target.model,
+                session_model=session_model,
+                canonical_models=canonical_models,
+                catalog_prices=catalog_prices,
             )
             if not model:
                 continue

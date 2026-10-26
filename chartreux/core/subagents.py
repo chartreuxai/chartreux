@@ -22,7 +22,15 @@ from chartreux.core.recovery_models import (
     RecoveryReference,
 )
 from chartreux.core.recovery_policy import ReplacementDecision
+from chartreux.core.subagent_submission import (
+    UNKNOWN_WRITE_FOOTPRINT,
+    bash_write_paths_from_result_event,
+    blocked_submission_response,
+    touched_path_from_result_event,
+)
+from chartreux.core.tools.secret_scan import incomplete_finding, scan_paths
 from chartreux.core.tools.ui import ToolUIDataAdapter
+from chartreux.observability.logging import logger
 
 __all__ = [
     "EffectVerification",
@@ -845,6 +853,11 @@ class SubagentRunnerPort(Protocol):
 class SubagentRunAccumulator:
     _response: list[str] = field(default_factory=list)
     _completed: bool = True
+    # P2-i: the session's touched paths — repo paths created or edited
+    # through the file tools, plus the write-classified paths shell
+    # commands produced — collected from observed tool results and scanned
+    # at the submission boundary (build_result). Insertion-ordered.
+    _touched_paths: dict[str, None] = field(default_factory=dict)
 
     def observe(self, event: BaseEvent, *, tool_call_id: str) -> ToolStreamEvent | None:
         if isinstance(event, AssistantEvent):
@@ -858,8 +871,22 @@ class SubagentRunAccumulator:
         if event.skipped:
             self._completed = False
             return None
+        # P2-i R6/R7: bash-written artifacts join the same scan — collected
+        # from a successful result, and from a failed or timed-out run's
+        # error event (partial execution still wrote files); an
+        # unestablished write surface records the unknown-footprint sentinel.
+        # Collected before the result-less early return so error events
+        # contribute their footprint.
+        write_paths, write_unknown = bash_write_paths_from_result_event(event)
+        for path in write_paths:
+            self._touched_paths[path] = None
+        if write_unknown:
+            self._touched_paths[UNKNOWN_WRITE_FOOTPRINT] = None
         if event.result is None or event.tool_class is None:
             return None
+        touched_path = touched_path_from_result_event(event)
+        if touched_path is not None:
+            self._touched_paths[touched_path] = None
         if event.presentation is not None:
             display = event.presentation.display
         else:
@@ -876,6 +903,38 @@ class SubagentRunAccumulator:
 
     def build_result(self, *, turns_used: int, completed: bool = True) -> TaskResult:
         completed = self._completed and completed
+        # P2-i submission boundary: the scan runs when the session reports
+        # its work complete, before the result is surfaced as final. Both
+        # the foreground and the background publication paths assemble
+        # their result here, so neither can bypass the gate. A finding
+        # blocks the submission: the result carries the redacted block
+        # message instead of the agent's response, and never surfaces as
+        # final (completed=False).
+        findings = scan_paths(self._touched_paths)
+        if UNKNOWN_WRITE_FOOTPRINT in self._touched_paths:
+            # Fail-closed: a shell command whose write surface could not be
+            # established leaves an unscannable footprint — scan_paths skips
+            # the missing sentinel path itself, so the gate adds the
+            # scan-incomplete finding explicitly.
+            findings.append(
+                incomplete_finding(
+                    UNKNOWN_WRITE_FOOTPRINT,
+                    "the write surface of a shell command could not be established",
+                )
+            )
+        if findings:
+            logger.warning(
+                "Subagent submission blocked by the secret scan: %d finding(s) "
+                "over %d touched path(s), rules=%s",
+                len(findings),
+                len(self._touched_paths),
+                ",".join(sorted({finding.rule_id for finding in findings})),
+            )
+            return TaskResult(
+                response=blocked_submission_response(findings),
+                turns_used=turns_used,
+                completed=False,
+            )
         response = "".join(self._response)
         if completed and not response.strip():
             raise EmptySubagentResponseError(

@@ -12,6 +12,11 @@ AIMD = "AIMD"
 # Pinned test-function name in tests/tools/test_read_file_outline.py; the
 # repo convention is "unparsable", but this identifier is contract-fixed.
 unparseable = "unparseable"
+# GNU wget composite short options (-nd = --no-directories; -pn likewise a
+# literal option token) in the shell policy corpus and its fixtures —
+# contract-fixed command text, not the words "and"/"on".
+nd = "nd"
+pn = "pn"
 
 [default.extend-identifiers]
 # macOS pasteboard four-char-code for the PNG flavor — required verbatim

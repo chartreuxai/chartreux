@@ -517,8 +517,8 @@ SHELL_PERMISSIONS_SETTING = SettingDescriptor(
     "shell_permissions",
     "Shell Permissions",
     "Inspect and revoke dangerous-command permission authority (for example "
-    "git push) for this session and project. Authority is approved per "
-    "command when it is needed; it is not set here.",
+    "git push or network.egress) for this session and project. Authority is "
+    "approved per command when it is needed; it is not set here.",
     "deferred",
     "Advanced & Tools",
     control="shell_permissions",

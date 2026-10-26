@@ -51,6 +51,7 @@ from chartreux.core.launch_types import (
     LaunchConfig,
     ResolvedIdentityLaunch,
     ResolvedLaunchAuthority,
+    validate_difficulty_for_purpose,
 )
 from chartreux.core.model_catalog.resolver import (
     ModelResolutionError,
@@ -446,6 +447,12 @@ class TaskIdentityArgs(BaseModel):
                 "a multi-seat purpose route; supply the purpose (or drop the "
                 "seat)"
             )
+        # Purpose-keyed difficulty admission (P1-c2): the demanding route
+        # requires a qualifying difficulty category; every other purpose
+        # rejects the field.
+        validate_difficulty_for_purpose(
+            self.purpose, self.config.difficulty if self.config is not None else None
+        )
         return self
 
 
@@ -500,8 +507,11 @@ def _overlay_resource_loader() -> ResourceLoader:
 
 def _route_inputs(
     config: ChartreuxConfigSchema,
-) -> tuple[Mapping[str, object], Mapping[str, str], ModelResolver]:
-    """The selectable model aliases and their canonical bases (route inputs)."""
+) -> tuple[Mapping[str, object], Mapping[str, str], ModelResolver, Mapping[str, float]]:
+    """The selectable model aliases, canonical bases, resolver, and the
+    per-base price totals (route inputs; the totals drive the cost-tier
+    default).
+    """
     resolver = resolver_for(config)
     allowed = config.allowed_models
     catalog = resolver.snapshot.catalog
@@ -511,7 +521,7 @@ def _route_inputs(
     aliases.update({f"@{name}": None for name in resolver.eligible_roles(allowed)})
     canonical: dict[str, str] = {base: base for base in catalog.models}
     canonical.update({f"@{name}": role.model for name, role in catalog.roles.items()})
-    return aliases, canonical, resolver
+    return aliases, canonical, resolver, resolver.catalog_prices(allowed)
 
 
 def _required_delegation_message(reference: str, facts: AgentIdentity) -> str:
@@ -552,7 +562,7 @@ def validate_launch_purpose_binding(
     adopted.
     """
     try:
-        aliases, canonical, _resolver = _route_inputs(config)
+        aliases, canonical, _resolver, prices = _route_inputs(config)
     except ModelResolutionError as exc:
         raise InvalidLaunchModelSelectionError("model", str(exc)) from exc
     try:
@@ -563,6 +573,7 @@ def validate_launch_purpose_binding(
             seat=seat,
             routes=(routes if routes is not None else config.purpose_routes.routes),
             canonical_models=canonical,
+            catalog_prices=prices,
         )
     except RouteResolutionError as exc:
         raise InvalidLaunchPurposeError("purpose", str(exc)) from exc
@@ -621,7 +632,7 @@ def resolve_identity_launch(  # noqa: PLR0914, PLR0915
     )
     session_expression = session_model or config.active_model or "@main"
     try:
-        aliases, canonical, resolver = _route_inputs(config)
+        aliases, canonical, resolver, prices = _route_inputs(config)
     except ModelResolutionError as exc:
         raise InvalidLaunchModelSelectionError("model", str(exc)) from exc
     if parsed.purpose is not None:
@@ -635,6 +646,7 @@ def resolve_identity_launch(  # noqa: PLR0914, PLR0915
                 identity=explicit_identity,
                 routes=(routes if routes is not None else config.purpose_routes.routes),
                 canonical_models=canonical,
+                catalog_prices=prices,
             )
         except RouteResolutionError as exc:
             raise InvalidLaunchPurposeError("purpose", str(exc)) from exc

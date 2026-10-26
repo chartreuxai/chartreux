@@ -731,6 +731,13 @@ class SubagentExecution:
             task_summary=normalize_task_summary(
                 args.task_summary, fallback=effective_task
             ),
+            # P1-c2: the run's claimed difficulty category — non-None only on
+            # a demanding-route launch, surfaced on the acknowledgment.
+            difficulty=(
+                args.config.difficulty.value
+                if args.config is not None and args.config.difficulty is not None
+                else None
+            ),
         )
         record.current_run = run_record
         record.latest_run_id = run_id
@@ -1507,6 +1514,14 @@ class SubagentExecution:
                 "base_model": context.record.base_model,
                 "active_provider": context.record.active_provider,
                 "effective_model": context.record.effective_model,
+                # P1-c2: the demanding route's structured difficulty category
+                # rides the acknowledgment, so escalations are auditable
+                # without re-reading transcripts. Admission validated it.
+                **(
+                    {"difficulty": context.run_record.difficulty}
+                    if context.run_record.difficulty is not None
+                    else {}
+                ),
                 **(
                     {
                         "replaced_run_id": replacement.run.run_id,

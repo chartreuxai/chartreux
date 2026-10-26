@@ -470,6 +470,19 @@ def test_interpreter_value_options_before_inline_code_policy(
         assert "matches denylist pattern" in (result.reason or "")
 
 
+@pytest.mark.parametrize(
+    "command", [".venv/bin/python --version", "python --version", "python3 --version"]
+)
+def test_interpreter_own_version_flag_resolves(command, tmp_path: Path) -> None:
+    tool = Bash(
+        config_getter=lambda: BashToolConfig(permission=ToolPermission.ALWAYS),
+        state=BaseToolState(),
+        cwd=tmp_path,
+    )
+    result = tool.resolve_permission(BashArgs(command=command))
+    assert result is not None and result.permission is ToolPermission.ALWAYS
+
+
 def test_unknown_interpreter_option_before_inline_code_is_denied(
     tmp_path: Path,
 ) -> None:

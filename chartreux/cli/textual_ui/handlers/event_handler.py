@@ -36,6 +36,7 @@ from chartreux.app_server.models import (
     PublicNoticeEntry,
     PublicReasoningEntry,
     RootRecoveryNoticeDetail,
+    RouteTableAppliedNoticeDetail,
     ScheduledLoopFiredNoticeDetail,
     SessionTitleUpdatedNoticeDetail,
     SkippedEffectState,
@@ -494,6 +495,12 @@ class EventHandler:
                 # recovery — a history entry (readable after an overnight
                 # interval and across reconnect), never a fresh instruction
                 # that would trigger another turn.
+                await self.finalize_streaming()
+                await self.mount_callback(UserCommandMessage(entry.message))
+            case RouteTableAppliedNoticeDetail():
+                # ADR 0022: the applied route notice is a history entry —
+                # readable after the reload — never a fresh instruction that
+                # would trigger another turn.
                 await self.finalize_streaming()
                 await self.mount_callback(UserCommandMessage(entry.message))
 

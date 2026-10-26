@@ -90,6 +90,10 @@ class RunRecord:
     # stable recovery-chain identity carried across the episode.
     resumed_from_run_id: str | None = None
     recovery_chain_id: str | None = None
+    # P1-c2: the structured difficulty category claimed by this run's launch
+    # config; non-None only on a demanding-route launch (admission validates
+    # the category, so this is always a qualifying value when set).
+    difficulty: str | None = None
 
 
 @dataclass(slots=True)
@@ -369,10 +373,12 @@ def _accepted_saved_grants(
     return tuple(sorted(entries, key=_grant_entry_sort_key))
 
 
-# One canonical probe form per registry operation. The denylist is matched
-# with the resolver's own prefix/canonical-git matching, so a probe doubles as
-# the operation's representative command; tests pin each probe to exactly its
-# operation through the frozen classifier.
+# One canonical probe form per registry operation (the modeled network
+# clients each get one: a denylist pattern naming either client vetoes
+# network.egress). The denylist is matched with the resolver's own
+# prefix/canonical-git matching, so a probe doubles as the operation's
+# representative command; tests pin each probe to exactly its operation
+# through the frozen classifiers.
 _DANGEROUS_COMMAND_DENYLIST_PROBES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("git.push", ("git", "push")),
     ("git.push.force", ("git", "push", "--force")),
@@ -385,6 +391,10 @@ _DANGEROUS_COMMAND_DENYLIST_PROBES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("git.stash.clear", ("git", "stash", "clear")),
     ("git.reflog.expire", ("git", "reflog", "expire")),
     ("git.reflog.delete", ("git", "reflog", "delete")),
+    # v0.5.9 P2-a: the destination-aware egress rule's ask-class operation,
+    # probed through both modeled clients.
+    ("network.egress", ("curl", "https://example.invalid/")),
+    ("network.egress", ("wget", "https://example.invalid/")),
 )
 
 

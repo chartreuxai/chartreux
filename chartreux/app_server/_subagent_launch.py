@@ -242,13 +242,11 @@ class ChildLaunchAdmission:
                 ),
                 session_model=parent.agent_loop.config.active_model,
                 user_prompts_dirs=parent.agent_loop.harness_files.user_prompts_dirs,
-                # Purpose routes resolve against the CONVERSATION'S FROZEN
-                # route table — the bound bundle's captured snapshot, the
-                # same source the rendered launch-target table carries —
-                # never the reloaded live config, so a mid-conversation
-                # route edit stays pending instead of producing a
-                # mixed-generation launch (design §6, §10).
-                routes=parent.agent_loop.frozen_purpose_routes,
+                # Purpose routes resolve against the conversation's LIVE
+                # route table — the in-memory table the reload swaps
+                # atomically, the same source the rendered launch-target
+                # table carries — so a validated route edit applies to
+                # every launch admitted after the reload commit (ADR 0022).
             )
             claim = args.config
             if claim is not None and claim.predecessor_agent_id is not None:
@@ -296,16 +294,14 @@ class ChildLaunchAdmission:
             # its record, so the route's own defaults are validated for
             # availability only — never adopted — but an invalid purpose or
             # seat binding fails loudly instead of being accepted. The
-            # binding validates against the conversation's FROZEN route
-            # table (the bound bundle's snapshot), so a purpose whose frozen
-            # route was edited away mid-conversation is rejected exactly as
-            # a fresh launch would reject it (design §6, §10).
+            # binding validates against the conversation's LIVE route table,
+            # so a purpose whose route was edited by a reload is validated
+            # exactly as a fresh launch validates it (ADR 0022).
             validate_launch_purpose_binding(
                 args.purpose,
                 config=parent.agent_loop.config,
                 seat=args.seat,
                 session_model=parent.agent_loop.config.active_model,
-                routes=parent.agent_loop.frozen_purpose_routes,
             )
         return resolve_launch(
             identity=retained_identity,
@@ -540,13 +536,13 @@ class ChildLaunchAdmission:
         # the claimed candidate and the candidate set — a separate axis from
         # the package tier, and absent markings keep the legacy tier-label
         # derivation (the shipped routes mark nothing). The facts derive
-        # from the conversation's FROZEN route table — the bound bundle's
-        # captured snapshot — so a mid-conversation route edit stays pending
-        # for recovery exactly as it does for launch (design §6, §10).
+        # from the conversation's LIVE route table — the same source launch
+        # admission resolves against (ADR 0022).
         mechanical_models, capability_markings = route_recovery_facts(
-            parent.agent_loop.frozen_purpose_routes,
+            config.purpose_routes.routes,
             session_model=session_model_alias(config),
             canonical_models=resolver.canonical_model_map(),
+            catalog_prices=resolver.catalog_prices(),
         )
         claimed = ReplacementCandidate(
             base_model=resolved.base_model,

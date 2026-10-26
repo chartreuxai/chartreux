@@ -10,10 +10,10 @@ from tests.conftest import build_test_agent_loop, build_test_vibe_config
 def _description_lines(description: str) -> list[str]:
     """The description's lines, order-insensitive.
 
-    The conversation's frozen route table is sorted by purpose, while the
-    live configured table follows the configured order, so a description
-    rendered from the frozen source carries the same content as the live
-    render with the launch-target rows in sorted order.
+    Every render path reads the conversation's LIVE route table, so a
+    description rendered after a reload carries the edited table; the
+    sort keeps the comparison robust against any row-order difference
+    between render paths.
     """
     return sorted(description.splitlines())
 
@@ -96,10 +96,9 @@ async def test_saved_identity_edit_applies_next_session_not_refresh() -> None:
     assert task_description_for_config(edited) == initial_task
 
     prepared = agent._prepare_reload_consumers(edited, False, reuse_backend=True)
-    # The prepared consumers serve the conversation's FROZEN route table:
+    # The prepared consumers serve the conversation's LIVE route table:
     # content-identical to the initial description (the identity edit does
-    # not touch the routes), with the launch-target rows in the frozen
-    # table's sorted-by-purpose order.
+    # not touch the routes).
     assert _description_lines(prepared.tool_manager._tool_descriptions["task"]) == (
         _description_lines(initial_task)
     )

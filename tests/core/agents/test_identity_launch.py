@@ -49,7 +49,13 @@ from tests.conftest import build_test_vibe_config
 
 
 def _catalog() -> ModelCatalog:
-    """A deterministic three-model catalog with two role presets."""
+    """A deterministic three-model catalog with two role presets.
+
+    ``alpha-model`` and ``beta-model`` carry price data so the shipped
+    cost-tier route defaults resolve (the cheapest capable model is
+    ``alpha-model``); ``limited-model`` stays unpriced and is never the
+    cost-tier default.
+    """
     return ModelCatalog.model_validate({
         "providers": {
             "alpha": {"api_base": "https://alpha.test"},
@@ -58,11 +64,23 @@ def _catalog() -> ModelCatalog:
         "models": {
             "alpha-model": {
                 "thinking": "medium",
-                "deployments": [{"provider": "alpha", "name": "alpha-wire"}],
+                "deployments": [
+                    {
+                        "provider": "alpha",
+                        "name": "alpha-wire",
+                        "prices": {"input": 1.0, "output": 2.0},
+                    }
+                ],
             },
             "beta-model": {
                 "thinking": "high",
-                "deployments": [{"provider": "beta", "name": "beta-wire"}],
+                "deployments": [
+                    {
+                        "provider": "beta",
+                        "name": "beta-wire",
+                        "prices": {"input": 3.0, "output": 8.0},
+                    }
+                ],
             },
             "limited-model": {
                 "thinking": "off",

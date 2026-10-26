@@ -130,6 +130,29 @@ Credential precedence is precise: a **non-empty** value already present in the p
 
 For web search, use Settings > Web search or `/web-search` to select a provider and manage its credential separately from search settings. A key may be saved or kept for the current session; see [Tools and safety](tools-safety.md) for provider, readiness, and retry behavior.
 
+### Project environment injection
+
+When a `bash` or `bash_start` call's working folder is inside a [trusted folder](tools-safety.md#trusted-folders), Chartreux loads exactly two dotenv files into the command's subprocess environment:
+
+1. the trusted folder's `.env` (the project level), and
+2. `$CHARTREUX_HOME/.env` (the global level).
+
+Project-level keys win over global-level keys, and an explicit non-empty value already present in the process or shell environment wins over both files. There are no profile variants and no cascading lookups: the trusted folder is the trust root of the working folder, and only its own `.env` loads, so a working folder nested deeper does not pick up intermediate `.env` files. Both files are re-read when their mtime changes, so rotating a secret takes effect on the next command without a restart.
+
+Known secret values — from `$CHARTREUX_HOME/.env`, the project `.env`, and the keyring — are masked in tool output, so the values reach your scripts, never the transcript. Verify a key's presence without seeing it:
+
+```bash
+printenv MISTRAL_API_KEY   # masked output: present; nonzero exit: absent
+```
+
+Keep credentials out of artifacts, logs, and commits, and document the key names your project expects in a committable `.env.example` (never commit the real `.env`):
+
+```dotenv
+# .env.example — key names only, no values
+MISTRAL_API_KEY=
+DATABASE_URL=
+```
+
 ## Status line and message timing
 
 Open `/settings` and select **Status line** to customize the bottom session row.

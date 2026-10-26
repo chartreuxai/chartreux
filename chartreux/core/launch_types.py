@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import enum
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from chartreux.core.agents.identities import AgentIdentity, ToolPosture
 from chartreux.core.config.models import ThinkingLevel
+from chartreux.core.dispatch.purposes import DEMANDING_IMPLEMENTATION_PURPOSE
 from chartreux.core.dispatch.route_models import ReplacementCapability
 from chartreux.core.recovery_models import PackageTier
 from chartreux.core.tools.models import ToolPermission
@@ -16,6 +18,70 @@ if TYPE_CHECKING:
     # policy.composition is a heavy import — both are annotation-only here.
     from chartreux.core.policy.composition import ExecutionContext
     from chartreux.core.session_types import CommittedModelIdentity
+
+
+class DifficultyCategory(enum.StrEnum):
+    """The bounded difficulty categories of a demanding-route launch (P1-c2).
+
+    Only the qualifying set (``NOVEL_ALGORITHM``, ``CONCURRENCY``,
+    ``SUBTLE_INVARIANT``) justifies the demanding route; ``CROSS_SUBSYSTEM``
+    and ``NONE_OF_THESE_FIT`` are record-only categories — a launch carrying
+    one of them fails admission (the qualifying-set rule).
+    """
+
+    NOVEL_ALGORITHM = "novel-algorithm"
+    CONCURRENCY = "concurrency"
+    SUBTLE_INVARIANT = "subtle-invariant"
+    CROSS_SUBSYSTEM = "cross-subsystem"
+    NONE_OF_THESE_FIT = "none-of-these-fit"
+
+
+#: The difficulty categories that justify the demanding route (P1-c2); the
+#: remaining categories are record-only and fail admission.
+QUALIFYING_DIFFICULTY_CATEGORIES: frozenset[DifficultyCategory] = frozenset({
+    DifficultyCategory.NOVEL_ALGORITHM,
+    DifficultyCategory.CONCURRENCY,
+    DifficultyCategory.SUBTLE_INVARIANT,
+})
+
+
+def validate_difficulty_for_purpose(
+    purpose: str | None, difficulty: DifficultyCategory | None
+) -> None:
+    """Purpose-keyed difficulty admission (P1-c2).
+
+    A demanding-route launch MUST carry a difficulty category from the
+    qualifying set — the field is required there, and a record-only category
+    (``cross-subsystem``, ``none-of-these-fit``) fails admission. Every other
+    purpose (including a direct unrouted launch) rejects the field outright.
+    Raises ``ValueError``; the canonical task grammar surfaces it as a
+    validation error, so a rejected launch never admits.
+    """
+    qualifying = ", ".join(
+        sorted(category.value for category in QUALIFYING_DIFFICULTY_CATEGORIES)
+    )
+    if purpose == DEMANDING_IMPLEMENTATION_PURPOSE:
+        if difficulty is None:
+            raise ValueError(
+                f"purpose '{DEMANDING_IMPLEMENTATION_PURPOSE}' requires "
+                "config.difficulty from the qualifying set "
+                f"({qualifying}); the difficulty category is required so "
+                "escalations stay auditable"
+            )
+        if difficulty not in QUALIFYING_DIFFICULTY_CATEGORIES:
+            raise ValueError(
+                f"config.difficulty {difficulty.value!r} does not justify the "
+                f"'{DEMANDING_IMPLEMENTATION_PURPOSE}' route: it is a "
+                f"record-only category. Use a qualifying category "
+                f"({qualifying}) or route the work to the default implementor"
+            )
+        return
+    if difficulty is not None:
+        raise ValueError(
+            f"config.difficulty is only accepted for purpose "
+            f"'{DEMANDING_IMPLEMENTATION_PURPOSE}'; purpose "
+            f"{purpose!r} does not accept it"
+        )
 
 
 class LaunchToolOverride(BaseModel):
@@ -41,6 +107,17 @@ class LaunchConfig(BaseModel):
 
     model: str | None = Field(
         default=None, description="canonical model name or `@role`"
+    )
+    difficulty: DifficultyCategory | None = Field(
+        default=None,
+        description=(
+            "The structured difficulty category for the "
+            "'implementation-demanding-settled' purpose. Required there, and "
+            "only the qualifying set (novel-algorithm, concurrency, "
+            "subtle-invariant) justifies that route; cross-subsystem and "
+            "none-of-these-fit are record-only and fail admission; every "
+            "other purpose rejects the field."
+        ),
     )
     instructions: str | None = None
     thinking: ThinkingLevel | None = None

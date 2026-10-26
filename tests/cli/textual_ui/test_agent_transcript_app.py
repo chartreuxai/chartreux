@@ -6,7 +6,7 @@ from contextlib import suppress
 import logging
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from textual.widgets import Button
@@ -1153,3 +1153,99 @@ async def test_metadata_disappearance_returns_to_main_with_explanation() -> None
         # No ghost rows remain in the browser.
         bar = app._agent_bar
         assert bar is not None and not bar.agents
+
+
+@pytest.mark.asyncio
+async def test_close_releases_mouse_capture_inside_viewer_subtree() -> None:
+    """A capture held on a pruned viewer widget leaves App.mouse_captured
+    dangling; all mouse events then route to the removed widget and are
+    dropped (mouse-dead / keyboard-alive split after close).
+    """
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        app.app_server.resources.sessions.read_agent_transcript = AsyncMock(
+            return_value=AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+            )
+        )
+        await app._handle_turn_event(AgentsUpdate([_agent("one")]))
+        await pilot.press("ctrl+shift+a", "down", "enter")
+        await pilot.pause()
+        viewer = app.query_one(AgentTranscriptViewer)
+        inner = viewer.query_one("#agent-transcript-header")
+        app.capture_mouse(inner)
+        await pilot.pause()
+        assert app.mouse_captured is inner
+
+        await app._request_agent_transcript_close()
+        transition = app._agent_transition_task
+        if transition is not None:
+            await transition
+        await pilot.pause()
+
+        assert not app.query(AgentTranscriptViewer)
+        assert app.mouse_captured is None
+
+
+@pytest.mark.asyncio
+async def test_close_keeps_capture_held_outside_viewer_subtree() -> None:
+    """Only a capture pointing into the pruned viewer subtree is released;
+    a capture held elsewhere survives the teardown.
+    """
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        app.app_server.resources.sessions.read_agent_transcript = AsyncMock(
+            return_value=AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+            )
+        )
+        await app._handle_turn_event(AgentsUpdate([_agent("one")]))
+        await pilot.press("ctrl+shift+a", "down", "enter")
+        await pilot.pause()
+        assert app.query_one(AgentTranscriptViewer)
+        container = app._chat_input_container
+        assert container is not None
+        input_widget = container.input_widget
+        assert input_widget is not None
+        app.capture_mouse(input_widget)
+        await pilot.pause()
+        assert app.mouse_captured is input_widget
+
+        await app._request_agent_transcript_close(restore_focus=False)
+        transition = app._agent_transition_task
+        if transition is not None:
+            await transition
+        await pilot.pause()
+
+        assert not app.query(AgentTranscriptViewer)
+        assert app.mouse_captured is input_widget
+
+
+@pytest.mark.asyncio
+async def test_close_restores_chat_when_dispose_raises() -> None:
+    """A dispose exception during close must not leave the chat hidden: the
+    chat-restore block runs in a finally.
+    """
+    app = build_test_chartreux_app()
+    async with app.run_test() as pilot:
+        app.app_server.resources.sessions.read_agent_transcript = AsyncMock(
+            return_value=AgentTranscriptGetResponse(
+                state=AgentTranscriptState.NO_SAVED_TRANSCRIPT
+            )
+        )
+        await app._handle_turn_event(AgentsUpdate([_agent("one")]))
+        await pilot.press("ctrl+shift+a", "down", "enter")
+        await pilot.pause()
+        viewer = app.query_one(AgentTranscriptViewer)
+        assert not app.query_one("#chat").display
+
+        async def failing_dispose() -> None:
+            raise RuntimeError("dispose exploded")
+
+        with patch.object(viewer, "dispose", failing_dispose):
+            await app._request_agent_transcript_close()
+        await pilot.pause()
+
+        assert app.query_one("#chat").display
+        for chrome_id in ("loading-area", "bottom-app-container", "bottom-bar"):
+            assert app.query_one(f"#{chrome_id}").display

@@ -43,6 +43,7 @@ CEREMONY_ANCHORS: tuple[str, ...] = (
     "never run tests, builds, or other verification yourself",
     "never edit repo files yourself",
     "the gate ends the turn",
+    'supersedes the "when unsure whether the user accepted, ask" default',
 )
 
 # Model-tier doctrine anchors: the mechanical/substantive routing and
@@ -225,7 +226,7 @@ CLAUSE_DISPOSITIONS: tuple[tuple[str, str, str, str], ...] = (
     ("advisor: role + output format", "identity", "advisor", "Denials encountered"),
     ("reviewer: role + output format", "identity", "reviewer", "Review Report"),
     (
-        "reviewer: read-only posture, no shell verification",
+        "reviewer: read-only posture, bash verification carve-out",
         "identity",
         "reviewer",
         "do not hide failed checks",
@@ -533,6 +534,8 @@ def test_ceremony_workflow_carries_all_ceremony(bodies: dict[str, str]) -> None:
         "classify",
         "the gate ends the turn",
         "verify",
+        "authorizes its named work packages in sequence",
+        'supersedes the "when unsure whether the user accepted, ask" default',
     ):
         _assert_contains(ceremony, anchor)
 
@@ -642,19 +645,26 @@ def test_orchestrator_minimal_none_resolves_with_no_missing_required_pieces(
 # --- Reviewer / bounded child / strategy -----------------------------------
 
 
-def test_reviewer_identity_makes_no_shell_verification_promise(
+def test_reviewer_identity_pins_the_bash_verification_carve_out(
     bodies: dict[str, str],
 ) -> None:
     reviewer = bodies["identity/reviewer"]
     # The old reviewer.md:28 promise ("run declared check-only project
-    # verification commands") is removed by the honest read-only reviewer
-    # posture (design section 9).
-    for anchor in ("run declared check-only", "check-only", "bash"):
+    # verification commands") stays removed (design section 9); settlement
+    # decision 3 (P1-h) supersedes the no-shell posture with an execution
+    # carve-out: non-mutating verification commands through bash, its
+    # permission guards intact, never a file modification.
+    for anchor in ("run declared check-only", "check-only"):
         _assert_lacks(reviewer, anchor)
-    # The truthfulness requirement stays.
-    for anchor in ("not run", "do not hide failed checks", "never modify"):
+    for anchor in (
+        "read-only",
+        "never modify",
+        "non-mutating verification commands",
+        "through bash",
+        "not run",
+        "do not hide failed checks",
+    ):
         _assert_contains(reviewer, anchor)
-    _assert_contains(reviewer, "read-only")
 
 
 def test_bounded_child_returns_blockers_and_never_restarts_the_parent_workflow(

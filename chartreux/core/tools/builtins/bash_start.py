@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from typing import cast
 
 from pydantic import JsonValue
 
 from chartreux.core.background_jobs import BashStartArgs, StartResult
+from chartreux.core.env import project_env_for_cwd
 from chartreux.core.tools.base import (
     BaseTool,
     BaseToolConfig,
@@ -15,10 +17,37 @@ from chartreux.core.tools.base import (
 )
 from chartreux.core.tools.builtins._shell_permission_resolver import (
     ShellPermissionResolver,
+    shell_command_write_paths,
 )
-from chartreux.core.tools.builtins.bash import Bash, BashToolConfig
+from chartreux.core.tools.builtins.bash import (
+    Bash,
+    BashToolConfig,
+    CancelledShellCommand,
+)
 from chartreux.core.tools.permissions import PermissionContext
 from chartreux.core.tools.ui import ToolResultDisplay, ToolUIData
+
+
+class FailedJobStart(ToolError):
+    """ToolError from a background job whose admission failed.
+
+    A failed admission may still have spawned the command (partial
+    execution), so it carries the command's write-classified paths and its
+    unknown-write-surface flag; the tool executor copies them onto the error
+    result event, and the submission scan collects the footprint exactly as
+    a successful start's would be.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        write_paths: list[str] | None = None,
+        write_paths_unknown: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.write_paths = list(write_paths or [])
+        self.write_paths_unknown = write_paths_unknown
 
 
 class BashStart(
@@ -36,6 +65,10 @@ class BashStart(
             self.workspace,
             self.path_authority,
             self.dangerous_command_authorities_getter,
+            # The same trust-gated environment the background job's
+            # subprocess receives; the egress rule consults it for injected
+            # non-loopback proxies (v0.5.9 R1).
+            injected_env=project_env_for_cwd(self.cwd),
         ).resolve_permission(args)
 
     async def run(
@@ -43,10 +76,40 @@ class BashStart(
     ) -> AsyncGenerator[StartResult, None]:
         if ctx is None or ctx.background_jobs is None:
             raise ToolError("Background jobs unavailable in this context")
+        # R7: surface the started command's write-classified paths (redirect
+        # targets, write-option values, write-classified command operands)
+        # on the result, so the submission secret scan covers a started
+        # background job's write surface exactly as a foreground run's. The
+        # footprint is computed before the admission attempt: a failed or
+        # cancelled start may still have spawned the command, and its write
+        # surface must reach the submission scan regardless of the outcome.
+        write_paths, write_paths_unknown = shell_command_write_paths(
+            args.command,
+            cwd=self.cwd,
+            workspace=self.workspace,
+            authority=self.path_authority,
+        )
         try:
-            yield await ctx.background_jobs.start(args, cwd=self.cwd)
+            result = await ctx.background_jobs.start(args, cwd=self.cwd)
+        except asyncio.CancelledError as exc:
+            # The registry finishes its pre-commit recovery before
+            # re-raising; the executor's cancellation handler copies the
+            # write footprint onto the cancelled result event.
+            raise CancelledShellCommand(
+                write_paths=write_paths, write_paths_unknown=write_paths_unknown
+            ) from exc
         except (ValueError, OSError) as exc:
-            raise ToolError("Unable to start background job") from exc
+            raise FailedJobStart(
+                "Unable to start background job",
+                write_paths=write_paths,
+                write_paths_unknown=write_paths_unknown,
+            ) from exc
+        yield result.model_copy(
+            update={
+                "write_paths": list(write_paths),
+                "write_paths_unknown": write_paths_unknown,
+            }
+        )
 
     @classmethod
     def format_result_display(cls, result: StartResult) -> ToolResultDisplay:

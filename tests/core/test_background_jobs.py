@@ -665,9 +665,18 @@ def process_adapter(monkeypatch: pytest.MonkeyPatch) -> Any:
             self.fail_spawn = False
             self.fail_stop = False
             self.on_spawn: Any = None
+            self.last_extra_env: dict[str, str] | None = None
 
-        async def spawn(self, command: str, *, cwd=None, merge_stderr: bool) -> Any:
+        async def spawn(
+            self,
+            command: str,
+            *,
+            cwd=None,
+            merge_stderr: bool,
+            extra_env: dict[str, str] | None = None,
+        ) -> Any:
             assert merge_stderr
+            self.last_extra_env = extra_env
             self.spawn_entered.set()
             await self.spawn_gate.wait()
             if self.fail_spawn:

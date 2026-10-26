@@ -604,14 +604,23 @@ async def test_a_project_grant_does_not_follow_another_worktree(
         await loop.aclose()
 
 
-async def test_child_always_saves_through_the_root_orchestrator_keyed_by_child_cwd(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+async def test_child_with_user_input_capability_denies_ask_class_and_reports_a_blocker(
+    tmp_path: Path, config_dir: Path
 ) -> None:
+    """Blanket child denial: a capable child never surfaces the approval prompt.
+
+    The child's own gap is locally grantable (the parent holds session
+    authority, so this is not a parent ceiling), yet the child denies with
+    remediation instead of prompting: the blocker flows back to the parent
+    and dangerous_command_grants_by_project stays the only child
+    pre-authorization path.
+    """
     project = make_repo(tmp_path / "project")
     nested = project / "nested"
     nested.mkdir()
     marker = nested / "executed.txt"
     config_path = config_dir / "config.toml"
+    disk = config_path.read_bytes()
     parent = await _make_loop(project, config_path, FakeBackend())
     server, _, session = await _open_session(parent)
     try:
@@ -641,10 +650,82 @@ async def test_child_always_saves_through_the_root_orchestrator_keyed_by_child_c
             parent_authority_getter=policy.parent_authority_getter,
             parent_authority_revision_getter=policy.parent_authority_revision_getter,
         )
-        sibling = AgentLoop(
+        registry._children[child.session_id] = registry._build_child_runtime(child)
+        # The runtime construction bound the child's persistence port too.
+        assert isinstance(
+            child._dangerous_command_grant_port, SessionDangerousCommandGrantPort
+        )
+        try:
+            events, requests = await _drive_loop(child, "Always for this project")
+            # No prompt surfaces even with user-input capability and a bound
+            # persistence port: the ask-class operation denies outright.
+            assert requests == []
+            results = _results(events)
+            assert len(results) == 1
+            assert results[0].skipped
+            assert not marker.exists()
+            assert any(
+                GRANTS_FIELD in text and "config.toml" in text
+                for text in _tool_texts(child)
+            )
+            # No authority was installed anywhere and nothing was persisted.
+            assert _authorities(child) == []
+            assert _authorities(parent) == [
+                (frozenset({"git.push"}), _scope_of(project))
+            ]
+            assert _saved_grants(config_path) == {}
+            assert config_path.read_bytes() == disk
+        finally:
+            await child.aclose()
+    finally:
+        await session.close()
+        await parent.aclose()
+
+
+async def test_paired_main_and_child_for_the_same_ungranted_ask_class_call(
+    tmp_path: Path, config_dir: Path
+) -> None:
+    """The same ungranted call prompts in the main session, denies in a child."""
+    project = make_repo(tmp_path / "project")
+    config_path = config_dir / "config.toml"
+    disk = config_path.read_bytes()
+    marker_name = "executed.txt"
+    command = f"git push; touch {marker_name}"
+    main = await _make_loop(
+        project, config_path, FakeBackend([*_turn(command, "main-1")])
+    )
+    _, _, session = await _open_session(main)
+    try:
+        callbacks = await _drive(session, "Allow once")
+        # The main session surfaces the approval dialog and the granted call
+        # executes.
+        assert len(callbacks) == 1
+        assert (project / marker_name).exists()
+    finally:
+        await session.close()
+        await main.aclose()
+    # Clear the main half's marker so the child half starts unexecuted.
+    (project / marker_name).unlink()
+
+    parent = await _make_loop(project, config_path, FakeBackend())
+    server, _, session = await _open_session(parent)
+    try:
+        root_backend = server._require_root()
+        assert isinstance(root_backend, SessionBackendImpl)
+        registry = root_backend.children
+        assert isinstance(registry, SessionRuntimeRegistry)
+        policy = parent.child_runtime_policy
+        # The parent holds session authority so the child's gap is locally
+        # grantable instead of a parent ceiling: the paired child denial is
+        # the blanket child gate, not a ceiling denial.
+        parent._dangerous_command_grants.grant_session({
+            ("git.push", _scope_of(project))
+        })
+        parent.tool_manager._invalidate_dangerous_command_authority()
+        child = AgentLoop(
             config_orchestrator=parent.config_orchestrator.copy(),
-            cwd=nested,
-            backend=FakeBackend(),
+            cwd=project,
+            backend=FakeBackend([*_turn(command, "child-1")]),
             is_subagent=True,
             inherited_workspace=policy.inherited_workspace,
             inherited_restrictions=policy.inherited_restrictions,
@@ -656,48 +737,22 @@ async def test_child_always_saves_through_the_root_orchestrator_keyed_by_child_c
             parent_authority_revision_getter=policy.parent_authority_revision_getter,
         )
         registry._children[child.session_id] = registry._build_child_runtime(child)
-        registry._children[sibling.session_id] = registry._build_child_runtime(sibling)
-        # The runtime construction bound the child's persistence port too.
-        assert isinstance(
-            child._dangerous_command_grant_port, SessionDangerousCommandGrantPort
-        )
-        # The root orchestrator writes; a child orchestrator never does.
-        root_save = AsyncMock(
-            wraps=parent.config_orchestrator.save_dangerous_command_grant
-        )
-        monkeypatch.setattr(
-            parent.config_orchestrator, "save_dangerous_command_grant", root_save
-        )
-        child_save = AsyncMock(
-            side_effect=AssertionError("child orchestrators never write")
-        )
-        monkeypatch.setattr(
-            child.config_orchestrator, "save_dangerous_command_grant", child_save
-        )
         try:
-            events, requests = await _drive_loop(child, "Always for this project")
-            assert len(requests) == 1
+            events, requests = await _drive_loop(child, "Allow once")
+            # The child denies the same operation with remediation.
+            assert requests == []
             results = _results(events)
             assert len(results) == 1
-            assert not results[0].skipped
-            assert marker.exists()
-            # The calling child gets its own grant; the parent keeps exactly
-            # its pre-existing authority and the sibling stays unchanged.
-            assert _authorities(child) == [(frozenset({"git.push"}), _scope_of(nested))]
-            assert _authorities(parent) == [
-                (frozenset({"git.push"}), _scope_of(project))
-            ]
-            assert _authorities(sibling) == []
-            # The save routed through the root orchestrator, keyed by the
-            # child's registered cwd, never by a caller-supplied project path.
-            assert root_save.call_count == 1
-            assert root_save.call_args.kwargs["project"] == nested.resolve()
-            assert root_save.call_args.kwargs["operation_id"] == "git.push"
-            child_save.assert_not_called()
-            assert _saved_grants(config_path) == {str(nested.resolve()): ["git.push"]}
+            assert results[0].skipped
+            assert not (project / marker_name).exists()
+            assert any(
+                GRANTS_FIELD in text and "config.toml" in text
+                for text in _tool_texts(child)
+            )
+            assert _authorities(child) == []
+            assert config_path.read_bytes() == disk
         finally:
             await child.aclose()
-            await sibling.aclose()
     finally:
         await session.close()
         await parent.aclose()
@@ -802,3 +857,162 @@ async def test_child_inherits_approved_project_authority(
     finally:
         await session.close()
         await parent.aclose()
+
+
+# v0.5.9 P2-a: the destination-aware egress rule resolves non-loopback
+# network-client egress to the same ask-class as git push, so the P1-g
+# gates compose unchanged — the dialog in an interactive main session,
+# denial with remediation in headless and child sessions. The command
+# targets TEST-NET-1 (192.0.2.1, RFC 5737) with a one-second cap: the
+# curl fails fast and the trailing touch still proves execution.
+EGRESS_COMMAND = "curl -s --max-time 1 https://192.0.2.1/; touch {marker}"
+
+
+async def test_paired_main_and_child_for_the_same_ungranted_egress_call(
+    tmp_path: Path, config_dir: Path
+) -> None:
+    """The same ungranted egress call prompts in the main session, denies in a child."""
+    project = make_repo(tmp_path / "project")
+    config_path = config_dir / "config.toml"
+    disk = config_path.read_bytes()
+    marker_name = "executed.txt"
+    command = EGRESS_COMMAND.format(marker=marker_name)
+    main = await _make_loop(
+        project, config_path, FakeBackend([*_turn(command, "main-1")])
+    )
+    _, _, session = await _open_session(main)
+    try:
+        callbacks: list[str] = []
+        async for event in session.act("Exercise dangerous-command grants"):
+            if isinstance(event, CallbackRequested):
+                callbacks.append(event.callback.callback_id)
+                detail = event.callback.detail
+                assert isinstance(detail, UserInputCallbackDetail)
+                question = detail.request.questions[0]
+                # The egress approval is not described as a git command.
+                assert question.question.startswith("Allow this dangerous command?")
+                assert "network.egress" in question.question
+                assert "192.0.2.1" in question.question
+                # network.egress is publication-class: the persistent
+                # choice is offered, exactly like git push.
+                assert [option.label for option in question.options] == [
+                    "Deny",
+                    "Allow once",
+                    "Allow this session",
+                    "Always for this project",
+                ]
+                await session.respond_to_callback(
+                    event.callback.callback_id,
+                    UserInputCallbackOutput(
+                        result=UserQuestionResult(
+                            answers=[UserAnswer(question="grant", answer="Allow once")]
+                        )
+                    ),
+                )
+        # The main session surfaces the approval dialog, and the once
+        # permit covers the egress requirement: the call executes.
+        assert len(callbacks) == 1
+        assert (project / marker_name).exists()
+    finally:
+        await session.close()
+        await main.aclose()
+    # Clear the main half's marker so the child half starts unexecuted.
+    (project / marker_name).unlink()
+
+    parent = await _make_loop(project, config_path, FakeBackend())
+    server, _, session = await _open_session(parent)
+    try:
+        root_backend = server._require_root()
+        assert isinstance(root_backend, SessionBackendImpl)
+        registry = root_backend.children
+        assert isinstance(registry, SessionRuntimeRegistry)
+        policy = parent.child_runtime_policy
+        # The parent holds session authority so the child's gap is locally
+        # grantable instead of a parent ceiling: the paired child denial
+        # is the blanket child gate (P1-g), not a ceiling denial.
+        parent._dangerous_command_grants.grant_session({
+            ("network.egress", _scope_of(project))
+        })
+        parent.tool_manager._invalidate_dangerous_command_authority()
+        child = AgentLoop(
+            config_orchestrator=parent.config_orchestrator.copy(),
+            cwd=project,
+            backend=FakeBackend([*_turn(command, "child-1")]),
+            is_subagent=True,
+            inherited_workspace=policy.inherited_workspace,
+            inherited_restrictions=policy.inherited_restrictions,
+            inherited_mode_restrictions=policy.inherited_mode_restrictions,
+            inherited_plan_write_scopes=policy.inherited_plan_write_scopes,
+            inherited_root_grants=policy.inherited_root_grants,
+            user_input_capability=True,
+            parent_authority_getter=policy.parent_authority_getter,
+            parent_authority_revision_getter=policy.parent_authority_revision_getter,
+        )
+        registry._children[child.session_id] = registry._build_child_runtime(child)
+        try:
+            events, requests = await _drive_loop(child, "Allow once")
+            # The child denies the same egress call with remediation: no
+            # prompt even with user-input capability, no execution, and the
+            # config knob is named.
+            assert requests == []
+            results = _results(events)
+            assert len(results) == 1
+            assert results[0].skipped
+            assert not (project / marker_name).exists()
+            assert any(
+                GRANTS_FIELD in text and "config.toml" in text
+                for text in _tool_texts(child)
+            )
+            assert _authorities(child) == []
+            assert config_path.read_bytes() == disk
+        finally:
+            await child.aclose()
+    finally:
+        await session.close()
+        await parent.aclose()
+
+
+@pytest.mark.parametrize("entrypoint", ["programmatic", "acp"])
+async def test_headless_egress_denies_with_remediation(
+    tmp_path: Path, config_dir: Path, entrypoint: AgentEntrypoint
+) -> None:
+    """A headless session denies egress with remediation instead of prompting."""
+    project = make_repo(tmp_path / "project")
+    marker = project / "executed.txt"
+    config_path = config_dir / "config.toml"
+    disk = config_path.read_bytes()
+    command = EGRESS_COMMAND.format(marker=marker.name)
+    user = UserConfigLayer(path=config_path)
+    overlay = OverridesLayer(data={})
+    orchestrator = await ConfigOrchestrator.create(
+        schema=ChartreuxConfigSchema,
+        layers=[DefaultConfigLayer(schema=ChartreuxConfigSchema), user, overlay],
+        default_layer_resolver=lambda: overlay,
+    )
+    loop = AgentLoop(
+        config_orchestrator=orchestrator,
+        cwd=project,
+        backend=FakeBackend([*_turn(command, "egress-headless-1")]),
+        mcp_registry=FakeMCPRegistry(),
+    )
+    client_transport, server_transport = memory_transport_pair()
+    server = build_test_app_server(loop, server_transport)
+    client = AppServerClient(client_transport, run_peer=server.serve)
+    session = await AppServerSession.start(
+        client,
+        client_info=ClientInfo(
+            name="dangerous-prompt-test", version="0", entrypoint=entrypoint
+        ),
+        capabilities=ClientCapabilities(callback_kinds=["user_input"]),
+    )
+    try:
+        callbacks = await _drive(session, "Allow this session")
+        assert callbacks == []
+        assert not marker.exists()
+        assert _authorities(loop) == []
+        texts = _tool_texts(loop)
+        assert any(GRANTS_FIELD in text and "config.toml" in text for text in texts)
+        assert config_path.read_bytes() == disk
+    finally:
+        await session.close()
+        await loop.aclose()

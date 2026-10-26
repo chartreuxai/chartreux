@@ -20,16 +20,16 @@ For an independent review, launch a fresh reviewer on the review purpose — nev
 
 ### Launch targets
 
-Delegated work routes by purpose. Every shipped default target binds the session model, so one configured model and ten produce identical routing; explicit fields override the route's corresponding field.
+Delegated work routes by purpose. This is the conversation's live route table: a validated route edit applies to subsequent launches, while children already admitted keep their bindings. Shipped targets bind the session model except `implementation`, `mechanical-edit`, `search`, and `verification`, which default to the cheapest capable model in the catalog — the `$cheapest-capable` binding, resolved at launch from the catalog's price data. Explicit fields override the route's corresponding field.
 
 | Purpose | Identity | Tier | Seat | Model |
 | --- | --- | --- | --- | --- |
-| `implementation` | `coder` | substantive | — | `beta-model` |
-| `mechanical-edit` | `coder` | mechanical | — | `beta-model` |
+| `implementation` | `coder` | substantive | — | `$cheapest-capable` |
+| `mechanical-edit` | `coder` | mechanical | — | `$cheapest-capable` |
 | `research` | `researcher` | substantive | — | `beta-model` |
-| `search` | `researcher` | mechanical | — | `beta-model` |
+| `search` | `researcher` | mechanical | — | `$cheapest-capable` |
 | `exploration` | `researcher` | substantive | — | `beta-model` |
-| `verification` | `coder` | mechanical | — | `beta-model` |
+| `verification` | `coder` | mechanical | — | `$cheapest-capable` |
 | `design-analysis` | `advisor` | substantive | — | `beta-model` |
 | `planning-analysis` | `advisor` | substantive | — | `beta-model` |
 | `implementation-demanding-settled` | `coder` | substantive | — | `beta-model` |
@@ -50,7 +50,7 @@ Delegated work routes by purpose. Every shipped default target binds the session
 - `verification`: Run proportionate tests, builds, and other verification; report only checks actually run.
 - `mechanical-edit`: Mechanical single-file edits with a known, bounded transformation.
 - `implementation`: All substantive implementation, including novel algorithmic reasoning, difficult refactoring, and broad-impact work.
-- `implementation-demanding-settled`: Demanding execution with a settled approach; a proactive escalation-implementor route, not only a failure-triggered route. State the reason for this route.
+- `implementation-demanding-settled`: Exceptionally demanding, genuinely tricky work (novel algorithms, subtle invariants, concurrency) whose approach is already settled; ordinary substantive implementation goes to the default implementor. A settled or detailed approach alone never justifies this route; a merely large package is split at planning time so the default implementor can take the pieces.
 - `design-analysis`: Architecture, cross-subsystem design, design refinements, and destructive-operation analysis; read-only advice, never implementation. Keep an advisor across related refinements.
 - `planning-analysis`: Analyze an approved design into bounded steps, dependencies, and acceptance checks; read-only advice, never implementation.
 - `review.quick`: A quick independent judgment in a fresh reviewer context, never the author or a reused advisor.

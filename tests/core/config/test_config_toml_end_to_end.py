@@ -177,6 +177,22 @@ async def test_toml_bash_denylist_still_requires_dangerous_command_authority(
         assert result is not None and result.permission is ToolPermission.NEVER
         assert result.denial_kind is None
         assert result.dangerous_command_proposal is None
+    # v0.5.9 P2-a: curl left the shipped denylist, so a configured list
+    # omitting it no longer admits curl unconditionally — an unparseable
+    # destination resolves ask-class (denied pending network.egress
+    # authority). A configured entry still vetoes it outright.
     result = tool.resolve_permission(BashArgs(command="curl example.org"))
     assert result is not None
-    assert (result.permission is ToolPermission.NEVER) is curl_denied
+    assert result.permission is ToolPermission.NEVER
+    if curl_denied:
+        assert "matches denylist pattern 'curl'" in (result.reason or "")
+        assert result.denial_kind is None
+        assert result.dangerous_command_proposal is None
+    else:
+        assert result.denial_kind == "dangerous_command"
+        assert result.dangerous_command_proposal is not None
+    # The configured denylist still replaces the shipped defaults: nc ships
+    # on the shipped list, so a configured list omitting it admits it.
+    result = tool.resolve_permission(BashArgs(command="nc example.org 443"))
+    assert result is not None
+    assert result.permission is ToolPermission.ALWAYS

@@ -51,10 +51,10 @@ The `ceremony` workflow (`workflow = "ceremony"`) and the shipped orchestration 
 | `coder` | optional | all granted | all granted | Direct execution; may delegate |
 | `orchestrator` | required | non-mutating only | all granted | Must orchestrate from the root session |
 | `researcher` | optional | non-mutating only | non-mutating only | Read-only analysis |
-| `reviewer` | optional | non-mutating only | non-mutating only | Read-only analysis |
+| `reviewer` | optional | non-mutating + `bash` carve-out | non-mutating only | Read-only analysis; runs verification |
 | `advisor` | optional | non-mutating only | non-mutating only | Read-only analysis |
 
-The read-only postures are honest: `bash` classifies as mutating regardless of command text, and unclassified or custom tools (including MCP tools) classify as mutating by default, so a read-only identity genuinely excludes them. A read-only reviewer does not run shell-based verification; check-only verification is expressed through the execution-seat overlay instead (see [Purpose routes](#purpose-routes-seats-and-diversity)).
+The read-only postures are honest: `bash` classifies as mutating regardless of command text, and unclassified or custom tools (including MCP tools) classify as mutating by default, so a read-only identity genuinely excludes them. The reviewer carries one reviewed exception: an identity-level execution carve-out admitting the `bash` tool — with its own permission guards intact — so an exit-gate review can run non-mutating verification commands (tests, type checks, linters) itself. The carve-out is personal-axis only (the reviewer's delegation set stays non-mutating, and it cannot delegate its shell), and `edit`/`write_file` remain excluded. Deep-review execution seats still bind `coder` with the execution-seat overlay (see [Purpose routes](#purpose-routes-seats-and-diversity)).
 
 Custom identities carry no harness-known posture. Their prompt file is the whole contract, and their delegation set is the full granted ceiling of the session. An identity whose future typed posture declares `delegation = none` combined with an explicit orchestration strategy is a configuration error, not a silent no-op; no shipped identity sets `none`.
 

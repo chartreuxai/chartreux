@@ -39,6 +39,7 @@ from chartreux.core.dispatch.route_models import (
     ReplacementCapability,
     RouteTarget,
 )
+from chartreux.core.launch_types import DifficultyCategory
 from chartreux.core.message_list import MessageList
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.recovery_models import PackageTier
@@ -1188,6 +1189,35 @@ async def test_foreground_dynamic_launch_uses_resolver_and_rejects_retained_hand
             ),
         )
         assert result.agent_id is None
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_demanding_route_launch_surfaces_difficulty_in_ack_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1-c2: a demanding-route launch carrying a qualifying difficulty
+    category surfaces the category on the launch acknowledgment metadata, so
+    escalations are auditable without re-reading transcripts.
+    """
+    registry, parent, _record, context, _first, _backends = await _dynamic_registry(
+        monkeypatch
+    )
+    try:
+        ack = await _background_result(
+            registry,
+            TaskArgs(
+                task="hard work",
+                purpose="implementation-demanding-settled",
+                background=True,
+                config=LaunchConfig(difficulty=DifficultyCategory.SUBTLE_INVARIANT),
+            ),
+            context,
+        )
+        assert ack.metadata is not None
+        assert ack.metadata["difficulty"] == "subtle-invariant"
     finally:
         await registry.drain_children()
         await parent.aclose()

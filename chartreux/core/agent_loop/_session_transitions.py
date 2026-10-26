@@ -50,6 +50,7 @@ from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.deferred_questions import DeferredQuestionStore
 from chartreux.core.dispatch.renderer import task_description_for_config
 from chartreux.core.dispatch.session import (
+    applied_route_changes,
     bind_policy_bundle,
     bound_identity_reference,
     resume_policy_bundle,
@@ -59,7 +60,6 @@ from chartreux.core.file_state import FileStateStore
 from chartreux.core.llm_models import LLMMessage
 from chartreux.core.message_list import MessageList
 from chartreux.core.middleware import MiddlewarePipeline
-from chartreux.core.policy.manifest import routes_from_snapshot
 from chartreux.core.session.session_id import extract_suffix
 from chartreux.core.session.session_lease import SessionLease
 from chartreux.core.session.session_logger import SessionLogger
@@ -71,6 +71,7 @@ from chartreux.observability.logging import logger
 
 if TYPE_CHECKING:
     from chartreux.core.config.harness_files import HarnessFilesManager
+    from chartreux.core.dispatch.route_models import AppliedRouteChange
     from chartreux.core.policy.bundle import ActivatedPolicy, BundleStore
     from chartreux.core.policy.composition import ExecutionContext
 
@@ -99,6 +100,10 @@ class _PreparedResume:
     owner: RootAccountingOwner | None
     previous_scratchpad: Path | None
     scratchpad_dir: Path | None
+    # The route edits resume ADOPTS, diffed against the persisted bundle's
+    # bind-time snapshot (the integrity and diff anchor, ADR 0022 P1-i-b):
+    # the commit installs the diff and publishes the resume notice.
+    resumed_route_changes: tuple[AppliedRouteChange, ...]
     resumed_task_description: str
     resumed_prompt: str
 
@@ -387,14 +392,16 @@ class SessionTransitions:
             raise ValueError("Child sessions cannot own a prepared scratchpad")
 
         resumed_config = self._config_getter()
-        # The task-tool description is conversation-owned policy like the
-        # prompt: it renders from the RESUMED conversation's frozen route
-        # snapshot — the same table launch admission resolves against —
-        # never the source loop's current saved config (design §6, §10).
-        resumed_task_description = task_description_for_config(
-            resumed_config,
-            routes=routes_from_snapshot(resumed_activated.manifest.route_snapshot),
-        )
+        # ADR 0022 P1-i-b: resume ADOPTS the CURRENT SAVED route table. The
+        # resume's orchestrator reload (the disk-loading boundary) re-read it
+        # into the loop's config, and launch admission resolves the same live
+        # table — so the served launch-target table can never diverge from
+        # admission post-resume. The persisted bundle's bind-time route
+        # snapshot keeps only the reduced role of integrity and diff anchor:
+        # never the admission source, and the diff anchor for the resume
+        # notice the commit publishes.
+        resumed_route_changes = applied_route_changes(resumed_config, resumed_activated)
+        resumed_task_description = task_description_for_config(resumed_config)
         # The rebuilt SkillManager reads the RESUMED conversation's frozen
         # selections (the persisted bundle's manifest) — never the source
         # loop's — so eligibility and the rendered skills catalog follow
@@ -428,6 +435,7 @@ class SessionTransitions:
             owner=owner,
             previous_scratchpad=previous_scratchpad,
             scratchpad_dir=scratchpad_dir,
+            resumed_route_changes=resumed_route_changes,
             resumed_task_description=resumed_task_description,
             resumed_prompt=resumed_prompt,
         )
@@ -504,15 +512,13 @@ class SessionTransitions:
                 new_activated = self._bound_policy_getter()
                 new_identity = self._bound_identity_getter()
             new_config = self._config_getter()
-            # The task-tool description follows the NEW conversation's
-            # frozen route snapshot — the freshly bound bundle's (a root
-            # reset) or the child's own (a rewind) — the same table the
-            # new conversation's admission resolves against (design §6,
-            # §10).
-            new_task_description = task_description_for_config(
-                new_config,
-                routes=routes_from_snapshot(new_activated.manifest.route_snapshot),
-            )
+            # The task-tool description follows the NEW conversation's LIVE
+            # route table — the same source its admission resolves against.
+            # A root reset binds a fresh bundle whose snapshot equals the
+            # current selections, and a rewind keeps the child's own bundle
+            # for the frozen identity content, but the served route table is
+            # live in both cases (ADR 0022).
+            new_task_description = task_description_for_config(new_config)
             # The rebuilt SkillManager reads the NEW conversation's frozen
             # selections (the newly bound bundle's manifest) — a root reset
             # binds them fresh from the current selections, a rewind keeps

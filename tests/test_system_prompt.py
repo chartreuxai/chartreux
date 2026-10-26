@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -185,11 +186,17 @@ def test_model_catalog_section_renders_thin_descriptions_and_routes_by_vocabular
     assert "| disabled |" not in prompt
     assert "@unavailable" not in prompt
     # The routing renders from the package-4 route facts: the launch-target
-    # table binds every shipped default target to the session model `base`,
-    # so the rendering is model-bound and role-free rather than role-routed.
+    # table binds the session-bound shipped targets to the session model
+    # `base` and the four cost-tier-aware purposes to the $cheapest-capable
+    # marker, so the rendering is model-bound and role-free rather than
+    # role-routed.
     assert "### Launch targets" in prompt
     assert "| Purpose | Identity | Tier | Seat | Model |" in prompt
-    assert "| `implementation` | `coder` | substantive | — | `base` |" in prompt
+    assert (
+        "| `implementation` | `coder` | substantive | — | `$cheapest-capable` |"
+        in prompt
+    )
+    assert "| `research` | `researcher` | substantive | — | `base` |" in prompt
     assert "### Purpose meanings" in prompt
     assert "| `mechanical` | `worker` |" not in prompt
     assert "`@scout` for search" not in prompt
@@ -362,10 +369,14 @@ def test_shipped_catalog_role_descriptions_are_thin_and_vocabulary_carries_routi
     }
     assert "never implementation" in SHIPPED_PURPOSES["design-analysis"].description
     assert "never implementation" in SHIPPED_PURPOSES["planning-analysis"].description
-    assert (
-        "settled approach"
-        in SHIPPED_PURPOSES["implementation-demanding-settled"].description
+    # P1-c2: the demanding route triggers on difficulty, not plan quality —
+    # the retired tautology license ("state the reason") is gone.
+    demanding = SHIPPED_PURPOSES["implementation-demanding-settled"].description
+    assert "genuinely tricky work" in demanding
+    assert "ordinary substantive implementation goes to the default implementor" in (
+        demanding
     )
+    assert "never justifies this route" in demanding
     assert (
         "report only checks actually run"
         in SHIPPED_PURPOSES["verification"].description
@@ -478,6 +489,26 @@ def test_current_date_placeholder_substituted_in_prompt(
     expected = f"Today's date is {today.isoformat()} ({today.strftime('%A')})."
     assert expected in prompt
     assert "$current_date" not in prompt
+
+
+def test_skills_preamble_routes_loading_through_the_skill_tool() -> None:
+    from types import SimpleNamespace
+
+    from chartreux.core.system_prompt import _get_available_skills_section
+
+    class _StubManager:
+        available_skills: ClassVar[dict[str, object]] = {
+            "demo": SimpleNamespace(
+                name="demo", description="A demo skill", skill_path=None
+            )
+        }
+
+    section = _get_available_skills_section(_StubManager())  # type: ignore[arg-type]
+
+    # The preamble routes skill loading through the `skill` tool only: the
+    # manual skill-file read fallback is retired (P0 reclassification).
+    assert "use the `skill` tool to load the full skill instructions." in section
+    assert "read the files manually" not in section
 
 
 def test_default_prompt_composes_the_coder_minimal_selection(
@@ -623,7 +654,9 @@ def test_composed_child_prompts_contain_the_bounded_child_contract(
         "Perform one bounded assignment",
         "return a structured blocker",
         "Do not spawn, delegate to, or coordinate nested subagents.",
-        "Never read, modify, create, or disclose `.env` files.",
+        "Project secrets are injected into your shell environment and their values are redacted from tool output",
+        "verify a key with `printenv KEY`",
+        "document key names in a committable `.env.example`",
         "Preserve unrelated changes",
         "Validate the result with available, relevant checks when practical.",
         "Report the files changed, checks actually run and their outcomes",
@@ -639,6 +672,23 @@ def test_composed_child_prompts_contain_the_bounded_child_contract(
         )
         assert "do not persist them to task-note files" in prompt
         assert "do not modify files to reconcile them" in prompt
+
+
+def test_composed_child_prompts_carry_the_deep_thinking_work_loop(
+    build_config: ConfigBuilder,
+    load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
+) -> None:
+    prompt = _compose_child_prompt(build_config, load_orchestrator, "coder")
+
+    # The deep-thinking work loop is folded into the shared bounded-child
+    # fragment, so every composed child prompt carries all four clauses.
+    for clause in (
+        "Plan the next bounded step before each action",
+        "run the check when a check can be run",
+        "no rehearsal",
+        "settled decisions stay settled",
+    ):
+        assert clause in prompt
 
 
 def test_bounded_child_fragment_retires_stop_rule_and_failure_retries() -> None:
@@ -1013,6 +1063,32 @@ def test_ceremony_workflow_acceptance_lattice_fails_closed() -> None:
     )
 
 
+def test_ceremony_workflow_granularity_clause_authorizes_sequential_packages() -> None:
+    prompt = _workflow("ceremony")
+
+    # An accepted plan authorizes its named work packages in sequence; a
+    # completed package needs no fresh acceptance to begin the next.
+    assert "An accepted plan authorizes its named work packages in sequence" in prompt
+    assert (
+        "a completed package does not require fresh acceptance to begin the next"
+        in prompt
+    )
+    # A package boundary ends the turn only for the three crisp exceptions.
+    assert (
+        "end the turn only for a genuine blocker, a real decision requiring "
+        "user input, or work outside the accepted plan's scope" in prompt
+    )
+    # The clause explicitly supersedes the ask-when-unsure default at package
+    # boundaries — the default that produced both observed mid-plan stops.
+    assert (
+        "At package boundaries inside an accepted plan, this supersedes the "
+        '"when unsure whether the user accepted, ask" default'
+    ) in prompt
+    # It is not a license to skip the gates for work outside the plan.
+    assert "It is not license to skip the gates" in prompt
+    assert "any new design or plan, still requires its own acceptance" in prompt
+
+
 def test_rendered_orchestrated_multi_model_prompt_routes_by_task_not_difficulty(
     build_config: ConfigBuilder,
     load_orchestrator: OrchestratorLoader[ChartreuxConfigSchema],
@@ -1036,10 +1112,15 @@ def test_rendered_orchestrated_multi_model_prompt_routes_by_task_not_difficulty(
         config, SkillManager(lambda: config), AgentManager(load_orchestrator(config))
     )
 
-    # The launch-target table binds the session model of the catalog.
+    # The launch-target table binds the session model of the catalog; the
+    # four cost-tier-aware purposes render the $cheapest-capable marker
+    # (resolved at launch from the catalog's price data).
     assert "### Launch targets" in prompt
     assert "| Purpose | Identity | Tier | Seat | Model |" in prompt
-    assert "| `implementation` | `coder` | substantive | — | `beta-model` |" in prompt
+    assert (
+        "| `implementation` | `coder` | substantive | — | `$cheapest-capable` |"
+        in prompt
+    )
     assert (
         "| `review.deep` | `reviewer` | substantive | analytical | `beta-model` |"
         in prompt

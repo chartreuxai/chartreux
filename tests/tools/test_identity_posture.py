@@ -30,20 +30,16 @@ import pytest
 from chartreux.core.agents.identities import UnknownIdentityError
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.tools.base import BaseToolConfig
+from chartreux.core.tools.builtins.bash import BashArgs
 from chartreux.core.tools.builtins.edit import EditArgs
 from chartreux.core.tools.classification import ToolClass
 from chartreux.core.tools.manager import NoSuchToolError, ToolManager
 from chartreux.core.tools.models import ToolPermission
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
+from tests.mock.utils import collect_result
 
-MUTATING_TOOLS = frozenset({
-    "bash",
-    "bash_start",
-    "edit",
-    "skill",
-    "todo",
-    "write_file",
-})
+MUTATING_TOOLS = frozenset({"bash", "bash_start", "edit", "write_file"})
+NON_MUTATING_TOOLS = frozenset({"read_file", "skill"})
 CONTROL_PLANE_TOOLS = frozenset({
     "ask_user_question",
     "bash_stop",
@@ -54,6 +50,7 @@ CONTROL_PLANE_TOOLS = frozenset({
     "release_agent",
     "resume_agent",
     "task",
+    "todo",
     "wait_for_agent",
 })
 
@@ -162,6 +159,35 @@ class ReadFile(BaseTool[ReadFileArgs, ReadFileResult, BaseToolConfig, BaseToolSt
         yield ReadFileResult()
 '''
 
+# An unstamped custom variant of the carved-out ``bash`` name: it wins
+# selection under its own name, but the registry never stamped it, so the
+# reviewer's execution carve-out must not admit it (P1-h fail-closed pin).
+UNSTAMPED_CUSTOM_BASH_SOURCE = '''\
+from collections.abc import AsyncGenerator
+
+from pydantic import BaseModel
+
+from chartreux.core.tools.base import BaseTool, BaseToolConfig, BaseToolState
+
+
+class BashArgs(BaseModel):
+    command: str = ""
+
+
+class BashResult(BaseModel):
+    pass
+
+
+class Bash(BaseTool[BashArgs, BashResult, BaseToolConfig, BaseToolState]):
+    """Unstamped custom variant of the carved-out bash name."""
+
+    async def run(
+        self, args: BashArgs, ctx: object = None
+    ) -> AsyncGenerator[BashResult, None]:
+        # imagine arbitrary mutating work here
+        yield BashResult()
+'''
+
 
 def _manager(
     tmp_path: Path,
@@ -229,6 +255,21 @@ def test_control_plane_tools_survive_a_read_only_posture(tmp_path: Path) -> None
         manager = _manager(tmp_path, identity=identity)
         assert CONTROL_PLANE_TOOLS <= set(manager.available_tools), identity
         assert "task" in manager.available_tools
+
+
+def test_read_only_identities_resolve_skill_and_orchestrator_resolves_todo(
+    tmp_path: Path,
+) -> None:
+    # skill is session-scoped instruction loading, not a mutation: every
+    # read-only identity admits it. todo writes session-local tracking state
+    # only, so it rides with the orchestrator's control-plane set.
+    for identity in ("researcher", "reviewer", "advisor"):
+        manager = _manager(tmp_path, identity=identity)
+        assert "skill" in manager.available_tools, identity
+        assert manager.get("skill") is not None, identity
+    orchestrator = _manager(tmp_path, identity="orchestrator")
+    assert "todo" in orchestrator.available_tools
+    assert orchestrator.get("todo") is not None
 
 
 def test_child_of_orchestrator_writes_within_the_granted_ceiling(
@@ -948,3 +989,93 @@ async def test_user_qualified_identity_with_a_resource_binds_at_loop_constructio
         assert loop._bound_identity == "user:my-custom"
     finally:
         await loop.aclose()
+
+
+# --- Reviewer execution carve-out (settlement decision 3, P1-h) --------------
+
+
+@pytest.mark.asyncio
+async def test_reviewer_resolves_bash_and_runs_a_verification_command(
+    tmp_path: Path,
+) -> None:
+    """The exit-gate reviewer executes verification itself (decision 3, P1-h).
+
+    The reviewer's personal posture stays non-mutating, but its identity-level
+    execution carve-out admits the bash tool: the reviewer resolves it through
+    the manager's personal axis and runs a verification-style command.
+    """
+    manager = _manager(tmp_path, identity="reviewer")
+    assert "bash" in manager.available_tools
+    assert "bash" in {spec.name for spec in manager.available_tool_specs()}
+    bash_tool = manager.get("bash")
+    result = await collect_result(
+        bash_tool.run(BashArgs(command="echo verification-ok"))
+    )
+    assert result.exit_code == 0
+    assert result.stdout == "verification-ok\n"
+
+
+def test_reviewer_carve_out_is_bash_only(tmp_path: Path) -> None:
+    """The non-mutating contract holds except the execution carve-out.
+
+    The carve-out admits exactly the bash surface; the write tools and
+    bash_start stay excluded, and an override cannot loosen them.
+    """
+    manager = _manager(tmp_path, identity="reviewer")
+    for name in ("edit", "write_file", "bash_start"):
+        assert name not in manager.available_tools, name
+        with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
+            manager.get(name)
+    loosened = _manager(
+        tmp_path,
+        identity="reviewer",
+        enabled_tools=["edit", "write_file", "bash_start"],
+    )
+    for name in ("edit", "write_file", "bash_start"):
+        assert name not in loosened.available_tools, name
+
+
+def test_researcher_and_advisor_remain_without_the_bash_tool(tmp_path: Path) -> None:
+    """The carve-out is reviewer-scoped: researcher and advisor keep no shell."""
+    for identity in ("researcher", "advisor"):
+        manager = _manager(tmp_path, identity=identity)
+        assert "bash" not in manager.available_tools, identity
+        assert "bash" not in manager.delegable_tools, identity
+        with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
+            manager.get("bash")
+
+
+def test_reviewer_carve_out_never_reaches_the_delegation_axis(tmp_path: Path) -> None:
+    """The reviewer runs bash itself but cannot hand the shell to a child.
+
+    The carve-out is personal-axis only: the reviewer's delegation set stays
+    non-mutating, so a coder child under a reviewer is still capped by the
+    ancestor chain.
+    """
+    manager = _manager(tmp_path, identity="reviewer")
+    assert "bash" in manager.available_tools
+    assert "bash" not in manager.delegable_tools
+    child = _manager(tmp_path, identity="coder", parent=manager)
+    assert "bash" not in child.available_tools
+    with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
+        child.get("bash")
+
+
+def test_unstamped_custom_bash_variant_fails_closed_under_the_reviewer(
+    tmp_path: Path,
+) -> None:
+    """The carve-out admits the reviewed builtin, never a custom namesake.
+
+    Launch admission is name-keyed, but the runtime boundary is the registry-
+    provenance stamp of the exact selected class: an unstamped custom variant
+    named ``bash`` classifies MUTATING and stays excluded even under the
+    reviewer's carve-out.
+    """
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir()
+    (tools_dir / "bash.py").write_text(UNSTAMPED_CUSTOM_BASH_SOURCE, encoding="utf-8")
+    manager = _manager(tmp_path, identity="reviewer", tool_paths=[tools_dir])
+    assert manager._all_tools["bash"] is not None
+    assert "bash" not in manager.available_tools
+    with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
+        manager.get("bash")

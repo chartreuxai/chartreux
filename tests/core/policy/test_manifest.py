@@ -13,7 +13,7 @@ from chartreux.core.dispatch.renderer import (
     render_composition_regions,
     render_launch_target_region,
 )
-from chartreux.core.dispatch.routes import shipped_routes
+from chartreux.core.dispatch.routes import COST_TIER_DEFAULT, shipped_routes
 from chartreux.core.policy.composition import (
     CONTEXT_FRAGMENTS,
     CompositionInputs,
@@ -211,7 +211,8 @@ def test_manifest_records_the_route_snapshot(tmp_path):
     implementation = next(
         entry for entry in manifest.route_snapshot if entry.purpose == "implementation"
     )
-    assert implementation.targets[0].model == "$session"
+    assert implementation.targets[0].model == COST_TIER_DEFAULT
+    assert implementation.targets[0].model != "$session"
     assert implementation.targets[0].tier == "substantive"
 
 

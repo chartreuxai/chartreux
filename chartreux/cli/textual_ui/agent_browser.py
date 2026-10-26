@@ -396,20 +396,27 @@ class AgentBrowserController:
         self._agent_transcript_epoch += 1
         self.agent_transcript_viewer = None
         self._agent_transcript_parent_id = None
-        if viewer is not None and viewer.is_mounted:
-            debug = get_effective_log_level() == "DEBUG"
-            start = time.perf_counter() if debug else 0.0
-            if debug:
-                logger.debug(
-                    "Agent transcript teardown phase=start generation=%d agent=%s",
-                    self.selection_generation,
-                    viewer.agent_id,
-                )
-            try:
+        try:
+            if viewer is not None and viewer.is_mounted:
+                debug = get_effective_log_level() == "DEBUG"
+                start = time.perf_counter() if debug else 0.0
+                if debug:
+                    logger.debug(
+                        "Agent transcript teardown phase=start generation=%d agent=%s",
+                        self.selection_generation,
+                        viewer.agent_id,
+                    )
+                # dispose() prunes the viewer subtree; a capture held on a widget
+                # inside it would dangle in App.mouse_captured, so all mouse events
+                # route to the removed widget and get dropped (textual #6643).
+                captured = self._app.mouse_captured
+                if captured is not None and (
+                    captured is viewer or viewer in captured.ancestors
+                ):
+                    self._app.capture_mouse(None)
                 await viewer.dispose()
                 if viewer.is_mounted:
                     await viewer.remove()
-            finally:
                 if debug:
                     logger.debug(
                         "Agent transcript teardown took %.3fs generation=%d agent=%s",
@@ -417,14 +424,16 @@ class AgentBrowserController:
                         self.selection_generation,
                         viewer.agent_id,
                     )
-        if show_chat:
-            if self._app._cached_chat is not None:
-                self._app._cached_chat.display = True
-            self.restore_conversation_chrome()
-            if self._agent_browser_anchor is not None:
-                await self._app._transcript.restore_anchor(
-                    self._app._messages_area, self._agent_browser_anchor
-                )
+        finally:
+            # A dispose exception must not leave the chat permanently hidden.
+            if show_chat:
+                if self._app._cached_chat is not None:
+                    self._app._cached_chat.display = True
+                self.restore_conversation_chrome()
+                if self._agent_browser_anchor is not None:
+                    await self._app._transcript.restore_anchor(
+                        self._app._messages_area, self._agent_browser_anchor
+                    )
         if not restore_focus:
             self.agent_transcript_focus_target = None
             return

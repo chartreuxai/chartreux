@@ -12,6 +12,7 @@ else:
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from chartreux.core.dispatch.route_models import AppliedRouteChange
 from chartreux.core.llm_models import ImageAttachment
 from chartreux.core.session_types import AgentStats
 from chartreux.user_content import UserDisplayContent, UserResource
@@ -82,6 +83,14 @@ class ToolResultEvent(BaseEvent):
     result: BaseModel | None = None
     error: str | None = None
     error_display: str | None = None
+    # R7: a failed or timed-out shell run may still have written files
+    # (partial execution), so its write-classified paths ride the error
+    # event: the bash tool attaches them to the raised ToolError and the
+    # tool executor copies them here, and the submission scan collects
+    # them exactly as a successful run's would be. Empty for other tools
+    # and for errors raised before the command ran.
+    error_write_paths: list[str] = Field(default_factory=list)
+    error_write_paths_unknown: bool = False
     skipped: bool = False
     skip_reason: str | None = None
     cancelled: bool = False
@@ -158,6 +167,21 @@ class CompactEndEvent(BaseEvent):
 class SessionTitleUpdatedEvent(BaseEvent):
     title: str
     session_id: str
+
+
+class RouteTableAppliedEvent(BaseEvent):
+    """A validated route edit applied at a reload commit (ADR 0022).
+
+    Routes are bindings, not frozen content: the edit applies to subsequent
+    launch admissions in the same conversation, while every already-admitted
+    launch keeps its pinned binding. The changes are diffed against the
+    manifest's bind-time route snapshot — the frozen integrity and diff
+    anchor — and ride the out-of-band channel so the session surfaces them
+    as a conversation-visible notice.
+    """
+
+    session_id: str
+    changes: tuple[AppliedRouteChange, ...]
 
 
 class BackgroundJobsChangedEvent(BaseEvent):

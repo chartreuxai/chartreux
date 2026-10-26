@@ -10,6 +10,15 @@ repos:
         files: ^(docs/|mkdocs\.yml$|README\.md$|CHANGELOG\.md$|ACKNOWLEDGEMENTS\.md$|\.pre-commit-config\.yaml$)
         exclude: ^docs/reviews/
         pass_filenames: false
+      # Artifact-side secret scan (P2-i): blocks user-driven commits that
+      # stage a secret. Excludes are the seeded-synthetic-secret test
+      # fixtures; see the commit message for the per-path justification.
+      - id: secret-scan
+        name: Secret scan (block committed secrets)
+        entry: uv run python -m chartreux.core.tools.secret_scan_hook
+        language: system
+        pass_filenames: true
+        exclude: ^(tests/agent_loop/test_chartreux_policy_denials\.py|tests/agent_loop/test_secret_redaction_exfil\.py|tests/cli/test_question_app\.py|tests/cli/textual_ui/test_dangerous_command_question\.py|tests/core/hooks/test_hooks\.py|tests/core/test_background_jobs\.py|tests/core/tools/test_secret_redaction\.py|tests/core/tools/test_secret_scan\.py|tests/recovery/test_failure_envelope\.py|tests/tools/test_bash_project_env\.py|tests/tools/test_glob_expansion_budget_diagnostics\.py|tests/tools/test_shell_diagnostics\.py)$
 
   - repo: https://github.com/mpalmer/action-validator
     rev: 7fa61514fb806fc9afd664b909e83584aca84f78 # v0.7.0

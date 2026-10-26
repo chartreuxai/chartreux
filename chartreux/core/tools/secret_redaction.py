@@ -9,7 +9,9 @@ than the 8-character direct-match threshold are not redacted.
 
 Chartreux loads its own credentials: API keys stored in ``~/.chartreux/.env``,
 keys resolved through the keyring, model-catalog and web-search provider keys,
-and known MCP OAuth access/refresh token records. Two controls reduce exposure
+known MCP OAuth access/refresh token records, and the values of each live
+session's project ``.env`` (the trusted folder's ``.env``, injected into the
+bash tool's subprocess environment). Two controls reduce exposure
 of those values:
 
 1. :func:`redact` replaces every known secret value in tool response text with
@@ -33,6 +35,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 import json
 import os
+from pathlib import Path
 import re
 import shlex
 import threading
@@ -41,6 +44,7 @@ from typing import Any
 from urllib.parse import unquote
 import weakref
 
+from chartreux.core.env import dotenv_file_entries
 from chartreux.observability.logging import logger
 
 REDACTED_PLACEHOLDER = "[REDACTED]"
@@ -174,6 +178,9 @@ _mcp_static_auth_env_names: frozenset[str] = frozenset()
 _live_policies: weakref.WeakKeyDictionary[Any, ScrubPolicy] = (
     weakref.WeakKeyDictionary()
 )
+#: Each live session's project ``.env`` (the trusted folder's ``.env``), whose
+#: values join the redaction set alongside the injected shell environment.
+_project_env_files: weakref.WeakKeyDictionary[Any, Path] = weakref.WeakKeyDictionary()
 
 
 def register_session_policy(owner: Any, policy: ScrubPolicy) -> None:
@@ -185,6 +192,25 @@ def register_session_policy(owner: Any, policy: ScrubPolicy) -> None:
 def unregister_session_policy(owner: Any) -> None:
     with _lock:
         _live_policies.pop(owner, None)
+
+
+def register_project_env(owner: Any, env_file: Path | None) -> None:
+    """Track a session's project ``.env`` so its values join the redaction set.
+
+    The file is re-read on mtime change (the same reload the injection uses),
+    so a rotated project value is masked without a restart. ``None`` drops the
+    registration, e.g. when the session's working folder leaves trusted folders.
+    """
+    with _lock:
+        if env_file is None:
+            _project_env_files.pop(owner, None)
+        else:
+            _project_env_files[owner] = env_file
+
+
+def unregister_project_env(owner: Any) -> None:
+    with _lock:
+        _project_env_files.pop(owner, None)
 
 
 def _env_file_token() -> object:
@@ -199,14 +225,19 @@ def _env_file_token() -> object:
 
 
 def _read_dotenv_entries() -> dict[str, str | None]:
-    """Names and stored values in ``~/.chartreux/.env`` (empty when absent)."""
+    """Names and stored values in ``~/.chartreux/.env`` (empty when absent).
+
+    Only regular files load: a FIFO or other non-regular file is treated as
+    absent, so a FIFO ``.env`` can never block the redaction set on a
+    blocking open (the same guard as the env-injection loader).
+    """
     try:
         from dotenv import dotenv_values
 
         from chartreux.core.paths import GLOBAL_ENV_FILE
 
         path = GLOBAL_ENV_FILE.path
-        if not path.is_file() and not path.is_fifo():
+        if not path.is_file():
             return {}
         return dict(dotenv_values(path))
     except Exception:
@@ -355,7 +386,9 @@ def _loaded_credentials() -> list[tuple[str, str]]:
 
     Sources are the live environment, the values stored in
     ``~/.chartreux/.env`` (even when an explicit environment value shadowed
-    them at load time), and the keyring. Only values at least
+    them at load time), the keyring, and the project ``.env`` of every live
+    session (the trusted folder's ``.env`` whose values injection places into
+    the bash tool's subprocess environment). Only values at least
     :data:`MIN_SECRET_LENGTH` characters long are included; shorter strings
     are too prone to false positives.
     """
@@ -364,11 +397,27 @@ def _loaded_credentials() -> list[tuple[str, str]]:
     names = credential_env_var_names()
     with _lock:
         stored = dict(_dotenv_entries) if _dotenv_entries is not None else {}
+        project_files = tuple(_project_env_files.values())
     pairs: list[tuple[str, str]] = []
     for name in sorted(names):
         for value in (os.environ.get(name), stored.get(name), _keyring_value(name)):
             if value and len(value) >= MIN_SECRET_LENGTH:
                 pairs.append((name, value))
+    # The redaction backstop covers the injected project values: any
+    # occurrence in tool output is masked, re-read on mtime change like the
+    # injection itself.
+    for path in project_files:
+        for name, value in sorted(dotenv_file_entries(path).items()):
+            if len(value) >= MIN_SECRET_LENGTH:
+                pairs.append((name, value))
+            # The inherited process value wins over the .env value for this
+            # name (the shell environment merge), so the child actually
+            # receives the inherited value: it is as live a secret as the
+            # .env one, and redacting only the .env value would leave
+            # `printenv NAME` output unmasked.
+            inherited = os.environ.get(name)
+            if inherited and inherited != value and len(inherited) >= MIN_SECRET_LENGTH:
+                pairs.append((name, inherited))
     return pairs
 
 
@@ -1278,8 +1327,10 @@ __all__ = [
     "redact",
     "redact_json_value",
     "redact_persisted_result",
+    "register_project_env",
     "reset_cache",
     "scrub_child_env",
     "set_env_passthrough",
     "set_mcp_static_auth_env_names",
+    "unregister_project_env",
 ]

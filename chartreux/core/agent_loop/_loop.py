@@ -116,8 +116,13 @@ from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.dangerous_command_grants import DangerousCommandGrantPersistencePort
 from chartreux.core.deferred_questions import DeferredQuestionStore
 from chartreux.core.dispatch.renderer import task_description_for_config
-from chartreux.core.dispatch.route_models import PurposeRoute, ReplacementCapability
+from chartreux.core.dispatch.route_models import (
+    AppliedRouteChange,
+    PurposeRoute,
+    ReplacementCapability,
+)
 from chartreux.core.dispatch.session import bound_identity_reference
+from chartreux.core.env import project_env_file
 from chartreux.core.errors import ContextTooLongError
 from chartreux.core.events import (
     AssistantEvent,
@@ -126,6 +131,7 @@ from chartreux.core.events import (
     CompactEndEvent,
     CompactStartEvent,
     ReasoningEvent,
+    RouteTableAppliedEvent,
     SessionTitleUpdatedEvent,
     ToolCallEvent,
     ToolResultEvent,
@@ -176,7 +182,6 @@ from chartreux.core.policy.bundle import (
     PolicyBundle,
 )
 from chartreux.core.policy.composition import ExecutionContext
-from chartreux.core.policy.manifest import routes_from_snapshot
 from chartreux.core.prompts import UtilityPrompt
 from chartreux.core.recovery_models import PackageTier
 from chartreux.core.review import ReviewManager
@@ -561,6 +566,17 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._bundle_store = BundleStore()
         self._policy_bind_lock = threading.Lock()
         self.pending_policy_changes: tuple[str, ...] = ()
+        # ADR 0022: the route edits the last reload APPLIED (old → new per
+        # purpose). Routes are bindings, not pending policy: an applied edit
+        # governs subsequent launches while in-flight children keep their
+        # pinned bindings. The applied notice diffs against the previous
+        # LIVE table (R7): the last-seen live table is tracked alongside the
+        # frozen bind-time snapshot (the integrity anchor and the resume
+        # notice's diff base) and updated at every reload commit; None means
+        # no reload has committed yet, so the first reload diffs against the
+        # bind-time snapshot.
+        self.applied_route_changes: tuple[AppliedRouteChange, ...] = ()
+        self._last_seen_purpose_routes: dict[str, PurposeRoute] | None = None
         if bound_policy is not None:
             self._bound_identity = bound_identity_reference(bound_policy)
             self._bound_policy: ActivatedPolicy | None = bound_policy
@@ -621,6 +637,10 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         )
         self.scrub_policy = secret_redaction.ScrubPolicy.from_config(self.config)
         secret_redaction.register_session_policy(self, self.scrub_policy)
+        # The session's project .env (the trusted folder's .env) joins the
+        # redaction set, so the values injected into shell children are
+        # masked in tool output.
+        secret_redaction.register_project_env(self, project_env_file(self.cwd))
         self._retired_mcp_pools: list[MCPConnectionPool] = []
         self._mcp_pool: MCPConnectionPool | None = (
             None if defer_heavy_init else self._create_mcp_pool()
@@ -640,20 +660,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             )
         if self.committed_model is not None:
             config.attach_committed_model(self.committed_model)
-        # The task-tool description is conversation-owned policy like the
-        # prompt: a loop constructed WITH a bound bundle (a reconstructed
-        # conversation) serves the bundle's frozen route table — the same
-        # source launch admission resolves against — never the pending live
-        # config; a fresh conversation IS the current selections, so its
-        # manager reads the live config (the bundle binds from it at the
-        # first render, design §6, §10).
-        if self._bound_policy is not None:
-            task_description = task_description_for_config(
-                config,
-                routes=routes_from_snapshot(self._bound_policy.manifest.route_snapshot),
-            )
-        else:
-            task_description = task_description_for_config(config)
+        # The task-tool description renders from the conversation's LIVE
+        # route table — the same source launch admission resolves against —
+        # for a fresh conversation AND a loop constructed WITH a bound bundle
+        # (a reconstructed conversation): the bundle's route snapshot stays
+        # frozen as the integrity and diff anchor, never as the served
+        # table (ADR 0022).
+        task_description = task_description_for_config(config)
         self.tool_manager = ToolManager(
             lambda: self.config,
             mcp_registry=self.mcp_registry,
@@ -1470,6 +1483,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             task.add_done_callback(self._observe_close_outcome)
         await asyncio.shield(task)
         secret_redaction.unregister_session_policy(self)
+        secret_redaction.unregister_project_env(self)
 
     def _observe_close_outcome(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
@@ -1649,22 +1663,23 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         return _resolve_identity_revision(self._bound_identity, self.harness_files)
 
     @property
-    def frozen_purpose_routes(self) -> Mapping[str, PurposeRoute]:
-        """The conversation's frozen purpose-route table (design §6, §10).
+    def live_purpose_routes(self) -> Mapping[str, PurposeRoute]:
+        """The conversation's live purpose-route table (ADR 0022).
 
-        The route snapshot the bound bundle's manifest captured at bind
-        time, rebuilt as the executable ``[orchestration.routes]`` table.
-        Launch admission resolves purpose routes against THIS table — the
-        same source the rendered launch-target table carries — never the
-        reloaded live config, so a mid-conversation route edit stays
-        pending (reported by ``pending_policy_changes``) instead of
-        producing a mixed-generation launch. Binding on demand matches the
-        render path: the first reader captures the bundle every later
-        reader serves, so admission and rendering can never diverge.
+        The in-memory ``[orchestration.routes]`` table the reload swaps
+        atomically. Launch admission resolves purpose routes against THIS
+        table — the same live source the rendered launch-target table (the
+        task-tool description) carries — so the two can never diverge: both
+        switch in the same synchronous reload commit. A validated route edit
+        therefore applies to every launch admitted AFTER the reload, while
+        every already-admitted launch keeps its pinned binding (its committed
+        model, identity revision, and overlay). The manifest's bind-time route
+        snapshot stays frozen as the integrity anchor and the RESUME notice's
+        diff base — never the admission source. The RELOAD notice diffs
+        against the previous live table instead, tracked in
+        ``_last_seen_purpose_routes`` alongside the snapshot.
         """
-        from chartreux.core.policy.manifest import routes_from_snapshot
-
-        return routes_from_snapshot(self._ensure_bound_policy().manifest.route_snapshot)
+        return self.config.purpose_routes.routes
 
     def _render_system_prompt(
         self,
@@ -3274,6 +3289,21 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._session_transitions.restore_file_state(loaded_messages)
         self._session_transitions.restore_deferred_questions(loaded_messages)
         self.tool_manager._install_task_description(prepared.resumed_task_description)
+        # ADR 0022 P1-i-b: resume adopts the CURRENT SAVED route table (the
+        # resume's orchestrator reload re-read it) for subsequent launch
+        # admissions, and the resume notice reports the diff against the
+        # persisted bundle's bind-time snapshot — the snapshot stays the
+        # integrity and diff anchor, never the admission source. The
+        # last-seen LIVE table starts at the adopted table, so the next
+        # reload's notice diffs against it, not the persisted snapshot.
+        self.applied_route_changes = prepared.resumed_route_changes
+        self._last_seen_purpose_routes = dict(self.config.purpose_routes.routes)
+        if prepared.resumed_route_changes:
+            self._out_of_band_events.put_nowait(
+                RouteTableAppliedEvent(
+                    session_id=self.session_id, changes=prepared.resumed_route_changes
+                )
+            )
         self._publish_system_prompt(prepared.resumed_prompt)
         cleanup_scratchpad(prepared.previous_scratchpad)
 
@@ -3371,6 +3401,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         """Point the loop's workspace roots at *cwd* (the relocator's seam)."""
         self.cwd = cwd
         self.harness_files = harness_files
+        # The project .env follows the working folder, so the redaction set
+        # tracks the new trust root.
+        secret_redaction.register_project_env(self, project_env_file(cwd))
 
     async def _bind_workspace(
         self, cwd: Path, harness_files: HarnessFilesManager

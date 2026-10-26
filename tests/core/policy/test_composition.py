@@ -377,11 +377,14 @@ def test_launch_target_region_renders_the_route_facts() -> None:
     region = render_launch_target_region(dict(shipped_routes()), "beta-model")
     assert "### Launch targets" in region
     assert "| Purpose | Identity | Tier | Seat | Model |" in region
-    # Every shipped default target binds the session model: the $session
-    # sentinel never leaks into the rendered table.
+    # Session-bound shipped targets render the session model; the four
+    # cost-tier-aware purposes render the $cheapest-capable marker (resolved
+    # at launch from the catalog's price data), never the $session sentinel.
     assert "`beta-model`" in region
     assert "$session" not in region
-    assert "| `implementation` | `coder` | substantive | — | `beta-model` |" in (region)
+    assert "| `implementation` | `coder` | substantive | — | `$cheapest-capable` |" in (
+        region
+    )
     assert (
         "| `review.deep` | `reviewer` | substantive | analytical | `beta-model` |"
         in region
@@ -413,7 +416,9 @@ def test_task_description_composes_from_route_facts() -> None:
     assert "Every task brief must carry the worker disclosure requirement" in task
     # The task-side routing region is the launch-target table.
     assert "### Launch targets" in task
-    assert "| `implementation` | `coder` | substantive | — | `beta-model` |" in (task)
+    assert "| `implementation` | `coder` | substantive | — | `$cheapest-capable` |" in (
+        task
+    )
     # The reuse and review regions render from the composition scaffolding.
     assert "To continue genuine work on the same feature" in task
     assert "For an independent review, launch a fresh reviewer" in task
@@ -784,9 +789,17 @@ def test_get_universal_system_prompt_serves_the_composed_artifact() -> None:
     assert "Your model name is:" in prompt
     assert prompt.rstrip().endswith("this closing note adds no new rules.")
     assert "$dispatch" not in prompt
-    # The launch-target table binds the session model of the config's catalog.
+    # The launch-target table binds the session model of the config's
+    # catalog; the cost-tier-aware implementation row renders the
+    # $cheapest-capable marker.
     alias = config.get_active_model().alias
-    assert f"| `implementation` | `coder` | substantive | — | `{alias}` |" in (prompt)
+    assert f"| `review.deep` | `reviewer` | substantive | analytical | `{alias}` |" in (
+        prompt
+    )
+    assert (
+        "| `implementation` | `coder` | substantive | — | `$cheapest-capable` |"
+        in prompt
+    )
 
 
 def test_get_universal_system_prompt_serves_the_orchestrated_selection() -> None:

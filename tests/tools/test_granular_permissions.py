@@ -149,7 +149,9 @@ class TestBashGranularPermissions:
 
     def test_arity_based_command_executes_without_approval_requirements(self):
         bash = self._bash()
-        result = bash.resolve_permission(BashArgs(command="docker compose up -d"))
+        result = bash.resolve_permission(
+            BashArgs(command="terraform apply -auto-approve")
+        )
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ALWAYS
 

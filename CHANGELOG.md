@@ -2,6 +2,142 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.5.9 (2026-10-25)
+
+### Security
+
+- Destination-aware egress is the settled exfiltration decision for the
+  modeled network clients. Modeled `curl` and `wget` calls are no longer
+  denylisted outright; the destination decides. A literal loopback
+  destination (`localhost`, `127.0.0.0/8`, `::1`) runs with no dialog; any
+  other destination — another IP literal, a DNS name, or one the recognizer
+  cannot parse — resolves ask-class (`network.egress`) and prompts in
+  interactive sessions, denying with remediation in headless and child
+  sessions. The destination-changing behavior classes resolve ask-class even
+  for a literal loopback destination: redirect-following flags (`curl -L`),
+  `wget`'s default redirect behavior, and destination-overriding options
+  (`--resolve`, `--connect-to`). The development-egress carve-out stays
+  run-class (`git fetch`/`clone`/`pull`, `pip`/`uv` installs), and a user
+  denylist entry for these clients remains an absolute veto.
+- Probed egress clients move onto the shipped default denylist: `ssh`,
+  `scp`, `rsync`, `ftp`, `telnet`, `http`/`httpie`, `wget2`, `aria2c`,
+  `lftp`, and `watch` are denied until they are modeled; remove an entry to
+  re-enable a client deliberately.
+- Recursive `rm` gains a git-status-aware carve-out. Over a tree with
+  unsaved changes the blanket handoff denial remains. Over a git-clean tree
+  a recursive `rm` runs on its own only when every expanded operand lies
+  within the assessed repository, clear of its Git metadata (neither
+  encompassing it nor lying inside it, linked-worktree common directories
+  included), with recovery established for every repository involved, nested
+  ones included. The analysis fails closed on every axis — operand scope,
+  metadata overlap, recovery status, expansion, resolution — and any mixed
+  operand set fails closed to the handoff denial.
+- Artifact secret scan: a gitleaks-rule-based scan with entropy checks over
+  the session's touched paths runs automatically at the agent submission
+  boundary — a finding blocks the submission, the match is redacted from the
+  transcript, and the agent is told the artifact failed the scan (not what
+  it matched) — and runs as a pre-commit hook for user-driven commits.
+- Child sessions deny ask-class dangerous commands outright, regardless of
+  user-input capability: the dangerous-command approval dialog is never
+  surfaced in a child, a denied ask-class call returns a blocker to the
+  parent, and `dangerous_command_grants_by_project` is the only child
+  pre-authorization path (saved project grants still run without a prompt).
+  The same blanket child semantics apply to out-of-root access grants.
+
+### Added
+
+- Local tool trust: tools authored under `~/.chartreux/tools/` are trusted
+  by file location and admitted to the non-mutating posture; project-discovered
+  tools, `tool_paths` entries, and MCP proxies stay fail-closed. The
+  provenance-stamp machinery is removed; shipped builtins are classified by
+  their defining module.
+- Project environment injection: inside a trusted folder, the project `.env`
+  and `$CHARTREUX_HOME/.env` load into `bash`/`bash_start` subprocess
+  environments (re-read on mtime change so rotation takes effect without a
+  restart), with known secret values masked in tool output as a redaction
+  backstop; document expected key names in a committable `.env.example`.
+- Live route editing (ADR 0022, promoted to `docs/adr/`): route edits apply
+  to subsequent launches in the same conversation instead of new
+  conversations only; in-flight children keep their admitted bindings, and a
+  resumed conversation adopts the current saved route table with a diff
+  notice.
+
+### Changed
+
+- Wrapper and flag recognition: `sg` and `sudo -u <user>` are transparent
+  wrappers whose payloads are re-analyzed (including `sg`'s unquoted
+  multi-token `-c` payloads, closing a fail-open); `git symbolic-ref`
+  resolves in read mode and is classified by mode; `.venv/bin/python
+  --version` resolves while bare interpreter invocation stays denied; a
+  `VIRTUAL_ENV=...` prefix no longer denies.
+- Every grammar-rejection denial names a compliant alternative inline —
+  across the variable/subshell-expansion, glob-inspection, zsh
+  equals-expansion, heredoc, and for-loop rejection categories.
+- The `skill` tool is reclassified as session-scoped instruction loading
+  (not a mutation) and `todo` as control-plane, so read-only and orchestrator
+  identities admit them; brief-writing and skills-preamble guidance now
+  directs children to load named skills via the `skill` tool, and the manual
+  skill-file read fallback is retired.
+- The reviewer identity gains a bash execution carve-out for non-mutating
+  verification commands, so a review exit gate can run the checks it names.
+- The shipped `implementation`, `mechanical-edit`, `search`, and
+  `verification` route defaults are cost-tier aware: they no longer bind
+  `$session` and default to the cheapest capable catalog model.
+- The demanding route triggers on difficulty with a structured difficulty
+  category field carried in launch metadata; record-only categories fail
+  admission.
+- The ceremony acceptance lattice gains the plan-granularity clause: an
+  accepted plan authorizes its named work packages in sequence, and a
+  completed package does not require fresh acceptance to begin the next.
+- The git reader subcommand table and the unmodeled-builtin table no longer
+  overlap (dispatch-order-aware dedup).
+- `bash_read` bounds (`wait_seconds` at most 30, `max_bytes` at least 4096)
+  are named in the parameter-schema descriptions and surfaced in the
+  validation-error remediation.
+- The wrapper-class audit closed with an explicit disposition for every
+  payload-runner and egress-client entry (modeled transparent, denylisted,
+  or fail-closed), one corpus row per entry.
+
+### Fixed
+
+- Mouse capture is released before the agent-transcript viewer disposes, so
+  exiting the viewer no longer leaves the UI mouse-dead with the keyboard
+  alive.
+- Three latent bugs in the same teardown path: a dispose exception can no
+  longer leave the chat permanently hidden, detached-widget hit-race delivery
+  uses the filtered widget result, and the detach-for-reparenting registry no
+  longer leaks (`is_mounted` is false for detached widgets).
+- The agent-transcript live tick is bounded — streaming teardown and O(page)
+  page sizing — so a large transcript cannot saturate the Textual message
+  pump or grow memory monotonically.
+- Generic-keyword assignment no longer false-positives on a function-call
+  right-hand side.
+
+### Breaking
+
+- Breaking (pre-release alpha; loud, actionable errors; no silent
+  migration): modeled `curl` and `wget` now resolve per destination instead
+  of denying outright — a non-loopback destination surfaces a
+  `network.egress` ask in interactive sessions and denies with remediation
+  in headless and child sessions, and the probed egress clients listed above
+  are newly denied by the shipped default denylist. Tooling or workflows
+  that relied on the outright denial must re-authorize deliberately.
+- Child sessions no longer surface the dangerous-command approval dialog
+  under any capability: an ask-class call in a child resolves to a blocker
+  returned to the parent. Pre-authorize children through
+  `dangerous_command_grants_by_project`.
+- The provenance-stamp machinery is removed. Tools that relied on a
+  provenance stamp for admission must instead live under
+  `~/.chartreux/tools/` (file-location trust) or ship as builtins classified
+  by their defining module.
+
+### Retained limitations
+
+- The probed egress clients remain denylisted until they are modeled;
+  modeling them is the fast-follow.
+- The bare-interpreter gate is retained: bare `.venv/bin/python` still
+  denies while `.venv/bin/pytest` (a tool, not an interpreter) passes.
+
 ## 0.5.8 (2026-10-23)
 
 ### Security

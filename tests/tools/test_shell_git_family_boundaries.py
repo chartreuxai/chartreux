@@ -222,3 +222,84 @@ def test_reader_subcommands_set_inspect_git_repository() -> None:
     for tokens in (["git", "fixture-alias"], ["git"], ["ls"], []):
         result = policy.analyze_shell_command_policy(tokens)
         assert result.inspect_git_repository is False, tokens
+
+
+# symbolic-ref is modeled by mode (v0.5.9 P2-d), never blanket-read: the
+# read form (exactly one operand, no write marker) resolves like a reader;
+# the write forms (a ref update or deletion) are not granted by the read
+# modeling, and neither are bare or unscannable forms.
+SYMBOLIC_REF_READ_COMMANDS = (
+    "git symbolic-ref HEAD",
+    "git symbolic-ref -q HEAD",
+    "git symbolic-ref --short HEAD",
+    "git symbolic-ref --recurse HEAD",
+    "git symbolic-ref --no-recurse HEAD",
+    "git -C . symbolic-ref HEAD",
+    "git symbolic-ref -- HEAD",
+)
+
+SYMBOLIC_REF_WRITE_COMMANDS = (
+    "git symbolic-ref HEAD refs/heads/main",
+    "git symbolic-ref -m reason HEAD refs/heads/main",
+    "git symbolic-ref --message reason HEAD refs/heads/main",
+    "git symbolic-ref -m reason HEAD",
+    "git symbolic-ref -d HEAD",
+    "git symbolic-ref --delete HEAD",
+    "git symbolic-ref -d -q HEAD",
+    "git symbolic-ref HEAD refs/heads/main extra",
+)
+
+SYMBOLIC_REF_UNMODELED_COMMANDS = (
+    "git symbolic-ref",
+    "git symbolic-ref -q",
+    "git symbolic-ref --recurse",
+    "git symbolic-ref --bogus HEAD",
+    "git symbolic-ref -x HEAD",
+)
+
+
+def test_symbolic_ref_is_modeled_not_table_classified() -> None:
+    """symbolic-ref leaves the flat tables: its mode decides, not membership."""
+    assert "symbolic-ref" not in _shell_git_support._GIT_UNMODELED_BUILTINS
+    assert "symbolic-ref" not in _shell_git_support._GIT_READER_SUBCOMMANDS
+    assert "symbolic-ref" not in _shell_git_support._GIT_NONREADER_SUBCOMMANDS
+
+
+def test_symbolic_ref_read_forms_resolve_like_readers() -> None:
+    """The read mode carries no dangerous operation and inspects the repo."""
+    for command in SYMBOLIC_REF_READ_COMMANDS:
+        classification = _classify(command)
+        assert classification.kind == "routine", command
+        assert classification.grantable is None, command
+        result = policy.analyze_shell_command_policy(shlex.split(command))
+        assert result.requires_approval is False, command
+        assert result.inspect_git_repository is True, command
+        assert result.positional_values == ("HEAD",), command
+
+
+def test_symbolic_ref_write_forms_are_never_grantable() -> None:
+    """The write mode is not granted by the read modeling: never run-class."""
+    for command in SYMBOLIC_REF_WRITE_COMMANDS:
+        classification = _classify(command)
+        assert classification.kind == "hard_denied", command
+        assert classification.grantable is None, command
+        assert "write form" in (classification.reason or ""), command
+        result = policy.analyze_shell_command_policy(shlex.split(command))
+        assert result.requires_approval is True, command
+        assert result.inspect_git_repository is False, command
+        # The policy layer's denial text carries the classifier's reason.
+        assert result.denial_reason is not None, command
+        assert result.denial_reason.startswith(classification.reason or ""), command
+
+
+def test_symbolic_ref_unmodeled_forms_fail_closed() -> None:
+    """Bare, operand-less, and unscannable forms keep the form denial."""
+    for command in SYMBOLIC_REF_UNMODELED_COMMANDS:
+        classification = _classify(command)
+        assert classification.kind == "hard_denied", command
+        assert classification.grantable is None, command
+        assert "write form" not in (classification.reason or ""), command
+        result = policy.analyze_shell_command_policy(shlex.split(command))
+        assert result.requires_approval is True, command
+        assert result.denial_reason is not None, command
+        assert result.denial_reason.startswith(classification.reason or ""), command

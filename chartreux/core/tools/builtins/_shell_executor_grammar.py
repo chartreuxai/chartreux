@@ -3,9 +3,11 @@
 The declarative grammar model (``ExecutorGrammar``, with option tables built on
 ``_shell_argv._OptionTable``), the boundary result type (``ExecutorBoundary``
 with the ``BoundaryKind``/``ArgumentRange`` aliases), the legacy inline-switch
-table (``_INLINE_SWITCHES``), and ``EXECUTOR_REGISTRY`` — all 36 executor
+table (``_INLINE_SWITCHES``), and ``EXECUTOR_REGISTRY`` — all 38 executor
 families — are declared here, together with the boundary engine
-(``_executor_option``, ``_module_executor_command``, ``executor_boundary``)
+(``_executor_option``, ``_module_executor_command``, ``_group_shell_boundary``,
+``_env_assignment_operand``, ``_sudo_env_operand``, ``_sudo_user_boundary``,
+``executor_boundary``)
 and the package-adapter projection (``_PACKAGE_PATH_COMMANDS``,
 ``_PACKAGE_PATH_OPTIONS``, the package path helpers,
 ``_short_interpreter_option``, ``inline_interpreter_switch``,
@@ -39,10 +41,30 @@ from chartreux.core.tools.builtins._shell_policy_types import ShellCommandPolicy
 # Only modeled options may advance the scan: an unknown option might consume
 # the next word, hiding an execution target behind it.
 _INLINE_SWITCHES = {
-    "python": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
-    "python3": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
-    "pypy": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
-    "pypy3": ("c", frozenset("bBdEhiIOPqRsSuvVx"), frozenset("WX"), {}),
+    "python": (
+        "c",
+        frozenset("bBdEhiIOPqRsSuvVx"),
+        frozenset("WX"),
+        {"--version": False},
+    ),
+    "python3": (
+        "c",
+        frozenset("bBdEhiIOPqRsSuvVx"),
+        frozenset("WX"),
+        {"--version": False},
+    ),
+    "pypy": (
+        "c",
+        frozenset("bBdEhiIOPqRsSuvVx"),
+        frozenset("WX"),
+        {"--version": False},
+    ),
+    "pypy3": (
+        "c",
+        frozenset("bBdEhiIOPqRsSuvVx"),
+        frozenset("WX"),
+        {"--version": False},
+    ),
     "node": (
         "e",
         frozenset("ip"),
@@ -54,14 +76,15 @@ _INLINE_SWITCHES = {
             "--trace-warnings": False,
             "--no-deprecation": False,
             "--experimental-repl-await": False,
+            "--version": False,
         },
     ),
-    "perl": ("e", frozenset("wlnpT"), frozenset("IMmF"), {}),
+    "perl": ("e", frozenset("wlnpT"), frozenset("IMmF"), {"--version": False}),
     "ruby": (
         "e",
         frozenset("wdv"),
         frozenset("IrCEFKTW"),
-        {"--disable": True, "--enable": True},
+        {"--disable": True, "--enable": True, "--version": False},
     ),
 }
 
@@ -284,6 +307,15 @@ EXECUTOR_REGISTRY: dict[str, ExecutorGrammar] = {
         inline_options=("-c",),
         reject_execution="unsupported script -c shell wrapper",
     ),
+    # `env [OPTION]... [-] [NAME=VALUE]... [COMMAND [ARG]...]` runs the
+    # command with the assignments applied: the wrapped command argv is
+    # re-analyzed exactly like a directly spelled invocation. env applies
+    # every pre-command operand containing `=` — putenv(3) does not
+    # validate the name — so the operand scan consumes them all, whatever
+    # the name (see `_env_assignment_operand`); admission still requires a
+    # strictly valid LEADING assignment, so a leading invalid name fails
+    # closed. Every other form (a missing command, an unmodeled option)
+    # fails closed.
     "env": ExecutorGrammar(
         options=_OptionTable(
             long_values=frozenset({"--unset", "--chdir"}),
@@ -295,6 +327,31 @@ EXECUTOR_REGISTRY: dict[str, ExecutorGrammar] = {
         assignments=True,
         require_leading_assignment=True,
         cwd_options=("--chdir", "-C"),
+    ),
+    # `sg` runs its group session the way the shells run -c: the -c payload
+    # is shell source. The group name is a prefix operand, so the scan must
+    # skip it before looking for the -c option; every other form (interactive
+    # shell, direct command operand, nested shell behind the group) is
+    # unmodeled and fails closed.
+    "sg": ExecutorGrammar(
+        options=_OptionTable(short_values=frozenset("c")),
+        boundary_kind="shell_source",
+        prefix_operands=1,
+        inline_options=("-c",),
+    ),
+    # `sudo -u <user> <command>` runs the command as the named user: the
+    # wrapped command argv is re-analyzed exactly like a directly spelled
+    # invocation. Only the -u/--user form is modeled — every other sudo
+    # form (a root shell, a shell behind -s/-i, an unmodeled option, a
+    # missing command, a root sudo without -u) fails closed. sudo's
+    # NAME=value operands are environment settings for the wrapped command
+    # (sudo(8) parse_args) and are consumed as such — see
+    # `_sudo_user_boundary`.
+    "sudo": ExecutorGrammar(
+        options=_OptionTable(
+            long_values=frozenset({"--user"}), short_values=frozenset("u")
+        ),
+        boundary_kind="argv_positional",
     ),
     "eval": ExecutorGrammar(boundary_kind="shell_source"),
     "command": ExecutorGrammar(
@@ -321,6 +378,14 @@ EXECUTOR_REGISTRY: dict[str, ExecutorGrammar] = {
     ),
 }
 
+# These argv wrappers exec their first operand as the command. A
+# NAME=value operand therefore becomes the exec'd command name, and the
+# exec fails (ENOENT) before any wrapped command runs: fail-safe by exec
+# semantics, not by model. Unlike env (assignments=True) and sudo (modeled
+# NAME=value operands), these wrappers never apply the operand to the
+# wrapped command's environment, so the routine resolution of such forms
+# is pinned by the PERMISSION_R7_CASES nice/timeout rows rather than
+# remodeled.
 for _name, (_values, _flags, _operands) in {
     "timeout": (
         ("--signal", "--kill-after", "-s", "-k"),
@@ -472,6 +537,131 @@ def _module_executor_command(value: str, arguments: list[str]) -> tuple[str, ...
     return ()
 
 
+def _group_shell_boundary(
+    name: str, tokens: list[str], grammar: ExecutorGrammar
+) -> ExecutorBoundary:
+    """Boundary for a group wrapper whose -c payload is shell source (``sg``).
+
+    ``sg <group> -c <payload>`` runs the payload through a local shell, so
+    the payload is shell source exactly like a shell's own -c. The group
+    name is a prefix operand the option scan must skip first; every other
+    form (interactive shell, direct command operand, a nested shell behind
+    the group) is unmodeled and fails closed. A payload spanning several
+    argv tokens is unquoted shell word splitting: the remaining tokens join
+    the source (the eval precedent) so a gated payload spelled unquoted is
+    analyzed exactly like its quoted form instead of degrading to the bare
+    first word with the rest dismissed as program arguments.
+    """
+    prefix = grammar.prefix_operands
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("-") or token == "-":
+            if prefix == 0:
+                raise ValueError(f"unsupported {name} form")
+            prefix -= 1
+            index += 1
+            continue
+        count, parsed = _executor_option(tokens, index, grammar)
+        if any(option in grammar.inline_options for option, _ in parsed.values):
+            if count == 1:
+                raise ValueError("shell -c requires a separate source operand")
+            payload = index + 1
+            if payload + 1 < len(tokens):
+                return ExecutorBoundary(
+                    "shell_source",
+                    None,
+                    ((0, len(tokens)),),
+                    ((payload, len(tokens)),),
+                    inline_payloads=(" ".join(tokens[payload:]),),
+                )
+            return ExecutorBoundary(
+                "shell_source",
+                None,
+                ((0, payload + 1),),
+                ((payload, payload + 1),),
+                program_argument_range=(payload + 1, len(tokens)),
+                inline_payloads=(tokens[payload],),
+            )
+        index += count
+    raise ValueError(f"unsupported {name} form")
+
+
+def _env_assignment_operand(token: str) -> bool:
+    """Whether env(1) applies a pre-command operand as an environment setting.
+
+    env's operand scan applies every operand containing ``=`` — putenv(3)
+    does not validate the name, so ``env FOO=1 1X=1 printenv 1X`` prints
+    the value, an empty name is consumed (with a warning) while the command
+    still runs, and a name containing ``/`` is set verbatim — until the
+    first operand without ``=``, which env execs as the command. Operands
+    starting with ``-`` are excluded here: they keep flowing to option
+    parsing, which fails closed on unknown options (GNU env's own scan
+    would putenv them, so refusing them only over-gates).
+    """
+    return "=" in token and not token.startswith("-")
+
+
+def _sudo_env_operand(token: str) -> bool:
+    """Whether sudo(8) applies a command-line operand as an environment setting.
+
+    sudo's parse_args treats an operand containing ``=`` — starting with
+    neither ``/``, ``-``, nor ``=`` — as a NAME=value environment setting
+    for the wrapped command (its ``is_envar``), interspersed with options.
+    """
+    return "=" in token and not token.startswith(("/", "-", "="))
+
+
+def _sudo_user_boundary(
+    name: str, tokens: list[str], grammar: ExecutorGrammar
+) -> ExecutorBoundary:
+    """Boundary for sudo's transparent ``-u <user>`` wrapper form.
+
+    ``sudo -u <user> <command>`` runs the command as the named user, so
+    the command argv is re-analyzed exactly like a directly spelled
+    invocation. Only the -u/--user form is modeled: a sudo without it (a
+    root shell or a root command), an unmodeled option, a shell behind
+    -s/-i, and a missing command all fail closed.
+
+    sudo also applies NAME=value operands as environment settings for the
+    wrapped command, interspersed with its options, so the scan consumes
+    them (the resolver recovers them as the child's assignments) and the
+    wrapped command is re-analyzed exactly like a directly spelled
+    invocation. After ``--`` sudo execs the next operand as the command
+    even when it looks like NAME=value — the exec then fails (ENOENT), so
+    consuming assignment-shaped operands there too only over-gates a form
+    that never runs: fail-closed either way.
+    """
+    index = 1
+    user_seen = False
+    while index < len(tokens):
+        token = tokens[index]
+        if _sudo_env_operand(token):
+            index += 1
+            continue
+        if token == "--":
+            index += 1
+            while index < len(tokens) and _sudo_env_operand(tokens[index]):
+                index += 1
+            break
+        if not token.startswith("-") or token == "-":
+            break  # The wrapped command starts here.
+        count, parsed = _executor_option(tokens, index, grammar)
+        if parsed.values_for("-u", "--user"):
+            user_seen = True
+        index += count
+    if not user_seen or index >= len(tokens):
+        raise ValueError(f"unsupported {name} form")
+    if tokens[index].startswith("-") and tokens[index - 1] != "--":
+        raise ValueError(f"unsupported {name} form")
+    return ExecutorBoundary(
+        "argv_positional",
+        (index, len(tokens)),
+        ((0, index),),
+        child_execution=grammar.child_execution,
+    )
+
+
 def executor_boundary(  # noqa: PLR0911, PLR0912, PLR0914, PLR0915
     tokens: list[str], *, admission: bool = False
 ) -> ExecutorBoundary | None:
@@ -519,6 +709,11 @@ def executor_boundary(  # noqa: PLR0911, PLR0912, PLR0914, PLR0915
             inline_payload_ranges=((1, len(tokens)),),
             inline_payloads=(" ".join(tokens[1:]),),
         )
+    if name == "sudo":
+        return _sudo_user_boundary(name, tokens, grammar)
+    if grammar.prefix_operands and kind == "shell_source":
+        return _group_shell_boundary(name, tokens, grammar)
+
     while index < len(tokens):
         token = tokens[index]
         if token == "--":
@@ -542,9 +737,7 @@ def executor_boundary(  # noqa: PLR0911, PLR0912, PLR0914, PLR0915
                 keyword_seen = True
                 index += 1
                 continue
-            if grammar.assignments and re.fullmatch(
-                r"[A-Za-z_][A-Za-z0-9_]*=.*", token, re.DOTALL
-            ):
+            if grammar.assignments and _env_assignment_operand(token):
                 index += 1
                 continue
             break
@@ -638,10 +831,9 @@ def executor_boundary(  # noqa: PLR0911, PLR0912, PLR0914, PLR0915
             program_argument_range=(end, len(tokens)),
         )
     if grammar.assignments:
-        # GNU env still consumes assignments after its option terminator.
-        while index < len(tokens) and re.fullmatch(
-            r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index], re.DOTALL
-        ):
+        # env still consumes assignment operands after its option
+        # terminator, whatever the operand's name.
+        while index < len(tokens) and _env_assignment_operand(tokens[index]):
             index += 1
     index += grammar.prefix_operands
     if kind in {"inline_code_switch", "shell_source"}:

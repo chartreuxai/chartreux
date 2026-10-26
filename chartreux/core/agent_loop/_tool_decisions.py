@@ -241,12 +241,14 @@ class ToolDecisionCoordinator:
             # No typed proposal, or the call can no longer be re-derived:
             # keep the plain denial.
             return None
-        if not self._user_input_capability_getter() or (
-            self._is_subagent_getter() and self._grant_port_getter() is None
-        ):
-            # A runtime-managed session that cannot prompt names the
-            # persistent config knob (publication only); a bare loop keeps the
-            # existing denial text unchanged.
+        if self._is_subagent_getter() or not self._user_input_capability_getter():
+            # Blanket child denial: a child session never prompts for
+            # ask-class authority, whatever its user-input capability — the
+            # denial with remediation flows back to the parent as a blocker,
+            # and dangerous_command_grants_by_project stays the only child
+            # pre-authorization path. A runtime-managed session that cannot
+            # prompt names the persistent config knob (publication only); a
+            # bare loop keeps the existing denial text unchanged.
             return (
                 _dangerous_command_denial(ctx, tool_name, proposal)
                 if self._grant_port_getter() is not None
@@ -478,16 +480,21 @@ class ToolDecisionCoordinator:
 
         Returns None when the denial must keep the existing behavior: the tool
         is not a promptable file tool, or no promptable target can be proposed.
+        A child session never prompts, whatever its user-input capability: it
+        denies with remediation and the blocker flows back to the parent.
         """
         if tool_name not in ROOT_GRANT_TOOLS:
             return None
-        if not self._user_input_capability_getter() or (
-            self._is_subagent_getter() and self._root_grant_port_getter() is None
-        ):
-            # A runtime-managed session that cannot prompt names the persistent
-            # config knob; a bare loop keeps the existing denial text unchanged.
-            # A runtime-bound child may prompt: its approved grant resolves back
-            # to this child's own store, never to the parent or a sibling.
+        if self._is_subagent_getter() or not self._user_input_capability_getter():
+            # Blanket child denial: a child session never prompts for
+            # out-of-root scope, whatever its user-input capability — the
+            # denial with remediation flows back to the parent as a blocker,
+            # and already-issued child-local grants stay effective because
+            # this gate is only the interactive ask for new scope.
+            # authorized_roots_by_project and parent-directed scope changes
+            # stay the child's only paths to new roots. A runtime-managed
+            # session that cannot prompt names the persistent config knob; a
+            # bare loop keeps the existing denial text unchanged.
             return (
                 _out_of_root_denial(ctx, tool_name)
                 if self._root_grant_port_getter() is not None

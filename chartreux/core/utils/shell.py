@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import os
 from pathlib import Path
 
@@ -9,9 +10,13 @@ from chartreux.core.utils.async_subprocess import spawn_registered_process
 
 
 async def spawn_shell_command(
-    command: str, *, cwd: Path | None = None, merge_stderr: bool = False
+    command: str,
+    *,
+    cwd: Path | None = None,
+    merge_stderr: bool = False,
+    extra_env: Mapping[str, str] | None = None,
 ) -> asyncio.subprocess.Process:
-    env = _shell_environment()
+    env = _shell_environment(extra_env)
     cwd = cwd or Path.cwd()
     return await spawn_registered_process(
         asyncio.create_subprocess_shell(
@@ -29,7 +34,7 @@ async def spawn_shell_command(
     )
 
 
-def _shell_environment() -> dict[str, str]:
+def _shell_environment(extra_env: Mapping[str, str] | None = None) -> dict[str, str]:
     # Chartreux's credential variables never reach shell children unless the
     # user opted specific names back in via credential_env_passthrough.
     env = {
@@ -41,7 +46,7 @@ def _shell_environment() -> dict[str, str]:
     # LC_ALL overrides every LC_* category, so a user-set LC_ALL=C (common in
     # CI/containers) would defeat LC_CTYPE below and yield non-UTF-8 output.
     env.pop("LC_ALL", None)
-    return {
+    env = {
         **env,
         "TERM": "dumb",
         "DEBIAN_FRONTEND": "noninteractive",
@@ -50,6 +55,12 @@ def _shell_environment() -> dict[str, str]:
         "LESS": "-FX",
         "LC_CTYPE": "C.UTF-8",
     }
+    if extra_env:
+        # The project environment (the trusted folder's .env and
+        # $CHARTREUX_HOME/.env) only fills names the harness did not set: an
+        # explicit process/shell value wins over the .env files.
+        env = {**extra_env, **env}
+    return env
 
 
 __all__ = ["spawn_shell_command"]

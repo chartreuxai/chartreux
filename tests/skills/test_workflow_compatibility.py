@@ -504,12 +504,17 @@ class TestShippedSkillRewrites:
         assert "missing or incomplete reports treated explicitly" in review
         assert "resolved canonical-model identities" in review
 
-    def test_routed_deep_requires_post_edit_conversation(self) -> None:
+    def test_routed_deep_admits_live_route_edits(self) -> None:
         review = skill_body("main-review")
 
-        assert "FROZEN route table" in review
-        assert "saved config edits apply to new conversations only" in review
-        assert "the frozen snapshot, not a validator defect" in review
+        assert "LIVE route table" in review
+        assert "applies to subsequent launches in the same conversation" in review
+        assert "children already admitted keep their bindings" in review
+        assert "not a validator defect" in review
+        assert "rejected at reload" in review
+        assert "the prior table stays effective" in review
+        assert "FROZEN route table" not in review
+        assert "saved config edits apply to new conversations only" not in review
 
     def test_routed_deep_requires_configured_multi_model_route(self) -> None:
         review = skill_body("main-review")
@@ -542,7 +547,10 @@ class TestShippedSkillRewrites:
         assert "Supplementary seats" in review
         assert "`luna`" in review
         assert "`flash`" in review
-        assert "bind the read-only `reviewer` identity with no shell access" in review
+        assert (
+            "bind the read-only `reviewer` identity, whose tool surface carries only the bash verification carve-out"
+            in review
+        )
         assert "intent, regression coverage, and evidence quality" in review
         assert "negative cases and boundary questions" in review
 

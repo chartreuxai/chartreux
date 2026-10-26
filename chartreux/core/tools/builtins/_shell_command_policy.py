@@ -7,6 +7,7 @@ import re
 from chartreux.core.dangerous_commands import (
     GitRepositoryRelocation as GitRepositoryRelocation,
 )
+from chartreux.core.tools.builtins._destination import network_client_path_operands
 from chartreux.core.tools.builtins._shell_argv import (
     _COMBINED_SHORT_OPTION_MIN_LENGTH as _COMBINED_SHORT_OPTION_MIN_LENGTH,
     _GLOB_META_CHARACTERS as _GLOB_META_CHARACTERS,
@@ -93,6 +94,7 @@ from chartreux.core.tools.builtins._shell_git_classifier import (
     _classify_git_remote as _classify_git_remote,
     _classify_git_stash_or_reflog as _classify_git_stash_or_reflog,
     _classify_git_switch as _classify_git_switch,
+    _classify_git_symbolic_ref as _classify_git_symbolic_ref,
     _classify_git_worktree_subcommand as _classify_git_worktree_subcommand,
     _dispatch_git_subcommand as _dispatch_git_subcommand,
     _fail_closed_on_end_of_options as _fail_closed_on_end_of_options,
@@ -133,6 +135,7 @@ from chartreux.core.tools.builtins._shell_git_inspection import (
     git_metadata_paths as git_metadata_paths,
     git_push_destination_risk as git_push_destination_risk,
     git_work_tree_writing_subcommand as git_work_tree_writing_subcommand,
+    path_reaches_bare_repository as path_reaches_bare_repository,
     resolve_git_work_tree as resolve_git_work_tree,
     resolve_repository_scope as resolve_repository_scope,
 )
@@ -150,6 +153,8 @@ from chartreux.core.tools.builtins._shell_git_policy import (
     _git_destructive_policy as _git_destructive_policy,
     _git_policy,
     _legacy_clean_flags as _legacy_clean_flags,
+    _symbolic_ref_policy as _symbolic_ref_policy,
+    git_apply_cwd_root_write as git_apply_cwd_root_write,
 )
 from chartreux.core.tools.builtins._shell_git_support import (
     _GIT_BOOLEAN_GLOBALS as _GIT_BOOLEAN_GLOBALS,
@@ -167,15 +172,20 @@ from chartreux.core.tools.builtins._shell_git_support import (
     _GIT_PAGING_SUBCOMMANDS,
     _GIT_READER_SUBCOMMANDS,
     _GIT_SUBCOMMAND_INDEX,
+    _GIT_SYMBOLIC_REF_BOOLEAN_SHORTS as _GIT_SYMBOLIC_REF_BOOLEAN_SHORTS,
+    _GIT_SYMBOLIC_REF_TABLE as _GIT_SYMBOLIC_REF_TABLE,
+    _GIT_SYMBOLIC_REF_WRITE_OPTIONS as _GIT_SYMBOLIC_REF_WRITE_OPTIONS,
     _GIT_UNMODELED_BUILTINS as _GIT_UNMODELED_BUILTINS,
     _effective_clean_flags as _effective_clean_flags,
     _git_global_options,
     _GitConfigCall as _GitConfigCall,
     _GitGlobalScan as _GitGlobalScan,
+    _GitSymbolicRefCall as _GitSymbolicRefCall,
     _OptionTokenScan as _OptionTokenScan,
     _scan_classified_git_options as _scan_classified_git_options,
     _scan_git_config_call as _scan_git_config_call,
     _scan_git_globals as _scan_git_globals,
+    _scan_git_symbolic_ref_call as _scan_git_symbolic_ref_call,
     _scan_long_option_token as _scan_long_option_token,
     _scan_required_long_value as _scan_required_long_value,
     _scan_short_option_token as _scan_short_option_token,
@@ -1253,9 +1263,16 @@ def _sed_delimited_end(script: str, index: int, delimiter: str) -> int:
     raise ValueError("unterminated sed expression")
 
 
-def _sed_script_paths(script: str) -> tuple[str, ...]:  # noqa: PLR0912
-    """Inspect literal file commands without interpreting substitutions as code."""
+def _sed_script_paths(script: str) -> tuple[tuple[str, ...], tuple[str, ...]]:  # noqa: PLR0912, PLR0915
+    """Inspect literal file commands without interpreting substitutions as code.
+
+    Returns the script's file operands in script order, and the ``w``/``W``
+    subset of them: the commands that name files sed writes the pattern
+    space to (the ``r``/``R`` commands name files sed only reads — their
+    contents join the output).
+    """
     paths: list[str] = []
+    writes: list[str] = []
     index = 0
     while index < len(script):
         character = script[index]
@@ -1306,6 +1323,8 @@ def _sed_script_paths(script: str) -> tuple[str, ...]:  # noqa: PLR0912
                 raise ValueError("escaped sed filename cannot be safely inspected")
             if target:
                 paths.append(target)
+                if character in "wW":
+                    writes.append(target)
             index = end
         elif character in "aic#":
             # Text and comments are not sed commands.
@@ -1317,7 +1336,7 @@ def _sed_script_paths(script: str) -> tuple[str, ...]:  # noqa: PLR0912
         elif character not in "dDgGhHlnNpPqx=z":
             # Unknown syntax may hide a file command; do not guess its boundary.
             raise ValueError("unsupported sed script syntax")
-    return tuple(paths)
+    return tuple(paths), tuple(writes)
 
 
 def _sed_policy(args: list[str]) -> ShellCommandPolicy:
@@ -1335,11 +1354,14 @@ def _sed_policy(args: list[str]) -> ShellCommandPolicy:
             denial_reason="external sed scripts cannot be analyzed; inline the script instead",
         )
     paths: list[str] = []
+    script_writes: list[str] = []
     requires_approval = False
     denial_reason = None
     try:
         for script in scripts:
-            paths.extend(_sed_script_paths(script))
+            paths_part, writes_part = _sed_script_paths(script)
+            paths.extend(paths_part)
+            script_writes.extend(writes_part)
     except ValueError as exc:
         requires_approval = True
         denial_reason = str(exc)
@@ -1359,6 +1381,11 @@ def _sed_policy(args: list[str]) -> ShellCommandPolicy:
         inspect_positional_paths=True,
         option_path_values=tuple(paths),
         positional_values=inputs,
+        # The w/W script targets are files sed writes itself (with or without
+        # -i); they stay in option_path_values too — write_path_values only
+        # ADDS the write classification, so the inspected surface, the path
+        # candidates, and their order are unchanged.
+        write_path_values=tuple(script_writes),
     )
 
 
@@ -1773,6 +1800,71 @@ def _sevenzip_policy(args: list[str]) -> ShellCommandPolicy:
     )
 
 
+# 7z's commands that rewrite the archive itself: a (add), d (delete), u
+# (update), and rn (rename) create, replace, or rewrite the archive operand;
+# every other command (e/x extract, l list, t test, b benchmark, h hash,
+# i info) leaves the archive unchanged.
+_SEVENZIP_ARCHIVE_WRITING_COMMANDS = frozenset({"a", "d", "u", "rn"})
+
+
+# The destination-position tables: the full value-taking option surface of
+# the commands whose written destination the resolver's write collection
+# locates as a positional operand. Unlike the write-operand tables, these
+# options are never extracted as writes — they consume their values so a
+# value-taking option spelled AFTER the operands cannot displace the true
+# destination positional. An option missing from the table can only leave
+# its value as a surplus positional candidate (an over-block), never hide
+# the destination.
+#
+# cp/mv/install: -S/--suffix names a backup suffix and --sparse a mode
+# (cp only); -t/--target-directory is the destination-directory option the
+# write-operand table already extracts. GNU coreutils permutes options past
+# the operands, so `install src dst -m 644` consumes 644 as -m's value and
+# the true final positional stays the destination. cp's and install's
+# optional-value long forms (--backup, --context, --preserve, --update)
+# never consume a following token (getopt_long optional arguments are
+# attached-only), so leaving them unmodeled cannot displace anything.
+#
+# objcopy: -O/--output-target, -I/--input-target, and -B/--binary-
+# architecture name BFD formats, not files, and `-O binary` is the common
+# trailing spelling. Every other value-taking option (--add-section,
+# --dump-section, --redefine-sym, ...) stays unmodeled: its value surfaces
+# as a surplus positional candidate, and --dump-section's written dump file
+# remains an uncollected residual (a documented over-block/residual pair).
+_DESTINATION_POSITION_TABLES: dict[str, _OptionTable] = {
+    "cp": _OptionTable(
+        long_values=frozenset({"--sparse", "--suffix", "--target-directory"}),
+        short_values=frozenset({"S", "t"}),
+    ),
+    "mv": _OptionTable(
+        long_values=frozenset({"--suffix", "--target-directory"}),
+        short_values=frozenset({"S", "t"}),
+    ),
+    "install": _OptionTable(
+        long_values=frozenset({
+            "--group",
+            "--mode",
+            "--owner",
+            "--suffix",
+            "--target-directory",
+        }),
+        short_values=frozenset({"g", "m", "o", "S", "t"}),
+    ),
+    "objcopy": _OptionTable(
+        long_values=frozenset({
+            "--binary-architecture",
+            "--input-target",
+            "--output-target",
+        }),
+        short_values=frozenset({"B", "I", "O"}),
+    ),
+    # zip's own policy table: its value-taking options (-P password, -b
+    # scratch directory, -i/-x patterns, -n suffixes) consume their values so
+    # they never displace the archive operand.
+    "zip": _ZIP_TABLE,
+}
+
+
 # unar extracts into -o's directory (default: the current directory) and
 # spells the option in four forms: `-o DIR`, `-o=DIR`, and the single-dash
 # long `-output-directory DIR` / `-output-directory=DIR`. The attached
@@ -1833,6 +1925,19 @@ def _mktemp_policy(args: list[str]) -> ShellCommandPolicy:
     return ShellCommandPolicy(option_path_values=parsed.values_for("-p", "--tmpdir"))
 
 
+# The modeled network clients (v0.5.9 P2-a) are no longer blanket-denylisted:
+# their DESTINATIONS decide run vs ask (see _destination.py). Their local-file
+# operands join the inspected surface here, so a client that downloads to
+# -o/--output, -O/--output-document or --directory-prefix writes only inside
+# the caller's authority, and a config, cookie, upload or data-file operand
+# reads only inside it — the same workspace and sensitive-file guards every
+# other command's operands get. Positional URL operands are destinations,
+# not paths, and stay out of this surface.
+def _network_client_policy(client: str, args: list[str]) -> ShellCommandPolicy:
+    reads, writes = network_client_path_operands(client, args)
+    return ShellCommandPolicy(option_path_values=reads, write_path_values=writes)
+
+
 _COMMAND_POLICIES = {
     "chmod": _chmod_policy,
     "chown": _chown_policy,
@@ -1880,6 +1985,8 @@ _COMMAND_POLICIES.update({
     name: _zstd_policy for name in ("zstd", "zstdcat", "zstdmt", "unzstd")
 })
 _COMMAND_POLICIES["mktemp"] = _mktemp_policy
+_COMMAND_POLICIES["curl"] = lambda args: _network_client_policy("curl", args)
+_COMMAND_POLICIES["wget"] = lambda args: _network_client_policy("wget", args)
 
 
 def analyze_shell_command_policy(tokens: list[str]) -> ShellCommandPolicy:
@@ -1962,12 +2069,15 @@ def path_candidates(
         *policy.write_path_values,
     ]
     if not (inspect_positional_paths or policy.inspect_positional_paths):
-        return tuple(candidates)
+        return tuple(dict.fromkeys(candidates))
     command = _command_name(tokens[0])
     candidates.extend(_command_operand_paths(command, tokens))
     if policy.positional_values is not None:
         candidates.extend(policy.positional_values)
-        return tuple(candidates)
+        # write_path_values overlaps option_path_values where a policy classifies
+        # an extracted operand as a write too (sed's w/W script targets), so the
+        # sequence can carry a duplicate the ordered-set dedupe collapses.
+        return tuple(dict.fromkeys(candidates))
     options_ended = False
     for token in tokens[1:]:
         if token == "--":

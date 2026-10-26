@@ -1,4 +1,4 @@
-"""Child inheritance and child-originated session root grants."""
+"""Child inheritance of session root grants and the blanket child ask denial."""
 
 from __future__ import annotations
 
@@ -186,9 +186,17 @@ async def test_child_dispatched_after_a_parent_grant_inherits_it(
         await parent.aclose()
 
 
-async def test_child_local_grant_under_a_permitting_ceiling_is_child_only(
+async def test_capable_child_denies_the_ask_but_an_issued_grant_stays_child_only(
     tmp_path: Path,
 ) -> None:
+    """Blanket child denial: a capable child never prompts for out-of-root scope.
+
+    The child's gap is locally grantable (the frozen parent ceiling permits
+    the target), yet the child denies with remediation instead of prompting:
+    the blocker flows back to the parent. An already-issued child-local grant
+    — a parent-directed scope change to this child — still applies, and only
+    to that child.
+    """
     project = tmp_path / "project"
     project.mkdir()
     nested = project / "nested"
@@ -204,7 +212,13 @@ async def test_child_local_grant_under_a_permitting_ceiling_is_child_only(
         policy = parent.child_runtime_policy
         assert policy.inherited_root_grants == ()
         child = _child_loop(
-            parent, policy, FakeBackend([*_read_turn(target, "child-read")]), cwd=nested
+            parent,
+            policy,
+            FakeBackend([
+                *_read_turn(target, "child-denied"),
+                *_read_turn(target, "child-granted"),
+            ]),
+            cwd=nested,
         )
         sibling = _child_loop(
             parent,
@@ -221,24 +235,38 @@ async def test_child_local_grant_under_a_permitting_ceiling_is_child_only(
             assert not child.tool_manager.workspace.allows(target)
             ceiling = child.tool_manager.workspace.ceiling
             assert ceiling is not None and ceiling.allows(target)
+            # The ask is denied outright: no prompt, remediation, no grant.
             events, requests = await _drive(child, "Allow this session")
-            assert len(requests) == 1
+            assert requests == []
+            results = _results(events)
+            assert len(results) == 1
+            assert results[0].skipped
+            assert child._session_root_grants.roots == set()
+            assert any(
+                "authorized_roots_by_project" in text and "config.toml" in text
+                for text in _tool_texts(child)
+            )
+            # An already-issued child-local grant stays effective.
+            assert child.apply_root_grant(project)
+            assert child.tool_manager.workspace.allows(target)
+            events, requests = await _drive(child, "Allow this session")
+            assert requests == []
             results = _results(events)
             assert len(results) == 1
             assert not results[0].skipped
             assert results[0].result is not None
             assert "parent project content" in results[0].result.model_dump_json()
-            assert child._session_root_grants.roots == {project.resolve()}
             # The grant is child-local: parent and sibling stores stay empty.
             assert parent._session_root_grants.roots == set()
             assert sibling._session_root_grants.roots == set()
             assert not sibling.tool_manager.workspace.allows(target)
-            # A sibling asks for itself; the parent still receives nothing.
-            events, requests = await _drive(sibling, "Deny")
-            assert len(requests) == 1
+            # A sibling's own ask is denied outright too; nothing was recorded
+            # as a user decline, because the user was never asked.
+            events, requests = await _drive(sibling, "Allow this session")
+            assert requests == []
             assert _results(events)[0].skipped
             assert sibling._session_root_grants.roots == set()
-            assert sibling._session_root_grants.denied_roots == {project.resolve()}
+            assert sibling._session_root_grants.denied_roots == set()
             assert parent._session_root_grants.roots == set()
         finally:
             await child.aclose()
@@ -296,7 +324,16 @@ async def test_parent_ceiling_denial_from_a_child_never_prompts(tmp_path: Path) 
         await parent.aclose()
 
 
-async def test_grandchild_inherits_a_child_local_grant(tmp_path: Path) -> None:
+async def test_grandchild_inherits_an_already_issued_child_local_grant(
+    tmp_path: Path,
+) -> None:
+    """An already-issued child-local grant inherits down the tree.
+
+    The child cannot issue the grant by asking — the blanket child denial
+    denies its own ask outright — so the grant arrives by parent direction
+    to the child's store; a grandchild dispatched by the granted child
+    inherits it and reads without prompting.
+    """
     project = tmp_path / "project"
     project.mkdir()
     nested = project / "nested"
@@ -313,16 +350,21 @@ async def test_grandchild_inherits_a_child_local_grant(tmp_path: Path) -> None:
         child = _child_loop(
             parent,
             policy,
-            FakeBackend([*_read_turn(target, "child-grant")]),
+            FakeBackend([*_read_turn(target, "child-denied")]),
             cwd=nested,
         )
         child.bind_root_grant_port(port)
         port.register(child)
         try:
+            # The child's own ask is denied outright.
             events, requests = await _drive(child, "Allow this session")
-            assert len(requests) == 1
-            assert not _results(events)[0].skipped
+            assert requests == []
+            assert _results(events)[0].skipped
+            assert child._session_root_grants.roots == set()
+            # A parent-directed grant to the child stays child-local.
+            assert child.apply_root_grant(project)
             assert child._session_root_grants.roots == {project.resolve()}
+            assert parent._session_root_grants.roots == set()
             # A grandchild dispatched by the granted child inherits the grant.
             grandchild = _child_loop(
                 child,

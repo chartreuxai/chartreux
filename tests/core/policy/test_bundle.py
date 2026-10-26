@@ -338,13 +338,14 @@ def test_tampered_overlay_rejected_by_recomposition(tmp_path):
 
 
 def test_tampered_route_snapshot_rejected_at_activation(tmp_path):
-    # DF2 (delta re-review): the manifest's route snapshot is the EXECUTABLE
-    # route table and the frozen launch-target string is the ADVERTISED one
-    # — both captured from the same source at bind time. A persisted bundle
-    # whose snapshot disagrees with its own advertised table re-creates the
-    # half-applied generation from disk (admission would launch the tampered
-    # target while the model is told the advertised one), so activation
-    # refuses it loudly, naming the purpose and both sides.
+    # DF2 (delta re-review): the manifest's route snapshot is the ADVERTISED
+    # route table and the diff anchor for the applied-route notice — both
+    # captured from the same source at bind time, and frozen there (ADR
+    # 0022). A persisted bundle whose snapshot disagrees with its own
+    # advertised table re-creates the half-applied generation from disk
+    # (the notice's diff would report against a table the model is not
+    # told), so activation refuses it loudly, naming the purpose and both
+    # sides.
     snapshot, _ = _snapshot(tmp_path)
     data = build_bundle(snapshot).model_dump(mode="json")
     research = next(

@@ -386,6 +386,19 @@ class StreamingMessageBase(Static):
         await self._stream.stop()
         self._stream = None
 
+    def _on_unmount(self) -> None:
+        # A widget's MarkdownStream._run task pends forever until stop() and pins
+        # the whole widget tree; unmount is the one hook every removal path
+        # routes through (Textual dispatches it from the pump's message-loop exit).
+        # Cancel without awaiting: stop() is async and the Widget._on_unmount
+        # signature it overrides is sync — the cancelled task ends on its own.
+        self._cancel_write_timer()
+        self._to_write_buffer = ""
+        if self._stream is not None:
+            stream, self._stream = self._stream, None
+            if stream._task is not None:
+                stream._task.cancel()
+
     def _should_write_content(self) -> bool:
         return True
 

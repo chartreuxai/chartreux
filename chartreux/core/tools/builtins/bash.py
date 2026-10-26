@@ -6,6 +6,7 @@ from typing import final
 
 from pydantic import BaseModel, Field, computed_field, model_validator
 
+from chartreux.core.env import project_env_for_cwd
 from chartreux.core.events import ToolResultEvent, ToolStreamEvent
 from chartreux.core.tools.base import (
     BaseTool,
@@ -34,6 +35,7 @@ from chartreux.core.tools.builtins._shell_permission_resolver import (
     _split_command_tokens as _split_command_tokens,
     _UnsafeShellSyntax as _UnsafeShellSyntax,
     _update_guardrail_cwds as _update_guardrail_cwds,
+    shell_command_write_paths,
 )
 from chartreux.core.tools.io_port import ShellCommandRequest
 from chartreux.core.tools.permissions import PermissionContext
@@ -80,7 +82,12 @@ class BashToolConfig(BaseToolConfig):
         description="Commands that are denied only when run without arguments",
     )
     sensitive_patterns: list[str] = Field(
-        default=["sudo"],
+        # v0.5.9 P2-d: sudo left the shipped sensitive prefixes — the
+        # `sudo -u <user>` wrapper is modeled transparently in the executor
+        # grammar (the wrapped command is re-analyzed), and every other
+        # sudo form fails closed there. A user-configured "sudo" pattern
+        # still denies the wrapper's outer command outright.
+        default=[],
         description="Command prefixes denied before other resolver checks.",
     )
 
@@ -100,6 +107,17 @@ class CapturedShellResult(BaseModel):
     exit_code: int = 0
     stdout: str = ""
     stderr: str = ""
+    # P2-i R6: the resolved paths the command's write-classified operands
+    # name (redirect targets, write-option values, write-classified command
+    # operands), surfaced so the submission secret scan collects
+    # bash-written artifacts alongside file-tool paths. Excluded from
+    # `model_dump`: the post-tool hook payload and the persisted transcript
+    # keep their shape; the accumulator reads the attributes on the
+    # in-process result.
+    write_paths: list[str] = Field(default_factory=list, exclude=True)
+    # True when the command's write surface could not be established; the
+    # submission gate treats an unknown footprint as unscannable content.
+    write_paths_unknown: bool = Field(default=False, exclude=True)
 
     # `model_dump` of a tool result is the `post_tool` hook payload, so dropping
     # this key outright would break hooks that read `tool_output.returncode`.
@@ -109,8 +127,55 @@ class CapturedShellResult(BaseModel):
         return self.exit_code
 
 
+class FailedShellCommand(ToolError):
+    """ToolError from a shell command that failed or timed out.
+
+    A failed run may still have written files (partial execution), so it
+    carries the command's write-classified paths and its unknown-write-
+    surface flag; the tool executor copies them onto the error result
+    event, and the submission scan collects the footprint exactly as a
+    successful run's would be.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        write_paths: list[str] | None = None,
+        write_paths_unknown: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.write_paths = list(write_paths or [])
+        self.write_paths_unknown = write_paths_unknown
+
+
+class CancelledShellCommand(asyncio.CancelledError):
+    """CancelledError from a shell run cancelled mid-flight.
+
+    A cancelled run may still have written files (partial execution), so
+    it carries the command's write-classified paths and its unknown-write-
+    surface flag; the tool executor copies them onto the cancelled result
+    event, and the submission scan collects the footprint exactly as a
+    successful run's would be.
+    """
+
+    def __init__(
+        self, *, write_paths: list[str] | None = None, write_paths_unknown: bool = False
+    ) -> None:
+        super().__init__()
+        self.write_paths = list(write_paths or [])
+        self.write_paths_unknown = write_paths_unknown
+
+
 def completed_shell_result(
-    *, command: str, stdout: str, stderr: str, exit_code: int, shell: str = ""
+    *,
+    command: str,
+    stdout: str,
+    stderr: str,
+    exit_code: int,
+    shell: str = "",
+    write_paths: list[str] | None = None,
+    write_paths_unknown: bool = False,
 ) -> CapturedShellResult:
     if exit_code != 0:
         message = f"Command failed: {command!r}\nReturn code: {exit_code}"
@@ -118,10 +183,18 @@ def completed_shell_result(
             message += f"\nStderr: {stderr}"
         if stdout:
             message += f"\nStdout: {stdout}"
-        raise ToolError(message)
+        raise FailedShellCommand(
+            message, write_paths=write_paths, write_paths_unknown=write_paths_unknown
+        )
 
     return CapturedShellResult(
-        command=command, shell=shell, exit_code=exit_code, stdout=stdout, stderr=stderr
+        command=command,
+        shell=shell,
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        write_paths=list(write_paths or []),
+        write_paths_unknown=write_paths_unknown,
     )
 
 
@@ -184,17 +257,50 @@ class Bash(
             self.workspace,
             self.path_authority,
             self.dangerous_command_authorities_getter,
+            # The same trust-gated environment run() injects into the
+            # subprocess; the egress rule consults it for injected
+            # non-loopback proxies (v0.5.9 R1).
+            injected_env=project_env_for_cwd(self.cwd),
         ).resolve_permission(args)
 
     @final
-    def _build_timeout_error(self, command: str, timeout: int) -> ToolError:
-        return ToolError(f"Command timed out after {timeout}s: {command!r}")
+    def _build_timeout_error(
+        self,
+        command: str,
+        timeout: int,
+        write_paths: list[str] | None = None,
+        write_paths_unknown: bool = False,
+    ) -> ToolError:
+        # R7: a timed-out run may still have written files before the kill,
+        # so the error carries the run's write footprint for the submission
+        # scan, surfaced exactly as a successful run's would be.
+        return FailedShellCommand(
+            f"Command timed out after {timeout}s: {command!r}",
+            write_paths=write_paths,
+            write_paths_unknown=write_paths_unknown,
+        )
 
     async def run(
         self, args: BashArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | CapturedShellResult, None]:
         timeout = args.timeout or self.config.default_timeout
         max_bytes = self.config.max_output_bytes
+        # The project environment loads when the working folder is inside a
+        # trusted folder: the trusted folder's .env plus $CHARTREUX_HOME/.env,
+        # re-read on mtime change. Its values are masked by the redaction
+        # backstop, so scripts find keys via os.environ without the model
+        # ever seeing them.
+        project_env = project_env_for_cwd(self.cwd)
+        # P2-i R6: surface the command's write-classified paths (redirect
+        # targets, write-option values, write-classified command operands)
+        # onto the result, so the submission secret scan collects
+        # bash-written artifacts alongside file-tool paths.
+        write_paths, write_paths_unknown = shell_command_write_paths(
+            args.command,
+            cwd=self.cwd,
+            workspace=self.workspace,
+            authority=self.path_authority,
+        )
 
         if (
             ctx is not None
@@ -211,12 +317,23 @@ class Bash(
                         cwd=self.cwd,
                         timeout=timeout,
                         max_output_bytes=max_bytes,
+                        env=project_env or None,
                     )
                 )
             except TimeoutError:
-                raise self._build_timeout_error(args.command, timeout) from None
-            except asyncio.CancelledError:
-                raise
+                raise self._build_timeout_error(
+                    args.command,
+                    timeout,
+                    write_paths=write_paths,
+                    write_paths_unknown=write_paths_unknown,
+                ) from None
+            except asyncio.CancelledError as exc:
+                # A cancelled run may still have written files; the executor's
+                # cancellation handler copies the run's write footprint off
+                # the cancellation onto the cancelled result event.
+                raise CancelledShellCommand(
+                    write_paths=write_paths, write_paths_unknown=write_paths_unknown
+                ) from exc
             except Exception as exc:
                 raise ToolError(
                     f"Error running command {args.command!r}: {exc}"
@@ -226,13 +343,17 @@ class Bash(
                 stdout=result.stdout[:max_bytes],
                 stderr=result.stderr[:max_bytes],
                 exit_code=result.returncode,
+                write_paths=write_paths,
+                write_paths_unknown=write_paths_unknown,
             )
             return
 
         proc = None
         completed = False
         try:
-            proc = await spawn_shell_command(args.command, cwd=self.cwd)
+            proc = await spawn_shell_command(
+                args.command, cwd=self.cwd, extra_env=project_env
+            )
 
             try:
                 stdout_bytes, stderr_bytes, _ = await asyncio.wait_for(
@@ -245,7 +366,12 @@ class Bash(
                 )
             except TimeoutError:
                 await kill_async_subprocess(proc)
-                raise self._build_timeout_error(args.command, timeout)
+                raise self._build_timeout_error(
+                    args.command,
+                    timeout,
+                    write_paths=write_paths,
+                    write_paths_unknown=write_paths_unknown,
+                )
 
             stdout, stderr = await asyncio.gather(
                 asyncio.to_thread(decode_console_safe, stdout_bytes),
@@ -260,9 +386,18 @@ class Bash(
                 stdout=stdout,
                 stderr=stderr,
                 exit_code=proc.returncode or 0,
+                write_paths=write_paths,
+                write_paths_unknown=write_paths_unknown,
             )
 
-        except (ToolError, asyncio.CancelledError):
+        except asyncio.CancelledError as exc:
+            # Same footprint retention as the tool_io path above: the
+            # executor's cancellation handler copies the run's write
+            # footprint off the cancellation onto the result event.
+            raise CancelledShellCommand(
+                write_paths=write_paths, write_paths_unknown=write_paths_unknown
+            ) from exc
+        except ToolError:
             raise
         except Exception as exc:
             raise ToolError(f"Error running command {args.command!r}: {exc}") from exc

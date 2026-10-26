@@ -125,12 +125,17 @@ class TestTaskArgs:
     def test_task_prompt_documents_single_preset_semantics(
         self, catalog: ModelCatalog
     ) -> None:
-        prompt, alias = _rendered_task(catalog)
+        prompt, _alias = _rendered_task(catalog)
         prompt = " ".join(prompt.split())
 
         # One configured model and ten produce identical routing: the
-        # launch-target table binds the session model for every purpose.
-        assert f"| `implementation` | `coder` | substantive | — | `{alias}` |" in prompt
+        # launch-target table binds the session model for the session-bound
+        # purposes, and the four cost-tier-aware purposes render the
+        # $cheapest-capable marker.
+        assert (
+            "| `implementation` | `coder` | substantive | — | `$cheapest-capable` |"
+            in prompt
+        )
         assert "A purpose route binds the launch defaults for one purpose" in prompt
         assert (
             "Explicit `model` and `identity` fields override the route's "
@@ -148,14 +153,23 @@ class TestTaskArgs:
     def test_task_prompt_documents_mechanical_tier_routes(
         self, catalog: ModelCatalog
     ) -> None:
-        prompt, alias = _rendered_task(catalog)
+        prompt, _alias = _rendered_task(catalog)
         prompt = " ".join(prompt.split())
 
         # The mechanical-tier purposes render with their tier in the
-        # launch-target table, bound to the session model.
-        assert f"| `mechanical-edit` | `coder` | mechanical | — | `{alias}` |" in prompt
-        assert f"| `search` | `researcher` | mechanical | — | `{alias}` |" in prompt
-        assert f"| `verification` | `coder` | mechanical | — | `{alias}` |" in prompt
+        # launch-target table, on the $cheapest-capable cost-tier default.
+        assert (
+            "| `mechanical-edit` | `coder` | mechanical | — | `$cheapest-capable` |"
+            in prompt
+        )
+        assert (
+            "| `search` | `researcher` | mechanical | — | `$cheapest-capable` |"
+            in prompt
+        )
+        assert (
+            "| `verification` | `coder` | mechanical | — | `$cheapest-capable` |"
+            in prompt
+        )
         # The reuse prose re-states the purpose on every retask.
         assert "re-state the purpose explicitly on every reuse" in prompt
         # The retired slot-prose examples never render.

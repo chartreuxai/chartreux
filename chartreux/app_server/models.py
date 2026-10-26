@@ -1061,6 +1061,27 @@ class RootRecoveryNoticeDetail(ProtocolModel):
     affected_deployment: str | None = None
 
 
+class RouteTableAppliedChange(ProtocolModel):
+    """ADR 0022: one edited purpose's old → new target summary."""
+
+    purpose: str
+    before: str
+    after: str
+
+
+class RouteTableAppliedNoticeDetail(ProtocolModel):
+    """ADR 0022: a validated route edit applied at a reload commit.
+
+    Routes are bindings, not frozen content: the edit applies to subsequent
+    launch admissions in the same conversation, while children already
+    admitted keep their pinned bindings. The changes are diffed against the
+    manifest's bind-time route snapshot (the integrity and diff anchor).
+    """
+
+    kind: Literal["route_table_applied"] = "route_table_applied"
+    changes: list[RouteTableAppliedChange] = Field(default_factory=list)
+
+
 NoticeDetail = Annotated[
     HookNoticeDetail
     | ContextClearedNoticeDetail
@@ -1069,7 +1090,8 @@ NoticeDetail = Annotated[
     | PlanReviewEndedNoticeDetail
     | WaitingForInputNoticeDetail
     | ScheduledLoopFiredNoticeDetail
-    | RootRecoveryNoticeDetail,
+    | RootRecoveryNoticeDetail
+    | RouteTableAppliedNoticeDetail,
     Field(discriminator="kind"),
 ]
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -18,21 +18,33 @@ import tree_sitter_bash as tsbash
 from chartreux.core.dangerous_commands import (
     DangerousCommandAuthority,
     DangerousCommandProposal,
+    GitRepositoryRelocation,
     RepositoryScope,
     operations_for_ids,
 )
 from chartreux.core.tools.base import ToolPermission
+from chartreux.core.tools.builtins._destination import classify_network_egress
 from chartreux.core.tools.builtins._shell_argv import (
     PatternGlobCandidate,
     ShellToken,
+    _command_name,
+    _scan_options,
     split_shell_tokens,
 )
 from chartreux.core.tools.builtins._shell_command_policy import (
+    _COMPILER_OUTPUT_COMMANDS,
+    _DESTINATION_POSITION_TABLES,
+    _SEVENZIP_ARCHIVE_WRITING_COMMANDS,
+    _SEVENZIP_TABLE,
+    _WRITE_OPERAND_TABLES,
     ShellCommandPolicy,
+    _has_long,
+    _has_short,
     analyze_shell_command_policy,
     canonical_git_command,
     classify_dangerous_git_command,
     executor_boundary,
+    git_apply_cwd_root_write,
     git_cwd_relocations,
     git_metadata_paths,
     git_push_destination_risk,
@@ -42,6 +54,7 @@ from chartreux.core.tools.builtins._shell_command_policy import (
     is_dangerous_git_subcommand,
     matches_command_prefix,
     path_candidates,
+    path_reaches_bare_repository,
     resolve_git_work_tree,
     resolve_repository_scope,
 )
@@ -50,6 +63,12 @@ from chartreux.core.tools.builtins._shell_diagnostics import (
     Diagnostic,
     aggregate_denial_class,
     render_diagnostic,
+)
+from chartreux.core.tools.builtins._shell_git_state import (
+    RepositoryState,
+    repositories_intersecting,
+    repository_recovery,
+    repository_state,
 )
 from chartreux.core.tools.builtins._shell_permission_analysis import (
     _REDIRECTION_DEVICES,
@@ -110,12 +129,15 @@ def _dangerous_policy_reason(context: PermissionContext) -> Diagnostic:
     """
     proposal = context.dangerous_command_proposal
     if proposal is not None:
+        noun = (
+            "a dangerous git operation"
+            if all(operation.startswith("git.") for operation in proposal.operations)
+            else "a dangerous operation"
+        )
         return Diagnostic(
             "analysis",
             detail=(
-                "a dangerous git operation requiring approval ("
-                + ", ".join(proposal.operations)
-                + ")"
+                noun + " requiring approval (" + ", ".join(proposal.operations) + ")"
             ),
         )
     return Diagnostic(
@@ -190,14 +212,31 @@ class _GuardrailPart:
     # metacharacters, so the wrapper visit carries the source tokens and
     # downstream tokenization must not re-derive provenance from that text.
     tokens: tuple[str, ...] | None = None
+    # The command's OWN environment assignments: the literal command-prefix
+    # assignments (dropped from the part text), the env-wrapper and
+    # sudo-wrapper assignment operands (dropped from the reassembled argv),
+    # and the statement-level
+    # bindings in force where the part runs (an earlier `export NAME=value`
+    # or standalone `NAME=value` statement of the same command text). The
+    # shell applies all of them to this command's subprocess, so the egress
+    # proxy inspection consumes them. A wrapper's child re-visit accumulates
+    # the wrapper's assignments into the child part, and a nested shell's
+    # payload parts inherit the enclosing statement's, so a wrapped
+    # client's part carries the effective environment it runs with.
+    assignments: tuple[tuple[str, str], ...] = ()
 
 
 def _has_unrecognized_nested_shell(tokens: list[str]) -> bool:
-    """Detect shell -c behind an unmodeled executable (including script -c)."""
+    """Detect shell -c behind an unmodeled executable (including script -c).
+
+    The match is token-boundary-aligned: it fires only when a token IS a
+    shell name (``sh``, ``/bin/bash``, ...) and a LATER token of the same
+    command is a -c-style option (``-c``, ``-xc``, ...). A shell name and
+    option appearing as substrings inside one quoted multi-word argument
+    (``git commit -m 'fix bash -c handling'``) are data the wrapper
+    receives, never a nested shell the wrapper runs, so they never fire.
+    """
     return any(
-        re.search(r"(?:^|\s)(?:ash|bash|sh|dash|zsh)\s+-[a-zA-Z]*c(?:\s|$)", token)
-        for token in tokens[1:]
-    ) or any(
         Path(token).name in _SHELLS
         and any(
             option == "-c" or re.fullmatch(r"-[a-zA-Z]*c", option)
@@ -232,6 +271,7 @@ def _expand_guardrail_parts(  # noqa: PLR0915
     scratchpad_roots: frozenset[Path] = frozenset(),
     redirect_operands: tuple[tuple[str, ...], ...] = (),
     workspace_roots: frozenset[Path] | None = None,
+    command_assignments: tuple[tuple[tuple[str, str], ...], ...] = (),
 ) -> tuple[list[_GuardrailPart], list[str], list[Diagnostic]]:
     """Expand in occurrence order, preserving child-shell cwd isolation.
 
@@ -284,6 +324,7 @@ def _expand_guardrail_parts(  # noqa: PLR0915
         inspect_executable: bool = False,
         redirect_targets: tuple[str, ...] = (),
         tokens_override: tuple[str, ...] | None = None,
+        assignments: tuple[tuple[str, str], ...] = (),
     ) -> None:
         nonlocal byte_count, next_scope
         for target in redirect_targets:
@@ -300,6 +341,7 @@ def _expand_guardrail_parts(  # noqa: PLR0915
                 cwd_overrides=cwd_overrides,
                 inspect_executable=inspect_executable,
                 tokens=tokens_override,
+                assignments=assignments,
             )
         )
         tokens = _visit_tokens(part, tokens_override)
@@ -333,11 +375,29 @@ def _expand_guardrail_parts(  # noqa: PLR0915
                 next_scope += 1
                 child_scope = (*scope, next_scope)
                 nested_parts = list(analysis.command_parts)
+                nested_assignments = analysis.command_assignments
                 for index, child in enumerate(nested_parts):
                     targets = (
                         nested_operands[index] if index < len(nested_operands) else ()
                     )
-                    visit(child, child_scope, depth + 1, redirect_targets=targets)
+                    # The nested shell's subprocess inherits the enclosing
+                    # statement's bindings and the wrapper part's own
+                    # command-prefix assignments — that is the environment
+                    # the payload's commands run with — and the payload's
+                    # own bindings, which the nested analysis recorded, win
+                    # (POSIX prefix semantics — dict() keeps the last).
+                    visit(
+                        child,
+                        child_scope,
+                        depth + 1,
+                        redirect_targets=targets,
+                        assignments=assignments
+                        + (
+                            nested_assignments[index]
+                            if index < len(nested_assignments)
+                            else ()
+                        ),
+                    )
                 if len(nested_operands) > len(nested_parts):
                     # Targets that follow the nested source's last command.
                     for target in nested_operands[len(nested_parts)]:
@@ -357,6 +417,33 @@ def _expand_guardrail_parts(  # noqa: PLR0915
             if boundary.child_execution or boundary.cwd_overrides:
                 next_scope += 1
                 child_scope = (*scope, next_scope)
+            # env's assignment operands are dropped from the reassembled
+            # argv like the shell's own command-prefix assignments, but the
+            # env subprocess applies them; recover them from the consumed
+            # prefix for the egress proxy inspection. sudo's NAME=value
+            # operands are recovered the same way: sudo applies them to the
+            # wrapped command's environment (modulo sudoers scrubbing, which
+            # the gate must never un-gate — the same fail-closed union
+            # semantics the binding walk uses for conditional candidates).
+            child_assignments: tuple[tuple[str, str], ...] = ()
+            if boundary.inner_command_range is not None and _command_name(
+                tokens[0]
+            ) in {"env", "sudo"}:
+                child_assignments = tuple(
+                    (token.partition("=")[0], token.partition("=")[2])
+                    for token in tokens[1:start]
+                    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token, re.DOTALL)
+                )
+            # The wrapped command inherits the wrapper's accumulated
+            # assignments — the statement-level bindings in force where the
+            # wrapper runs and its own command-prefix assignments are the
+            # environment the wrapper's subprocess receives, and the model
+            # threads them through every modeled wrapper. That threading is
+            # fail-closed: a real sudo scrubs or env -i clears the child's
+            # environment, but the gate must never un-gate a known
+            # non-loopback proxy. env's operand assignments come last and
+            # win: env applies its operands over the inherited environment
+            # (POSIX prefix semantics — dict() keeps the last binding).
             # shlex.join is only a lossless argv serialization for the policy
             # helpers. This argv is NEVER parsed as shell source or an AST.
             # The original tokens ride along: re-deriving provenance from the
@@ -369,11 +456,15 @@ def _expand_guardrail_parts(  # noqa: PLR0915
                 boundary.cwd_overrides,
                 inspect_executable=True,
                 tokens_override=tuple(child_tokens),
+                assignments=assignments + child_assignments,
             )
 
     for index, part in enumerate(command_parts):
         targets = redirect_operands[index] if index < len(redirect_operands) else ()
-        visit(part, (), 0, redirect_targets=targets)
+        assignments = (
+            command_assignments[index] if index < len(command_assignments) else ()
+        )
+        visit(part, (), 0, redirect_targets=targets, assignments=assignments)
     if len(redirect_operands) > len(command_parts):
         # Targets that follow the last command of the whole chain.
         for target in redirect_operands[len(command_parts)]:
@@ -435,6 +526,14 @@ _EXPANSION_FAILURE_DETAIL = {
     ),
 }
 
+# The compliant alternative the glob-inspection denial names: the shell
+# would expand the pattern, the inspector cannot, so the reader is told how
+# to hand the resolver literal operands instead (P2-e recognition contract).
+_PATH_GLOB_ALTERNATIVE = (
+    "list the directory with ls to see the matching names, or write the "
+    "exact paths instead of the glob"
+)
+
 
 def _expansion_denial(
     token: str, failure: ExpansionFailure, command_part: str
@@ -442,14 +541,24 @@ def _expansion_denial(
     """The path-glob denial carrying the expansion-failure provenance.
 
     The provenance rides the Diagnostic detail, so it passes through the
-    renderer's redaction and bounding like every other diagnostic field.
+    renderer's redaction and bounding like every other diagnostic field. An
+    inspection failure (a work budget, unsupported glob syntax, or a token
+    the inspector never expanded) is a syntax denial and names the compliant
+    alternative; CALLER_DENIED stays a policy denial — the caller rejected
+    the expansion's RESULTS (an option-like word, a match outside the
+    authorized workspace), so suggesting exact paths would only invite a
+    retry that denies again.
     """
+    if failure is ExpansionFailure.CALLER_DENIED:
+        return _denied(Diagnostic("path_glob", token, command_part))
     return _denied(
         Diagnostic(
             "path_glob",
             token,
             command_part,
             detail=_EXPANSION_FAILURE_DETAIL.get(failure),
+            denial_class=DenialClass.SYNTAX,
+            alternative=_PATH_GLOB_ALTERNATIVE,
         )
     )
 
@@ -815,15 +924,114 @@ def _get_default_denylist() -> list[str]:
         "dash -i",
         "screen",
         "tmux",
-        # Network-client speed bumps; denylist and path policy control known
-        # network exfiltration routes (redaction cannot observe pipe/socket
-        # transit). These controls harden against known payload shapes, not
-        # complete egress containment.
-        "curl",
-        "wget",
+        # Modeled network clients (v0.5.9 P2-a): curl and wget left this
+        # denylist — their DESTINATIONS decide run vs ask under the
+        # destination-aware egress rule (see _destination.py), and their
+        # local-file operands are path-inspected by their command policy.
+        # Every other egress client stays denied fail-closed until modeled:
+        # denylist and path policy control known network exfiltration
+        # routes (redaction cannot observe pipe/socket transit). These
+        # controls harden against known payload shapes, not complete egress
+        # containment.
+        "wget2",
         "nc",
         "ncat",
         "socat",
+        # Probed egress clients and the watch repeater: resolved ALWAYS for
+        # arbitrary payloads, so denied fail-closed as the interim until each
+        # is modeled (v0.5.9 P1-e2). They stay denied under the
+        # destination-aware egress rule until modeled there.
+        "ssh",
+        "scp",
+        "rsync",
+        "ftp",
+        "telnet",
+        "http",
+        "httpie",
+        "aria2c",
+        "lftp",
+        "watch",
+        # v0.5.9 P1-e3 wrapper-class audit closure: every payload-runner
+        # class and named egress client was probed through Bash's permission
+        # resolution, and each entry dispositioned. The audit record:
+        #
+        # modeled transparent (payload re-analyzed; pinned in the corpus
+        # permission family): nice, env, stdbuf, flock, setsid, timeout,
+        # nohup, ionice, taskset, time, sg, sudo -u (v0.5.9 P2-d).
+        #
+        # modeled network clients (v0.5.9 P2-a, destination-aware ask-class
+        # egress rule): curl, wget — off the denylist, classified by
+        # destination in _destination.py, local-file operands path-inspected.
+        #
+        # fail-closed without a denylist entry (a modeled boundary refuses
+        # the form): xargs (unsafe/unmodeled options), find -exec
+        # (execution predicates), script -c (unsupported wrapper form).
+        # sudo's unmodeled forms (no -u, a shell behind -s/-i, unmodeled
+        # options, a missing command) fail closed the same way; the shipped
+        # sensitive-prefix rule for sudo retired with the P2-d modeling.
+        #
+        # run-class by client (exfiltration decision item 4): git clone,
+        # git fetch, git pull travel through the modeled git client and
+        # are run-class, not denylisted; git push stays classified
+        # dangerous per operation.
+        #
+        # denylisted fail-closed below: every probed entry that resolved
+        # ALWAYS without any payload analysis, denied until modeled, one
+        # corpus row each in the permission family:
+        #   group/namespace wrappers: su, chroot, unshare, nsenter,
+        #     parallel
+        #   build runners: make, rake, just, ninja, cmake, gradle, mvn,
+        #     ant, scons, meson
+        #   container runners: docker, podman, kubectl
+        #   schedulers: at, batch, systemd-run, crontab
+        #   repeaters: watch (above), entr
+        #   egress clients: sftp, mosh, gh, curlie, xh, httpx, tftp,
+        #     fetch, openssl s_client, openssl s_server
+        # atq/atrm only inspect and remove the at queue; they are not
+        # payload runners and stay run-class.
+        # Group wrappers:
+        "su",
+        "chroot",
+        "unshare",
+        "nsenter",
+        "parallel",
+        # Build runners: a Makefile/Rakefile/build-script target runs
+        # arbitrary commands, so the runner cannot be admitted unanalyzed.
+        "make",
+        "rake",
+        "just",
+        "ninja",
+        "cmake",
+        "gradle",
+        "mvn",
+        "ant",
+        "scons",
+        "meson",
+        # Container runners: the image entrypoint and exec payload run
+        # arbitrary commands.
+        "docker",
+        "podman",
+        "kubectl",
+        # Schedulers: at/batch submit scripts for later execution;
+        # systemd-run and crontab install units and schedules.
+        "at",
+        "batch",
+        "systemd-run",
+        "crontab",
+        # Repeaters: watch (above), entr runs a command on file change.
+        "entr",
+        # Egress clients probed by the P1-e3 audit, denied until modeled
+        # or until the destination-aware egress rule covers them.
+        "sftp",
+        "mosh",
+        "gh",
+        "curlie",
+        "xh",
+        "httpx",
+        "tftp",
+        "fetch",
+        "openssl s_client",
+        "openssl s_server",
         # Recognized dangerous Git forms (push, checkout, restore, stash
         # drop/clear, switch --discard-changes/-f, reflog expire/delete) are
         # no longer denylist entries: they are classified per operation by
@@ -1086,6 +1294,37 @@ def _operand_resolution_cwds(
     return _operand_guardrail_cwds(token, tokens, possible_cwds)
 
 
+def _rm_operands(tokens: list[str]) -> list[str]:
+    """The positional operands of one rm invocation.
+
+    GNU rm permutes options, so the scan keeps skipping option tokens after
+    an operand (``rm dir -rf`` is recursive) until ``--`` ends option
+    scanning; a bare ``-`` is an operand (a file named ``-``), not an option.
+    """
+    operands: list[str] = []
+    options_ended = False
+    for token in tokens[1:]:
+        if token == "--" and not options_ended:
+            options_ended = True
+            continue
+        if not options_ended and token.startswith("-") and token != "-":
+            continue
+        operands.append(token)
+    return operands
+
+
+def _rm_operand_glob_bearing(token: str) -> bool:
+    """Whether the shell pathname-expands this rm operand.
+
+    The same active-metacharacter reading the path layer's glob rule uses: a
+    plain ``str`` carries no quote provenance, so its metacharacters read as
+    unquoted, and a quoted glob still analyzes as its (superset) expansion.
+    """
+    return any(character in token for character in "*?") or _has_active_bracket_glob(
+        token.encode()
+    )
+
+
 # Metadata files whose content selects the programs git runs or the repository
 # identity itself. A hard link is invisible to path resolution, so write-time
 # containment compares (device, inode) identities against exactly these files.
@@ -1285,6 +1524,7 @@ class ShellPermissionResolver:
             [], tuple[DangerousCommandAuthority, ...]
         ]
         | None = None,
+        injected_env: Mapping[str, str] | None = None,
     ) -> None:
         self.config = config
         self.cwd = cwd
@@ -1295,6 +1535,11 @@ class ShellPermissionResolver:
         self._dangerous_command_authorities = dangerous_command_authorities or (
             lambda: ()
         )
+        # Trust-gated project-injected variables, not the full subprocess
+        # environment. The egress rule inspects injected non-loopback proxies;
+        # ambient, non-injected environment variables remain uninspected.
+        # Direct classifier users may omit this mapping.
+        self._injected_env = injected_env
 
     def _authorities(self) -> tuple[DangerousCommandAuthority, ...]:
         """The immutable dangerous-command authority snapshot for this call."""
@@ -1442,16 +1687,59 @@ class ShellPermissionResolver:
                 return _denied(Diagnostic("denylist", matched, part))
             if self._is_standalone_denylisted(part):
                 return _denied(Diagnostic("standalone", command_part=part))
-        for entry, tokens, possible_cwds, cwd_unknown in _scoped_guardrail_cwds(
-            expanded, self.cwd
+        state_cache: dict[tuple[Path, Path | None, bool, frozenset[Path]], bool] = {}
+        scoped = list(_scoped_guardrail_cwds(expanded, self.cwd))
+        policies = [
+            ShellCommandPolicy()
+            if entry.access is not None
+            else analyze_shell_command_policy(tokens)
+            for entry, tokens, _possible_cwds, _cwd_unknown in scoped
+        ]
+        # Recovery evidence must survive every statement's rm operands, mv
+        # sources, and collected writes, regardless of statement order. Earlier
+        # writes also invalidate the later rm's clean-tree eligibility scope.
+        # Two separate bash calls remain outside one resolution's view: each
+        # uses the current on-disk state, with no cross-call state kept.
+        call_footprint: frozenset[Path] | None = frozenset()
+        prior_writes: list[frozenset[Path] | None] | None = None
+        if any(
+            policy.requires_approval
+            and policy.diagnostic is not None
+            and policy.diagnostic.code == "recursive_rm"
+            for policy in policies
         ):
+            call_footprint = self._call_recovery_destruction_footprint(scoped)
+            prior_writes = self._prior_write_surfaces(scoped)
+        for position, (entry, tokens, possible_cwds, cwd_unknown) in enumerate(scoped):
             if entry.access is not None:
                 continue
             part = entry.text
             if self._is_sensitive(part):
                 return _denied(Diagnostic("sensitive_command"))
-            policy = analyze_shell_command_policy(tokens)
+            policy = policies[position]
             if policy.requires_approval:
+                if (
+                    policy.diagnostic is not None
+                    and policy.diagnostic.code == "recursive_rm"
+                    and self._recursive_rm_eligible(
+                        tokens,
+                        possible_cwds,
+                        cwd_unknown,
+                        state_cache,
+                        call_footprint=call_footprint,
+                        prior_writes=(
+                            prior_writes[position]
+                            if prior_writes is not None
+                            else frozenset()
+                        ),
+                    )
+                ):
+                    # Run-class under the full P2-c condition: every expanded
+                    # operand is in-repository, metadata-excluding, and
+                    # recovery-established. The path layer still gates each
+                    # operand independently — a run-class resolution dies at
+                    # a gate — and every other denial path is unchanged.
+                    continue
                 diagnostic = (
                     Diagnostic(
                         "command", detail="find execution predicates are not permitted"
@@ -1467,6 +1755,302 @@ class ShellPermissionResolver:
             if risk := self._repository_config_risk(tokens, policy, possible_cwds):
                 return _denied(Diagnostic("command", detail=risk, command_part=part))
         return None
+
+    def _call_recovery_destruction_footprint(
+        self, scoped: list[tuple[_GuardrailPart, list[str], set[Path], bool]]
+    ) -> frozenset[Path] | None:
+        """All rm operands, mv sources, and collected writes across this call.
+
+        A recovery target equal to or below any member cannot survive. All
+        statements contribute regardless of order or conditional execution;
+        directories conservatively cover their whole subtree. Each operand
+        resolves under every possible cwd, with rm/mv source globs expanded.
+        Unknown effects fail recursive-rm eligibility closed, never silently
+        disappear from the destruction set.
+        """
+        footprint: set[Path] = set()
+        for entry, tokens, possible_cwds, cwd_unknown in scoped:
+            surface = self._segment_write_paths(
+                entry, tokens, possible_cwds, cwd_unknown
+            )
+            if surface is None:
+                return None
+            footprint.update(surface)
+            if not tokens or entry.access is not None:
+                continue
+            command = _part_command(tokens)
+            if command not in {"rm", "mv"}:
+                continue
+            if cwd_unknown or not possible_cwds:
+                return None
+            if command == "rm":
+                operands = _rm_operands(tokens)
+            else:
+                parsed = _scan_options(tokens[1:], _DESTINATION_POSITION_TABLES["mv"])
+                operands = list(
+                    parsed.positionals
+                    if parsed.values_for("-t", "--target-directory")
+                    else parsed.positionals[:-1]
+                )
+            for token in operands:
+                for cwd in possible_cwds:
+                    paths = self._rm_operand_paths(token, cwd)
+                    if paths is None:
+                        return None
+                    footprint.update(paths)
+        return frozenset(footprint)
+
+    def _prior_write_surfaces(
+        self, scoped: list[tuple[_GuardrailPart, list[str], set[Path], bool]]
+    ) -> list[frozenset[Path] | None]:
+        """Per-position prior write surfaces for a call holding a recursive-rm.
+
+        Indexed by expanded-part position: entry ``i`` holds the union of
+        the write surfaces of every statement that ends before the
+        statement containing part ``i``. A statement is one command
+        together with the synthetic redirect parts attached to it (they are
+        synthesized immediately before their command part), so a segment's
+        OWN redirects belong to its statement, not to an earlier one. None
+        marks a position whose earlier write surface could not be
+        established; a later recursive-rm segment fails closed on it.
+        """
+        priors: list[frozenset[Path] | None] = []
+        accumulated: frozenset[Path] | None = frozenset()
+        pending: frozenset[Path] | None = frozenset()
+        for entry, tokens, possible_cwds, cwd_unknown in scoped:
+            surface = self._segment_write_paths(
+                entry, tokens, possible_cwds, cwd_unknown
+            )
+            priors.append(accumulated)
+            if entry.access is not None:
+                # A synthetic redirect operand joins the statement of the
+                # command part that follows it, not a statement of its own.
+                pending = _union_write_surfaces(pending, surface)
+                continue
+            accumulated = _union_write_surfaces(
+                _union_write_surfaces(accumulated, pending), surface
+            )
+            pending = frozenset()
+        return priors
+
+    def _segment_write_paths(
+        self,
+        entry: _GuardrailPart,
+        tokens: list[str],
+        possible_cwds: set[Path],
+        cwd_unknown: bool,
+    ) -> frozenset[Path] | None:
+        """The resolved write surface of one expanded part, or None (unknown).
+
+        The surface is the existing per-segment write-path collection —
+        the same classification and resolution ``shell_command_write_paths``
+        applies (write-classified operands, write-path option values, the
+        mutating commands' own destinations), resolved against the part's
+        tracked cwds. None means the surface could not be established (an
+        unresolvable write operand, or eval/exec's opaque effects), which
+        callers treat as unknown and fail closed on.
+        """
+        if not tokens:
+            return frozenset()
+        if _part_command(tokens) in {"eval", "exec"}:
+            return None
+        part_command = _part_command(tokens)
+        git_write_values = frozenset()
+        git_write_cwds: frozenset[Path] | None = None
+        if part_command == "git":
+            git_write_values = _git_write_values(tokens)
+            if git_write_values:
+                relocated = git_cwd_relocations(tokens, possible_cwds)
+                if relocated is not None:
+                    git_write_cwds = frozenset(relocated)
+        paths: set[Path] = set()
+        for token in _write_candidates(entry, tokens, part_command):
+            if _write_operand_unresolvable(token, cwd_unknown):
+                return None
+            for operand_cwd in _operand_resolution_cwds(
+                token,
+                tokens,
+                possible_cwds,
+                git_write_values=git_write_values,
+                git_write_cwds=git_write_cwds,
+            ):
+                paths.add(resolve_tool_path(token, operand_cwd))
+        return frozenset(paths)
+
+    def _recursive_rm_eligible(  # noqa: PLR0911
+        self,
+        tokens: list[str],
+        possible_cwds: set[Path],
+        cwd_unknown: bool,
+        state_cache: dict[tuple[Path, Path | None, bool, frozenset[Path]], bool],
+        *,
+        call_footprint: frozenset[Path] | None,
+        prior_writes: frozenset[Path] | None,
+    ) -> bool:
+        """Whether one recursive rm resolves run-class (v0.5.9 P2-c decision 2).
+
+        Over a git-clean tree, run-class requires EVERY expanded operand to
+        lie entirely within the repository whose clean status is assessed,
+        to not overlap that repository's Git metadata (neither encompassing
+        the Git directory nor lying inside it, including linked-worktree
+        common directories), and to leave recovery established for every
+        repository contained in or overlapped by the operand (nested
+        repositories included). Recovery evidence must survive the ENTIRE
+        destruction footprint of the WHOLE CALL: a configured remote's fetch
+        target may not lie inside (or equal) any rm operand, mv source, or
+        collected write surface in any statement. A write an earlier
+        statement of the same call performs
+        inside the segment's eligibility scope — the operand footprint, the
+        assessed repository's work tree, or a nested repository's work tree
+        — fails the segment closed: the write dirties the clean-tree state
+        the eligibility relies on, or writes content the deletion destroys.
+        Every unestablishable aspect — operand scope, metadata overlap,
+        recovery status, expansion, resolution, an earlier statement's write
+        surface — and any mixed operand resolves the whole command to
+        handoff instead (the shipped blanket denial stays the fallback).
+        """
+        if cwd_unknown or call_footprint is None:
+            return False
+        if prior_writes is None:
+            # An earlier statement's write surface could not be established;
+            # it may land inside this segment's eligibility scope, so the
+            # eligibility fails closed.
+            return False
+        operands = _rm_operands(tokens)
+        if not operands:
+            # rm without operands removes nothing.
+            return True
+        for cwd in possible_cwds:
+            scope = resolve_repository_scope(cwd, GitRepositoryRelocation())
+            assessed = repository_state(scope) if scope is not None else None
+            if assessed is None:
+                # No repository governs this directory, or its metadata
+                # layout cannot be established: fail closed.
+                return False
+            # Include this segment's expanded operands in the whole-call
+            # destruction set; no recovery target may lie beneath a member.
+            resolved: list[Path] = []
+            for token in operands:
+                paths = self._rm_operand_paths(token, cwd)
+                if paths is None:
+                    return False
+                resolved.extend(paths)
+            deletion_footprint = call_footprint | frozenset(resolved)
+            # The assessed repository's own recovery: a clean tree and no
+            # in-progress operation. Its commits are not at risk — the
+            # metadata overlap check below protects its Git directory.
+            if not self._repository_recovery(
+                assessed,
+                commits_at_risk=False,
+                deletion_footprint=deletion_footprint,
+                cache=state_cache,
+            ):
+                return False
+            for operand in resolved:
+                if not self._rm_operand_eligible(
+                    operand, assessed, deletion_footprint, state_cache, prior_writes
+                ):
+                    return False
+        return True
+
+    def _rm_operand_paths(self, token: str, cwd: Path) -> list[Path] | None:
+        """The resolved paths one rm operand deletes, or None (fail closed).
+
+        A glob-bearing operand is pathname-expanded by the shell, so the
+        expanded match set is the operand set; an expansion the inspector
+        cannot faithfully evaluate fails closed, and an empty match set
+        leaves the literal word (bash passes it through unexpanded). A
+        home-relative glob is never expanded: the shell expands ``~`` before
+        globbing, so the inspector's literal reading would under-model it.
+        """
+        if not _rm_operand_glob_bearing(token):
+            return [resolve_tool_path(token, cwd)]
+        if token.startswith("~"):
+            return None
+        expansion = _pattern_expansion(cwd, token)
+        if isinstance(expansion, ExpansionFailure):
+            return None
+        if expansion:
+            return [match.resolve() for match, _word in expansion]
+        return [resolve_tool_path(token, cwd)]
+
+    def _rm_operand_eligible(
+        self,
+        operand: Path,
+        assessed: RepositoryState,
+        deletion_footprint: frozenset[Path],
+        state_cache: dict[tuple[Path, Path | None, bool, frozenset[Path]], bool],
+        prior_writes: frozenset[Path] | None,
+    ) -> bool:
+        """The full P2-c condition for one resolved rm operand."""
+        # (a) The operand lies entirely within the assessed repository. The
+        # assessed repository always carries a work tree; a state without
+        # one fails closed.
+        if assessed.work_tree is None or not operand.is_relative_to(assessed.work_tree):
+            return False
+        # (b) The operand does not overlap the repository's Git metadata —
+        # neither encompassing it nor lying inside it.
+        for metadata in assessed.metadata_dirs:
+            if operand.is_relative_to(metadata) or metadata.is_relative_to(operand):
+                return False
+        # (c) Recovery is established for every repository the operand
+        # contains or overlaps (nested repositories included). A repository
+        # whose Git metadata the operand would destroy additionally needs
+        # its commits to be safe: no commit may exist that no
+        # remote-tracking ref reaches, and the recovery copy behind a
+        # configured remote must survive the ENTIRE deletion footprint —
+        # this operand and every other operand of the same command.
+        nested = repositories_intersecting(operand, assessed)
+        if nested is None:
+            return False
+        if prior_writes:
+            # (d) No earlier statement of the same call writes into this
+            # segment's eligibility scope: the operand footprint, the
+            # assessed repository's work tree, or a nested repository's
+            # work tree. Such a write dirties the clean-tree state the
+            # eligibility relies on, or writes content the deletion
+            # destroys, so the eligibility fails closed.
+            protected = {
+                operand,
+                assessed.work_tree,
+                *(repo.work_tree for repo in nested if repo.work_tree is not None),
+            }
+            if any(
+                write.is_relative_to(location)
+                for write in prior_writes
+                for location in protected
+            ):
+                return False
+        for repo in nested:
+            commits_at_risk = any(
+                metadata.is_relative_to(operand) for metadata in repo.metadata_dirs
+            )
+            if not self._repository_recovery(
+                repo,
+                commits_at_risk=commits_at_risk,
+                deletion_footprint=deletion_footprint,
+                cache=state_cache,
+            ):
+                return False
+        return True
+
+    def _repository_recovery(
+        self,
+        repo: RepositoryState,
+        *,
+        commits_at_risk: bool,
+        deletion_footprint: frozenset[Path],
+        cache: dict[tuple[Path, Path | None, bool, frozenset[Path]], bool],
+    ) -> bool:
+        """The cached recovery verdict for one repository under one deletion."""
+        key = (repo.git_dir, repo.work_tree, commits_at_risk, deletion_footprint)
+        if key not in cache:
+            cache[key] = repository_recovery(
+                repo,
+                commits_at_risk=commits_at_risk,
+                deletion_footprint=deletion_footprint,
+            )
+        return cache[key]
 
     def _resolve_preconditions(self) -> PermissionContext | None:
         if self.config.permission == ToolPermission.NEVER:
@@ -1889,7 +2473,11 @@ class ShellPermissionResolver:
         against every tracked cwd, including executor child directories);
         the literal ``.git`` component check catches metadata spelled into the
         operand itself; the inode comparison catches a pre-existing hard link
-        to a critical metadata file, which path resolution cannot see.
+        to a critical metadata file, which path resolution cannot see. A
+        nested bare repository's metadata is gated the same way: the operand's
+        own resolved ancestry is probed for git's bare-repository markers, so
+        an operand reaching inside a nested bare repository denies exactly
+        like a ``.git`` operand, through symlinked components included.
         """
         if ".git" in Path(token).parts or ".git" in resolved.parts:
             return "metadata_operand"
@@ -1897,6 +2485,13 @@ class ShellPermissionResolver:
             return "metadata_operand"
         if _is_hardlinked_metadata(resolved, guard.inodes):
             return "metadata_hardlink"
+        reaches = path_reaches_bare_repository(resolved)
+        if reaches is None:
+            # The bare-repository probe failed, so the operand's containment
+            # cannot be established; fail closed.
+            return "metadata_unlocated"
+        if reaches:
+            return "metadata_operand"
         return None
 
     def _redirect_metadata_permission(
@@ -1924,11 +2519,22 @@ class ShellPermissionResolver:
                     # file; path resolution cannot see it, the inode can.
                     hit = "metadata_hardlink"
                     break
+                reaches = path_reaches_bare_repository(resolved)
+                if reaches is None:
+                    # The bare-repository probe failed, so the target's
+                    # containment cannot be established; fail closed.
+                    hit = "metadata_unlocated"
+                    break
+                if reaches:
+                    # A nested bare repository's metadata is gated like a
+                    # .git target: the redirect writes inside it.
+                    hit = "metadata_redirect"
+                    break
             if hit is not None:
                 return _denied(Diagnostic(hit, path))
         return None
 
-    def _resolve_dangerous_command_permission(  # noqa: PLR0911
+    def _resolve_dangerous_command_permission(  # noqa: PLR0911, PLR0912
         self, args: ShellCommandArgs, expanded: list[_GuardrailPart]
     ) -> PermissionContext | None:
         """Classify the whole expanded call and deny missing dangerous authority.
@@ -1942,6 +2548,15 @@ class ShellPermissionResolver:
         remote of every candidate repository: git resolves an unconfigured
         destination as a URL, so the push would run the destination's
         receive-pack and hooks.
+
+        The modeled network clients (v0.5.9 P2-a) classify here too: a
+        curl/wget invocation whose destination is not literal loopback (or
+        whose recognizer cannot parse it — fail-closed, never loopback) or
+        whose destination-changing behavior gate fired resolves ask-class as
+        the network.egress operation, the same grantable class as git push,
+        so the runtime approval flow (dialog in interactive main sessions,
+        denial with remediation in headless and child sessions) composes
+        unchanged.
         """
         authorities = self._authorities()
         missing: dict[str, RepositoryScope] = {}
@@ -1950,6 +2565,49 @@ class ShellPermissionResolver:
         ):
             if entry.access is not None or not tokens:
                 continue  # Synthetic redirect operands are not executable commands.
+            egress = classify_network_egress(
+                tokens,
+                self._injected_env,
+                command_env=dict(entry.assignments) if entry.assignments else None,
+            )
+            if egress.kind == "ask":
+                if cwd_unknown:
+                    return _denied(
+                        Diagnostic(
+                            "dangerous_guard",
+                            detail=(
+                                "the working directory at this network client "
+                                "is not statically known, so its repository "
+                                f"scope cannot be located ({egress.reason})"
+                            ),
+                            command_part=entry.text,
+                        )
+                    )
+                egress_scopes: set[RepositoryScope] = set()
+                for cwd in possible_cwds:
+                    scope = resolve_repository_scope(cwd, GitRepositoryRelocation())
+                    if scope is None:
+                        return _denied(
+                            Diagnostic(
+                                "dangerous_guard",
+                                detail=(
+                                    "the repository scope for this network "
+                                    f"client cannot be located ({egress.reason})"
+                                ),
+                                command_part=entry.text,
+                            )
+                        )
+                    egress_scopes.add(scope)
+                covered = all(
+                    any(
+                        "network.egress" in authority.operations
+                        and authority.scope == scope
+                        for authority in authorities
+                    )
+                    for scope in egress_scopes
+                )
+                if not covered and "network.egress" not in missing:
+                    missing["network.egress"] = min(egress_scopes, key=_scope_sort_key)
             classification = classify_dangerous_git_command(tokens)
             if classification.kind == "routine":
                 continue
@@ -2078,6 +2736,7 @@ class ShellPermissionResolver:
                 scratchpad_roots=scratchpad_roots,
                 redirect_operands=analysis.redirect_operands,
                 workspace_roots=workspace_roots,
+                command_assignments=analysis.command_assignments,
             )
         except _UnsafeShellSyntax as exc:
             return _denied(
@@ -2162,3 +2821,289 @@ class ShellPermissionResolver:
         if dangerous_permission is not None:
             return dangerous_permission
         return PermissionContext(permission=ToolPermission.ALWAYS)
+
+
+def _union_write_surfaces(
+    left: frozenset[Path] | None, right: frozenset[Path] | None
+) -> frozenset[Path] | None:
+    """The union of two write surfaces; None (unknown) poisons the union."""
+    if left is None or right is None:
+        return None
+    return left | right
+
+
+#: The write-root token: a collected value naming the directory tree a
+#: command writes into whose members the command names only implicitly (an
+#: extraction's member names, a patch's target paths). It is never a literal
+#: operand token, so it bypasses the candidates filter in _write_candidates
+#: and resolves against the tracked cwds like any relative operand.
+_CWD_ROOT_WRITE = "."
+
+
+def _unzip_extraction_root(tokens: list[str]) -> tuple[str, ...]:
+    """The extraction root of one unzip call: -d's value, else the cwd."""
+    parsed = _scan_options(tokens[1:], _WRITE_OPERAND_TABLES["unzip"])
+    if parsed.values:
+        # -d names the extraction destination; its value is collected
+        # through the write-operand table.
+        return ()
+    if _has_short(
+        parsed, frozenset("lptvzZh"), _WRITE_OPERAND_TABLES["unzip"]
+    ) or _has_long(parsed, "--help", "--version"):
+        # The listing, test, pipe, and comment modes write nothing outside
+        # -d: the archive is a read and the members never reach the disk.
+        return ()
+    # The archive operand must be present: with no archive the call prompts
+    # for it and, this harness's stdin closed, never extracts.
+    return (_CWD_ROOT_WRITE,) if parsed.positionals else ()
+
+
+def _patch_target_root(tokens: list[str]) -> tuple[str, ...]:
+    """The directory tree one patch call writes: -o/-d's value, else the cwd."""
+    parsed = _scan_options(tokens[1:], _WRITE_OPERAND_TABLES["patch"])
+    if parsed.values_for("-o", "--output") or parsed.values_for("-d", "--directory"):
+        # The -o output, -d directory, -r rejects, and -B/-Y backup names
+        # are collected through the write-operand table.
+        return ()
+    if _has_long(parsed, "--help", "--version"):
+        return ()
+    # Without -o the patched result replaces every target file the diff
+    # names in place, under the working directory (the -d value when the
+    # call relocates) — the directory root covers them all.
+    return (_CWD_ROOT_WRITE,)
+
+
+def _mutating_destination_writes(  # noqa: PLR0911
+    command: str, tokens: list[str], policy: ShellCommandPolicy
+) -> tuple[str, ...]:
+    """The destination operands one mutating command writes itself.
+
+    cp/mv/install write their final positional — every earlier positional
+    is a source — unless -t/--target-directory names the destination
+    directory, in which case every positional is a source and the option
+    value (already collected through the write-operand table) is the write;
+    install's -D only creates the destination's leading components, so the
+    final positional stays the write there too. The destination-position
+    table scans the command's full value-taking option surface, so a
+    value-taking option spelled AFTER the operands (cp's -S .bak,
+    install's -m 644) consumes its value and the true final positional
+    stays the destination. objcopy's written output is the cp-destination
+    analog: the final positional is the written output, and a lone
+    positional is the in-place-rewritten input. zip's first positional is
+    the archive every invocation creates, replaces, or rewrites (the tar
+    -f treatment: write-classified either way). 7z's archive operand
+    follows the command letter, and only the archive-rewriting commands
+    (a/d/u/rn) name it as a write — the extracting, listing, and testing
+    ones leave it unchanged. dd parses no getopt options: its operands
+    are native ``name=value`` assignments, and of= names the written
+    output file (if= names the read input and stays uncollected).
+    sed/gsed rewrite every input file in place under -i/--in-place;
+    without it the inputs are reads and stay uncollected (the w/W
+    script targets are collected through the policy's write-path
+    values). unzip and patch write member/target names no operand
+    names: their extraction/patching root is -d/-o's value when given
+    (collected through the write-operand table) and the cwd tree root
+    otherwise. These operands are MUTATE-classified positionals the
+    path layer scopes as a whole (the cwd-root token resolves like any
+    relative operand), so collecting them changes no permission
+    decision: it is scan-scope coverage only, closing the copy-channel
+    gap — a file written through cp/mv/install/dd/sed -i, an archive
+    built by zip/7z, an unzip extraction, or a patch application now
+    reaches the submission secret scan exactly like a redirect or tee
+    target does.
+    """
+    if command in _DESTINATION_POSITION_TABLES:
+        parsed = _scan_options(tokens[1:], _DESTINATION_POSITION_TABLES[command])
+        if not parsed.positionals:
+            return ()
+        if command == "zip":
+            return (parsed.positionals[0],)
+        if command in {"cp", "mv", "install"} and parsed.values_for(
+            "-t", "--target-directory"
+        ):
+            return ()
+        return (parsed.positionals[-1],)
+    if command in {"7z", "7za", "7zr"}:
+        parsed = _scan_options(tokens[1:], _SEVENZIP_TABLE)
+        if (
+            parsed.positionals
+            and parsed.positionals[0] in _SEVENZIP_ARCHIVE_WRITING_COMMANDS
+        ):
+            return (parsed.positionals[1],) if len(parsed.positionals) > 1 else ()
+        return ()
+    if command == "dd":
+        return tuple(
+            token[3:] for token in tokens[1:] if token.startswith("of=") and token[3:]
+        )
+    if command == "unzip":
+        return _unzip_extraction_root(tokens)
+    if command == "patch":
+        return _patch_target_root(tokens)
+    if command == "git" and git_apply_cwd_root_write(tokens):
+        # A plain git apply patches the paths the diff names, relative to
+        # the current directory: the cwd tree root is the write root, and
+        # the git write-operand resolution below resolves it against the
+        # directories git's own -C sequence relocates the tracked cwds to.
+        return (_CWD_ROOT_WRITE,)
+    if command in {"sed", "gsed"} and policy.mutates_files:
+        return policy.positional_values or ()
+    return ()
+
+
+def _write_candidates(
+    entry: _GuardrailPart, tokens: list[str], command: str
+) -> tuple[str, ...]:
+    """The path candidates of one expanded part the policy layer classifies as writes.
+
+    The write surface is exactly the resolver's own classification, never a
+    re-derivation from the command text: every operand of a WRITE-classified
+    part (a synthetic redirect operand, or a tee/mkdir/touch command), every
+    ``write_path_values`` operand (git's raw writes, a modeled network
+    client's -o/-O/--rejected-log-style write options), and — for the
+    commands whose whole policy option surface is write operands (cp/mv/
+    install/ln -t, patch, tar, the compilers' -o/--output, ...) — every
+    ``option_path_values`` operand. The remaining MUTATE-classified
+    positionals are mixed-source/destination surface the policy layer does
+    not decompose, so they stay uncollected — except the destinations the
+    commands write themselves (a cp/mv/install/objcopy final positional, a
+    zip archive, a 7z archive operand, a dd of= output, a sed -i input
+    file) and the cwd-tree roots (an unzip extraction, a patch application,
+    a plain git apply), which the submission scan must see; collecting them
+    charges the session for no file a command merely read or touched.
+    """
+    policy = analyze_shell_command_policy(tokens)
+    candidates = tuple(
+        token
+        for token in path_candidates(
+            tokens,
+            inspect_positional_paths=command in _PATH_COMMANDS,
+            inspect_executable=entry.inspect_executable,
+        )
+        if token != "<redirect>"
+    )
+    if entry.access == PathAccess.WRITE or _operand_access(command) == PathAccess.WRITE:
+        return candidates
+    writes = [token for token in candidates if token in policy.write_path_values]
+    if command in _WRITE_OPERAND_TABLES or command in _COMPILER_OUTPUT_COMMANDS:
+        writes.extend(
+            value for value in policy.option_path_values if value in candidates
+        )
+    writes.extend(
+        value
+        for value in _mutating_destination_writes(command, tokens, policy)
+        if value in candidates or value == _CWD_ROOT_WRITE
+    )
+    return tuple(dict.fromkeys(writes))
+
+
+def _git_write_values(tokens: list[str]) -> frozenset[str]:
+    """The write-path operands one git invocation's operand resolution covers.
+
+    The policy's write-path values (a writing config --file, an archive
+    --output, an apply --directory/--output, an init/worktree/submodule
+    destination) plus the derived cwd-tree root of a plain git apply: the
+    cwd-root token resolves against the directories git's own -C sequence
+    relocates the tracked cwds to, exactly like every git write operand.
+    """
+    values = frozenset(analyze_shell_command_policy(tokens).write_path_values)
+    if git_apply_cwd_root_write(tokens):
+        return frozenset({*values, _CWD_ROOT_WRITE})
+    return values
+
+
+def _write_operand_unresolvable(token: str, cwd_unknown: bool) -> bool:
+    """Whether the path layer would deny this write operand instead of resolving it.
+
+    A glob-bearing write operand fails closed at the path-glob rule (only
+    read-context globs are modeled), and a relative operand under an unknown
+    cwd fails closed at the cwd rule; either way the command never runs, so
+    the run-phase extraction reports an unknown footprint rather than a
+    partial path set.
+    """
+    if cwd_unknown and not Path(token).is_absolute() and not token.startswith("~"):
+        return True
+    return (
+        isinstance(token, PatternGlobCandidate)
+        or any(character in token for character in "*?")
+        or _has_active_bracket_glob(token.encode())
+    )
+
+
+def shell_command_write_paths(
+    command: str, *, cwd: Path, workspace: Workspace, authority: PathAuthority
+) -> tuple[list[str], bool]:
+    """The resolved paths a shell command's write-classified operands name.
+
+    Returns ``(paths, unknown)``: the command's write surface, resolved
+    exactly as the permission path layer resolves every operand (occurrence
+    position, tracked cwd, git's own -C relocation), and whether that surface
+    could not be established. The extraction reuses the resolver's analysis —
+    segmentation, expansion, redirect synthesis, and the path layer's write
+    classification — never a pattern over the command text.
+
+    A command the resolver denies never runs and produces no result, so its
+    surface never reaches a submission; ``unknown`` is the fail-closed
+    outcome for a run-phase call whose analysis cannot be reproduced. The
+    surface is established exactly when the syntax analysis fully walked the
+    command with no findings: any approval reason — an unmodeled construct,
+    a non-literal redirection target, a failed analysis — is a hard denial
+    the resolver never clears (a grant cannot lift an analysis-level
+    reason), so the command never runs, and the extraction refuses to
+    certify a partial path set. The submission gate treats an unknown
+    footprint as unscannable content.
+    """
+    try:
+        scratchpad_roots = effective_scratchpad_roots(authority)
+        workspace_roots = frozenset(workspace.authorized_roots)
+        analysis = _analyze_guardrail_source(
+            command, scratchpad_roots=scratchpad_roots, workspace_roots=workspace_roots
+        )
+        if analysis.approval_reasons:
+            return [], True
+        command_parts = list(analysis.command_parts)
+        expanded, _inner_redirects, inner_errors = _expand_guardrail_parts(
+            command_parts,
+            scratchpad_roots=scratchpad_roots,
+            redirect_operands=analysis.redirect_operands,
+            workspace_roots=workspace_roots,
+            command_assignments=analysis.command_assignments,
+        )
+        if inner_errors:
+            return [], True
+        if any(
+            _split_command_tokens(part)
+            and _split_command_tokens(part)[0] in {"eval", "exec"}
+            for part in (entry.text for entry in expanded)
+        ):
+            return [], True
+        collected: dict[str, None] = {}
+        for entry, tokens, possible_cwds, cwd_unknown in _scoped_guardrail_cwds(
+            expanded, cwd
+        ):
+            if not tokens:
+                continue
+            part_command = _part_command(tokens)
+            git_write_values = frozenset()
+            git_write_cwds: frozenset[Path] | None = None
+            if part_command == "git":
+                git_write_values = _git_write_values(tokens)
+                if git_write_values:
+                    relocated = git_cwd_relocations(tokens, possible_cwds)
+                    if relocated is not None:
+                        git_write_cwds = frozenset(relocated)
+            for token in _write_candidates(entry, tokens, part_command):
+                if _write_operand_unresolvable(token, cwd_unknown):
+                    return [], True
+                for operand_cwd in _operand_resolution_cwds(
+                    token,
+                    tokens,
+                    possible_cwds,
+                    git_write_values=git_write_values,
+                    git_write_cwds=git_write_cwds,
+                ):
+                    collected[str(resolve_tool_path(token, operand_cwd))] = None
+        return list(collected), False
+    except Exception:
+        # Fail closed: an extraction that cannot complete leaves the write
+        # surface unknown rather than guessing a partial path set.
+        return [], True

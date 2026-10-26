@@ -82,12 +82,13 @@ def resolve_identity_candidate(
     through the committed-model path.
 
     ``routes`` is the purpose-route table the resolution consumes. Launch
-    admission passes the CONVERSATION'S FROZEN route table (the bound
-    bundle's captured snapshot — the same source the rendered
-    launch-target table carries), never the reloaded live config, so a
-    mid-conversation route edit stays pending instead of producing a
-    mixed-generation launch (design §6, §10). ``None`` keeps the live
-    config's table for direct, conversation-less callers.
+    admission passes the conversation's LIVE route table — the in-memory
+    ``[orchestration.routes]`` table the reload swaps atomically, the same
+    source the rendered launch-target table carries — so a validated route
+    edit applies to every launch admitted after the reload commit, while
+    already-admitted launches keep their pinned bindings (ADR 0022).
+    ``None`` keeps the live config's table for direct, conversation-less
+    callers.
     """
     from chartreux.core.agents.identity_launch import resolve_identity_launch
     from chartreux.core.agents.launch import resolve_launch

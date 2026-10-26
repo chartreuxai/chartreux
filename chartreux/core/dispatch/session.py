@@ -22,6 +22,13 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from chartreux.core.dispatch.route_models import (
+    AppliedRouteChange,
+    PurposeRoute,
+    RouteTarget,
+)
+from chartreux.core.dispatch.routes import SESSION_MODEL
+
 if TYPE_CHECKING:
     from chartreux.core.config import ChartreuxConfigSchema
     from chartreux.core.config.harness_files import HarnessFilesManager
@@ -173,12 +180,19 @@ def pending_policy_changes(
     conversations only. The resource comparison resolves the BOUND selections
     through the strict loader: a live reread for REPORTING only, never for
     prompt refresh.
+
+    Purpose routes are NOT pending policy: routes are bindings, not frozen
+    content (ADR 0022) — a validated route edit applies to subsequent launch
+    admissions in the same conversation and is reported at the reload commit
+    by :func:`live_route_changes` (diffed against the previous live table)
+    and at resume by :func:`applied_route_changes` (diffed against the
+    frozen bind-time snapshot).
     """
     from chartreux.core.policy.composition import (
         policy_resource_loader,
         user_resource_directories,
     )
-    from chartreux.core.policy.manifest import resource_revision, routes_from_snapshot
+    from chartreux.core.policy.manifest import resource_revision
     from chartreux.core.policy.models import ResourceKind
 
     manifest = activated.manifest
@@ -224,19 +238,95 @@ def pending_policy_changes(
                 "the frozen content — the edit applies to new conversations "
                 "only"
             )
-    # Purpose routes are frozen policy too (design §6: the manifest records
-    # the route/launch-target snapshot; §10: a reload never re-postures):
-    # the saved [orchestration.routes] table is compared against the
-    # frozen snapshot — the same table launch admission consumes — and a
-    # saved route edit is reported as pending, never half-applied.
-    frozen_routes = routes_from_snapshot(manifest.route_snapshot)
-    saved_routes = config.purpose_routes.routes
-    for purpose in sorted(set(frozen_routes) | set(saved_routes)):
-        if frozen_routes.get(purpose) != saved_routes.get(purpose):
-            notes.append(
-                f"pending [orchestration.routes] change for purpose "
-                f"{purpose!r}: the conversation stays bound to its frozen "
-                "route table; the saved route edit applies to new "
-                "conversations only"
-            )
     return tuple(notes)
+
+
+def _route_target_summary(target: RouteTarget, session_model: str) -> str:
+    """One target's compact summary for the applied-route report."""
+    model = session_model if target.model == SESSION_MODEL else target.model
+    seat = f"{target.seat}: " if target.seat else ""
+    return f"{seat}{target.identity} on {model}"
+
+
+def _route_summary(route: PurposeRoute | None, session_model: str) -> str:
+    """A route's compact old/new summary (``—`` when the side is absent)."""
+    if route is None:
+        return "—"
+    return "; ".join(
+        _route_target_summary(target, session_model) for target in route.targets
+    )
+
+
+def _route_changes(
+    before: Mapping[str, PurposeRoute],
+    after: Mapping[str, PurposeRoute],
+    session_model: str,
+) -> tuple[AppliedRouteChange, ...]:
+    """The old → new route report between two route tables, per purpose."""
+    changes: list[AppliedRouteChange] = []
+    for purpose in sorted(set(before) | set(after)):
+        old = before.get(purpose)
+        new = after.get(purpose)
+        if old == new:
+            continue
+        changes.append(
+            AppliedRouteChange(
+                purpose=purpose,
+                before=_route_summary(old, session_model),
+                after=_route_summary(new, session_model),
+            )
+        )
+    return tuple(changes)
+
+
+def applied_route_changes(
+    config: ChartreuxConfigSchema, activated: ActivatedPolicy
+) -> tuple[AppliedRouteChange, ...]:
+    """The route edits a RESUME adopts, old → new per purpose (ADR 0022).
+
+    Routes are bindings, not frozen content: a validated route edit applies
+    to subsequent launch admissions in the same conversation, while every
+    already-admitted launch keeps its pinned binding. A resumed conversation
+    adopts the current saved table, and this report states the diff against
+    the manifest's bind-time route snapshot — the frozen integrity and diff
+    anchor — so the resume notice says exactly what the conversation's
+    admission source changed from. An empty tuple means the saved table
+    matches the snapshot.
+    """
+    from chartreux.core.dispatch.renderer import session_model_alias
+    from chartreux.core.policy.manifest import routes_from_snapshot
+
+    return _route_changes(
+        routes_from_snapshot(activated.manifest.route_snapshot),
+        config.purpose_routes.routes,
+        session_model_alias(config),
+    )
+
+
+def live_route_changes(
+    config: ChartreuxConfigSchema,
+    previous_live: Mapping[str, PurposeRoute] | None,
+    activated: ActivatedPolicy,
+) -> tuple[AppliedRouteChange, ...]:
+    """The route edits a RELOAD applies, diffed against the previous LIVE table.
+
+    The reload notice reports what the live admission source changed at THIS
+    reload: A -> B -> C reports "A -> B" then "B -> C", a revert reports
+    "B -> A", and a reload that leaves the table unchanged reports nothing —
+    never the bind-time differences a frozen-snapshot diff would repeat.
+    ``previous_live`` is the last-seen live table the conversation tracked;
+    None means no reload has committed in this conversation yet, so the diff
+    base is the frozen bind-time snapshot: the first reload reports against
+    bind time, exactly as the resume notice does. The frozen snapshot stays
+    the integrity anchor and the resume notice's diff base; only the reload
+    notice's diff base moves to the live table. An empty tuple means the
+    reload left the live route table unchanged.
+    """
+    from chartreux.core.dispatch.renderer import session_model_alias
+    from chartreux.core.policy.manifest import routes_from_snapshot
+
+    if previous_live is None:
+        previous_live = routes_from_snapshot(activated.manifest.route_snapshot)
+    return _route_changes(
+        previous_live, config.purpose_routes.routes, session_model_alias(config)
+    )
