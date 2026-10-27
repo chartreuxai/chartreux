@@ -2330,8 +2330,10 @@ async def test_identity_keyed_launch_resolves_canonically(
         child = record.runtime.agent_loop
         assert child._bound_identity == "researcher"
         assert child.launch_identity == "researcher"
-        # The researcher posture: non-mutating personal tool set.
-        assert "edit" not in child.tool_manager.available_tools
+        # The researcher posture: the v0.5.9 carve-out admits the mutating
+        # builtin set on the personal axis; the delegation axis stays
+        # non-mutating (pinned separately in tests/tools/test_identity_posture.py).
+        assert "edit" in child.tool_manager.available_tools
         assert "read_file" in child.tool_manager.available_tools
         # The session default is the committed session binding.
         assert child.committed_model is not None

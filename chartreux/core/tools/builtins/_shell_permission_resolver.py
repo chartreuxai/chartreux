@@ -6,6 +6,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from functools import lru_cache
+from io import StringIO
 import os
 from pathlib import Path
 import re
@@ -22,7 +23,7 @@ from chartreux.core.dangerous_commands import (
     RepositoryScope,
     operations_for_ids,
 )
-from chartreux.core.tools.base import ToolPermission
+from chartreux.core.tools.base import ToolError, ToolPermission
 from chartreux.core.tools.builtins._destination import classify_network_egress
 from chartreux.core.tools.builtins._shell_argv import (
     PatternGlobCandidate,
@@ -34,12 +35,16 @@ from chartreux.core.tools.builtins._shell_argv import (
 from chartreux.core.tools.builtins._shell_command_policy import (
     _COMPILER_OUTPUT_COMMANDS,
     _DESTINATION_POSITION_TABLES,
+    _GIT_CHECKOUT_TABLE,
+    _GIT_SUBCOMMAND_INDEX,
     _SEVENZIP_ARCHIVE_WRITING_COMMANDS,
     _SEVENZIP_TABLE,
     _WRITE_OPERAND_TABLES,
     ShellCommandPolicy,
     _has_long,
     _has_short,
+    _scan_classified_git_options,
+    _scan_git_globals,
     analyze_shell_command_policy,
     canonical_git_command,
     classify_dangerous_git_command,
@@ -66,9 +71,13 @@ from chartreux.core.tools.builtins._shell_diagnostics import (
 )
 from chartreux.core.tools.builtins._shell_git_state import (
     RepositoryState,
+    config_selects_program,
+    in_progress_operation,
+    local_branch_exists,
     repositories_intersecting,
     repository_recovery,
     repository_state,
+    work_tree_is_clean,
 )
 from chartreux.core.tools.builtins._shell_permission_analysis import (
     _REDIRECTION_DEVICES,
@@ -1846,9 +1855,20 @@ class ShellPermissionResolver:
         the same classification and resolution ``shell_command_write_paths``
         applies (write-classified operands, write-path option values, the
         mutating commands' own destinations), resolved against the part's
-        tracked cwds. None means the surface could not be established (an
-        unresolvable write operand, or eval/exec's opaque effects), which
-        callers treat as unknown and fail closed on.
+        tracked cwds — PLUS the mutation scope of a checkout/switch
+        invocation: its resolved work-tree root is a bulk work-tree write
+        the recovery/destruction analysis accounts exactly like any other
+        segment write (an earlier checkout/switch dirties the clean-tree
+        state a later recursive-rm segment's eligibility relies on, and its
+        root joins the whole call's destruction footprint). None means the
+        surface could not be established (an unresolvable write operand,
+        eval/exec's opaque effects, or an unresolvable checkout/switch
+        root), which callers treat as unknown and fail closed on.
+
+        The mutation root is a PERMISSION-footprint member only: the
+        run-phase submission-scan extraction (``shell_command_write_paths``)
+        never collects it — the scan walks its collected paths recursively
+        with a bounded budget, and a work-tree root would burn it.
         """
         if not tokens:
             return frozenset()
@@ -1875,6 +1895,26 @@ class ShellPermissionResolver:
                 git_write_cwds=git_write_cwds,
             ):
                 paths.add(resolve_tool_path(token, operand_cwd))
+        if _git_mutation_root_subcommand(tokens) is not None:
+            # A checkout/switch rewrites tracked work-tree content in
+            # bulk: its mutation scope — the resolved work-tree root — is
+            # a segment write, resolved exactly as the mutation-roots
+            # footprint resolves it.
+            if (
+                cwd_unknown
+                or not possible_cwds
+                or any(name.startswith("GIT_") for name, _value in entry.assignments)
+            ):
+                # The root the invocation would mutate cannot be
+                # established: an unknown cwd, or a GIT_-prefixed assignment
+                # (GIT_DIR/GIT_WORK_TREE) relocating the invocation outside
+                # the modeled resolution.
+                return None
+            for possible_cwd in possible_cwds:
+                root = resolve_git_work_tree(tokens, possible_cwd)
+                if root is None:
+                    return None
+                paths.add(root)
         return frozenset(paths)
 
     def _recursive_rm_eligible(  # noqa: PLR0911
@@ -2534,6 +2574,63 @@ class ShellPermissionResolver:
                 return _denied(Diagnostic(hit, path))
         return None
 
+    def _checkout_exemption_eligible(
+        self,
+        exemption: _CheckoutExemption,
+        scoped_candidates: list[tuple[Path, RepositoryScope]],
+        cache: dict[tuple[Path, Path | None, str, str | None, str | None], bool],
+    ) -> bool:
+        """Whether every candidate repository scope passes the A2 guardrails.
+
+        The command may run in any statically possible directory, so every
+        candidate scope must pass (a fully clean work tree, no in-progress
+        operation marker, no program-selecting repository config, and an
+        existing local target branch for the plain branch form). The cache
+        is per call — one probe set per repository and shape, never across
+        calls — following the resolver's recovery-cache pattern.
+
+        The probes assess the EFFECTIVE work tree — the same
+        core.worktree-aware resolution an actual checkout honors (and the
+        mutation-root path collects) — never the discovery directory alone:
+        a configured relocated work tree can be dirty while the discovery
+        directory probes clean. An effective work tree that cannot be
+        established fails the exemption closed.
+        """
+        shape = exemption.shape
+        entry = exemption.entry
+        tokens = (
+            list(entry.tokens)
+            if entry.tokens is not None
+            else _split_command_tokens(entry.text)
+        )
+        for cwd, scope in scoped_candidates:
+            assessed = repository_state(scope)
+            if assessed is None or assessed.work_tree is None:
+                # No work tree to keep clean (a nominal non-repository
+                # scope or a bare repository): the exemption fails closed.
+                return False
+            effective = resolve_git_work_tree(tokens, cwd)
+            if effective is None:
+                # The work tree the checkout would rewrite cannot be
+                # established: the exemption fails closed.
+                return False
+            if effective != assessed.work_tree:
+                # Probe the work tree the checkout actually rewrites; the
+                # metadata directories stay the discovered repository's.
+                assessed = replace(assessed, work_tree=effective)
+            key = (
+                assessed.git_dir,
+                assessed.work_tree,
+                shape.kind,
+                shape.branch,
+                shape.start,
+            )
+            if key not in cache:
+                cache[key] = _checkout_guardrails_pass(assessed, shape)
+            if not cache[key]:
+                return False
+        return True
+
     def _resolve_dangerous_command_permission(  # noqa: PLR0911, PLR0912
         self, args: ShellCommandArgs, expanded: list[_GuardrailPart]
     ) -> PermissionContext | None:
@@ -2560,6 +2657,14 @@ class ShellPermissionResolver:
         """
         authorities = self._authorities()
         missing: dict[str, RepositoryScope] = {}
+        # A2: the whole-call eligibility gate for the clean-tree checkout
+        # exemption, evaluated over the full expanded call at the top of the
+        # flow. The exemption applies only when the entire composed shell
+        # command is exactly one eligible git checkout invocation.
+        checkout_exemption = _whole_call_checkout_exemption(args.command, expanded)
+        checkout_state_cache: dict[
+            tuple[Path, Path | None, str, str | None, str | None], bool
+        ] = {}
         for entry, tokens, possible_cwds, cwd_unknown in _scoped_guardrail_cwds(
             expanded, self.cwd
         ):
@@ -2649,6 +2754,7 @@ class ShellPermissionResolver:
             # The command may run in any statically possible directory, so
             # every candidate repository scope must carry the authority.
             scopes: set[RepositoryScope] = set()
+            scoped_candidates: list[tuple[Path, RepositoryScope]] = []
             for cwd in possible_cwds:
                 scope = resolve_repository_scope(cwd, grantable.relocation)
                 if scope is None:
@@ -2662,6 +2768,20 @@ class ShellPermissionResolver:
                         )
                     )
                 scopes.add(scope)
+                scoped_candidates.append((cwd, scope))
+            # A2: the state-aware clean-tree checkout exemption, after
+            # candidate-scope resolution and before per-operation coverage.
+            # The whole-call gate above pinned the invocation's shape; every
+            # candidate repository scope must now pass the guardrails, or
+            # the call keeps the existing approval class.
+            if (
+                checkout_exemption is not None
+                and entry is checkout_exemption.entry
+                and self._checkout_exemption_eligible(
+                    checkout_exemption, scoped_candidates, checkout_state_cache
+                )
+            ):
+                continue
             # A bare-name push destination resolves only through the
             # repository's configured remotes: git resolves any destination
             # that is not a configured remote name as a URL, so an
@@ -3011,6 +3131,32 @@ def _git_write_values(tokens: list[str]) -> frozenset[str]:
     return values
 
 
+# The checkout/switch subcommands whose mutation scope is the work tree they
+# run in rather than the individual paths they name: a checkout/switch
+# rewrites tracked work-tree content in bulk, so the resolved work-tree root
+# is the mutation-scope footprint the permission layer's write-footprint
+# collection and the completion audit's touched-path comparisons consume.
+# It is a PERMISSION footprint only — never a submission-scan path: the
+# submission scan walks collected paths recursively with a bounded budget,
+# and a work-tree root would scan the whole repository and burn the budget.
+_GIT_MUTATION_ROOT_SUBCOMMANDS = frozenset({"checkout", "switch"})
+
+
+def _git_mutation_root_subcommand(tokens: list[str]) -> str | None:
+    """The subcommand when one git invocation's mutation scope is its work tree.
+
+    Returns the subcommand name for checkout/switch (the canonical form's
+    subcommand, so recognized global options and exec-path spellings do not
+    hide it), or None for every other invocation — other git subcommands,
+    unmodeled or unrecognized forms, and non-git commands.
+    """
+    canonical = canonical_git_command(tokens)
+    if canonical is None or len(canonical) <= _GIT_SUBCOMMAND_INDEX:
+        return None
+    subcommand = canonical[1]
+    return subcommand if subcommand in _GIT_MUTATION_ROOT_SUBCOMMANDS else None
+
+
 def _write_operand_unresolvable(token: str, cwd_unknown: bool) -> bool:
     """Whether the path layer would deny this write operand instead of resolving it.
 
@@ -3107,3 +3253,365 @@ def shell_command_write_paths(
         # Fail closed: an extraction that cannot complete leaves the write
         # surface unknown rather than guessing a partial path set.
         return [], True
+
+
+def shell_command_mutation_roots(  # noqa: PLR0911
+    command: str, *, cwd: Path, workspace: Workspace, authority: PathAuthority
+) -> tuple[list[str], bool]:
+    """The resolved work-tree roots one shell command's checkout/switch
+    invocations mutate, as a distinct mutation-roots footprint.
+
+    Returns ``(roots, unknown)``: the resolved work-tree root of every
+    expanded part that is a checkout/switch invocation, resolved exactly as
+    the permission layer resolves the invocation's own scope (per candidate
+    cwd, git's own -C relocation, --work-tree, the repository's
+    core.worktree), and whether that footprint could not be established.
+    This is the mutation-scope footprint the permission write-footprint
+    collection and the completion audit's touched-path comparisons consume —
+    it never joins the submission secret-scan path list: the scan walks its
+    collected paths recursively with a bounded budget, and a work-tree root
+    would scan the whole repository and burn the budget, blocking publication.
+
+    The extraction reuses the resolver's analysis — segmentation, expansion,
+    and the tracked candidate cwds — never a pattern over the command text.
+    A command the resolver denies never runs, so its footprint never reaches
+    a submission; ``unknown`` is the fail-closed outcome for a run-phase call
+    whose analysis cannot be reproduced (an approval reason is a hard denial
+    the resolver never clears), for a checkout/switch whose work-tree root
+    cannot be resolved (an unresolvable repository, an unreadable config, a
+    GIT_-prefixed environment assignment that relocates the invocation
+    outside the modeled resolution), and for a cwd the analysis cannot pin.
+    An unresolvable state is an unknown footprint, never a partial path set.
+    """
+    try:
+        scratchpad_roots = effective_scratchpad_roots(authority)
+        workspace_roots = frozenset(workspace.authorized_roots)
+        analysis = _analyze_guardrail_source(
+            command, scratchpad_roots=scratchpad_roots, workspace_roots=workspace_roots
+        )
+        if analysis.approval_reasons:
+            return [], True
+        command_parts = list(analysis.command_parts)
+        expanded, _inner_redirects, inner_errors = _expand_guardrail_parts(
+            command_parts,
+            scratchpad_roots=scratchpad_roots,
+            redirect_operands=analysis.redirect_operands,
+            workspace_roots=workspace_roots,
+            command_assignments=analysis.command_assignments,
+        )
+        if inner_errors:
+            return [], True
+        if any(
+            _split_command_tokens(part)
+            and _split_command_tokens(part)[0] in {"eval", "exec"}
+            for part in (entry.text for entry in expanded)
+        ):
+            return [], True
+        collected: dict[str, None] = {}
+        for entry, tokens, possible_cwds, cwd_unknown in _scoped_guardrail_cwds(
+            expanded, cwd
+        ):
+            if not tokens:
+                continue
+            if _git_mutation_root_subcommand(tokens) is None:
+                continue
+            if cwd_unknown or not possible_cwds:
+                return [], True
+            if any(name.startswith("GIT_") for name, _value in entry.assignments):
+                # A GIT_-prefixed assignment relocates the invocation outside
+                # the modeled resolution (GIT_DIR/GIT_WORK_TREE): the root the
+                # invocation would mutate cannot be established.
+                return [], True
+            for possible_cwd in possible_cwds:
+                root = resolve_git_work_tree(tokens, possible_cwd)
+                if root is None:
+                    return [], True
+                collected[str(root)] = None
+        return list(collected), False
+    except Exception:
+        # Fail closed: an extraction that cannot complete leaves the
+        # mutation scope unknown rather than guessing a partial root set.
+        return [], True
+
+
+# --- A2: the fail-closed clean-tree checkout exemption ------------------------
+
+
+#: The flag injected into the executed string of an exempt checkout: an
+#: ignored-file collision fails closed (checkout refuses) instead of
+#: silently clobbering local content.
+_NO_OVERWRITE_IGNORE = "--no-overwrite-ignore"
+
+
+@dataclass(frozen=True)
+class _CheckoutExemptionShape:
+    """One exempt checkout invocation's modeled operands (A2).
+
+    ``switch`` is ``git checkout <branch>``; ``create`` is
+    ``git checkout -b <new> [<start>]``.
+    """
+
+    kind: str
+    branch: str
+    start: str | None
+
+
+@dataclass(frozen=True)
+class _CheckoutExemption:
+    """One whole-call-eligible exempt checkout invocation (A2)."""
+
+    entry: _GuardrailPart
+    shape: _CheckoutExemptionShape
+    checkout_token_index: int
+
+
+def _shell_token_spans(text: str) -> list[tuple[str, int, int]] | None:
+    """The shell words of *text* with their source spans, or None.
+
+    Mirrors ``split_shell_tokens`` exactly (POSIX shlex, whitespace
+    splitting, no comment handling) while also reporting where each word
+    begins and ends in the source, so a caller can rewrite the source string
+    without re-deriving any word's quoting. Malformed quoting returns None,
+    so callers fail closed.
+    """
+    stream = StringIO(text)
+    lexer = shlex.shlex(stream, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    spans: list[tuple[str, int, int]] = []
+    try:
+        while True:
+            start = stream.tell()
+            token = lexer.get_token()
+            if token is None or token == lexer.eof:
+                return spans
+            spans.append((token, start, stream.tell()))
+    except ValueError:
+        return None
+
+
+def _checkout_exemption_shape(  # noqa: PLR0911
+    tokens: list[str],
+) -> tuple[_CheckoutExemptionShape, int] | None:
+    """The exempt checkout shape of one git invocation, with the subcommand's
+    token index, or None when the invocation is not an exempt shape.
+
+    Exempt only: ``git checkout <branch>`` — no options, exactly one
+    operand — and ``git checkout -b <new> [<start>]`` — the ``-b`` option
+    alone, at most one further operand. Every excluded shape stays gated:
+    pathspecs (a second operand or an end-of-options marker),
+    ``-f``/``--force``/``--discard-changes``/``--merge``,
+    ``--orphan``/``--conflict``/``--pathspec-from-file``/
+    ``--recurse-submodules``, ``-B``, and any other option. Global options
+    are restricted to the recognized grammar that neither overrides
+    configuration nor relocates the repository: an inline
+    ``-c``/``--config-env`` (which can alter the actual invocation's
+    behavior, e.g. core.hooksPath) and repository relocation
+    (``-C``/``--git-dir``/``--work-tree``) both fail closed.
+    """
+    if not tokens or tokens[0] != "git":
+        # A bare git executable only: no path, no alias form.
+        return None
+    globals_scan = _scan_git_globals(tokens[1:])
+    if globals_scan.error is not None or globals_scan.end_of_options:
+        return None
+    if globals_scan.relocation != GitRepositoryRelocation():
+        return None
+    args = tokens[1:]
+    if globals_scan.index >= len(args) or args[globals_scan.index] != "checkout":
+        return None
+    scan = _scan_classified_git_options(
+        args[globals_scan.index + 1 :], _GIT_CHECKOUT_TABLE, strict=False
+    )
+    if scan.error is not None or scan.end_of_options:
+        return None
+    subcommand_index = 1 + globals_scan.index
+    if not scan.options and not scan.values and len(scan.operands) == 1:
+        return (
+            _CheckoutExemptionShape("switch", scan.operands[0], None),
+            subcommand_index,
+        )
+    if (
+        scan.options == ("-b",)
+        and len(scan.values) == 1
+        and scan.values[0][0] == "-b"
+        and len(scan.operands) <= 1
+    ):
+        return (
+            _CheckoutExemptionShape(
+                "create", scan.values[0][1], scan.operands[0] if scan.operands else None
+            ),
+            subcommand_index,
+        )
+    return None
+
+
+def _whole_call_checkout_exemption(
+    command: str, expanded: list[_GuardrailPart]
+) -> _CheckoutExemption | None:
+    """The exempt checkout invocation when the whole call is exactly one.
+
+    The exemption applies only when the entire composed shell command is
+    exactly one eligible git invocation: a single expanded part carrying no
+    environment assignments and no enclosing scope, whose own word sequence
+    is the whole raw command (no wrapper, chained, piped, or redirected
+    statement around it), a bare ``git`` executable, recognized global
+    options that neither override configuration nor relocate the
+    repository, and the checkout subcommand in an exempt shape.
+    Recognized global options that neither override configuration nor
+    relocate the repository (``--no-pager`` and equivalents) do not
+    break eligibility. Any ineligible shape fails closed to the existing
+    approval class.
+    """
+    if len(expanded) != 1:
+        return None
+    entry = expanded[0]
+    if entry.scope or entry.access is not None or entry.assignments:
+        # A synthetic operand, a nested scope, or an environment assignment
+        # is not a bare single git invocation.
+        return None
+    tokens = (
+        list(entry.tokens)
+        if entry.tokens is not None
+        else _split_command_tokens(entry.text)
+    )
+    if not tokens or _split_command_tokens(command) != tokens:
+        # The raw command's own words must be exactly this part's words: a
+        # wrapper, assignment prefix, subshell, or redirect around the git
+        # invocation breaks eligibility for the whole call.
+        return None
+    shape = _checkout_exemption_shape(tokens)
+    if shape is None:
+        return None
+    return _CheckoutExemption(entry, shape[0], shape[1])
+
+
+def _checkout_guardrails_pass(
+    state: RepositoryState, shape: _CheckoutExemptionShape
+) -> bool:
+    """The clean-tree checkout guardrails for one repository scope (A2).
+
+    The exemption holds only on a fully clean work tree (no change, no
+    staged work, no untracked file), with no in-progress operation marker
+    and no repository configuration that selects a program the invocation
+    could run; the plain branch form additionally requires the target to be
+    an existing LOCAL branch (a sanitized rev-parse probe), so a pathspec
+    fallback, a tag, a remote-tracking name, or a commit-ish never rides
+    the exemption. Every unestablishable aspect fails closed.
+
+    The configuration check runs FIRST, before any state probe that
+    spawns git: it reads the repository's config without invoking
+    anything, while ``git status`` can pass work-tree contents through
+    repository-configured clean/smudge process filters — a repository
+    whose config selects a program is declined without the probes ever
+    spawning (the fail-open ordering the deep review repaired).
+    """
+    if config_selects_program(state) is not False:
+        return False
+    if work_tree_is_clean(state) is not True:
+        return False
+    if in_progress_operation(state) is not False:
+        return False
+    if shape.kind == "switch":
+        return local_branch_exists(state, shape.branch)
+    return True
+
+
+class CheckoutInjectionError(ToolError):
+    """An exempt checkout's protected executed string could not be derived.
+
+    The whole-call exemption was re-derived at execution time, but the
+    ``--no-overwrite-ignore`` insertion could not be performed safely — or
+    the re-derivation itself failed after the permission-time exemption.
+    The tool call must fail BEFORE execution: running the original string
+    would silently drop the ignored-collision protection the exemption
+    exists to provide, so the error propagates out of the tool's run
+    instead of returning the unprotected command.
+    """
+
+
+def _exempt_checkout_executed_string(
+    command: str, exemption: _CheckoutExemption
+) -> str:
+    """The executed string of one eligible exempt checkout, with the flag.
+
+    The rewrite inserts ``--no-overwrite-ignore`` immediately after the
+    ``checkout`` subcommand token, by source span, so every other byte of
+    the command — quoting, spacing, comments, expansion — is preserved
+    exactly. Every failure mode raises CheckoutInjectionError: an eligible
+    checkout whose protected string cannot be derived must fail the call
+    before execution, never execute the unprotected string.
+    """
+    spans = _shell_token_spans(command)
+    if spans is None or len(spans) <= exemption.checkout_token_index:
+        raise CheckoutInjectionError(
+            f"the executed string of {command!r} could not be rewritten safely"
+        )
+    token, start, end = spans[exemption.checkout_token_index]
+    if token != "checkout" or end <= start:
+        raise CheckoutInjectionError(
+            f"the executed string of {command!r} could not be rewritten safely"
+        )
+    if command[end - 1].isspace():
+        # The lexer read one whitespace terminator past the token and
+        # pushed it back; the token's own span ends before it.
+        end -= 1
+    return f"{command[:end]} {_NO_OVERWRITE_IGNORE}{command[end:]}"
+
+
+def shell_command_checkout_no_overwrite_ignore(
+    command: str, *, workspace: Workspace, authority: PathAuthority
+) -> str | None:
+    """The command rewritten with ``--no-overwrite-ignore`` for an exempt
+    checkout, or None when no injection applies (A2).
+
+    The bash tool executes a command STRING, and ``Bash.run()`` has no access
+    to the permission decision, so the exemption predicate is re-derived
+    here at execution time through the resolver's whole-call eligibility
+    check (the gate and the exempt shape; the permission-time state probes
+    are not a transaction, and the flag is the execution-time protection).
+    The original command string stays original for display and result
+    surfaces; only the executed string carries the flag, so an ignored-file
+    collision fails closed (checkout refuses) instead of silently clobbering
+    local content.
+
+    The None/raise distinction is the fail-closed contract: None means the
+    command is NOT a whole-call-eligible exempt checkout, so the caller
+    executes it unmodified; CheckoutInjectionError means the command IS an
+    eligible exempt checkout whose protected string could not be safely
+    derived — or the re-derivation itself failed after the permission-time
+    exemption — so the call fails before execution instead of silently
+    dropping the ignored-collision protection.
+    """
+    try:
+        scratchpad_roots = effective_scratchpad_roots(authority)
+        workspace_roots = frozenset(workspace.authorized_roots)
+        analysis = _analyze_guardrail_source(
+            command, scratchpad_roots=scratchpad_roots, workspace_roots=workspace_roots
+        )
+        if analysis.approval_reasons:
+            return None
+        command_parts = list(analysis.command_parts)
+        expanded, _inner_redirects, inner_errors = _expand_guardrail_parts(
+            command_parts,
+            scratchpad_roots=scratchpad_roots,
+            redirect_operands=analysis.redirect_operands,
+            workspace_roots=workspace_roots,
+            command_assignments=analysis.command_assignments,
+        )
+        if inner_errors:
+            return None
+        exemption = _whole_call_checkout_exemption(command, expanded)
+        if exemption is None:
+            return None
+        return _exempt_checkout_executed_string(command, exemption)
+    except CheckoutInjectionError:
+        raise
+    except Exception as exc:
+        # Fail closed: a re-derivation that cannot complete after the
+        # permission-time exemption leaves the protected string
+        # uncertifiable — the call fails instead of executing the
+        # unprotected original.
+        raise CheckoutInjectionError(
+            f"the executed string of {command!r} could not be rewritten safely"
+        ) from exc

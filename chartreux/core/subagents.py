@@ -31,6 +31,7 @@ from chartreux.core.subagent_submission import (
 from chartreux.core.tools.secret_scan import incomplete_finding, scan_paths
 from chartreux.core.tools.ui import ToolUIDataAdapter
 from chartreux.observability.logging import logger
+from chartreux.utils.tool_presentation import ToolEffectKind
 
 __all__ = [
     "EffectVerification",
@@ -849,6 +850,50 @@ class SubagentRunnerPort(Protocol):
     ) -> AsyncGenerator[ToolStreamEvent | TaskResult, None]: ...
 
 
+#: Mutation-roots sentinel recorded when a shell command's mutation-roots
+#: footprint could not be established (a checkout/switch whose work-tree root
+#: is unresolvable). Mutation-scope accounting only: it never enters the
+#: submission scan's path list.
+UNKNOWN_MUTATION_ROOT_FOOTPRINT = (
+    "<shell command with an unestablished mutation-scope root>"
+)
+
+
+def mutation_roots_from_result_event(event: ToolResultEvent) -> tuple[list[str], bool]:
+    """The mutation-roots footprint a shell result reports, and its unknown flag.
+
+    The bash tool surfaces the resolved work-tree roots of its command's
+    checkout/switch invocations alongside its write paths, and bash_start
+    surfaces the started command's the same way; a failed, timed-out, or
+    cancelled run's footprint rides the error event's fields, copied there by
+    the tool executor. The footprint is mutation-scope accounting only — the
+    caller keeps it OUT of the submission scan's path list (a work-tree root
+    would scan the whole repository and burn the scan's budget). Skipped
+    calls never ran. Returns ``(roots, unknown)``; a result carrying the
+    footprint fields without well-formed values reads as unknown, never as
+    an established empty one, and a result of a tool whose model carries no
+    footprint attributes at all reads as an established empty one.
+    """
+    if event.skipped or event.tool_class is None:
+        return [], False
+    result = event.result
+    if result is not None:
+        missing = object()
+        roots = getattr(result, "mutation_roots", missing)
+        unknown = bool(getattr(result, "mutation_roots_unknown", False))
+        shell = getattr(event.tool_class, "effect_kind", None) is ToolEffectKind.SHELL
+        if roots is missing and not shell:
+            return [], False
+        if not isinstance(roots, (list, tuple)):
+            return [], True
+    else:
+        roots = getattr(event, "error_mutation_roots", None)
+        unknown = bool(getattr(event, "error_mutation_roots_unknown", False))
+    if not isinstance(roots, (list, tuple)):
+        return [], unknown
+    return [root for root in roots if isinstance(root, str) and root], unknown
+
+
 @dataclass(slots=True)
 class SubagentRunAccumulator:
     _response: list[str] = field(default_factory=list)
@@ -858,6 +903,13 @@ class SubagentRunAccumulator:
     # commands produced — collected from observed tool results and scanned
     # at the submission boundary (build_result). Insertion-ordered.
     _touched_paths: dict[str, None] = field(default_factory=dict)
+    # A1: the session's mutation-roots footprint — the resolved work-tree
+    # roots of the shell commands' checkout/switch invocations, collected
+    # from observed tool results alongside the touched paths. A
+    # mutation-scope footprint ONLY: it is never scanned at the submission
+    # boundary (a work-tree root would scan the whole repository and burn
+    # the scan's budget); the completion audit consumes it.
+    _mutation_roots: dict[str, None] = field(default_factory=dict)
 
     def observe(self, event: BaseEvent, *, tool_call_id: str) -> ToolStreamEvent | None:
         if isinstance(event, AssistantEvent):
@@ -882,6 +934,13 @@ class SubagentRunAccumulator:
             self._touched_paths[path] = None
         if write_unknown:
             self._touched_paths[UNKNOWN_WRITE_FOOTPRINT] = None
+        # A1: the mutation-roots footprint is collected alongside — into its
+        # own mutation-scope accounting, never into _touched_paths.
+        mutation_roots, mutation_unknown = mutation_roots_from_result_event(event)
+        for root in mutation_roots:
+            self._mutation_roots[root] = None
+        if mutation_unknown:
+            self._mutation_roots[UNKNOWN_MUTATION_ROOT_FOOTPRINT] = None
         if event.result is None or event.tool_class is None:
             return None
         touched_path = touched_path_from_result_event(event)
@@ -897,6 +956,15 @@ class SubagentRunAccumulator:
             tool_call_id=tool_call_id,
         )
 
+    @property
+    def mutation_roots(self) -> list[str]:
+        """The collected mutation-roots footprint, in collection order.
+
+        The mutation-scope footprint the completion audit's touched-path
+        comparisons consume; the submission scan never sees it.
+        """
+        return list(self._mutation_roots)
+
     def record_error(self, message: str) -> None:
         self._completed = False
         self._response.append(f"\n[Subagent error: {message}]")
@@ -910,6 +978,10 @@ class SubagentRunAccumulator:
         # blocks the submission: the result carries the redacted block
         # message instead of the agent's response, and never surfaces as
         # final (completed=False).
+        # A1: the scan scopes EXACTLY _touched_paths — the mutation-roots
+        # footprint never joins it (a work-tree root would scan the whole
+        # repository and burn the bounded walk's budget, blocking
+        # publication); the completion audit consumes _mutation_roots.
         findings = scan_paths(self._touched_paths)
         if UNKNOWN_WRITE_FOOTPRINT in self._touched_paths:
             # Fail-closed: a shell command whose write surface could not be

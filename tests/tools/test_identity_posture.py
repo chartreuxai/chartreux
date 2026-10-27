@@ -16,8 +16,11 @@ Chain rule: a child's effective tools are the granted tree ceiling ∩ every
 ancestor's delegation set ∩ the child's personal posture. Enforcement uses
 the S1-approved classification classes (mutating / non-mutating /
 control-plane), never tool-name lists: control-plane tools (task, agent
-lifecycle, user questions) ride with a read-only posture, so an
-orchestrator can delegate without gaining direct write authority.
+lifecycle, user questions) ride with a read-only posture, so delegation
+never depends on personal tool access. The v0.5.9 execution carve-out
+additionally admits the mutating builtin set on the orchestrator,
+researcher, and advisor PERSONAL axes only — the delegation axis never
+receives it.
 """
 
 from __future__ import annotations
@@ -216,15 +219,17 @@ def test_coder_identity_is_unrestricted_on_both_axes(tmp_path: Path) -> None:
     assert manager.get("edit") is not None
 
 
-def test_root_researcher_cannot_use_mutating_tools_personally(tmp_path: Path) -> None:
-    # The write tools are GRANTED at the config level; the researcher's
-    # personal posture still excludes them below the config layer.
+def test_root_researcher_carve_out_grants_the_mutating_tools_personally(
+    tmp_path: Path,
+) -> None:
+    # The write tools are GRANTED at the config level, and the v0.5.9
+    # identity carve-out admits them on the researcher's personal axis;
+    # the delegation axis stays non-mutating (pinned separately below).
     manager = _manager(tmp_path, identity="researcher")
-    assert not (MUTATING_TOOLS & set(manager.available_tools))
-    assert not (MUTATING_TOOLS & {spec.name for spec in manager.available_tool_specs()})
+    assert MUTATING_TOOLS <= set(manager.available_tools)
+    assert MUTATING_TOOLS <= {spec.name for spec in manager.available_tool_specs()}
     for name in MUTATING_TOOLS:
-        with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
-            manager.get(name)
+        assert manager.get(name) is not None
     assert "read_file" in manager.available_tools
     assert "grep" in manager.available_tools
 
@@ -236,14 +241,13 @@ def test_root_researcher_cannot_delegate_mutating_tools(tmp_path: Path) -> None:
     assert "task" in manager.delegable_tools
 
 
-def test_root_orchestrator_cannot_write_personally_but_delegates_writes(
+def test_root_orchestrator_grants_writes_personally_and_delegates_writes(
     tmp_path: Path,
 ) -> None:
     manager = _manager(tmp_path, identity="orchestrator")
-    # Personal axis: no mutating tool, despite the granted config.
-    assert not (MUTATING_TOOLS & set(manager.available_tools))
-    with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
-        manager.get("edit")
+    # Personal axis: the v0.5.9 carve-out admits the mutating builtin set.
+    assert MUTATING_TOOLS <= set(manager.available_tools)
+    assert manager.get("edit") is not None
     # Delegation axis: the full granted ceiling, writes included.
     assert MUTATING_TOOLS <= set(manager.delegable_tools)
     # Control-plane stays personal: the orchestrator can delegate at all.
@@ -375,19 +379,22 @@ def test_custom_identity_delegation_defaults_to_the_full_granted_ceiling(
 
 def test_builtin_qualified_identity_reference_keeps_its_posture(tmp_path: Path) -> None:
     manager = _manager(tmp_path, identity="builtin:researcher")
-    assert not (MUTATING_TOOLS & set(manager.available_tools))
+    # The qualified reference resolves to the shipped posture including the
+    # v0.5.9 personal carve-out; the delegation axis stays non-mutating.
+    assert MUTATING_TOOLS <= set(manager.available_tools)
     assert not (MUTATING_TOOLS & set(manager.delegable_tools))
 
 
 def test_delegation_and_personal_axes_are_independently_monotonic(
     tmp_path: Path,
 ) -> None:
-    # A coder parent grants writes; a researcher CHILD still cannot use them
-    # personally (personal axis), while its delegation set stays read-only.
+    # A coder parent grants writes; a researcher CHILD executes the
+    # carved-out tools personally (v0.5.9 grant) while its delegation set
+    # stays read-only.
     parent = _manager(tmp_path, identity="coder")
     child = _manager(tmp_path, identity="researcher", parent=parent)
     assert MUTATING_TOOLS <= set(parent.delegable_tools)
-    assert not (MUTATING_TOOLS & set(child.available_tools))
+    assert MUTATING_TOOLS <= set(child.available_tools)
     assert not (MUTATING_TOOLS & set(child.delegable_tools))
     # The grandchild chain keeps narrowing: a coder grandchild of the
     # researcher is still capped by the researcher's delegation set.
@@ -445,14 +452,16 @@ def test_bound_identity_freezes_posture_against_in_place_flips(tmp_path: Path) -
         accepted_token_getter=lambda: "accepted",
         bound_identity="researcher",
     )
-    assert not (MUTATING_TOOLS & set(manager.available_tools))
+    assert MUTATING_TOOLS <= set(manager.available_tools)
     assert "read_file" in manager.available_tools
-    # The bound identity holds even against a live in-place flip to coder.
+    # The bound identity holds even against a live in-place flip to coder:
+    # the personal carve-out stays the bound researcher's, and the DELEGATION
+    # axis stays non-mutating where a live coder posture would delegate the
+    # full granted ceiling.
     resolved.agent.identity = "coder"
-    assert not (MUTATING_TOOLS & set(manager.available_tools))
+    assert MUTATING_TOOLS <= set(manager.available_tools)
     assert not (MUTATING_TOOLS & set(manager.delegable_tools))
-    with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
-        manager.get("edit")
+    assert manager.get("edit") is not None
 
 
 def test_unknown_builtin_qualified_identity_fails_at_config_load() -> None:
@@ -579,8 +588,10 @@ def test_cache_hit_rechecks_the_live_identity_posture(tmp_path: Path) -> None:
     """A warm selection cannot serve a tool the live posture excludes (S2 W2).
 
     The live posture and filter checks re-run on EVERY availability decision,
-    cache hits included: an unsanctioned in-place identity flip must not
-    leave a warm selection returning the tool through ``get()``.
+    cache hits included. Post-grant the in-place flip to the orchestrator
+    keeps ``edit`` served (the v0.5.9 carve-out admits it personally); the
+    exclusion proof re-pins against the reviewer flip, whose bash-only
+    carve-out still excludes the write tools.
     """
     resolved = build_test_vibe_config(agent={"identity": "coder"})
     manager = ToolManager(
@@ -591,6 +602,9 @@ def test_cache_hit_rechecks_the_live_identity_posture(tmp_path: Path) -> None:
     )
     assert manager.get("edit") is not None  # warm the selection and instance
     resolved.agent.identity = "orchestrator"
+    assert "edit" in manager.available_tools
+    assert manager.get("edit") is not None
+    resolved.agent.identity = "reviewer"
     assert "edit" not in manager.available_tools
     assert "edit" not in {spec.name for spec in manager.available_tool_specs()}
     with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
@@ -1035,14 +1049,16 @@ def test_reviewer_carve_out_is_bash_only(tmp_path: Path) -> None:
         assert name not in loosened.available_tools, name
 
 
-def test_researcher_and_advisor_remain_without_the_bash_tool(tmp_path: Path) -> None:
-    """The carve-out is reviewer-scoped: researcher and advisor keep no shell."""
+def test_researcher_and_advisor_delegate_no_shell(tmp_path: Path) -> None:
+    """The v0.5.9 grant admits bash personally for researcher and advisor;
+    their delegation sets stay non-mutating, so neither can hand the shell
+    to a child.
+    """
     for identity in ("researcher", "advisor"):
         manager = _manager(tmp_path, identity=identity)
-        assert "bash" not in manager.available_tools, identity
+        assert "bash" in manager.available_tools, identity
         assert "bash" not in manager.delegable_tools, identity
-        with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
-            manager.get("bash")
+        assert manager.get("bash") is not None, identity
 
 
 def test_reviewer_carve_out_never_reaches_the_delegation_axis(tmp_path: Path) -> None:

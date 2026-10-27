@@ -17,6 +17,8 @@ from chartreux.core.tools.base import (
 )
 from chartreux.core.tools.builtins._shell_permission_resolver import (
     ShellPermissionResolver,
+    shell_command_checkout_no_overwrite_ignore,
+    shell_command_mutation_roots,
     shell_command_write_paths,
 )
 from chartreux.core.tools.builtins.bash import (
@@ -44,10 +46,14 @@ class FailedJobStart(ToolError):
         *,
         write_paths: list[str] | None = None,
         write_paths_unknown: bool = False,
+        mutation_roots: list[str] | None = None,
+        mutation_roots_unknown: bool = False,
     ) -> None:
         super().__init__(message)
         self.write_paths = list(write_paths or [])
         self.write_paths_unknown = write_paths_unknown
+        self.mutation_roots = list(mutation_roots or [])
+        self.mutation_roots_unknown = mutation_roots_unknown
 
 
 class BashStart(
@@ -76,6 +82,17 @@ class BashStart(
     ) -> AsyncGenerator[StartResult, None]:
         if ctx is None or ctx.background_jobs is None:
             raise ToolError("Background jobs unavailable in this context")
+        # A2: the same executed-string rewriting as Bash.run(): a
+        # whole-call-eligible exempt checkout executes with
+        # --no-overwrite-ignore so an ignored-file collision fails closed.
+        # The rewritten string is the executed command (execute_command=...
+        # below); args.command stays original, so the stored job summary
+        # keeps the original command string.
+        command = shell_command_checkout_no_overwrite_ignore(
+            args.command, workspace=self.workspace, authority=self.path_authority
+        )
+        if command is None:
+            command = args.command
         # R7: surface the started command's write-classified paths (redirect
         # targets, write-option values, write-classified command operands)
         # on the result, so the submission secret scan covers a started
@@ -83,31 +100,50 @@ class BashStart(
         # footprint is computed before the admission attempt: a failed or
         # cancelled start may still have spawned the command, and its write
         # surface must reach the submission scan regardless of the outcome.
+        # A1: the mutation-roots footprint (the resolved work-tree roots of
+        # the command's checkout/switch invocations) is collected alongside
+        # it — a mutation-scope footprint that never enters the submission
+        # scan's path list.
         write_paths, write_paths_unknown = shell_command_write_paths(
-            args.command,
+            command,
+            cwd=self.cwd,
+            workspace=self.workspace,
+            authority=self.path_authority,
+        )
+        mutation_roots, mutation_roots_unknown = shell_command_mutation_roots(
+            command,
             cwd=self.cwd,
             workspace=self.workspace,
             authority=self.path_authority,
         )
         try:
-            result = await ctx.background_jobs.start(args, cwd=self.cwd)
+            result = await ctx.background_jobs.start(
+                args, cwd=self.cwd, execute_command=command
+            )
         except asyncio.CancelledError as exc:
             # The registry finishes its pre-commit recovery before
             # re-raising; the executor's cancellation handler copies the
             # write footprint onto the cancelled result event.
             raise CancelledShellCommand(
-                write_paths=write_paths, write_paths_unknown=write_paths_unknown
+                write_paths=write_paths,
+                write_paths_unknown=write_paths_unknown,
+                mutation_roots=mutation_roots,
+                mutation_roots_unknown=mutation_roots_unknown,
             ) from exc
         except (ValueError, OSError) as exc:
             raise FailedJobStart(
                 "Unable to start background job",
                 write_paths=write_paths,
                 write_paths_unknown=write_paths_unknown,
+                mutation_roots=mutation_roots,
+                mutation_roots_unknown=mutation_roots_unknown,
             ) from exc
         yield result.model_copy(
             update={
                 "write_paths": list(write_paths),
                 "write_paths_unknown": write_paths_unknown,
+                "mutation_roots": list(mutation_roots),
+                "mutation_roots_unknown": mutation_roots_unknown,
             }
         )
 

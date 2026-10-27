@@ -1555,6 +1555,9 @@ async def test_replaced_streaming_widget_is_collected_on_the_live_tick() -> None
 
 
 @pytest.mark.asyncio
+# the repo-global pytest timeout is 10s; this test's legitimate runtime under
+# load can exceed that while still remaining bounded, so raise its bound to 30s
+@pytest.mark.timeout(30)
 async def test_sustained_ticks_retained_memory_is_bounded() -> None:
     messages = _seed_messages()
     source = _ResidentTranscriptSource(messages)

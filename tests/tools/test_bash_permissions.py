@@ -1173,8 +1173,6 @@ def test_user_denylist_entry_stays_an_absolute_veto(tmp_path):
     [
         ("git push", ("git.push",)),
         ("git push --force origin main", ("git.push.force",)),
-        ("git checkout main", ("git.checkout",)),
-        ("git checkout -b feature", ("git.checkout",)),
         ("git stash drop", ("git.stash.drop",)),
         ("git stash clear", ("git.stash.clear",)),
         ("git restore file.txt", ("git.restore",)),
@@ -1191,7 +1189,6 @@ def test_user_denylist_entry_stays_an_absolute_veto(tmp_path):
         ("git reflog delete main", ("git.reflog.delete",)),
         # Recognized git global options relocate the repository scope.
         ("git -C . push", ("git.push",)),
-        ("git --no-pager checkout main", ("git.checkout",)),
         ("git -C . switch --discard-changes", ("git.switch.discard",)),
         ("git --no-pager switch -f main", ("git.switch.discard",)),
         ("git -C . reflog expire --all", ("git.reflog.expire",)),
@@ -1204,6 +1201,48 @@ def test_dangerous_git_forms_require_dangerous_command_approval_by_default(
     # The recognized git forms left the shipped denylist: they are denied
     # pending typed dangerous-command authority, with a whole-call proposal.
     bash_tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState())
+
+    permission = bash_tool.resolve_permission(BashArgs(command=command))
+
+    assert isinstance(permission, PermissionContext)
+    assert permission.permission is ToolPermission.NEVER
+    assert permission.denial_kind == "dangerous_command"
+    assert "requires approval for a dangerous git operation" in (
+        permission.reason or ""
+    )
+    proposal = permission.dangerous_command_proposal
+    assert proposal is not None
+    assert proposal.operations == operation_ids
+    assert proposal.command == tuple(shlex.split(command))
+    assert proposal.consequence
+
+
+@pytest.mark.parametrize(
+    ("command", "operation_ids"),
+    [
+        ("git checkout main", ("git.checkout",)),
+        ("git checkout -b feature", ("git.checkout",)),
+        ("git --no-pager checkout main", ("git.checkout",)),
+    ],
+)
+def test_dangerous_git_checkout_forms_require_approval_outside_the_exemption(
+    command, operation_ids, tmp_path
+):
+    # A2 re-pin: the clean-tree checkout exemption is state-aware, so the
+    # checkout forms keep requiring dangerous-command approval when the
+    # process cwd is not an exempt clean repository. The re-pin context is
+    # an unborn-branch repository with an untracked file: no local branch
+    # exists and the tree is dirty, so the guardrails fail closed and the
+    # denial keeps its original whole-call proposal shape.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True, capture_output=True
+    )
+    (repo / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+    bash_tool = Bash(
+        config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=repo
+    )
 
     permission = bash_tool.resolve_permission(BashArgs(command=command))
 

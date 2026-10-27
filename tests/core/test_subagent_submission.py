@@ -17,6 +17,7 @@ secret, the rule id, or the matched line.
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 from pydantic import BaseModel
 import pytest
@@ -788,3 +789,62 @@ def test_bash_write_paths_join_the_file_tool_scan(tmp_path: Path) -> None:
     assert blocked.completed is False
     assert str(artifact) in blocked.response
     assert str(clean) not in blocked.response
+
+
+# A1: the mutation-roots footprint publication regression. A checkout/switch
+# invocation's mutation scope is the resolved work-tree root — a distinct
+# footprint class the resolver collection produces alongside write_paths.
+# SCAN-SCOPE SEPARATION: it is a mutation-scope footprint only and must NEVER
+# enter the submission scan's path list — the scan walks its collected paths
+# recursively with a bounded budget, and a work-tree root would scan the whole
+# repository and its budget overrun would block publication. The regression
+# runs a REAL shell result (the real Bash tool performing a real checkout in a
+# real repository that also holds an artifact larger than the per-file scan
+# cap, so a scan of the root WOULD block) through the accumulator's observe
+# collection, and asserts the completed submission passes.
+
+
+def _checkout_repo(tmp_path: Path) -> Path:
+    """A real git repository holding an artifact the scan cannot finish."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "p@example.com"], check=True
+    )
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "P"], check=True)
+    (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+    (repo / "big-artifact.bin").write_bytes(b"x" * (DEFAULT_MAX_SCAN_BYTES + 1))
+    return repo
+
+
+@pytest.mark.asyncio
+async def test_completed_run_with_an_eligible_checkout_is_not_blocked_by_it(
+    tmp_path: Path,
+) -> None:
+    repo = _checkout_repo(tmp_path)
+    tool = Bash(config_getter=lambda: BashToolConfig(), state=BaseToolState(), cwd=repo)
+    result = await collect_result(tool.run(BashArgs(command="git checkout -b side")))
+    assert result.mutation_roots == [str(repo)]
+    assert result.mutation_roots_unknown is False
+
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(AssistantEvent(content="checked out"), tool_call_id="task")
+    accumulator.observe(
+        ToolResultEvent(
+            tool_name="bash", tool_class=Bash, result=result, tool_call_id="bash-1"
+        ),
+        tool_call_id="task",
+    )
+
+    # The mutation-roots footprint is present in the collected metadata...
+    assert accumulator.mutation_roots == [str(repo)]
+    # ...and the work-tree root never entered the scan's path list: the
+    # submission is NOT blocked by an incomplete scan over the repository.
+    assert str(repo) not in accumulator._touched_paths
+    passed = accumulator.build_result(turns_used=1)
+    assert passed.completed is True
+    assert passed.response == "checked out"
+    assert "could not be fully inspected" not in passed.response

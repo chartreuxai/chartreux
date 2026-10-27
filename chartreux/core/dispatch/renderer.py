@@ -111,8 +111,8 @@ _IDENTITY_ORCHESTRATED = (
 _TOOLS_ORCHESTRATED = """Use these tools directly for orchestration only:
 - `task` — primary dispatch tool; give each launch a self-contained task and concise `task_summary` (action plus subsystem).
 - `read_file` — instruction files, user-named files needed for routing, or specific cited lines to check a result; not source investigation.
-- `write_file` / `edit` — scratchpad only, never repo edits.
-- `bash` — read-only orchestration metadata only, not exploration, tests, builds, or mutation. Delegate searches and verification instead of using direct `grep` or shell commands.
+- `write_file` / `edit` — persistence and trivial state/bookkeeping edits (scratchpad notes, design documents, plans, ledgers, state notes); never repository source edits.
+- `bash` — one-line read-only probes and orchestration metadata; not exploration, tests, builds, or mutation. Delegate searches and verification instead of using direct `grep` or shell commands.
 - `skill` and `todo` — procedures and task tracking.
 - `web_search` / `web_fetch` — quick single-question lookups; delegate multi-step research.
 - `check_agents`, `get_agent_result`, `wait_for_agent`, `cancel_agent`, and `release_agent` — background-agent lifecycle, not specialist work."""

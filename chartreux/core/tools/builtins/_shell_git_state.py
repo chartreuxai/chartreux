@@ -1,15 +1,18 @@
 """Git-state assessment for the recursive-`rm` operand analysis (v0.5.9 P2-c).
 
 The pure-filesystem inspection family (``_shell_git_inspection``) never
-invokes git. This module deliberately does — for exactly three facts that
-filesystem inspection cannot establish: whether a repository's work tree is
-clean (``git status --porcelain --untracked-files=all`` reports nothing),
-whether it carries commits no remote-tracking ref reaches (``git rev-list
---count --all --not --remotes``), and whether any remote is configured to
-hold a recovery copy (``git remote`` plus ``git remote get-url`` for each
-configured remote). The plan's saved/unsaved split is stated in ``git
-status`` terms, and re-deriving status semantics over the index, the object
-database and the ignore rules would be a re-derivation, not a reuse. The
+invokes git. This module deliberately does — for the facts that filesystem
+inspection cannot establish: whether a repository's work tree is clean
+(``git status --porcelain --untracked-files=all`` reports nothing), whether
+it carries commits no remote-tracking ref reaches (``git rev-list --count
+--all --not --remotes``), whether any remote is configured to hold a
+recovery copy (``git remote`` plus ``git remote get-url`` for each
+configured remote), and — for the clean-tree checkout exemption — whether a
+named LOCAL branch exists (``git show-ref --verify --quiet
+refs/heads/<branch>``, an exact-ref probe). The plan's saved/unsaved split
+is stated in ``git status`` terms, and re-deriving status semantics over
+the index, the object database and the ignore rules would be a
+re-derivation, not a reuse. The
 remote check gates the unpushed criterion: a remote-tracking ref is local
 metadata any writer can author with ``git update-ref``, so it counts as
 evidence of a recovery copy only when a remote exists to hold one — and a
@@ -621,6 +624,58 @@ def repository_recovery(
         if unpushed is None or unpushed > 0:
             return False
     return True
+
+
+def work_tree_is_clean(state: RepositoryState) -> bool | None:
+    """Whether git status reports no change, no staged work, no untracked file.
+
+    Public wrapper over the private probe, for the checkout-exemption
+    guardrails; None means the check itself failed, so callers fail closed.
+    """
+    return _work_tree_is_clean(state)
+
+
+def in_progress_operation(state: RepositoryState) -> bool | None:
+    """Whether any metadata directory carries an in-progress operation marker.
+
+    Public wrapper over the private probe, for the checkout-exemption
+    guardrails; None means a marker's presence cannot be established, so
+    callers fail closed.
+    """
+    return _in_progress_operation(state)
+
+
+def config_selects_program(state: RepositoryState) -> bool | None:
+    """Whether the repository's own config can run a program in our invocation.
+
+    Public wrapper over the private probe, for the checkout-exemption
+    guardrails; None means the config could not be read or parsed, so
+    callers fail closed.
+    """
+    return _config_selects_program(state)
+
+
+def local_branch_exists(state: RepositoryState, branch: str) -> bool:
+    """Whether ``refs/heads/<branch>`` exists, probed with a sanitized git.
+
+    The probe is one more sanitized ``_run_git_state`` invocation — an
+    explicit git dir, no optional locks, a disabled hooks path and fsmonitor,
+    and a from-scratch environment — so no repository- or user-owned
+    configuration can select a program, hook, or pager through it. The probe
+    is ``show-ref --verify``, which requires the EXACT ref: ``rev-parse
+    --verify`` would also accept rev expressions (``refs/heads/main^{}``,
+    ``refs/heads/topic~1`` when it resolves), and a commit-ish must never
+    ride the branch exemption. Any failure (no git executable, a nonzero
+    exit, a timeout) reads as the branch not existing, so callers fail
+    closed: only a target that verifiably exists as a LOCAL branch rides
+    the exemption.
+    """
+    output = _run_git_state(
+        state,
+        ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        work_tree=False,
+    )
+    return output is not None
 
 
 def _repository_state_at(root: Path) -> RepositoryState | None:

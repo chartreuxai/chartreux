@@ -395,10 +395,11 @@ async def test_root_researcher_cannot_obtain_a_writing_coder_through_the_task_to
     registry.bind_root(root)
     context = InvokeContext(tool_call_id="task-1", session_id=parent.session_id)
     try:
-        # The researcher root keeps the control-plane task tool personally...
+        # The researcher root keeps the control-plane task tool personally
+        # and the v0.5.9 carve-out admits the mutating tools on its personal
+        # axis...
         assert "task" in parent.tool_manager.available_tools
-        # ...but not the mutating tools, despite the granted config.
-        assert "edit" not in parent.tool_manager.available_tools
+        assert "edit" in parent.tool_manager.available_tools
         result = await _background_result(
             registry,
             TaskArgs(task="write code", identity="coder", background=True),
@@ -449,7 +450,9 @@ async def test_root_researcher_cannot_obtain_a_writing_coder_via_direct_launch(
     root = registry._build_child_runtime(parent)
     child = None
     try:
-        assert "edit" not in parent.tool_manager.available_tools
+        # The v0.5.9 carve-out admits edit on the researcher's personal
+        # axis; the delegation axis stays non-mutating.
+        assert "edit" in parent.tool_manager.available_tools
         assert "edit" not in parent.tool_manager.delegable_tools
         child = await AgentRuntimeFactory().create_child(parent, "coder")
         assert "edit" not in child.tool_manager.available_tools
@@ -478,12 +481,13 @@ async def test_root_researcher_cannot_obtain_a_writing_coder_via_direct_launch(
         await parent.aclose()
 
 
-async def test_root_orchestrator_cannot_write_personally_but_delegates_writes(
+async def test_root_orchestrator_grants_writes_personally_and_delegates_writes(
     tmp_path: Path,
 ) -> None:
-    """The orchestrator's personal posture is non-mutating while its
-    delegation set is the full granted ceiling: it cannot write itself but
-    can delegate writes to a coder child.
+    """The orchestrator's personal carve-out admits the mutating builtin set
+    while its delegation set is the full granted ceiling: it persists its own
+    scratchpad/deliverable writes and delegates repo-source writes to a coder
+    child.
     """
     path = tmp_path / "settings.toml"
     path.write_text('[agent]\nidentity = "orchestrator"\n')
@@ -494,11 +498,10 @@ async def test_root_orchestrator_cannot_write_personally_but_delegates_writes(
     )
     child = None
     try:
-        # Personal axis: no mutating tool despite the granted config...
-        assert "edit" not in parent.tool_manager.available_tools
-        with pytest.raises(Exception, match="Unknown or disabled tool"):
-            parent.tool_manager.get("edit")
-        # ...but the control-plane task tool stays personal, so the
+        # Personal axis: the v0.5.9 carve-out admits the mutating tools...
+        assert "edit" in parent.tool_manager.available_tools
+        assert parent.tool_manager.get("edit") is not None
+        # ...and the control-plane task tool stays personal, so the
         # orchestrator can delegate at all.
         assert "task" in parent.tool_manager.available_tools
         # Delegation axis: the full granted ceiling, writes included.
@@ -645,14 +648,19 @@ async def test_resume_admits_stored_write_override_under_orchestrator_parent(
     """3b lifecycle pin: the resume path's admission ceiling is the parent's
     DELEGATION set, not its personal inventory (design §8).
 
-    A child launched under a write-restricted orchestrator parent with a
-    stored write-tool override (admitted at launch: the delegation ceiling
-    includes writes) must resume without rejection. The personal axis would
-    wrongly reject the same stored override; the child's own identity
-    posture still applies below the config layer inside its ToolManager.
+    A child launched under an orchestrator parent with a stored write-tool
+    override (admitted at launch: the delegation ceiling includes writes)
+    must resume without rejection. Post-grant the orchestrator also holds
+    the write tools personally (the v0.5.9 carve-out), so the axes agree
+    there; the delegation-ceiling discrimination re-pins against the
+    researcher, whose personal grant does not widen its non-mutating
+    delegation set. The child's own identity posture still applies below
+    the config layer inside its ToolManager.
     """
     path = tmp_path / "settings.toml"
     path.write_text('[agent]\nidentity = "orchestrator"\n')
+    researcher_path = tmp_path / "researcher-settings.toml"
+    researcher_path.write_text('[agent]\nidentity = "researcher"\n')
     orchestrator = await make_orchestrator(path)
     assert not await orchestrator.set_field(
         "/session_logging",
@@ -665,21 +673,34 @@ async def test_resume_admits_stored_write_override_under_orchestrator_parent(
     factory = AgentRuntimeFactory()
     loops: list[AgentLoop] = []
     try:
-        # The parent's personal posture excludes writes; its delegation set
-        # is the full granted ceiling.
-        assert "edit" not in parent.tool_manager.available_tools
+        # The v0.5.9 carve-out admits the write tools on the parent's
+        # personal axis; its delegation set is the full granted ceiling.
+        assert "edit" in parent.tool_manager.available_tools
         assert "edit" in parent.tool_manager.delegable_tools
-        # Negative control: the PERSONAL axis would wrongly reject the
-        # stored override at admission — this is the pre-3b miswired axis.
+        # Post-grant the axes agree for the orchestrator, so the 3b ceiling
+        # discrimination re-pins against the researcher: the carve-out gives
+        # it edit PERSONALLY while its delegation set stays non-mutating.
+        # The miswired personal-inventory axis would now ADMIT the override
+        # (fail open); the delegation ceiling rejects it.
+        researcher = AgentLoop(
+            config_orchestrator=await make_orchestrator(researcher_path),
+            cwd=tmp_path,
+            backend=FakeBackend(),
+        )
+        loops.append(researcher)
+        assert "edit" in researcher.tool_manager.available_tools
+        assert "edit" not in researcher.tool_manager.delegable_tools
         with pytest.raises(InvalidLaunchToolError, match="exceeds parent authority"):
             resolve_launch(
                 identity="coder",
                 config=LaunchConfig(enabled_tools=["edit"]),
-                parent_orchestrator=parent.config_orchestrator,
+                parent_orchestrator=researcher.config_orchestrator,
                 tool_inventory={
-                    name: object() for name in parent.tool_manager.registered_tools
+                    name: object() for name in researcher.tool_manager.registered_tools
                 },
-                authorized_tool_names=frozenset(parent.tool_manager.available_tools),
+                authorized_tool_names=frozenset(
+                    researcher.tool_manager.delegable_tools
+                ),
             )
         # Launch with the write override: admitted through the delegation
         # ceiling, and persisted as the child's stored launch state.
@@ -701,8 +722,8 @@ async def test_resume_admits_stored_write_override_under_orchestrator_parent(
         await child.aclose()
         # Resume: the stored write override is re-validated against the
         # parent's DELEGATION ceiling and admitted; the resumed child keeps
-        # the write — the orchestrator parent may delegate writes it cannot
-        # perform itself.
+        # the write — delegation rides the ceiling, not the parent's
+        # personal inventory (which also holds the write post-grant).
         resumed = await factory.resume_child(parent, "coder", child_id, directory)
         loops.append(resumed)
         await resumed.wait_until_ready()
@@ -717,9 +738,17 @@ async def test_resume_admits_stored_write_override_under_orchestrator_parent(
 async def test_retask_uses_the_parent_delegation_ceiling_not_personal_inventory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """3b lifecycle pin: the retask path admits a write-tool override under a
-    write-restricted orchestrator parent — the admission ceiling is the
-    parent's delegation set, not its personal inventory.
+    """3b lifecycle pin: the retask path's admission ceiling is the parent's
+    delegation set, never its personal inventory.
+
+    Post-grant the orchestrator holds the write tools personally (the
+    v0.5.9 carve-out), so the pre-grant personal-vs-delegation gap for edit
+    no longer discriminates there: the retask override stays admitted
+    through the delegation ceiling. The distinction that still exists is
+    the reviewer — bash is admitted personally while its delegation set
+    stays non-mutating — so a retask bash override is rejected against the
+    delegation ceiling even though the parent's personal inventory contains
+    bash.
     """
     monkeypatch.setattr(
         "chartreux.core.agent_loop._loop.create_backend",
@@ -736,7 +765,9 @@ async def test_retask_uses_the_parent_delegation_ceiling_not_personal_inventory(
     registry.bind_root(root)
     context = InvokeContext(tool_call_id="task-1", session_id=parent.session_id)
     try:
-        assert "edit" not in parent.tool_manager.available_tools
+        # The v0.5.9 carve-out admits edit on the parent's personal axis;
+        # the delegation set keeps the full granted ceiling.
+        assert "edit" in parent.tool_manager.available_tools
         assert "edit" in parent.tool_manager.delegable_tools
         launch = await _background_result(
             registry,
@@ -757,7 +788,8 @@ async def test_retask_uses_the_parent_delegation_ceiling_not_personal_inventory(
         child = record.runtime
         assert "edit" in child.agent_loop.tool_manager.available_tools
         # Retask the same agent with the same write override: admitted again
-        # through the parent's delegation ceiling, never its personal set.
+        # through the parent's delegation ceiling — the admission consults
+        # the delegated set, never the personal inventory.
         retask = await _background_result(
             registry,
             TaskArgs(
@@ -777,6 +809,53 @@ async def test_retask_uses_the_parent_delegation_ceiling_not_personal_inventory(
     finally:
         await registry.drain_children()
         await parent.aclose()
+
+    # The delegation-ceiling distinction that still exists post-grant: the
+    # reviewer holds bash personally (its carve-out) while its delegation
+    # set stays non-mutating. A cleanly launched coder child retasked with a
+    # bash override is rejected — the ceiling is the delegation set, not the
+    # personal inventory that contains bash.
+    reviewer = build_test_agent_loop(
+        config=build_test_vibe_config(agent={"identity": "reviewer"}),
+        backend=FakeBackend(),
+    )
+    registry = _retention_registry()
+    root = registry._build_child_runtime(reviewer)
+    root.turns._projector = MagicMock()
+    root.turns.link_subagent = AsyncMock()
+    registry.bind_root(root)
+    context = InvokeContext(tool_call_id="task-1", session_id=reviewer.session_id)
+    try:
+        assert "bash" in reviewer.tool_manager.available_tools
+        assert "bash" not in reviewer.tool_manager.delegable_tools
+        clean = await _background_result(
+            registry,
+            TaskArgs(task="read code", identity="coder", background=True, retain=True),
+            context,
+        )
+        assert clean.agent_id is not None
+        record = registry._agent_records[clean.agent_id]
+        first_run = record.current_run
+        assert first_run is not None
+        await first_run.completion_task
+        child = record.runtime
+        assert "bash" not in child.agent_loop.tool_manager.available_tools
+        # The retask's bash override exceeds the reviewer's delegation set.
+        with pytest.raises(InvalidLaunchToolError, match="exceeds parent authority"):
+            await _background_result(
+                registry,
+                TaskArgs(
+                    task="run checks",
+                    agent_id=record.agent_id,
+                    background=True,
+                    config=LaunchConfig(enabled_tools=["bash"]),
+                ),
+                InvokeContext(tool_call_id="task-2", session_id=reviewer.session_id),
+            )
+        assert "bash" not in child.agent_loop.tool_manager.available_tools
+    finally:
+        await registry.drain_children()
+        await reviewer.aclose()
 
 
 async def test_retask_rejects_write_override_beyond_the_parent_delegation_ceiling(

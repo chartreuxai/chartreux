@@ -108,6 +108,17 @@ class TestBuiltinSkills:
             "a later invocation cannot see the previous shell's status — "
             "`$?` probes are unnecessary" in prompt
         )
+        # A5 additive pins: the clean-tree checkout exemption documented in
+        # the prompt (existing pins above are unchanged by the addition).
+        assert "Clean-tree checkout exemption" in prompt
+        assert "sanctioned delegated switch shapes" in prompt
+        assert "--no-overwrite-ignore" in prompt
+        assert "Anything unestablishable fails closed to the approval flow" in prompt
+        assert (
+            "Branch merging, switches to remote-tracking branches, and "
+            "operations on branches other than the current working branch "
+            "remain user-owned" in prompt
+        )
 
     def test_grep_prompt_documents_context_configuration(self) -> None:
         prompt = (

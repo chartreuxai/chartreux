@@ -185,6 +185,13 @@ class StartResult(_Result):
     # the in-process result.
     write_paths: list[str] = Field(default_factory=list, exclude=True)
     write_paths_unknown: bool = Field(default=False, exclude=True)
+    # A1: the started command's mutation-roots footprint (the resolved
+    # work-tree roots of its checkout/switch invocations), surfaced alongside
+    # `write_paths` — a mutation-scope footprint the submission secret scan
+    # never walks; the completion audit consumes it. Excluded from
+    # `model_dump` for the same reason as `write_paths`.
+    mutation_roots: list[str] = Field(default_factory=list, exclude=True)
+    mutation_roots_unknown: bool = Field(default=False, exclude=True)
 
 
 class ReadResult(_Result):
@@ -393,10 +400,24 @@ class BackgroundJobRegistry:
         return job_id
 
     async def start(
-        self, port: BackgroundJobsPort, args: BashStartArgs, *, cwd: Path | None = None
+        self,
+        port: BackgroundJobsPort,
+        args: BashStartArgs,
+        *,
+        cwd: Path | None = None,
+        execute_command: str | None = None,
     ) -> StartResult:
+        # A2 narrow seam: the executed command may differ from the stored
+        # one — a whole-call-eligible exempt checkout executes with
+        # --no-overwrite-ignore injected, while the reserved job (and so
+        # every JobSummary the list/read snapshots show) keeps args.command
+        # original. reserve() below is unchanged and still records
+        # args.command; A1's StartResult footprint fields (write_paths,
+        # mutation_roots) ride the result exactly as before.
         job_id = self.reserve(port, args)
-        task = asyncio.create_task(self._launch(job_id, args.command, cwd))
+        task = asyncio.create_task(
+            self._launch(job_id, execute_command or args.command, cwd)
+        )
         with self._lock:
             self._jobs[job_id].admission = task
             self._admissions.add(task)
@@ -955,9 +976,15 @@ class BackgroundJobsPort:
             return self._registry.creator_port(object())
 
     async def start(
-        self, args: BashStartArgs, *, cwd: Path | None = None
+        self,
+        args: BashStartArgs,
+        *,
+        cwd: Path | None = None,
+        execute_command: str | None = None,
     ) -> StartResult:
-        return await self._registry.start(self, args, cwd=cwd)
+        return await self._registry.start(
+            self, args, cwd=cwd, execute_command=execute_command
+        )
 
     async def stop(self, args: BashStopArgs) -> StopResult:
         return await self._registry.stop(self, args)

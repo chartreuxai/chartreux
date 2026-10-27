@@ -226,6 +226,10 @@ class ToolExecutor:
                 error_write_paths_unknown=bool(
                     getattr(exc, "write_paths_unknown", False)
                 ),
+                error_mutation_roots=getattr(exc, "mutation_roots", None) or [],
+                error_mutation_roots_unknown=bool(
+                    getattr(exc, "mutation_roots_unknown", False)
+                ),
                 tool_call_id=tool_call.call_id,
             )
             async for ev in self._finalize_cancelled_tool(
@@ -269,10 +273,15 @@ class ToolExecutor:
                 ),
                 # R7: a failed or timed-out shell run may still have written
                 # files; the tool attaches its write footprint to the raised
-                # error so the submission scan keeps covering it.
+                # error so the submission scan keeps covering it. A1: the
+                # mutation-roots footprint rides the error the same way.
                 error_write_paths=getattr(exc, "write_paths", None) or [],
                 error_write_paths_unknown=bool(
                     getattr(exc, "write_paths_unknown", False)
+                ),
+                error_mutation_roots=getattr(exc, "mutation_roots", None) or [],
+                error_mutation_roots_unknown=bool(
+                    getattr(exc, "mutation_roots_unknown", False)
                 ),
                 tool_call_id=tool_call.call_id,
             )

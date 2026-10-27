@@ -20,3 +20,11 @@ Notes:
 - Do NOT pass `-o addopts=''`: addopts carries xdist parallelism (`-n auto`); stripping it turns a ~2-minute parallel suite into a ~20-minute serial run.
 - For long suites, redirect output to a temp file and read the tail — never rerun the suite to recover truncated output. Use `--lf` or targeted node IDs for failure follow-ups.
 - Installed-contract tests (tests/cli/test_installed_contracts.py) require `UV_FIND_LINKS` pointing at a pre-provisioned wheelhouse; skip them locally without it (CI covers them).
+
+## Git workflow policy
+
+- Unpublished history: rebase, `commit --amend`, and `reset --soft`/`--mixed` on unpublished history are agent-executable. A branch is UNPUBLISHED only when HEAD is not contained in any remote-tracking ref (`git rev-list --count HEAD --not --remotes > 0` and no remote-tracking branch contains HEAD).
+- Published history: rewrites of commits contained in remote-tracking refs remain handoff-only and approval-gated. The publication gate checks the operation's ENTIRE affected commit range (every commit the operation could rewrite, e.g. `git rev-list` of the range being rebased) against remote-reachable history; remote-tracking refs count as current only if refreshed in this session (e.g. via `git fetch`) or the affected range is provably local-only.
+- Backstop rule: when a branch's publication status is UNCERTAIN, the agent stops and hands the operation to the user — never rewrites on uncertainty.
+- Destructive checkout: "destructive checkout" means a checkout that discards uncommitted changes; a clean-tree checkout of an existing local branch is not destructive.
+- Hard guards preserved: update-ref, forced and deleting pushes, and history rewrites of published commits keep their existing gates exactly as before this amendment.

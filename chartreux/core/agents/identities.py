@@ -41,6 +41,15 @@ class AgentIdentity:
 # (their delegation_tools posture), so their declared delegation metadata is
 # OPTIONAL — not NONE — matching the executable delegation behavior (design §3:
 # no shipped identity sets none in v1).
+
+# The settled v0.5.9 personal execution grant (settlement: identity tool
+# grants): the delegation-bearing identities may execute the full mutating
+# builtin set themselves — bash for probes and verification, bash_start for
+# managed jobs, write_file/edit for scratchpad and deliverable persistence.
+# Repo-source edits remain DELEGATED by role contract (the B1 prose), not by
+# tool denial; the carve-out never reaches the delegation axis.
+_EXECUTION_CARVE_OUT = frozenset({"bash", "bash_start", "edit", "write_file"})
+
 _IDENTITIES = {
     "coder": AgentIdentity(
         "coder",
@@ -57,6 +66,10 @@ _IDENTITIES = {
         ToolPosture.ALL_GRANTED,
         "restricted",
         "Orchestrator",
+        # Probes, managed jobs, and scratchpad/deliverable persistence run
+        # personally (v0.5.9 identity tool grants); repo-source edits stay
+        # delegated by role contract.
+        execution_carve_out=_EXECUTION_CARVE_OUT,
     ),
     "researcher": AgentIdentity(
         "researcher",
@@ -65,6 +78,10 @@ _IDENTITIES = {
         ToolPosture.NON_MUTATING,
         "read-only",
         "Researcher",
+        # Read-only repo posture with personal scratchpad/deliverable
+        # persistence and probe/managed-job execution (v0.5.9 identity tool
+        # grants); the delegation set stays non-mutating.
+        execution_carve_out=_EXECUTION_CARVE_OUT,
     ),
     "reviewer": AgentIdentity(
         "reviewer",
@@ -87,6 +104,10 @@ _IDENTITIES = {
         ToolPosture.NON_MUTATING,
         "read-only",
         "Advisor",
+        # Same personal execution grant as the researcher (v0.5.9 identity
+        # tool grants): analysis deliverables persist personally; the
+        # delegation set stays non-mutating.
+        execution_carve_out=_EXECUTION_CARVE_OUT,
     ),
 }
 

@@ -91,6 +91,12 @@ class ToolResultEvent(BaseEvent):
     # and for errors raised before the command ran.
     error_write_paths: list[str] = Field(default_factory=list)
     error_write_paths_unknown: bool = False
+    # A1: the failed or cancelled run's mutation-roots footprint (the resolved
+    # work-tree roots of its checkout/switch invocations), copied off the
+    # raised error the same way — a mutation-scope footprint the submission
+    # scan never walks; the completion audit consumes it.
+    error_mutation_roots: list[str] = Field(default_factory=list)
+    error_mutation_roots_unknown: bool = False
     skipped: bool = False
     skip_reason: str | None = None
     cancelled: bool = False

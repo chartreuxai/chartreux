@@ -87,6 +87,73 @@ identity); on recheck failure nothing executes and unused once authority is
 destroyed. Noninteractive sessions deny promptly with remediation. Child approval
 never lifts a missing parent dangerous-command authority (`parent_ceiling`).
 
+### State-aware clean-tree checkout exemption
+
+The `git.checkout` operation keeps its consequential classification and its
+approval flow, but the permission resolver grants a narrow, state-aware
+exemption from that flow without user approval. Exempt shapes only:
+`git checkout <branch>` where the target is an existing LOCAL branch, and
+`git checkout -b <new> [<start>]` for branch creation — no pathspec, no
+`--`, no `-f`/`--force`/`--discard-changes`/`--merge`/`--orphan`/
+`--conflict`/`--pathspec-from-file`/`--recurse-submodules`, no `-B`, and no
+other option. The exemption applies only when the ENTIRE composed shell call
+is exactly one eligible git invocation: no preceding or chained commands, no
+pipeline segments, no environment assignments, no wrapper commands, and no
+inline configuration options (any `git -c <key>=<value>` form is ineligible —
+it can alter the actual invocation's behavior, `core.hooksPath` included).
+Display-only global options (`--no-pager` and equivalents) do not break
+eligibility; repository relocation (`-C`/`--git-dir`/`--work-tree`) fails
+closed. Every ineligible shape falls back to the existing approval class.
+
+The exemption holds only when every candidate repository scope passes the
+state guardrails, each fail-closed on any unestablishable state: a fully
+clean work tree (no unstaged, staged, or untracked changes), no in-progress
+operation marker (merge, rebase, cherry-pick, revert), and no repository
+configuration that selects a program the invocation could run
+(`core.hooksPath` and the other program-selection keys). The plain branch
+form additionally requires the target to exist as a local branch (a
+sanitized rev-parse probe), so a pathspec fallback, a tag, a
+remote-tracking name, or a commit-ish never rides the exemption.
+
+The bash tool executes a command STRING, and the execution path has no
+access to the permission decision, so the executed string of every exempt
+checkout is rewritten at execution time — the exemption predicate is
+re-derived through the same whole-call eligibility check — by inserting
+`--no-overwrite-ignore` immediately after the `checkout` subcommand token,
+by source span, leaving every other byte of the command untouched; the
+original string stays original for display and result surfaces. The flag
+makes an ignored-file collision fail closed (checkout refuses) instead of
+silently clobbering local content; it is the execution-time protection for
+the adjudicated race between the permission-time state probe and execution
+(a concurrent actor can change the tree after the probe: conflicting
+concurrent changes cause a refusal, non-conflicting ones may survive a
+successful non-forcing checkout — the invariant is preservation of
+concurrent user changes, never a destructive outcome).
+
+Classifier divergence, deliberate and pinned: the pure classifier
+(`classify_dangerous_git_command`) is unchanged — `git checkout` keeps its
+classification and the git_pure corpus bytes stay frozen — while the
+resolver's state-aware layer grants the exemption; the divergence is
+pinned by the shell-policy corpus, which observes resolver permission
+under a discriminator without changing old record shapes.
+The approval classes are preserved: a non-exempt checkout still
+demands the consequential approval flow (Deny default; Allow once /
+Allow this session; never Always), and the exemption never bypasses the
+denylist veto, parent ceilings, or any other recheck.
+
+Sanctioned delegated switch shapes (amended branch-ownership rule): the
+two exempt shapes above are the sanctioned delegated switch operations
+available to any bash-capable seat. Branch MERGING, switches to
+remote-tracking branches, and operations on branches other than the
+current working branch remain USER-OWNED.
+
+Deferred alternatives, documented as non-goals: exempting
+conflict-resolution reads (`checkout --ours`/`--theirs`; the sanctioned
+paths are `git show :2:<path>`/`git show :3:<path>` and `git merge -X`
+strategy options), a published-HEAD gate in the resolver (a branch's
+publication status is a prompt/policy contract, not a resolver gate),
+and any `git update-ref` relaxation (update-ref stays a hard guard).
+
 ### Protected persistence and absolute veto
 
 Only the publication operations may persist — `git.push` and

@@ -1441,6 +1441,7 @@ def fixtures_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
     build_recursive_rm_fixtures(root)
     build_bare_metadata_fixtures(root)
     build_curl_destination_fixtures(root)
+    build_git_workflow_fixtures(root)
     return root
 
 
@@ -1781,6 +1782,68 @@ def build_curl_destination_fixtures(root: Path) -> None:
     os.symlink("../../plain-repo", safe / "escape")
 
 
+def build_git_workflow_fixtures(root: Path) -> None:
+    """Build the git-workflow repositories the R15/R16 permission rows and the
+    runtime-aware divergence rows resolve against (A3).
+
+    Seven repositories over one base layout — ``main`` with a tracked file
+    named ``topic`` (the branch-vs-file ambiguity fixture) and a ``topic``
+    branch one commit ahead — varied by guardrail state: a clean tree, an
+    unsaved modification, in-progress merge and rebase markers on otherwise
+    clean trees (each isolating one guardrail), a program-selecting
+    ``core.hooksPath`` configuration, an unpublished branch (no remote at
+    all), and a published branch (every branch pushed to a bare remote beside
+    the fixture root, mirroring the ``rm-nested-pushed`` pattern). The clean
+    fixture also carries a ``v1.0`` tag for the non-branch operand pins. The
+    recorded observations name no commit hashes, branches, or absolute paths,
+    so the build is replay-stable, and no recorded row names the bare remote.
+    """
+
+    def workflow_repo(path: Path) -> Path:
+        path.mkdir(parents=True, exist_ok=True)
+        _git(path, "init", "-q", "-b", "main")
+        _git(path, "config", "user.email", "corpus@example.com")
+        _git(path, "config", "user.name", "Corpus")
+        (path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        (path / "topic").write_text("main version\n", encoding="utf-8")
+        _git(path, "add", "-A")
+        _git(path, "commit", "-q", "-m", "base")
+        _git(path, "checkout", "-q", "-b", "topic")
+        (path / "topic").write_text("topic version\n", encoding="utf-8")
+        _git(path, "add", "-A")
+        _git(path, "commit", "-q", "-m", "topic work")
+        _git(path, "checkout", "-q", "main")
+        return path
+
+    clean = workflow_repo(root / "gw-clean")
+    _git(clean, "tag", "v1.0")
+
+    dirty = workflow_repo(root / "gw-dirty")
+    (dirty / "tracked.txt").write_text("unsaved\n", encoding="utf-8")
+
+    # Each marker fixture isolates one in-progress guardrail: the tree stays
+    # otherwise clean, so the gate fires on the marker alone.
+    merge = workflow_repo(root / "gw-merge-in-progress")
+    (merge / ".git" / "MERGE_HEAD").write_text("in progress\n", encoding="utf-8")
+    rebase = workflow_repo(root / "gw-rebase-in-progress")
+    (rebase / ".git" / "rebase-merge").mkdir()
+
+    # Publication status does not gate the exemption (checkout rewrites no
+    # history): the unpublished fixture has no remote at all, the published
+    # fixture pushed both branches to the bare remote.
+    workflow_repo(root / "gw-unpublished")
+    published = workflow_repo(root / "gw-published")
+    bare = root.parent / "gw-published-origin.git"
+    bare.mkdir(parents=True)
+    _git(bare, "init", "-q", "--bare")
+    _git(published, "remote", "add", "origin", str(bare))
+    _git(published, "push", "-q", "origin", "refs/heads/main:refs/heads/main")
+    _git(published, "push", "-q", "origin", "refs/heads/topic:refs/heads/topic")
+
+    hooks = workflow_repo(root / "gw-hookspath")
+    _git(hooks, "config", "core.hooksPath", "hooks")
+
+
 # ---------------------------------------------------------------------------
 # Family observers (shared verbatim by the recorder and the replay)
 # ---------------------------------------------------------------------------
@@ -1963,7 +2026,7 @@ def observe_push_risk(entry: dict[str, Any], root: Path) -> dict[str, Any]:
 def observe_divergence(entry: dict[str, Any], root: Path) -> dict[str, Any]:
     """The pinned deliberate divergences, observed end to end in one entry."""
     argv = [str(token) for token in entry["argv"]]
-    return {
+    observed = {
         "policy": call_json(lambda: policy.analyze_shell_command_policy(list(argv))),
         "candidates": call_json(
             lambda: policy.path_candidates(list(argv), inspect_positional_paths=True)
@@ -1979,6 +2042,13 @@ def observe_divergence(entry: dict[str, Any], root: Path) -> dict[str, Any]:
             lambda: policy.classify_dangerous_git_command(list(argv))
         ),
     }
+    if entry.get("runtime_permission"):
+        # A3: the runtime-aware divergence rows also observe the resolver
+        # permission in the entry's fixture repository — the frozen pure
+        # classifier versus the runtime decision in one record. Entries
+        # without the discriminator keep the original shape.
+        observed["permission"] = observe_permission(entry, root)["context"]
+    return observed
 
 
 PERMISSION_ARGV: list[list[str]] = [
@@ -4183,6 +4253,201 @@ PERMISSION_R14_CASES: list[dict[str, Any]] = (
 )
 
 
+PERMISSION_R15_CASES: list[dict[str, Any]] = [
+    # A3 R15: the clean-tree checkout exemption's guardrail states, one
+    # fixture per state (build_git_workflow_fixtures). On the clean
+    # repository every guardrail passes and both exempt forms ride the
+    # exemption; every other state fails closed to the existing approval
+    # class.
+    {"argv": ["git", "checkout", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "-b", "feature"], "cwd": "gw-clean"},
+    # An unsaved modification dirties the tree: fail closed.
+    {"argv": ["git", "checkout", "topic"], "cwd": "gw-dirty"},
+    {"argv": ["git", "checkout", "-b", "feature"], "cwd": "gw-dirty"},
+    # The in-progress markers each fail closed on an otherwise clean tree,
+    # so the row isolates the marker guardrail alone.
+    {"argv": ["git", "checkout", "topic"], "cwd": "gw-merge-in-progress"},
+    {"argv": ["git", "checkout", "-b", "feature"], "cwd": "gw-merge-in-progress"},
+    {"argv": ["git", "checkout", "topic"], "cwd": "gw-rebase-in-progress"},
+    {"argv": ["git", "checkout", "-b", "feature"], "cwd": "gw-rebase-in-progress"},
+    # A program-selecting configuration fails closed.
+    {"argv": ["git", "checkout", "topic"], "cwd": "gw-hookspath"},
+    {"argv": ["git", "checkout", "-b", "feature"], "cwd": "gw-hookspath"},
+    # Publication status does not gate the exemption — checkout rewrites no
+    # history — so the same clean-tree checkout is allowed whether the
+    # branch is unpublished (no remote at all) or published.
+    {"argv": ["git", "checkout", "topic"], "cwd": "gw-unpublished"},
+    {"argv": ["git", "checkout", "topic"], "cwd": "gw-published"},
+    # Unestablishable state fails closed: a directory governed by no
+    # repository, and a corrupted git dir whose state probes cannot be
+    # established (the recursive-rm fixtures reused here).
+    {"argv": ["git", "checkout", "main"], "cwd": "rm-norepo"},
+    {"argv": ["git", "checkout", "main"], "cwd": "rm-corrupt"},
+]
+
+
+PERMISSION_R16_CASES: list[dict[str, Any]] = [
+    # A3 R16: the git-workflow permission surface, pinned against the
+    # gw-clean / gw-published fixtures.
+    # The exempt shapes resolve run-class (always) on the clean tree.
+    {"argv": ["git", "checkout", "main"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "-b", "feature"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "-b", "feature", "main"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "-b", "feature", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "--no-pager", "checkout", "topic"], "cwd": "gw-clean"},
+    {"argv": [], "raw": "git checkout 'topic'", "cwd": "gw-clean"},
+    # The excluded shapes stay gated with the git.checkout proposal:
+    # pathspecs, forcing and conflict options, other options, operand
+    # arity, and non-branch operands (a tag, a remote-tracking name,
+    # commit-ishes, a missing branch).
+    {"argv": ["git", "checkout", "topic", "file.txt"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "-f", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "--force", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "--discard-changes", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "-m", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "--merge", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "--orphan", "new"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "--conflict=merge", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "--conflict", "merge", "topic"], "cwd": "gw-clean"},
+    {
+        "argv": ["git", "checkout", "--pathspec-from-file=paths.txt", "topic"],
+        "cwd": "gw-clean",
+    },
+    {"argv": ["git", "checkout", "--recurse-submodules", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "-B", "new"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "-q", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "--detach", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "-p", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "topic", "extra"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "-b", "new", "main", "extra"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "v1.0"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "origin/main"], "cwd": "gw-published"},
+    {"argv": ["git", "checkout", "HEAD"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "topic~1"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "no-such-branch"], "cwd": "gw-clean"},
+    # Unmodeled forms stay hard guards: no grantable proposal at all.
+    {"argv": ["git", "checkout", "--", "file.txt"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "main", "--", "file.txt"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "--", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "-b"], "cwd": "gw-clean"},
+    # The whole-call eligibility gate: any wrapper, assignment, chain,
+    # pipe, subshell, inline configuration, relocation, or redirect fails
+    # closed to the existing approval class.
+    {
+        "argv": ["git", "checkout", "topic", "&&", "git", "status"],
+        "raw": "git checkout topic && git status",
+        "cwd": "gw-clean",
+    },
+    {
+        "argv": ["git", "checkout", "topic", ";", "git", "status"],
+        "raw": "git checkout topic; git status",
+        "cwd": "gw-clean",
+    },
+    {
+        "argv": ["git", "checkout", "topic", "|", "cat"],
+        "raw": "git checkout topic | cat",
+        "cwd": "gw-clean",
+    },
+    {
+        "argv": ["(", "git", "checkout", "topic", ")"],
+        "raw": "(git checkout topic)",
+        "cwd": "gw-clean",
+    },
+    {
+        "argv": ["sh", "-c", "git checkout topic"],
+        "raw": "sh -c 'git checkout topic'",
+        "cwd": "gw-clean",
+    },
+    {
+        "argv": ["FOO=1", "git", "checkout", "topic"],
+        "raw": "FOO=1 git checkout topic",
+        "cwd": "gw-clean",
+    },
+    {
+        "argv": ["export", "FOO=1", ";", "git", "checkout", "topic"],
+        "raw": "export FOO=1; git checkout topic",
+        "cwd": "gw-clean",
+    },
+    {"argv": ["env", "FOO=1", "git", "checkout", "topic"], "cwd": "gw-clean"},
+    {"argv": ["sudo", "-u", "root", "git", "checkout", "topic"], "cwd": "gw-clean"},
+    {
+        "argv": ["git", "-c", "core.hooksPath=/tmp/hooks", "checkout", "topic"],
+        "cwd": "gw-clean",
+    },
+    {
+        "argv": ["git", "--config-env", "core.hooksPath=HOOKS", "checkout", "topic"],
+        "cwd": "gw-clean",
+    },
+    {"argv": ["git", "-C", ".", "checkout", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "--git-dir", ".git", "checkout", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "--work-tree", ".", "checkout", "topic"], "cwd": "gw-clean"},
+    {
+        "argv": ["git", "checkout", "topic", ">", "out.txt"],
+        "raw": "git checkout topic > out.txt",
+        "cwd": "gw-clean",
+    },
+    # git switch is untouched: the plain form is routine, the discarding
+    # forms keep their own operation.
+    {"argv": ["git", "switch", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "switch", "-f", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "switch", "--discard-changes", "topic"], "cwd": "gw-clean"},
+    # The destructive workflow forms keep their refusals: the stash drop
+    # and the out-of-merge --ours checkout gate with their proposals, the
+    # history-rewriting reset --hard and update-ref stay hard guards.
+    {"argv": ["git", "stash", "drop"], "cwd": "gw-clean"},
+    {"argv": ["git", "checkout", "--ours", "topic"], "cwd": "gw-clean"},
+    {"argv": ["git", "reset", "--hard"], "cwd": "gw-clean"},
+    {"argv": ["git", "update-ref", "refs/heads/topic", "HEAD~1"], "cwd": "gw-clean"},
+    # The published fixture: the forced push against the configured bare
+    # origin stays gated.
+    {"argv": ["git", "push", "--force", "origin", "main"], "cwd": "gw-published"},
+]
+
+
+# A3: the runtime-aware divergence records for the checkout exemption. The
+# frozen pure classifier still classifies every exempt form as a dangerous
+# git operation, while the runtime resolver grants it on the clean
+# repository; the `runtime_permission` discriminator adds the resolver
+# observation to these entries alone, so the older divergence rows keep
+# their recorded shape.
+DIVERGENCE_GIT_WORKFLOW_CASES: list[dict[str, Any]] = [
+    {
+        "argv": ["git", "checkout", "topic"],
+        "cwd": "gw-clean",
+        "runtime_permission": True,
+    },
+    {
+        "argv": ["git", "checkout", "main"],
+        "cwd": "gw-clean",
+        "runtime_permission": True,
+    },
+    {
+        "argv": ["git", "checkout", "-b", "feature"],
+        "cwd": "gw-clean",
+        "runtime_permission": True,
+    },
+    {
+        "argv": ["git", "--no-pager", "checkout", "topic"],
+        "cwd": "gw-clean",
+        "runtime_permission": True,
+    },
+    # Controls: where the resolver withholds the exemption, both surfaces
+    # gate — the dirty tree on the state guardrail, the forcing option on
+    # the excluded shape.
+    {
+        "argv": ["git", "checkout", "topic"],
+        "cwd": "gw-dirty",
+        "runtime_permission": True,
+    },
+    {
+        "argv": ["git", "checkout", "--force", "topic"],
+        "cwd": "gw-clean",
+        "runtime_permission": True,
+    },
+]
+
+
 def _tokenize_paths(value: Any, root: Path) -> Any:
     if isinstance(value, str):
         return value.replace(str(root), FIXTURES_TOKEN)
@@ -4289,6 +4554,8 @@ def build_family_entries(family: str, root: Path) -> list[dict[str, Any]]:
     elif family == "divergence":
         for argv in DIVERGENCE_ARGV:
             add({"argv": argv}, observe_divergence({"argv": argv}, root))
+        for case in DIVERGENCE_GIT_WORKFLOW_CASES:
+            add(case, observe_divergence(case, root))
     elif family == "permission":
         for argv in PERMISSION_ARGV:
             add({"argv": argv}, observe_permission({"argv": argv}, root))
@@ -4331,6 +4598,10 @@ def build_family_entries(family: str, root: Path) -> list[dict[str, Any]]:
         for case in PERMISSION_R13_CASES:
             add(case, observe_permission(case, root))
         for case in PERMISSION_R14_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_R15_CASES:
+            add(case, observe_permission(case, root))
+        for case in PERMISSION_R16_CASES:
             add(case, observe_permission(case, root))
     else:
         raise AssertionError(f"unknown corpus family: {family}")
@@ -4735,6 +5006,7 @@ def main(argv: list[str] | None = None) -> int:
         build_recursive_rm_fixtures(root)
         build_bare_metadata_fixtures(root)
         build_curl_destination_fixtures(root)
+        build_git_workflow_fixtures(root)
         entries = build_entries(root)
     text = serialize_entries(entries)
     if args.record:

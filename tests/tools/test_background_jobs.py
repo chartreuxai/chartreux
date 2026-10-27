@@ -138,7 +138,7 @@ async def test_cancelled_start_attaches_command_write_paths(tmp_path):
     # footprint rides the cancellation (CancelledShellCommand) to the
     # executor's cancelled result event.
     class BlockedPort:
-        async def start(self, args, *, cwd=None):
+        async def start(self, args, *, cwd=None, execute_command=None):
             await asyncio.Event().wait()
 
     tool = manager(tmp_path).get("bash_start")
