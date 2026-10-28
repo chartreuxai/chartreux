@@ -33,7 +33,8 @@ from chartreux.core.llm_models import ImageAttachment
 from chartreux.core.tools.classification import (
     ToolClass,
     classify_tool,
-    registry_builtin_name,
+    location_trusted_user_tool,
+    shipped_builtin_name,
 )
 from chartreux.core.tools.models import (
     ToolPermission,
@@ -160,26 +161,28 @@ class BaseToolState(BaseModel):
 
 
 def registry_provenance_classification(tool_class: type[BaseTool]) -> ToolClass:
-    """Authority classification computed from registry provenance — never virtual.
+    """Authority classification computed from where the class comes from.
 
     ``BaseTool.get_authority_classification`` is an overridable classmethod, so
     authority decisions must not dispatch through it: a custom class can
     self-declare NON_MUTATING and ride a read-only posture (S2 classification
-    self-declaration blocker). Only the registry's provenance stamp on the
-    exact class confers a reviewed table entry; anything un-stamped (a custom
-    replacement, an MCP proxy, a subclass) fails closed as MUTATING.
-
-    The stamp is consulted in the harness-side side table
-    (``classification.registry_builtin_name``), NEVER in the class namespace:
-    a custom class declaring ``_registry_builtin_name`` in its own body is
-    indistinguishable from a registry-conferred stamp under a ``__dict__``
-    lookup, so a forged declaration would confer the reviewed builtin
-    classification (S2 round 2: forgeable provenance stamp).
+    self-declaration blocker). A class DEFINED by a shipped builtin module is
+    that builtin and takes its reviewed table entry
+    (``classification.shipped_builtin_name``); the file-location trust
+    contract (P4-1) then admits an exact class the gated discovery path
+    recorded from the user's OWN tools directory (``~/.chartreux/tools/``) —
+    the user's own code — as NON_MUTATING, by where it lives. Anything else
+    (a custom replacement, an MCP proxy, a project-discovered tool, a
+    subclass) fails closed as MUTATING. The reviewed table entry always wins
+    for shipped builtins, so location trust never widens a builtin's
+    reviewed classification.
     """
-    stamped = registry_builtin_name(tool_class)
-    if stamped is None:
-        return ToolClass.MUTATING
-    return classify_tool(stamped, builtin=True)
+    builtin = shipped_builtin_name(tool_class)
+    if builtin is not None:
+        return classify_tool(builtin, builtin=True)
+    if location_trusted_user_tool(tool_class):
+        return ToolClass.NON_MUTATING
+    return ToolClass.MUTATING
 
 
 class BaseTool[
@@ -196,13 +199,13 @@ class BaseTool[
     # variant is the available one with the greatest priority.
     selection_priority: ClassVar[int] = 0
 
-    # Registry provenance is deliberately NOT a class attribute: the
-    # registry-conferred builtin stamp lives in the harness-side side table
-    # (``chartreux.core.tools.classification.registry_builtin_name``), so a
-    # custom class declaring ``_registry_builtin_name`` in its own body never
-    # confers the reviewed classification (S2 round 2: forgeable provenance
-    # stamp). Custom implementations and MCP proxies are never stamped, and
-    # the stamp is keyed by the exact class, so a subclass never inherits it.
+    # Builtin identity is deliberately NOT a class attribute: a shipped
+    # builtin is the class a shipped builtin module DEFINES
+    # (``chartreux.core.tools.classification.shipped_builtin_name``), so a
+    # custom class declaring builtin-ish attributes in its own body never
+    # confers the reviewed classification, and a subclass — defined outside
+    # the shipped builtin modules — never inherits it. Custom
+    # implementations, MCP proxies, and project-discovered tools fail closed.
 
     def __init__(
         self,
@@ -588,10 +591,10 @@ class BaseTool[
 
     @classmethod
     def get_authority_classification(cls) -> ToolClass:
-        """Reviewed table class for registered builtins; others fail closed.
+        """Reviewed table class for shipped builtins; others fail closed.
 
-        Only the registry's provenance stamp on this exact class confers a
-        builtin entry: a custom implementation reusing a builtin name, or
+        Only a class defined by a shipped builtin module takes a builtin
+        entry: a custom implementation reusing a builtin name, or
         subclassing one, stays MUTATING. The table is read live, so a
         reviewed reclassification applies immediately.
 

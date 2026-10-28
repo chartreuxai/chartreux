@@ -75,6 +75,7 @@ from chartreux.observability.logging import logger
 from chartreux.utils.retry_prompt import build_resume_prompt
 
 if TYPE_CHECKING:
+    from chartreux.app_server._recovery_controller import RecoveryController
     from chartreux.app_server._sessions import SessionRuntime
     from chartreux.app_server._subagent_execution import SubagentExecution
 
@@ -113,6 +114,10 @@ class RecoveryStateView(Protocol):
     _draining_children: bool
     _max_running_subagents: int | None
     _execution: SubagentExecution
+    # C6a: the WP4 controller collaborator — the explicit admission consults
+    # the same read-only availability snapshot the controller schedules
+    # against and stands down the pending automatic schedule at commit.
+    _recovery_controller: RecoveryController
 
     def _generation_is_current(self, generation: int) -> bool: ...
 
@@ -343,13 +348,29 @@ class SubagentRecovery:
         idempotency_key: str,
         *,
         requester_session_id: str,
+        override_cooldown: bool = False,
     ) -> ResumeAgentResult:
-        """Admit at most one successor for a suspended failed run (WP2)."""
+        """Explicitly resume a suspended agent (handoff §1.4; WP2).
+
+        Nonblocking acceptance through ONE admission operation (the later
+        automatic controller must call the same operation): single-flight
+        and run-pinned, so concurrent same-key and different-key calls
+        admit exactly one successor with a NEW run_id on the SAME agent
+        identity. The old failed result and waits pinned to it stay
+        immutable; prior execution/tool tasks are joined before admission.
+        NO auto-scheduling: an admitted successor starts immediately.
+        With ``override_cooldown`` the explicit request also mints the
+        endpoint-bound forced-attempt permit from the root ledger (C6b)
+        and binds it to the successor's first model call; the ledger
+        denies the mint when the episode is exhausted, spacing-bound, or
+        has an attempt in flight, and a denied mint consumes nothing.
+        """
         view = self._view
         admission: _ResumeAdmission | None = None
         slot: _ActiveWorkSlot | None = None
         eligibility: RecoveryEligibility | None = None
         reason_codes: list[str] = []
+        forced_reason_codes: list[str] | None = None
         raise_after_lock: RuntimeError | None = None
         async with view._registry_lock:
             if view._admission_closed or view._draining_children:
@@ -544,6 +565,44 @@ class SubagentRecovery:
                     reason="The suspended runtime is no longer resident",
                     reason_codes=["runtime_unavailable"],
                 )
+            # C6a: reject an unavailable admission BEFORE consuming a resume
+            # or publishing RESTORING — the same read-only availability
+            # snapshot the controller schedules against. C6b: an explicit
+            # ``override_cooldown`` request forces the attempt past a
+            # temporary (never permanent) unavailability; the ledger still
+            # denies the mint when the episode is exhausted, spacing-bound,
+            # or has an attempt in flight, and a denied mint consumes
+            # nothing.
+            availability = view._recovery_controller._availability(record)
+            forced_override = (
+                not availability.available
+                and override_cooldown
+                and not availability.permanent
+            )
+            if not availability.available and not forced_override:
+                if availability.permanent:
+                    unavailability_reason = (
+                        "Every deployment of the committed model is "
+                        "permanently excluded; resume is rejected"
+                    )
+                    unavailability_codes = ["permanent_incompatibility"]
+                else:
+                    unavailability_reason = (
+                        "Every deployment of the committed model is currently "
+                        "unavailable; resume is rejected without consuming "
+                        "the resume budget"
+                    )
+                    unavailability_codes = ["model_unavailable"]
+                return ResumeAgentResult(
+                    outcome=ResumeOutcome.NOT_RESUMABLE,
+                    agent_id=agent_id,
+                    run_id=expected_run_id,
+                    eligibility=eligibility,
+                    reason=unavailability_reason,
+                    reason_codes=unavailability_codes,
+                )
+            if forced_override:
+                forced_reason_codes = [*reason_codes, "forced_un_stick_attempt"]
             # Capacity: the successor consumes one active-work slot, exactly
             # like a fresh launch (the failed run's slot was released when
             # its monitor finalized).
@@ -595,6 +654,13 @@ class SubagentRecovery:
                 record.pending_resume = operation
                 record.state = _AgentState.RESTORING
                 record.same_agent_resumes_used += 1
+                # C6a: a COMMITTED admission stands down the pending automatic
+                # schedule — the timer must never fire on a RESTORING record.
+                # The episode itself stays active: the successor's completion
+                # transition closes it, and the automatic route's own
+                # post-admission accounting still sees it active. A rejected
+                # admission (every return above) leaves the timer armed.
+                view._recovery_controller.stand_down_schedule_locked(agent_id)
                 # Review R8: the successor's slot is RESERVED here, under the
                 # lock — the cap checks above and the reservation are one
                 # atomic step, so concurrent resumes can never all pass the
@@ -618,7 +684,9 @@ class SubagentRecovery:
         assert admission is not None
         assert slot is not None
         try:
-            await self._admit_successor(admission, slot)
+            await self._admit_successor(
+                admission, slot, override_cooldown=override_cooldown
+            )
         except BaseException:
             async with view._registry_lock:
                 record = admission.record
@@ -629,6 +697,12 @@ class SubagentRecovery:
                     record.pending_resume = None
                     record.state = _AgentState.SUSPENDED
                     record.same_agent_resumes_used = admission.resumes_used_before
+                    # C6a rollback: the committed admission stood the
+                    # automatic schedule down; a failed successor admission
+                    # must re-arm it — a suspended agent produces no new
+                    # failure envelope, so nothing else restores the
+                    # automatic route.
+                    view._recovery_controller.rearm_schedule_locked(agent_id)
                 if not slot.transferred:
                     view._active_work_slots.discard(slot)
             raise
@@ -641,13 +715,17 @@ class SubagentRecovery:
             recovery_operation_id=admission.operation.operation_id,
             retry_at=admission.operation.admitted_at,
             eligibility=eligibility,
-            reason_codes=reason_codes,
+            reason_codes=forced_reason_codes or reason_codes,
             same_agent_resumes_used=admission.record.same_agent_resumes_used,
             reason="Resume admitted; the successor run started immediately",
         )
 
     async def _admit_successor(
-        self, admission: _ResumeAdmission, slot: _ActiveWorkSlot
+        self,
+        admission: _ResumeAdmission,
+        slot: _ActiveWorkSlot,
+        *,
+        override_cooldown: bool = False,
     ) -> None:
         """Drive one admitted resume to a running successor (no scheduling).
 
@@ -658,7 +736,11 @@ class SubagentRecovery:
         allocated at admission is published atomically with the run.
         ``slot`` is the capacity slot RESERVED at admission, under the
         registry lock (review R8) — the cap checks and the reservation are
-        one atomic step.
+        one atomic step. With ``override_cooldown`` the explicit request
+        also mints the endpoint-bound forced-attempt permit from the root
+        ledger (C6b) and binds it to the successor's first model call; the
+        ledger denies the mint when the episode is exhausted, spacing-bound,
+        or has an attempt in flight, and a denied mint consumes nothing.
         """
         view = self._view
         record = admission.record
@@ -679,6 +761,7 @@ class SubagentRecovery:
                 task=(record.initial_task_summary or record.last_task_summary or ""),
                 agent_id=record.agent_id,
                 background=True,
+                override_cooldown=override_cooldown,
             )
             ctx = InvokeContext(
                 tool_call_id=f"resume:{admission.operation.operation_id}",
@@ -698,14 +781,18 @@ class SubagentRecovery:
                 context.runtime.turns._event_sink = context.consume_event
                 # 4. ONE resume marker + injected continuation, mirroring
                 #    /retry. Injected and NEVER user_initiated_retry (F6).
+                #    P4: the frozen contract renders into the resumed prompt
+                #    too — the successor run keeps the failed run's
+                #    run-scoped contract snapshot, so the worker still
+                #    receives the requirements it must cite.
+                resume_text = build_resume_prompt(failed_run.run_id)
+                contract = context.run_record.completion_contract
+                if contract is not None:
+                    resume_text = f"{resume_text}\n\n{contract.render_prompt_section()}"
                 response, action = context.runtime.turns.start(
                     TurnStartParams(
                         session_id=context.runtime.agent_loop.session_id,
-                        message=[
-                            TextContentBlock(
-                                text=build_resume_prompt(failed_run.run_id)
-                            )
-                        ],
+                        message=[TextContentBlock(text=resume_text)],
                         injected=True,
                     )
                 )

@@ -29,6 +29,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from chartreux.core.completion_contract import CompletionRejectionReason
 from chartreux.core.llm.failures import FailureCategory
 
 __all__ = [
@@ -48,6 +49,7 @@ __all__ = [
     "attach_attempted_deployment",
     "attach_call_evidence",
     "backend_transport_attempts",
+    "build_completion_rejection_envelope",
     "build_failure_envelope",
     "build_root_turn_failure",
     "canonical_endpoint_identity",
@@ -87,6 +89,11 @@ class FailureClass(enum.StrEnum):
     AUTHORIZATION = "authorization"
     PERMANENT_CONFIG = "permanent_config"
     BUDGET_STOP = "budget_stop"
+    # P11: a typed completion-audit rejection — a worker-side disposition
+    # (P1's CompletionRejectionReason vocabulary), never derived from an LLM
+    # observation. Replacement-authorized by the failure-time policy; never
+    # auto-resumed.
+    COMPLETION_REJECTION = "completion_rejection"
     INCOMPLETE_STREAM = "incomplete_stream"
     EMPTY_RESPONSE = "empty_response"
     UNKNOWN = "unknown"
@@ -171,6 +178,22 @@ class ExhaustionReason(enum.StrEnum):
     ATTEMPTS = "attempts"
     NONRETRYABLE = "nonretryable"
     UNKNOWN = "unknown"
+
+
+class MeasuredTimeoutReason(enum.StrEnum):
+    """Specific MEASURED timeout reasons (C5a) — a reason vocabulary, never a
+    failure class.
+
+    Every member classifies INSIDE an existing failure class (the timeout
+    operational signature): the value rides the envelope's failure evidence
+    codes, so consumers recognize the specific harness-measured timeout
+    without a new ``FailureClass`` member (P11's wire mirror stays
+    untouched). The producer contract (C5a -> C5b): a harness-raised
+    deadline failure carries the reason value as its ``error_code``, which
+    the WP0 observation carrier already extracts from the exception chain.
+    """
+
+    RESUME_PROGRESS_DEADLINE = "resume_progress_deadline"
 
 
 #: Default ports dropped from the canonical endpoint identity (review R9):
@@ -557,6 +580,10 @@ _TRANSIENT_CLASSES = frozenset({
 
 _BUDGET_STOP_REASONS = frozenset({"budget_exceeded", "budget_unverifiable"})
 
+# C7: cooldown and endpoint-cooldown are both time-based transient launch
+# blocks; every other exclusion reason is a permanent admission restriction.
+_LAUNCH_TRANSIENT_EXCLUSION_REASONS = frozenset({"cooldown", "endpoint-cooldown"})
+
 
 def _derive_phase(
     observation_phase: str | None, transport_attempts: int | None
@@ -618,6 +645,42 @@ def _derive_tool_effects(
     return ToolEffectsDisposition.UNKNOWN, ["tool_effects_not_transcript_visible"]
 
 
+def _measured_timeout_reason(observation: Any | None) -> MeasuredTimeoutReason | None:
+    """The specific measured timeout reason an observation carries, if any.
+
+    The C5a producer contract: a harness-raised measured deadline failure
+    carries the reason value as its ``error_code`` (the WP0 carrier extracts
+    ``error_code`` from the exception chain). Recognition errs toward the
+    prohibition direction: a colliding code can only suppress the automatic
+    continuation, never enable one.
+    """
+    if observation is None:
+        return None
+    code = getattr(observation, "error_code", None)
+    if not isinstance(code, str):
+        return None
+    try:
+        return MeasuredTimeoutReason(code)
+    except ValueError:
+        return None
+
+
+def measured_timeout_reason_of(
+    envelope: FailureEnvelope,
+) -> MeasuredTimeoutReason | None:
+    """The envelope's specific measured timeout reason (C5a), if any.
+
+    The reason rides the failure block's evidence codes (the reason value IS
+    the evidence code); consumers — the automatic-recovery controller's
+    prohibition gate, the failure-time replacement policy — recognize it
+    through this one helper so the evidence-code contract stays in one place.
+    """
+    for reason in MeasuredTimeoutReason:
+        if reason.value in envelope.failure.evidence_codes:
+            return reason
+    return None
+
+
 def build_failure_envelope(  # noqa: PLR0913, PLR0912, PLR0914, PLR0915
     # One deliberate derivation entry point: the §1.7 envelope is built in a
     # single place so every field's provenance stays reviewable together.
@@ -670,6 +733,8 @@ def build_failure_envelope(  # noqa: PLR0913, PLR0912, PLR0914, PLR0915
         if not isinstance(cause_category, FailureCategory):
             cause_category = None
 
+    measured_timeout = _measured_timeout_reason(observation)
+
     exception_type: str | None = (
         getattr(observation, "exception_type", None)
         if observation is not None
@@ -679,7 +744,17 @@ def build_failure_envelope(  # noqa: PLR0913, PLR0912, PLR0914, PLR0915
 
     # --- class derivation (protected classes dominate) ---
     evidence_codes: list[str] = []
-    if stop_reason in _BUDGET_STOP_REASONS:
+    if measured_timeout is not None:
+        # C5a: a harness-measured progress deadline is a MEASURED timeout —
+        # the specific reason rides the evidence codes, the class stays the
+        # existing timeout operational signature (never a new FailureClass),
+        # and the confidence is MEASURED (the harness measured the deadline
+        # directly, not a signature inference from attempt history).
+        cause_category = FailureCategory.TIMEOUT
+        failure_class = FailureClass.PROVIDER_STALL
+        confidence = FailureConfidence.MEASURED
+        evidence_codes.append(measured_timeout.value)
+    elif stop_reason in _BUDGET_STOP_REASONS:
         failure_class = FailureClass.BUDGET_STOP
         confidence = FailureConfidence.MEASURED
         evidence_codes.append("budget_stop")
@@ -755,7 +830,11 @@ def build_failure_envelope(  # noqa: PLR0913, PLR0912, PLR0914, PLR0915
 
     # --- exhaustion ---
     exhaustion: ExhaustionReason | None = None
-    if call_evidence is not None or cause_category is not None:
+    if measured_timeout is not None:
+        # C5a: the measured deadline IS the exhaustion fact — derived, not
+        # inferred from the attempt history or the retry budget.
+        exhaustion = ExhaustionReason.DEADLINE
+    elif call_evidence is not None or cause_category is not None:
         exhaustion = _derive_exhaustion(
             budget_exhausted=(
                 call_evidence.budget_exhausted if call_evidence is not None else None
@@ -763,8 +842,8 @@ def build_failure_envelope(  # noqa: PLR0913, PLR0912, PLR0914, PLR0915
             cause_category=cause_category,
             transport_attempts=transport_attempts,
         )
-        if exhaustion is not None:
-            evidence_codes.append(f"exhaustion_{exhaustion.value}")
+    if exhaustion is not None:
+        evidence_codes.append(f"exhaustion_{exhaustion.value}")
 
     # --- progress / tool effects ---
     tool_effects, tool_effect_codes = _derive_tool_effects(
@@ -791,12 +870,25 @@ def build_failure_envelope(  # noqa: PLR0913, PLR0912, PLR0914, PLR0915
     elif failure_class is FailureClass.UNKNOWN:
         eligibility = RecoveryEligibility.PROHIBITED
         reason_codes = ["unknown_cause_report_and_park"]
+    elif failure_class is FailureClass.COMPLETION_REJECTION:
+        # P11: a typed audit rejection is a worker-side disposition the
+        # failure-time policy authorizes a cross-agent replacement for (the
+        # escalation joins the package's lineage); it never authorizes a
+        # warm same-agent auto-resume (P12's suspension gates stay shut).
+        eligibility = RecoveryEligibility.PROHIBITED
+        reason_codes = ["completion_rejection_no_auto_recovery"]
     elif failure_class is FailureClass.LAUNCH_FAILURE:
         reasons = exclusion_reasons or []
-        if reasons and all(reason == "cooldown" for reason in reasons):
+        if reasons and all(
+            reason in _LAUNCH_TRANSIENT_EXCLUSION_REASONS for reason in reasons
+        ):
             eligibility = RecoveryEligibility.ELIGIBLE
             reason_codes = ["transient_launch_failure", "no_execution_progress"]
-            evidence_codes.append("cooldown_exclusion")
+            evidence_codes.append(
+                "endpoint_cooldown_exclusion"
+                if "endpoint-cooldown" in reasons
+                else "cooldown_exclusion"
+            )
         elif not reasons:
             # No exclusion detail observed: never confidently relabel.
             eligibility = RecoveryEligibility.PROHIBITED
@@ -857,6 +949,8 @@ def build_failure_envelope(  # noqa: PLR0913, PLR0912, PLR0914, PLR0915
         f"observation (phase={getattr(observation, 'phase', None)}); "
         f"subagent-level derivation chartreux.core.recovery_models {CLASSIFICATION_VERSION}"
     )
+    if measured_timeout is not None:
+        provenance += f"; measured harness deadline {measured_timeout.value}"
 
     return FailureEnvelope(
         event_id=f"failure-event:{agent_id}:{run_id}{event_turn}",
@@ -952,6 +1046,79 @@ def build_failure_envelope(  # noqa: PLR0913, PLR0912, PLR0914, PLR0915
             reason_codes=reason_codes,
             same_agent_resumes_used=same_agent_resumes_used,
             expires_at=None,
+        ),
+    )
+
+
+def build_completion_rejection_envelope(
+    *,
+    agent_id: str,
+    run_id: str,
+    rejection: CompletionRejectionReason,
+    turn_id: str | None = None,
+    work_package_id: str | None = None,
+    predecessor_agent_id: str | None = None,
+    recovery_chain_id: str | None = None,
+    message: str | None = None,
+    clock: Any = time.time,
+) -> FailureEnvelope:
+    """Build the bounded public envelope for one typed completion rejection.
+
+    The P11 failure class is never derived from an LLM-call observation —
+    a completion rejection is the audit's verdict on a worker's claimed
+    completion — so this bounded constructor classifies it directly from the
+    P1 rejection vocabulary instead of running the §1.6 derivation. Bounded
+    and redacted throughout: the free-text message is redacted then bounded,
+    the typed rejection value rides the evidence codes as an identifier, the
+    deployment/request blocks carry no transport attempt, and the recovery
+    block is PROHIBITED with its own distinct reason code — a typed audit
+    rejection authorizes a cross-agent replacement (recovery_policy), never
+    a warm same-agent auto-resume (P12's suspension gates stay shut).
+    """
+    event_turn = f":{turn_id}" if turn_id else ""
+    return FailureEnvelope(
+        event_id=f"failure-event:{agent_id}:{run_id}{event_turn}",
+        agent_id=agent_id,
+        run_id=run_id,
+        work_package_id=work_package_id,
+        predecessor_agent_id=predecessor_agent_id,
+        # The rejection is never a resume: the per-run derivation fallback
+        # keeps the record on its own episode chain (review R10's contract).
+        recovery_chain_id=(
+            recovery_chain_id
+            if recovery_chain_id is not None
+            else f"recovery-chain:{agent_id}:{run_id}"
+        ),
+        observed_at=clock(),
+        failure=EnvelopeFailure(
+            failure_class=FailureClass.COMPLETION_REJECTION,
+            cause_category=None,
+            phase=FailurePhase.FINALIZE,
+            exception_type=None,
+            message=_bound_and_redact(message) if message else None,
+            confidence=FailureConfidence.MEASURED,
+            evidence_codes=[
+                f"completion_rejection_{rejection.value}",
+                "completion_audit_rejection",
+            ][:_MAX_EVIDENCE_CODES],
+            fingerprint=(
+                f"origin={FailurePhase.FINALIZE.value};type=none;"
+                f"status=none;code={_sanitize_fingerprint_code(rejection.value)};"
+                f"adapter=unknown;layer={FailurePhase.FINALIZE.value}"
+            ),
+            classification_version=CLASSIFICATION_VERSION,
+            classification_provenance=(
+                "typed completion-audit rejection (P11) over the P1 "
+                f"rejection vocabulary; recovery_models {CLASSIFICATION_VERSION}"
+            ),
+            diagnostics_state="captured",
+        ),
+        deployment=EnvelopeDeployment(),
+        request=EnvelopeRequest(),
+        progress=EnvelopeProgress(),
+        recovery=EnvelopeRecovery(
+            eligibility=RecoveryEligibility.PROHIBITED,
+            reason_codes=["completion_rejection_no_auto_recovery"],
         ),
     )
 

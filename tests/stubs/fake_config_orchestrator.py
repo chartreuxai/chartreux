@@ -20,6 +20,7 @@ from chartreux.core.config.orchestrator import ConfigOrchestrator, _changed_keys
 from chartreux.core.config.patch import PatchOp, ensure_parent_paths
 from chartreux.core.config.types import ConfigChangeEvent, ConflictStrategy
 from chartreux.core.model_catalog.availability import AvailabilityRegistry
+from chartreux.core.recovery_override import CooldownOverrideLedger
 from chartreux.core.utils.concurrency import run_sync
 
 
@@ -45,12 +46,15 @@ class FakeConfigOrchestrator[C: ChartreuxConfigSchema](ConfigOrchestrator[C]):
         self._policy_owner = uuid4()
         self._accepted_token = uuid4()
         self._availability_registry = AvailabilityRegistry()
+        self._cooldown_override_ledger = CooldownOverrideLedger()
 
     def copy(self, *, config: C | None = None) -> FakeConfigOrchestrator[C]:
         base_config = self._base_config if config is None else config
         clone = FakeConfigOrchestrator(base_config.model_copy(deep=True))
         clone._policy_owner = self._policy_owner
         clone._availability_registry = self._availability_registry
+        # C1: copies share the root's forced-override accounting.
+        clone._cooldown_override_ledger = self._cooldown_override_ledger
         clone._extra_layers = [copy.deepcopy(layer) for layer in self._extra_layers]
         clone.rebuild()
         return clone

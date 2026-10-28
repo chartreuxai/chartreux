@@ -599,6 +599,21 @@ Markdown {
     text-style: bold;
 }
 
+/* Oversized error payloads: the summary line never wraps (one unbreakable
+   token must stay one row), and the disclosed body is capped so even an
+   expanded error cannot reclaim the viewport. Keep the max-height in sync
+   with _ERROR_MAX_ROWS in widgets/messages.py. */
+.error-content.error-head {
+    max-height: 1;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+.error-overflow-body {
+    max-height: 12;
+    overflow-y: auto;
+}
+
 .warning-content {
     width: 1fr;
     height: auto;

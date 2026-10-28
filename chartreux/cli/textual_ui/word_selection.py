@@ -210,12 +210,13 @@ class WordSelectScreen(Screen[None]):
         # handles its own multi-click in _on_mouse_down; interactive ancestors
         # (collapsibles, etc.) get the Click forwarded via _interactive_ancestor.
         if isinstance(event, events.Click) and event.chain >= _DOUBLE_CLICK:
-            widget: Widget | None = None
-            region = None
-            try:
-                widget, region = self.get_widget_at(event.x, event.y)
-            except errors.NoWidget:
-                pass
+            # Use the filtered lookup so a DOM-detached widget under the
+            # cursor (the hit race in Textualize/textual#6643) is dropped
+            # for delivery exactly as it is for selection; the unfiltered
+            # get_widget_at would still return it.
+            widget: Widget | None
+            region: Offset | None
+            widget, region = self.get_widget_and_offset_at(event.x, event.y)
             if widget is not None and region is not None:
                 interactive = self._interactive_ancestor(widget)
                 if (

@@ -18,6 +18,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PurposeId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$")]
 
+#: The demanding implementation route (P1-c2): the only purpose that accepts
+#: the structured difficulty field on a launch config.
+DEMANDING_IMPLEMENTATION_PURPOSE = "implementation-demanding-settled"
+
 
 class PurposeDefinition(BaseModel):
     """Developer-owned rendering for one purpose, including overlay additions."""
@@ -45,7 +49,14 @@ SHIPPED_PURPOSES: PurposeVocabulary = MappingProxyType({
         "verification": "Run proportionate tests, builds, and other verification; report only checks actually run.",
         "mechanical-edit": "Mechanical single-file edits with a known, bounded transformation.",
         "implementation": "All substantive implementation, including novel algorithmic reasoning, difficult refactoring, and broad-impact work.",
-        "implementation-demanding-settled": "Demanding execution with a settled approach; a proactive escalation-implementor route, not only a failure-triggered route. State the reason for this route.",
+        DEMANDING_IMPLEMENTATION_PURPOSE: (
+            "Exceptionally demanding, genuinely tricky work (novel algorithms, "
+            "subtle invariants, concurrency) whose approach is already "
+            "settled; ordinary substantive implementation goes to the default "
+            "implementor. A settled or detailed approach alone never justifies "
+            "this route; a merely large package is split at planning time so "
+            "the default implementor can take the pieces."
+        ),
         "design-analysis": "Architecture, cross-subsystem design, design refinements, and destructive-operation analysis; read-only advice, never implementation. Keep an advisor across related refinements.",
         "planning-analysis": "Analyze an approved design into bounded steps, dependencies, and acceptance checks; read-only advice, never implementation.",
         "review.quick": "A quick independent judgment in a fresh reviewer context, never the author or a reused advisor.",

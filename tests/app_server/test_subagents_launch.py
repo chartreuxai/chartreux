@@ -39,6 +39,7 @@ from chartreux.core.dispatch.route_models import (
     ReplacementCapability,
     RouteTarget,
 )
+from chartreux.core.launch_types import DifficultyCategory
 from chartreux.core.message_list import MessageList
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.recovery_models import PackageTier
@@ -422,7 +423,7 @@ async def test_reused_launch_failure_restores_idle_bookkeeping_and_rearms_reaper
     registry._agent_records[record.agent_id] = record
     registry._children[record.session_id] = record.runtime
 
-    def fail_start(*_args: object) -> tuple[str, object]:
+    def fail_start(*_args: object, **_kwargs: object) -> tuple[str, object]:
         raise RuntimeError("start failed")
 
     monkeypatch.setattr(SessionRuntimeRegistry, "_start_child_turn", fail_start)
@@ -923,8 +924,8 @@ async def test_prelaunch_registry_lock_cancellation_aborts_real_prepared_turn(
     release_final_lock = asyncio.Event()
     original_start_child_turn = SessionRuntimeRegistry._start_child_turn
 
-    def signal_prepared(*values: Any) -> tuple[str, Any]:
-        result = original_start_child_turn(*values)
+    def signal_prepared(*values: Any, **kwargs: Any) -> tuple[str, Any]:
+        result = original_start_child_turn(*values, **kwargs)
         prepared.set()
         return result
 
@@ -1188,6 +1189,35 @@ async def test_foreground_dynamic_launch_uses_resolver_and_rejects_retained_hand
             ),
         )
         assert result.agent_id is None
+    finally:
+        await registry.drain_children()
+        await parent.aclose()
+
+
+@pytest.mark.asyncio
+async def test_demanding_route_launch_surfaces_difficulty_in_ack_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1-c2: a demanding-route launch carrying a qualifying difficulty
+    category surfaces the category on the launch acknowledgment metadata, so
+    escalations are auditable without re-reading transcripts.
+    """
+    registry, parent, _record, context, _first, _backends = await _dynamic_registry(
+        monkeypatch
+    )
+    try:
+        ack = await _background_result(
+            registry,
+            TaskArgs(
+                task="hard work",
+                purpose="implementation-demanding-settled",
+                background=True,
+                config=LaunchConfig(difficulty=DifficultyCategory.SUBTLE_INVARIANT),
+            ),
+            context,
+        )
+        assert ack.metadata is not None
+        assert ack.metadata["difficulty"] == "subtle-invariant"
     finally:
         await registry.drain_children()
         await parent.aclose()
@@ -2300,8 +2330,10 @@ async def test_identity_keyed_launch_resolves_canonically(
         child = record.runtime.agent_loop
         assert child._bound_identity == "researcher"
         assert child.launch_identity == "researcher"
-        # The researcher posture: non-mutating personal tool set.
-        assert "edit" not in child.tool_manager.available_tools
+        # The researcher posture: the v0.5.9 carve-out admits the mutating
+        # builtin set on the personal axis; the delegation axis stays
+        # non-mutating (pinned separately in tests/tools/test_identity_posture.py).
+        assert "edit" in child.tool_manager.available_tools
         assert "read_file" in child.tool_manager.available_tools
         # The session default is the committed session binding.
         assert child.committed_model is not None

@@ -280,8 +280,16 @@ def test_launch_targets_bind_the_session_model_regardless_of_roster_size(
     alias = config.get_active_model().alias
     rows = [line for line in task.splitlines() if line.startswith("| `")]
     assert rows
+    # Session-bound purposes render the session model; the four cost-tier
+    # aware purposes render the $cheapest-capable marker, regardless of
+    # roster size.
+    cost_tier = {"`implementation`", "`mechanical-edit`", "`search`", "`verification`"}
     for row in rows:
-        assert row.endswith(f"| `{alias}` |")
+        purpose = row.split("|")[1].strip()
+        if purpose in cost_tier:
+            assert row.endswith("| `$cheapest-capable` |")
+        else:
+            assert row.endswith(f"| `{alias}` |")
 
 
 def test_launch_targets_render_deep_review_seats_honestly() -> None:

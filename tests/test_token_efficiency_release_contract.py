@@ -82,7 +82,12 @@ def test_configured_review_behavior_is_documented() -> None:
     assert "launch only because the route configures them" in SUBAGENTS
     assert "no authorship substitution" in SUBAGENTS
     assert "applies only to quick single-seat reviews" in SUBAGENTS
-    assert "FROZEN route table" in SUBAGENTS
+    assert "LIVE route" in SUBAGENTS
+    assert "applies to subsequent launches in the same" in SUBAGENTS
+    assert "children already admitted keep their bindings" in SUBAGENTS
+    assert "rejected at reload" in SUBAGENTS
+    assert "leaving the prior table effective" in SUBAGENTS
+    assert "FROZEN route" not in SUBAGENTS
     assert "configured multi-model route" in SUBAGENTS
 
 
@@ -159,4 +164,4 @@ def test_version_locations_and_release_heading_agree() -> None:
     heading = re.search(r"^## (\S+ \([^)]*\))", RELEASE_NOTES, re.MULTILINE)
     assert heading is not None
     assert pyproject_version == chartreux.__version__ == lock_version
-    assert heading.group(1) == f"{pyproject_version} (2026-10-23)"
+    assert heading.group(1) == f"{pyproject_version} (2026-10-28)"

@@ -171,6 +171,31 @@ class ModelResolver:
         })
         return mapping
 
+    def catalog_prices(self, allowed_models: Sequence[str] = ()) -> dict[str, float]:
+        """The input+output token-price total per eligible canonical base.
+
+        A base enters the map when at least one enabled, permitted deployment
+        of it declares both input and output prices; its value is the cheapest
+        such deployment's total. Bases with unknown prices are absent — the
+        capability criterion of the cost-tier route default (P0 decision 5),
+        pinned by the route tests' catalog fixture.
+        """
+        prices: dict[str, float] = {}
+        for base in self.eligible_models(allowed_models):
+            definition = self.snapshot.catalog.models[base]
+            totals = [
+                deployment.prices.input + deployment.prices.output
+                for deployment in definition.deployments
+                if not deployment.disabled
+                and not self.snapshot.catalog.providers[deployment.provider].disabled
+                and self._allowed(base, definition, deployment, allowed_models)
+                and deployment.prices.input is not None
+                and deployment.prices.output is not None
+            ]
+            if totals:
+                prices[base] = min(totals)
+        return prices
+
     def canonicalize(
         self, expression: str, *, allowed_models: Sequence[str] = ()
     ) -> str:

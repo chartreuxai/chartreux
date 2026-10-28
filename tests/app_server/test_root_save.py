@@ -252,9 +252,17 @@ async def test_save_succeeds_during_an_active_turn_without_an_idle_reservation(
         await loop.aclose()
 
 
-async def test_child_always_saves_through_the_root_orchestrator_keyed_by_child_cwd(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+async def test_child_denies_the_ask_and_never_saves_a_project_root(
+    tmp_path: Path, config_dir: Path
 ) -> None:
+    """Blanket child denial: a capable child never prompts and never saves.
+
+    The child's gap is locally grantable (the frozen parent ceiling permits
+    the target), yet the ask-class prompt never surfaces even with
+    user-input capability and a registered runtime: the denial with
+    remediation flows back to the parent, and no root grant is saved
+    anywhere.
+    """
     project = tmp_path / "project"
     project.mkdir()
     nested = project / "nested"
@@ -269,63 +277,37 @@ async def test_child_always_saves_through_the_root_orchestrator_keyed_by_child_c
         assert isinstance(root_backend, SessionBackendImpl)
         registry = root_backend.children
         policy = parent.child_runtime_policy
-
-        def build_child(call_id: str) -> AgentLoop:
-            return AgentLoop(
-                config_orchestrator=parent.config_orchestrator.copy(),
-                cwd=nested,
-                backend=FakeBackend([*_read_turn(target, call_id)]),
-                is_subagent=True,
-                inherited_workspace=policy.inherited_workspace,
-                inherited_restrictions=policy.inherited_restrictions,
-                inherited_mode_restrictions=policy.inherited_mode_restrictions,
-                inherited_plan_write_scopes=policy.inherited_plan_write_scopes,
-                inherited_root_grants=policy.inherited_root_grants,
-                user_input_capability=True,
-                parent_authority_getter=policy.parent_authority_getter,
-                parent_authority_revision_getter=policy.parent_authority_revision_getter,
-            )
-
-        child = build_child("child-read")
-        sibling = build_child("sibling-read")
+        child = AgentLoop(
+            config_orchestrator=parent.config_orchestrator.copy(),
+            cwd=nested,
+            backend=FakeBackend([*_read_turn(target, "child-read")]),
+            is_subagent=True,
+            inherited_workspace=policy.inherited_workspace,
+            inherited_restrictions=policy.inherited_restrictions,
+            inherited_mode_restrictions=policy.inherited_mode_restrictions,
+            inherited_plan_write_scopes=policy.inherited_plan_write_scopes,
+            inherited_root_grants=policy.inherited_root_grants,
+            user_input_capability=True,
+            parent_authority_getter=policy.parent_authority_getter,
+            parent_authority_revision_getter=policy.parent_authority_revision_getter,
+        )
         registry._children[child.session_id] = registry._build_child_runtime(child)
-        registry._children[sibling.session_id] = registry._build_child_runtime(sibling)
-        # The root orchestrator writes; a child orchestrator never does.
-        root_save = AsyncMock(wraps=parent.config_orchestrator.save_project_root_grant)
-        monkeypatch.setattr(
-            parent.config_orchestrator, "save_project_root_grant", root_save
-        )
-        child_save = AsyncMock(
-            side_effect=AssertionError("child orchestrators never write")
-        )
-        monkeypatch.setattr(
-            child.config_orchestrator, "save_project_root_grant", child_save
-        )
         try:
             events, requests = await _drive_loop(child, "Always for this project")
-            assert len(requests) == 1
+            assert requests == []
             results = _results(events)
             assert len(results) == 1
-            assert not results[0].skipped
-            assert results[0].result is not None
-            assert "parent project content" in results[0].result.model_dump_json()
-            # The calling child gets the grant; parent and sibling stay unchanged.
-            assert child._session_root_grants.roots == {project.resolve()}
+            assert results[0].skipped
+            # No grant was installed anywhere and nothing reached the config.
+            assert child._session_root_grants.roots == set()
             assert parent._session_root_grants.roots == set()
-            assert sibling._session_root_grants.roots == set()
-            assert not sibling.tool_manager.workspace.allows(target)
-            # The save routed through the root orchestrator, keyed by the
-            # child's registered cwd, never by a caller-supplied project path.
-            assert root_save.call_count == 1
-            assert root_save.call_args.kwargs["project"] == nested.resolve()
-            assert root_save.call_args.kwargs["root"] == project.resolve()
-            child_save.assert_not_called()
-            assert _saved_roots(config_path) == {
-                str(nested.resolve()): [str(project.resolve())]
-            }
+            assert any(
+                "authorized_roots_by_project" in text and "config.toml" in text
+                for text in _tool_texts(child)
+            )
+            assert _saved_roots(config_path) == {}
         finally:
             await child.aclose()
-            await sibling.aclose()
     finally:
         await session.close()
         await parent.aclose()

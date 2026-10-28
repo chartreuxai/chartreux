@@ -6,7 +6,7 @@ Unknown implementations (including custom replacements and MCP proxies) fail clo
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from enum import StrEnum
 from hashlib import sha256
 from types import MappingProxyType
@@ -36,8 +36,8 @@ _CLASSIFICATIONS: dict[str, ToolClass] = {
     "web_fetch": ToolClass.NON_MUTATING,
     "edit": ToolClass.MUTATING,
     "write_file": ToolClass.MUTATING,
-    "skill": ToolClass.MUTATING,
-    "todo": ToolClass.MUTATING,
+    "skill": ToolClass.NON_MUTATING,
+    "todo": ToolClass.CONTROL_PLANE,
     "ask_user_question": ToolClass.CONTROL_PLANE,
     "task": ToolClass.CONTROL_PLANE,
     "check_agents": ToolClass.CONTROL_PLANE,
@@ -74,76 +74,94 @@ def classification_revision() -> str:
     return sha256(payload.encode()).hexdigest()
 
 
-# Harness-side registry provenance (S2 round 2: forgeable provenance stamp;
-# S2 round 3: weak-key aliasing). The registry-conferred builtin stamp lives
-# in THIS side table, never in the class namespace: a custom tool class can
-# declare ``_registry_builtin_name = "read_file"`` in its own body, and a
-# ``__dict__`` lookup cannot distinguish an author-declared attribute from a
-# registry-conferred one, so the forged declaration would confer the reviewed
-# builtin classification. Only the harness's gated stamping paths write here:
-# builtin discovery in ``ToolManager._register_discovered_tool_variant``
-# confers the stamp, and the reuse-path copy re-asserts an existing one.
+# Shipped-builtin identity (P4-2). A class is a shipped builtin exactly when
+# a shipped builtin module DEFINES it: the registry discovers precisely those
+# classes from the builtin directory (always first in the search paths, with
+# re-exports filtered there), so the defining module is the ground truth of
+# builtin identity and no side table is needed. The reviewed, name-keyed
+# table above then classifies it; a builtin-module class publishing an
+# unknown name still fails closed as MUTATING.
 #
-# The table is keyed by ``id(class)`` and stores ``(weakref(class), name)``.
-# A WeakKeyDictionary would dispatch the lookup through the class's
-# ``__hash__``/``__eq__``, which a custom METACLASS can alias to a stamped
-# builtin class's: the unstamped custom would then read the builtin's stamp
-# and ride a read-only posture (S2 round 3: weak-key aliasing). The identity
-# check ``reference() is tool_class`` makes the lookup alias-proof — a stale
-# id whose weak reference died (or points elsewhere) returns None, which
-# classifies MUTATING.
-_REGISTRY_BUILTIN_NAMES: dict[int, tuple[weakref.ref[type[BaseTool]], str]] = {}
+# This replaces the provenance-stamp side table removed in P4-2, which
+# defended impersonation of a builtin by a foreign class — a custom class
+# declaring ``_registry_builtin_name`` in its own body, or a metaclass
+# aliasing a builtin's hash/equality to read its stamp (S2 rounds 2-3). The
+# charter excludes that threat: tool modules execute arbitrary code at
+# import, inside the trust boundary the extension model grants, so an
+# in-process forger can already reach any private writer — the removed
+# table's own docstring conceded "defense-in-depth, not a security boundary
+# the side table can enforce". Foreign classes (custom replacements,
+# subclasses, MCP proxies, project-discovered tools) are defined outside the
+# shipped builtin modules, so they still fail closed as MUTATING.
+_BUILTIN_MODULE_PREFIX = "chartreux.core.tools.builtins."
 
 
-def _stamp_registry_builtin(tool_class: type[BaseTool], name: str) -> None:
-    """Record the registry-conferred builtin name for one exact class.
+def shipped_builtin_name(tool_class: type[BaseTool]) -> str | None:
+    """The reviewed table name of a shipped builtin class, or None.
 
-    This is the ONLY writer of the provenance side table, and the name is
-    private: the harness calls it only from its gated stamping paths (builtin
-    discovery in ``ToolManager._register_discovered_tool_variant`` and the
-    reuse-path copy in ``copy_registry_builtin_stamps``), so an author-declared
-    class attribute never reaches the table — declarative/data-level forgery
-    is gated (S2 round 2: forgeable provenance stamp). A determined
+    A class defined by a shipped builtin module is that builtin, and its
+    reviewed name is its tool name. Anything defined elsewhere — a custom
+    replacement, a subclass, an MCP proxy, a project-discovered tool — is
+    not a shipped builtin and fails closed. The check reads the class's
+    defining module, never its namespace: an author-declared attribute
+    confers nothing (see the module comment for the excluded threat).
+    """
+    if tool_class.__module__.startswith(_BUILTIN_MODULE_PREFIX):
+        return tool_class.get_name()
+    return None
+
+
+# File-location provenance for local user-authored tools (P4-1, charter
+# decision 4). A tool authored under the user's OWN tools directory
+# (``~/.chartreux/tools/`` — the user's home config, not project files) is
+# the user's own code, so the harness admits it to the non-mutating posture
+# by WHERE it lives: a deliberate, separate trust contract keyed on the
+# tools directory, distinct from the shipped-builtin identity check above
+# (which guards BUILTIN identity, not user authorship) and distinct from the
+# fail-closed defaults kept by project-discovered tools and MCP proxies.
+#
+# The table is keyed by ``id(class)`` and verified through a weak reference
+# for the same alias-proofing reasons the removed provenance-stamp table used
+# (S2 round 3: weak-key aliasing): a custom metaclass aliasing a trusted
+# class's hash/equality must not read its trust, and a recycled id whose weak
+# reference died (or points elsewhere) must not inherit it. Only the
+# harness's gated discovery path writes here — user-tools-directory
+# discovery in ``ToolManager._register_discovered_tool_variant`` — so an
+# author-declared class attribute never reaches the table, and neither do
+# project-discovered tools, config ``tool_paths`` entries, or MCP proxies.
+_LOCATION_TRUSTED_USER_TOOLS: dict[int, weakref.ref[type[BaseTool]]] = {}
+
+
+def _stamp_location_trusted_user_tool(tool_class: type[BaseTool]) -> None:
+    """Record file-location trust for one exact class.
+
+    This is the ONLY writer of the location-trust side table, and the name is
+    private: the harness calls it only from its gated discovery path (a
+    class discovered from a file under the user's own tools directory in
+    ``ToolManager._register_discovered_tool_variant``), so an
+    author-declared class attribute never reaches the table. A determined
     in-process caller could still reach the private name, but custom-tool
-    module code already executes arbitrary code at import — an imperative call
-    from such code sits INSIDE the arbitrary-code-execution trust boundary the
-    extension model grants, not outside it: the privacy of this name is
-    defense-in-depth, not a security boundary the side table can enforce.
+    module code already executes arbitrary code at import — inside the
+    arbitrary-code-execution trust boundary the extension model grants, not
+    outside it: the privacy of this name is defense-in-depth, not a
+    security boundary the side table can enforce.
     """
-    _REGISTRY_BUILTIN_NAMES[id(tool_class)] = (weakref.ref(tool_class), name)
+    _LOCATION_TRUSTED_USER_TOOLS[id(tool_class)] = weakref.ref(tool_class)
 
 
-def registry_builtin_name(tool_class: type[BaseTool]) -> str | None:
-    """The registry-conferred builtin name of one exact class, if any.
+def location_trusted_user_tool(tool_class: type[BaseTool]) -> bool:
+    """Whether the exact class was discovered from the user's tools directory.
 
-    Absent for anything the registry never stamped: custom replacements, MCP
-    proxies, and subclasses all fail closed as MUTATING. The lookup is
-    identity-safe — keyed on ``id(class)`` and verified through a weak
-    reference — so a metaclass aliasing a stamped class's hash/equality (or a
-    recycled id) cannot read another class's stamp (S2 round 3: weak-key
-    aliasing).
+    Absent for anything the gated discovery path never stamped: custom
+    replacements, project-discovered tools, config ``tool_paths`` entries,
+    MCP proxies, and subclasses all fail closed. The lookup is identity-safe
+    — keyed on ``id(class)`` and verified through a weak reference — so a
+    metaclass aliasing a trusted class's hash/equality (or a recycled id)
+    cannot read another class's trust (S2 round 3: weak-key aliasing).
     """
-    entry = _REGISTRY_BUILTIN_NAMES.get(id(tool_class))
-    if entry is None:
-        return None
-    reference, name = entry
-    if reference() is not tool_class:
-        # A stale id whose weak reference died (or points elsewhere) carries
-        # no provenance: fail closed.
-        return None
-    return name
-
-
-def copy_registry_builtin_stamps(tool_classes: Iterable[type[BaseTool]]) -> None:
-    """Re-assert provenance stamps for reused discovery classes.
-
-    The ``discovery_source`` reuse path (policy-only staging) copies the
-    accepted variant registries without re-running discovery. The side table
-    is keyed by the exact class, so the reused classes already carry their
-    stamps; the copy re-asserts them alongside ``_tool_variants_by_name`` so
-    the reuse path never depends on when the source manager's discovery ran.
-    """
-    for tool_class in tool_classes:
-        stamped = registry_builtin_name(tool_class)
-        if stamped is not None:
-            _stamp_registry_builtin(tool_class, stamped)
+    reference = _LOCATION_TRUSTED_USER_TOOLS.get(id(tool_class))
+    if reference is None:
+        return False
+    # A stale id whose weak reference died (or points elsewhere) carries no
+    # trust: fail closed.
+    return reference() is tool_class

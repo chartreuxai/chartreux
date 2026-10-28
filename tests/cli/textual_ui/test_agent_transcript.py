@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+import gc
 import hashlib
+import tracemalloc
 from typing import Any
 from unittest.mock import MagicMock, patch
+from weakref import ref
 
 import pytest
 from textual.app import App, ComposeResult
+from textual.containers import Vertical
 from textual.widget import Widget
 from textual.widgets import Static
 
+from chartreux.app_server._agent_transcript import read_live_agent_transcript
 from chartreux.app_server.models import (
     CompletedEffectState,
     EffectResultDisplay,
@@ -43,6 +48,7 @@ from chartreux.cli.textual_ui.widgets.tools import (
     ToolGroup,
     ToolResultMessage,
 )
+from chartreux.core.llm_models import LLMMessage, PersistedToolResult, Role
 from chartreux.utils.tool_presentation import EffectCallDisplay
 
 
@@ -1288,3 +1294,371 @@ async def test_closed_viewer_ignores_late_read_failure() -> None:
         await _wait_for_rest(app.viewer)
         assert "old" in app.viewer._known_entries
         assert app.viewer._feedback is None
+
+
+def _seed_messages(
+    message_count: int = 92, total_bytes: int = 7_700_000
+) -> list[LLMMessage]:
+    """A synthetic resident child transcript of roughly *total_bytes*.
+
+    This seeds the store the live viewer reads: the ~7.7 MB / 92-message
+    transcript of the UI-freeze and OOM-death defect entries.
+    """
+    text = "word " * (total_bytes // message_count // 5)
+    messages: list[LLMMessage] = []
+    for index in range(message_count):
+        if index % 3 == 0:
+            messages.append(
+                LLMMessage(role=Role.user, content=text, message_id=f"seed-{index}")
+            )
+        elif index % 3 == 1:
+            messages.append(
+                LLMMessage(
+                    role=Role.assistant,
+                    content=text,
+                    message_id=f"seed-{index}",
+                    reasoning_content=text,
+                    reasoning_message_id=f"seed-reasoning-{index}",
+                )
+            )
+        else:
+            messages.append(
+                LLMMessage(
+                    role=Role.tool,
+                    tool_call_id=f"call-{index}",
+                    tool_result=PersistedToolResult(output={"content": text}),
+                    message_id=f"seed-{index}",
+                )
+            )
+    return messages
+
+
+class _ResidentTranscriptSource(AgentTranscriptSource):
+    """Read the live projection of a persistent synthetic message list."""
+
+    def __init__(self, messages: list[LLMMessage]) -> None:
+        self._messages = messages
+        self.reads = 0
+
+    async def read_agent_transcript(
+        self, agent_id: str, *, before: str | None = None, limit: int = 50
+    ) -> AgentTranscriptGetResponse:
+        self.reads += 1
+        return read_live_agent_transcript(self._messages, before=before, limit=limit)
+
+
+async def _settle(viewer: AgentTranscriptViewer, pilot: Any) -> None:
+    await _wait_for_rest(viewer)
+    await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_tick_restages_and_replaces_only_the_changed_set() -> None:
+    source = _FakeSource()
+    app = _ViewerApp(source, live=True, page_size=50)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        user = _entry("user", "Question", created_at=0)
+        assistant = _entry(
+            "assistant",
+            "The answer is",
+            kind=AgentTranscriptEntryKind.ASSISTANT_TEXT,
+            created_at=1,
+        )
+        reasoning = _entry(
+            "reasoning",
+            "Deliberating",
+            kind=AgentTranscriptEntryKind.REASONING,
+            created_at=2,
+        )
+        source.respond(0, _available(user, assistant, reasoning))
+        await _settle(app.viewer, pilot)
+        viewer = app.viewer
+        original_user = viewer.query_one(UserMessage)
+        original_assistant = viewer.query_one(AssistantMessage)
+        original_reasoning = viewer.query_one(ReasoningMessage)
+        known_before = dict(viewer._known_entries)
+
+        viewer._append_live_output()
+        await pilot.pause()
+        changed_assistant = _entry(
+            "assistant",
+            "The answer is 42.",
+            kind=AgentTranscriptEntryKind.ASSISTANT_TEXT,
+            created_at=1,
+            revision=1,
+        )
+        newer = _entry("newer", "Follow-up", created_at=3)
+        source.respond(1, _available(user, changed_assistant, reasoning, newer))
+        await _settle(viewer, pilot)
+
+        # Unchanged entries keep both their widgets and their staged objects:
+        # the staging bookkeeping operates on the delta, not the page.
+        assert viewer.query_one(UserMessage) is original_user
+        assert viewer.query_one(ReasoningMessage) is original_reasoning
+        assert viewer._known_entries["user"] is known_before["user"]
+        assert viewer._known_entries["reasoning"] is known_before["reasoning"]
+        # The changed and new entries were restaged as fresh objects.
+        assert viewer._known_entries["assistant"] is not known_before["assistant"]
+        assert viewer._known_entries["newer"] is not None
+        # Exactly the changed entry's widget was replaced; the new entry mounted.
+        assert viewer.query_one(AssistantMessage) is not original_assistant
+        assert viewer.query_one(AssistantMessage).get_content() == "The answer is 42."
+        assert [unit.entry_ids[:] for unit in viewer._units] == [
+            ["user"],
+            ["assistant"],
+            ["reasoning"],
+            ["newer"],
+        ]
+
+        # A tick with no changes replaces nothing and restages nothing.
+        units_before = [unit.entry_ids[:] for unit in viewer._units]
+        mounted_ids = {
+            id(widget)
+            for widget in viewer.query(
+                "UserMessage, AssistantMessage, ReasoningMessage"
+            )
+        }
+        known_before = dict(viewer._known_entries)
+        viewer._append_live_output()
+        await pilot.pause()
+        source.respond(2, _available(user, changed_assistant, reasoning, newer))
+        await _settle(viewer, pilot)
+        assert [unit.entry_ids[:] for unit in viewer._units] == units_before
+        assert {
+            id(widget)
+            for widget in viewer.query(
+                "UserMessage, AssistantMessage, ReasoningMessage"
+            )
+        } == mounted_ids
+        assert all(
+            viewer._known_entries[entry_id] is known_before[entry_id]
+            for entry_id in known_before
+        )
+
+
+@pytest.mark.asyncio
+async def test_live_tick_stays_on_the_delta_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _FakeSource()
+    app = _ViewerApp(source, live=True, page_size=50)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        source.respond(0, _available(_entry("user", "Question", created_at=0)))
+        await _settle(app.viewer, pilot)
+        viewer = app.viewer
+
+        submissions: list[tuple[str | None, bool]] = []
+        original_submit = viewer._submit_request
+
+        def recording_submit(*, before: str | None, replace: bool) -> None:
+            submissions.append((before, replace))
+            original_submit(before=before, replace=replace)
+
+        monkeypatch.setattr(viewer, "_submit_request", recording_submit)
+        resets: list[bool] = []
+        original_reset = viewer._reset_rendered_content
+
+        async def counting_reset() -> None:
+            resets.append(True)
+            await original_reset()
+
+        monkeypatch.setattr(viewer, "_reset_rendered_content", counting_reset)
+
+        # The live tick submits a delta request and never resets the page.
+        viewer._append_live_output()
+        await pilot.pause()
+        source.respond(
+            1,
+            _available(
+                _entry("user", "Question", created_at=0),
+                _entry(
+                    "assistant",
+                    "Streamed",
+                    kind=AgentTranscriptEntryKind.ASSISTANT_TEXT,
+                    created_at=1,
+                ),
+            ),
+        )
+        await _settle(viewer, pilot)
+        assert submissions == [(None, False)]
+        assert resets == []
+
+        # Mount and explicit refresh are the replace=True paths.
+        viewer.action_refresh()
+        await pilot.pause()
+        source.respond(
+            2,
+            _available(
+                _entry("user", "Question", created_at=0),
+                _entry(
+                    "assistant",
+                    "Streamed",
+                    kind=AgentTranscriptEntryKind.ASSISTANT_TEXT,
+                    created_at=1,
+                ),
+            ),
+        )
+        await _settle(viewer, pilot)
+        assert submissions[-1] == (None, True)
+        assert resets == [True]
+        viewer.action_latest()
+        await pilot.pause()
+        source.respond(
+            3,
+            _available(
+                _entry("user", "Question", created_at=0),
+                _entry(
+                    "assistant",
+                    "Streamed",
+                    kind=AgentTranscriptEntryKind.ASSISTANT_TEXT,
+                    created_at=1,
+                ),
+            ),
+        )
+        await _settle(viewer, pilot)
+        assert submissions[-1] == (None, True)
+        assert resets == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_replaced_streaming_widget_is_collected_on_the_live_tick() -> None:
+    gc.collect()
+    messages = _seed_messages()
+    source = _ResidentTranscriptSource(messages)
+    app = _ViewerApp(source, live=True, page_size=50)
+    async with app.run_test() as pilot:
+        await _settle(app.viewer, pilot)
+        viewer = app.viewer
+        streaming_id = max(
+            viewer._known_entries,
+            key=lambda entry_id: viewer._known_entries[entry_id].created_at,
+        )
+        assert isinstance(
+            viewer._entry_units[streaming_id].entry_widgets[streaming_id][0],
+            AssistantMessage,
+        )
+        streaming_text = messages[-1].content or ""
+        for tick in range(6):
+            displaced = ref(
+                viewer._entry_units[streaming_id].entry_widgets[streaming_id][0]
+            )
+            messages[-1].content = f"streaming tail {tick} " + streaming_text[:4000]
+            viewer._append_live_output()
+            await _settle(viewer, pilot)
+            gc.collect()
+            gc.collect()
+            assert displaced() is None, (
+                f"tick {tick}: the replaced streaming widget was not collected"
+            )
+
+
+@pytest.mark.asyncio
+# the repo-global pytest timeout is 10s; this test's legitimate runtime under
+# load can exceed that while still remaining bounded, so raise its bound to 30s
+@pytest.mark.timeout(30)
+async def test_sustained_ticks_retained_memory_is_bounded() -> None:
+    messages = _seed_messages()
+    source = _ResidentTranscriptSource(messages)
+    app = _ViewerApp(source, live=True, page_size=50)
+    async with app.run_test() as pilot:
+        await _settle(app.viewer, pilot)
+        await asyncio.sleep(0.2)
+        await pilot.pause()
+        gc.collect()
+        tracemalloc.start()
+        try:
+            early = 0
+            viewer = app.viewer
+            streaming_text = messages[-1].content or ""
+            for tick in range(18):
+                if tick == 8:
+                    # the render working set settles during the first ticks;
+                    # measure drift only after it has
+                    gc.collect()
+                    _, early = tracemalloc.get_traced_memory()
+                messages[-1].content = f"streaming tail {tick} " + streaming_text[:4000]
+                viewer._append_live_output()
+                await _settle(viewer, pilot)
+            gc.collect()
+            gc.collect()
+            _, late = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        # After the working set settles, sustained ticks must not accumulate
+        # retained allocations: pins the bounded-tick memory property of the
+        # live refresh (the OOM-death defect entry's acceptance clause).
+        assert late - early < 2_000_000, f"retained growth {late - early:,} bytes"
+
+
+class _ClickProbe(Widget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.clicks = 0
+
+    def on_click(self) -> None:
+        self.clicks += 1
+
+
+class _ReparentApp(App[None]):
+    def compose(self) -> ComposeResult:
+        yield Vertical(id="left")
+        yield Vertical(id="right")
+
+
+@pytest.mark.asyncio
+async def test_detach_for_reparenting_unregisters_mounted_widget() -> None:
+    """A registered child must leave the app registry when detached for
+    reparenting (a bare detach used to leak the entry, so App.is_mounted
+    stayed true), and its remount must attach it again.
+    """
+    app = _ReparentApp()
+    async with app.run_test() as pilot:
+        left = app.query_one("#left")
+        right = app.query_one("#right")
+        child = _ClickProbe()
+        await left.mount(child)
+        await pilot.pause()
+        assert app.is_mounted(child)
+
+        await agent_transcript._detach_for_reparenting(left, child)
+        await pilot.pause()
+
+        # Widget.is_mounted is a pump flag Textual 8.2.8 never resets (even
+        # remove() leaves it True); the registry is the unregistration record.
+        assert not app.is_mounted(child)
+        assert child not in left._nodes
+        assert child._parent is None
+
+        await right.mount(child)
+        await pilot.pause()
+        assert child.parent is right
+        assert app.is_mounted(child)
+        assert child._task is not None and not child._task.done()
+        child.clicks = 0
+        await pilot.click(child)
+        await pilot.pause()
+        assert child.clicks == 1
+
+
+@pytest.mark.asyncio
+async def test_detach_for_reparenting_handles_never_registered_widgets() -> None:
+    """Freshly built (never registered) subtree children — the actual shape
+    of the merge/replace call sites — still detach and remount cleanly.
+    """
+    app = _ReparentApp()
+    async with app.run_test() as pilot:
+        container = Vertical()
+        child = _ClickProbe()
+        container._add_child(child)  # attached, never registered
+        right = app.query_one("#right")
+
+        await agent_transcript._detach_for_reparenting(container, child)
+        await pilot.pause()
+
+        assert child._parent is None
+        await right.mount(child)
+        await pilot.pause()
+        assert child.parent is right
+        assert app.is_mounted(child)

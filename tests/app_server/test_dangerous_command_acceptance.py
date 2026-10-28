@@ -603,10 +603,9 @@ async def test_hard_guards_stay_denied_without_a_question(
 @pytest.mark.parametrize(
     ("command", "expected_denial"),
     [
-        (
-            "git push origin main; sudo true",
-            "Command denied by a sensitive command rule",
-        ),
+        # v0.5.9 P2-d: sudo is no longer a shipped sensitive prefix; the
+        # unmodeled `sudo true` form fails closed in the executor grammar.
+        ("git push origin main; sudo true", "Command denied: unsupported sudo form"),
         (
             "git push origin main; cat /etc/hostname",
             "Shell path is outside the authorized workspace",

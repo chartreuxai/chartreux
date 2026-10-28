@@ -102,6 +102,21 @@ _INTERRUPT_STILL_STOPPING_WARNING = (
     "The turn is still stopping. New turns will wait until it has fully stopped."
 )
 
+# A provider error string can embed a multi-kilobyte (or megabyte) single-line
+# excerpt. The first line (provider, model, error head) stays visible and the
+# ErrorMessage disclosure shows the retained excerpt; anything beyond this
+# bound is dropped here so a megabyte blob is never carried into the TUI.
+_MAX_TURN_ERROR_CHARS = 4000
+
+
+def _truncate_error_payload(message: str) -> str:
+    if len(message) <= _MAX_TURN_ERROR_CHARS:
+        return message
+    omitted = len(message) - _MAX_TURN_ERROR_CHARS
+    return (
+        f"{message[:_MAX_TURN_ERROR_CHARS]}\n…[truncated; {omitted} characters omitted]"
+    )
+
 
 def _public_entry(event: AppServerEvent) -> PublicHistoryEntry | None:
     match event:
@@ -713,7 +728,9 @@ class TurnSupervisor:
         if not isinstance(e, AppServerTurnError):
             # R1: a transport disconnect / suspected hang gets
             # inspection/reconnect guidance — never a retry affordance.
-            return f"{e}{_transport_disconnect_guidance(e)}"
+            return (
+                f"{_truncate_error_payload(str(e))}{_transport_disconnect_guidance(e)}"
+            )
         code = e.error.code
         match code:
             case TurnErrorCode.RATE_LIMIT:
@@ -723,7 +740,7 @@ class TurnSupervisor:
             case TurnErrorCode.REFUSAL:
                 return self._refusal_message(e.error)
             case _:
-                base = str(e)
+                base = _truncate_error_payload(str(e))
         if code in _RETRY_AFFORDANCE_TURN_ERROR_CODES:
             # PublicError.code arrives as a plain str (pydantic enum
             # coercion), so compare by value, never by identity.

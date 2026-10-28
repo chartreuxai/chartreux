@@ -45,6 +45,32 @@ def _switch_notice_lines(metadata: dict[str, object] | None) -> list[str]:
     return lines
 
 
+def _override_diagnostics_line(metadata: dict[str, object] | None) -> str:
+    """The bounded un-stick diagnostics line for the result display (C4).
+
+    Rendered only for an explicit override_cooldown launch: the forced
+    deployment, the cooldown exclusions the permit bypassed, and the start
+    allowance remaining after the attempt consumes.
+    """
+    if not metadata:
+        return ""
+    diagnostics = metadata.get("cooldown_override")
+    if not isinstance(diagnostics, dict):
+        return ""
+    provider = diagnostics.get("provider")
+    wire_name = diagnostics.get("wire_name")
+    bypassed = diagnostics.get("exclusions_bypassed")
+    remaining = diagnostics.get("remaining_starts")
+    parts = ["forced un-stick"]
+    if isinstance(provider, str) and isinstance(wire_name, str):
+        parts.append(f"{format_model_display_name(provider, wire_name)}")
+    if isinstance(bypassed, list) and bypassed:
+        parts.append(f"bypassed {', '.join(str(item) for item in bypassed)}")
+    if isinstance(remaining, int):
+        parts.append(f"{remaining} forced start(s) left in the episode")
+    return "; ".join(parts)
+
+
 def _result_display_names(result: TaskResult) -> list[str]:
     metadata = result.metadata or {}
     return (
@@ -174,7 +200,8 @@ class Task(
                 )
             names = _result_display_names(result)
             switches = _switch_notice_lines(result.metadata)
-            detail = "; ".join([*names, *switches])
+            override = _override_diagnostics_line(result.metadata)
+            detail = "; ".join([*names, *switches, *([override] if override else [])])
             if result.agent_id is not None:
                 # WP5: a replacement launch acknowledgment shows the
                 # validated decision's milestone notice (with its honest
@@ -217,14 +244,17 @@ class Task(
     def project_result(cls, result: TaskResult) -> dict[str, JsonValue] | None:
         names = _result_display_names(result)
         switches = _switch_notice_lines(result.metadata)
-        if not names and not switches:
-            return None
+        metadata = result.metadata or {}
+        diagnostics = metadata.get("cooldown_override")
         output: dict[str, JsonValue] = {}
         if names:
             output["models"] = cast(JsonValue, names)
         if switches:
             output["switches"] = cast(JsonValue, switches)
-        return output
+        # C4: the bounded un-stick diagnostics persist with the projection.
+        if isinstance(diagnostics, dict):
+            output["cooldown_override"] = cast(JsonValue, diagnostics)
+        return output or None
 
     @classmethod
     def get_status_text(cls) -> str:

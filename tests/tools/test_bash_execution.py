@@ -17,7 +17,9 @@ from chartreux.core.tools.builtins.bash import (
     Bash,
     BashArgs,
     BashToolConfig,
+    CancelledShellCommand,
     CapturedShellResult,
+    FailedShellCommand,
 )
 from tests.mock.utils import collect_result
 from tests.tools._bash_test_support import bash as bash, locate_file as locate_file
@@ -89,6 +91,64 @@ async def test_handles_timeout(bash):
         await collect_result(bash.run(BashArgs(command="sleep 2", timeout=1)))
 
     assert "Command timed out after 1s" in str(err.value)
+
+
+@pytest.mark.asyncio
+async def test_failed_command_retains_its_write_paths(bash, tmp_path):
+    # R7: a failed run may still have written files (partial execution);
+    # the raised error carries the run's write-classified paths exactly as
+    # a successful result would surface them, so the submission scan keeps
+    # covering the footprint.
+    with pytest.raises(FailedShellCommand) as err:
+        await collect_result(
+            bash.run(BashArgs(command="echo x > failed_out.txt; exit 3"))
+        )
+
+    assert err.value.write_paths == [str(tmp_path / "failed_out.txt")]
+    assert err.value.write_paths_unknown is False
+
+
+@pytest.mark.asyncio
+async def test_timed_out_command_retains_its_write_paths(bash, tmp_path):
+    # R7: same footprint retention on the timeout path — the command wrote
+    # the file before the kill.
+    with pytest.raises(FailedShellCommand) as err:
+        await collect_result(
+            bash.run(BashArgs(command="echo x > timed_out.txt; sleep 30", timeout=1))
+        )
+
+    assert err.value.write_paths == [str(tmp_path / "timed_out.txt")]
+    assert err.value.write_paths_unknown is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_command_retains_its_write_paths(bash, tmp_path):
+    # Same footprint retention on the cancellation path — the command wrote
+    # the file before the interrupt; the cancellation carries the run's
+    # write-classified paths for the executor's cancelled result event.
+    # Observed inside the task, as the executor sees it: a task-cancelled
+    # run's exception is replaced by a fresh instance at the task boundary.
+    captured = {}
+
+    async def run_and_capture():
+        try:
+            await collect_result(
+                bash.run(BashArgs(command="echo x > cancelled_out.txt; sleep 30"))
+            )
+        except asyncio.CancelledError as exc:
+            captured["cancellation"] = exc
+            raise
+
+    task = asyncio.ensure_future(run_and_capture())
+    await asyncio.sleep(0.5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    cancellation = captured["cancellation"]
+    assert isinstance(cancellation, CancelledShellCommand)
+    assert cancellation.write_paths == [str(tmp_path / "cancelled_out.txt")]
+    assert cancellation.write_paths_unknown is False
 
 
 @pytest.mark.asyncio

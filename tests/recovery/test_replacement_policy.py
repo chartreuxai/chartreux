@@ -52,7 +52,11 @@ from chartreux.core.dispatch.route_models import (
     ReplacementCapability,
     RouteTarget,
 )
-from chartreux.core.dispatch.routes import SESSION_MODEL, shipped_routes
+from chartreux.core.dispatch.routes import (
+    COST_TIER_DEFAULT,
+    SESSION_MODEL,
+    shipped_routes,
+)
 from chartreux.core.llm.exceptions import (
     BackendError,
     IncompleteStreamError,
@@ -61,6 +65,7 @@ from chartreux.core.llm.exceptions import (
 from chartreux.core.llm_models import FunctionCall, LLMChunk, ToolCall
 from chartreux.core.model_catalog.defaults import SHIPPED_CATALOG
 from chartreux.core.model_catalog.loader import CatalogSnapshot
+from chartreux.core.model_catalog.resolver import ModelResolver
 from chartreux.core.model_catalog.schema import ModelCatalog
 from chartreux.core.recovery_models import (
     FailureClass,
@@ -601,6 +606,15 @@ def test_route_recovery_facts_canonicalize_presets_and_markings() -> None:
                 ),
             )
         ),
+        "cost-tier": PurposeRoute(
+            targets=(
+                RouteTarget(
+                    model=COST_TIER_DEFAULT,
+                    identity="coder",
+                    tier=RoutePackageTier.MECHANICAL,
+                ),
+            )
+        ),
     }
     mechanical, capabilities = route_recovery_facts(
         routes,
@@ -615,7 +629,26 @@ def test_route_recovery_facts_canonicalize_presets_and_markings() -> None:
     )
     # The preset reference and the $session binding both canonicalize to
     # their base models; the explicit marking is keyed by canonical base.
+    # The cost-tier default contributes nothing without price data (a
+    # price-less catalog cannot have resolved it at launch).
     assert mechanical == frozenset({"luna-model", "main-model"})
+    assert capabilities == {"alt-model": ReplacementCapability.MECHANICAL}
+    # With price data the cost-tier default resolves to the cheapest
+    # capable model and joins the mechanical set.
+    mechanical, capabilities = route_recovery_facts(
+        routes,
+        session_model="main-model",
+        canonical_models={
+            "luna-model": "luna-model",
+            "main-model": "main-model",
+            "alt-model": "alt-model",
+            "budget-model": "budget-model",
+            "@scout": "luna-model",
+            "@main": "main-model",
+        },
+        catalog_prices={"budget-model": 1.5, "alt-model": 9.0},
+    )
+    assert mechanical == frozenset({"luna-model", "main-model", "budget-model"})
     assert capabilities == {"alt-model": ReplacementCapability.MECHANICAL}
     # No explicit marking anywhere: no markings are reported (the legacy
     # tier-label derivation applies unchanged).
@@ -2479,9 +2512,15 @@ async def test_replacement_migration_never_steals_a_same_brief_lineage_count(
 
 
 def _shipped_mechanical_models() -> frozenset[str]:
-    # The shipped mechanical-tier route targets bind the session model, so
-    # the mechanical set is the session model under the shipped defaults.
-    return mechanical_base_models_from_routes(shipped_routes(), session_model="glm-5-3")
+    # The shipped mechanical-tier route targets bind the cost-tier default;
+    # with the shipped catalog's price data the cheapest capable model is
+    # mistral-large-4, so the mechanical set is that model.
+    resolver = ModelResolver(CatalogSnapshot(SHIPPED_CATALOG, "shipped"))
+    return mechanical_base_models_from_routes(
+        shipped_routes(),
+        session_model="glm-5-3",
+        catalog_prices=resolver.catalog_prices(),
+    )
 
 
 def test_unattended_resilience_zero_ask_under_repeated_infrastructure_failure() -> None:
@@ -2506,8 +2545,9 @@ def test_unattended_resilience_zero_ask_under_repeated_infrastructure_failure() 
         )
 
     mechanical = _shipped_mechanical_models()
-    # The shipped mechanical-tier routes bind the session model (glm-5-3).
-    assert "glm-5-3" in mechanical
+    # The shipped mechanical-tier routes default to the cheapest capable
+    # model under the shipped catalog's prices (mistral-large-4).
+    assert mechanical == frozenset({"mistral-large-4"})
     candidates = candidates_from_catalog(
         SHIPPED_CATALOG, mechanical_base_models=mechanical
     )
@@ -2576,10 +2616,15 @@ def test_unattended_resilience_zero_ask_under_repeated_infrastructure_failure() 
 
     # ZERO ask_user_question invocations across the whole scenario.
     assert asks == []
-    # Independent work continued: wp-1 was replaced on an independent endpoint.
+    # Independent work continued: wp-1 was replaced on an independent
+    # endpoint. Under the shipped cost-tier defaults glm-5-3 is
+    # substantive-tier (the mechanical set is the cheapest capable model,
+    # mistral-large-4), so the failed model's own catalog deployment on
+    # api.mistral.ai is the one endpoint-independent eligible candidate.
     assert len(selected) == 1
     assert selected[0].candidate is not None
-    assert selected[0].candidate.base_model == "mistral-large-4"
+    assert selected[0].candidate.base_model == "glm-5-3"
+    assert selected[0].candidate.tier is PackageTier.SUBSTANTIVE
     assert selected[0].failed_endpoint == "gateway.test"
     # wp-2 parked (the shipped catalog has no endpoint-independent route).
     assert len(parked) == 1

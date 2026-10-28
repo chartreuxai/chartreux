@@ -390,6 +390,31 @@ def test_child_identity_posture_rejects_loosening_tool_patch(
     assert candidate.identity == "reviewer"
 
 
+def test_reviewer_bash_carve_out_passes_launch_admission(
+    config: ChartreuxConfigSchema,
+) -> None:
+    """The reviewer's bash execution carve-out is part of its ceiling (P1-h).
+
+    Explicitly enabling bash for a reviewer child is not a loosening attempt:
+    the carve-out is the identity's own reviewed exception, so admission
+    accepts it — while the write tools stay rejected by the same ceiling.
+    """
+    candidate = _resolve_with_identity(
+        config,
+        "reviewer",
+        LaunchConfig(enabled_tools=["bash"]),
+        frozenset({"bash", "read_file", "edit"}),
+    )
+    assert candidate.identity == "reviewer"
+    with pytest.raises(InvalidLaunchToolError, match="identity posture"):
+        _resolve_with_identity(
+            config,
+            "reviewer",
+            LaunchConfig(enabled_tools=["edit"]),
+            frozenset({"bash", "read_file", "edit"}),
+        )
+
+
 def test_coder_child_tool_overrides_pass_both_ceilings(
     config: ChartreuxConfigSchema,
 ) -> None:
@@ -483,7 +508,7 @@ def test_builtin_qualified_identity_normalizes_the_admission_posture(
 
     The runtime identity lookup normalizes the ``builtin:`` prefix
     (``ToolManager._identity_posture``); admission applies the same
-    normalization in ``_child_personal_posture``. Without it, a qualified
+    normalization in ``_child_identity``. Without it, a qualified
     selection of ``builtin:reviewer`` would get an UNRESTRICTED admission
     posture while the runtime enforced reviewer — the second admission
     ceiling would be void for qualified selections (S2 round 2 warning:

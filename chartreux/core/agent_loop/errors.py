@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 from chartreux.core.llm.failures import FailureCategory
+from chartreux.core.recovery_override import OverrideDenial, OverridePermit
 
 
 class AgentLoopError(Exception):
@@ -40,6 +41,30 @@ class ImagesNotSupportedError(AgentLoopError):
     def __init__(self, model: str) -> None:
         self.model = model
         super().__init__(model)
+
+
+class OverrideStartDeniedError(AgentLoopError):
+    """The override ledger denied the forced attempt's transport start (C3).
+
+    Raised from the transport-start observer when the ledger refuses the
+    permit's start — the episode closed between reserve and transport, or
+    the spacing/pressure bound denies it. The attempt aborts BEFORE any
+    transport, and the reservation is released through the pretransport
+    path. A LOCAL admission denial, never a provider failure: it is not
+    retryable and never fails over, and its UNKNOWN classification keeps
+    it off the measured-failure recording entirely.
+    """
+
+    non_retryable: ClassVar[bool] = True
+    failure_category: ClassVar[FailureCategory] = FailureCategory.UNKNOWN
+
+    def __init__(self, denial: OverrideDenial | None, permit: OverridePermit) -> None:
+        self.denial = denial
+        self.permit = permit
+        detail = denial.value if denial is not None else "unknown"
+        super().__init__(
+            f"Forced override attempt denied at transport start ({detail})"
+        )
 
 
 class EmptyReplayBudgetStop(EmptyLLMResponseError):

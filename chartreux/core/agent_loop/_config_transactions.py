@@ -24,7 +24,7 @@ from chartreux.core.agent_loop.backend_lifetime import BackendPublish
 from chartreux.core.agent_loop.errors import AgentLoopStateError
 from chartreux.core.agents.launch import (
     LaunchCandidate,
-    _child_personal_posture,
+    _child_identity,
     _validate_tools,
 )
 from chartreux.core.agents.manager import AgentManager
@@ -33,7 +33,8 @@ from chartreux.core.config._restrictions import SourceRestrictions
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.dispatch.renderer import task_description_for_config
 from chartreux.core.dispatch.route_models import ReplacementCapability
-from chartreux.core.dispatch.session import pending_policy_changes
+from chartreux.core.dispatch.session import live_route_changes, pending_policy_changes
+from chartreux.core.events import RouteTableAppliedEvent
 from chartreux.core.hooks.manager import HooksManager
 from chartreux.core.hooks.models import HookConfigResult
 from chartreux.core.llm.types import BackendLike
@@ -155,6 +156,35 @@ def _job_authority_config(config: ChartreuxConfigSchema) -> dict[str, Any]:
 def _guard_job_authority_config(loop: AgentLoop, config: ChartreuxConfigSchema) -> None:
     if loop._job_authority_config(config) != loop._execution_authority_config:
         loop.require_background_jobs_idle()
+
+
+def _guard_route_table(config: ChartreuxConfigSchema) -> None:
+    """ADR 0022: an invalid edited route table rejects the whole reload.
+
+    ``requires_distinct_models`` is validated at the reload that swaps the
+    table in — not only at launch — so an invalid edit never enters the
+    live table: the reload fails closed, the prior table stays effective,
+    and in-flight children are untouched. A config without an attached
+    catalog skips the check (route resolution already fails closed at launch
+    with the model-selection error).
+    """
+    if config.catalog_snapshot is None:
+        return
+    from chartreux.core.agents.identity_launch import _route_inputs
+    from chartreux.core.dispatch.routes import validate_route_table_diversity
+    from chartreux.core.model_catalog.resolver import ModelResolutionError
+
+    try:
+        aliases, canonical, _resolver, prices = _route_inputs(config)
+    except ModelResolutionError as exc:
+        raise ValueError(f"Invalid route table: {exc}") from exc
+    validate_route_table_diversity(
+        config.purpose_routes.routes,
+        catalog=aliases,
+        session_model=config.active_model or "@main",
+        canonical_models=canonical,
+        catalog_prices=prices,
+    )
 
 
 def _require_policy_idle(loop: AgentLoop) -> None:
@@ -346,12 +376,12 @@ def _prepare_launch_consumers(
             cwd=loop.cwd,
             harness_files=loop.harness_files,
             scratchpad_dir=loop.scratchpad_dir,
-            # The rebuilt manager serves the conversation's FROZEN route
+            # The rebuilt manager serves the conversation's LIVE route
             # table — the same source launch admission resolves against —
-            # never the retask target config's live routes (design §6, §10).
-            task_description=task_description_for_config(
-                target_config, routes=loop.frozen_purpose_routes
-            ),
+            # so the model-facing table and executable admission can never
+            # diverge, in this conversation or the retask's target config
+            # (ADR 0022).
+            task_description=task_description_for_config(target_config),
             session_root_grants=loop._session_root_grants,
             dangerous_command_authority_provider=loop._dangerous_command_grants,
         )
@@ -405,7 +435,7 @@ def _revalidate_launch_tool_ceilings(
         candidate.semantic_overrides,
         candidate.authority_inputs.known_tool_names,
         frozenset(ceiling_manager.delegable_tools),
-        _child_personal_posture(candidate.identity),
+        _child_identity(candidate.identity),
     )
 
 
@@ -515,6 +545,9 @@ def _prepare_reload(
     mcp_registry: MCPRegistry | None = None,
 ) -> _PreparedReload:
     loop._guard_job_authority_config(target_config)
+    # ADR 0022: validate the edited route table BEFORE any preparation —
+    # an invalid table rejects the whole reload, fail-closed.
+    _guard_route_table(target_config)
     # Preserve the retained deployment before constructing a replacement backend.
     # An unchanged selection expression is provenance, not a request to resolve a
     # different deployment for the same base model.
@@ -623,14 +656,12 @@ def _prepare_reload_consumers(
         cwd=loop.cwd,
         harness_files=loop.harness_files,
         scratchpad_dir=loop.scratchpad_dir,
-        # The task-tool description is conversation-owned policy like the
-        # prompt: it renders from the conversation's FROZEN route table —
-        # the same source launch admission resolves against — never the
-        # reloaded live config, so a saved route edit stays pending instead
-        # of half-applying to the model-facing table (design §6, §10).
-        task_description=task_description_for_config(
-            target_config, routes=loop.frozen_purpose_routes
-        ),
+        # The task-tool description renders from the reloaded config's LIVE
+        # route table — the same source launch admission resolves against —
+        # so a validated route edit applies to subsequent launches and the
+        # model-facing table switches in the SAME commit as admission
+        # (ADR 0022).
+        task_description=task_description_for_config(target_config),
         session_root_grants=loop._session_root_grants,
         dangerous_command_authority_provider=loop._dangerous_command_grants,
     )
@@ -888,6 +919,37 @@ def _commit_reload(  # noqa: PLR0915
         loop.pending_policy_changes = pending
         for note in pending:
             logger.warning("Pending policy change after reload: %s", note)
+        # ADR 0022: routes are bindings, not frozen content — a validated
+        # route edit APPLIES at this commit to every launch admitted after
+        # it. Publish the applied report (old → new per purpose) as a
+        # conversation-visible notice; in-flight children keep their pinned
+        # bindings. The notice diffs against the LIVE table this reload
+        # replaces (R7): A -> B -> C reports "A -> B" then "B -> C", a revert
+        # reports "B -> A", and a reload that leaves the table unchanged
+        # reports nothing. The frozen manifest snapshot stays the integrity
+        # anchor and the resume notice's diff base. The diff base is the
+        # last-seen live table on the install-then-catch-up path (the
+        # candidate already IS the live config), and the live table itself
+        # on the orchestrator paths — _commit_reload runs BEFORE the
+        # orchestrator accepts the candidate, so the live table is still the
+        # one this reload replaces; a swap that committed no consumers (a
+        # refresh or a raw reload) leaves the last-seen table stale, and the
+        # check must never diff against it.
+        if prepared.config is loop.config:
+            previous_live = loop._last_seen_purpose_routes
+        else:
+            previous_live = dict(loop.config.purpose_routes.routes)
+        changes = live_route_changes(prepared.config, previous_live, activated)
+        loop.applied_route_changes = changes
+        if changes:
+            loop._out_of_band_events.put_nowait(
+                RouteTableAppliedEvent(session_id=loop.session_id, changes=changes)
+            )
+    # The last-seen live table records the table this reload made live,
+    # unconditionally: a reload that commits with no bound policy still
+    # swapped the live table, and the next reload's notice must not diff
+    # against the older one.
+    loop._last_seen_purpose_routes = dict(prepared.config.purpose_routes.routes)
 
 
 # Policy replacement transactions.
@@ -998,13 +1060,11 @@ def _prepare_policy_manager(
         cwd=loop.cwd,
         harness_files=loop.harness_files,
         scratchpad_dir=loop.scratchpad_dir,
-        # The replacement manager keeps serving the conversation's FROZEN
-        # route table — the bound bundle's snapshot, the same source launch
-        # admission resolves against — never the staged live config's
-        # routes (design §6, §10).
-        task_description=task_description_for_config(
-            authority().config, routes=loop.frozen_purpose_routes
-        ),
+        # The replacement manager serves the conversation's LIVE route table
+        # — the same source launch admission resolves against — so the
+        # model-facing table and executable admission can never diverge
+        # (ADR 0022).
+        task_description=task_description_for_config(authority().config),
         session_root_grants=loop._session_root_grants,
         dangerous_command_authority_provider=loop._dangerous_command_grants,
     )

@@ -43,6 +43,7 @@ from typing import Any, cast
 
 import pytest
 
+from chartreux.app_server._recovery_controller import RecoveryController, _Availability
 from chartreux.app_server._sessions import SessionRuntimeRegistry, _AgentState
 from chartreux.app_server.protocol import TurnStartParams
 from chartreux.app_server.server import AppServer
@@ -1220,4 +1221,191 @@ async def test_resumed_run_failure_envelope_keeps_recovery_identity(
         )
         assert second_envelope.recovery.same_agent_resumes_used == 1
     finally:
+        await harness.session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_resume_rejected_when_unavailable_preserves_timer_budget_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C6a: an unavailable admission is rejected BEFORE consuming a resume
+    or publishing RESTORING — the same read-only availability snapshot the
+    automatic controller schedules against. A rejected admission consumes no
+    budget, publishes no RESTORING, reserves no slot, and leaves the pending
+    automatic timer armed; a subsequent available admission succeeds.
+    """
+    harness = await _start_harness(
+        monkeypatch,
+        child_scripts=[
+            [
+                _write_outcome("todo-1", "item"),
+                _empty_fault(),
+                _final_outcome("resumed done"),
+            ]
+        ],
+        launches=["launch the child"],
+    )
+    registry = harness.registry
+    try:
+        agent_id, run_id = await _launch_child(harness, "launch the child", 1)
+        failed = await _settle_child(harness, agent_id, run_id)
+        assert not failed.completed
+        record = registry._agent_records[agent_id]
+        await _until(lambda: record.state is _AgentState.SUSPENDED)
+        # The automatic controller armed its pending schedule at suspension.
+        controller = registry._recovery_controller
+        episode = controller._episodes[agent_id]
+        assert episode.active is True
+        assert episode.timer is not None
+        assert episode.scheduled_failed_run_id == run_id
+
+        original_availability = RecoveryController._availability
+
+        def _unavailable(_self: Any, _record: Any) -> _Availability:
+            return _Availability(
+                available=False,
+                permanent=False,
+                next_check_delay=12.0,
+                endpoint_blocked=False,
+            )
+
+        def _permanent(_self: Any, _record: Any) -> _Availability:
+            return _Availability(
+                available=False,
+                permanent=True,
+                next_check_delay=0.0,
+                endpoint_blocked=False,
+            )
+
+        async def assert_preserved() -> None:
+            """The rejected admission consumed nothing and preserved state."""
+            assert record.state is _AgentState.SUSPENDED
+            assert record.same_agent_resumes_used == 0
+            assert record.pending_resume is None
+            assert record.latest_run_id == run_id
+            assert not record.reserved_for_replacement
+            successors = [
+                item
+                for item in record.run_history
+                if item.resumed_from_run_id == run_id
+            ]
+            assert successors == []
+            # The pending automatic timer stays armed for a rejected admission.
+            assert episode.active is True
+            assert episode.timer is not None
+            assert episode.scheduled_failed_run_id == run_id
+
+        # Temporary unavailability (cooldown): rejected without consuming.
+        monkeypatch.setattr(RecoveryController, "_availability", _unavailable)
+        rejected = await registry.resume_agent(
+            agent_id, run_id, "k", requester_session_id=harness.requester_session_id
+        )
+        assert rejected.outcome is ResumeOutcome.NOT_RESUMABLE
+        assert rejected.reason_codes == ["model_unavailable"]
+        await assert_preserved()
+
+        # Permanent incompatibility: rejected with its own code, same
+        # preservation guarantees.
+        monkeypatch.setattr(RecoveryController, "_availability", _permanent)
+        blocked = await registry.resume_agent(
+            agent_id, run_id, "k", requester_session_id=harness.requester_session_id
+        )
+        assert blocked.outcome is ResumeOutcome.NOT_RESUMABLE
+        assert blocked.reason_codes == ["permanent_incompatibility"]
+        await assert_preserved()
+
+        # Availability restored: the admission succeeds and consumes exactly
+        # one resume — the rejections consumed none.
+        monkeypatch.setattr(RecoveryController, "_availability", original_availability)
+        resume = await registry.resume_agent(
+            agent_id, run_id, "k", requester_session_id=harness.requester_session_id
+        )
+        assert resume.outcome is ResumeOutcome.SCHEDULED
+        assert resume.same_agent_resumes_used == 1
+        assert resume.successor_run_id is not None
+        successor = await _settle_child(harness, agent_id, resume.successor_run_id)
+        assert successor.completed
+        assert successor.response == "resumed done"
+    finally:
+        await harness.session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_committed_resume_stands_down_timer_and_arms_progress_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C6a: a COMMITTED explicit admission stands down the pending automatic
+    timer (cancelled at the locked commit, the episode kept active for the
+    successor's completion accounting) and installs the C5b resumed-progress
+    context on the successor run's loop; the successor's completion closes
+    the episode.
+    """
+    prepare_gate = asyncio.Event()
+    call_gate = asyncio.Event()
+    gated = _Gated(_final_outcome("resumed done"), call_gate)
+    harness = await _start_harness(
+        monkeypatch,
+        child_scripts=[[_write_outcome("todo-1", "item"), _empty_fault(), gated]],
+        launches=["launch the child"],
+    )
+    registry = harness.registry
+    try:
+        agent_id, run_id = await _launch_child(harness, "launch the child", 1)
+        failed = await _settle_child(harness, agent_id, run_id)
+        assert not failed.completed
+        record = registry._agent_records[agent_id]
+        await _until(lambda: record.state is _AgentState.SUSPENDED)
+        controller = registry._recovery_controller
+        episode = controller._episodes[agent_id]
+        assert episode.timer is not None
+
+        # Hold the admission's prepare phase so the test observes the locked
+        # commit before the successor run is prepared.
+        original_prepare = registry._execution.prepare_background
+
+        async def gated_prepare(*args: Any, **kwargs: Any) -> Any:
+            await prepare_gate.wait()
+            return await original_prepare(*args, **kwargs)
+
+        monkeypatch.setattr(registry._execution, "prepare_background", gated_prepare)
+
+        resume_task = asyncio.ensure_future(
+            registry.resume_agent(
+                agent_id, run_id, "k", requester_session_id=harness.requester_session_id
+            )
+        )
+        await _until(lambda: record.pending_resume is not None)
+
+        # The commit stood down the pending automatic timer atomically (the
+        # stand-down shares the commit's critical section) while keeping the
+        # episode active for the successor's completion accounting.
+        assert episode.timer is None
+        assert episode.scheduled_failed_run_id is None
+        assert episode.active is True
+
+        prepare_gate.set()
+        resume = await resume_task
+        assert resume.outcome is ResumeOutcome.SCHEDULED
+        assert resume.successor_run_id is not None
+
+        # The C5b resumed-progress context is installed on the successor
+        # run's loop (armed by prepare_background with the resume admission).
+        await asyncio.wait_for(gated.started.wait(), timeout=5)
+        watch = record.runtime.agent_loop._completion_coordinator._resume_progress_watch
+        assert watch is not None
+        assert watch.disarmed is False
+        assert watch.expired is False
+
+        call_gate.set()
+        successor = await _settle_child(harness, agent_id, resume.successor_run_id)
+        assert successor.completed
+        assert successor.response == "resumed done"
+
+        # The successor's completion closed the kept-active episode.
+        await _until(lambda: agent_id not in controller._episodes)
+    finally:
+        prepare_gate.set()
+        call_gate.set()
         await harness.session.close()

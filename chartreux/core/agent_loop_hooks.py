@@ -30,7 +30,7 @@ from dataclasses import dataclass
 import json
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from chartreux.core.events import ToolResultEvent
 from chartreux.core.hooks.models import (
@@ -46,6 +46,7 @@ from chartreux.core.hooks.models import (
 )
 from chartreux.core.llm.format import ResolvedToolCall
 from chartreux.core.llm_models import ImageAttachment, PersistedToolResult
+from chartreux.core.tools import secret_redaction
 from chartreux.core.utils import (
     CANCELLATION_TAG,
     TOOL_ERROR_TAG,
@@ -87,6 +88,90 @@ class PostToolFinalization:
     # Preserve the frozen seconds verbatim rather than round-tripping via ms.
     duration: float | None = None
     initial_text: str = ""
+    # P2 (round-9): the executor-minted, run-scoped receipt occurrence ID,
+    # minted BEFORE the invocation at the tool-call dispatch site and carried
+    # here so the post-tool seam's receipt resolves to this invocation and
+    # not another one reusing the same tool_call_id.
+    occurrence_id: str | None = None
+
+
+class CompletionEvidenceReceipt(BaseModel):
+    """Typed completion-evidence receipt (P2): the side-channel payload.
+
+    Emitted from the post-tool finalization seam only — never forwarded on
+    the typed event stream, and never sent to the projector/outward path.
+    One receipt per invocation that reached post-tool finalization;
+    pre-invocation denials and skips never produced one (the tool never
+    ran), and a hard cancellation outside the seam leaves the invocation's
+    evidence derivable as unavailable — never contradictory — by the
+    collector (P3), which registers the executor-minted occurrence ID
+    unchanged from both this receipt and the result events.
+
+    ``final_text`` is the post-hook final text under the recorder's
+    redaction (the same ``secret_redaction`` pass that guards the transcript
+    choke point, _transcript_recorder.py:233-259); ``executed_args`` is the
+    effective executed-args signature — the serialized args the tool
+    actually ran with, after any rewrite — under the same redaction;
+    ``tool_output`` is the model-visible result serialization
+    (_tool_executor.py's ``result_dict`` join) likewise redacted.
+    ``bash_job_ids`` carries managed-job IDs from bash_start-shaped results
+    (a nested ``job.job_id``) for lineage.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    occurrence_id: str
+    tool_call_id: str
+    tool_name: str
+    status: ToolStatus
+    final_text: str
+    executed_args: dict[str, Any] = Field(default_factory=dict)
+    tool_output: dict[str, Any] | None = None
+    bash_job_ids: tuple[str, ...] = ()
+    duration_ms: float | None = None
+
+
+def _redacted_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A payload under the recorder's redaction (persisted-result shape)."""
+    if payload is None:
+        return None
+    return secret_redaction.redact_persisted_result(
+        PersistedToolResult(output=payload)
+    ).output
+
+
+def _bash_job_ids(output: dict[str, Any] | None) -> tuple[str, ...]:
+    """Managed-job IDs from a bash_start-shaped result serialization."""
+    if not output:
+        return ()
+    job = output.get("job")
+    if isinstance(job, dict):
+        job_id = job.get("job_id")
+        if isinstance(job_id, str) and job_id:
+            return (job_id,)
+    return ()
+
+
+def build_completion_evidence_receipt(
+    tool_call: ResolvedToolCall, finalization: PostToolFinalization, final_text: str
+) -> CompletionEvidenceReceipt:
+    """Assemble one typed receipt from the post-tool finalization inputs.
+
+    The executor supplies the effective executed-args signature and the
+    model-visible serialization through ``finalization``; the seam owns the
+    post-hook final text and the redaction pass.
+    """
+    return CompletionEvidenceReceipt(
+        occurrence_id=finalization.occurrence_id or "",
+        tool_call_id=tool_call.call_id,
+        tool_name=tool_call.tool_name,
+        status=finalization.tool_status,
+        final_text=secret_redaction.redact(final_text),
+        executed_args=_redacted_payload(dict(finalization.tool_input)) or {},
+        tool_output=_redacted_payload(finalization.tool_output),
+        bash_job_ids=_bash_job_ids(finalization.tool_output),
+        duration_ms=finalization.duration_ms,
+    )
 
 
 class AgentLoopHooksMixin:
@@ -102,6 +187,12 @@ class AgentLoopHooksMixin:
     _hook_session_context: Callable[[], HookSessionContext]
     _stats_getter: Callable[[], AgentStats]
     _messages_getter: Callable[[], MessageList]
+    # P2: the completion-evidence side-channel sink — a late-bound callback
+    # receiving the typed receipt emitted from the post-tool finalization
+    # seam, or None while no consumer (P3's accumulator) is registered.
+    _completion_evidence_sink_getter: Callable[
+        [], Callable[[CompletionEvidenceReceipt], None] | None
+    ]
 
     def _handle_tool_response(
         self,
@@ -238,6 +329,35 @@ class AgentLoopHooksMixin:
         self._handle_tool_response(
             tool_call, final_text, persisted_result, finalization.images
         )
+        self._emit_completion_evidence(tool_call, finalization, final_text)
+
+    def _emit_completion_evidence(
+        self,
+        tool_call: ResolvedToolCall,
+        finalization: PostToolFinalization,
+        final_text: str,
+    ) -> None:
+        """Side-channel emission of the typed completion-evidence receipt.
+
+        Invoked from the post-tool finalization seam only; never yields an
+        event, so the typed event-stream annotations (executor :143/:300,
+        batch runner :99, loop :2691) stay unchanged and the receipt never
+        reaches the projector/outward path. A sink failure is logged and
+        swallowed: the receipt is side-channel evidence and must never break
+        the tool flow it observes.
+        """
+        sink = self._completion_evidence_sink_getter()
+        if sink is None or finalization.occurrence_id is None:
+            return
+        try:
+            sink(build_completion_evidence_receipt(tool_call, finalization, final_text))
+        except Exception:
+            logger.warning(
+                "Completion-evidence sink failed tool=%s tool_call_id=%s",
+                tool_call.tool_name,
+                tool_call.call_id,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Pre-tool pipeline

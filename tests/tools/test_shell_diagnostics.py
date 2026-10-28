@@ -116,6 +116,34 @@ def test_unrecoverable_command_preview_with_secrets_remains_conservative() -> No
     assert "unclosed" not in rendered
 
 
+def test_push_destination_denial_detail_with_apostrophe_renders_informatively() -> None:
+    # The shell-aware redactor returns None on the detail's unmatched quote
+    # ("the destination's receive-pack and hooks"); the detail field is
+    # policy-authored prose, not shell source, so it must render with only
+    # actual secret values redacted instead of degrading to [REDACTED].
+    secret = "synthetic-unrelated-secret-0123456789"
+    detail = (
+        "git push: destination 'https://x/y' is a path or URL, not a remote "
+        "name: a push to it runs the destination's receive-pack and hooks, "
+        "outside the repository the grant covers"
+    )
+    with bind_policy(ScrubPolicy(redaction_credentials=(("TEST_TOKEN", secret),))):
+        rendered = render_diagnostic(Diagnostic("dangerous_guard", detail=detail))
+    assert "Command denied: git push: destination" in rendered
+    assert r"the destination\u0027s receive-pack and hooks" in rendered
+    assert "REDACTED" not in rendered
+    assert secret not in rendered
+
+
+def test_detail_preview_fallback_still_redacts_registered_secret_values() -> None:
+    secret = "synthetic-unrelated-secret-0123456789"
+    detail = f"the credential {secret} cannot authorize this command"
+    with bind_policy(ScrubPolicy(redaction_credentials=(("TEST_TOKEN", secret),))):
+        rendered = render_diagnostic(Diagnostic("dangerous_guard", detail=detail))
+    assert secret not in rendered
+    assert r"\u005bREDACTED\u005d" in rendered
+
+
 def test_redaction_precedes_escaping_and_truncation() -> None:
     secret = "synthetic-secret-[markup]\n" + "z" * 400
     policy = ScrubPolicy(redaction_credentials=(("TEST_TOKEN", secret),))

@@ -55,6 +55,8 @@ from chartreux.app_server.models import (
     PublicEntryGenerationStatus,
     PublicNoticeEntry,
     PublicSessionState,
+    RouteTableAppliedChange,
+    RouteTableAppliedNoticeDetail,
     SessionTitleUpdatedNoticeDetail,
     TextContentBlock,
 )
@@ -82,6 +84,7 @@ from chartreux.core.config import ChartreuxConfigSchema
 from chartreux.core.events import (
     BackgroundJobsChangedEvent,
     BackgroundWorkEvent,
+    RouteTableAppliedEvent,
     SessionTitleUpdatedEvent,
 )
 from chartreux.core.git.errors import GitError
@@ -952,6 +955,8 @@ class SessionRuntimeControllerImpl:
             try:
                 if isinstance(event, SessionTitleUpdatedEvent):
                     await self._notify_title(event)
+                elif isinstance(event, RouteTableAppliedEvent):
+                    await self._notify_route_table_applied(event)
                 elif isinstance(
                     event, (BackgroundWorkEvent, BackgroundJobsChangedEvent)
                 ):
@@ -1007,6 +1012,53 @@ class SessionRuntimeControllerImpl:
             level="info",
             message="Session title updated",
             detail=SessionTitleUpdatedNoticeDetail(title=title),
+        )
+        await self._services.notify(
+            "history/entryAdded",
+            HistoryEntryAddedParams(
+                event_id=0,
+                session_id=session_id,
+                turn_id=None,
+                entry=entry,
+                emitted_at=now,
+            ),
+        )
+
+    async def _notify_route_table_applied(self, event: RouteTableAppliedEvent) -> None:
+        # ADR 0022: the applied route notice rides the same session-notice
+        # channel as the title update — a PublicNoticeEntry emitted through
+        # history/entryAdded — so it is conversation-visible history, never
+        # a fresh instruction that would trigger another turn. A reset can
+        # swap in a new session while the event is still queued; the stale
+        # session guard keeps the notice off the fresh session's transcript.
+        session_id = event.session_id
+        if session_id != self._agent_loop.session_id:
+            return
+        now = now_ms()
+        edits = "; ".join(
+            f"`{change.purpose}`: {change.before} → {change.after}"
+            for change in event.changes
+        )
+        entry = PublicNoticeEntry(
+            id=str(uuid4()),
+            session_id=session_id,
+            turn_id=None,
+            created_at=now,
+            updated_at=now,
+            generation_status=PublicEntryGenerationStatus.COMPLETED,
+            level="info",
+            message=(
+                f"Route table updated — {edits}. The edited routes apply to "
+                "subsequent launches; in-flight children keep their bindings."
+            ),
+            detail=RouteTableAppliedNoticeDetail(
+                changes=[
+                    RouteTableAppliedChange.model_validate(
+                        change.model_dump(mode="json")
+                    )
+                    for change in event.changes
+                ]
+            ),
         )
         await self._services.notify(
             "history/entryAdded",

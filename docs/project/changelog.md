@@ -2,6 +2,347 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.6.0 (2026-10-28)
+
+This is a combined release: everything shipped since v0.5.8 — the
+permission realignment, the backlog design set, and the subagent
+completion audit — ships together as v0.6.0.
+
+### Security
+
+- Destination-aware egress is the settled exfiltration decision for the
+  modeled network clients. Modeled `curl` and `wget` calls are no longer
+  denylisted outright; the destination decides. A literal loopback
+  destination (`localhost`, `127.0.0.0/8`, `::1`) runs with no dialog; any
+  other destination — another IP literal, a DNS name, or one the recognizer
+  cannot parse — resolves ask-class (`network.egress`) and prompts in
+  interactive sessions, denying with remediation in headless and child
+  sessions. The destination-changing behavior classes resolve ask-class even
+  for a literal loopback destination: redirect-following flags (`curl -L`),
+  `wget`'s default redirect behavior, and destination-overriding options
+  (`--resolve`, `--connect-to`). The development-egress carve-out stays
+  run-class (`git fetch`/`clone`/`pull`, `pip`/`uv` installs), and a user
+  denylist entry for these clients remains an absolute veto.
+- Probed egress clients move onto the shipped default denylist: `ssh`,
+  `scp`, `rsync`, `ftp`, `telnet`, `http`/`httpie`, `wget2`, `aria2c`,
+  `lftp`, and `watch` are denied until they are modeled; remove an entry to
+  re-enable a client deliberately.
+- Recursive `rm` gains a git-status-aware carve-out. Over a tree with
+  unsaved changes the blanket handoff denial remains. Over a git-clean tree
+  a recursive `rm` runs on its own only when every expanded operand lies
+  within the assessed repository, clear of its Git metadata (neither
+  encompassing it nor lying inside it, linked-worktree common directories
+  included), with recovery established for every repository involved, nested
+  ones included. The analysis fails closed on every axis — operand scope,
+  metadata overlap, recovery status, expansion, resolution — and any mixed
+  operand set fails closed to the handoff denial.
+- Artifact secret scan: a gitleaks-rule-based scan with entropy checks over
+  the session's touched paths runs automatically at the agent submission
+  boundary — a finding blocks the submission, the match is redacted from the
+  transcript, and the agent is told the artifact failed the scan (not what
+  it matched) — and runs as a pre-commit hook for user-driven commits.
+- Child sessions deny ask-class dangerous commands outright, regardless of
+  user-input capability: the dangerous-command approval dialog is never
+  surfaced in a child, a denied ask-class call returns a blocker to the
+  parent, and `dangerous_command_grants_by_project` is the only child
+  pre-authorization path (saved project grants still run without a prompt).
+  The same blanket child semantics apply to out-of-root access grants.
+
+### Added
+
+- Completion audit (fabricant-proof) at the subagent submission
+  boundary. Every background subagent run now carries a typed, frozen
+  completion contract, admitted at launch and rendered into the worker's
+  prompt. The contract binds closed vocabularies of acceptance-check
+  templates (`pytest`, `ruff_check`, `pyright`, `git_head`, `git_status`,
+  `git_diff_stat`) and artifact kinds (`commit`, `touched_path`,
+  `check_pass`, `envelope`), a strict versioned envelope/receipt grammar
+  (unknown fields, duplicate requirement ids, and oversized payloads are
+  grammar violations, never worker faults; substantive seats must answer
+  with a claim, read-only seats are exempt), and a claim-evidence truth
+  table on five separate axes — claim fidelity, disclosure completeness,
+  mandate satisfaction, declared outcome, and primary runtime failure.
+  The audit composes at `build_result` from three evidence audits: the
+  artifact audit (claimed commit hashes and artifact paths resolved
+  against the run's evidence, with admission-versus-publication HEAD
+  snapshots and hash-prefix matching confined to git-command results),
+  the receipt audit (envelope-linked receipts only; no prose
+  extraction), and the check audit (contract-bound requirement ids and
+  their canonical commands; exit-zero evidence after the last mutation).
+  Verifier failures (denied, timeout, unavailable, unrunnable) are
+  informational, never worker misconduct; unavailable evidence is never
+  a contradiction.
+- Completion-evidence chronology with collection-time snapshots. Each
+  run keeps a bounded, per-run chronology of post-tool evidence
+  receipts, paired to their originating invocations by a harness-minted,
+  run-scoped receipt occurrence id (never `tool_call_id` alone —
+  tool-call ids are reused across turns), with collection-time content
+  snapshots (hash, byte size, sampled head/tail) captured at collection,
+  never at finalization; evicted evidence is marked unavailable, never
+  contradictory.
+- Once-only finalization and the acceptance-check runner. Acceptance
+  checks run exactly once per run, awaited immediately before each
+  `build_result` call site and cached run-keyed; cancellation and
+  exception paths never start new verification, publish no completed
+  result before the audit completes, and leave no orphaned verifier. The
+  runner builds its argv from the frozen contract's templates, validates
+  paths under the child's authorized roots, and passes full shell
+  command admission — guardrails, path permissions, dangerous-command
+  classification, denylist — immediately before spawn (resolve once,
+  spawn the resolved target; no prompts, retries, or fallbacks; a
+  denial stamps the check denied without spawning).
+- Enforce mode is the default: `[completion].mode = "enforce"`. A
+  contradicted claim blocks publication at the submission boundary: the
+  run finalizes `completed=False` with a typed `completion_rejection`
+  failure class (mirrored on the public wire), a measured rejection
+  envelope, and the audit result riding `TaskResult.completion_audit`.
+  Enforce-mode activation wired the composition's two inert-input
+  surfaces into production: parent-shared roots frozen on the contract
+  at admission (a failed finalization check observing final state under
+  a shared root — the session scratchpad the parent and the child both
+  write — composes as check-context unverified, never contradicted,
+  never a block), and the receipt's bounded claimed-value surface
+  (claimed commit hashes and claimed artifact paths, keyed by
+  requirement id), which the artifact audit resolves against the
+  evidence. The activation gates — the offline replay corpus, the
+  post-contract observation gate, and the fresh-runtime enforce-mode
+  test — ran green with zero honest false rejections; `stamp` remains
+  available and only stamps the composed classification onto the result
+  without blocking.
+- Un-stick machinery for stalled orchestrator endpoints. An explicit
+  `override_cooldown` on `task` and `resume_agent` launches lets an
+  accepted request force a completion attempt past an endpoint's
+  cooldown, metered by a root-shared, endpoint-episode cooldown ledger
+  (carried unchanged through every `ConfigOrchestrator.copy()`): at most
+  2 forced starts per endpoint episode, at least 30 seconds apart, at
+  most one attempt in flight, with the pressure bound
+  `min(2, 1 + floor(T/30s))`. An episode opens only on a measured
+  endpoint failure and closes only on a measured endpoint recovery —
+  agent lifecycle, replacement, release, timer expiry, and elapsed time
+  never replenish the counters, and automatic paths never acquire
+  permits. A permit bypasses only its matching cooldown predicates at
+  candidate selection and is consumed once at the actual transport
+  start — no retries, no empty-response replay, no failover replay for
+  the forced attempt. Denied overrides return bounded diagnostics
+  (selected deployment, bypassed exclusions, remaining allowance, next
+  permitted time) and consume neither budget nor allowance. The `task`
+  and `resume_agent` tool contracts document the bounded override, the
+  deadline exception, the diagnostics, and the no-replay rule.
+- Resume-progress deadline for stalled resumed runs. A resumed subagent
+  run that stalls on its first model call (the provider accepts the
+  request and never streams a byte) now trips the one hard in-flight
+  kill in the recovery policy: a run-scoped, run-armed
+  first-semantic-progress deadline
+  (`[recovery.subagents].resume_progress_deadline_seconds`, 180s by
+  default), armed at the run's first conversation model call and disarmed
+  at the observation of the first semantic delta (content, reasoning, or
+  tool-call; heartbeat and usage-only chunks never disarm). Expiry
+  cancels the in-flight call and classifies as the measured
+  `resume_progress_deadline` timeout reason; automatic same-payload
+  continuation is prohibited.
+- Transactional explicit resume. Explicit resume admission is now
+  transactional: an unavailable admission is rejected before consuming
+  a resume or publishing RESTORING; on committed admission the pending
+  automatic timer is cancelled and the resumed-progress context is
+  installed.
+- Resume lineage in the agent bar: the details pane and the agent
+  browser render `resumed_from_run_id` with full metadata.
+- Worker and orchestrator contracts. The bounded-child and coder prompts
+  carry the evidence-linked completion clauses (cite commit hashes and
+  receipt references at completion; never discard a result you issued;
+  re-issue on conflict; the no-edit proof obligation; file-state metadata
+  is non-authoritative), and the orchestrator's dispatch policy retains
+  implementation predecessors for replacement lineage, escalates the
+  first typed audit rejection through the existing lineage, reruns the
+  discriminating check before consequential reliance, and routes
+  release/publish/destructive/migration/git-state scopes off the flash
+  tier (budget fit is advisory-log only).
+- Documented residuals and scope exclusions: a stamp means "claim
+  matched evidence," never "task correct"; the acceptance check executes
+  project code (conftest, test bodies) and authorized-root validation is
+  not containment; managed-job (`bash_start`) and custom/MCP writes are
+  excluded from the evidence scope.
+
+- Shell mutation-roots footprint. `bash` and `bash_start` surface the
+  resolved work-tree roots of their commands' checkout/switch invocations
+  (`mutation_roots`) alongside the write-path footprint — on success and,
+  copied onto the error event by the tool executor, on failed, timed-out,
+  or cancelled runs alike. The footprint is collected into mutation-scope
+  accounting next to the touched paths: it never joins the artifact secret
+  scan's path list (a work-tree root would scan the whole repository and
+  burn the bounded walk's budget), and the completion audit consumes it
+  for its touched-path comparisons. A footprint that cannot be
+  established records an unknown-mutation-root sentinel, never an
+  established empty one.
+
+- Local tool trust: tools authored under `~/.chartreux/tools/` are trusted
+  by file location and admitted to the non-mutating posture; project-discovered
+  tools, `tool_paths` entries, and MCP proxies stay fail-closed. The
+  provenance-stamp machinery is removed; shipped builtins are classified by
+  their defining module.
+- Project environment injection: inside a trusted folder, the project `.env`
+  and `$CHARTREUX_HOME/.env` load into `bash`/`bash_start` subprocess
+  environments (re-read on mtime change so rotation takes effect without a
+  restart), with known secret values masked in tool output as a redaction
+  backstop; document expected key names in a committable `.env.example`.
+- Live route editing (ADR 0022, promoted to `docs/adr/`): route edits apply
+  to subsequent launches in the same conversation instead of new
+  conversations only; in-flight children keep their admitted bindings, and a
+  resumed conversation adopts the current saved route table with a diff
+  notice.
+
+### Changed
+
+- Pure cooldown/endpoint-cooldown launch-exclusion sets are normalized
+  as transient launch exclusions (an additive classification; existing
+  exclusion records are unchanged).
+
+- Identity tool grants: the read-only-posture identities that bear
+  delegation (`orchestrator`, `researcher`, `advisor`) gain a settled
+  personal execution carve-out — `bash` for probes and verification,
+  `bash_start` for managed jobs, and `write_file`/`edit` for scratchpad
+  and deliverable persistence. Repository-source edits remain delegated
+  by role contract, not by tool denial: the carve-out is personal-axis
+  only and never reaches a delegation set. The shipped identity prompts
+  are reconciled to match — "read-only: never modify repository source
+  files" replaces the blanket "never modify files".
+
+- State-aware clean-tree checkout exemption (ADR 0019 amendment).
+  `git checkout <branch>` to an existing local branch and
+  `git checkout -b <new> [<start>]` run without the consequential
+  approval flow when the entire composed shell call is exactly that one
+  eligible invocation and every candidate repository scope passes the
+  state guardrails — a fully clean work tree, no in-progress operation
+  marker, and no repository configuration that selects a program the
+  invocation could run — with the plain branch form additionally
+  requiring the target to exist as a local branch (a sanitized
+  `show-ref` probe, so a pathspec fallback, a tag, a remote-tracking
+  name, or a commit-ish never rides the exemption). Because the bash
+  tool executes a command string, the executed command is rewritten at
+  execution time with `--no-overwrite-ignore` inserted after the
+  `checkout` subcommand, so an ignored-file collision fails closed
+  instead of silently clobbering local content. Every ineligible shape
+  and every unestablishable state fails closed to the existing
+  consequential approval flow; the exemption never bypasses the denylist
+  veto, parent ceilings, or any other recheck, and the pure classifier's
+  `git.checkout` classification is unchanged.
+
+- Git workflow policy (AGENTS.md, layered on ADR 0019's runtime gates):
+  rewrites of unpublished history — rebase, `commit --amend`, and
+  `reset --soft`/`--mixed` on a branch whose HEAD no remote-tracking ref
+  contains — are agent-executable; rewrites of published history remain
+  handoff-only and approval-gated, with the publication gate checking
+  the operation's entire affected commit range against remote-reachable
+  history; when a branch's publication status is uncertain the agent
+  stops and hands the operation to the user rather than rewriting on
+  uncertainty; a destructive checkout is one that discards uncommitted
+  changes (a clean-tree checkout of an existing local branch is not
+  destructive); and the hard guards — `git update-ref`, forced and
+  deleting pushes, and history rewrites of published commits — keep
+  their existing gates.
+
+- Wrapper and flag recognition: `sg` and `sudo -u <user>` are transparent
+  wrappers whose payloads are re-analyzed (including `sg`'s unquoted
+  multi-token `-c` payloads, closing a fail-open); `git symbolic-ref`
+  resolves in read mode and is classified by mode; `.venv/bin/python
+  --version` resolves while bare interpreter invocation stays denied; a
+  `VIRTUAL_ENV=...` prefix no longer denies.
+- Every grammar-rejection denial names a compliant alternative inline —
+  across the variable/subshell-expansion, glob-inspection, zsh
+  equals-expansion, heredoc, and for-loop rejection categories.
+- The `skill` tool is reclassified as session-scoped instruction loading
+  (not a mutation) and `todo` as control-plane, so read-only and orchestrator
+  identities admit them; brief-writing and skills-preamble guidance now
+  directs children to load named skills via the `skill` tool, and the manual
+  skill-file read fallback is retired.
+- The reviewer identity gains a bash execution carve-out for non-mutating
+  verification commands, so a review exit gate can run the checks it names.
+- The shipped `implementation`, `mechanical-edit`, `search`, and
+  `verification` route defaults are cost-tier aware: they no longer bind
+  `$session` and default to the cheapest capable catalog model.
+- The demanding route triggers on difficulty with a structured difficulty
+  category field carried in launch metadata; record-only categories fail
+  admission.
+- The ceremony acceptance lattice gains the plan-granularity clause: an
+  accepted plan authorizes its named work packages in sequence, and a
+  completed package does not require fresh acceptance to begin the next.
+- The git reader subcommand table and the unmodeled-builtin table no longer
+  overlap (dispatch-order-aware dedup).
+- `bash_read` bounds (`wait_seconds` at most 30, `max_bytes` at least 4096)
+  are named in the parameter-schema descriptions and surfaced in the
+  validation-error remediation.
+- The wrapper-class audit closed with an explicit disposition for every
+  payload-runner and egress-client entry (modeled transparent, denylisted,
+  or fail-closed), one corpus row per entry.
+
+### Fixed
+
+- The completion-evidence receipt sink is wired into production runs:
+  it is installed on the child loop at run admission on both paths
+  (background and foreground) and cleared at run teardown — previously
+  every post-tool receipt was minted and discarded, so the receipt audit
+  found no matching command.
+- A denied `override_cooldown` mint on a retained agent no longer
+  strands the record as RUNNING: the minted permit is released and the
+  reused claim rolled back on any failure.
+- Shell-permission tests fail loudly on stray git repositories above
+  the tmp tree (a `/tmp/.git` left by a crashed tool run, for example):
+  an autouse guard in `tests/tools/conftest.py` detects the pollution
+  that silently re-labeled scope-derived assertions under parallel
+  (xdist) schedules. The guard only detects; it never deletes or
+  modifies anything.
+
+- Oversized TUI error messages are capped behind the `+N lines`
+  disclosure: an error widget estimated taller than 12 wrapped rows
+  renders as a one-line summary plus the disclosure with a height-capped
+  body, and the turn supervisor truncates the error payload at 4000
+  characters before it reaches the TUI — a multi-kilobyte API-error
+  excerpt can no longer fold-wrap into dozens of rows and stretch or
+  obscure the pane.
+
+- Test-suite flake fix: the sustained-ticks transcript memory test's
+  timeout bound is raised from the repo-global 10 seconds to 30 — its
+  legitimate runtime under load can exceed the global bound while
+  remaining bounded.
+
+- Mouse capture is released before the agent-transcript viewer disposes, so
+  exiting the viewer no longer leaves the UI mouse-dead with the keyboard
+  alive.
+- Three latent bugs in the same teardown path: a dispose exception can no
+  longer leave the chat permanently hidden, detached-widget hit-race delivery
+  uses the filtered widget result, and the detach-for-reparenting registry no
+  longer leaks (`is_mounted` is false for detached widgets).
+- The agent-transcript live tick is bounded — streaming teardown and O(page)
+  page sizing — so a large transcript cannot saturate the Textual message
+  pump or grow memory monotonically.
+- Generic-keyword assignment no longer false-positives on a function-call
+  right-hand side.
+
+### Breaking
+
+- Breaking (pre-release alpha; loud, actionable errors; no silent
+  migration): modeled `curl` and `wget` now resolve per destination instead
+  of denying outright — a non-loopback destination surfaces a
+  `network.egress` ask in interactive sessions and denies with remediation
+  in headless and child sessions, and the probed egress clients listed above
+  are newly denied by the shipped default denylist. Tooling or workflows
+  that relied on the outright denial must re-authorize deliberately.
+- Child sessions no longer surface the dangerous-command approval dialog
+  under any capability: an ask-class call in a child resolves to a blocker
+  returned to the parent. Pre-authorize children through
+  `dangerous_command_grants_by_project`.
+- The provenance-stamp machinery is removed. Tools that relied on a
+  provenance stamp for admission must instead live under
+  `~/.chartreux/tools/` (file-location trust) or ship as builtins classified
+  by their defining module.
+
+### Retained limitations
+
+- The probed egress clients remain denylisted until they are modeled;
+  modeling them is the fast-follow.
+- The bare-interpreter gate is retained: bare `.venv/bin/python` still
+  denies while `.venv/bin/pytest` (a tool, not an interpreter) passes.
+
 ## 0.5.8 (2026-10-23)
 
 ### Security

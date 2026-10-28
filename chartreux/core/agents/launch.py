@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
-from chartreux.core.agents.identities import ToolPosture, get_builtin_identity
+from chartreux.core.agents.identities import AgentIdentity, get_builtin_identity
 from chartreux.core.agents.registry import build_child_orchestrator
 from chartreux.core.config.agent_selection import AgentSelectionConfig
 from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
@@ -18,7 +18,8 @@ from chartreux.core.dispatch.route_models import ReplacementCapability
 from chartreux.core.llm.backend.anthropic import REASONING_BLOCK_TYPES
 from chartreux.core.llm.thinking_levels import get_thinking_levels
 from chartreux.core.llm_models import LLMMessage
-from chartreux.core.recovery_models import PackageTier
+from chartreux.core.recovery_models import PackageTier, canonical_endpoint_identity
+from chartreux.core.recovery_override import CooldownOverrideLedger, OverridePermit
 from chartreux.core.session_types import CommittedModelIdentity
 from chartreux.core.subagents import (
     ImmutableLaunchPersonaError,
@@ -28,7 +29,7 @@ from chartreux.core.subagents import (
     LaunchConfig,
     LaunchToolOverride,
 )
-from chartreux.core.tools.manager import posture_allows_name
+from chartreux.core.tools.manager import identity_allows_name
 from chartreux.core.tools.models import ToolPermission
 from chartreux.core.utils import name_matches
 
@@ -299,7 +300,7 @@ def _validate_tools(
     overrides: LaunchConfig,
     names: frozenset[str],
     authorized_names: frozenset[str],
-    personal_posture: ToolPosture | None = None,
+    child_identity: AgentIdentity | None = None,
 ) -> None:
     """Validate launch tool overrides against two independent ceilings.
 
@@ -308,9 +309,11 @@ def _validate_tools(
     personal posture: a launch override can never loosen it (v0.5.7 policy
     reversal — overrides used to be able to widen against profile-level
     restrictions; the ToolManager enforces the posture below the config layer,
-    and this guard rejects loosening attempts at admission). Narrowing
-    overrides (``disabled_tools``, ``permission = "never"`` patches) stay
-    allowed on both axes.
+    and this guard rejects loosening attempts at admission). The identity's
+    execution carve-out is part of that ceiling, not a loosening of it: a
+    carved-out name is admitted exactly as the manager's runtime check admits
+    it. Narrowing overrides (``disabled_tools``, ``permission = "never"``
+    patches) stay allowed on both axes.
     """
     if "enabled_tools" in overrides.model_fields_set:
         patterns = overrides.enabled_tools or []
@@ -323,8 +326,8 @@ def _validate_tools(
                             "config.enabled_tools",
                             f"Tool '{name}' exceeds parent authority",
                         )
-                    if personal_posture is not None and not posture_allows_name(
-                        personal_posture, name
+                    if child_identity is not None and not identity_allows_name(
+                        child_identity, name
                     ):
                         raise InvalidLaunchToolError(
                             "config.enabled_tools",
@@ -344,10 +347,10 @@ def _validate_tools(
                 f"config.tools.{name}", f"Tool '{name}' exceeds parent authority"
             )
         if (
-            personal_posture is not None
+            child_identity is not None
             and patch.permission is not None
             and patch.permission != ToolPermission.NEVER
-            and not posture_allows_name(personal_posture, name)
+            and not identity_allows_name(child_identity, name)
         ):
             raise InvalidLaunchToolError(
                 f"config.tools.{name}",
@@ -365,8 +368,8 @@ def _validate_tools(
             ) from exc
 
 
-def _child_personal_posture(identity: str) -> ToolPosture | None:
-    """The child identity's personal posture selector (None = unrestricted).
+def _child_identity(identity: str) -> AgentIdentity | None:
+    """The child's resolved built-in identity (None = custom, unrestricted).
 
     The admission ceiling and the enforced posture derive from the SAME
     resolved identity binding the launch committed, so they always agree. The
@@ -374,10 +377,11 @@ def _child_personal_posture(identity: str) -> ToolPosture | None:
     (``ToolManager._identity_posture``); admission applies the same
     normalization, so an explicitly qualified selection cannot widen the
     admission ceiling while the runtime enforces the builtin posture (S2
-    round 2: admission builtin: normalization).
+    round 2: admission builtin: normalization). The identity carries the
+    execution carve-out alongside its posture, so admission and the runtime
+    enforce the same ceiling.
     """
-    builtin = get_builtin_identity(identity.removeprefix("builtin:"))
-    return builtin.personal_tools if builtin is not None else None
+    return get_builtin_identity(identity.removeprefix("builtin:"))
 
 
 def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
@@ -394,6 +398,8 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     purpose: str | None = None,
     effective_tier: PackageTier = PackageTier.SUBSTANTIVE,
     replacement_capability: ReplacementCapability = ReplacementCapability.NONE,
+    override_permit: OverridePermit | None = None,
+    override_ledger: CooldownOverrideLedger | None = None,
 ) -> LaunchCandidate:
     """Resolve launch semantics without constructing any child-owned resource.
 
@@ -403,6 +409,13 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     record's committed binding) — admission validates it and the runtime
     enforces it, so the installed selection and the validated binding can
     never disagree (S2 identity disagreement).
+
+    ``override_permit``/``override_ledger`` (C2 typed permits): a permit
+    minted by the root ``CooldownOverrideLedger`` bypasses ONLY the
+    candidate's cooldown predicate at model assignment — the availability
+    check — for deployments serving the permit's canonical endpoint. Every
+    other admission check (compatibility, thinking, history) still applies,
+    and a wrong/expired/released/used permit never bypasses.
     """
     semantic = _merge_semantic_overrides(accumulated_overrides, config)
     explicit_model = config is not None and "model" in config.model_fields_set
@@ -413,10 +426,13 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     # package_tier) is loop-owned claim metadata, not a configuration-layer
     # concern: it rides the LaunchConfig (semantic_overrides) into the loop's
     # launch metadata and the agent record — never into the child's
-    # config-layer build, whose source validation rejects unknown keys.
+    # config-layer build, whose source validation rejects unknown keys. The
+    # demanding route's difficulty category (P1-c2) is the same kind of
+    # admission metadata: it rides the run record and the acknowledgment.
     inputs.pop("work_package_id", None)
     inputs.pop("predecessor_agent_id", None)
     inputs.pop("package_tier", None)
+    inputs.pop("difficulty", None)
     if "model" in inputs:
         inputs["active_model"] = inputs.pop("model")
     if committed_model is not None and not explicit_model:
@@ -444,7 +460,7 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
         )
     # The child identity's personal posture is the second admission ceiling
     # for tool overrides, independent of the parent's delegation set.
-    child_personal_posture = _child_personal_posture(identity)
+    child_identity = _child_identity(identity)
     orchestrator = build_child_orchestrator(
         source, inputs, strip_runtime_thinking=explicit_model
     )
@@ -478,10 +494,20 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     explicit_thinking = "thinking" in semantic.model_fields_set
 
     def assignment_candidate(candidate: Any) -> bool:
-        from chartreux.core.model_catalog.availability import compatibility_exclusion
+        from chartreux.core.model_catalog.availability import (
+            compatibility_exclusion,
+            cooldown_override_bypasses,
+        )
 
-        if not orchestrator.availability_registry.is_available(
-            candidate.base_model, candidate.deployment.provider
+        endpoint_identity = canonical_endpoint_identity(candidate.provider.api_base)
+        cooldown_bypassed = cooldown_override_bypasses(
+            override_permit, override_ledger, endpoint_identity
+        )
+        if (
+            not cooldown_bypassed
+            and not orchestrator.availability_registry.is_available(
+                candidate.base_model, candidate.deployment.provider
+            )
         ):
             return False
         candidate_thinking = (
@@ -538,9 +564,7 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     # The admission ceiling is REQUIRED: it is the parent's delegation set,
     # passed explicitly by every production caller. Defaulting to "all known
     # tools" here would be a latent fail-open (S2 round 2 INFO).
-    _validate_tools(
-        semantic, known_tools, authorized_tool_names, child_personal_posture
-    )
+    _validate_tools(semantic, known_tools, authorized_tool_names, child_identity)
     effective_thinking = _effective_thinking(staged_config, model, thinking, history)
     staged_config.attach_committed_model(resolved_identity)
     return LaunchCandidate(

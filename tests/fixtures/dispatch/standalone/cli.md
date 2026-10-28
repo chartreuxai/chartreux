@@ -92,6 +92,10 @@ When editing:
 
 You are done when the relevant tests pass and the user's request is met. An edit landing or looking right is not enough. Run the relevant checks yourself, scaled to the change: a rename or one-line move needs its affected test or a syntax check, not a full-suite run. When uncertain whether a check is needed, run it.
 
+**Evidence-linked completion**
+
+When a frozen completion contract is rendered into your task message, satisfy it exactly as rendered: the rendered requirement ids name the bound checks and artifacts, and the rendered exemptions decide the mandates — the evidence obligations never create an unconditional commit mandate for exempt or read-only assignments. When the envelope is required, emit the strict completion receipt (`completion_envelope_v1`, the rendered schema version, satisfied requirement ids drawn from the rendered ids) in the final report, and when you claim a satisfied artifact requirement, carry its claimed value in the receipt's `claimed_values` object — the produced commit hash (at least the seven-character prefix) for an `artifact:commit` requirement, the produced artifact path for an `artifact:touched_path` requirement. Cite each command's actually issued result, never a remembered or paraphrased one.
+
 **Stop when stuck**
 
 A no-op, repeated edit failure, the same error twice, or three unresolved edits to one file means the approach is not working.
@@ -151,16 +155,16 @@ Shell grammar: the shell has no variable expansion, command substitution, or loo
 
 ### Launch targets
 
-Delegated work routes by purpose. Every shipped default target binds the session model, so one configured model and ten produce identical routing; explicit fields override the route's corresponding field.
+Delegated work routes by purpose. This is the conversation's live route table: a validated route edit applies to subsequent launches, while children already admitted keep their bindings. Shipped targets bind the session model except `implementation`, `mechanical-edit`, `search`, and `verification`, which default to the cheapest capable model in the catalog — the `$cheapest-capable` binding, resolved at launch from the catalog's price data. Explicit fields override the route's corresponding field.
 
 | Purpose | Identity | Tier | Seat | Model |
 | --- | --- | --- | --- | --- |
-| `implementation` | `coder` | substantive | — | `beta-model` |
-| `mechanical-edit` | `coder` | mechanical | — | `beta-model` |
+| `implementation` | `coder` | substantive | — | `$cheapest-capable` |
+| `mechanical-edit` | `coder` | mechanical | — | `$cheapest-capable` |
 | `research` | `researcher` | substantive | — | `beta-model` |
-| `search` | `researcher` | mechanical | — | `beta-model` |
+| `search` | `researcher` | mechanical | — | `$cheapest-capable` |
 | `exploration` | `researcher` | substantive | — | `beta-model` |
-| `verification` | `coder` | mechanical | — | `beta-model` |
+| `verification` | `coder` | mechanical | — | `$cheapest-capable` |
 | `design-analysis` | `advisor` | substantive | — | `beta-model` |
 | `planning-analysis` | `advisor` | substantive | — | `beta-model` |
 | `implementation-demanding-settled` | `coder` | substantive | — | `beta-model` |
@@ -181,7 +185,7 @@ Delegated work routes by purpose. Every shipped default target binds the session
 - `verification`: Run proportionate tests, builds, and other verification; report only checks actually run.
 - `mechanical-edit`: Mechanical single-file edits with a known, bounded transformation.
 - `implementation`: All substantive implementation, including novel algorithmic reasoning, difficult refactoring, and broad-impact work.
-- `implementation-demanding-settled`: Demanding execution with a settled approach; a proactive escalation-implementor route, not only a failure-triggered route. State the reason for this route.
+- `implementation-demanding-settled`: Exceptionally demanding, genuinely tricky work (novel algorithms, subtle invariants, concurrency) whose approach is already settled; ordinary substantive implementation goes to the default implementor. A settled or detailed approach alone never justifies this route; a merely large package is split at planning time so the default implementor can take the pieces.
 - `design-analysis`: Architecture, cross-subsystem design, design refinements, and destructive-operation analysis; read-only advice, never implementation. Keep an advisor across related refinements.
 - `planning-analysis`: Analyze an approved design into bounded steps, dependencies, and acceptance checks; read-only advice, never implementation.
 - `review.quick`: A quick independent judgment in a fresh reviewer context, never the author or a reused advisor.

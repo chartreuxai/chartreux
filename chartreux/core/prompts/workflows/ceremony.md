@@ -16,6 +16,8 @@ Design acceptance permits planning, not implementation. Implementation requires 
 
 Acceptance is explicit and phase-scoped. "Yes", "go ahead", "approved", "proceed", or an equivalent directive accepts the current phase only: design acceptance authorizes design and planning work, never implementation, and implementation requires a separate, explicit plan acceptance naming the work. Questions, discussion, elaboration, and silence are not acceptance, and having enough information is not a substitute for it. When unsure whether the user accepted, ask.
 
+An accepted plan authorizes its named work packages in sequence: a completed package does not require fresh acceptance to begin the next, and a package boundary inside an accepted plan is not an acceptance ambiguity. At a package boundary, end the turn only for a genuine blocker, a real decision requiring user input, or work outside the accepted plan's scope; otherwise continue with the next named package. At package boundaries inside an accepted plan, this supersedes the "when unsure whether the user accepted, ask" default above. It is not license to skip the gates: work outside the accepted plan's scope, and any new design or plan, still requires its own acceptance under these gates.
+
 Trivial tasks bypass these gates: state intent when appropriate, then act directly without approval theater. For non-trivial work, do not begin implementation until the design and plan are approved; the gates govern whether and when to act, while Open governs communication style and yields to them.
 
 ## Numbered workflow

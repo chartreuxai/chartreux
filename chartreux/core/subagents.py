@@ -3,12 +3,23 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field
 import enum
+from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from chartreux.core.agents.identity_launch import TaskIdentityArgs
+from chartreux.core.completion_contract import (
+    CompletionAuditClassification,
+    claimed_values_from_receipt,
+)
+from chartreux.core.completion_evidence import (
+    MAX_CHRONOLOGY_ENTRIES,
+    ContentSnapshot,
+    PerRunCompletionChronology,
+    snapshot_bytes,
+)
 from chartreux.core.events import (
     AssistantEvent,
     BaseEvent,
@@ -22,7 +33,16 @@ from chartreux.core.recovery_models import (
     RecoveryReference,
 )
 from chartreux.core.recovery_policy import ReplacementDecision
+from chartreux.core.subagent_submission import (
+    UNKNOWN_WRITE_FOOTPRINT,
+    bash_write_paths_from_result_event,
+    blocked_submission_response,
+    touched_path_from_result_event,
+)
+from chartreux.core.tools.secret_scan import incomplete_finding, scan_paths
 from chartreux.core.tools.ui import ToolUIDataAdapter
+from chartreux.observability.logging import logger
+from chartreux.utils.tool_presentation import ToolEffectKind
 
 __all__ = [
     "EffectVerification",
@@ -36,6 +56,9 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from chartreux.core.agent_loop_hooks import CompletionEvidenceReceipt
     from chartreux.core.tools.base import InvokeContext
 
 
@@ -190,6 +213,18 @@ class TaskResult(BaseModel):
         description=(
             "The failure-time replacement policy decision for a claimed "
             "replacement launch; None for unclaimed launches."
+        ),
+    )
+    completion_audit: CompletionAuditClassification | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "The typed, versioned completion-audit stamp attached to a "
+            "completed result; stamped whenever the composition has a "
+            "surface (findings, receipt, check verdicts, or collected "
+            "evidence) and omitted from dumps entirely only when the audit "
+            "composed inertly (no surface — the stamp-mode default's "
+            "behavior preservation)."
         ),
     )
 
@@ -801,6 +836,7 @@ class SubagentManagementPort(Protocol):
         idempotency_key: str,
         *,
         requester_session_id: str,
+        override_cooldown: bool = False,
     ) -> ResumeAgentResult:
         """Explicitly resume a suspended agent (handoff §1.4; WP2).
 
@@ -811,6 +847,11 @@ class SubagentManagementPort(Protocol):
         identity. The old failed result and waits pinned to it stay
         immutable; prior execution/tool tasks are joined before admission.
         NO auto-scheduling: an admitted successor starts immediately.
+        With ``override_cooldown`` the explicit request also mints the
+        endpoint-bound forced-attempt permit from the root ledger (C6b)
+        and binds it to the successor's first model call; the ledger
+        denies the mint when the episode is exhausted, spacing-bound, or
+        has an attempt in flight, and a denied mint consumes nothing.
         """
         ...
 
@@ -841,10 +882,141 @@ class SubagentRunnerPort(Protocol):
     ) -> AsyncGenerator[ToolStreamEvent | TaskResult, None]: ...
 
 
+#: Mutation-roots sentinel recorded when a shell command's mutation-roots
+#: footprint could not be established (a checkout/switch whose work-tree root
+#: is unresolvable). Mutation-scope accounting only: it never enters the
+#: submission scan's path list.
+UNKNOWN_MUTATION_ROOT_FOOTPRINT = (
+    "<shell command with an unestablished mutation-scope root>"
+)
+
+
+#: Read cap for one artifact's collection-time content snapshot — mirrors
+#: the secret scan's per-file cap; an over-cap artifact records no witness
+#: (it is already scan-incomplete at the submission gate).
+_ARTIFACT_SNAPSHOT_READ_CAP_BYTES = 4 * 1024 * 1024
+
+
+def _capture_artifact_snapshot(path: str) -> ContentSnapshot | None:
+    """The bounded collection-time content snapshot of one artifact.
+
+    Reads the artifact as the run's collection observed it — the tool just
+    wrote it. A missing, unreadable, or over-cap artifact records no
+    witness: an availability fact, never a fabricated one.
+    """
+    try:
+        artifact = Path(path)
+        if (
+            not artifact.is_file()
+            or artifact.stat().st_size > _ARTIFACT_SNAPSHOT_READ_CAP_BYTES
+        ):
+            return None
+        return snapshot_bytes(artifact.read_bytes())
+    except OSError:
+        return None
+
+
+def mutation_roots_from_result_event(event: ToolResultEvent) -> tuple[list[str], bool]:
+    """The mutation-roots footprint a shell result reports, and its unknown flag.
+
+    The bash tool surfaces the resolved work-tree roots of its command's
+    checkout/switch invocations alongside its write paths, and bash_start
+    surfaces the started command's the same way; a failed, timed-out, or
+    cancelled run's footprint rides the error event's fields, copied there by
+    the tool executor. The footprint is mutation-scope accounting only — the
+    caller keeps it OUT of the submission scan's path list (a work-tree root
+    would scan the whole repository and burn the scan's budget). Skipped
+    calls never ran. Returns ``(roots, unknown)``; a result carrying the
+    footprint fields without well-formed values reads as unknown, never as
+    an established empty one, and a result of a tool whose model carries no
+    footprint attributes at all reads as an established empty one.
+    """
+    if event.skipped or event.tool_class is None:
+        return [], False
+    result = event.result
+    if result is not None:
+        missing = object()
+        roots = getattr(result, "mutation_roots", missing)
+        unknown = bool(getattr(result, "mutation_roots_unknown", False))
+        shell = getattr(event.tool_class, "effect_kind", None) is ToolEffectKind.SHELL
+        if roots is missing and not shell:
+            return [], False
+        if not isinstance(roots, (list, tuple)):
+            return [], True
+    else:
+        roots = getattr(event, "error_mutation_roots", None)
+        unknown = bool(getattr(event, "error_mutation_roots_unknown", False))
+    if not isinstance(roots, (list, tuple)):
+        return [], unknown
+    return [root for root in roots if isinstance(root, str) and root], unknown
+
+
 @dataclass(slots=True)
 class SubagentRunAccumulator:
     _response: list[str] = field(default_factory=list)
     _completed: bool = True
+    # P2-i: the session's touched paths — repo paths created or edited
+    # through the file tools, plus the write-classified paths shell
+    # commands produced — collected from observed tool results and scanned
+    # at the submission boundary (build_result). Insertion-ordered.
+    _touched_paths: dict[str, None] = field(default_factory=dict)
+    # A1: the session's mutation-roots footprint — the resolved work-tree
+    # roots of the shell commands' checkout/switch invocations, collected
+    # from observed tool results alongside the touched paths. A
+    # mutation-scope footprint ONLY: it is never scanned at the submission
+    # boundary (a work-tree root would scan the whole repository and burn
+    # the scan's budget); the completion audit consumes it.
+    _mutation_roots: dict[str, None] = field(default_factory=dict)
+    # P3: the bounded per-run completion-evidence chronology — receipts
+    # pair with their originating invocations via the harness-minted,
+    # run-scoped receipt occurrence ID (never tool_call_id alone).
+    _chronology: PerRunCompletionChronology = field(
+        default_factory=PerRunCompletionChronology
+    )
+    # P3 (round 5): the collected artifacts' bounded content snapshots —
+    # the path-keyed collection-time mutation witnesses the completion
+    # audit consumes (the artifact audit reads them by path; the receipt
+    # audit reads the invocation-level witness off the chronology entry).
+    # Bounded like the chronology: the oldest snapshot evicts first, and
+    # an evicted path's witness is an availability fact, never a
+    # contradiction.
+    _artifact_snapshots: dict[str, ContentSnapshot] = field(default_factory=dict)
+    # P6a's run-keyed finalization cache, declared by P3 (round 6) and
+    # INERT until P6a consumes it for finalization idempotency.
+    _finalization_cache: dict[str, Any] = field(default_factory=dict)
+
+    def completion_evidence_sink(self) -> Callable[[CompletionEvidenceReceipt], None]:
+        """The P2 side-channel sink: registers receipts against invocations."""
+        return self._chronology.observe_receipt
+
+    def _collect_artifact_snapshots(
+        self, event: ToolResultEvent, artifact_paths: Sequence[str]
+    ) -> None:
+        """Capture each collected artifact's collection-time snapshot (P3).
+
+        The bounded content snapshot (hash + byte size + sampled head/tail)
+        is the mutation witness the completion audit consumes: kept per
+        artifact path for the artifact audit, and stored on the
+        invocation's chronology entry for the receipt audit. Capture
+        happens at collection, never at finalization; a missing,
+        unreadable, or over-cap artifact records no witness — an
+        availability fact, never a fabricated one.
+        """
+        witness: ContentSnapshot | None = None
+        for path in artifact_paths:
+            snapshot = _capture_artifact_snapshot(path)
+            if snapshot is None:
+                continue
+            self._artifact_snapshots[path] = snapshot
+            while len(self._artifact_snapshots) > MAX_CHRONOLOGY_ENTRIES:
+                self._artifact_snapshots.pop(next(iter(self._artifact_snapshots)))
+            if witness is None:
+                witness = snapshot
+        if event.occurrence_id:
+            # The result event registers against its harness-minted,
+            # run-scoped occurrence ID — never reminted, never keyed by
+            # tool_call_id alone.
+            self._chronology.observe_result_event(event, snapshot=witness)
 
     def observe(self, event: BaseEvent, *, tool_call_id: str) -> ToolStreamEvent | None:
         if isinstance(event, AssistantEvent):
@@ -858,8 +1030,39 @@ class SubagentRunAccumulator:
         if event.skipped:
             self._completed = False
             return None
+        # P2-i R6/R7: bash-written artifacts join the same scan — collected
+        # from a successful result, and from a failed or timed-out run's
+        # error event (partial execution still wrote files); an
+        # unestablished write surface records the unknown-footprint sentinel.
+        # Collected before the result-less early return so error events
+        # contribute their footprint.
+        write_paths, write_unknown = bash_write_paths_from_result_event(event)
+        for path in write_paths:
+            self._touched_paths[path] = None
+        if write_unknown:
+            self._touched_paths[UNKNOWN_WRITE_FOOTPRINT] = None
+        # A1: the mutation-roots footprint is collected alongside — into its
+        # own mutation-scope accounting, never into _touched_paths.
+        mutation_roots, mutation_unknown = mutation_roots_from_result_event(event)
+        for root in mutation_roots:
+            self._mutation_roots[root] = None
+        if mutation_unknown:
+            self._mutation_roots[UNKNOWN_MUTATION_ROOT_FOOTPRINT] = None
+        # P3 (round 5): the collected artifacts' bounded content snapshots,
+        # captured HERE at collection — the mutation witnesses the
+        # completion audit consumes (never captured at finalization) — and
+        # the result event's registration against its harness-minted,
+        # run-scoped occurrence ID (the pairing the receipt side of the
+        # chronology completes).
+        touched_path = touched_path_from_result_event(event)
+        artifact_paths = list(write_paths)
+        if touched_path is not None:
+            artifact_paths.append(touched_path)
+        self._collect_artifact_snapshots(event, artifact_paths)
         if event.result is None or event.tool_class is None:
             return None
+        if touched_path is not None:
+            self._touched_paths[touched_path] = None
         if event.presentation is not None:
             display = event.presentation.display
         else:
@@ -870,18 +1073,140 @@ class SubagentRunAccumulator:
             tool_call_id=tool_call_id,
         )
 
+    @property
+    def mutation_roots(self) -> list[str]:
+        """The collected mutation-roots footprint, in collection order.
+
+        The mutation-scope footprint the completion audit's touched-path
+        comparisons consume; the submission scan never sees it.
+        """
+        return list(self._mutation_roots)
+
     def record_error(self, message: str) -> None:
         self._completed = False
         self._response.append(f"\n[Subagent error: {message}]")
 
-    def build_result(self, *, turns_used: int, completed: bool = True) -> TaskResult:
+    def build_result(
+        self,
+        *,
+        turns_used: int,
+        completed: bool = True,
+        run_id: str | None = None,
+        contract: Any = None,
+        claim: Any = None,
+        runner: Any = None,
+        mode: Literal["stamp", "enforce"] | None = None,
+    ) -> TaskResult:
         completed = self._completed and completed
+        # P10: the completion-audit composition, before the submission
+        # gate. The composition module is imported here, at the call:
+        # subagents.py sits above it in the import graph (the composition's
+        # artifact audit imports this module's mutation-roots sentinel), so
+        # a module-level import would close a cycle.
+        from chartreux.core.completion_audit import compose_completion_audit
+
+        # The composition's two inert-input surfaces ride the existing
+        # parameters: the parent-shared roots are frozen on the contract at
+        # admission (the session scratchpad the parent and the child both
+        # write — a failed finalization check observing final state under
+        # one composes UNVERIFIED, never CONTRADICTED), and the claim's
+        # bounded claimed-value surface (claimed commit hashes, claimed
+        # artifact paths) reaches the artifact audit through the receipt.
+        contract_shared_roots = getattr(contract, "shared_roots", ())
+        if isinstance(contract_shared_roots, (list, tuple)):
+            shared_roots = tuple(
+                root for root in contract_shared_roots if isinstance(root, str) and root
+            )
+        else:
+            shared_roots = ()
+        # The composition reads the once-only finalization (P6a) from the
+        # run-keyed cache and runs no checks; in stamp mode the composed
+        # classification rides on the result, in enforce mode a
+        # worker-side disposition blocks the submission (completed=False,
+        # bounded actionable rejection message).
+        composition = compose_completion_audit(
+            accumulator=self,
+            contract=contract,
+            claim=claim,
+            finalization=(self._finalization_cache.get(run_id) if run_id else None),
+            claimed_values=claimed_values_from_receipt(claim),
+            shared_roots=shared_roots,
+            declared_completed=completed,
+            runner=runner,
+            mode=mode or getattr(contract, "audit_mode", None) or "stamp",
+        )
+        audit = composition.classification
+        blocked_message = composition.rejection_message()
+        # P1 dump-shape rule: an inert composition stamps nothing — the
+        # result's completion_audit stays None (the old dump shape,
+        # unchanged for runs composed without an audit surface).
+        stamped_audit = audit if composition.has_surface else None
+        # P2-i submission boundary: the scan runs when the session reports
+        # its work complete, before the result is surfaced as final. Both
+        # the foreground and the background publication paths assemble
+        # their result here, so neither can bypass the gate. A finding
+        # blocks the submission: the result carries the redacted block
+        # message instead of the agent's response, and never surfaces as
+        # final (completed=False).
+        # A1: the scan scopes EXACTLY _touched_paths — the mutation-roots
+        # footprint never joins it (a work-tree root would scan the whole
+        # repository and burn the bounded walk's budget, blocking
+        # publication); the completion audit consumes _mutation_roots.
+        findings = scan_paths(self._touched_paths)
+        if UNKNOWN_WRITE_FOOTPRINT in self._touched_paths:
+            # Fail-closed: a shell command whose write surface could not be
+            # established leaves an unscannable footprint — scan_paths skips
+            # the missing sentinel path itself, so the gate adds the
+            # scan-incomplete finding explicitly.
+            findings.append(
+                incomplete_finding(
+                    UNKNOWN_WRITE_FOOTPRINT,
+                    "the write surface of a shell command could not be established",
+                )
+            )
+        if findings:
+            # Secret-scan precedence: the scan's redacted block message
+            # wins over any audit rejection — the scan's findings never
+            # leak into another surface.
+            logger.warning(
+                "Subagent submission blocked by the secret scan: %d finding(s) "
+                "over %d touched path(s), rules=%s",
+                len(findings),
+                len(self._touched_paths),
+                ",".join(sorted({finding.rule_id for finding in findings})),
+            )
+            return TaskResult(
+                response=blocked_submission_response(findings),
+                turns_used=turns_used,
+                completed=False,
+                completion_audit=stamped_audit,
+            )
+        if blocked_message is not None:
+            # P10 enforce mode: a worker-side disposition blocks the
+            # submission — the bounded, actionable rejection message
+            # replaces the response and the result never surfaces as
+            # final (completed=False).
+            logger.warning(
+                "Subagent submission blocked by the completion audit: %s",
+                blocked_message,
+            )
+            return TaskResult(
+                response=blocked_message,
+                turns_used=turns_used,
+                completed=False,
+                completion_audit=stamped_audit,
+            )
         response = "".join(self._response)
         if completed and not response.strip():
             raise EmptySubagentResponseError(
                 "Completed subagent produced an empty response"
             )
-        return TaskResult(response=response, turns_used=turns_used, completed=completed)
+        return TaskResult(
+            response=response,
+            turns_used=turns_used,
+            completed=completed,
+            completion_audit=stamped_audit,
+        )
 
 
 # The worker disclosure requirement rides in every task brief, with or without

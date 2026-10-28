@@ -58,6 +58,7 @@ from chartreux.core.config.types import (
 )
 from chartreux.core.model_catalog.availability import AvailabilityRegistry
 from chartreux.core.model_catalog.loader import CatalogSnapshot, load_catalog
+from chartreux.core.recovery_override import CooldownOverrideLedger
 from chartreux.core.utils.concurrency import run_sync
 
 
@@ -129,6 +130,7 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
         bus: EventBus | None = None,
         catalog_loader: Callable[[], CatalogSnapshot] | None = None,
         availability_registry: AvailabilityRegistry | None = None,
+        cooldown_override_ledger: CooldownOverrideLedger | None = None,
     ) -> None:
         self._builder = builder
         self._snapshot = candidate
@@ -144,6 +146,11 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
             if availability_registry is not None
             else _availability_registry_from_config(candidate.config)
         )
+        self._cooldown_override_ledger = (
+            cooldown_override_ledger
+            if cooldown_override_ledger is not None
+            else CooldownOverrideLedger()
+        )
         self._mutation_lock = asyncio.Lock()
         self._accepted_token = uuid4()
         self._can_persist = True
@@ -152,6 +159,11 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
     def availability_registry(self) -> AvailabilityRegistry:
         """Root-owned deployment availability state shared by all copies."""
         return self._availability_registry
+
+    @property
+    def cooldown_override_ledger(self) -> CooldownOverrideLedger:
+        """Root-owned forced-override accounting shared by all copies."""
+        return self._cooldown_override_ledger
 
     @property
     def accepted_token(self) -> object:
@@ -359,6 +371,7 @@ class ConfigOrchestrator[S: ConfigSchema]:  # noqa: PLR0904
             bus=None,
             catalog_loader=self._catalog_loader,
             availability_registry=self._availability_registry,
+            cooldown_override_ledger=self._cooldown_override_ledger,
         )
         copied._can_persist = self._can_persist
         return copied

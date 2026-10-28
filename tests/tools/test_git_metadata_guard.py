@@ -368,6 +368,194 @@ def test_gitfile_layout_metadata_writes_are_denied(
     assert_denied(gitfile_tool, command)
 
 
+# --- Nested bare-repository metadata (deep-review round 3) ---
+#
+# A bare repository carries its Git metadata directly in its directory (a
+# HEAD file plus objects/ and refs/ — git's own heuristic), so the operand
+# guard gates mutating operands that reach inside it exactly like .git
+# operands: discovery probes the operand's own resolved ancestry, so a bare
+# repository reached through a symlinked directory component is found too,
+# and a marker entry that is itself a symlink resolves the way git resolves
+# it. Reads of bare metadata stay governed by the workspace authority alone.
+
+
+@pytest.fixture
+def bare_nested_repo(tmp_path: Path) -> Path:
+    """A git-clean repository ignoring a nested bare repository.
+
+    The bare repository holds one loose object and has no remote, so its
+    commits are unpushed; a symlink names it through a symlinked directory
+    component. Both stay ignored, keeping the assessed tree clean for the
+    recursive-rm controls.
+    """
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "guard@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Guard"], check=True
+    )
+    (tmp_path / "seed.txt").write_text("seed\n")
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "artifact.txt").write_text("artifact\n")
+    (tmp_path / ".gitignore").write_text("backup.git/\nlink\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-q", "-m", "init"], check=True
+    )
+    bare = tmp_path / "backup.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    hashed = subprocess.run(
+        ["git", "--git-dir", str(bare), "hash-object", "-w", "--stdin"],
+        input="secret commit content\n",
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    oid = hashed.stdout.strip()
+    assert (bare / "objects" / oid[:2] / oid[2:]).is_file()
+    (tmp_path / "link").symlink_to(bare, target_is_directory=True)
+    return tmp_path
+
+
+@pytest.fixture
+def bare_nested_tool(bare_nested_repo: Path) -> Bash:
+    config = BashToolConfig(denylist=["bash -i"], denylist_standalone=["python"])
+    return Bash(
+        config_getter=lambda: config, state=BaseToolState(), cwd=bare_nested_repo
+    )
+
+
+@pytest.fixture
+def bare_loose_object(bare_nested_repo: Path) -> str:
+    """The loose object's repository-relative path inside backup.git."""
+    objects = bare_nested_repo / "backup.git" / "objects"
+    shards = [entry for entry in objects.iterdir() if len(entry.name) == 2]
+    assert len(shards) == 1
+    (loose,) = [entry for entry in shards[0].iterdir() if entry.is_file()]
+    return f"backup.git/objects/{shards[0].name}/{loose.name}"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Mutating operands reaching inside the nested bare metadata.
+        "cp backup.git/config copy.txt",
+        "cp backup.git/HEAD copy.txt",
+        "cp backup.git/objects/{object_tail} copy.txt",
+        "cp -r backup.git backup-copy",
+        "mv backup.git/config moved-config",
+        "rm backup.git/config",
+        "rm backup.git/objects/{object_tail}",
+        "sed -i s/x/y/ backup.git/config",
+        "tee backup.git/config",
+        "mkdir backup.git/hooks2",
+        "ln backup.git/config hardlink",
+        "install seed.txt backup.git/hooks/pre-push",
+        "echo x > backup.git/config",
+        "echo x >> backup.git/config",
+        # The same writes through a symlinked directory component.
+        "cp link/config copy.txt",
+        "cp link/objects/{object_tail} copy.txt",
+        "cp -r link link-copy",
+        "rm link/config",
+        "mv link/HEAD moved-head",
+        "echo x > link/config",
+        # Absolute spellings of the same writes.
+        "cp {repo}/backup.git/config copy.txt",
+        "rm {repo}/backup.git/config",
+        "echo x > {repo}/backup.git/config",
+    ],
+)
+def test_nested_bare_repository_metadata_writes_are_denied(
+    bare_nested_tool: Bash, bare_nested_repo: Path, bare_loose_object: str, command: str
+) -> None:
+    object_tail = bare_loose_object.partition("backup.git/objects/")[2]
+    assert_denied(
+        bare_nested_tool, command.format(repo=bare_nested_repo, object_tail=object_tail)
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Reads of bare metadata stay governed by the workspace authority.
+        "cat backup.git/config",
+        "cat backup.git/HEAD",
+        "cat link/config",
+        "ls backup.git",
+        # Ordinary mutating operands stay permitted.
+        "cp seed.txt copy.txt",
+        "cp -r build build-copy",
+        "mv seed.txt moved.txt",
+        "rm seed.txt",
+        "sed -i s/x/y/ seed.txt",
+        "echo x > out.txt",
+        # git's own selectors locate the bare repository; they stay
+        # governed by the classifier, not the operand guard.
+        "git --git-dir=backup.git log",
+        "git -C backup.git log",
+    ],
+)
+def test_nested_bare_repository_benign_forms_stay_permitted(
+    bare_nested_tool: Bash, command: str
+) -> None:
+    assert_permitted(bare_nested_tool, command)
+
+
+def test_marker_symlinked_bare_repository_is_discovered(bare_nested_repo: Path) -> None:
+    # A bare repository whose marker entries are themselves symlinks is
+    # still a repository — git resolves the markers — so discovery follows
+    # them and the operand guard gates its metadata too.
+    sym = bare_nested_repo / "sym.git"
+    real = bare_nested_repo / "real-gitdir"
+    sym.mkdir()
+    real.mkdir()
+    subprocess.run(["git", "init", "-q", "--bare", str(real)], check=True)
+    (sym / "HEAD").symlink_to(real / "HEAD")
+    (sym / "objects").symlink_to(real / "objects", target_is_directory=True)
+    (sym / "refs").symlink_to(real / "refs", target_is_directory=True)
+    (sym / "config").write_text("[core]\n\tbare = true\n")
+    config = BashToolConfig(denylist=["bash -i"], denylist_standalone=["python"])
+    tool = Bash(
+        config_getter=lambda: config, state=BaseToolState(), cwd=bare_nested_repo
+    )
+    assert_denied(tool, "cp sym.git/config copy.txt")
+    assert_denied(tool, "rm sym.git/config")
+    assert_denied(tool, "echo x > sym.git/config")
+    assert_permitted(tool, "cat sym.git/config")
+
+
+def test_recursive_rm_encompassing_nested_bare_repository_resolves_handoff(
+    bare_nested_tool: Bash,
+) -> None:
+    # The R7 gate is unchanged: the bare repository's commits are unpushed
+    # and no remote holds a copy, so an operand encompassing its metadata
+    # resolves handoff (the shipped recursive-rm denial).
+    for command in ("rm -rf backup.git", "rm -r backup.git"):
+        context = bare_nested_tool.resolve_permission(BashArgs(command=command))
+        assert context is not None, command
+        assert context.permission is ToolPermission.NEVER, command
+        assert "recursive rm" in (context.reason or ""), command
+
+
+def test_recursive_rm_inside_nested_bare_metadata_is_denied(
+    bare_nested_tool: Bash,
+) -> None:
+    # An operand reaching INSIDE the bare metadata is gated by the operand
+    # guard itself, exactly like a .git-interior operand.
+    assert_denied(bare_nested_tool, "rm -rf backup.git/objects")
+
+
+def test_recursive_rm_clean_operand_stays_run_class_with_nested_bare(
+    bare_nested_tool: Bash,
+) -> None:
+    # The nested bare repository does not disturb the R7 run-class path: a
+    # clean tree's metadata-excluding operand still resolves run-class.
+    assert_permitted(bare_nested_tool, "rm -rf build")
+
+
 # --- Fail closed ---
 
 

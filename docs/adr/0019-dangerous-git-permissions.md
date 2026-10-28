@@ -32,9 +32,10 @@ consequence summary, and a persistable flag:
 - Consequential: `git.push.force`, `git.push.delete`, `git.push.mirror`,
   `git.checkout`, `git.restore`, `git.switch.discard`, `git.stash.drop`,
   `git.stash.clear`, `git.reflog.expire`, `git.reflog.delete` (never persistable).
-- Hard guards have no operation ID and no grant path: recursive `rm`,
-  `git reset --hard`, forced non-dry-run `git clean`, and unmodeled or ambiguous
-  forms. Every writer of the push-effecting surface is a hard guard too: an
+- Hard guards have no operation ID and no grant path: recursive `rm` (resolving
+  run-class under the git-status-aware clean-tree carve-out where it
+  establishes it), `git reset --hard`, forced non-dry-run `git clean`, and
+  unmodeled or ambiguous forms. Every writer of the push-effecting surface is a hard guard too: an
   explicit path or URL push destination, a `git remote` mutation (`add`,
   `set-url`, `rename`, `remove`), and any `git config` write to
   `remote.<name>.url`, `remote.<name>.pushurl`, `remote.<name>.receivepack`,
@@ -86,9 +87,77 @@ identity); on recheck failure nothing executes and unused once authority is
 destroyed. Noninteractive sessions deny promptly with remediation. Child approval
 never lifts a missing parent dangerous-command authority (`parent_ceiling`).
 
+### State-aware clean-tree checkout exemption
+
+The `git.checkout` operation keeps its consequential classification and its
+approval flow, but the permission resolver grants a narrow, state-aware
+exemption from that flow without user approval. Exempt shapes only:
+`git checkout <branch>` where the target is an existing LOCAL branch, and
+`git checkout -b <new> [<start>]` for branch creation — no pathspec, no
+`--`, no `-f`/`--force`/`--discard-changes`/`--merge`/`--orphan`/
+`--conflict`/`--pathspec-from-file`/`--recurse-submodules`, no `-B`, and no
+other option. The exemption applies only when the ENTIRE composed shell call
+is exactly one eligible git invocation: no preceding or chained commands, no
+pipeline segments, no environment assignments, no wrapper commands, and no
+inline configuration options (any `git -c <key>=<value>` form is ineligible —
+it can alter the actual invocation's behavior, `core.hooksPath` included).
+Display-only global options (`--no-pager` and equivalents) do not break
+eligibility; repository relocation (`-C`/`--git-dir`/`--work-tree`) fails
+closed. Every ineligible shape falls back to the existing approval class.
+
+The exemption holds only when every candidate repository scope passes the
+state guardrails, each fail-closed on any unestablishable state: a fully
+clean work tree (no unstaged, staged, or untracked changes), no in-progress
+operation marker (merge, rebase, cherry-pick, revert), and no repository
+configuration that selects a program the invocation could run
+(`core.hooksPath` and the other program-selection keys). The plain branch
+form additionally requires the target to exist as a local branch (a
+sanitized rev-parse probe), so a pathspec fallback, a tag, a
+remote-tracking name, or a commit-ish never rides the exemption.
+
+The bash tool executes a command STRING, and the execution path has no
+access to the permission decision, so the executed string of every exempt
+checkout is rewritten at execution time — the exemption predicate is
+re-derived through the same whole-call eligibility check — by inserting
+`--no-overwrite-ignore` immediately after the `checkout` subcommand token,
+by source span, leaving every other byte of the command untouched; the
+original string stays original for display and result surfaces. The flag
+makes an ignored-file collision fail closed (checkout refuses) instead of
+silently clobbering local content; it is the execution-time protection for
+the adjudicated race between the permission-time state probe and execution
+(a concurrent actor can change the tree after the probe: conflicting
+concurrent changes cause a refusal, non-conflicting ones may survive a
+successful non-forcing checkout — the invariant is preservation of
+concurrent user changes, never a destructive outcome).
+
+Classifier divergence, deliberate and pinned: the pure classifier
+(`classify_dangerous_git_command`) is unchanged — `git checkout` keeps its
+classification and the git_pure corpus bytes stay frozen — while the
+resolver's state-aware layer grants the exemption; the divergence is
+pinned by the shell-policy corpus, which observes resolver permission
+under a discriminator without changing old record shapes.
+The approval classes are preserved: a non-exempt checkout still
+demands the consequential approval flow (Deny default; Allow once /
+Allow this session; never Always), and the exemption never bypasses the
+denylist veto, parent ceilings, or any other recheck.
+
+Sanctioned delegated switch shapes (amended branch-ownership rule): the
+two exempt shapes above are the sanctioned delegated switch operations
+available to any bash-capable seat. Branch MERGING, switches to
+remote-tracking branches, and operations on branches other than the
+current working branch remain USER-OWNED.
+
+Deferred alternatives, documented as non-goals: exempting
+conflict-resolution reads (`checkout --ours`/`--theirs`; the sanctioned
+paths are `git show :2:<path>`/`git show :3:<path>` and `git merge -X`
+strategy options), a published-HEAD gate in the resolver (a branch's
+publication status is a prompt/policy contract, not a resolver gate),
+and any `git update-ref` relaxation (update-ref stays a hard guard).
+
 ### Protected persistence and absolute veto
 
-Only `git.push` may persist, through the protected user-layer
+Only the publication operations may persist — `git.push` and
+`network.egress` — through the protected user-layer
 `dangerous_command_grants_by_project` map (project key to operation IDs). The
 field is accepted only from an installed user source; programmatic and generic
 config writes to it are rejected, and saves use dedicated revision-checked
@@ -116,6 +185,19 @@ git-metadata containment, reusing `git_metadata_paths` (gitfile pointers,
 `--git-dir`/`--work-tree` overrides, and `commondir` are all resolved without
 invoking git). The literal `.git` path component is denied on its own, so
 containment also holds for spellings that never name the metadata directory.
+A nested BARE repository's metadata is gated the same way: a bare repository
+carries its Git metadata directly in its directory (git's own heuristic — a
+`HEAD` file plus `objects/` and `refs/`), so the operand guard also probes
+each write/mutate-classified operand's own resolved ancestry for those
+markers (`path_reaches_bare_repository`). An operand that is or reaches
+inside a nested bare repository — through a symlinked directory component,
+or a marker entry that is itself a symlink, both resolved exactly as the
+operand's own resolution resolves them — denies like a `.git` operand, and a
+redirection into it denies like a `.git` redirect. Reads of bare metadata
+(`cat backup.git/config`) stay governed by the workspace authority alone,
+and the recursive-`rm` analysis is unchanged: an operand encompassing a
+nested bare repository still resolves through its recovery gate, while an
+operand reaching inside its metadata is denied by this operand guard.
 
 `git` itself is governed in two distinct ways. Its `-C`/`--git-dir`/`--work-tree`
 SELECTORS still locate the repository rather than write it: they are classified
@@ -280,9 +362,15 @@ This is a documented breaking change: configurations that cleared the denylist
 to let the agent push now need an approval flow or a saved project grant, and
 configurations relying on shipped git entries no longer get denylist enforcement
 for them (they get the stricter approval flow instead). Hard guards are
-unchanged: `git reset --hard`, forced non-dry-run `git clean`, and recursive `rm`
-remain denied with no approval path. An approval is permission authority, not
-standing intent to publish; prompts and documentation say so.
+unchanged for `git reset --hard` and forced non-dry-run `git clean`: both remain
+denied with no approval path. Recursive `rm` is no longer a flat hard guard:
+over a git-clean tree it resolves run-class under the git-status-aware clean-tree
+carve-out — every operand inside the assessed repository, no Git metadata
+overlap, recovery established for every repository the operand touches — and
+every unestablishable aspect fail-closes back to the hard-guard denial (see the
+Recursive rm analysis section of the tools-safety guide). An approval is
+permission authority, not standing intent to publish; prompts and documentation
+say so.
 
 ## Security invariants
 
@@ -380,11 +468,17 @@ standing intent to publish; prompts and documentation say so.
     `yq -i` (in-place mutator), `cabextract -d` (extraction destination).
     These are not installed in the probe environment, so they are
     policy-surface residuals, not runtime-confirmed chains.
-  - `curl`/`wget` `-o`/`-O` are unmodeled write operands with full config
-    content control (probe-verified raw), but the shipped default denylist
-    denies `curl`/`wget` outright — a single removable protection, unlike
-    `strip`/`zip`/`bzip2` which had none. They are DENYLIST-PROTECTED, not
-    operand-guard-protected: removing the denylist entry re-opens the write.
+  - `curl`/`wget` left the denylist and joined the modeled surface, so the
+    earlier denylist-protection framing no longer applies: they are
+    destination-aware network clients (non-loopback egress resolves ask-class,
+    `network.egress`), and their `-o`/`--output` (curl) and
+    `-O`/`--output-document` (wget) operands are modeled write operands —
+    collected, path-inspected, and metadata-guarded like every other write
+    operand, with the derivable default downloads (`curl -O`, a plain
+    `wget <url>` writing the URL's file part under `--output-dir`/`-P`)
+    collected too. The shipped default denylist no longer names them: the
+    operand guard and the egress rule protect these writes, not a removable
+    denylist entry.
   - `toybox` (busybox's multi-call twin) is now handled by the busybox-style
     applet admission (shell applets `sh`/`ash` are analyzed as shell sources;
     every other applet fails closed with "unsupported toybox applet"), which

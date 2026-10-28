@@ -35,6 +35,7 @@ from chartreux.core.config._defaults import (
 # lives in chartreux.config_values.
 from chartreux.core.config.models import (
     AgentSelectionConfig,
+    CompletionSectionConfig,
     MCPServer,
     MissingAPIKeyError,
     ModelConfig,
@@ -452,6 +453,13 @@ class ChartreuxConfigSchema(ConfigSchema):
     # user_questions.unattended_timeout_enabled = false to disable it.
     user_questions: Annotated[UserQuestionsConfig, WithDeepMerge()] = Field(
         default_factory=UserQuestionsConfig
+    )
+
+    # P1: the [completion] section takes effect ONLY by this registration —
+    # the root schema stays frozen (never extra="forbid"), so unknown
+    # top-level sections stay ignored.
+    completion: Annotated[CompletionSectionConfig, WithDeepMerge()] = Field(
+        default_factory=CompletionSectionConfig
     )
 
     def _resolve_main_model(self) -> ResolvedModel:

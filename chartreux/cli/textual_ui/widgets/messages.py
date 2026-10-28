@@ -40,6 +40,8 @@ from textual.widgets import Button, Link, Static
 from chartreux.cli.textual_ui.widgets.collapsible import (
     ClickWithoutDragMixin,
     DisclosureHeader,
+    OverflowCollapsibleSection,
+    lines_label,
 )
 from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
 from chartreux.cli.textual_ui.widgets.message_header import MessageHeader
@@ -51,6 +53,25 @@ from chartreux.ui.widgets.no_markup_static import NoMarkupStatic, NonSelectableS
 
 # Full-content MarkdownStream reparsing per delta dominated CPU; 50ms frames cut it ~40%.
 STREAM_WRITE_FRAME_SECONDS = 0.05
+
+# A fatal provider error can carry a multi-kilobyte single-line excerpt that
+# fold-wraps into dozens of rows and obscures the transcript. Errors estimated
+# taller than this render as a one-line summary plus an "+N lines" disclosure;
+# the expanded body is capped at the same height (keep in sync with the
+# `.error-overflow-body` max-height in app.tcss).
+_ERROR_MAX_ROWS = 12
+_ERROR_ESTIMATE_WIDTH = 80
+
+
+def _estimated_row_count(text: str, width: int = _ERROR_ESTIMATE_WIDTH) -> int:
+    """Upper-bound the wrapped row count at a typical transcript width.
+
+    The fold-wrap of one unbreakable token is what blows up the layout, so
+    estimating per logical line (never trusting newlines alone) is enough to
+    tell a short error from an oversized payload; the disclosure body's
+    max-height is the hard cap either way.
+    """
+    return sum(max(1, -(-len(line) // width)) for line in text.split("\n"))
 
 
 class ExpandingBorder(NonSelectableStatic):
@@ -386,6 +407,19 @@ class StreamingMessageBase(Static):
         await self._stream.stop()
         self._stream = None
 
+    def _on_unmount(self) -> None:
+        # A widget's MarkdownStream._run task pends forever until stop() and pins
+        # the whole widget tree; unmount is the one hook every removal path
+        # routes through (Textual dispatches it from the pump's message-loop exit).
+        # Cancel without awaiting: stop() is async and the Widget._on_unmount
+        # signature it overrides is sync — the cancelled task ends on its own.
+        self._cancel_write_timer()
+        self._to_write_buffer = ""
+        if self._stream is not None:
+            stream, self._stream = self._stream, None
+            if stream._task is not None:
+                stream._task.cancel()
+
     def _should_write_content(self) -> bool:
         return True
 
@@ -637,6 +671,7 @@ class ErrorMessage(Static):
         self._retryable = retryable
         self._retry_activated = False
         self._content_widget: Static | None = None
+        self._overflow_section: OverflowCollapsibleSection | None = None
         self._retry_button: Button | None = None
 
     def compose(self) -> ComposeResult:
@@ -649,22 +684,63 @@ class ErrorMessage(Static):
                 else Content(clean_output(self._error))
             )
             text = Content("Error: ") + error if self._show_border else error
-            self._content_widget = NoMarkupStatic(text, classes="error-content")
-            if self._retryable:
-                # R1: the keyboard-accessible "Retry — new turn" affordance.
-                # A Button is focusable and activates with Enter/Space; the
-                # warning text above it (kept by the turn supervisor's hint)
-                # states that completed actions may repeat.
-                with Vertical(classes="error-body"):
+            plain = text.plain
+            if _estimated_row_count(plain) > _ERROR_MAX_ROWS:
+                # Oversized payload: keep a one-line summary plus the house
+                # "+N lines" disclosure. Even when the caller asks for an
+                # expanded start (collapsed=False), the body is capped by the
+                # `.error-overflow-body` max-height, so the error can never
+                # reclaim the viewport.
+                head, _, _ = plain.partition("\n")
+                body = plain
+                self._content_widget = NoMarkupStatic(
+                    head, classes="error-content error-head"
+                )
+                self._overflow_section = OverflowCollapsibleSection(
+                    lambda: NoMarkupStatic(body, classes="error-overflow-body"),
+                    collapsed_label=lines_label(_estimated_row_count(body) - 1),
+                )
+                if self._retryable:
+                    # R1: the keyboard-accessible "Retry — new turn" affordance.
+                    # A Button is focusable and activates with Enter/Space; the
+                    # warning text above it (kept by the turn supervisor's hint)
+                    # states that completed actions may repeat.
+                    with Vertical(classes="error-body"):
+                        yield self._content_widget
+                        yield self._overflow_section
+                        self._retry_button = Button(
+                            "Retry — new turn",
+                            classes="error-retry-button",
+                            variant="primary",
+                        )
+                        yield self._retry_button
+                else:
                     yield self._content_widget
-                    self._retry_button = Button(
-                        "Retry — new turn",
-                        classes="error-retry-button",
-                        variant="primary",
-                    )
-                    yield self._retry_button
+                    yield self._overflow_section
             else:
-                yield self._content_widget
+                self._content_widget = NoMarkupStatic(text, classes="error-content")
+                if self._retryable:
+                    # R1: the keyboard-accessible "Retry — new turn" affordance.
+                    # A Button is focusable and activates with Enter/Space; the
+                    # warning text above it (kept by the turn supervisor's hint)
+                    # states that completed actions may repeat.
+                    with Vertical(classes="error-body"):
+                        yield self._content_widget
+                        self._retry_button = Button(
+                            "Retry — new turn",
+                            classes="error-retry-button",
+                            variant="primary",
+                        )
+                        yield self._retry_button
+                else:
+                    yield self._content_widget
+
+    def on_mount(self) -> None:
+        # OverflowCollapsibleSection always starts collapsed; honor the caller's
+        # collapsed=False here, after the children are mounted and the lazy body
+        # can be built safely.
+        if not self.collapsed and self._overflow_section is not None:
+            self._overflow_section.set_collapsed(False)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button is not self._retry_button:
@@ -678,7 +754,8 @@ class ErrorMessage(Static):
         self.post_message(ErrorRetryRequested())
 
     def set_collapsed(self, collapsed: bool) -> None:
-        pass
+        if self._overflow_section is not None:
+            self._overflow_section.set_collapsed(collapsed)
 
 
 class HookRunContainer(Vertical):

@@ -16,13 +16,11 @@ has not already been trusted.
 
 ## Approval gates in unattended runs
 
-Headless mode disables the approval gates: the headless prompt overrides any
+Ask-class operations are runtime-enforced in unattended runs, not a usage discipline: dangerous git commands and non-loopback egress through modeled `curl`/`wget` (`network.egress`) are denied with remediation in headless/programmatic mode instead of prompting. Pre-authorize them through the user configuration's `dangerous_command_grants_by_project` field, keyed by project; hard guards (`git reset --hard`, forced non-dry-run `git clean`, recursive `rm` outside its clean-tree carve-out) have no grant path and are always denied. Everything else keeps the headless posture: the headless prompt overrides any
 earlier instruction to wait for confirmation or ask the user, and when the task
 is ambiguous it makes the best judgment call and proceeds. With no human to
 accept a design or plan mid-run, the run does whatever the prompt authorizes —
-send only pre-authorized work headless. The gates are a usage discipline, not a
-runtime enforcement, in unattended runs: pre-authorize the phase and scope of
-work up front in the prompt (or a trusted `AGENTS.md`). Compaction handoffs
+send only pre-authorized work headless. Compaction handoffs
 carry the acceptance state, approval evidence, and one-time grants forward, so
 a resumed run cannot infer approval that was never given.
 

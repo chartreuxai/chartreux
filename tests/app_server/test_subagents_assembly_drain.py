@@ -653,7 +653,7 @@ async def test_drain_cancels_finalizing_monitor_without_stale_notification(
     monkeypatch.setattr(
         SessionRuntimeRegistry,
         "_start_child_turn",
-        lambda *_args: ("turn-1", lambda: None),
+        lambda *_args, **_kwargs: ("turn-1", lambda: None),
     )
     monkeypatch.setattr(registry, "_emit_agents_update", emit_agents_update)
 

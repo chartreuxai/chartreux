@@ -337,6 +337,58 @@ def git_metadata_paths(tokens: list[str], *, cwd: Path) -> tuple[Path, ...] | No
     return tuple(metadata)
 
 
+def _bare_markers_present_resolved(root: Path) -> bool | None:
+    """Whether the bare-repository markers are all present at ``root``.
+
+    Git's own heuristic — a ``HEAD`` file plus ``objects/`` and ``refs/``
+    directories, all three required — with every marker resolved through
+    symlinks (``stat`` semantics, the way git's own repository check reads
+    them): a bare repository whose marker entries are themselves links is
+    still a repository. None means a probe itself failed, so callers fail
+    closed.
+    """
+    try:
+        head = (root / "HEAD").stat()
+        objects = (root / "objects").stat()
+        refs = (root / "refs").stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return None
+    return (
+        stat.S_ISREG(head.st_mode)
+        and stat.S_ISDIR(objects.st_mode)
+        and stat.S_ISDIR(refs.st_mode)
+    )
+
+
+def path_reaches_bare_repository(path: Path) -> bool | None:
+    """Whether a resolved path is a bare repository's git dir or lies inside one.
+
+    The operand-metadata guard's nested-bare-repository discovery: git's own
+    bare-repository heuristic is probed at ``path`` itself and at every
+    ancestor, so a mutating operand that reaches inside a nested bare
+    repository's metadata — its objects, refs, config, HEAD, or any other
+    entry — is gated the same way a ``.git`` operand is. The probe runs on
+    the operand's already-resolved path, so a bare repository reached
+    through a symlinked directory component is found exactly like a
+    directly spelled one, and a marker entry that is itself a symlink
+    resolves the way git resolves it. None means a probe failed, so callers
+    fail closed.
+    """
+    current = path
+    while True:
+        present = _bare_markers_present_resolved(current)
+        if present is None:
+            return None
+        if present:
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
 def _parse_git_config_entries(
     config_paths: tuple[Path, ...],
 ) -> tuple[tuple[str, str, str], ...] | None:

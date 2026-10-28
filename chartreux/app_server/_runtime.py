@@ -805,10 +805,10 @@ class AgentRuntimeFactory:
                 authorized_tool_names=frozenset(parent.tool_manager.delegable_tools),
                 session_model=parent.config.active_model,
                 user_prompts_dirs=parent.harness_files.user_prompts_dirs,
-                # Purpose routes resolve against the conversation's FROZEN
-                # route table (the bound bundle's captured snapshot), never
-                # the reloaded live config (design §6, §10).
-                routes=parent.frozen_purpose_routes,
+                # Purpose routes resolve against the conversation's LIVE
+                # route table — the in-memory table the reload swaps
+                # atomically — so a validated route edit applies to every
+                # launch admitted after the reload commit (ADR 0022).
             )
         policy = parent.child_runtime_policy
         # The child's session directory prefix derives from its committed

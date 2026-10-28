@@ -111,8 +111,8 @@ _IDENTITY_ORCHESTRATED = (
 _TOOLS_ORCHESTRATED = """Use these tools directly for orchestration only:
 - `task` — primary dispatch tool; give each launch a self-contained task and concise `task_summary` (action plus subsystem).
 - `read_file` — instruction files, user-named files needed for routing, or specific cited lines to check a result; not source investigation.
-- `write_file` / `edit` — scratchpad only, never repo edits.
-- `bash` — read-only orchestration metadata only, not exploration, tests, builds, or mutation. Delegate searches and verification instead of using direct `grep` or shell commands.
+- `write_file` / `edit` — persistence and trivial state/bookkeeping edits (scratchpad notes, design documents, plans, ledgers, state notes); never repository source edits.
+- `bash` — one-line read-only probes and orchestration metadata; not exploration, tests, builds, or mutation. Delegate searches and verification instead of using direct `grep` or shell commands.
 - `skill` and `todo` — procedures and task tracking.
 - `web_search` / `web_fetch` — quick single-question lookups; delegate multi-step research.
 - `check_agents`, `get_agent_result`, `wait_for_agent`, `cancel_agent`, and `release_agent` — background-agent lifecycle, not specialist work."""
@@ -241,17 +241,22 @@ def render_launch_target_region(
 ) -> str:
     """The rendered launch-target table (design §5 step 7; package-4 facts).
 
-    Every shipped default target binds the session model, so one configured
-    model and ten produce identical routing; unmet model-diversity
-    requirements are reported, never faked.
+    Shipped targets bind the session model except the cost-tier-aware four,
+    which render the ``$cheapest-capable`` marker (resolved at launch from
+    the catalog's price data); unmet model-diversity requirements are
+    reported, never faked.
     """
     lines = [
         "### Launch targets",
         "",
-        "Delegated work routes by purpose. Every shipped default target "
-        "binds the session model, so one configured model and ten produce "
-        "identical routing; explicit fields override the route's "
-        "corresponding field.",
+        "Delegated work routes by purpose. This is the conversation's live "
+        "route table: a validated route edit applies to subsequent launches, "
+        "while children already admitted keep their bindings. Shipped "
+        "targets bind the session model except `implementation`, "
+        "`mechanical-edit`, `search`, and `verification`, which default to "
+        "the cheapest capable model in the catalog — the `$cheapest-capable` "
+        "binding, resolved at launch from the catalog's price data. Explicit "
+        "fields override the route's corresponding field.",
         "",
         "| Purpose | Identity | Tier | Seat | Model |",
         "| --- | --- | --- | --- | --- |",
@@ -374,12 +379,12 @@ def render_task_description_for_config(
 
     The description is composition-rendered: the launch-target table and the
     purpose meanings come from the configured ``[orchestration.routes.*]``
-    and the session model, never from a dispatch policy. Conversation-owned
-    rebuilds pass ``routes`` — the frozen route table the bound bundle
-    captured (design §6, §10) — so the model-facing description and
-    executable launch admission consume the SAME table and can never
-    diverge; the default reads the live configured table (a config-only
-    surface with no conversation).
+    and the session model, never from a dispatch policy. The DEFAULT reads
+    the configuration's LIVE route table — the same source launch admission
+    resolves against (ADR 0022) — so the model-facing description and
+    executable admission can never diverge; ``routes`` remains an explicit
+    override for callers that must render one specific table (a config-only
+    surface with no conversation, or a pinned fixture).
     """
     return render_task_description_for_composition(
         routes=dict(routes if routes is not None else config.purpose_routes.routes),

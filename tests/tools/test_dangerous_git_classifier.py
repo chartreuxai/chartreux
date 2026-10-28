@@ -20,6 +20,7 @@ from chartreux.core.dangerous_commands import (
     is_grant_choice_valid,
     operations_for_ids,
 )
+from chartreux.core.tools.builtins import _shell_git_classifier, _shell_git_support
 from chartreux.core.tools.builtins._shell_command_policy import (
     analyze_shell_command_policy,
     classify_dangerous_git_command,
@@ -38,6 +39,9 @@ FROZEN_OPERATION_IDS = (
     "git.stash.clear",
     "git.reflog.expire",
     "git.reflog.delete",
+    # v0.5.9 P2-a: destination-aware egress — publication-class like
+    # git.push, so the ask-class rule grants it the same way.
+    "network.egress",
 )
 
 
@@ -405,6 +409,25 @@ def test_other_stash_and_reflog_forms_are_routine(command: str) -> None:
     # drop/clear and expire/delete are recognized without enabling other
     # unmodeled forms.
     assert classify(command).kind == "routine"
+
+
+def test_reflog_stays_dispatch_masked_after_the_unmodeled_dedup() -> None:
+    """reflog's safety is the dispatch mask, never the reader set.
+
+    Deduplicated out of the unmodeled table (its entry there was dead: the
+    dispatch to the mode-aware stash/reflog classifier runs before the
+    unmodeled check, so no reflog form ever reached it). reflog can write,
+    so its destructive forms must keep their mode-aware classification —
+    its reader-set membership only governs the policy layer's read forms.
+    """
+    assert "reflog" in _shell_git_classifier._DANGEROUS_GIT_SUBCOMMANDS
+    assert "reflog" in _shell_git_support._GIT_READER_SUBCOMMANDS
+    assert "reflog" not in _shell_git_support._GIT_UNMODELED_BUILTINS
+    assert is_dangerous_git_subcommand(["git", "reflog"])
+    assert_grantable("git reflog expire --all", ("git.reflog.expire",))
+    assert_grantable("git reflog delete main@{0}", ("git.reflog.delete",))
+    assert classify("git reflog").kind == "routine"
+    assert classify("git reflog show").kind == "routine"
 
 
 @pytest.mark.parametrize(
@@ -1333,6 +1356,64 @@ def test_readers_and_unclassified_subcommands_are_routine(command: str) -> None:
 @pytest.mark.parametrize(
     "command",
     [
+        # v0.5.9 P2-d: symbolic-ref is modeled by mode — the read form
+        # (exactly one operand, no write marker) carries no dangerous
+        # operation.
+        "git symbolic-ref HEAD",
+        "git symbolic-ref -q HEAD",
+        "git symbolic-ref --short HEAD",
+        "git symbolic-ref --recurse HEAD",
+        "git symbolic-ref --no-recurse HEAD",
+        "git -C . symbolic-ref HEAD",
+    ],
+)
+def test_symbolic_ref_read_forms_are_routine(command: str) -> None:
+    assert classify(command).kind == "routine"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # The write forms (a ref update or deletion) are not granted by the
+        # read modeling: hard guards with no grantable operation.
+        "git symbolic-ref HEAD refs/heads/main",
+        "git symbolic-ref -m reason HEAD refs/heads/main",
+        "git symbolic-ref --message reason HEAD refs/heads/main",
+        "git symbolic-ref -m reason HEAD",
+        "git symbolic-ref -d HEAD",
+        "git symbolic-ref --delete HEAD",
+        "git symbolic-ref -d -q HEAD",
+        "git symbolic-ref HEAD refs/heads/main extra",
+    ],
+)
+def test_symbolic_ref_write_forms_are_hard_denied(command: str) -> None:
+    result = classify(command)
+    assert result.kind == "hard_denied"
+    assert result.grantable is None
+    assert "write form" in (result.reason or "")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Bare, operand-less, and unscannable forms fail closed too.
+        "git symbolic-ref",
+        "git symbolic-ref -q",
+        "git symbolic-ref --recurse",
+        "git symbolic-ref --bogus HEAD",
+        "git symbolic-ref -x HEAD",
+    ],
+)
+def test_symbolic_ref_unmodeled_forms_are_hard_denied(command: str) -> None:
+    result = classify(command)
+    assert result.kind == "hard_denied"
+    assert result.grantable is None
+    assert "write form" not in (result.reason or "")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "echo hi",
         "ls -la",
         "rm -rf src",
@@ -1411,19 +1492,19 @@ def test_classification_requires_payload_exactly_when_grantable() -> None:
 
 def test_registry_matches_the_frozen_contract() -> None:
     assert tuple(OPERATION_REGISTRY) == FROZEN_OPERATION_IDS
-    assert PUBLICATION_OPERATION_IDS == frozenset({"git.push"})
+    assert PUBLICATION_OPERATION_IDS == frozenset({"git.push", "network.egress"})
     assert CONSEQUENTIAL_OPERATION_IDS == {
         operation_id
         for operation_id in FROZEN_OPERATION_IDS
-        if operation_id != "git.push"
+        if OPERATION_REGISTRY[operation_id].command_class == "consequential"
     }
     persistable = [
         operation_id
         for operation_id, operation in OPERATION_REGISTRY.items()
         if operation.persistable
     ]
-    # Only ordinary publication is persistable.
-    assert persistable == ["git.push"]
+    # Only publication is persistable.
+    assert persistable == ["git.push", "network.egress"]
     for operation in OPERATION_REGISTRY.values():
         assert operation.consequence
         assert operation.command_class in {"publication", "consequential"}

@@ -305,7 +305,7 @@ Purpose routes — the executable launch bindings for `task` purposes and seats 
 | --- | --- |
 | `[orchestration.routes.<purpose>]` | Purpose-route table; sparse entries override the shipped route of the same purpose, and new keys introduce custom purposes. |
 | `targets` | Required, non-empty list of route-target tables. |
-| `targets[].model` | Required. A canonical model name, or `$session` to bind the session model (what every shipped target uses). |
+| `targets[].model` | Required. A canonical model name, `$session` to bind the session model, or `$cheapest-capable` to default to the cheapest capable model in the catalog (resolved at launch from the catalog's price data; the shipped `implementation`, `mechanical-edit`, `search`, and `verification` routes use it, and a catalog with no priced model fails the launch with guidance to configure the route explicitly). |
 | `targets[].identity` | Required. Built-in or custom identity id. |
 | `targets[].tier` | Required. `mechanical` or `substantive` (the work-class label feeding the replacement policy). |
 | `targets[].seat` | Optional seat name for multi-seat purposes. |

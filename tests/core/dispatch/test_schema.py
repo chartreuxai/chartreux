@@ -48,10 +48,10 @@ def test_vocabulary_has_all_developer_owned_descriptions() -> None:
     assert all(entry.description.strip() for entry in SHIPPED_PURPOSES.values())
     assert "never implementation" in SHIPPED_PURPOSES["design-analysis"].description
     assert "never implementation" in SHIPPED_PURPOSES["planning-analysis"].description
-    assert (
-        "settled approach"
-        in SHIPPED_PURPOSES["implementation-demanding-settled"].description
-    )
+    # P1-c2: the demanding route triggers on difficulty, not plan quality.
+    demanding = SHIPPED_PURPOSES["implementation-demanding-settled"].description
+    assert "genuinely tricky work" in demanding
+    assert "never justifies this route" in demanding
 
 
 def test_shipped_model_payload_and_role_bindings_preserved() -> None:

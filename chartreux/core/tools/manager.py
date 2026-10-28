@@ -12,7 +12,11 @@ import threading
 from typing import TYPE_CHECKING, Any, TypeGuard
 import weakref
 
-from chartreux.core.agents.identities import ToolPosture, get_builtin_identity
+from chartreux.core.agents.identities import (
+    AgentIdentity,
+    ToolPosture,
+    get_builtin_identity,
+)
 from chartreux.core.config.harness_files import (
     HarnessFilesManager,
     get_harness_files_manager,
@@ -36,10 +40,10 @@ from chartreux.core.tools.base import (
 )
 from chartreux.core.tools.classification import (
     ToolClass,
-    _stamp_registry_builtin,
+    _stamp_location_trusted_user_tool,
     classification_revision,
     classify_tool,
-    copy_registry_builtin_stamps,
+    shipped_builtin_name,
 )
 from chartreux.core.tools.remote import MCPTool
 from chartreux.core.tools.utils import PathAuthority
@@ -132,6 +136,21 @@ def posture_allows_name(posture: ToolPosture, tool_name: str) -> bool:
     return posture_allows_class(posture, classify_tool(tool_name, builtin=True))
 
 
+def identity_allows_name(identity: AgentIdentity, tool_name: str) -> bool:
+    """Admission-level personal check, honoring the execution carve-out.
+
+    The launch-admission mirror of ``ToolManager._personal_posture_allows``:
+    a carved-out name is admitted as the identity's own reviewed exception,
+    everything else follows the posture's class set. The admission check is
+    name-keyed by design; the runtime boundary stays exact-class — a custom
+    variant of a carved-out name still fails closed at the shipped-builtin
+    check inside the manager.
+    """
+    if tool_name in identity.execution_carve_out:
+        return True
+    return posture_allows_name(identity.personal_tools, tool_name)
+
+
 class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full method budget
     """Manages tool discovery and instantiation for an Agent.
 
@@ -139,7 +158,7 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
     should have its own ToolManager instance.
     """
 
-    def __init__(  # noqa: PLR0913, PLR0915 - runtime-owned dependency injection
+    def __init__(  # noqa: PLR0913 - runtime-owned dependency injection
         self,
         config_getter: Callable[[], ChartreuxConfigSchema],
         mcp_registry: MCPRegistry | None = None,
@@ -260,21 +279,15 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
                 self._all_tools = dict(discovery_source._all_tools)
                 self._tool_descriptions = dict(discovery_source._tool_descriptions)
                 self._mcp_integrated = discovery_source._mcp_integrated
-                # The provenance side table is keyed by the exact class, so the
-                # reused classes already carry their registry-conferred stamps;
-                # the copy re-asserts them alongside _tool_variants_by_name so
-                # the reuse path never depends on when the source's discovery
-                # ran (S2 round 2: forgeable provenance stamp).
-                copy_registry_builtin_stamps(
-                    tool_class
-                    for variants in self._tool_variants_by_name.values()
-                    for tool_class in variants
-                )
         else:
-            for tool_class, is_custom in self._iter_tool_classes_with_origin(
-                self._search_paths
-            ):
-                self._register_discovered_tool_variant(tool_class, is_custom=is_custom)
+            for (
+                tool_class,
+                is_custom,
+                source_file,
+            ) in self._iter_tool_classes_with_origin(self._search_paths):
+                self._register_discovered_tool_variant(
+                    tool_class, is_custom=is_custom, source_file=source_file
+                )
             self._tool_descriptions: dict[str, str] = dict(
                 self._iter_tool_descriptions(self._search_paths)
             )
@@ -364,24 +377,41 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
         the directory — the same flat layout as the builtins and as the sibling
         ``prompts/*.md`` descriptions (see ``_iter_tool_descriptions``).
         """
-        for tool_class, _ in ToolManager._iter_tool_classes_with_origin(search_paths):
+        for tool_class, _, _ in ToolManager._iter_tool_classes_with_origin(
+            search_paths
+        ):
             yield tool_class
 
     @staticmethod
     def _iter_tool_classes_with_origin(
         search_paths: list[Path],
-    ) -> Iterator[tuple[type[BaseTool], bool]]:
+    ) -> Iterator[tuple[type[BaseTool], bool, Path]]:
+        """Yield ``(tool_class, is_custom, source_file)`` per discovered class.
+
+        ``source_file`` is the ``.py`` file the class was loaded from — the
+        file-location provenance input for the user-tools-directory trust
+        contract (P4-1): the trust decision keys on WHERE the tool was
+        authored, so registration needs the file, not just the class.
+        """
         builtin_dir = DEFAULT_TOOL_DIR.path.resolve()
         for base in search_paths:
             if not base.is_dir() and base.name.endswith(".py"):
                 if tools := ToolManager._load_tools_from_file(base):
                     for tool in tools:
-                        yield tool, not base.resolve().is_relative_to(builtin_dir)
+                        yield (
+                            tool,
+                            not base.resolve().is_relative_to(builtin_dir),
+                            base,
+                        )
 
             for path in base.glob("*.py"):
                 if tools := ToolManager._load_tools_from_file(path):
                     for tool in tools:
-                        yield tool, not path.resolve().is_relative_to(builtin_dir)
+                        yield (
+                            tool,
+                            not path.resolve().is_relative_to(builtin_dir),
+                            path,
+                        )
 
     @staticmethod
     def _load_tools_from_file(file_path: Path) -> list[type[BaseTool]] | None:
@@ -479,25 +509,52 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
                 continue
         return defaults
 
+    def _is_user_tools_file(self, source_file: Path) -> bool:
+        """Whether a discovered tool file lives under the user's tools directory.
+
+        The file-location trust contract (P4-1) keys on the user's OWN tools
+        directory (``~/.chartreux/tools/`` — the user's home config, not
+        project files): project-discovered tools and config ``tool_paths``
+        entries stay fail-closed. The comparison resolves both sides, so a
+        symlinked spelling of the same directory still matches and a
+        different directory that merely shares a name never does.
+        """
+        try:
+            resolved = source_file.resolve()
+        except (OSError, ValueError):
+            return False
+        return any(
+            resolved.is_relative_to(directory.resolve())
+            for directory in self._harness_files.user_tools_dirs
+        )
+
     def _register_discovered_tool_variant(
-        self, tool_class: type[BaseTool], *, is_custom: bool
+        self,
+        tool_class: type[BaseTool],
+        *,
+        is_custom: bool,
+        source_file: Path | None = None,
     ) -> None:
         name = tool_class.get_name()
         self._tool_variants_by_name.setdefault(name, []).append(tool_class)
         self._custom_tool_variants_by_name.setdefault(name, []).append(is_custom)
         self._all_tools[name] = tool_class
-        if not is_custom and tool_class.__module__.startswith(
-            "chartreux.core.tools.builtins."
+        if (
+            source_file is not None
+            and not self._is_remote_tool_class(tool_class)
+            and self._is_user_tools_file(source_file)
         ):
-            # Only classes defined by shipped builtin modules carry the reviewed
-            # table entry; a subclass registered through this path still fails
-            # closed. The stamp is recorded in the harness-side provenance side
-            # table — never as a class attribute — so a custom class declaring
-            # `_registry_builtin_name` in its own body cannot forge it
-            # (S2 round 2: forgeable provenance stamp). The writer is private
-            # to the classification module (S2 round 4: stamp-writer
-            # hardening): only the harness's gated stamping paths reach it.
-            _stamp_registry_builtin(tool_class, name)
+            # File-location provenance (P4-1, charter decision 4): a tool
+            # authored under the user's OWN tools directory is the user's own
+            # code, so it is trusted by where it lives and admitted to the
+            # non-mutating posture — a deliberate, separate contract recorded
+            # in the harness-side location-trust side table, never as a class
+            # attribute. MCP proxies keep their own explicit fail-closed
+            # decision even when a user file wraps one, and a class
+            # registered through this path WITHOUT a user-tools-directory
+            # source file (direct registration, re-export, reuse staging)
+            # carries no location trust and fails closed as before.
+            _stamp_location_trusted_user_tool(tool_class)
         self._registry_generation += 1
 
     @property
@@ -519,9 +576,10 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
             return None
         return parent if parent is not self else None
 
-    @property
-    def _identity_posture(self) -> tuple[ToolPosture | None, ToolPosture | None]:
-        """(personal, delegation) posture selectors of this manager's identity.
+    def _identity_posture(
+        self,
+    ) -> tuple[ToolPosture | None, ToolPosture | None, frozenset[str]]:
+        """(personal, delegation, carve-out) selectors of this manager's identity.
 
         Derived from the ``[agent]`` selection below the tool-config layer: a
         custom identity carries no harness-known posture (None = unrestricted
@@ -530,43 +588,57 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
         conversation's identity at construction (design §3, decision log item
         3), posture derives from the BOUND identity: a later live config
         change is a pending selection for new conversations and never
-        re-postures an existing manager.
+        re-postures an existing manager. The carve-out is the identity's
+        execution exception to its personal posture (settlement decision 3);
+        the delegation axis never receives it.
         """
         if self._bound_identity is not None:
             reference = self._bound_identity
         else:
             reference = self._config.agent.identity
         if reference.startswith("user:"):
-            return None, None
+            return None, None, frozenset()
         identity = get_builtin_identity(reference.removeprefix("builtin:"))
         if identity is None:
-            return None, None
-        return identity.personal_tools, identity.delegation_tools
+            return None, None, frozenset()
+        return (
+            identity.personal_tools,
+            identity.delegation_tools,
+            identity.execution_carve_out,
+        )
 
     def _personal_posture_allows(self, tool_class: type[BaseTool]) -> bool:
         """Whether this identity may execute the SELECTED implementation itself.
 
-        The classification is computed from the exact selected class's registry
-        provenance — never re-resolved by name: with several variants of one
-        name, a name-keyed lookup can classify a DIFFERENT class than the one
-        the availability decision actually selected, letting an unstamped
-        custom ride a read-only posture (S2 round 2: posture reselects by
-        name).
+        The classification is computed from the exact selected class's origin
+        — never re-resolved by name: with several variants of one name, a
+        name-keyed lookup can classify a DIFFERENT class than the one the
+        availability decision actually selected, letting a foreign custom
+        ride a read-only posture (S2 round 2: posture reselects by name). The
+        identity's execution carve-out admits a carved-out name only for a
+        class defined by a shipped builtin module, so a foreign custom variant
+        of that name fails closed exactly as any other custom does.
         """
-        personal, _ = self._identity_posture
+        personal, _, carve_out = self._identity_posture()
         if personal is None:
             return True
-        return posture_allows_class(
-            personal, registry_provenance_classification(tool_class)
-        )
+        classification = registry_provenance_classification(tool_class)
+        if posture_allows_class(personal, classification):
+            return True
+        if not carve_out:
+            return False
+        builtin = shipped_builtin_name(tool_class)
+        return builtin is not None and builtin in carve_out
 
     def _delegation_posture_allows(self, tool_class: type[BaseTool]) -> bool:
         """Whether this identity may pass the SELECTED implementation to children.
 
         Classifies the exact selected class, exactly as the personal axis does
-        (S2 round 2: posture reselects by name).
+        (S2 round 2: posture reselects by name). The execution carve-out is
+        personal-axis only: a read-only identity's delegation set stays
+        read-only, so a reviewer cannot hand its shell to a child.
         """
-        _, delegation = self._identity_posture
+        _, delegation, _ = self._identity_posture()
         if delegation is None:
             return True
         return posture_allows_class(
@@ -1918,14 +1990,14 @@ class ToolManager:  # noqa: PLR0904 - reviewed authority lookup joins the full m
     def get_authority_classification(self, tool_name: str) -> ToolClass:
         """Reviewed class of the registered implementation for ``tool_name``.
 
-        Computed MANAGER-SIDE from registry provenance: the selected class's
-        provenance stamp names its reviewed table entry, while anything
-        un-stamped (custom replacements, MCP proxies, subclasses) fails closed
-        as MUTATING regardless of its name or remote hints. The selected
-        class's ``get_authority_classification`` classmethod is deliberately
-        NOT consulted for authority — it is overridable, and a self-declared
-        class would widen a read-only posture (S2 classification
-        self-declaration blocker). Unknown names fail closed.
+        Computed MANAGER-SIDE from the selected class's origin: a class
+        defined by a shipped builtin module takes its reviewed table entry,
+        while anything else (custom replacements, MCP proxies, subclasses)
+        fails closed as MUTATING regardless of its name or remote hints. The
+        selected class's ``get_authority_classification`` classmethod is
+        deliberately NOT consulted for authority — it is overridable, and a
+        self-declared class would widen a read-only posture (S2
+        classification self-declaration blocker). Unknown names fail closed.
         """
         with self._lock:
             fallback = self._all_tools.get(tool_name)

@@ -42,6 +42,7 @@ from chartreux.core.config.layers.user import UserConfigLayer
 from chartreux.core.config.orchestrator import ConfigOrchestrator
 from chartreux.core.dangerous_commands import OPERATION_REGISTRY
 from chartreux.core.tools.base import ToolPermission
+from chartreux.core.tools.builtins._destination import classify_network_egress
 from chartreux.core.tools.builtins._shell_command_policy import (
     GitRepositoryRelocation,
     classify_dangerous_git_command,
@@ -886,10 +887,18 @@ def test_denylist_probes_match_the_frozen_classifier() -> None:
     """Each denylist probe is exactly one registry operation's grantable form."""
     from chartreux.app_server._sessions import _DANGEROUS_COMMAND_DENYLIST_PROBES
 
-    assert [operation_id for operation_id, _ in _DANGEROUS_COMMAND_DENYLIST_PROBES] == [
+    # Every registry operation has a probe; the git operations have exactly
+    # one each, and the modeled network clients each get a network.egress
+    # probe (v0.5.9 P2-a).
+    assert {operation_id for operation_id, _ in _DANGEROUS_COMMAND_DENYLIST_PROBES} == {
         operation.operation_id for operation in OPERATION_REGISTRY.values()
-    ]
+    }
     for operation_id, probe in _DANGEROUS_COMMAND_DENYLIST_PROBES:
+        if operation_id == "network.egress":
+            # The egress probe is the operation's ask-class form, classified
+            # by the destination recognizer, not the git classifier.
+            assert classify_network_egress(list(probe)).kind == "ask"
+            continue
         classification = classify_dangerous_git_command(list(probe))
         assert classification.kind == "grantable"
         assert classification.grantable is not None
@@ -921,7 +930,11 @@ _ALL_OPERATIONS = [
         ("git stash", ["git.stash.drop", "git.stash.clear"]),
         ("git reflog", ["git.reflog.expire", "git.reflog.delete"]),
         ("git checkout -", ["git.checkout"]),
-        ("curl", []),
+        # v0.5.9 P2-a: a denylist pattern naming a modeled network client
+        # vetoes the egress operation through its probe.
+        ("curl", ["network.egress"]),
+        ("wget", ["network.egress"]),
+        ("curl https://example.invalid/", ["network.egress"]),
     ],
 )
 def test_denylist_blocking_operations(pattern: str, operations: list[str]) -> None:

@@ -15,6 +15,7 @@ from chartreux.core.llm_models import LLMMessage
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.resolver import ModelResolver, ResolvedModel
 from chartreux.core.recovery_models import canonical_endpoint_identity
+from chartreux.core.recovery_override import CooldownOverrideLedger, OverridePermit
 from chartreux.core.session_types import CommittedModelIdentity
 
 
@@ -458,6 +459,28 @@ def compatibility_exclusion(
     return None
 
 
+def cooldown_override_bypasses(
+    override_permit: OverridePermit | None,
+    override_ledger: CooldownOverrideLedger | None,
+    endpoint_identity: str | None,
+) -> bool:
+    """Whether a typed forced-attempt permit bypasses one candidate's cooldowns.
+
+    The bypass is endpoint-scoped and fail-closed: the permit must be the
+    ledger's live reservation for its own episode — a wrong-endpoint,
+    expired, released, or already-used permit never bypasses — and the
+    candidate must serve the permit's canonical endpoint. Only the cooldown
+    predicates (deployment cooldown, endpoint-wide correlation) are
+    bypassed; every other admission check still applies, and the bypass
+    never mutates the registry.
+    """
+    if override_permit is None or override_ledger is None:
+        return False
+    if endpoint_identity is None or endpoint_identity != override_permit.endpoint:
+        return False
+    return override_ledger.permit_outstanding(override_permit)
+
+
 def eligible_deployments(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915
     *,
     snapshot: CatalogSnapshot,
@@ -471,6 +494,8 @@ def eligible_deployments(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915
     compaction_only: bool = False,
     allowed_models: Sequence[str] = (),
     claim_probes: bool = True,
+    override_permit: OverridePermit | None = None,
+    override_ledger: CooldownOverrideLedger | None = None,
 ) -> EligibilityResult:
     """Resolve ordered candidates for exactly the committed canonical base.
 
@@ -480,6 +505,16 @@ def eligible_deployments(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915
     recovery controller uses for scheduling: no probe is claimed or released,
     so the controller can never consume another caller's probe or strand a
     token-owned claim — availability is read through ``is_available`` only.
+
+    ``override_permit``/``override_ledger`` (C2 typed permits): a permit
+    minted by the root ``CooldownOverrideLedger`` bypasses ONLY the
+    cooldown predicates — the endpoint-wide correlation check and the
+    deployment admission/availability check — for candidates serving the
+    permit's canonical endpoint. Every other admission check (disabled,
+    allowlist, compaction, compatibility) still applies, and a
+    wrong/expired/released/used permit never bypasses. The bypass never
+    mutates the registry: a bypassed candidate is admitted with no probe
+    claim and no cooldown is cleared.
 
     Round-2 V3, claim safety: every probe claimed during the pass is
     tracked, and an out-of-band error (exception or cancellation) between
@@ -520,8 +555,13 @@ def eligible_deployments(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915
                 if provider is not None
                 else None
             )
-            if endpoint_identity is not None and registry.endpoint_correlation_active(
-                endpoint_identity
+            cooldown_bypassed = cooldown_override_bypasses(
+                override_permit, override_ledger, endpoint_identity
+            )
+            if (
+                endpoint_identity is not None
+                and not cooldown_bypassed
+                and registry.endpoint_correlation_active(endpoint_identity)
             ):
                 # Endpoint-wide correlation cooldown (WP1): cross-model rate-limit
                 # evidence on ONE endpoint excludes every deployment of that
@@ -566,7 +606,15 @@ def eligible_deployments(  # noqa: PLR0912, PLR0913, PLR0914, PLR0915
                     ExclusionReason.COMPACTION_INCOMPATIBLE,
                 )
             else:
-                if claim_probes:
+                if cooldown_bypassed:
+                    # C2 typed permit: ONLY this candidate's cooldown
+                    # predicates are bypassed. The candidate is admitted
+                    # with no probe claim and the registry is untouched —
+                    # no cooldown is cleared, no probe is claimed or
+                    # released (the forced attempt is metered by the
+                    # override ledger, not the single-flight probe).
+                    admitted, probe, probe_token = True, False, None
+                elif claim_probes:
                     admitted, probe, probe_token = registry.admission(
                         committed.base_model,
                         deployment.provider,

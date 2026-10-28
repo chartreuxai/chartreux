@@ -26,12 +26,30 @@ class AgentIdentity:
     delegation_tools: ToolPosture
     safety: str
     display_name: str
+    # Reviewed builtin tool names admitted BEYOND the personal posture's class
+    # set (settlement decision 3, P1-h): an identity-scoped execution carve-out.
+    # The posture table stays untouched — it is shared by every NON_MUTATING
+    # selector (researcher, advisor, the orchestrator's personal axis, and every
+    # delegation axis), so a table change would widen all of them. The carve-out
+    # is personal-axis only (a reviewer cannot delegate its shell) and is
+    # enforced against the shipped-builtin identity of the exact selected
+    # class, so a foreign custom variant of a carved-out name fails closed.
+    execution_carve_out: frozenset[str] = frozenset()
 
 
 # The read-only identities still DELEGATE their non-mutating/control-plane set
 # (their delegation_tools posture), so their declared delegation metadata is
 # OPTIONAL — not NONE — matching the executable delegation behavior (design §3:
 # no shipped identity sets none in v1).
+
+# The settled v0.5.9 personal execution grant (settlement: identity tool
+# grants): the delegation-bearing identities may execute the full mutating
+# builtin set themselves — bash for probes and verification, bash_start for
+# managed jobs, write_file/edit for scratchpad and deliverable persistence.
+# Repo-source edits remain DELEGATED by role contract (the B1 prose), not by
+# tool denial; the carve-out never reaches the delegation axis.
+_EXECUTION_CARVE_OUT = frozenset({"bash", "bash_start", "edit", "write_file"})
+
 _IDENTITIES = {
     "coder": AgentIdentity(
         "coder",
@@ -48,6 +66,10 @@ _IDENTITIES = {
         ToolPosture.ALL_GRANTED,
         "restricted",
         "Orchestrator",
+        # Probes, managed jobs, and scratchpad/deliverable persistence run
+        # personally (v0.5.9 identity tool grants); repo-source edits stay
+        # delegated by role contract.
+        execution_carve_out=_EXECUTION_CARVE_OUT,
     ),
     "researcher": AgentIdentity(
         "researcher",
@@ -56,6 +78,10 @@ _IDENTITIES = {
         ToolPosture.NON_MUTATING,
         "read-only",
         "Researcher",
+        # Read-only repo posture with personal scratchpad/deliverable
+        # persistence and probe/managed-job execution (v0.5.9 identity tool
+        # grants); the delegation set stays non-mutating.
+        execution_carve_out=_EXECUTION_CARVE_OUT,
     ),
     "reviewer": AgentIdentity(
         "reviewer",
@@ -64,6 +90,12 @@ _IDENTITIES = {
         ToolPosture.NON_MUTATING,
         "read-only",
         "Reviewer",
+        # Exit gates verify (settlement decision 3): the reviewer may run
+        # non-mutating verification commands through bash itself. Only the
+        # bash surface is carved out — bash_start is job management, not
+        # verification, and the write tools stay excluded — and bash's own
+        # permission guards remain the mutation boundary.
+        execution_carve_out=frozenset({"bash"}),
     ),
     "advisor": AgentIdentity(
         "advisor",
@@ -72,6 +104,10 @@ _IDENTITIES = {
         ToolPosture.NON_MUTATING,
         "read-only",
         "Advisor",
+        # Same personal execution grant as the researcher (v0.5.9 identity
+        # tool grants): analysis deliverables persist personally; the
+        # delegation set stays non-mutating.
+        execution_carve_out=_EXECUTION_CARVE_OUT,
     ),
 }
 

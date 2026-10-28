@@ -16,8 +16,11 @@ Chain rule: a child's effective tools are the granted tree ceiling ∩ every
 ancestor's delegation set ∩ the child's personal posture. Enforcement uses
 the S1-approved classification classes (mutating / non-mutating /
 control-plane), never tool-name lists: control-plane tools (task, agent
-lifecycle, user questions) ride with a read-only posture, so an
-orchestrator can delegate without gaining direct write authority.
+lifecycle, user questions) ride with a read-only posture, so delegation
+never depends on personal tool access. The v0.5.9 execution carve-out
+additionally admits the mutating builtin set on the orchestrator,
+researcher, and advisor PERSONAL axes only — the delegation axis never
+receives it.
 """
 
 from __future__ import annotations
@@ -30,20 +33,16 @@ import pytest
 from chartreux.core.agents.identities import UnknownIdentityError
 from chartreux.core.config.harness_files import HarnessFilesManager
 from chartreux.core.tools.base import BaseToolConfig
+from chartreux.core.tools.builtins.bash import BashArgs
 from chartreux.core.tools.builtins.edit import EditArgs
 from chartreux.core.tools.classification import ToolClass
 from chartreux.core.tools.manager import NoSuchToolError, ToolManager
 from chartreux.core.tools.models import ToolPermission
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
+from tests.mock.utils import collect_result
 
-MUTATING_TOOLS = frozenset({
-    "bash",
-    "bash_start",
-    "edit",
-    "skill",
-    "todo",
-    "write_file",
-})
+MUTATING_TOOLS = frozenset({"bash", "bash_start", "edit", "write_file"})
+NON_MUTATING_TOOLS = frozenset({"read_file", "skill"})
 CONTROL_PLANE_TOOLS = frozenset({
     "ask_user_question",
     "bash_stop",
@@ -54,6 +53,7 @@ CONTROL_PLANE_TOOLS = frozenset({
     "release_agent",
     "resume_agent",
     "task",
+    "todo",
     "wait_for_agent",
 })
 
@@ -162,6 +162,35 @@ class ReadFile(BaseTool[ReadFileArgs, ReadFileResult, BaseToolConfig, BaseToolSt
         yield ReadFileResult()
 '''
 
+# An unstamped custom variant of the carved-out ``bash`` name: it wins
+# selection under its own name, but the registry never stamped it, so the
+# reviewer's execution carve-out must not admit it (P1-h fail-closed pin).
+UNSTAMPED_CUSTOM_BASH_SOURCE = '''\
+from collections.abc import AsyncGenerator
+
+from pydantic import BaseModel
+
+from chartreux.core.tools.base import BaseTool, BaseToolConfig, BaseToolState
+
+
+class BashArgs(BaseModel):
+    command: str = ""
+
+
+class BashResult(BaseModel):
+    pass
+
+
+class Bash(BaseTool[BashArgs, BashResult, BaseToolConfig, BaseToolState]):
+    """Unstamped custom variant of the carved-out bash name."""
+
+    async def run(
+        self, args: BashArgs, ctx: object = None
+    ) -> AsyncGenerator[BashResult, None]:
+        # imagine arbitrary mutating work here
+        yield BashResult()
+'''
+
 
 def _manager(
     tmp_path: Path,
@@ -190,15 +219,17 @@ def test_coder_identity_is_unrestricted_on_both_axes(tmp_path: Path) -> None:
     assert manager.get("edit") is not None
 
 
-def test_root_researcher_cannot_use_mutating_tools_personally(tmp_path: Path) -> None:
-    # The write tools are GRANTED at the config level; the researcher's
-    # personal posture still excludes them below the config layer.
+def test_root_researcher_carve_out_grants_the_mutating_tools_personally(
+    tmp_path: Path,
+) -> None:
+    # The write tools are GRANTED at the config level, and the v0.5.9
+    # identity carve-out admits them on the researcher's personal axis;
+    # the delegation axis stays non-mutating (pinned separately below).
     manager = _manager(tmp_path, identity="researcher")
-    assert not (MUTATING_TOOLS & set(manager.available_tools))
-    assert not (MUTATING_TOOLS & {spec.name for spec in manager.available_tool_specs()})
+    assert MUTATING_TOOLS <= set(manager.available_tools)
+    assert MUTATING_TOOLS <= {spec.name for spec in manager.available_tool_specs()}
     for name in MUTATING_TOOLS:
-        with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
-            manager.get(name)
+        assert manager.get(name) is not None
     assert "read_file" in manager.available_tools
     assert "grep" in manager.available_tools
 
@@ -210,14 +241,13 @@ def test_root_researcher_cannot_delegate_mutating_tools(tmp_path: Path) -> None:
     assert "task" in manager.delegable_tools
 
 
-def test_root_orchestrator_cannot_write_personally_but_delegates_writes(
+def test_root_orchestrator_grants_writes_personally_and_delegates_writes(
     tmp_path: Path,
 ) -> None:
     manager = _manager(tmp_path, identity="orchestrator")
-    # Personal axis: no mutating tool, despite the granted config.
-    assert not (MUTATING_TOOLS & set(manager.available_tools))
-    with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
-        manager.get("edit")
+    # Personal axis: the v0.5.9 carve-out admits the mutating builtin set.
+    assert MUTATING_TOOLS <= set(manager.available_tools)
+    assert manager.get("edit") is not None
     # Delegation axis: the full granted ceiling, writes included.
     assert MUTATING_TOOLS <= set(manager.delegable_tools)
     # Control-plane stays personal: the orchestrator can delegate at all.
@@ -229,6 +259,21 @@ def test_control_plane_tools_survive_a_read_only_posture(tmp_path: Path) -> None
         manager = _manager(tmp_path, identity=identity)
         assert CONTROL_PLANE_TOOLS <= set(manager.available_tools), identity
         assert "task" in manager.available_tools
+
+
+def test_read_only_identities_resolve_skill_and_orchestrator_resolves_todo(
+    tmp_path: Path,
+) -> None:
+    # skill is session-scoped instruction loading, not a mutation: every
+    # read-only identity admits it. todo writes session-local tracking state
+    # only, so it rides with the orchestrator's control-plane set.
+    for identity in ("researcher", "reviewer", "advisor"):
+        manager = _manager(tmp_path, identity=identity)
+        assert "skill" in manager.available_tools, identity
+        assert manager.get("skill") is not None, identity
+    orchestrator = _manager(tmp_path, identity="orchestrator")
+    assert "todo" in orchestrator.available_tools
+    assert orchestrator.get("todo") is not None
 
 
 def test_child_of_orchestrator_writes_within_the_granted_ceiling(
@@ -334,19 +379,22 @@ def test_custom_identity_delegation_defaults_to_the_full_granted_ceiling(
 
 def test_builtin_qualified_identity_reference_keeps_its_posture(tmp_path: Path) -> None:
     manager = _manager(tmp_path, identity="builtin:researcher")
-    assert not (MUTATING_TOOLS & set(manager.available_tools))
+    # The qualified reference resolves to the shipped posture including the
+    # v0.5.9 personal carve-out; the delegation axis stays non-mutating.
+    assert MUTATING_TOOLS <= set(manager.available_tools)
     assert not (MUTATING_TOOLS & set(manager.delegable_tools))
 
 
 def test_delegation_and_personal_axes_are_independently_monotonic(
     tmp_path: Path,
 ) -> None:
-    # A coder parent grants writes; a researcher CHILD still cannot use them
-    # personally (personal axis), while its delegation set stays read-only.
+    # A coder parent grants writes; a researcher CHILD executes the
+    # carved-out tools personally (v0.5.9 grant) while its delegation set
+    # stays read-only.
     parent = _manager(tmp_path, identity="coder")
     child = _manager(tmp_path, identity="researcher", parent=parent)
     assert MUTATING_TOOLS <= set(parent.delegable_tools)
-    assert not (MUTATING_TOOLS & set(child.available_tools))
+    assert MUTATING_TOOLS <= set(child.available_tools)
     assert not (MUTATING_TOOLS & set(child.delegable_tools))
     # The grandchild chain keeps narrowing: a coder grandchild of the
     # researcher is still capped by the researcher's delegation set.
@@ -404,14 +452,16 @@ def test_bound_identity_freezes_posture_against_in_place_flips(tmp_path: Path) -
         accepted_token_getter=lambda: "accepted",
         bound_identity="researcher",
     )
-    assert not (MUTATING_TOOLS & set(manager.available_tools))
+    assert MUTATING_TOOLS <= set(manager.available_tools)
     assert "read_file" in manager.available_tools
-    # The bound identity holds even against a live in-place flip to coder.
+    # The bound identity holds even against a live in-place flip to coder:
+    # the personal carve-out stays the bound researcher's, and the DELEGATION
+    # axis stays non-mutating where a live coder posture would delegate the
+    # full granted ceiling.
     resolved.agent.identity = "coder"
-    assert not (MUTATING_TOOLS & set(manager.available_tools))
+    assert MUTATING_TOOLS <= set(manager.available_tools)
     assert not (MUTATING_TOOLS & set(manager.delegable_tools))
-    with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
-        manager.get("edit")
+    assert manager.get("edit") is not None
 
 
 def test_unknown_builtin_qualified_identity_fails_at_config_load() -> None:
@@ -538,8 +588,10 @@ def test_cache_hit_rechecks_the_live_identity_posture(tmp_path: Path) -> None:
     """A warm selection cannot serve a tool the live posture excludes (S2 W2).
 
     The live posture and filter checks re-run on EVERY availability decision,
-    cache hits included: an unsanctioned in-place identity flip must not
-    leave a warm selection returning the tool through ``get()``.
+    cache hits included. Post-grant the in-place flip to the orchestrator
+    keeps ``edit`` served (the v0.5.9 carve-out admits it personally); the
+    exclusion proof re-pins against the reviewer flip, whose bash-only
+    carve-out still excludes the write tools.
     """
     resolved = build_test_vibe_config(agent={"identity": "coder"})
     manager = ToolManager(
@@ -550,6 +602,9 @@ def test_cache_hit_rechecks_the_live_identity_posture(tmp_path: Path) -> None:
     )
     assert manager.get("edit") is not None  # warm the selection and instance
     resolved.agent.identity = "orchestrator"
+    assert "edit" in manager.available_tools
+    assert manager.get("edit") is not None
+    resolved.agent.identity = "reviewer"
     assert "edit" not in manager.available_tools
     assert "edit" not in {spec.name for spec in manager.available_tool_specs()}
     with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
@@ -948,3 +1003,95 @@ async def test_user_qualified_identity_with_a_resource_binds_at_loop_constructio
         assert loop._bound_identity == "user:my-custom"
     finally:
         await loop.aclose()
+
+
+# --- Reviewer execution carve-out (settlement decision 3, P1-h) --------------
+
+
+@pytest.mark.asyncio
+async def test_reviewer_resolves_bash_and_runs_a_verification_command(
+    tmp_path: Path,
+) -> None:
+    """The exit-gate reviewer executes verification itself (decision 3, P1-h).
+
+    The reviewer's personal posture stays non-mutating, but its identity-level
+    execution carve-out admits the bash tool: the reviewer resolves it through
+    the manager's personal axis and runs a verification-style command.
+    """
+    manager = _manager(tmp_path, identity="reviewer")
+    assert "bash" in manager.available_tools
+    assert "bash" in {spec.name for spec in manager.available_tool_specs()}
+    bash_tool = manager.get("bash")
+    result = await collect_result(
+        bash_tool.run(BashArgs(command="echo verification-ok"))
+    )
+    assert result.exit_code == 0
+    assert result.stdout == "verification-ok\n"
+
+
+def test_reviewer_carve_out_is_bash_only(tmp_path: Path) -> None:
+    """The non-mutating contract holds except the execution carve-out.
+
+    The carve-out admits exactly the bash surface; the write tools and
+    bash_start stay excluded, and an override cannot loosen them.
+    """
+    manager = _manager(tmp_path, identity="reviewer")
+    for name in ("edit", "write_file", "bash_start"):
+        assert name not in manager.available_tools, name
+        with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
+            manager.get(name)
+    loosened = _manager(
+        tmp_path,
+        identity="reviewer",
+        enabled_tools=["edit", "write_file", "bash_start"],
+    )
+    for name in ("edit", "write_file", "bash_start"):
+        assert name not in loosened.available_tools, name
+
+
+def test_researcher_and_advisor_delegate_no_shell(tmp_path: Path) -> None:
+    """The v0.5.9 grant admits bash personally for researcher and advisor;
+    their delegation sets stay non-mutating, so neither can hand the shell
+    to a child.
+    """
+    for identity in ("researcher", "advisor"):
+        manager = _manager(tmp_path, identity=identity)
+        assert "bash" in manager.available_tools, identity
+        assert "bash" not in manager.delegable_tools, identity
+        assert manager.get("bash") is not None, identity
+
+
+def test_reviewer_carve_out_never_reaches_the_delegation_axis(tmp_path: Path) -> None:
+    """The reviewer runs bash itself but cannot hand the shell to a child.
+
+    The carve-out is personal-axis only: the reviewer's delegation set stays
+    non-mutating, so a coder child under a reviewer is still capped by the
+    ancestor chain.
+    """
+    manager = _manager(tmp_path, identity="reviewer")
+    assert "bash" in manager.available_tools
+    assert "bash" not in manager.delegable_tools
+    child = _manager(tmp_path, identity="coder", parent=manager)
+    assert "bash" not in child.available_tools
+    with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
+        child.get("bash")
+
+
+def test_unstamped_custom_bash_variant_fails_closed_under_the_reviewer(
+    tmp_path: Path,
+) -> None:
+    """The carve-out admits the reviewed builtin, never a custom namesake.
+
+    Launch admission is name-keyed, but the runtime boundary is the registry-
+    provenance stamp of the exact selected class: an unstamped custom variant
+    named ``bash`` classifies MUTATING and stays excluded even under the
+    reviewer's carve-out.
+    """
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir()
+    (tools_dir / "bash.py").write_text(UNSTAMPED_CUSTOM_BASH_SOURCE, encoding="utf-8")
+    manager = _manager(tmp_path, identity="reviewer", tool_paths=[tools_dir])
+    assert manager._all_tools["bash"] is not None
+    assert "bash" not in manager.available_tools
+    with pytest.raises(NoSuchToolError, match="Unknown or disabled tool"):
+        manager.get("bash")

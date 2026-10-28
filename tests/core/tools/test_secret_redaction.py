@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -1355,3 +1356,94 @@ def test_redact_persisted_result_fallback_redacts_presentation(
     assert FAKE_VALUE not in redacted.presentation.display.message
     assert sr.REDACTED_PLACEHOLDER in redacted.output["stdout"]
     assert sr.REDACTED_PLACEHOLDER in redacted.presentation.display.message
+
+
+def test_read_dotenv_entries_treats_a_fifo_global_env_as_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The redaction set reads the global .env through the same regular-file
+    # guard as the injection loader: a FIFO must be treated as absent, never
+    # a blocking open.
+    home = tmp_path / "chartreux-home"
+    home.mkdir()
+    monkeypatch.setenv("CHARTREUX_HOME", str(home))
+    fifo = home / ".env"
+    os.mkfifo(fifo)
+    try:
+        assert sr._read_dotenv_entries() == {}
+    finally:
+        fifo.unlink()
+
+
+def test_register_project_env_with_a_fifo_env_file_yields_no_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The redaction set re-reads each live session's project .env through
+    # env.dotenv_file_entries: a FIFO project .env is absent, not a hang.
+    monkeypatch.setattr(sr, "_read_dotenv_entries", lambda: {})
+    monkeypatch.setattr(sr, "_catalog_env_var_names", lambda: frozenset())
+    monkeypatch.setattr(sr, "credential_env_var_names", lambda policy=None: frozenset())
+    monkeypatch.setattr(sr, "_keyring_value", lambda name: None)
+    sr.reset_cache()
+    fifo = tmp_path / ".env"
+    os.mkfifo(fifo)
+    owner = type("Session", (), {})()
+    try:
+        sr.register_project_env(owner, fifo)
+        assert sr.known_secret_values() == frozenset()
+    finally:
+        sr.unregister_project_env(owner)
+        fifo.unlink()
+
+
+def test_project_env_redaction_covers_the_inherited_process_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R6: the inherited process value wins over the project .env value for
+    # a name present in both (the shell environment merge), so the value the
+    # child actually receives is as live a secret as the .env one — the
+    # redaction set masks BOTH, not only the .env value.
+    monkeypatch.setattr(sr, "_read_dotenv_entries", lambda: {})
+    monkeypatch.setattr(sr, "_catalog_env_var_names", lambda: frozenset())
+    monkeypatch.setattr(sr, "credential_env_var_names", lambda policy=None: frozenset())
+    monkeypatch.setattr(sr, "_keyring_value", lambda name: None)
+    sr.reset_cache()
+    env_file = tmp_path / ".env"
+    env_file.write_text("REDACT_TEST_KEY=from-env-file\n", encoding="utf-8")
+    monkeypatch.setenv("REDACT_TEST_KEY", "from-process-env")
+    owner = type("Session", (), {})()
+    try:
+        sr.register_project_env(owner, env_file)
+        values = sr.known_secret_values()
+        assert "from-env-file" in values
+        assert "from-process-env" in values
+        assert sr.redact("file=from-env-file process=from-process-env") == (
+            f"file={sr.REDACTED_PLACEHOLDER} process={sr.REDACTED_PLACEHOLDER}"
+        )
+    finally:
+        sr.unregister_project_env(owner)
+
+
+def test_project_env_redaction_keeps_a_matching_inherited_value_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An inherited value identical to the .env value is already covered by
+    # the .env contribution; the inherited-side addition only fires on a
+    # differing value.
+    monkeypatch.setattr(sr, "_read_dotenv_entries", lambda: {})
+    monkeypatch.setattr(sr, "_catalog_env_var_names", lambda: frozenset())
+    monkeypatch.setattr(sr, "credential_env_var_names", lambda policy=None: frozenset())
+    monkeypatch.setattr(sr, "_keyring_value", lambda name: None)
+    sr.reset_cache()
+    env_file = tmp_path / ".env"
+    env_file.write_text("REDACT_SAME_KEY=same-value-both\n", encoding="utf-8")
+    monkeypatch.setenv("REDACT_SAME_KEY", "same-value-both")
+    owner = type("Session", (), {})()
+    try:
+        sr.register_project_env(owner, env_file)
+        pairs = sr._loaded_credentials()
+        assert [pair for pair in pairs if pair[0] == "REDACT_SAME_KEY"] == [
+            ("REDACT_SAME_KEY", "same-value-both")
+        ]
+    finally:
+        sr.unregister_project_env(owner)

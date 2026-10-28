@@ -48,13 +48,22 @@ from chartreux.app_server._subagent_execution import (
     BackgroundExecutionContext as BackgroundExecutionContext,
     ForegroundExecutionContext,
     SubagentExecution,
+    apply_cancellation_disposition,
+    finalize_run_with_drain,
+    freeze_run_admission,
+    operative_completion_claim,
 )
-from chartreux.app_server._subagent_launch import ChildLaunchAdmission
+from chartreux.app_server._subagent_finalization import _check_runner as _check_runner
+from chartreux.app_server._subagent_launch import (
+    ChildLaunchAdmission,
+    override_launch_diagnostics,
+)
 from chartreux.app_server._subagent_records import (
     _DANGEROUS_COMMAND_DENYLIST_PROBES as _DANGEROUS_COMMAND_DENYLIST_PROBES,
     AgentRecord as AgentRecord,
     DangerousCommandDenylistBlock as DangerousCommandDenylistBlock,
     DangerousCommandGrantEntry as DangerousCommandGrantEntry,
+    FrozenCompletionContract as FrozenCompletionContract,
     ResidentTranscriptReadSnapshot as ResidentTranscriptReadSnapshot,
     RunRecord as RunRecord,
     StoredChildSession as StoredChildSession,
@@ -1277,14 +1286,21 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
 
     @staticmethod
     def _start_child_turn(
-        runtime: SessionRuntime, args: TaskArgs, ctx: InvokeContext, session_id: str
+        runtime: SessionRuntime,
+        args: TaskArgs,
+        ctx: InvokeContext,
+        session_id: str,
+        *,
+        completion_contract: FrozenCompletionContract | None = None,
     ) -> tuple[str, TurnStartAction]:
+        text = prepare_subagent_prompt(args.task, ctx)
+        if completion_contract is not None:
+            # P4: the frozen contract renders into the child prompt — a
+            # worker cannot reference requirements it never received.
+            text = f"{text}\n\n{completion_contract.render_prompt_section()}"
         response, start = runtime.turns.start(
             TurnStartParams(
-                session_id=session_id,
-                message=[
-                    TextContentBlock(text=prepare_subagent_prompt(args.task, ctx))
-                ],
+                session_id=session_id, message=[TextContentBlock(text=text)]
             )
         )
         return response.turn.id, start
@@ -1499,7 +1515,11 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             try:
                 context.runtime.turns._event_sink = context.consume_event
                 turn_id, action = SessionRuntimeRegistry._start_child_turn(
-                    context.runtime, args, ctx, context.runtime.agent_loop.session_id
+                    context.runtime,
+                    args,
+                    ctx,
+                    context.runtime.agent_loop.session_id,
+                    completion_contract=context.run_record.completion_contract,
                 )
                 context.turn_id = turn_id
                 context.action = action
@@ -1535,6 +1555,38 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             parent, args, ctx
         )
         child = runtime.agent_loop
+        # C6b: snapshot the bounded un-stick diagnostics for an explicit
+        # override_cooldown launch pre-start (create_registered minted and
+        # bound the permit; the child's first model call consumes the
+        # binding), so the foreground result carries them exactly like the
+        # background acknowledgment (C4). Gated on the explicit request:
+        # ordinary and automatic launches never carry a binding (F6), and
+        # the foreground surface is also driven through spec'd mock
+        # registries whose loops carry no coordinator slot.
+        override_diagnostics = (
+            override_launch_diagnostics(child) if args.override_cooldown else None
+        )
+        # P4: freeze the completion contract at foreground admission and
+        # capture the admission HEAD baseline alongside it (PRE-EXECUTION,
+        # only when the contract mandates a commit artifact). The identity
+        # binding is the canonical source; the launch-resolved reference is
+        # the fallback for a child constructed without one.
+        binding = child._identity_binding()
+        if isinstance(binding, tuple) and binding:
+            bound_identity, bound_identity_revision = binding[0], binding[1]
+        else:
+            bound_identity = (
+                _launch_identity or requested_identity_reference(args) or ""
+            )
+            bound_identity_revision = None
+        completion_contract, admission_head = freeze_run_admission(
+            args=args,
+            identity=bound_identity,
+            identity_revision=bound_identity_revision,
+            tier=child.launch_package_tier,
+            runtime=runtime,
+            parent=parent,
+        )
         # Foreground execution context (ASC area 3, step 2): the
         # per-invocation state of one foreground run. The event consumer and
         # the slot discard callback are context methods, the teardown is the
@@ -1549,15 +1601,28 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             tool_call_id=ctx.tool_call_id,
             previous_event_sink=runtime.turns._event_sink,
             slot=slot,
+            completion_contract=completion_contract,
+            admission_head=admission_head,
         )
+        # P2/P3 wiring: install the run's receipt sink on the child loop —
+        # the post-tool finalization seam emits each invocation's receipt
+        # into THIS run's accumulator chronology. Cleared at run teardown.
+        completion_evidence_sink = context.accumulator.completion_evidence_sink()
+        child._completion_evidence_sink = completion_evidence_sink
+        context.completion_evidence_sink = completion_evidence_sink
         runtime.turns._event_sink = context.consume_event
         try:
             turn_id, start = SessionRuntimeRegistry._start_child_turn(
-                runtime, args, ctx, child.session_id
+                runtime,
+                args,
+                ctx,
+                child.session_id,
+                completion_contract=completion_contract,
             )
             start()
         except BaseException:
             runtime.turns._event_sink = context.previous_event_sink
+            child._completion_evidence_sink = None
             await self._rollback_created_child(parent, runtime, ctx.tool_call_id)
             raise
         context.turn_id = turn_id
@@ -1567,7 +1632,6 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         )
         context.completion = completion
         slot.transferred = True
-        completion.add_done_callback(lambda task: context.discard_work_slot(self, task))
         try:
             async for item in stream_until_complete(
                 context.progress, completion, event_task_name="vibe-subagent-progress"
@@ -1579,20 +1643,122 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             turns_used = sum(
                 message.role is Role.assistant for message in child.messages
             )
+            # P6b: the once-only finalization is awaited immediately BEFORE
+            # the result build, drain-wrapped like the monitor's sites; a run
+            # cancelled before the audit starts (the turn settled INTERRUPTED)
+            # takes the cancellation disposition instead — the stub
+            # finalization is cached and no check spawns.
+            stop_reason: RunStopReason | None = None
+            if turn.status is PublicTurnStatus.INTERRUPTED:
+                stop_reason = (
+                    self._run_stop_reason(turn) or RunStopReason.USER_CANCELLED
+                )
+                apply_cancellation_disposition(
+                    context.accumulator,
+                    turn_id,
+                    completion_contract,
+                    admission_head,
+                    stop_reason,
+                )
+            await finalize_run_with_drain(
+                run_id=turn_id,
+                accumulator=context.accumulator,
+                contract=completion_contract,
+                admission_head=admission_head,
+                runtime=runtime,
+            )
+            result_update: dict[str, Any] = {
+                "metadata": {
+                    **child.completion_metadata_since(context.completion_metadata_mark),
+                    # C6b: the bounded un-stick diagnostics ride the
+                    # foreground result's metadata exactly like the background
+                    # acknowledgment (C4).
+                    **(
+                        {"cooldown_override": override_diagnostics}
+                        if override_diagnostics is not None
+                        else {}
+                    ),
+                }
+            }
+            if stop_reason is not None:
+                result_update["stop_reason"] = stop_reason
+            # P12: the call site wires the composition surface — the run
+            # key (the once-only finalization cache read), the frozen
+            # contract (the mandate surface and the audit mode), the
+            # worker's receipt claim (operative only on a healthy
+            # completed turn), and the acceptance-check runner.
             context.result = context.accumulator.build_result(
                 turns_used=turns_used,
                 completed=turn.status is PublicTurnStatus.COMPLETED,
-            ).model_copy(
-                update={
-                    "metadata": child.completion_metadata_since(
-                        context.completion_metadata_mark
-                    )
-                }
-            )
+                run_id=turn_id,
+                contract=completion_contract,
+                claim=operative_completion_claim(
+                    context.accumulator,
+                    turn_completed=turn.status is PublicTurnStatus.COMPLETED,
+                ),
+                runner=_check_runner(runtime),
+            ).model_copy(update=result_update)
             if turn.error is not None:
                 raise RuntimeError(turn.error.message)
+        except asyncio.CancelledError:
+            if context.result is None:
+                # P6b case (b): cancellation mid-run — the disposition runs
+                # without awaits (no further scheduling before the stub is
+                # cached), the terminal result builds exactly once, and the
+                # cancellation propagates; the drain wrapper already killed
+                # this run's in-flight check processes.
+                terminal = runtime.turns.operation_terminal_turn(turn_id)
+                terminal_reason = (
+                    self._run_stop_reason(terminal) if terminal is not None else None
+                )
+                apply_cancellation_disposition(
+                    context.accumulator,
+                    turn_id,
+                    completion_contract,
+                    admission_head,
+                    terminal_reason,
+                )
+                # P12: the cancelled run wires the mandate surface and
+                # the finalization cache read; the worker's claim is NOT
+                # operative on a cancelled run, so no claim rides — the
+                # terminal turn's reason stays preserved on the result.
+                context.result = context.accumulator.build_result(
+                    turns_used=sum(
+                        message.role is Role.assistant for message in child.messages
+                    ),
+                    completed=False,
+                    run_id=turn_id,
+                    contract=completion_contract,
+                    runner=_check_runner(runtime),
+                ).model_copy(
+                    update={
+                        "metadata": {
+                            **child.completion_metadata_since(
+                                context.completion_metadata_mark
+                            ),
+                            # C6b: the cancelled foreground result carries the
+                            # bounded un-stick diagnostics like the settled one.
+                            **(
+                                {"cooldown_override": override_diagnostics}
+                                if override_diagnostics is not None
+                                else {}
+                            ),
+                        },
+                        "stop_reason": terminal_reason
+                        if terminal_reason is not None
+                        else RunStopReason.USER_CANCELLED,
+                    }
+                )
+            raise
         finally:
+            # P6b: the capacity slot stays accounted while the finalization
+            # verification runs and is released only here — the former
+            # completion done-callback released it before the checks ran.
+            context.discard_work_slot(self, completion)
             runtime.turns._event_sink = context.previous_event_sink
+            # P2/P3 run-end hygiene: the run's receipt sink is spent.
+            if child._completion_evidence_sink is context.completion_evidence_sink:
+                child._completion_evidence_sink = None
             if self._children.get(child.session_id) is runtime:
                 parent_runtime, tool_call_id = self._child_links[child.session_id]
                 parent_loop = parent_runtime.agent_loop
@@ -2285,6 +2451,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         idempotency_key: str,
         *,
         requester_session_id: str,
+        override_cooldown: bool = False,
     ) -> ResumeAgentResult:
         """Delegate to the recovery collaborator (WP2 explicit resume)."""
         return await self._recovery.resume_agent(
@@ -2292,6 +2459,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             expected_run_id,
             idempotency_key,
             requester_session_id=requester_session_id,
+            override_cooldown=override_cooldown,
         )
 
     async def reconcile_result(

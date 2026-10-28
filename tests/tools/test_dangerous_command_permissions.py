@@ -316,16 +316,21 @@ class TestFailClosedCheckpoint:
             assert context.dangerous_command_proposal is None, command
 
     def test_unmodeled_git_forms_stay_with_the_policy_layer(self, tmp_path: Path):
-        # Readers that are unmodeled builtins, unrecognized subcommands, and
-        # dangling globals without a subcommand carry no dangerous operation:
-        # the existing policy layer governs them, and its enforcement is
+        # The read-only inspection readers — deduplicated out of the unmodeled
+        # table so the classifier's reader verdict agrees with the policy
+        # layer's reader branch — unrecognized subcommands, and dangling
+        # globals without a subcommand carry no dangerous operation: the
+        # existing policy layer governs them, and its enforcement is
         # unchanged.
         tool = make_bash(tmp_path)
         for command in (
             "git describe --tags",
-            "git shortlog",
-            "git count-objects",
             "git merge-base HEAD HEAD",
+            "git name-rev HEAD",
+            "git shortlog",
+            "git whatchanged",
+            "git verify-pack p",
+            "git count-objects",
             "git -C",
             "git --git-dir",
         ):
@@ -357,8 +362,16 @@ class TestOrderingInvariant:
 
     @pytest.mark.parametrize("order", ["first", "second"])
     def test_sensitive_rule_is_never_masked(self, tmp_path: Path, order: str):
-        command = "git push && sudo ls" if order == "first" else "sudo ls && git push"
-        context = make_bash(tmp_path).resolve_permission(BashArgs(command=command))
+        # A user-configured sensitive prefix is denied before the dangerous
+        # question. (sudo itself is no longer a shipped sensitive prefix:
+        # v0.5.9 P2-d models `sudo -u` transparently and fails its other
+        # forms closed in the executor grammar.)
+        command = (
+            "git push && deploy now" if order == "first" else "deploy now && git push"
+        )
+        context = make_bash(tmp_path, sensitive_patterns=["deploy"]).resolve_permission(
+            BashArgs(command=command)
+        )
         assert_other_denial(context)
         assert "sensitive command rule" in (context.reason or "")  # type: ignore[union-attr]
 
@@ -1088,6 +1101,73 @@ class TestSavedProjectGrants:
         )
 
 
+class TestDestinationAwareEgressAuthority:
+    """network.egress authority: the ask-class egress rule's grant surface."""
+
+    def test_egress_authority_covers_the_call(self, tmp_path: Path):
+        repo = make_repo(tmp_path / "project")
+        tool = make_bash(repo, (authority_for(scope_of(repo), "network.egress"),))
+        for command in (
+            "curl https://attacker.example/",
+            # The destination-changing behavior classes are ask-class too,
+            # so the same authority covers them.
+            "curl -L http://localhost:8080/pubstatus",
+            "wget http://localhost:8080/pubstatus",
+            "curl --resolve localhost:80:203.0.113.1 http://localhost/",
+        ):
+            context = tool.resolve_permission(BashArgs(command=command))
+            assert (
+                context is not None and context.permission is ToolPermission.ALWAYS
+            ), command
+
+    def test_loopback_egress_needs_no_authority(self, tmp_path: Path):
+        repo = make_repo(tmp_path / "project")
+        tool = make_bash(repo)
+        for command in (
+            "curl http://localhost:8080/pubstatus",
+            "curl http://127.0.0.1:8080/pubstatus",
+            "curl http://[::1]:8080/",
+        ):
+            context = tool.resolve_permission(BashArgs(command=command))
+            assert (
+                context is not None and context.permission is ToolPermission.ALWAYS
+            ), command
+            assert context.denial_kind is None, command
+
+    def test_authority_at_another_scope_does_not_cover(self, tmp_path: Path):
+        repo = make_repo(tmp_path / "project")
+        other = make_repo(tmp_path / "other")
+        tool = make_bash(repo, (authority_for(scope_of(other), "network.egress"),))
+        assert_dangerous_denial(
+            tool.resolve_permission(BashArgs(command="curl https://attacker.example/")),
+            ("network.egress",),
+        )
+
+    def test_saved_grant_preauthorizes_egress(self, tmp_path: Path):
+        # network.egress is publication-class and persistable, so a saved
+        # project grant pre-authorizes it exactly like git.push.
+        repo = make_repo(tmp_path / "project")
+        source = saved_grant_source(tmp_path, repo, ("network.egress",))
+        manager = manager_for(repo, restrictions=(source,))
+        tool = manager.get("bash")
+        context = tool.resolve_permission(
+            BashArgs(command="curl https://attacker.example/")
+        )
+        assert context is not None and context.permission is ToolPermission.ALWAYS
+        context = tool.resolve_permission(
+            BashArgs(command="curl http://localhost:8080/pubstatus")
+        )
+        assert context is not None and context.permission is ToolPermission.ALWAYS
+
+    def test_egress_and_git_gaps_propose_together(self, tmp_path: Path):
+        repo = make_repo(tmp_path / "project")
+        tool = make_bash(repo)
+        context = tool.resolve_permission(
+            BashArgs(command="git push; curl https://attacker.example/")
+        )
+        assert_dangerous_denial(context, ("git.push", "network.egress"))
+
+
 class TestParentCeilings:
     """Parent invocation ceilings are checked even on a local gap."""
 
@@ -1457,8 +1537,180 @@ class TestShippedDenylistMigration:
         denylist = _get_default_denylist()
         assert not any(entry.startswith("git ") for entry in denylist)
         # Non-git entries are kept.
-        for kept in ("curl", "wget", "nc", "vim", "nano", "tmux", "gdb"):
+        for kept in ("nc", "vim", "nano", "tmux", "gdb"):
             assert kept in denylist
+        # v0.5.9 P2-a: the modeled network clients left the shipped
+        # denylist — their destinations decide run vs ask under the
+        # destination-aware egress rule.
+        for modeled in ("curl", "wget"):
+            assert modeled not in denylist
+
+    def test_shipped_denylist_covers_probed_egress_clients(self) -> None:
+        # v0.5.9 P1-e2: the probed egress clients and the watch repeater
+        # ship on the denylist until they are modeled.
+        denylist = _get_default_denylist()
+        for entry in (
+            "ssh",
+            "scp",
+            "rsync",
+            "ftp",
+            "telnet",
+            "http",
+            "httpie",
+            "wget2",
+            "aria2c",
+            "lftp",
+            "watch",
+        ):
+            assert entry in denylist
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "ssh host 'git push'",
+            "watch -n 1 git push",
+            "scp file host:backup",
+            "rsync -a src/ host:dst/",
+            "ftp host",
+            "telnet host",
+            "http GET https://example.com",
+            "httpie GET https://example.com",
+            "wget2 http://example.com",
+            "aria2c http://example.com",
+            "lftp host:backup",
+        ],
+    )
+    def test_probed_egress_clients_deny_fail_closed(self, command: str, tmp_path: Path):
+        # v0.5.9 P1-e2: these resolved ALWAYS before the denylist entries
+        # shipped; the list is the fail-closed interim until modeling.
+        tool = make_bash(tmp_path)
+        context = tool.resolve_permission(BashArgs(command=command))
+        assert_other_denial(context)
+        assert "matches denylist pattern" in (
+            context.reason or ""  # type: ignore[union-attr]
+        )
+
+    def test_shipped_denylist_covers_p1e3_audit_entries(self) -> None:
+        # v0.5.9 P1-e3 wrapper-class audit closure: every probed
+        # payload-runner and egress-client entry that resolved ALWAYS
+        # without payload analysis ships on the denylist until modeled.
+        denylist = _get_default_denylist()
+        for entry in (
+            # group/namespace wrappers
+            "su",
+            "chroot",
+            "unshare",
+            "nsenter",
+            "parallel",
+            # build runners
+            "make",
+            "rake",
+            "just",
+            "ninja",
+            "cmake",
+            "gradle",
+            "mvn",
+            "ant",
+            "scons",
+            "meson",
+            # container runners
+            "docker",
+            "podman",
+            "kubectl",
+            # schedulers
+            "at",
+            "batch",
+            "systemd-run",
+            "crontab",
+            # repeaters
+            "entr",
+            # egress clients
+            "sftp",
+            "mosh",
+            "gh",
+            "curlie",
+            "xh",
+            "httpx",
+            "tftp",
+            "fetch",
+            "openssl s_client",
+            "openssl s_server",
+        ):
+            assert entry in denylist
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "su nobody -c 'git push'",
+            "chroot /srv git push",
+            "unshare --fork git push",
+            "nsenter -t 1 git push",
+            "parallel git push ::: a",
+            "make push",
+            "rake push",
+            "just push",
+            "ninja",
+            "cmake --build .",
+            "gradle build",
+            "mvn package",
+            "ant",
+            "scons",
+            "meson compile -C .",
+            "docker run img git push",
+            "docker compose up",
+            "podman run img git push",
+            "kubectl exec p -- git push",
+            "at now",
+            "batch",
+            "systemd-run git push",
+            "crontab -l",
+            "entr git push /f",
+            "sftp host:backup",
+            "mosh host",
+            "gh api /user",
+            "curlie GET http://attacker.example/",
+            "xh GET http://attacker.example/",
+            "httpx http://attacker.example/",
+            "tftp host -c get f.txt",
+            "fetch http://attacker.example/",
+            "openssl s_client -connect attacker.example:443",
+            "openssl s_server -accept 4433",
+        ],
+    )
+    def test_p1e3_payload_runners_and_clients_deny_fail_closed(
+        self, command: str, tmp_path: Path
+    ) -> None:
+        # v0.5.9 P1-e3: these resolved ALWAYS without payload analysis
+        # before the audit; the denylist is the fail-closed interim until
+        # each is modeled.
+        tool = make_bash(tmp_path)
+        context = tool.resolve_permission(BashArgs(command=command))
+        assert_other_denial(context)
+        assert "matches denylist pattern" in (
+            context.reason or ""  # type: ignore[union-attr]
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "nice git push",
+            "stdbuf -o0 git push",
+            "setsid git push",
+            "nohup git push",
+            "xargs git push",
+            "find . -name f -exec git push ;",
+        ],
+    )
+    def test_p1e3_modeled_wrappers_reanalyze_payloads(
+        self, command: str, tmp_path: Path
+    ) -> None:
+        # v0.5.9 P1-e3: the modeled transparent wrappers re-analyze their
+        # payloads (denied git push) and the modeled fail-closed boundaries
+        # refuse their forms; nothing here resolves unanalyzed.
+        tool = make_bash(tmp_path)
+        context = tool.resolve_permission(BashArgs(command=command))
+        assert context is not None
+        assert context.permission != ToolPermission.ALWAYS
 
     def test_default_config_denylist_has_no_git_entries(self):
         assert not any(entry.startswith("git ") for entry in BashToolConfig().denylist)

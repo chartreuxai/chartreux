@@ -26,8 +26,11 @@ from chartreux.core.agents.identities import (
 )
 from chartreux.core.config import SessionLoggingConfig
 from chartreux.core.config.harness_files import get_harness_files_manager
+from chartreux.core.dispatch.route_models import PackageTier, PurposeRoute, RouteTarget
+from chartreux.core.dispatch.routes import SESSION_MODEL, shipped_routes
 from chartreux.core.dispatch.session import (
     SessionPolicyError,
+    applied_route_changes,
     bind_policy_bundle,
     bound_identity_reference,
     pending_policy_changes,
@@ -178,6 +181,43 @@ def test_pending_policy_changes_reports_never_applies() -> None:
     assert "'orchestrator'" in notes[0]
     assert "'coder'" in notes[0]
     assert "new conversations only" in notes[0]
+
+
+def test_applied_route_changes_reports_the_edit_against_the_manifest_snapshot() -> None:
+    # ADR 0022: routes are bindings, not frozen content — a route edit is
+    # APPLIED at the reload commit and reported old -> new against the
+    # manifest's bind-time snapshot (the diff anchor), never as a pending
+    # "new conversations only" note.
+    _bundle, activated = _bind(_config())
+    harness_files = get_harness_files_manager()
+    # No route edit: nothing applied, nothing pending.
+    assert applied_route_changes(_config(), activated) == ()
+    assert (
+        pending_policy_changes(_config(), activated, harness_files=harness_files) == ()
+    )
+
+    routes = dict(shipped_routes())
+    routes["research"] = PurposeRoute(
+        targets=(
+            RouteTarget(
+                model=SESSION_MODEL, identity="coder", tier=PackageTier.SUBSTANTIVE
+            ),
+        )
+    )
+    edited = build_test_vibe_config(
+        agent=ORCHESTRATED_SELECTION, orchestration={"routes": routes}
+    ).attach_catalog_snapshot(CatalogSnapshot(SHIPPED_CATALOG, "original"))
+
+    changes = applied_route_changes(edited, activated)
+    assert len(changes) == 1
+    change = changes[0]
+    assert change.purpose == "research"
+    assert "researcher" in change.before
+    assert "coder" in change.after
+    assert change.before != change.after
+    # The route edit produces NO pending note: it is applied, not deferred,
+    # and the identity/workflow/strategy pending branches are untouched.
+    assert pending_policy_changes(edited, activated, harness_files=harness_files) == ()
 
 
 def test_identity_registry_is_the_builtin_subagent_surface() -> None:

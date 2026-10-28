@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,11 +22,12 @@ from chartreux.core.background_jobs import (
 from chartreux.core.events import ToolResultEvent
 from chartreux.core.llm.format import ResolvedToolCall
 from chartreux.core.llm_models import Role
+from chartreux.core.subagent_submission import bash_write_paths_from_result_event
 from chartreux.core.tools.base import InvokeContext, ToolError, ToolPermission
-from chartreux.core.tools.builtins.bash import BashArgs
+from chartreux.core.tools.builtins.bash import BashArgs, CancelledShellCommand
 from chartreux.core.tools.builtins.bash_list import BashList
 from chartreux.core.tools.builtins.bash_read import BashRead
-from chartreux.core.tools.builtins.bash_start import BashStart
+from chartreux.core.tools.builtins.bash_start import BashStart, FailedJobStart
 from chartreux.core.tools.builtins.bash_stop import BashStop
 from chartreux.core.tools.manager import ToolManager
 from chartreux.core.tools.secret_redaction import ScrubPolicy, bind_policy
@@ -74,6 +76,82 @@ async def test_launch_uses_authorized_cwd_and_new_runtime_after_relocation(
         ).splitlines()[0] == str(tmp_path)
     finally:
         await registry.aclose()
+
+
+@pytest.mark.asyncio
+async def test_start_surfaces_command_write_paths_for_the_submission_scan(tmp_path):
+    # R7: bash_start's command write surface joins the submission scan
+    # exactly as a foreground bash run's does — the result carries the
+    # started command's write-classified paths, and the gate collects them
+    # from the result event.
+    registry = BackgroundJobRegistry()
+    try:
+        port = registry.root_port()
+        ctx = InvokeContext(tool_call_id="start", background_jobs=port)
+        tool = manager(tmp_path).get("bash_start")
+        result = await run(
+            tool, BashStartArgs(command="echo ok > started_out.txt"), ctx
+        )
+        assert result.write_paths == [str(tmp_path / "started_out.txt")]
+        assert result.write_paths_unknown is False
+        # The projected payload keeps its shape (the write surface is
+        # in-process accounting, not wire output).
+        assert "write_paths" not in result.model_dump(mode="json")
+
+        paths, unknown = bash_write_paths_from_result_event(
+            ToolResultEvent(
+                tool_name="bash_start",
+                tool_class=BashStart,
+                result=result,
+                tool_call_id="start",
+            )
+        )
+        assert paths == [str(tmp_path / "started_out.txt")]
+        assert unknown is False
+    finally:
+        await registry.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_start_attaches_command_write_paths_for_the_submission_scan(
+    tmp_path,
+):
+    # A failed admission may still have spawned the command (partial
+    # execution): the write footprint is computed before the start outcome
+    # and rides the raised error, so the submission scan keeps covering it.
+    registry = BackgroundJobRegistry()
+    port = registry.root_port()
+    await registry.aclose()
+    tool = manager(tmp_path).get("bash_start")
+    ctx = InvokeContext(tool_call_id="start", background_jobs=port)
+    with pytest.raises(ToolError) as excinfo:
+        await run(tool, BashStartArgs(command="echo ok > started_out.txt"), ctx)
+    assert isinstance(excinfo.value, FailedJobStart)
+    assert "Unable to start background job" in str(excinfo.value)
+    assert excinfo.value.write_paths == [str(tmp_path / "started_out.txt")]
+    assert excinfo.value.write_paths_unknown is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_attaches_command_write_paths(tmp_path):
+    # A cancelled admission may still have spawned the command; the write
+    # footprint rides the cancellation (CancelledShellCommand) to the
+    # executor's cancelled result event.
+    class BlockedPort:
+        async def start(self, args, *, cwd=None, execute_command=None):
+            await asyncio.Event().wait()
+
+    tool = manager(tmp_path).get("bash_start")
+    ctx = InvokeContext(tool_call_id="start", background_jobs=cast(Any, BlockedPort()))
+    task = asyncio.create_task(
+        run(tool, BashStartArgs(command="echo ok > started_out.txt"), ctx)
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(CancelledShellCommand) as excinfo:
+        await task
+    assert excinfo.value.write_paths == [str(tmp_path / "started_out.txt")]
+    assert excinfo.value.write_paths_unknown is False
 
 
 @pytest.mark.parametrize("child", [False, True])
@@ -130,8 +208,10 @@ async def run(tool: Any, args: Any, ctx: InvokeContext | None = None) -> Any:
             for key, value in (
                 ("cursor", -1),
                 ("cursor", True),
+                ("max_bytes", 100),
                 ("max_bytes", 4095),
                 ("max_bytes", 64001),
+                ("wait_seconds", 60),
                 ("wait_seconds", 31),
                 ("wait_seconds", float("nan")),
             )
@@ -145,6 +225,49 @@ async def run(tool: Any, args: Any, ctx: InvokeContext | None = None) -> Any:
 def test_schema_rejects_invalid_controls(schema, values):
     with pytest.raises(ValidationError):
         schema.model_validate(values)
+
+
+def test_bash_read_schema_field_descriptions_name_bounds():
+    properties = BashRead.get_parameters()["properties"]
+    assert properties["max_bytes"]["description"] == (
+        "UTF-8 output bytes; minimum 4096, maximum 64000"
+    )
+    assert properties["max_bytes"]["minimum"] == 4096
+    assert properties["max_bytes"]["maximum"] == 64000
+    assert properties["wait_seconds"]["description"] == (
+        "Seconds to wait for new output; maximum 30"
+    )
+    assert properties["wait_seconds"]["maximum"] == 30
+    assert properties["wait_seconds"]["minimum"] == 0
+    assert properties["cursor"]["description"] == (
+        "Cursor position; start at 0, then pass next_cursor forward"
+    )
+
+
+@pytest.mark.parametrize(
+    ("values", "remediation"),
+    [
+        ({"job_id": "j", "wait_seconds": 60}, "wait_seconds must be at most 30"),
+        ({"job_id": "j", "max_bytes": 100}, "max_bytes must be at least 4096"),
+    ],
+)
+def test_bash_read_bounds_name_the_violated_bound(values, remediation):
+    with pytest.raises(ValidationError) as excinfo:
+        BashReadArgs.model_validate(values)
+    assert remediation in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_bash_read_invoke_remediation_names_the_violated_bound(tmp_path):
+    tool = manager(tmp_path).get("bash_read")
+    with pytest.raises(ToolError) as excinfo:
+        async for _ in tool.invoke(job_id="j", wait_seconds=60):
+            pass
+    assert "wait_seconds must be at most 30" in str(excinfo.value)
+    with pytest.raises(ToolError) as excinfo:
+        async for _ in tool.invoke(job_id="j", max_bytes=100):
+            pass
+    assert "max_bytes must be at least 4096" in str(excinfo.value)
 
 
 @pytest.mark.parametrize("tool_class", TOOLS)

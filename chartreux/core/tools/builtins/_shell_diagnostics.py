@@ -121,6 +121,16 @@ def _command_preview(value: str, limit: int = _PREVIEW_LENGTH) -> str:
     return _preview(REDACTED_PLACEHOLDER if sanitized is None else sanitized, limit)
 
 
+def _detail_preview(value: str, limit: int = _PREVIEW_LENGTH) -> str:
+    # A denial detail is policy-authored prose, not shell source: an
+    # unmatched quote in it ("the destination's receive-pack and hooks")
+    # must degrade to direct redaction of the known secret values, never to
+    # dropping the whole reason. Command-source fields stay conservative
+    # above: an unrecoverable source previews as [REDACTED].
+    sanitized = _redact_shell_source(value)
+    return _preview(value if sanitized is None else sanitized, limit)
+
+
 def render_diagnostic(diagnostic: Diagnostic) -> str:  # noqa: PLR0912
     """The single redaction, escaping and bounding boundary for shell denials."""
     field_preview = _command_preview if known_secret_values() else _preview
@@ -131,7 +141,11 @@ def render_diagnostic(diagnostic: Diagnostic) -> str:  # noqa: PLR0912
         if diagnostic.related
         else diagnostic.detail or ""
     )
-    detail = field_preview(original_detail, 640)
+    detail = (
+        _detail_preview(original_detail, 640)
+        if known_secret_values()
+        else _preview(original_detail, 640)
+    )
     match diagnostic.code:
         case "recursive_rm":
             # A policy hard guard: the blocked requirement is stated plainly
@@ -155,9 +169,24 @@ def render_diagnostic(diagnostic: Diagnostic) -> str:  # noqa: PLR0912
         case "denylist":
             message = f"Command denied: '{part}' matches denylist pattern '{token}'. Do not attempt to run this command."
         case "dangerous_command":
+            # The noun follows the operations: git calls keep the historical
+            # wording (and a token-less diagnostic renders it unchanged);
+            # a call naming a non-git operation (network.egress, v0.5.9
+            # P2-a) is not described as a git operation.
+            operations = [
+                operation.strip()
+                for operation in (diagnostic.offending_token or "").split(",")
+                if operation.strip()
+            ]
+            noun = (
+                "a dangerous operation"
+                if operations
+                and not all(operation.startswith("git.") for operation in operations)
+                else "a dangerous git operation"
+            )
             message = (
-                f"Command denied: '{part}' requires approval for a dangerous git "
-                f"operation ({token}): {detail}"
+                f"Command denied: '{part}' requires approval for "
+                f"{noun} ({token}): {detail}"
             )
         case "dangerous_guard":
             message = f"Command denied: {detail}"

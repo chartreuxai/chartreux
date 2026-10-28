@@ -635,7 +635,7 @@ async def test_notification_failure_still_idles_agent_and_cleans_pending_markers
     monkeypatch.setattr(
         SessionRuntimeRegistry,
         "_start_child_turn",
-        lambda *_args: ("turn-1", lambda: None),
+        lambda *_args, **_kwargs: ("turn-1", lambda: None),
     )
     monkeypatch.setattr(
         registry,

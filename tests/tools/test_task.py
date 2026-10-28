@@ -125,12 +125,17 @@ class TestTaskArgs:
     def test_task_prompt_documents_single_preset_semantics(
         self, catalog: ModelCatalog
     ) -> None:
-        prompt, alias = _rendered_task(catalog)
+        prompt, _alias = _rendered_task(catalog)
         prompt = " ".join(prompt.split())
 
         # One configured model and ten produce identical routing: the
-        # launch-target table binds the session model for every purpose.
-        assert f"| `implementation` | `coder` | substantive | — | `{alias}` |" in prompt
+        # launch-target table binds the session model for the session-bound
+        # purposes, and the four cost-tier-aware purposes render the
+        # $cheapest-capable marker.
+        assert (
+            "| `implementation` | `coder` | substantive | — | `$cheapest-capable` |"
+            in prompt
+        )
         assert "A purpose route binds the launch defaults for one purpose" in prompt
         assert (
             "Explicit `model` and `identity` fields override the route's "
@@ -148,14 +153,23 @@ class TestTaskArgs:
     def test_task_prompt_documents_mechanical_tier_routes(
         self, catalog: ModelCatalog
     ) -> None:
-        prompt, alias = _rendered_task(catalog)
+        prompt, _alias = _rendered_task(catalog)
         prompt = " ".join(prompt.split())
 
         # The mechanical-tier purposes render with their tier in the
-        # launch-target table, bound to the session model.
-        assert f"| `mechanical-edit` | `coder` | mechanical | — | `{alias}` |" in prompt
-        assert f"| `search` | `researcher` | mechanical | — | `{alias}` |" in prompt
-        assert f"| `verification` | `coder` | mechanical | — | `{alias}` |" in prompt
+        # launch-target table, on the $cheapest-capable cost-tier default.
+        assert (
+            "| `mechanical-edit` | `coder` | mechanical | — | `$cheapest-capable` |"
+            in prompt
+        )
+        assert (
+            "| `search` | `researcher` | mechanical | — | `$cheapest-capable` |"
+            in prompt
+        )
+        assert (
+            "| `verification` | `coder` | mechanical | — | `$cheapest-capable` |"
+            in prompt
+        )
         # The reuse prose re-states the purpose on every retask.
         assert "re-state the purpose explicitly on every reuse" in prompt
         # The retired slot-prose examples never render.
@@ -780,14 +794,34 @@ def test_background_task_result_display_uses_launch_handle() -> None:
     assert display.message == "agent agent-1 (run run-1): provider/base"
     assert Task.project_result(result) == {"models": ["provider/base"]}
 
-    def test_task_prompt_documents_working_set_handoff(self) -> None:
-        prompt = (
-            Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/task.md"
-        ).read_text()
 
-        # The dispatch documentation surfaces the spawn handoff: the working-set
-        # files with revisions and outlines, and the append-only state blocks.
-        assert "file_state_handoff" in prompt
-        assert "working-set files" in prompt
-        assert "<file_state>" in prompt
-        assert "never rewritten" in prompt
+def test_task_prompt_documents_working_set_handoff() -> None:
+    prompt = (
+        Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/task.md"
+    ).read_text()
+
+    # The dispatch documentation surfaces the spawn handoff: the working-set
+    # files with revisions and outlines, and the append-only state blocks.
+    assert "file_state_handoff" in prompt
+    assert "working-set files" in prompt
+    assert "<file_state>" in prompt
+    assert "never rewritten" in prompt
+
+
+def test_task_prompt_documents_cooldown_override() -> None:
+    prompt = (
+        Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/task.md"
+    ).read_text()
+
+    # The explicit un-stick override is request-only: the ledger still
+    # denies, denials consume nothing, diagnostics are bounded, and the
+    # forced attempt is never replayed automatically (F6).
+    assert "`override_cooldown: true`" in prompt
+    assert "only REQUESTS the override" in prompt
+    assert "still denies the mint" in prompt
+    assert "consumes nothing" in prompt
+    assert "never automatically replayed" in prompt
+    assert "Automatic paths never request the override or acquire permits" in prompt
+    # Bounded un-stick diagnostics ride the launch acknowledgment.
+    assert "bounded un-stick diagnostics" in prompt
+    assert "next permitted start" in prompt

@@ -16,12 +16,15 @@ from chartreux.app_server.models import (
     PublicCheckpointEntry,
     PublicHistoryEntry,
     PublicMessageEntry,
+    PublicNoticeEntry,
+    RouteTableAppliedNoticeDetail,
 )
 from chartreux.app_server.protocol import (
     AppServerResponseError,
     ClientInfo,
     ConfigMutationResponse,
     ConfigReloadParams,
+    HistoryEntryAddedParams,
     Notification,
     PageRequest,
     ProtocolErrorCode,
@@ -37,6 +40,8 @@ from chartreux.app_server.session import AppServerSession
 from chartreux.app_server.transport import memory_transport_pair
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.config import ModelConfig, SessionLoggingConfig
+from chartreux.core.dispatch.route_models import PackageTier, PurposeRoute, RouteTarget
+from chartreux.core.dispatch.routes import SESSION_MODEL, shipped_routes
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session.session_lease import SessionBusyError, SessionLease
 from tests.app_server._session_runtime_support import (
@@ -477,6 +482,92 @@ async def test_reload_reports_pending_identity_change_without_reposturing(
             for note in agent_loop.pending_policy_changes
         )
     finally:
+        await agent_loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reload_applies_route_edit_and_publishes_the_applied_notice() -> None:
+    # ADR 0022 checks 3 and 4 end to end over the wire: a validated route
+    # edit applied at a config reload is adopted by the admission source,
+    # served by the task tool description (the served launch-target table
+    # equals the admission table), and the applied notice publishes through
+    # history/entryAdded — the "applies to new conversations only" route
+    # pending text is gone.
+    client_transport, server_transport = memory_transport_pair()
+    agent_loop = build_test_agent_loop(
+        config=build_test_vibe_config(
+            enabled_tools=["task"], tools={"task": {"permission": "always"}}
+        )
+    )
+    server = build_test_app_server(agent_loop, server_transport)
+    client = AppServerClient(client_transport, run_peer=server.serve)
+    try:
+        await client.initialize(ClientInfo(name="route-edit-test", version="1"))
+        await client.notify("initialized")
+        await client.request("session/start", SessionStartParams())
+
+        routes = dict(shipped_routes())
+        routes["research"] = PurposeRoute(
+            targets=(
+                RouteTarget(
+                    model=SESSION_MODEL, identity="coder", tier=PackageTier.SUBSTANTIVE
+                ),
+            )
+        )
+        set_agent_config(
+            agent_loop,
+            build_test_vibe_config(
+                enabled_tools=["task"],
+                tools={"task": {"permission": "always"}},
+                orchestration={"routes": routes},
+            ),
+        )
+        await client.request(
+            "config/reload", ConfigReloadParams(session_id=agent_loop.session_id)
+        )
+
+        # The admission source is the edited live table...
+        assert agent_loop.live_purpose_routes["research"].targets[0].identity == (
+            "coder"
+        )
+        # ...and the served task tool description shows the same table.
+        served = agent_loop.tool_manager._tool_descriptions["task"]
+        research_row = next(
+            line for line in served.splitlines() if line.startswith("| `research` |")
+        )
+        assert "`coder`" in research_row
+
+        # Check 4: the applied notice publishes through history/entryAdded.
+        incoming = client.incoming()
+        async with asyncio.timeout(5):
+            while True:
+                message = await anext(incoming)
+                if not (
+                    isinstance(message, Notification)
+                    and message.method == "history/entryAdded"
+                ):
+                    continue
+                params = validate_wire(HistoryEntryAddedParams, message.params)
+                entry = params.entry
+                if isinstance(entry, PublicNoticeEntry) and isinstance(
+                    entry.detail, RouteTableAppliedNoticeDetail
+                ):
+                    break
+        await incoming.aclose()
+
+        assert entry.message.startswith("Route table updated")
+        assert "`research`" in entry.message
+        assert "apply to subsequent launches" in entry.message
+        assert "in-flight children keep their bindings" in entry.message
+        assert [change.purpose for change in entry.detail.changes] == ["research"]
+        change = entry.detail.changes[0]
+        assert "researcher" in change.before
+        assert "coder" in change.after
+        # The route edit is applied, not pending: no route pending note, and
+        # the identity/workflow/strategy pending branches stay silent too.
+        assert agent_loop.pending_policy_changes == ()
+    finally:
+        await client.close()
         await agent_loop.aclose()
 
 

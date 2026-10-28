@@ -13,8 +13,11 @@ scanner stack (``_OptionTokenScan``, ``_StrictGitOptions``,
 ``_GitGlobalScan``, the ``_scan_*`` token scanners,
 ``_scan_classified_git_options``), the ``git config`` scan contract shared by
 classifier and runtime policy (``_GIT_CONFIG_TABLE`` with its action sets,
-``_GitConfigCall``, ``_scan_git_config_call``), and
-``_GIT_SUBCOMMAND_INDEX``. This module imports only ``_shell_argv`` and
+``_GitConfigCall``, ``_scan_git_config_call``), the ``git symbolic-ref`` mode
+scan shared by classifier and runtime policy (``_GIT_SYMBOLIC_REF_TABLE``
+with its write markers, ``_GitSymbolicRefCall``,
+``_scan_git_symbolic_ref_call``), and ``_GIT_SUBCOMMAND_INDEX``. This module
+imports only ``_shell_argv`` and
 ``chartreux.core.dangerous_commands``; ``_shell_command_policy`` (the facade)
 re-exports every name defined here, so import paths and object identity are
 unchanged by the split.
@@ -170,12 +173,14 @@ _GIT_NONREADER_SUBCOMMANDS = frozenset({
 
 # Known builtins without modeled operand/side-effect rules remain gated, but
 # are not aliases. Do not treat these as readers (e.g. fsck --lost-found writes).
+# Disjoint from the reader set by construction: a subcommand listed here and
+# in _GIT_READER_SUBCOMMANDS would make the classifier's unmodeled check
+# contradict the policy layer's reader branch for the same invocation.
 _GIT_UNMODELED_BUILTINS = frozenset({
     "bundle",
     "fsck",
     "gc",
     "maintenance",
-    "reflog",
     "prune",
     "repack",
     "pack-objects",
@@ -183,32 +188,25 @@ _GIT_UNMODELED_BUILTINS = frozenset({
     "unpack-objects",
     "update-index",
     "update-ref",
-    "symbolic-ref",
     "hash-object",
     "write-tree",
     "read-tree",
     "commit-tree",
     "mktree",
-    "merge-base",
     "merge-file",
     "merge-index",
     "merge-tree",
-    "name-rev",
-    "describe",
     "fast-export",
     "fast-import",
     "filter-branch",
     "format-patch",
     "send-email",
     "request-pull",
-    "shortlog",
     "sparse-checkout",
     "multi-pack-index",
     "pack-refs",
-    "verify-pack",
     "verify-commit",
     "verify-tag",
-    "count-objects",
     "rerere",
     "replace",
     "credential",
@@ -223,7 +221,6 @@ _GIT_UNMODELED_BUILTINS = frozenset({
     "bugreport",
     "diagnose",
     "scalar",
-    "whatchanged",
 })
 
 
@@ -700,6 +697,62 @@ def _scan_git_config_call(args: list[str]) -> _GitConfigCall:
         mutates=mutates,
         section_operation=section_operation,
         renames=subcommand == "rename-section" or "--rename-section" in options,
+    )
+
+
+# git symbolic-ref reads a symbolic ref (``git symbolic-ref HEAD`` prints
+# the branch HEAD points at) but also writes refs: two operands update the
+# ref, and -m/--message (an update with a reflog reason) and -d/--delete
+# (a deletion) select the write forms. The builtin is therefore modeled BY
+# MODE: the read form (exactly one operand, no write marker) resolves like
+# a reader; every other form is not granted by the read modeling and keeps
+# the unmodeled-builtin denial.
+_GIT_SYMBOLIC_REF_TABLE = _OptionTable(
+    frozenset({"--message"}),
+    frozenset({"m"}),
+    boolean_long=frozenset({
+        "--delete",
+        "--no-recurse",
+        "--quiet",
+        "--recurse",
+        "--short",
+    }),
+)
+_GIT_SYMBOLIC_REF_BOOLEAN_SHORTS = frozenset({"d", "q"})
+# Write markers: -m/--message records a reflog reason for an update,
+# -d/--delete deletes the named ref, and a second operand is the plain
+# ``symbolic-ref <name> <ref>`` update form.
+_GIT_SYMBOLIC_REF_WRITE_OPTIONS = frozenset({"--delete", "--message", "-d", "-m"})
+
+
+@dataclass(frozen=True)
+class _GitSymbolicRefCall:
+    """One scanned ``git symbolic-ref`` call, shared by classifier and policy.
+
+    ``reads`` holds only for the modeled read form (exactly one operand and
+    no write marker); ``writes`` holds for the ref-updating and deleting
+    forms. A scan error or any other operand count is neither: it fails
+    closed under the unmodeled-form denial.
+    """
+
+    operands: tuple[str, ...]
+    error: str | None
+    reads: bool
+    writes: bool
+
+
+def _scan_git_symbolic_ref_call(args: list[str]) -> _GitSymbolicRefCall:
+    """Scan one git symbolic-ref call into its read/write mode."""
+    scan = _scan_classified_git_options(
+        args, _GIT_SYMBOLIC_REF_TABLE, boolean_shorts=_GIT_SYMBOLIC_REF_BOOLEAN_SHORTS
+    )
+    writes = scan.error is None and (
+        bool(set(scan.options) & _GIT_SYMBOLIC_REF_WRITE_OPTIONS)
+        or len(scan.operands) > 1
+    )
+    reads = scan.error is None and not writes and len(scan.operands) == 1
+    return _GitSymbolicRefCall(
+        operands=scan.operands, error=scan.error, reads=reads, writes=writes
     )
 
 

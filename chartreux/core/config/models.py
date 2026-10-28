@@ -187,8 +187,12 @@ class RecoveryConfig(BaseModel):
     (promoted at WP6 per OD5 once WP4's acceptance matrix passed;
     ``enabled`` defaults to True). Every deadline here is an ADVISORY
     scheduling/admission bound (Q2/F3: no hard in-flight kill exists —
-    the retry budget is consulted only between attempts), and safety
-    exclusions are code invariants, never config escape hatches.
+    the retry budget is consulted only between attempts) with ONE explicit
+    exception: ``resume_progress_deadline_seconds`` (C5b) is a hard in-flight
+    kill for explicitly marked resumed contexts — a resumed run's first
+    model call must observe a semantic delta within the deadline or the
+    in-flight call is killed; ordinary runs are structurally unaffected.
+    Safety exclusions are code invariants, never config escape hatches.
 
     The section lives inside the ``[recovery]`` container
     (:class:`RecoverySectionConfig`); the root-turn controller's
@@ -205,6 +209,16 @@ class RecoveryConfig(BaseModel):
     # Advisory aggregate episode bound (handoff §2.3: ~40 minutes including
     # the initial failed call); never an in-flight kill.
     episode_deadline_seconds: float = Field(default=2400.0, gt=0.0, allow_inf_nan=False)
+    # C5b: the ONE hard in-flight kill in the recovery policy — the explicit
+    # exception to the advisory-deadlines policy in the class docstring. A
+    # resumed run's first model call must observe a semantic delta (content,
+    # reasoning, or tool-call) within this deadline or the in-flight call is
+    # killed and the run fails with the measured ``resume_progress_deadline``
+    # timeout reason (the C5a producer contract). Armed only for explicitly
+    # marked resumed contexts; ordinary runs are structurally unaffected.
+    resume_progress_deadline_seconds: float = Field(
+        default=180.0, gt=0.0, allow_inf_nan=False
+    )
     endpoint_correlation_window_seconds: float = Field(
         default=300.0, gt=0.0, allow_inf_nan=False
     )
@@ -245,6 +259,11 @@ class RecoveryConfig(BaseModel):
         default=None, gt=0.0, allow_inf_nan=False
     )
     fallback_replacements_max_per_package: int = Field(default=2, ge=0, strict=True)
+
+    @field_validator("resume_progress_deadline_seconds", mode="before")
+    @classmethod
+    def validate_resume_progress_deadline(cls, value: Any) -> Any:
+        return _reject_bool_duration(value)
 
     @field_validator("cooldowns_seconds")
     @classmethod
@@ -448,6 +467,26 @@ class UserQuestionsConfig(BaseModel):
                 "max_timeout_seconds"
             )
         return self
+
+
+class CompletionSectionConfig(BaseModel):
+    """The ``[completion]`` config section: the completion-audit mode.
+
+    ``mode`` defaults to ``enforce``: publication is blocked on an audit
+    rejection (a worker-side disposition); ``stamp`` only stamps the
+    composed classification onto the result without blocking. The default
+    is the recorded enforce-activation decision: the activation
+    prerequisites landed first — the parent-shared roots and the receipt's
+    claimed-value surface are wired into the production composition, so an
+    honest worker is never falsely rejected (the zero-honest-false-
+    rejections economics), and the replay gates, the post-contract
+    observation gate, and the offline fresh-runtime enforce-mode test are
+    green. Before that activation the default was ``stamp``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["stamp", "enforce"] = "enforce"
 
 
 type StatusLineSegment = Literal[

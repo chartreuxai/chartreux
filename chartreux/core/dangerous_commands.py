@@ -110,6 +110,16 @@ _OPERATION_ENTRIES: tuple[DangerousOperation, ...] = (
         consequence="Delete a reflog entry; destroys the recovery path for lost commits.",
         persistable=False,
     ),
+    DangerousOperation(
+        operation_id="network.egress",
+        command_class="publication",
+        consequence=(
+            "Send data from this machine to a network destination outside "
+            "the local loopback (non-localhost egress via a recognized "
+            "network client)."
+        ),
+        persistable=True,
+    ),
 )
 
 OPERATION_REGISTRY: Mapping[str, DangerousOperation] = MappingProxyType({

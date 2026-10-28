@@ -5,6 +5,9 @@
 Accepted; superseded in part by v0.5.8 — the redirect-glob statements in
 Consequences (and the F2/F3 fix-round note) are reversed; see
 [Superseded in part by v0.5.8](#superseded-in-part-by-v058) at the end of
+this record. Also superseded in part by v0.6.0 — the `curl` clause of the
+`<redirect>`-marker bullet in section 1 no longer holds; see
+[Superseded in part by v0.6.0](#superseded-in-part-by-v060) at the end of
 this record.
 
 ## Context
@@ -259,3 +262,16 @@ release notes):
 Everything else in this record — the occurrence-local cd-chain modeling, the
 scratchpad absolute-target authorization, the metadata-guard ordering, and
 the accepted residuals — stands unchanged.
+
+## Superseded in part by v0.6.0
+
+The `curl` clause of the `<redirect>`-marker bullet in section 1 ("`curl ...
+> log.txt` stays denied via prefix matching") no longer holds. Modeled
+`curl` and `wget` left the shipped denylist in the v0.6.0 permission
+realignment, so a redirect target no longer inherits a client-name denial:
+`curl ... > log.txt` resolves like any modeled `curl` call — the
+destination-aware egress rule decides (a literal loopback destination runs
+with no dialog; any other destination resolves ask-class `network.egress`),
+and the redirect destination itself is a collected, path-inspected write
+operand. The `<redirect>` marker's other half — `python > log.txt` stays
+allowed while bare `python` stays standalone-denied — stands unchanged.

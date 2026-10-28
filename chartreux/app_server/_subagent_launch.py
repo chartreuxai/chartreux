@@ -12,6 +12,7 @@ from chartreux.app_server._subagent_recovery import _effective_eligibility
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agents.identity_launch import (
     parse_model_shorthand,
+    resolve_identity_launch,
     validate_launch_purpose_binding,
 )
 from chartreux.core.agents.launch import FrozenPersona, LaunchCandidate, resolve_launch
@@ -24,10 +25,16 @@ from chartreux.core.dispatch.renderer import session_model_alias
 from chartreux.core.dispatch.route_models import ReplacementCapability
 from chartreux.core.model_catalog.resolver import ModelResolutionError, resolver_for
 from chartreux.core.recovery_models import (
+    FailureClass,
     FailureEnvelope,
     PackageTier,
     RecoveryEligibility,
     canonical_endpoint_identity,
+)
+from chartreux.core.recovery_override import (
+    CooldownOverrideLedger,
+    OverrideDenial,
+    OverridePermit,
 )
 from chartreux.core.recovery_policy import (
     ReplacementCandidate,
@@ -38,14 +45,16 @@ from chartreux.core.recovery_policy import (
     validate_replacement_selection,
 )
 from chartreux.core.session.saved_sessions import delete_saved_session
+from chartreux.core.session_types import CommittedModelIdentity
 from chartreux.core.subagents import (
     InvalidLaunchModelError,
     LaunchConfig,
     LaunchConfigError,
+    ReconcileOutcome,
     RunStatus,
     TaskArgs,
 )
-from chartreux.core.tools.base import InvokeContext
+from chartreux.core.tools.base import InvokeContext, ToolError
 from chartreux.core.tools.manager import ToolManager
 from chartreux.core.tools.models import ToolPermission, ToolPermissionError
 from chartreux.observability.logging import logger
@@ -151,6 +160,134 @@ class ChildPublicationAttempt:
             await delete_saved_session(session_id, child.config.session_logging)
 
 
+@dataclass(frozen=True, slots=True)
+class OverrideMint:
+    """The C4 mint: one endpoint-bound permit plus its binding ledger."""
+
+    permit: OverridePermit
+    ledger: CooldownOverrideLedger
+    endpoint: str
+
+
+def bind_override_to_loop(loop: AgentLoop, mint: OverrideMint) -> None:
+    """Bind the minted permit to the child's NEXT logical model call (C3).
+
+    The coordinator slot is C3's binding channel: the child's first
+    completion attempt enumerates its candidates THROUGH the permit (the
+    cooled forced deployment is eligible), the forced candidate carries the
+    binding into the gateway, the actual transport start consumes the
+    permit, and the slot clears — exactly one forced attempt per mint.
+    """
+    loop._completion_coordinator._active_override = (mint.permit, mint.ledger)
+
+
+def release_bound_override(loop: AgentLoop) -> None:
+    """Release the loop's bound permit when its run never started (C4 net).
+
+    A pre-start discard (rollback of the creation or of the admission) must
+    not strand the endpoint's single in-flight slot: release the still-bound
+    permit. Release is typed and idempotent — a permit already consumed at
+    its transport start is no longer outstanding and release is a no-op —
+    so the net is safe on every rollback path.
+    """
+    binding = loop._completion_coordinator._active_override
+    if binding is None:
+        return
+    permit, ledger = binding
+    loop._completion_coordinator._active_override = None
+    ledger.release(permit)
+
+
+def override_launch_diagnostics(loop: AgentLoop) -> dict[str, object] | None:
+    """The bounded C4 un-stick diagnostics from the loop's bound permit.
+
+    Read pre-start (before the child's first model call consumes the
+    binding): the selected deployment, the cooldown exclusions the permit
+    bypasses, the start allowance remaining after this attempt consumes, and
+    the delay until the NEXT permitted start. None when the loop carries no
+    override binding (ordinary and automatic launches never do — F6).
+    """
+    binding = loop._completion_coordinator._active_override
+    if binding is None:
+        return None
+    permit, ledger = binding
+    registry = loop.config_orchestrator.availability_registry
+    # episode_status canonicalizes its input, so it needs the RAW api_base;
+    # recover it from the catalog by matching the permit's canonical identity.
+    snapshot = loop.config.catalog_snapshot
+    raw_endpoint = (
+        next(
+            (
+                provider.api_base
+                for provider in snapshot.catalog.providers.values()
+                if canonical_endpoint_identity(provider.api_base) == permit.endpoint
+            ),
+            None,
+        )
+        if snapshot is not None
+        else None
+    )
+    status = ledger.episode_status(raw_endpoint)
+    exclusions: list[str] = []
+    committed = loop.committed_model
+    if committed is not None:
+        if registry.endpoint_correlation_active(permit.endpoint):
+            exclusions.append("endpoint-cooldown")
+        if not registry.is_available(committed.base_model, committed.provider):
+            exclusions.append("deployment-cooldown")
+    remaining = (status.starts_remaining - 1) if status is not None else 0
+    next_start_delay: float | None = None
+    if status is not None and remaining > 0:
+        # The next start after this attempt's own: spacing since this
+        # attempt's reserve and the pressure bound's window for start
+        # number starts_used + 2.
+        next_time = max(
+            permit.issued_at + ledger.start_spacing_seconds,
+            status.opened_at + (status.starts_used + 1) * status.start_spacing_seconds,
+        )
+        next_start_delay = max(0.0, next_time - ledger._clock())
+    diagnostics: dict[str, object] = {
+        "endpoint": permit.endpoint,
+        "exclusions_bypassed": exclusions,
+        "remaining_starts": max(0, remaining),
+        "next_start_delay_seconds": next_start_delay,
+    }
+    if committed is not None:
+        diagnostics["base_model"] = committed.base_model
+        diagnostics["provider"] = committed.provider
+        diagnostics["wire_name"] = committed.wire_name
+    return diagnostics
+
+
+def _override_denial_message(
+    denial: OverrideDenial | None, ledger: CooldownOverrideLedger, endpoint: str | None
+) -> str:
+    """The bounded un-stick denial message, diagnostics included."""
+    status = ledger.episode_status(endpoint) if endpoint is not None else None
+    if denial is OverrideDenial.NO_ACTIVE_EPISODE or status is None:
+        detail = (
+            "no active endpoint episode: the un-stick override applies only "
+            "within a measured cooldown episode"
+        )
+    elif denial is OverrideDenial.EPISODE_EXHAUSTED:
+        detail = "the episode's forced-start budget is exhausted"
+    elif denial is OverrideDenial.ATTEMPT_IN_FLIGHT:
+        detail = "a forced attempt is already in flight for this endpoint"
+    elif denial is OverrideDenial.SPACING_EXCEEDED:
+        detail = "the forced-start spacing floor has not elapsed yet"
+    else:
+        detail = "the override ledger denied the reservation"
+    message = f"Cooldown override denied for endpoint {endpoint!r}: {detail}."
+    if status is not None:
+        delay = status.next_start_delay_seconds(ledger._clock())
+        message += f" Starts used {status.starts_used}/{status.max_starts}; " + (
+            f"next permitted start in ~{delay:.0f}s."
+            if delay is not None
+            else "no further start is admitted in this episode."
+        )
+    return message
+
+
 class ChildLaunchAdmission:
     """Launch admission, publication, and rollback for child sessions.
 
@@ -204,6 +341,8 @@ class ChildLaunchAdmission:
         *,
         runtime: SessionRuntime | None = None,
         identity: str | None = None,
+        override_permit: OverridePermit | None = None,
+        override_ledger: CooldownOverrideLedger | None = None,
     ) -> LaunchCandidate:
         """Resolve the launch candidate for a fresh or reused child.
 
@@ -222,6 +361,11 @@ class ChildLaunchAdmission:
         nested config.model), and a supplied purpose/seat binding is
         validated through the route grammar — never copied from the previous
         run, never accepted unvalidated.
+
+        ``override_permit``/``override_ledger`` (C4): the minted forced-
+        attempt binding for an explicit ``override_cooldown`` task request,
+        threaded into the model-assignment availability predicate so the
+        cooled forced deployment stays assignable.
         """
         child = runtime.agent_loop if runtime is not None else None
         if child is None:
@@ -242,13 +386,13 @@ class ChildLaunchAdmission:
                 ),
                 session_model=parent.agent_loop.config.active_model,
                 user_prompts_dirs=parent.agent_loop.harness_files.user_prompts_dirs,
-                # Purpose routes resolve against the CONVERSATION'S FROZEN
-                # route table — the bound bundle's captured snapshot, the
-                # same source the rendered launch-target table carries —
-                # never the reloaded live config, so a mid-conversation
-                # route edit stays pending instead of producing a
-                # mixed-generation launch (design §6, §10).
-                routes=parent.agent_loop.frozen_purpose_routes,
+                # Purpose routes resolve against the conversation's LIVE
+                # route table — the in-memory table the reload swaps
+                # atomically, the same source the rendered launch-target
+                # table carries — so a validated route edit applies to
+                # every launch admitted after the reload commit (ADR 0022).
+                override_permit=override_permit,
+                override_ledger=override_ledger,
             )
             claim = args.config
             if claim is not None and claim.predecessor_agent_id is not None:
@@ -296,16 +440,14 @@ class ChildLaunchAdmission:
             # its record, so the route's own defaults are validated for
             # availability only — never adopted — but an invalid purpose or
             # seat binding fails loudly instead of being accepted. The
-            # binding validates against the conversation's FROZEN route
-            # table (the bound bundle's snapshot), so a purpose whose frozen
-            # route was edited away mid-conversation is rejected exactly as
-            # a fresh launch would reject it (design §6, §10).
+            # binding validates against the conversation's LIVE route table,
+            # so a purpose whose route was edited by a reload is validated
+            # exactly as a fresh launch validates it (ADR 0022).
             validate_launch_purpose_binding(
                 args.purpose,
                 config=parent.agent_loop.config,
                 seat=args.seat,
                 session_model=parent.agent_loop.config.active_model,
-                routes=parent.agent_loop.frozen_purpose_routes,
             )
         return resolve_launch(
             identity=retained_identity,
@@ -338,6 +480,90 @@ class ChildLaunchAdmission:
             replacement_capability=(
                 child.launch_replacement_capability or ReplacementCapability.NONE
             ),
+            override_permit=override_permit,
+            override_ledger=override_ledger,
+        )
+
+    def mint_override_permit(
+        self,
+        parent: SessionRuntime,
+        args: TaskArgs,
+        *,
+        committed: CommittedModelIdentity | None = None,
+    ) -> OverrideMint | None:
+        """Mint the C1 permit for an explicit ``override_cooldown`` request.
+
+        C4 activation: the strict task flag only REQUESTS the un-stick
+        override — root launch admission mints the endpoint-bound permit
+        from the ROOT ledger (shared by every orchestrator copy) only here,
+        and only for the explicit request. The permit's endpoint comes from
+        a pure pre-resolution of the launch selection — the explicitly named
+        model, else the given committed binding (a retained retask), else
+        the canonical session-default resolution — which is the same
+        selection the deep validation makes once the permit bypasses the
+        cooldown predicate. A ledger denial raises :class:`ToolError` with
+        the bounded diagnostics and consumes NOTHING (a denied reserve
+        mutates no counter, no slot, and no episode).
+
+        Automatic paths never carry the flag (F6): only the task tool's
+        explicit argument can request the override, and a subagent context
+        cannot launch at all.
+        """
+        if not args.override_cooldown:
+            return None
+        config = parent.agent_loop.config
+        expression: str | None = args.model
+        if expression is not None:
+            shorthand = parse_model_shorthand(expression)
+            if shorthand is not None:
+                expression = shorthand.model
+        elif (
+            args.config is not None
+            and "model" in args.config.model_fields_set
+            and args.config.model is not None
+        ):
+            # The schema's documented promotion: the legacy nested
+            # config.model is the canonical top-level model selection.
+            expression = args.config.model
+        try:
+            if expression is not None:
+                selected = (
+                    resolver_for(config)
+                    .resolve(expression, allowed_models=config.allowed_models)
+                    .identity
+                )
+            elif committed is not None:
+                selected = committed
+            else:
+                selected = resolve_identity_launch(
+                    args,
+                    config=config,
+                    authorized_tool_names=frozenset(
+                        parent.agent_loop.tool_manager.delegable_tools
+                    ),
+                    session_model=parent.agent_loop.config.active_model,
+                    user_prompts_dirs=parent.agent_loop.harness_files.user_prompts_dirs,
+                ).committed_model
+        except ModelResolutionError as exc:
+            raise InvalidLaunchModelError("model", str(exc)) from exc
+        snapshot = config.catalog_snapshot
+        provider = (
+            snapshot.catalog.providers.get(selected.provider)
+            if snapshot is not None
+            else None
+        )
+        # The raw api_base: the ledger canonicalizes internally, so the
+        # reserve (and the denial diagnostics' status lookup) must receive
+        # the URL, never the canonical identity.
+        raw_endpoint = provider.api_base if provider is not None else None
+        ledger = parent.agent_loop.config_orchestrator.cooldown_override_ledger
+        outcome = ledger.reserve(raw_endpoint)
+        if outcome.denial is not None or outcome.permit is None:
+            raise ToolError(
+                _override_denial_message(outcome.denial, ledger, raw_endpoint)
+            )
+        return OverrideMint(
+            permit=outcome.permit, ledger=ledger, endpoint=outcome.permit.endpoint
         )
 
     def validate_admission(
@@ -455,7 +681,11 @@ class ChildLaunchAdmission:
         the lineage. The write-ownership transfer happens only after
         reconciliation — a suspended barrier that still requires
         reconcile_result blocks the claim; verified unrepeatable damage
-        prohibits any repeat of the package.
+        prohibits any repeat of the package. A typed completion-audit
+        rejection is the one exempt prohibition: its PROHIBITED eligibility
+        bars only a warm same-agent auto-resume, and the failure-time
+        policy authorizes a cross-agent replacement for it (P11), so the
+        claim proceeds to policy validation.
         """
         if (
             record.work_package_id is not None
@@ -487,7 +717,11 @@ class ChildLaunchAdmission:
                 "barrier; submit reconcile_result first — the transfer "
                 "happens only after reconciliation",
             )
-        if eligibility is RecoveryEligibility.PROHIBITED:
+        rejection_escalation = (
+            record.reconcile_outcome != ReconcileOutcome.PROHIBITED.value
+            and envelope.failure.failure_class is FailureClass.COMPLETION_REJECTION
+        )
+        if eligibility is RecoveryEligibility.PROHIBITED and not rejection_escalation:
             raise ReplacementPolicyError(
                 ["recovery_prohibited"],
                 f"Replacement claim rejected: predecessor agent "
@@ -540,13 +774,13 @@ class ChildLaunchAdmission:
         # the claimed candidate and the candidate set — a separate axis from
         # the package tier, and absent markings keep the legacy tier-label
         # derivation (the shipped routes mark nothing). The facts derive
-        # from the conversation's FROZEN route table — the bound bundle's
-        # captured snapshot — so a mid-conversation route edit stays pending
-        # for recovery exactly as it does for launch (design §6, §10).
+        # from the conversation's LIVE route table — the same source launch
+        # admission resolves against (ADR 0022).
         mechanical_models, capability_markings = route_recovery_facts(
-            parent.agent_loop.frozen_purpose_routes,
+            config.purpose_routes.routes,
             session_model=session_model_alias(config),
             canonical_models=resolver.canonical_model_map(),
+            catalog_prices=resolver.catalog_prices(),
         )
         claimed = ReplacementCandidate(
             base_model=resolved.base_model,
@@ -684,7 +918,23 @@ class ChildLaunchAdmission:
             requested_identity = requested_identity_reference(args)
             if requested_identity is not None:
                 self.require_identity_allowed(parent, requested_identity)
-            candidate = self.resolve_candidate(parent, args)
+            # C4: an explicit override request on a replacement claim
+            # resolves the claim's dry-run candidate THROUGH a minted permit
+            # (the cooled forced deployment must pass the claim's identity
+            # resolution); the dry-run reservation is released immediately —
+            # the admitted launch mints its OWN permit at create_registered,
+            # and a release never consumes the start budget.
+            mint = self.mint_override_permit(parent, args)
+            try:
+                candidate = self.resolve_candidate(
+                    parent,
+                    args,
+                    override_permit=mint.permit if mint is not None else None,
+                    override_ledger=mint.ledger if mint is not None else None,
+                )
+            finally:
+                if mint is not None:
+                    mint.ledger.release(mint.permit)
             self.require_identity_allowed(
                 parent, candidate.orchestrator.config.agent.identity
             )
@@ -745,8 +995,42 @@ class ChildLaunchAdmission:
         """Construct, register, and project one child, rolling back on failure.
 
         The second element is the child's committed launch identity reference.
+
+        C4: an explicit ``override_cooldown`` task request mints its permit
+        HERE, at root admission, before the candidate resolution (the deep
+        validation must resolve the cooled forced deployment THROUGH the
+        permit); the permit binds to the constructed child's first model
+        call, and every failure before the run starts releases the
+        reservation so the endpoint's in-flight slot never strands.
         """
-        candidate = self._view._resolve_launch_candidate(parent, args)
+        mint = self.mint_override_permit(parent, args)
+        try:
+            return await self._create_registered_minted(parent, args, ctx, mint)
+        except BaseException:
+            if mint is not None:
+                # Pretransport release: the run never started, so the
+                # reservation must not strand the in-flight slot.
+                mint.ledger.release(mint.permit)
+            raise
+
+    async def _create_registered_minted(
+        self,
+        parent: SessionRuntime,
+        args: TaskArgs,
+        ctx: InvokeContext,
+        mint: OverrideMint | None,
+    ) -> tuple[SessionRuntime, str]:
+        if mint is not None:
+            # C4: the minted permit must reach the model-assignment
+            # availability predicate, and the registry's thin delegate has a
+            # fixed signature — the override path resolves through the
+            # admission collaborator directly. The ordinary (no-mint) path
+            # keeps the delegate so instance patches keep intercepting.
+            candidate = self.resolve_candidate(
+                parent, args, override_permit=mint.permit, override_ledger=mint.ledger
+            )
+        else:
+            candidate = self._view._resolve_launch_candidate(parent, args)
         # The identity denylist applies AFTER final resolution (11c): a
         # route/shorthand/structured identity launch is checked against its
         # resolved identity — the same surface the task tool enforces — before
@@ -775,6 +1059,8 @@ class ChildLaunchAdmission:
             handoff = child.file_state_handoff_message()
             if handoff is not None:
                 child.messages.append(handoff)
+            if mint is not None:
+                bind_override_to_loop(child, mint)
             attempt.child = child
         try:
             self.validate_admission(parent, attempt.identity)
@@ -812,6 +1098,9 @@ class ChildLaunchAdmission:
         self, parent: SessionRuntime, runtime: SessionRuntime, tool_call_id: str
     ) -> None:
         """Remove every durable/runtime trace of a child rejected before acceptance."""
+        # C4: a rejected child never runs, so its bound override permit (if
+        # any) is released pretransport — the in-flight slot must not strand.
+        release_bound_override(runtime.agent_loop)
         session_id = runtime.agent_loop.session_id
         self._view._children.pop(session_id, None)
         self._view._child_links.pop(session_id, None)
