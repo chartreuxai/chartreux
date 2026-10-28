@@ -2,14 +2,20 @@
 
 ## Status
 
-Accepted; implemented in v0.5.9 — the core live semantics (P1-i-a) and the
-resume semantics (P1-i-b) shipped on the v0.5.9 permission-realignment
-branch. The record below is the accepted design; the implementation note at
-the end marks what changed at implementation time.
+Accepted; implemented in v0.6.0 — the core live semantics (P1-i-a) and the
+resume semantics (P1-i-b) shipped on the permission-realignment branch,
+released combined as v0.6.0. The record below is the accepted design; the
+implementation note at the end marks what changed at implementation time.
 
 ## Context
 
-The v0.5.9 plan settled live route editing as in-scope (P0 settlement decision 6), reversing the earlier pending-only position. Shipped semantics were pending-only (`chartreux/core/dispatch/session.py:227-241`): route edits applied to new conversations only, and the per-launch model override was the sanctioned interim mechanism. The design pass of 2026-10-24 (the plan's P1-i analysis) settled the frozen-policy semantics against the shipped code.
+The permission-realignment plan settled live route editing as in-scope (P0
+settlement decision 6), reversing the earlier pending-only position. Shipped
+semantics were pending-only (`chartreux/core/dispatch/session.py:227-241`):
+route edits applied to new conversations only, and the per-launch model
+override was the sanctioned interim mechanism. The design pass of 2026-10-24
+(the plan's P1-i analysis) settled the frozen-policy semantics against the
+shipped code.
 
 ## Decision
 

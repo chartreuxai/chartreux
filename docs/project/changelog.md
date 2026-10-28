@@ -4,6 +4,50 @@ All notable changes to Chartreux are documented in this file.
 
 ## 0.6.0 (2026-10-28)
 
+This is a combined release: everything shipped since v0.5.8 — the
+permission realignment, the backlog design set, and the subagent
+completion audit — ships together as v0.6.0.
+
+### Security
+
+- Destination-aware egress is the settled exfiltration decision for the
+  modeled network clients. Modeled `curl` and `wget` calls are no longer
+  denylisted outright; the destination decides. A literal loopback
+  destination (`localhost`, `127.0.0.0/8`, `::1`) runs with no dialog; any
+  other destination — another IP literal, a DNS name, or one the recognizer
+  cannot parse — resolves ask-class (`network.egress`) and prompts in
+  interactive sessions, denying with remediation in headless and child
+  sessions. The destination-changing behavior classes resolve ask-class even
+  for a literal loopback destination: redirect-following flags (`curl -L`),
+  `wget`'s default redirect behavior, and destination-overriding options
+  (`--resolve`, `--connect-to`). The development-egress carve-out stays
+  run-class (`git fetch`/`clone`/`pull`, `pip`/`uv` installs), and a user
+  denylist entry for these clients remains an absolute veto.
+- Probed egress clients move onto the shipped default denylist: `ssh`,
+  `scp`, `rsync`, `ftp`, `telnet`, `http`/`httpie`, `wget2`, `aria2c`,
+  `lftp`, and `watch` are denied until they are modeled; remove an entry to
+  re-enable a client deliberately.
+- Recursive `rm` gains a git-status-aware carve-out. Over a tree with
+  unsaved changes the blanket handoff denial remains. Over a git-clean tree
+  a recursive `rm` runs on its own only when every expanded operand lies
+  within the assessed repository, clear of its Git metadata (neither
+  encompassing it nor lying inside it, linked-worktree common directories
+  included), with recovery established for every repository involved, nested
+  ones included. The analysis fails closed on every axis — operand scope,
+  metadata overlap, recovery status, expansion, resolution — and any mixed
+  operand set fails closed to the handoff denial.
+- Artifact secret scan: a gitleaks-rule-based scan with entropy checks over
+  the session's touched paths runs automatically at the agent submission
+  boundary — a finding blocks the submission, the match is redacted from the
+  transcript, and the agent is told the artifact failed the scan (not what
+  it matched) — and runs as a pre-commit hook for user-driven commits.
+- Child sessions deny ask-class dangerous commands outright, regardless of
+  user-input capability: the dangerous-command approval dialog is never
+  surfaced in a child, a denied ask-class call returns a blocker to the
+  parent, and `dangerous_command_grants_by_project` is the only child
+  pre-authorization path (saved project grants still run without a prompt).
+  The same blanket child semantics apply to out-of-root access grants.
+
 ### Added
 
 - Completion audit (fabricant-proof) at the subagent submission
@@ -119,72 +163,17 @@ All notable changes to Chartreux are documented in this file.
   not containment; managed-job (`bash_start`) and custom/MCP writes are
   excluded from the evidence scope.
 
-### Changed
-
-- Pure cooldown/endpoint-cooldown launch-exclusion sets are normalized
-  as transient launch exclusions (an additive classification; existing
-  exclusion records are unchanged).
-
-### Fixed
-
-- The completion-evidence receipt sink is wired into production runs:
-  it is installed on the child loop at run admission on both paths
-  (background and foreground) and cleared at run teardown — previously
-  every post-tool receipt was minted and discarded, so the receipt audit
-  found no matching command.
-- A denied `override_cooldown` mint on a retained agent no longer
-  strands the record as RUNNING: the minted permit is released and the
-  reused claim rolled back on any failure.
-- Shell-permission tests fail loudly on stray git repositories above
-  the tmp tree (a `/tmp/.git` left by a crashed tool run, for example):
-  an autouse guard in `tests/tools/conftest.py` detects the pollution
-  that silently re-labeled scope-derived assertions under parallel
-  (xdist) schedules. The guard only detects; it never deletes or
-  modifies anything.
-
-## 0.5.9 (2026-10-25)
-
-### Security
-
-- Destination-aware egress is the settled exfiltration decision for the
-  modeled network clients. Modeled `curl` and `wget` calls are no longer
-  denylisted outright; the destination decides. A literal loopback
-  destination (`localhost`, `127.0.0.0/8`, `::1`) runs with no dialog; any
-  other destination — another IP literal, a DNS name, or one the recognizer
-  cannot parse — resolves ask-class (`network.egress`) and prompts in
-  interactive sessions, denying with remediation in headless and child
-  sessions. The destination-changing behavior classes resolve ask-class even
-  for a literal loopback destination: redirect-following flags (`curl -L`),
-  `wget`'s default redirect behavior, and destination-overriding options
-  (`--resolve`, `--connect-to`). The development-egress carve-out stays
-  run-class (`git fetch`/`clone`/`pull`, `pip`/`uv` installs), and a user
-  denylist entry for these clients remains an absolute veto.
-- Probed egress clients move onto the shipped default denylist: `ssh`,
-  `scp`, `rsync`, `ftp`, `telnet`, `http`/`httpie`, `wget2`, `aria2c`,
-  `lftp`, and `watch` are denied until they are modeled; remove an entry to
-  re-enable a client deliberately.
-- Recursive `rm` gains a git-status-aware carve-out. Over a tree with
-  unsaved changes the blanket handoff denial remains. Over a git-clean tree
-  a recursive `rm` runs on its own only when every expanded operand lies
-  within the assessed repository, clear of its Git metadata (neither
-  encompassing it nor lying inside it, linked-worktree common directories
-  included), with recovery established for every repository involved, nested
-  ones included. The analysis fails closed on every axis — operand scope,
-  metadata overlap, recovery status, expansion, resolution — and any mixed
-  operand set fails closed to the handoff denial.
-- Artifact secret scan: a gitleaks-rule-based scan with entropy checks over
-  the session's touched paths runs automatically at the agent submission
-  boundary — a finding blocks the submission, the match is redacted from the
-  transcript, and the agent is told the artifact failed the scan (not what
-  it matched) — and runs as a pre-commit hook for user-driven commits.
-- Child sessions deny ask-class dangerous commands outright, regardless of
-  user-input capability: the dangerous-command approval dialog is never
-  surfaced in a child, a denied ask-class call returns a blocker to the
-  parent, and `dangerous_command_grants_by_project` is the only child
-  pre-authorization path (saved project grants still run without a prompt).
-  The same blanket child semantics apply to out-of-root access grants.
-
-### Added
+- Shell mutation-roots footprint. `bash` and `bash_start` surface the
+  resolved work-tree roots of their commands' checkout/switch invocations
+  (`mutation_roots`) alongside the write-path footprint — on success and,
+  copied onto the error event by the tool executor, on failed, timed-out,
+  or cancelled runs alike. The footprint is collected into mutation-scope
+  accounting next to the touched paths: it never joins the artifact secret
+  scan's path list (a work-tree root would scan the whole repository and
+  burn the bounded walk's budget), and the completion audit consumes it
+  for its touched-path comparisons. A footprint that cannot be
+  established records an unknown-mutation-root sentinel, never an
+  established empty one.
 
 - Local tool trust: tools authored under `~/.chartreux/tools/` are trusted
   by file location and admitted to the non-mutating posture; project-discovered
@@ -203,6 +192,54 @@ All notable changes to Chartreux are documented in this file.
   notice.
 
 ### Changed
+
+- Pure cooldown/endpoint-cooldown launch-exclusion sets are normalized
+  as transient launch exclusions (an additive classification; existing
+  exclusion records are unchanged).
+
+- Identity tool grants: the read-only-posture identities that bear
+  delegation (`orchestrator`, `researcher`, `advisor`) gain a settled
+  personal execution carve-out — `bash` for probes and verification,
+  `bash_start` for managed jobs, and `write_file`/`edit` for scratchpad
+  and deliverable persistence. Repository-source edits remain delegated
+  by role contract, not by tool denial: the carve-out is personal-axis
+  only and never reaches a delegation set. The shipped identity prompts
+  are reconciled to match — "read-only: never modify repository source
+  files" replaces the blanket "never modify files".
+
+- State-aware clean-tree checkout exemption (ADR 0019 amendment).
+  `git checkout <branch>` to an existing local branch and
+  `git checkout -b <new> [<start>]` run without the consequential
+  approval flow when the entire composed shell call is exactly that one
+  eligible invocation and every candidate repository scope passes the
+  state guardrails — a fully clean work tree, no in-progress operation
+  marker, and no repository configuration that selects a program the
+  invocation could run — with the plain branch form additionally
+  requiring the target to exist as a local branch (a sanitized
+  `show-ref` probe, so a pathspec fallback, a tag, a remote-tracking
+  name, or a commit-ish never rides the exemption). Because the bash
+  tool executes a command string, the executed command is rewritten at
+  execution time with `--no-overwrite-ignore` inserted after the
+  `checkout` subcommand, so an ignored-file collision fails closed
+  instead of silently clobbering local content. Every ineligible shape
+  and every unestablishable state fails closed to the existing
+  consequential approval flow; the exemption never bypasses the denylist
+  veto, parent ceilings, or any other recheck, and the pure classifier's
+  `git.checkout` classification is unchanged.
+
+- Git workflow policy (AGENTS.md, layered on ADR 0019's runtime gates):
+  rewrites of unpublished history — rebase, `commit --amend`, and
+  `reset --soft`/`--mixed` on a branch whose HEAD no remote-tracking ref
+  contains — are agent-executable; rewrites of published history remain
+  handoff-only and approval-gated, with the publication gate checking
+  the operation's entire affected commit range against remote-reachable
+  history; when a branch's publication status is uncertain the agent
+  stops and hands the operation to the user rather than rewriting on
+  uncertainty; a destructive checkout is one that discards uncommitted
+  changes (a clean-tree checkout of an existing local branch is not
+  destructive); and the hard guards — `git update-ref`, forced and
+  deleting pushes, and history rewrites of published commits — keep
+  their existing gates.
 
 - Wrapper and flag recognition: `sg` and `sudo -u <user>` are transparent
   wrappers whose payloads are re-analyzed (including `sg`'s unquoted
@@ -239,6 +276,34 @@ All notable changes to Chartreux are documented in this file.
   or fail-closed), one corpus row per entry.
 
 ### Fixed
+
+- The completion-evidence receipt sink is wired into production runs:
+  it is installed on the child loop at run admission on both paths
+  (background and foreground) and cleared at run teardown — previously
+  every post-tool receipt was minted and discarded, so the receipt audit
+  found no matching command.
+- A denied `override_cooldown` mint on a retained agent no longer
+  strands the record as RUNNING: the minted permit is released and the
+  reused claim rolled back on any failure.
+- Shell-permission tests fail loudly on stray git repositories above
+  the tmp tree (a `/tmp/.git` left by a crashed tool run, for example):
+  an autouse guard in `tests/tools/conftest.py` detects the pollution
+  that silently re-labeled scope-derived assertions under parallel
+  (xdist) schedules. The guard only detects; it never deletes or
+  modifies anything.
+
+- Oversized TUI error messages are capped behind the `+N lines`
+  disclosure: an error widget estimated taller than 12 wrapped rows
+  renders as a one-line summary plus the disclosure with a height-capped
+  body, and the turn supervisor truncates the error payload at 4000
+  characters before it reaches the TUI — a multi-kilobyte API-error
+  excerpt can no longer fold-wrap into dozens of rows and stretch or
+  obscure the pane.
+
+- Test-suite flake fix: the sustained-ticks transcript memory test's
+  timeout bound is raised from the repo-global 10 seconds to 30 — its
+  legitimate runtime under load can exceed the global bound while
+  remaining bounded.
 
 - Mouse capture is released before the agent-transcript viewer disposes, so
   exiting the viewer no longer leaves the UI mouse-dead with the keyboard

@@ -91,22 +91,29 @@ that validation and the tool layer both enforce:
 | Identity | Delegation | Personal tools | Delegation tools | Posture |
 | --- | --- | --- | --- | --- |
 | `coder` | optional | all granted | all granted | Direct execution; may delegate |
-| `orchestrator` | required | non-mutating only | all granted | Must orchestrate from the root session |
-| `researcher` | optional | non-mutating only | non-mutating only | Read-only analysis |
+| `orchestrator` | required | non-mutating + `bash`/`bash_start`/`edit`/`write_file` carve-out | all granted | Must orchestrate from the root session |
+| `researcher` | optional | non-mutating + `bash`/`bash_start`/`edit`/`write_file` carve-out | non-mutating only | Read-only analysis |
 | `reviewer` | optional | non-mutating + `bash` carve-out | non-mutating only | Read-only analysis; runs verification |
-| `advisor` | optional | non-mutating only | non-mutating only | Read-only analysis |
+| `advisor` | optional | non-mutating + `bash`/`bash_start`/`edit`/`write_file` carve-out | non-mutating only | Read-only analysis |
 
 The read-only postures are honest: `bash` classifies as mutating regardless of
 command text, and unclassified or custom tools (including MCP tools) classify
-as mutating by default, so a read-only identity genuinely excludes them. The
-one reviewed exception is the reviewer's identity-level execution carve-out:
-`bash` is admitted — with its own permission guards intact — so an exit-gate
-review can run non-mutating verification commands itself; the carve-out never
-reaches the reviewer's delegation set. A required-delegation identity
-(`orchestrator`) is rejected as a child with an actionable error — it must
-orchestrate from the root session. Custom identities
-carry no harness-known posture: their prompt file is the whole contract, and
-their delegation set is the full granted ceiling of the session.
+as mutating by default, so a read-only identity genuinely excludes them. Two
+reviewed identity-level execution carve-outs sit beyond the posture class
+sets. The reviewer's carve-out admits `bash` — with its own permission
+guards intact — so an exit-gate review can run non-mutating verification
+commands itself. The delegation-bearing read-only identities
+(`orchestrator`, `researcher`, `advisor`) carry the settled personal
+execution grant: `bash`, `bash_start`, `edit`, and `write_file` run
+personally — `bash` for probes and verification, `bash_start` for managed
+jobs, the write tools for scratchpad and deliverable persistence — while
+repository-source edits remain delegated by role contract, not by tool
+denial. Neither carve-out ever reaches a delegation set. A
+required-delegation identity (`orchestrator`) is rejected as a child
+with an actionable error — it must orchestrate from the root session.
+Custom identities carry no harness-known posture: their prompt file is
+the whole contract, and their delegation set is the full granted ceiling
+of the session.
 
 Three independent axes govern a child's tools, and narrowing is monotonic down
 the tree:
@@ -122,8 +129,9 @@ A child's effective tools are the granted ceiling intersected with every
 ancestor's delegation set intersected with the child's personal set. The
 consequences are exercised at the root, since children cannot launch at all: a
 `researcher` cannot obtain a writing `coder` through `task` or a direct launch,
-while an `orchestrator` cannot write personally but can delegate writes within
-the granted ceiling.
+while an `orchestrator` executes personally only its carved-out builtins (probes,
+managed jobs, persistence writes) and delegates everything else within the
+granted ceiling.
 
 ## Purpose routes
 

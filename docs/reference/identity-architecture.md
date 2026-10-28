@@ -40,7 +40,7 @@ The default is model-count agnostic: shipped purpose routes all bind the session
 identity = "orchestrator"
 ```
 
-or `chartreux --identity orchestrator`. The orchestrator must delegate: it may not perform mutating work itself (its personal tool set is non-mutating only) but can delegate any work within the session's granted authority. The delegation obligation lives in the identity prompt itself, never in a selectable strategy — the orchestrator is self-sufficient with `orchestration_strategy = "none"`.
+or `chartreux --identity orchestrator`. The orchestrator must delegate: repository-source work is never personal — its personal tool set is non-mutating beyond the settled execution carve-out (`bash` for probes, `bash_start` for managed jobs, `edit`/`write_file` for persistence and bookkeeping) — but it can delegate any work within the session's granted authority. The delegation obligation lives in the identity prompt itself, never in a selectable strategy — the orchestrator is self-sufficient with `orchestration_strategy = "none"`.
 
 The `ceremony` workflow (`workflow = "ceremony"`) and the shipped orchestration strategy (`orchestration_strategy = "builtin:default"`) remain selectable independently. The strategy body carries packaging and routing preferences only — brief discipline, parallelism, reuse — never ceremony, model-tier doctrine, or authority claims.
 
@@ -49,12 +49,12 @@ The `ceremony` workflow (`workflow = "ceremony"`) and the shipped orchestration 
 | Identity | Delegation | Personal tools | Delegation tools | Posture |
 | --- | --- | --- | --- | --- |
 | `coder` | optional | all granted | all granted | Direct execution; may delegate |
-| `orchestrator` | required | non-mutating only | all granted | Must orchestrate from the root session |
-| `researcher` | optional | non-mutating only | non-mutating only | Read-only analysis |
+| `orchestrator` | required | non-mutating + `bash`/`bash_start`/`edit`/`write_file` carve-out | all granted | Must orchestrate from the root session |
+| `researcher` | optional | non-mutating + `bash`/`bash_start`/`edit`/`write_file` carve-out | non-mutating only | Read-only analysis |
 | `reviewer` | optional | non-mutating + `bash` carve-out | non-mutating only | Read-only analysis; runs verification |
-| `advisor` | optional | non-mutating only | non-mutating only | Read-only analysis |
+| `advisor` | optional | non-mutating + `bash`/`bash_start`/`edit`/`write_file` carve-out | non-mutating only | Read-only analysis |
 
-The read-only postures are honest: `bash` classifies as mutating regardless of command text, and unclassified or custom tools (including MCP tools) classify as mutating by default, so a read-only identity genuinely excludes them. The reviewer carries one reviewed exception: an identity-level execution carve-out admitting the `bash` tool — with its own permission guards intact — so an exit-gate review can run non-mutating verification commands (tests, type checks, linters) itself. The carve-out is personal-axis only (the reviewer's delegation set stays non-mutating, and it cannot delegate its shell), and `edit`/`write_file` remain excluded. Deep-review execution seats still bind `coder` with the execution-seat overlay (see [Purpose routes](#purpose-routes-seats-and-diversity)).
+The read-only postures are honest: `bash` classifies as mutating regardless of command text, and unclassified or custom tools (including MCP tools) classify as mutating by default, so a read-only identity genuinely excludes them. Two reviewed identity-level execution carve-outs sit beyond the posture class sets. The reviewer's carve-out admits the `bash` tool — with its own permission guards intact — so an exit-gate review can run non-mutating verification commands (tests, type checks, linters) itself; it is personal-axis only (the reviewer's delegation set stays non-mutating, and it cannot delegate its shell), and `edit`/`write_file` remain excluded. The delegation-bearing read-only identities (`orchestrator`, `researcher`, `advisor`) carry the settled personal execution grant: `bash`, `bash_start`, `edit`, and `write_file` run personally — `bash` for probes and verification, `bash_start` for managed jobs, the write tools for scratchpad and deliverable persistence — while repository-source edits remain delegated by role contract, not by tool denial; the grant is personal-axis only and never reaches a delegation set. Deep-review execution seats still bind `coder` with the execution-seat overlay (see [Purpose routes](#purpose-routes-seats-and-diversity)).
 
 Custom identities carry no harness-known posture. Their prompt file is the whole contract, and their delegation set is the full granted ceiling of the session. An identity whose future typed posture declares `delegation = none` combined with an explicit orchestration strategy is a configuration error, not a silent no-op; no shipped identity sets `none`.
 
@@ -144,7 +144,7 @@ A child's effective tools are the granted ceiling intersected with every ancesto
 Consequences, exercised at the root (children cannot launch at all):
 
 - A `researcher` cannot obtain a writing `coder` — through `task` or a direct launch.
-- An `orchestrator` cannot write personally, but can delegate writes within the granted ceiling.
+- An `orchestrator` executes personally only its carved-out builtins (probes, managed jobs, persistence writes), but can delegate writes within the granted ceiling.
 - A read-only identity's delegation set is non-mutating only, so its children are non-mutating too.
 - An explicit root denial still prevents delegated writes.
 
