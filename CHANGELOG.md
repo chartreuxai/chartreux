@@ -2,6 +2,146 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.6.0 (2026-10-28)
+
+### Added
+
+- Completion audit (fabricant-proof) at the subagent submission
+  boundary. Every background subagent run now carries a typed, frozen
+  completion contract, admitted at launch and rendered into the worker's
+  prompt. The contract binds closed vocabularies of acceptance-check
+  templates (`pytest`, `ruff_check`, `pyright`, `git_head`, `git_status`,
+  `git_diff_stat`) and artifact kinds (`commit`, `touched_path`,
+  `check_pass`, `envelope`), a strict versioned envelope/receipt grammar
+  (unknown fields, duplicate requirement ids, and oversized payloads are
+  grammar violations, never worker faults; substantive seats must answer
+  with a claim, read-only seats are exempt), and a claim-evidence truth
+  table on five separate axes — claim fidelity, disclosure completeness,
+  mandate satisfaction, declared outcome, and primary runtime failure.
+  The audit composes at `build_result` from three evidence audits: the
+  artifact audit (claimed commit hashes and artifact paths resolved
+  against the run's evidence, with admission-versus-publication HEAD
+  snapshots and hash-prefix matching confined to git-command results),
+  the receipt audit (envelope-linked receipts only; no prose
+  extraction), and the check audit (contract-bound requirement ids and
+  their canonical commands; exit-zero evidence after the last mutation).
+  Verifier failures (denied, timeout, unavailable, unrunnable) are
+  informational, never worker misconduct; unavailable evidence is never
+  a contradiction.
+- Completion-evidence chronology with collection-time snapshots. Each
+  run keeps a bounded, per-run chronology of post-tool evidence
+  receipts, paired to their originating invocations by a harness-minted,
+  run-scoped receipt occurrence id (never `tool_call_id` alone —
+  tool-call ids are reused across turns), with collection-time content
+  snapshots (hash, byte size, sampled head/tail) captured at collection,
+  never at finalization; evicted evidence is marked unavailable, never
+  contradictory.
+- Once-only finalization and the acceptance-check runner. Acceptance
+  checks run exactly once per run, awaited immediately before each
+  `build_result` call site and cached run-keyed; cancellation and
+  exception paths never start new verification, publish no completed
+  result before the audit completes, and leave no orphaned verifier. The
+  runner builds its argv from the frozen contract's templates, validates
+  paths under the child's authorized roots, and passes full shell
+  command admission — guardrails, path permissions, dangerous-command
+  classification, denylist — immediately before spawn (resolve once,
+  spawn the resolved target; no prompts, retries, or fallbacks; a
+  denial stamps the check denied without spawning).
+- Enforce mode is the default: `[completion].mode = "enforce"`. A
+  contradicted claim blocks publication at the submission boundary: the
+  run finalizes `completed=False` with a typed `completion_rejection`
+  failure class (mirrored on the public wire), a measured rejection
+  envelope, and the audit result riding `TaskResult.completion_audit`.
+  Enforce-mode activation wired the composition's two inert-input
+  surfaces into production: parent-shared roots frozen on the contract
+  at admission (a failed finalization check observing final state under
+  a shared root — the session scratchpad the parent and the child both
+  write — composes as check-context unverified, never contradicted,
+  never a block), and the receipt's bounded claimed-value surface
+  (claimed commit hashes and claimed artifact paths, keyed by
+  requirement id), which the artifact audit resolves against the
+  evidence. The activation gates — the offline replay corpus, the
+  post-contract observation gate, and the fresh-runtime enforce-mode
+  test — ran green with zero honest false rejections; `stamp` remains
+  available and only stamps the composed classification onto the result
+  without blocking.
+- Un-stick machinery for stalled orchestrator endpoints. An explicit
+  `override_cooldown` on `task` and `resume_agent` launches lets an
+  accepted request force a completion attempt past an endpoint's
+  cooldown, metered by a root-shared, endpoint-episode cooldown ledger
+  (carried unchanged through every `ConfigOrchestrator.copy()`): at most
+  2 forced starts per endpoint episode, at least 30 seconds apart, at
+  most one attempt in flight, with the pressure bound
+  `min(2, 1 + floor(T/30s))`. An episode opens only on a measured
+  endpoint failure and closes only on a measured endpoint recovery —
+  agent lifecycle, replacement, release, timer expiry, and elapsed time
+  never replenish the counters, and automatic paths never acquire
+  permits. A permit bypasses only its matching cooldown predicates at
+  candidate selection and is consumed once at the actual transport
+  start — no retries, no empty-response replay, no failover replay for
+  the forced attempt. Denied overrides return bounded diagnostics
+  (selected deployment, bypassed exclusions, remaining allowance, next
+  permitted time) and consume neither budget nor allowance. The `task`
+  and `resume_agent` tool contracts document the bounded override, the
+  deadline exception, the diagnostics, and the no-replay rule.
+- Resume-progress deadline for stalled resumed runs. A resumed subagent
+  run that stalls on its first model call (the provider accepts the
+  request and never streams a byte) now trips the one hard in-flight
+  kill in the recovery policy: a run-scoped, run-armed
+  first-semantic-progress deadline
+  (`[recovery.subagents].resume_progress_deadline_seconds`, 180s by
+  default), armed at the run's first conversation model call and disarmed
+  at the observation of the first semantic delta (content, reasoning, or
+  tool-call; heartbeat and usage-only chunks never disarm). Expiry
+  cancels the in-flight call and classifies as the measured
+  `resume_progress_deadline` timeout reason; automatic same-payload
+  continuation is prohibited.
+- Transactional explicit resume. Explicit resume admission is now
+  transactional: an unavailable admission is rejected before consuming
+  a resume or publishing RESTORING; on committed admission the pending
+  automatic timer is cancelled and the resumed-progress context is
+  installed.
+- Resume lineage in the agent bar: the details pane and the agent
+  browser render `resumed_from_run_id` with full metadata.
+- Worker and orchestrator contracts. The bounded-child and coder prompts
+  carry the evidence-linked completion clauses (cite commit hashes and
+  receipt references at completion; never discard a result you issued;
+  re-issue on conflict; the no-edit proof obligation; file-state metadata
+  is non-authoritative), and the orchestrator's dispatch policy retains
+  implementation predecessors for replacement lineage, escalates the
+  first typed audit rejection through the existing lineage, reruns the
+  discriminating check before consequential reliance, and routes
+  release/publish/destructive/migration/git-state scopes off the flash
+  tier (budget fit is advisory-log only).
+- Documented residuals and scope exclusions: a stamp means "claim
+  matched evidence," never "task correct"; the acceptance check executes
+  project code (conftest, test bodies) and authorized-root validation is
+  not containment; managed-job (`bash_start`) and custom/MCP writes are
+  excluded from the evidence scope.
+
+### Changed
+
+- Pure cooldown/endpoint-cooldown launch-exclusion sets are normalized
+  as transient launch exclusions (an additive classification; existing
+  exclusion records are unchanged).
+
+### Fixed
+
+- The completion-evidence receipt sink is wired into production runs:
+  it is installed on the child loop at run admission on both paths
+  (background and foreground) and cleared at run teardown — previously
+  every post-tool receipt was minted and discarded, so the receipt audit
+  found no matching command.
+- A denied `override_cooldown` mint on a retained agent no longer
+  strands the record as RUNNING: the minted permit is released and the
+  reused claim rolled back on any failure.
+- Shell-permission tests fail loudly on stray git repositories above
+  the tmp tree (a `/tmp/.git` left by a crashed tool run, for example):
+  an autouse guard in `tests/tools/conftest.py` detects the pollution
+  that silently re-labeled scope-derived assertions under parallel
+  (xdist) schedules. The guard only detects; it never deletes or
+  modifies anything.
+
 ## 0.5.9 (2026-10-25)
 
 ### Security

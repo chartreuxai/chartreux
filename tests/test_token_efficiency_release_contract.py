@@ -164,4 +164,4 @@ def test_version_locations_and_release_heading_agree() -> None:
     heading = re.search(r"^## (\S+ \([^)]*\))", RELEASE_NOTES, re.MULTILINE)
     assert heading is not None
     assert pyproject_version == chartreux.__version__ == lock_version
-    assert heading.group(1) == f"{pyproject_version} (2026-10-25)"
+    assert heading.group(1) == f"{pyproject_version} (2026-10-28)"
