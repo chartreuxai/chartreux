@@ -415,7 +415,8 @@ async def test_admission_freezes_contract_and_renders_it_into_the_child_prompt(
         child_cwd = record.runtime.agent_loop.cwd
         assert contract.cwd == str(child_cwd)
         assert contract.cwd in contract.roots
-        assert contract.audit_mode == "stamp"
+        # The released default mode (enforce) flows from the loaded config.
+        assert contract.audit_mode == "enforce"
         assert contract.capability is CompletionCapability.AVAILABLE
         assert contract.envelope_required is True
         assert contract.exemptions == ()

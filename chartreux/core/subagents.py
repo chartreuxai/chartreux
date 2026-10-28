@@ -10,7 +10,10 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from chartreux.core.agents.identity_launch import TaskIdentityArgs
-from chartreux.core.completion_contract import CompletionAuditClassification
+from chartreux.core.completion_contract import (
+    CompletionAuditClassification,
+    claimed_values_from_receipt,
+)
 from chartreux.core.completion_evidence import (
     MAX_CHRONOLOGY_ENTRIES,
     ContentSnapshot,
@@ -1102,6 +1105,20 @@ class SubagentRunAccumulator:
         # a module-level import would close a cycle.
         from chartreux.core.completion_audit import compose_completion_audit
 
+        # The composition's two inert-input surfaces ride the existing
+        # parameters: the parent-shared roots are frozen on the contract at
+        # admission (the session scratchpad the parent and the child both
+        # write — a failed finalization check observing final state under
+        # one composes UNVERIFIED, never CONTRADICTED), and the claim's
+        # bounded claimed-value surface (claimed commit hashes, claimed
+        # artifact paths) reaches the artifact audit through the receipt.
+        contract_shared_roots = getattr(contract, "shared_roots", ())
+        if isinstance(contract_shared_roots, (list, tuple)):
+            shared_roots = tuple(
+                root for root in contract_shared_roots if isinstance(root, str) and root
+            )
+        else:
+            shared_roots = ()
         # The composition reads the once-only finalization (P6a) from the
         # run-keyed cache and runs no checks; in stamp mode the composed
         # classification rides on the result, in enforce mode a
@@ -1112,6 +1129,8 @@ class SubagentRunAccumulator:
             contract=contract,
             claim=claim,
             finalization=(self._finalization_cache.get(run_id) if run_id else None),
+            claimed_values=claimed_values_from_receipt(claim),
+            shared_roots=shared_roots,
             declared_completed=completed,
             runner=runner,
             mode=mode or getattr(contract, "audit_mode", None) or "stamp",

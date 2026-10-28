@@ -193,11 +193,15 @@ def test_completion_section_registers_as_a_field() -> None:
     assert config.completion.mode == "enforce"
 
 
-def test_completion_section_defaults_to_stamp() -> None:
+def test_completion_section_defaults_to_enforce() -> None:
     from chartreux.core.config.chartreux_schema import ChartreuxConfigSchema
 
+    # The released default is enforce (the recorded enforce-activation
+    # decision); an explicit stamp still validates.
     config = ChartreuxConfigSchema.model_validate({})
-    assert config.completion.mode == "stamp"
+    assert config.completion.mode == "enforce"
+    explicit = ChartreuxConfigSchema.model_validate({"completion": {"mode": "stamp"}})
+    assert explicit.completion.mode == "stamp"
 
 
 def test_completion_section_rejects_unknown_fields() -> None:
@@ -395,7 +399,7 @@ def test_root_schema_stays_open_for_unknown_sections() -> None:
 
     config = ChartreuxConfigSchema.model_validate({"not_a_section": {"x": 1}})
 
-    assert config.completion.mode == "stamp"
+    assert config.completion.mode == "enforce"
 
 
 # ---------------------------------------------------------------------------

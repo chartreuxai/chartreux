@@ -101,6 +101,13 @@ class FrozenCompletionContract:
     (substantive seats require, read-only seats are exempt), the audit mode,
     and the capability inputs. A reuse admission freezes a NEW contract; a
     resume admission carries the failed run's run-scoped snapshot.
+
+    ``shared_roots`` carries the root paths shared with the parent — the
+    session scratchpad the parent and the child both write — frozen at
+    admission from the child runtime's inherited scratch authority. The
+    composition's check-context guard consumes it: a failed finalization
+    check observing final state under a shared root composes UNVERIFIED,
+    never CONTRADICTED (round-2 amendment 2, amendments 12/14).
     """
 
     schema_version: int
@@ -115,6 +122,7 @@ class FrozenCompletionContract:
     exemptions: tuple[str, ...]
     audit_mode: str
     capability: CompletionCapability
+    shared_roots: tuple[str, ...] = ()
 
     @property
     def requires_commit_artifact(self) -> bool:
@@ -181,6 +189,7 @@ class FrozenCompletionContract:
         shell_less: bool,
         audit_mode: str,
         capability: CompletionCapability,
+        shared_roots: tuple[str, ...] = (),
     ) -> FrozenCompletionContract:
         """Freeze one run's contract from the admission inputs (P4).
 
@@ -274,6 +283,7 @@ class FrozenCompletionContract:
             exemptions=tuple(exemptions),
             audit_mode=audit_mode,
             capability=capability,
+            shared_roots=tuple(shared_roots),
         )
 
 

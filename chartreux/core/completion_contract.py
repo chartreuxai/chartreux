@@ -8,7 +8,9 @@ grammar, and the audit truth table for the completion-contract work:
 - :class:`CompletionArtifactKind` — the closed vocabulary of artifact kinds a
   contract requirement may demand;
 - :class:`CompletionEnvelope` / :class:`CompletionReceipt` — the strict,
-  versioned grammar binding a worker's claim to a contract's mandates;
+  versioned grammar binding a worker's claim to a contract's mandates,
+  including the receipt's bounded claimed-value surface (the claimed commit
+  hashes and claimed artifact paths the artifact audit resolves);
 - :class:`CompletionAuditClassification` — the truth table's output: five
   separate axes (claim fidelity, disclosure completeness, mandate
   satisfaction, declared outcome, primary runtime failure), classified by
@@ -43,6 +45,7 @@ __all__ = [
     "CompletionReceipt",
     "CompletionRejectionReason",
     "CompletionRequirement",
+    "claimed_values_from_receipt",
     "classify_completion",
 ]
 
@@ -58,6 +61,13 @@ COMPLETION_ENVELOPE_MARKER = "completion_envelope_v1"
 MAX_ENVELOPE_REQUIREMENTS = 16
 MAX_SATISFIED_REQUIREMENTS = 16
 MAX_REQUIREMENT_ID_LENGTH = 64
+
+#: Upper bounds of the receipt's claimed-value surface: the claimed commit
+#: hashes and claimed artifact paths a claim may carry, keyed by requirement
+#: id. A payload exceeding any of them is a grammar violation, not a worker
+#: fault; a claim without values is never a fault at all.
+MAX_CLAIMED_VALUES = 16
+MAX_CLAIMED_VALUE_LENGTH = 1024
 
 
 class CompletionCheckTemplate(StrEnum):
@@ -124,7 +134,11 @@ class CompletionEnvelope(BaseModel):
 
 class CompletionReceipt(BaseModel):
     """The claim side of the grammar: the requirement ids the worker
-    reports satisfied against one issued envelope.
+    reports satisfied against one issued envelope, and the bounded
+    claimed-value surface — the claimed commit hashes and claimed artifact
+    paths the claim's artifact requirements rest on, keyed by requirement
+    id. A claim without values is well-formed: the artifact audit resolves
+    it "no commit hash/artifact path to check" — unverified, never a fault.
 
     Unknown fields are rejected (``extra="forbid"``) and duplicate
     requirement ids are a grammar violation — both at construction time.
@@ -138,6 +152,7 @@ class CompletionReceipt(BaseModel):
     satisfied_requirement_ids: tuple[str, ...] = Field(
         default=(), max_length=MAX_SATISFIED_REQUIREMENTS
     )
+    claimed_values: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _satisfied_ids_resolve_into_the_envelope(self) -> CompletionReceipt:
@@ -164,6 +179,27 @@ class CompletionReceipt(BaseModel):
             set(self.satisfied_requirement_ids)
         ):
             raise ValueError("duplicate satisfied requirement id in the receipt")
+        return self
+
+    @model_validator(mode="after")
+    def _claimed_values_resolve_into_the_envelope(self) -> CompletionReceipt:
+        if len(self.claimed_values) > MAX_CLAIMED_VALUES:
+            raise ValueError("too many claimed values in the receipt")
+        for key, value in self.claimed_values.items():
+            if not key or len(key) > MAX_REQUIREMENT_ID_LENGTH:
+                raise ValueError(
+                    "malformed claimed-value requirement id in the receipt"
+                )
+            if len(value) > MAX_CLAIMED_VALUE_LENGTH:
+                raise ValueError("oversized claimed value in the receipt")
+        if self.envelope is None:
+            return self
+        known = {
+            requirement.requirement_id for requirement in self.envelope.requirements
+        }
+        unknown = sorted(key for key in self.claimed_values if key not in known)
+        if unknown:
+            raise ValueError(f"claimed values unknown to the bound envelope: {unknown}")
         return self
 
 
@@ -338,6 +374,32 @@ def _envelope_grammar_rejection(  # noqa: PLR0911 - one early exit per guard
     return None
 
 
+def _claimed_values_grammar_rejection(  # noqa: PLR0911 - one early exit per guard
+    claimed: Any,
+) -> CompletionRejectionReason | None:
+    """Name the grammar violation in one raw claimed-values payload.
+
+    See :func:`_envelope_grammar_rejection`. The surface is bounded: a
+    non-mapping, an over-count, a malformed or over-long key, or a
+    non-string or over-long value is a grammar violation, never a worker
+    fault.
+    """
+    if not isinstance(claimed, Mapping):
+        return CompletionRejectionReason.ENVELOPE_MALFORMED
+    if len(claimed) > MAX_CLAIMED_VALUES:
+        return CompletionRejectionReason.ENVELOPE_OVERSIZED
+    for key, value in claimed.items():
+        if not isinstance(key, str) or not key:
+            return CompletionRejectionReason.ENVELOPE_MALFORMED
+        if len(key) > MAX_REQUIREMENT_ID_LENGTH:
+            return CompletionRejectionReason.ENVELOPE_OVERSIZED
+        if not isinstance(value, str):
+            return CompletionRejectionReason.ENVELOPE_MALFORMED
+        if len(value) > MAX_CLAIMED_VALUE_LENGTH:
+            return CompletionRejectionReason.ENVELOPE_OVERSIZED
+    return None
+
+
 def _receipt_grammar_rejection(  # noqa: PLR0911 - one early exit per guard
     payload: Any,
 ) -> CompletionRejectionReason | None:
@@ -367,6 +429,10 @@ def _receipt_grammar_rejection(  # noqa: PLR0911 - one early exit per guard
         return CompletionRejectionReason.ENVELOPE_MALFORMED
     if len(satisfied) != len(set(satisfied)):
         return CompletionRejectionReason.REQUIREMENT_ID_DUPLICATE
+    claimed = payload.get("claimed_values", {})
+    reason = _claimed_values_grammar_rejection(claimed)
+    if reason is not None:
+        return reason
     if envelope is not None:
         try:
             bound = CompletionEnvelope.model_validate(envelope)
@@ -374,6 +440,8 @@ def _receipt_grammar_rejection(  # noqa: PLR0911 - one early exit per guard
             return CompletionRejectionReason.ENVELOPE_MALFORMED
         known = {requirement.requirement_id for requirement in bound.requirements}
         if any(satisfied_id not in known for satisfied_id in satisfied):
+            return CompletionRejectionReason.REQUIREMENT_ID_UNKNOWN
+        if any(key not in known for key in claimed):
             return CompletionRejectionReason.REQUIREMENT_ID_UNKNOWN
     return None
 
@@ -391,6 +459,34 @@ def _normalize_evidence(
         # The evidence surface is harness-produced; a malformed payload is a
         # harness-side defect, never a worker fault.
         return CompletionEvidence()
+
+
+def claimed_values_from_receipt(
+    claim: CompletionReceipt | Mapping[str, Any] | None,
+) -> Mapping[str, str]:
+    """The bounded claimed-value surface of one receipt claim.
+
+    The typed receipt carries its claimed values (the claimed commit hashes
+    and claimed artifact paths keyed by requirement id); a raw payload — a
+    grammar violation riding to the truth table — contributes only its
+    well-formed string pairs, so a malformed value never fabricates a claim.
+    ``None`` or a claim without values yields the empty surface: the artifact
+    audit resolves "no commit hash/artifact path to check" — unverified,
+    never a fault.
+    """
+    if claim is None:
+        return {}
+    if isinstance(claim, CompletionReceipt):
+        return dict(claim.claimed_values)
+    if isinstance(claim, Mapping):
+        raw = claim.get("claimed_values")
+        if isinstance(raw, Mapping):
+            return {
+                key: value
+                for key, value in raw.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+    return {}
 
 
 def classify_completion(  # noqa: PLR0911 - one classification per truth-table branch

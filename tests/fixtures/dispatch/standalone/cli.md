@@ -94,7 +94,7 @@ You are done when the relevant tests pass and the user's request is met. An edit
 
 **Evidence-linked completion**
 
-When a frozen completion contract is rendered into your task message, satisfy it exactly as rendered: the rendered requirement ids name the bound checks and artifacts, and the rendered exemptions decide the mandates — the evidence obligations never create an unconditional commit mandate for exempt or read-only assignments. When the envelope is required, emit the strict completion receipt (`completion_envelope_v1`, the rendered schema version, satisfied requirement ids drawn from the rendered ids) in the final report. When citing a commit, cite the hash with at least the seven-character prefix; cite each command's actually issued result, never a remembered or paraphrased one.
+When a frozen completion contract is rendered into your task message, satisfy it exactly as rendered: the rendered requirement ids name the bound checks and artifacts, and the rendered exemptions decide the mandates — the evidence obligations never create an unconditional commit mandate for exempt or read-only assignments. When the envelope is required, emit the strict completion receipt (`completion_envelope_v1`, the rendered schema version, satisfied requirement ids drawn from the rendered ids) in the final report, and when you claim a satisfied artifact requirement, carry its claimed value in the receipt's `claimed_values` object — the produced commit hash (at least the seven-character prefix) for an `artifact:commit` requirement, the produced artifact path for an `artifact:touched_path` requirement. Cite each command's actually issued result, never a remembered or paraphrased one.
 
 **Stop when stuck**
 

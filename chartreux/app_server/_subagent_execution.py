@@ -163,14 +163,17 @@ def extract_completion_claim(
 
     The P13 worker contract emits a strict receipt — a JSON object carrying
     the ``completion_envelope_v1`` marker and the ``satisfied_requirement_ids``
-    key — in the final report. The LAST such object is the operative claim:
-    the final report's receipt wins over any earlier prose, and the nested
-    envelope (which carries the same marker but no ``satisfied_requirement_ids``
-    key) is not the claim. A well-formed payload validates into the P1
-    receipt model; a grammar-violating payload rides RAW so the truth table
-    classifies the violation as a disclosure fact instead of escaping as an
-    exception. A report with no receipt-shaped object carries no claim
-    (``None``) — an availability fact, never a fabricated one.
+    key — in the final report, optionally with the bounded ``claimed_values``
+    surface (the claimed commit hashes and claimed artifact paths the claim's
+    artifact requirements rest on). The LAST such object is the operative
+    claim: the final report's receipt wins over any earlier prose, and the
+    nested envelope (which carries the same marker but neither claim key) is
+    not the claim. A well-formed payload validates into the P1 receipt model
+    (claimed values riding it through); a grammar-violating payload rides RAW
+    so the truth table classifies the violation as a disclosure fact instead
+    of escaping as an exception. A report with no receipt-shaped object
+    carries no claim (``None``) — an availability fact, never a fabricated
+    one.
     """
     if COMPLETION_ENVELOPE_MARKER not in response:
         return None
@@ -190,7 +193,7 @@ def extract_completion_claim(
         if (
             isinstance(payload, dict)
             and payload.get("marker") == COMPLETION_ENVELOPE_MARKER
-            and "satisfied_requirement_ids" in payload
+            and ("satisfied_requirement_ids" in payload or "claimed_values" in payload)
         ):
             claim = payload
     if claim is None:
@@ -479,6 +482,24 @@ def _budget_fit_description(
     return ", ".join(limits) if limits else "unconfigured (no run-budget middleware)"
 
 
+def _parent_shared_roots(loop: Any) -> tuple[str, ...]:
+    """The root paths one child run shares with its parent (P4, defect-E).
+
+    The canonical shared root in this harness is the session scratchpad:
+    the parent and its children both write there (the child's tool
+    authority inherits the parent's scratch roots along the parent chain).
+    ``ToolManager.scratchpad_roots`` walks exactly that chain, so the
+    child runtime's inherited scratch roots are the parent-shared roots.
+    A loop whose scratch authority cannot be reported freezes no shared
+    root — external writes are then not established as possible, and the
+    composition keeps its full force.
+    """
+    try:
+        return tuple(str(root) for root in loop.tool_manager.scratchpad_roots)
+    except Exception:
+        return ()
+
+
 def freeze_run_admission(
     *,
     args: TaskArgs,
@@ -491,10 +512,10 @@ def freeze_run_admission(
     """Freeze the completion contract at admission, capture the HEAD baseline.
 
     The contract freezes identity/seat/tier, cwd/roots, the mandates, the
-    envelope requirement/exemption, the audit mode, and the capability
-    inputs. The admission HEAD baseline is captured alongside the frozen
-    contract — only when the contract mandates a commit artifact; runs
-    without a commit mandate perform no HEAD probes.
+    envelope requirement/exemption, the audit mode, the capability inputs,
+    and the parent-shared roots. The admission HEAD baseline is captured
+    alongside the frozen contract — only when the contract mandates a
+    commit artifact; runs without a commit mandate perform no HEAD probes.
     """
     loop = runtime.agent_loop
     try:
@@ -518,6 +539,7 @@ def freeze_run_admission(
         shell_less=_shell_less_launch(args, identity_facts),
         audit_mode=loop.config.completion.mode,
         capability=_verification_capability(parent),
+        shared_roots=_parent_shared_roots(loop),
     )
     admission_head = (
         _capture_admission_head(loop.cwd) if contract.requires_commit_artifact else None

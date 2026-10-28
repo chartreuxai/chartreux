@@ -472,14 +472,21 @@ class UserQuestionsConfig(BaseModel):
 class CompletionSectionConfig(BaseModel):
     """The ``[completion]`` config section: the completion-audit mode.
 
-    ``mode`` defaults to ``stamp`` (audit stamps ride on results without
-    blocking publication); ``enforce`` blocks publication on an audit
-    rejection. The P18 activation gate owns any mode change.
+    ``mode`` defaults to ``enforce``: publication is blocked on an audit
+    rejection (a worker-side disposition); ``stamp`` only stamps the
+    composed classification onto the result without blocking. The default
+    is the recorded enforce-activation decision: the activation
+    prerequisites landed first — the parent-shared roots and the receipt's
+    claimed-value surface are wired into the production composition, so an
+    honest worker is never falsely rejected (the zero-honest-false-
+    rejections economics), and the replay gates, the post-contract
+    observation gate, and the offline fresh-runtime enforce-mode test are
+    green. Before that activation the default was ``stamp``.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    mode: Literal["stamp", "enforce"] = "stamp"
+    mode: Literal["stamp", "enforce"] = "enforce"
 
 
 type StatusLineSegment = Literal[
