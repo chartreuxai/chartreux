@@ -570,6 +570,11 @@ class PublicFailureClass(StrEnum):
     AUTHORIZATION = "authorization"
     PERMANENT_CONFIG = "permanent_config"
     BUDGET_STOP = "budget_stop"
+    # P11: a typed completion-audit rejection — a worker-side disposition
+    # (the P1 CompletionRejectionReason vocabulary), never derived from an
+    # LLM observation. Replacement-authorized by the failure-time policy;
+    # never auto-resumed.
+    COMPLETION_REJECTION = "completion_rejection"
     INCOMPLETE_STREAM = "incomplete_stream"
     EMPTY_RESPONSE = "empty_response"
     UNKNOWN = "unknown"

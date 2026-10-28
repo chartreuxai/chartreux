@@ -794,14 +794,34 @@ def test_background_task_result_display_uses_launch_handle() -> None:
     assert display.message == "agent agent-1 (run run-1): provider/base"
     assert Task.project_result(result) == {"models": ["provider/base"]}
 
-    def test_task_prompt_documents_working_set_handoff(self) -> None:
-        prompt = (
-            Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/task.md"
-        ).read_text()
 
-        # The dispatch documentation surfaces the spawn handoff: the working-set
-        # files with revisions and outlines, and the append-only state blocks.
-        assert "file_state_handoff" in prompt
-        assert "working-set files" in prompt
-        assert "<file_state>" in prompt
-        assert "never rewritten" in prompt
+def test_task_prompt_documents_working_set_handoff() -> None:
+    prompt = (
+        Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/task.md"
+    ).read_text()
+
+    # The dispatch documentation surfaces the spawn handoff: the working-set
+    # files with revisions and outlines, and the append-only state blocks.
+    assert "file_state_handoff" in prompt
+    assert "working-set files" in prompt
+    assert "<file_state>" in prompt
+    assert "never rewritten" in prompt
+
+
+def test_task_prompt_documents_cooldown_override() -> None:
+    prompt = (
+        Path(__file__).parents[2] / "chartreux/core/tools/builtins/prompts/task.md"
+    ).read_text()
+
+    # The explicit un-stick override is request-only: the ledger still
+    # denies, denials consume nothing, diagnostics are bounded, and the
+    # forced attempt is never replayed automatically (F6).
+    assert "`override_cooldown: true`" in prompt
+    assert "only REQUESTS the override" in prompt
+    assert "still denies the mint" in prompt
+    assert "consumes nothing" in prompt
+    assert "never automatically replayed" in prompt
+    assert "Automatic paths never request the override or acquire permits" in prompt
+    # Bounded un-stick diagnostics ride the launch acknowledgment.
+    assert "bounded un-stick diagnostics" in prompt
+    assert "next permitted start" in prompt

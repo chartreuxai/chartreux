@@ -18,7 +18,8 @@ from chartreux.core.dispatch.route_models import ReplacementCapability
 from chartreux.core.llm.backend.anthropic import REASONING_BLOCK_TYPES
 from chartreux.core.llm.thinking_levels import get_thinking_levels
 from chartreux.core.llm_models import LLMMessage
-from chartreux.core.recovery_models import PackageTier
+from chartreux.core.recovery_models import PackageTier, canonical_endpoint_identity
+from chartreux.core.recovery_override import CooldownOverrideLedger, OverridePermit
 from chartreux.core.session_types import CommittedModelIdentity
 from chartreux.core.subagents import (
     ImmutableLaunchPersonaError,
@@ -397,6 +398,8 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     purpose: str | None = None,
     effective_tier: PackageTier = PackageTier.SUBSTANTIVE,
     replacement_capability: ReplacementCapability = ReplacementCapability.NONE,
+    override_permit: OverridePermit | None = None,
+    override_ledger: CooldownOverrideLedger | None = None,
 ) -> LaunchCandidate:
     """Resolve launch semantics without constructing any child-owned resource.
 
@@ -406,6 +409,13 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     record's committed binding) — admission validates it and the runtime
     enforces it, so the installed selection and the validated binding can
     never disagree (S2 identity disagreement).
+
+    ``override_permit``/``override_ledger`` (C2 typed permits): a permit
+    minted by the root ``CooldownOverrideLedger`` bypasses ONLY the
+    candidate's cooldown predicate at model assignment — the availability
+    check — for deployments serving the permit's canonical endpoint. Every
+    other admission check (compatibility, thinking, history) still applies,
+    and a wrong/expired/released/used permit never bypasses.
     """
     semantic = _merge_semantic_overrides(accumulated_overrides, config)
     explicit_model = config is not None and "model" in config.model_fields_set
@@ -484,10 +494,20 @@ def resolve_launch(  # noqa: PLR0913, PLR0914, PLR0915
     explicit_thinking = "thinking" in semantic.model_fields_set
 
     def assignment_candidate(candidate: Any) -> bool:
-        from chartreux.core.model_catalog.availability import compatibility_exclusion
+        from chartreux.core.model_catalog.availability import (
+            compatibility_exclusion,
+            cooldown_override_bypasses,
+        )
 
-        if not orchestrator.availability_registry.is_available(
-            candidate.base_model, candidate.deployment.provider
+        endpoint_identity = canonical_endpoint_identity(candidate.provider.api_base)
+        cooldown_bypassed = cooldown_override_bypasses(
+            override_permit, override_ledger, endpoint_identity
+        )
+        if (
+            not cooldown_bypassed
+            and not orchestrator.availability_registry.is_available(
+                candidate.base_model, candidate.deployment.provider
+            )
         ):
             return False
         candidate_thinking = (

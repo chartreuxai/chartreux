@@ -41,6 +41,10 @@ from chartreux.core.agents.identities import (
     get_builtin_identity,
     validate_identity_selection,
 )
+from chartreux.core.completion_contract import (
+    CompletionArtifactKind,
+    CompletionCheckTemplate,
+)
 from chartreux.core.config.harness_files import get_harness_files_manager
 from chartreux.core.dispatch.route_models import (
     PackageTier as RoutePackageTier,
@@ -371,9 +375,35 @@ class TaskIdentityArgs(BaseModel):
             "launches."
         ),
     )
+    override_cooldown: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "Request a forced un-stick completion attempt past the selected "
+            "endpoint's cooldown. The boolean only REQUESTS the override: root "
+            "launch admission mints the endpoint-bound permit from the root "
+            "ledger only for an explicit accepted request, and the ledger "
+            "denies the mint when the episode is exhausted, spacing-bound, or "
+            "has an attempt in flight. Automatic paths never set this."
+        ),
+    )
     config: LaunchConfig | None = Field(
         default=None,
         description="Optional semantic launch configuration overrides for this child.",
+    )
+    completion_check: list[CompletionCheckTemplate] | None = Field(
+        default=None,
+        description=(
+            "Completion-check templates this task's contract mandates; None "
+            "disables only the check mandates (fail-open)."
+        ),
+    )
+    required_artifacts: list[CompletionArtifactKind] | None = Field(
+        default=None,
+        description=(
+            "Artifact kinds this task's contract requires of the worker; "
+            "None requires none (fail-open)."
+        ),
     )
 
     @model_validator(mode="before")

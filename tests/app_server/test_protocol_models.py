@@ -1445,6 +1445,39 @@ def test_public_failure_envelope_mirrors_the_core_schema() -> None:
     )
 
 
+def test_completion_rejection_class_mirrors_to_the_wire() -> None:
+    """P11: the typed completion-rejection failure class mirrors into
+    ``PublicFailureClass`` — the set-equality pin above stays green, and a
+    typed rejection envelope projects losslessly through the public
+    projection.
+    """
+    from chartreux.app_server.models import (
+        PublicFailureClass,
+        PublicFailureEnvelope,
+        PublicRecoveryEligibility,
+    )
+    from chartreux.core import recovery_models as core
+    from chartreux.core.completion_contract import CompletionRejectionReason
+    from chartreux.core.recovery_models import build_completion_rejection_envelope
+
+    envelope = build_completion_rejection_envelope(
+        agent_id="agent-1",
+        run_id="run-1",
+        rejection=CompletionRejectionReason.CLAIM_CONTRADICTED,
+        work_package_id="wp-1",
+        predecessor_agent_id="agent-0",
+    )
+    assert envelope.failure.failure_class is core.FailureClass.COMPLETION_REJECTION
+    projected = PublicFailureEnvelope.model_validate(
+        envelope.model_dump(mode="json", by_alias=True)
+    )
+    assert projected.model_dump(mode="json", by_alias=True) == envelope.model_dump(
+        mode="json", by_alias=True
+    )
+    assert projected.failure.failure_class is PublicFailureClass.COMPLETION_REJECTION
+    assert projected.recovery.eligibility is PublicRecoveryEligibility.PROHIBITED
+
+
 def test_task_result_wire_contract_carries_failure_evidence() -> None:
     """WP1: TaskResult carries run_status + the typed failure envelope and
     the compact recovery reference; legacy payloads stay valid.

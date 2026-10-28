@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 import enum
 from pathlib import Path
@@ -11,6 +12,15 @@ from chartreux.app_server.protocol import (
     DangerousCommandGrantWire,
 )
 from chartreux.core.agent_loop import AgentLoop
+from chartreux.core.agents.identities import get_builtin_identity
+from chartreux.core.completion_contract import (
+    COMPLETION_CONTRACT_SCHEMA_VERSION,
+    COMPLETION_ENVELOPE_MARKER,
+    CompletionArtifactKind,
+    CompletionCheckTemplate,
+    CompletionEnvelope,
+    CompletionRequirement,
+)
 from chartreux.core.dangerous_commands import DangerousCommandAuthority, RepositoryScope
 from chartreux.core.llm_models import LLMMessage
 from chartreux.core.recovery_models import FailureEnvelope, PackageTier
@@ -64,6 +74,209 @@ class StoredRunResult:
     terminal_identity: tuple[str, str, str] | None = None
 
 
+class CompletionCapability(enum.StrEnum):
+    """The run-scoped harness verification capability frozen at admission (P4).
+
+    Derived from the parent delegation authority: the harness
+    acceptance-check runner may act only under authority the parent could
+    delegate. The capability is template-only (the check vocabulary is the
+    closed :class:`CompletionCheckTemplate` set), never widens the child
+    identity posture, and never prompts at finalization; a denied or
+    unavailable authority stamps the check unavailable — an informational
+    stamp, never a worker fault.
+    """
+
+    AVAILABLE = "available"
+    DENIED = "denied"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenCompletionContract:
+    """The completion contract frozen at admission (P4).
+
+    One run's mandate surface, frozen before execution starts: the
+    identity/seat/tier binding, the child's cwd and authorized roots, the
+    mandates (the versioned envelope), the envelope requirement/exemption
+    (substantive seats require, read-only seats are exempt), the audit mode,
+    and the capability inputs. A reuse admission freezes a NEW contract; a
+    resume admission carries the failed run's run-scoped snapshot.
+    """
+
+    schema_version: int
+    identity: str
+    identity_revision: str | None
+    seat: str | None
+    tier: PackageTier | None
+    cwd: str
+    roots: tuple[str, ...]
+    envelope: CompletionEnvelope | None
+    envelope_required: bool
+    exemptions: tuple[str, ...]
+    audit_mode: str
+    capability: CompletionCapability
+
+    @property
+    def requires_commit_artifact(self) -> bool:
+        """Whether the frozen contract requires a commit artifact.
+
+        The admission HEAD baseline is captured only when this holds — runs
+        without a commit mandate perform no HEAD probes. An exempt seat
+        (reviewer, read-only) never requires the commit artifact, so frozen
+        mandates alone do not arm the probe.
+        """
+        if not self.envelope_required or self.envelope is None:
+            return False
+        return any(
+            requirement.artifact is CompletionArtifactKind.COMMIT
+            for requirement in self.envelope.requirements
+        )
+
+    def render_prompt_section(self) -> str:
+        """Render the frozen contract into the child prompt (P4).
+
+        A worker cannot reference requirements it never received: the
+        section carries the schema version, the envelope marker, the
+        requirement ids with their check bindings and artifact mandates,
+        the envelope requirement, and the exemptions.
+        """
+        lines = [
+            "Completion contract (frozen at admission):",
+            f"- schema version: {self.schema_version}",
+            f"- envelope marker: {COMPLETION_ENVELOPE_MARKER}",
+            f"- envelope required: {'yes' if self.envelope_required else 'no'}",
+            "- exemptions: "
+            f"{', '.join(self.exemptions) if self.exemptions else 'none'}",
+            f"- audit mode: {self.audit_mode}",
+        ]
+        if self.envelope is None:
+            lines.append("- mandates: none (no completion mandates frozen)")
+        else:
+            lines.append("- mandates:")
+            for requirement in self.envelope.requirements:
+                if requirement.template is not None:
+                    lines.append(
+                        f"  - {requirement.requirement_id}: "
+                        f"check `{requirement.template.value}`"
+                    )
+                elif requirement.artifact is not None:
+                    lines.append(
+                        f"  - {requirement.requirement_id}: "
+                        f"artifact `{requirement.artifact.value}`"
+                    )
+        return "\n".join(lines)
+
+    @classmethod
+    def freeze(  # noqa: PLR0913 - the frozen contract's admission inputs
+        cls,
+        *,
+        identity: str,
+        identity_revision: str | None,
+        seat: str | None,
+        tier: PackageTier | None,
+        cwd: str,
+        roots: tuple[str, ...],
+        completion_check: Sequence[CompletionCheckTemplate] | None,
+        required_artifacts: Sequence[CompletionArtifactKind] | None,
+        shell_less: bool,
+        audit_mode: str,
+        capability: CompletionCapability,
+    ) -> FrozenCompletionContract:
+        """Freeze one run's contract from the admission inputs (P4).
+
+        The envelope requirement/exemption matrix (round-2 amendment 3, post-B
+        amendment 10): substantive/worker seats require the envelope;
+        reviewer seats remain exempt; researcher/advisor seats with mandated
+        deliverables carry the reduced matrix (envelope required, the commit
+        artifact NOT mandated, check_pass only when a contract-named check
+        exists); read-only seats without mandated deliverables are exempt;
+        shell-less launches (custom identities or explicitly disabled tools)
+        are exempt from the check-based classes. ``None`` mandates disable
+        only themselves (fail-open): no mandates supplied freezes no
+        envelope.
+        """
+        identity_facts = get_builtin_identity(identity.removeprefix("builtin:"))
+        exemptions: list[str] = []
+        envelope_required = True
+        templates = list(completion_check or [])
+        artifacts = list(required_artifacts or [])
+
+        if identity_facts is not None and identity_facts.id == "reviewer":
+            envelope_required = False
+            exemptions.append("reviewer")
+        elif identity_facts is not None and identity_facts.safety == "read-only":
+            if artifacts:
+                exemptions.append("reduced_matrix")
+                artifacts = [
+                    artifact
+                    for artifact in artifacts
+                    if artifact is not CompletionArtifactKind.COMMIT
+                ]
+                if not templates:
+                    artifacts = [
+                        artifact
+                        for artifact in artifacts
+                        if artifact is not CompletionArtifactKind.CHECK_PASS
+                    ]
+            else:
+                envelope_required = False
+                exemptions.append("read_only")
+
+        if shell_less:
+            exemptions.append("shell_less_checks")
+            templates = []
+            artifacts = [
+                artifact
+                for artifact in artifacts
+                if artifact is not CompletionArtifactKind.CHECK_PASS
+            ]
+
+        requirements: list[CompletionRequirement] = []
+        seen: set[str] = set()
+        if completion_check is not None or required_artifacts is not None:
+            for template in templates:
+                requirement_id = f"check:{template.value}"
+                if requirement_id not in seen:
+                    seen.add(requirement_id)
+                    requirements.append(
+                        CompletionRequirement(
+                            requirement_id=requirement_id, template=template
+                        )
+                    )
+            for artifact in artifacts:
+                requirement_id = f"artifact:{artifact.value}"
+                if requirement_id not in seen:
+                    seen.add(requirement_id)
+                    requirements.append(
+                        CompletionRequirement(
+                            requirement_id=requirement_id, artifact=artifact
+                        )
+                    )
+        envelope = (
+            CompletionEnvelope(
+                marker=COMPLETION_ENVELOPE_MARKER,
+                schema_version=COMPLETION_CONTRACT_SCHEMA_VERSION,
+                requirements=tuple(requirements),
+            )
+            if requirements
+            else None
+        )
+        return cls(
+            schema_version=COMPLETION_CONTRACT_SCHEMA_VERSION,
+            identity=identity,
+            identity_revision=identity_revision,
+            seat=seat,
+            tier=tier,
+            cwd=cwd,
+            roots=roots,
+            envelope=envelope,
+            envelope_required=envelope_required,
+            exemptions=tuple(exemptions),
+            audit_mode=audit_mode,
+            capability=capability,
+        )
+
+
 @dataclass(slots=True)
 class RunRecord:
     run_id: str
@@ -94,6 +307,16 @@ class RunRecord:
     # config; non-None only on a demanding-route launch (admission validates
     # the category, so this is always a qualifying value when set).
     difficulty: str | None = None
+    # P4: the completion contract frozen at admission — the run's mandate
+    # surface (identity/seat/tier, cwd/roots, mandates, envelope
+    # requirement/exemption, audit mode, capability inputs). None only on
+    # records constructed outside an admission.
+    completion_contract: FrozenCompletionContract | None = None
+    # P4 round-7: the admission HEAD baseline, captured PRE-EXECUTION at
+    # admission alongside the frozen contract — only when the contract
+    # mandates a commit artifact (runs without a commit mandate perform no
+    # HEAD probes). P6a consumes it for the admission-vs-publication proof.
+    admission_head: str | None = None
 
 
 @dataclass(slots=True)

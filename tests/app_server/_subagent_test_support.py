@@ -340,6 +340,10 @@ def _idle_record(
     # A direct launch carries no purpose label (the projection reads the
     # loop-owned record); a bare MagicMock would auto-create a truthy one.
     runtime.agent_loop.launch_purpose = None
+    # The P14 advisory budget-fit log formats these with a float format
+    # spec at admission; a bare MagicMock attribute would raise TypeError.
+    runtime.agent_loop.runtime_policy.run_max_price = None
+    runtime.agent_loop.runtime_policy.run_max_session_tokens = None
     return AgentRecord(
         agent_id=agent_id,
         identity="coder",

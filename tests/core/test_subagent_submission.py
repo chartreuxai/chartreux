@@ -18,10 +18,22 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
+from typing import Any
 
 from pydantic import BaseModel
 import pytest
 
+from chartreux.core.agent_loop_hooks import CompletionEvidenceReceipt
+from chartreux.core.completion_contract import (
+    COMPLETION_CONTRACT_SCHEMA_VERSION,
+    COMPLETION_ENVELOPE_MARKER,
+    CompletionCheckTemplate,
+    CompletionEnvelope,
+    CompletionReceipt,
+    CompletionRejectionReason,
+    CompletionRequirement,
+)
 from chartreux.core.events import AssistantEvent, ToolResultEvent
 from chartreux.core.subagent_submission import (
     BLOCK_MESSAGE_MAX_PATHS,
@@ -119,6 +131,188 @@ def test_accumulator_collects_each_touched_path_once(tmp_path: Path) -> None:
     accumulator.observe(_edit_event(str(first)), tool_call_id="task")
     accumulator.observe(_read_event(str(first)), tool_call_id="task")
     assert list(accumulator._touched_paths) == [str(first), str(second)]
+
+
+def _audit_envelope() -> CompletionEnvelope:
+    return CompletionEnvelope(
+        requirements=(
+            CompletionRequirement(
+                requirement_id="req-1", template=CompletionCheckTemplate.PYTEST
+            ),
+        ),
+        schema_version=COMPLETION_CONTRACT_SCHEMA_VERSION,
+        marker=COMPLETION_ENVELOPE_MARKER,
+    )
+
+
+def _audit_claim(envelope: CompletionEnvelope) -> CompletionReceipt:
+    return CompletionReceipt(
+        marker=COMPLETION_ENVELOPE_MARKER,
+        schema_version=COMPLETION_CONTRACT_SCHEMA_VERSION,
+        envelope=envelope,
+        satisfied_requirement_ids=("req-1",),
+    )
+
+
+def _observe_secret_free_write(accumulator: SubagentRunAccumulator, path: Path) -> None:
+    path.write_text("payload\n", encoding="utf-8")
+    accumulator.observe(AssistantEvent(content="done"), tool_call_id="task")
+    accumulator.observe(
+        ToolResultEvent(
+            tool_name="write_file",
+            tool_class=WriteFile,
+            result=WriteFileResult(
+                file_path=str(path), bytes_written=8, content="payload\n"
+            ),
+            tool_call_id="write-1",
+            occurrence_id="occ-1",
+        ),
+        tool_call_id="write-1",
+    )
+
+
+def _emit_failed_check_receipt(accumulator: SubagentRunAccumulator) -> None:
+    accumulator.completion_evidence_sink()(
+        CompletionEvidenceReceipt(
+            occurrence_id="occ-1",
+            tool_call_id="write-1",
+            tool_name="write_file",
+            status="failure",
+            final_text="1 failed",
+            executed_args={"command": "pytest tests/test_x.py"},
+        )
+    )
+
+
+def _enforce_audit_kwargs() -> dict[str, Any]:
+    envelope = _audit_envelope()
+    return {
+        "contract": SimpleNamespace(envelope=envelope),
+        "claim": _audit_claim(envelope),
+        "runner": SimpleNamespace(
+            check_argv=lambda template: ["pytest", "tests/test_x.py"]
+        ),
+        "mode": "enforce",
+    }
+
+
+def test_build_result_stamps_the_composed_audit(tmp_path: Path) -> None:
+    # P10: the composed classification rides on the result in stamp mode.
+    # The accumulator's collection gives the composition a real surface:
+    # the observed write is registered in the chronology with its
+    # collection-time snapshot.
+    artifact = tmp_path / "out.txt"
+    accumulator = SubagentRunAccumulator()
+    _observe_secret_free_write(accumulator, artifact)
+    result = accumulator.build_result(turns_used=1)
+    assert result.completed is True
+    assert result.completion_audit is not None
+    assert result.completion_audit.claim_fidelity.value == "claim_unverified"
+    assert result.completion_audit.mandate_satisfaction == "mandate_disabled"
+    # The collection-time capture rode along: the chronology entry carries
+    # the artifact's snapshot.
+    entry = accumulator._chronology.entry("occ-1")
+    assert entry is not None and entry.snapshot is not None
+
+
+def test_build_result_enforce_mode_cancellation_never_blocks() -> None:
+    # P10 enforce mode + P6b: a recorded cancellation is an informational
+    # disposition (honesty economics) — it never blocks the submission.
+    # The result builds completed=False, the response is the agent's own,
+    # and no rejection message is fabricated from it.
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(AssistantEvent(content="done"), tool_call_id="task")
+    accumulator.record_error("run cancelled (user_cancelled)")
+    result = accumulator.build_result(turns_used=1, mode="enforce")
+    assert result.completed is False
+    # The recorded cancellation joins the response (the accumulator's
+    # record_error appends the marker line): the agent's prose plus the
+    # recorded error, never erased.
+    assert result.response.startswith("done")
+    assert "[Subagent error: run cancelled (user_cancelled)]" in result.response
+    # The inert composition stamps nothing: no audit surface was collected.
+    assert result.completion_audit is None
+
+
+def test_build_result_enforce_mode_blocks_with_the_bounded_message(
+    tmp_path: Path,
+) -> None:
+    # P10: enforce mode blocks the submission on a worker-side
+    # disposition — the paired same-command conflict — with the bounded,
+    # actionable rejection message; the stamp rides on the result.
+    artifact = tmp_path / "out.txt"
+    accumulator = SubagentRunAccumulator()
+    _observe_secret_free_write(accumulator, artifact)
+    _emit_failed_check_receipt(accumulator)
+    result = accumulator.build_result(turns_used=1, **_enforce_audit_kwargs())
+    assert result.completed is False
+    assert result.response.startswith("[Completion audit rejected:")
+    assert "req-1: contradicted" in result.response
+    assert result.completion_audit is not None
+    assert (
+        result.completion_audit.rejection
+        is CompletionRejectionReason.CLAIM_CONTRADICTED
+    )
+
+
+def test_build_result_secret_scan_takes_precedence_over_the_audit_block(
+    tmp_path: Path,
+) -> None:
+    # P10: secret-scan precedence — when the scan blocks AND the audit
+    # would block, the scan's redacted block message is published (the
+    # scan's findings never leak into another surface) and the stamp
+    # still rides on the result.
+    artifact = tmp_path / "deploy.py"
+    artifact.write_text(f"# config\n{SECRET_LINE}\n", encoding="utf-8")
+    accumulator = SubagentRunAccumulator()
+    accumulator.observe(AssistantEvent(content="done"), tool_call_id="task")
+    accumulator.observe(
+        ToolResultEvent(
+            tool_name="write_file",
+            tool_class=WriteFile,
+            result=WriteFileResult(
+                file_path=str(artifact), bytes_written=8, content="x"
+            ),
+            tool_call_id="write-1",
+            occurrence_id="occ-1",
+        ),
+        tool_call_id="write-1",
+    )
+    _emit_failed_check_receipt(accumulator)
+    result = accumulator.build_result(turns_used=1, **_enforce_audit_kwargs())
+    assert result.completed is False
+    assert result.response.startswith("[Submission blocked:")
+    assert "Completion audit rejected" not in result.response
+    assert SECRET_LINE not in result.response
+    assert SECRET_LINE not in result.model_dump_json()
+    assert result.completion_audit is not None
+    assert (
+        result.completion_audit.rejection
+        is CompletionRejectionReason.CLAIM_CONTRADICTED
+    )
+
+
+def test_build_result_reads_the_finalization_cache(tmp_path: Path) -> None:
+    # P10: repeated builds run no checks — build_result resolves the
+    # once-only finalization (P6a) from the run-keyed cache and the
+    # composition consumes it unchanged; a repeated build is a cache hit
+    # with a stable stamp.
+    artifact = tmp_path / "out.txt"
+    accumulator = SubagentRunAccumulator()
+    _observe_secret_free_write(accumulator, artifact)
+    accumulator._finalization_cache["run-1"] = SimpleNamespace(
+        checks=(),
+        admission_head=None,
+        publication_head=None,
+        runtime_failure="unavailable",
+    )
+    first = accumulator.build_result(turns_used=1, run_id="run-1")
+    second = accumulator.build_result(turns_used=1, run_id="run-1")
+    assert first.completion_audit is not None
+    assert second.completion_audit is not None
+    assert second.completion_audit == first.completion_audit
+    # The cached finalization's availability fact reached the stamp.
+    assert first.completion_audit.primary_runtime_failure.value == "runtime_unavailable"
 
 
 def test_build_result_blocks_secret_bearing_touched_path(tmp_path: Path) -> None:

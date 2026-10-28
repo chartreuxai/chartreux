@@ -102,6 +102,13 @@ class ToolResultEvent(BaseEvent):
     cancelled: bool = False
     cancellation_origin: ToolCancellationOrigin | None = None
     duration: float | None = None
+    # P2 (round-9): the harness-minted, run-scoped completion-evidence
+    # receipt occurrence ID. Minted by the tool executor at the tool-call
+    # dispatch site BEFORE the invocation starts, it rides every result
+    # event the invocation produces so the accumulator's collection (P3)
+    # can register it unchanged; tool_call_id alone never keys pairing
+    # (tool-call ids are reused across turns).
+    occurrence_id: str | None = None
     tool_call_id: str
     presentation: ToolResultPresentation | None = None
 

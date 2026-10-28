@@ -1041,6 +1041,30 @@ async def test_full_metadata_omits_identity_rows_without_binding() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resume_lineage_rendered_in_details_and_metadata() -> None:
+    app = _BrowserApp()
+    async with app.run_test() as pilot:
+        agent = _agent(
+            "resumed-one",
+            availability="running",
+            current_run_id="r2",
+            resumed_from_run_id="r1",
+        )
+        app.bar.update_agents((agent,))
+        app.bar.open_browser()
+        await pilot.press("down")
+        detail = str(app.bar.query_one("#agent-bar-detail", Static).render())
+        assert "resumed from r1" in detail
+        metadata = app.bar.full_metadata(agent)
+        assert "Run ID: r2" in metadata
+        assert "Resumed from run ID: r1" in metadata
+        # A record without a resume lineage presents neither row.
+        plain = _agent("plain-one", availability="running", current_run_id="r2")
+        assert "resumed from" not in app.bar._agent_details(plain)
+        assert "Resumed from run ID:" not in app.bar.full_metadata(plain)
+
+
+@pytest.mark.asyncio
 async def test_eight_cell_transition_markers_do_not_collide_with_outcomes() -> None:
     app = _BrowserApp()
     async with app.run_test(size=(80, 24)) as pilot:

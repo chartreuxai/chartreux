@@ -84,6 +84,7 @@ from chartreux.core.recovery_models import (
     FailureEnvelope,
     RecoveryEligibility,
     canonical_endpoint_identity,
+    measured_timeout_reason_of,
 )
 from chartreux.core.subagents import ResumeAgentResult, ResumeOutcome, RunStatus
 from chartreux.core.utils.retry import jittered_backoff
@@ -319,6 +320,82 @@ class RecoveryController:
         for episode in list(self._episodes.values()):
             self._stop_episode_locked(episode, reason="invalidated")
 
+    def stand_down_schedule_locked(self, agent_id: str) -> None:
+        """Cancel one agent's armed backoff timer, keeping the episode (C6a).
+
+        Called at a COMMITTED resume admission (the WP2 operation, explicit or
+        automatic): the timer must never fire on a RESTORING record. The
+        episode itself stays active — the successor's completion transition
+        closes it (success/exhaustion accounting), and the automatic route's
+        own post-admission counting still sees an active episode. A REJECTED
+        admission never reaches this hook, so a rejected admission preserves
+        the pending timer (read-only waits never consume anything).
+        """
+        episode = self._episodes.get(agent_id)
+        if episode is not None and episode.active and episode.timer is not None:
+            episode.timer.cancel()
+            episode.timer = None
+            episode.scheduled_failed_run_id = None
+
+    def rearm_schedule_locked(self, agent_id: str) -> None:
+        """Re-arm a stood-down backoff timer after a failed post-commit admission.
+
+        C6a: a committed resume admission stands the pending automatic
+        schedule down (the timer must never fire on a RESTORING record);
+        when the successor admission then fails, the rollback restores the
+        SUSPENDED record — and must restore the schedule too. A suspended
+        agent never produces the new failure envelope that would re-arm it,
+        so without this the automatic recovery route is dead for that agent.
+        Read-only for the counters: the re-arm consumes no budget, and the
+        scheduled milestone keeps its exactly-once emission.
+        """
+        episode = self._episodes.get(agent_id)
+        if episode is None or not episode.active or episode.timer is not None:
+            return
+        record = self._view._agent_records.get(agent_id)
+        # A settled run leaves ``current_run`` cleared (it lives in the
+        # history); the suspended record's failed run is the one its
+        # ``latest_run_id`` still names.
+        run = (
+            next(
+                (
+                    item
+                    for item in (record.current_run, *record.run_history)
+                    if item is not None and item.run_id == record.latest_run_id
+                ),
+                None,
+            )
+            if record is not None
+            else None
+        )
+        if record is None or run is None or run.status is not RunStatus.FAILED:
+            return
+        if (
+            record.state is not _AgentState.SUSPENDED
+            or record.latest_run_id != run.run_id
+            or record.recovery_superseded
+            or record.reserved_for_replacement
+        ):
+            return
+        availability = self._availability(record)
+        if availability.permanent:
+            self._stop_episode_locked(
+                episode, reason="permanent_incompatibility", emit_exhaustion=True
+            )
+            return
+        delay = self._compute_delay(episode, availability)
+        # The admission would happen after the advisory deadline: stop now
+        # instead of arming a timer that can only be refused.
+        remaining = (
+            episode.started_at + episode.episode_deadline_seconds - self._epoch()
+        )
+        if delay > remaining:
+            self._stop_episode_locked(
+                episode, reason="episode_deadline_passed", emit_exhaustion=True
+            )
+            return
+        self._arm_timer_locked(record, run, episode, delay)
+
     # ------------------------------------------------------------------
     # Failure path (locked)
     # ------------------------------------------------------------------
@@ -369,6 +446,20 @@ class RecoveryController:
         if envelope is None:
             self._stop_episode_locked(
                 episode, reason="no_failure_envelope", emit_exhaustion=episode.driven
+            )
+            return
+        # C5a: a harness-measured progress deadline NEVER schedules the
+        # automatic same-payload continuation — the specific measured timeout
+        # reason stops the episode regardless of the configured eligible
+        # classes. The envelope-level classification keeps the explicit routes
+        # (resume admission, replacement claim) available; only the AUTOMATIC
+        # continuation is prohibited here. This gate names the specific
+        # reason in the exhaustion milestone instead of a generic refusal.
+        if measured_timeout_reason_of(envelope) is not None:
+            self._stop_episode_locked(
+                episode,
+                reason="resume_progress_deadline_no_auto_recovery",
+                emit_exhaustion=episode.driven,
             )
             return
         # Gate 1: the envelope's effective eligibility. RECONCILE_REQUIRED is

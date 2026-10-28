@@ -423,7 +423,7 @@ async def test_reused_launch_failure_restores_idle_bookkeeping_and_rearms_reaper
     registry._agent_records[record.agent_id] = record
     registry._children[record.session_id] = record.runtime
 
-    def fail_start(*_args: object) -> tuple[str, object]:
+    def fail_start(*_args: object, **_kwargs: object) -> tuple[str, object]:
         raise RuntimeError("start failed")
 
     monkeypatch.setattr(SessionRuntimeRegistry, "_start_child_turn", fail_start)
@@ -924,8 +924,8 @@ async def test_prelaunch_registry_lock_cancellation_aborts_real_prepared_turn(
     release_final_lock = asyncio.Event()
     original_start_child_turn = SessionRuntimeRegistry._start_child_turn
 
-    def signal_prepared(*values: Any) -> tuple[str, Any]:
-        result = original_start_child_turn(*values)
+    def signal_prepared(*values: Any, **kwargs: Any) -> tuple[str, Any]:
+        result = original_start_child_turn(*values, **kwargs)
         prepared.set()
         return result
 

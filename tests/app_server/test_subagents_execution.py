@@ -819,12 +819,12 @@ async def test_foreground_simulated_empty_child_result(
     monkeypatch.setattr(
         SessionRuntimeRegistry,
         "_start_child_turn",
-        lambda *_args: ("turn-1", lambda: None),
+        lambda *_args, **_kwargs: ("turn-1", lambda: None),
     )
     monkeypatch.setattr(
         TurnController,
         "wait_for_operation",
-        AsyncMock(return_value=MagicMock(error=None, status=status)),
+        AsyncMock(return_value=MagicMock(error=None, status=status, stop_reason=None)),
     )
     closed: list[SessionRuntime] = []
     original_close = SessionRuntime.close
@@ -840,7 +840,7 @@ async def test_foreground_simulated_empty_child_result(
                 await _foreground_result(registry, parent)
         else:
             result = await _foreground_result(registry, parent)
-            assert result.response == ""
+            assert "run cancelled (user_cancelled)" in result.response
             assert not result.completed
         await registry.drain_children()
         assert registry._children == {}

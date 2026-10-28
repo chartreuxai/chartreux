@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from chartreux.core.agents.launch import LaunchCandidate
     from chartreux.core.config import ChartreuxConfigSchema
     from chartreux.core.dispatch.route_models import PurposeRoute
+    from chartreux.core.recovery_override import CooldownOverrideLedger, OverridePermit
 
 
 def identity_denylist_keys(identity: str) -> tuple[str, ...]:
@@ -68,6 +69,8 @@ def resolve_identity_candidate(
     session_model: str | None = None,
     user_prompts_dirs: Sequence[Any] | None = None,
     routes: Mapping[str, PurposeRoute] | None = None,
+    override_permit: OverridePermit | None = None,
+    override_ledger: CooldownOverrideLedger | None = None,
 ) -> LaunchCandidate:
     """Resolve one fresh child launch through the canonical grammar (11c).
 
@@ -159,6 +162,11 @@ def resolve_identity_candidate(
         # through a mechanical-tier route is recovered as mechanical.
         effective_tier=resolved.effective_tier,
         replacement_capability=resolved.replacement_capability,
+        # C4: an explicitly requested un-stick launch resolves its model
+        # THROUGH the minted permit, so the cooled forced deployment stays
+        # assignable; every other admission check still applies.
+        override_permit=override_permit,
+        override_ledger=override_ledger,
     )
 
 

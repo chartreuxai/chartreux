@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+import json
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from pydantic import ValidationError
+
+from chartreux.app_server._subagent_finalization import (
+    RunFinalization,
+    _check_runner,
+    finalize_background_run,
+)
 from chartreux.app_server._subagent_records import (
     AgentRecord,
+    CompletionCapability,
+    FrozenCompletionContract,
     RunRecord,
     StoredRunResult,
     _ActiveWorkSlot,
@@ -18,14 +29,28 @@ from chartreux.app_server._subagent_records import (
 )
 from chartreux.app_server.models import PublicTurn, PublicTurnStatus, TextContentBlock
 from chartreux.app_server.protocol import TurnInterruptParams, TurnStartParams
+from chartreux.core import completion_checks
 from chartreux.core.agent_loop import AgentLoop
-from chartreux.core.agents.identities import get_builtin_identity
+from chartreux.core.agent_loop.resume_progress import (
+    arm_resume_progress_deadline,
+    clear_resume_progress_deadline,
+)
+from chartreux.core.agents.identities import AgentIdentity, get_builtin_identity
 from chartreux.core.agents.manager import requested_identity_reference
+from chartreux.core.completion_contract import (
+    COMPLETION_ENVELOPE_MARKER,
+    CompletionReceipt,
+    CompletionRejectionReason,
+)
 from chartreux.core.events import BaseEvent, ToolStreamEvent
+from chartreux.core.git.errors import GitError
+from chartreux.core.git.repo import GitRepo
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.recovery_models import (
     FailureEnvelope,
+    PackageTier,
     RecoveryReference,
+    build_completion_rejection_envelope,
     build_failure_envelope,
     canonical_endpoint_identity,
 )
@@ -52,24 +77,263 @@ from chartreux.core.subagents import (
     UnknownAgentError,
     normalize_task_summary,
 )
+from chartreux.core.tools.models import ToolPermission
+from chartreux.core.utils import kill_async_subprocess
 from chartreux.model_display import format_model_display_name
 from chartreux.observability.logging import logger
 
 if TYPE_CHECKING:
     from chartreux.app_server._sessions import SessionRuntime
     from chartreux.app_server._streaming import BoundedEventQueue
+    from chartreux.app_server._subagent_launch import ChildLaunchAdmission, OverrideMint
     from chartreux.app_server._subagent_results import PublicationDecision
     from chartreux.app_server._turns import TurnStartAction
     from chartreux.core.agent_loop._config_transactions import (
         _PreparedLaunchReconfiguration,
     )
     from chartreux.core.agent_loop.backend_lifetime import BackendPublish
+    from chartreux.core.agent_loop_hooks import CompletionEvidenceReceipt
     from chartreux.core.agents.launch import LaunchCandidate
     from chartreux.core.session_types import AgentStats
     from chartreux.core.tools.base import InvokeContext
 
 _BACKGROUND_PROGRESS_LIMIT = 32
 _MAX_RUN_HISTORY = 32
+
+
+def cancellation_finalization(
+    *,
+    run_id: str,
+    contract: FrozenCompletionContract | None,
+    admission_head: str | None,
+) -> RunFinalization:
+    """The cancelled-run finalization stub (P6b).
+
+    A run cancelled before its audit settled never credits the worker with
+    verifier evidence: the stub is cached so no later finalization re-runs
+    the bound checks, the admission baseline is preserved unchanged, and a
+    contract that binds check templates stamps the harness-side
+    ``unavailable`` word — the verifier evidence never became available.
+    """
+    binds_checks = (
+        contract is not None
+        and contract.envelope is not None
+        and any(
+            requirement.template is not None
+            for requirement in contract.envelope.requirements
+        )
+    )
+    return RunFinalization(
+        run_id=run_id,
+        admission_head=admission_head,
+        runtime_failure="unavailable" if binds_checks else None,
+    )
+
+
+def apply_cancellation_disposition(
+    accumulator: SubagentRunAccumulator,
+    run_id: str,
+    contract: FrozenCompletionContract | None,
+    admission_head: str | None,
+    stop_reason: RunStopReason | None,
+) -> None:
+    """The cancelled-run disposition (P6b): the reason recorded, stub cached.
+
+    The recorded error forces every later ``build_result`` completed=False
+    (no worker credit), and the stub finalization cached on the run-keyed
+    accumulator cache makes the awaited finalization after this disposition
+    a cache hit that runs no checks.
+    """
+    reason = stop_reason if stop_reason is not None else RunStopReason.USER_CANCELLED
+    accumulator.record_error(f"run cancelled ({reason.value})")
+    accumulator._finalization_cache[run_id] = cancellation_finalization(
+        run_id=run_id, contract=contract, admission_head=admission_head
+    )
+
+
+#: The bound on the claim scan's JSON-object candidates (P12): the marker
+#: pre-filter keeps a no-claim report off the scan entirely.
+_CLAIM_SCAN_MAX_OBJECTS = 64
+
+
+def extract_completion_claim(
+    response: str,
+) -> CompletionReceipt | Mapping[str, Any] | None:
+    """The worker's completion-receipt claim parsed from its final report.
+
+    The P13 worker contract emits a strict receipt — a JSON object carrying
+    the ``completion_envelope_v1`` marker and the ``satisfied_requirement_ids``
+    key — in the final report. The LAST such object is the operative claim:
+    the final report's receipt wins over any earlier prose, and the nested
+    envelope (which carries the same marker but no ``satisfied_requirement_ids``
+    key) is not the claim. A well-formed payload validates into the P1
+    receipt model; a grammar-violating payload rides RAW so the truth table
+    classifies the violation as a disclosure fact instead of escaping as an
+    exception. A report with no receipt-shaped object carries no claim
+    (``None``) — an availability fact, never a fabricated one.
+    """
+    if COMPLETION_ENVELOPE_MARKER not in response:
+        return None
+    decoder = json.JSONDecoder()
+    claim: Mapping[str, Any] | None = None
+    candidates = 0
+    for index, char in enumerate(response):
+        if char != "{":
+            continue
+        candidates += 1
+        if candidates > _CLAIM_SCAN_MAX_OBJECTS:
+            break
+        try:
+            payload, _end = decoder.raw_decode(response, index)
+        except ValueError:
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("marker") == COMPLETION_ENVELOPE_MARKER
+            and "satisfied_requirement_ids" in payload
+        ):
+            claim = payload
+    if claim is None:
+        return None
+    try:
+        return CompletionReceipt.model_validate(claim)
+    except ValidationError:
+        # A grammar violation is a grammar fact, never a worker fault: the
+        # raw payload rides so the truth table classifies it.
+        return claim
+
+
+def operative_completion_claim(
+    accumulator: SubagentRunAccumulator, *, turn_completed: bool
+) -> CompletionReceipt | Mapping[str, Any] | None:
+    """The worker's receipt claim, gated on a healthy completed turn (P12).
+
+    The claim is operative only on a healthy completed turn's publication:
+    a cancelled or failed run's primary disposition stays authoritative
+    (the cancellation reason or the runtime failure), so no claim rides —
+    the composition then classifies the run as an unaddressed mandate (a
+    disclosure fact), never a worker-side attribution.
+    """
+    if not turn_completed:
+        return None
+    return extract_completion_claim("".join(accumulator._response))
+
+
+def rejection_envelope(
+    context: BackgroundExecutionContext, result: TaskResult
+) -> FailureEnvelope | None:
+    """The measured rejection envelope for one audit-rejected run (P12).
+
+    When the composed audit rejects the run's claimed completion — the
+    enforce-mode worker-side disposition (``claim_contradicted``) — the run
+    finalizes as FAILED with the P11 rejection envelope, and the result's
+    audit stamp, the run status, and the envelope agree. The decision reads
+    ONLY the built result's typed stamp and the run's terminal state: the
+    truth table attributes a rejection solely while the verifier stayed
+    healthy, and only a healthy completed turn's publication can be
+    audit-rejected, so primary runtime failures, cancellation reasons, and
+    honest abort/blocker outcomes never carry the rejection envelope. The
+    envelope is PROHIBITED for recovery — a typed audit rejection
+    authorizes a cross-agent replacement, never a warm same-agent
+    auto-resume (the suspension gates stay shut).
+
+    Persisted-result compatibility: ``TaskResult.completion_audit`` is
+    omitted from dumps when ``None`` (the pre-audit dump shape is
+    unchanged); mixed-version consumption — an old reader consuming a new
+    persisted result with a populated audit — is unsupported.
+    """
+    audit = result.completion_audit
+    if (
+        result.completed
+        or audit is None
+        or audit.rejection is not CompletionRejectionReason.CLAIM_CONTRADICTED
+    ):
+        return None
+    rejection = audit.rejection
+    if context.run_record.status is not RunStatus.COMPLETED:
+        # A cancelled or failed turn keeps its primary disposition: the
+        # rejection envelope never replaces a runtime failure or a
+        # cancellation reason.
+        return None
+    contract = context.run_record.completion_contract
+    if contract is None or contract.audit_mode != "enforce":
+        # Escalation requires an enforce-mode contradiction disposition;
+        # stamp mode never escalates.
+        return None
+    try:
+        return build_completion_rejection_envelope(
+            agent_id=context.agent_id,
+            run_id=context.run_id,
+            rejection=rejection,
+            turn_id=context.turn_id,
+            work_package_id=context.record.work_package_id,
+            predecessor_agent_id=context.record.predecessor_agent_id,
+            recovery_chain_id=context.record.recovery_chain_id,
+            message=result.response,
+        )
+    except Exception as exc:
+        # Total by contract: an envelope-construction failure is logged and
+        # reported as None — it never masks the run's audit rejection.
+        logger.warning(
+            "Failed to build the completion rejection envelope", exc_info=exc
+        )
+        return None
+
+
+async def finalize_run_with_drain(
+    *,
+    run_id: str,
+    accumulator: SubagentRunAccumulator,
+    contract: FrozenCompletionContract | None,
+    admission_head: str | None,
+    runtime: SessionRuntime,
+) -> RunFinalization:
+    """The drain-wrapped once-only finalization (P6b).
+
+    Wraps ``finalize_background_run`` with check-spawn tracking scoped to
+    THIS task: spawns recorded while this wrapper's window is open carry
+    their owning task, so a sibling run's checks — and the worker's own
+    managed shell jobs — are never collateral. If cancellation lands
+    mid-audit (case b), the recorded check processes are force-terminated
+    and reaped before the CancelledError propagates — a completed check
+    reaps safely (its group is left intact), an in-flight check is killed
+    with its group — and the partial findings are discarded: the cache
+    write happens only once the finalization settles (P6a), so no partial
+    evidence is ever published.
+
+    The seam is the module-level ``spawn_shell_command`` the check runner
+    resolves at call time (the same seam the check tests patch). The
+    restore only fires when this wrapper is still the installed seam; a
+    leftover live sibling wrapper delegates transparently.
+    """
+    original_spawn = completion_checks.spawn_shell_command
+    recorded: list[tuple[asyncio.Task[Any] | None, asyncio.subprocess.Process]] = []
+
+    async def tracking_spawn(command: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        process = await original_spawn(command, **kwargs)
+        recorded.append((asyncio.current_task(), process))
+        return process
+
+    completion_checks.spawn_shell_command = tracking_spawn
+    try:
+        return await finalize_background_run(
+            run_id=run_id,
+            accumulator=accumulator,
+            contract=contract,
+            admission_head=admission_head,
+            runtime=runtime,
+        )
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        for owner, process in recorded:
+            if owner is not current:
+                continue
+            with suppress(Exception):
+                await kill_async_subprocess(process, kill_exited_process_group=False)
+        raise
+    finally:
+        if completion_checks.spawn_shell_command is tracking_spawn:
+            completion_checks.spawn_shell_command = original_spawn
 
 
 def _tool_call_effect_sets(messages: Sequence[LLMMessage]) -> tuple[set[str], set[str]]:
@@ -151,6 +415,116 @@ def _transfer_cumulative_stats(source: AgentStats, target: AgentStats) -> None:
     target.has_unknown_cost = target.has_unknown_cost or source.has_unknown_cost
 
 
+def _verification_capability(parent: SessionRuntime) -> CompletionCapability:
+    """The run-scoped harness verification capability (P4).
+
+    Derived from the parent delegation authority: the harness
+    acceptance-check runner may act only under authority the parent could
+    delegate, so the capability is available exactly when the parent's
+    delegation ceiling carries the shell tool. A parent whose delegation
+    ceiling excludes the shell leaves the capability denied, and a parent
+    that cannot report its authority leaves it unavailable; both stamp the
+    check unavailable at finalization — never a worker fault.
+    """
+    try:
+        delegable = set(parent.agent_loop.tool_manager.delegable_tools)
+    except Exception:
+        return CompletionCapability.UNAVAILABLE
+    if "bash" in delegable:
+        return CompletionCapability.AVAILABLE
+    return CompletionCapability.DENIED
+
+
+def _shell_less_launch(args: TaskArgs, identity_facts: AgentIdentity | None) -> bool:
+    """Whether this launch is shell-less (round-2 amendment 10).
+
+    A shell-less launch is a custom identity (no harness-known posture) or a
+    launch explicitly disabling the shell tool per-launch; the shipped
+    researcher/advisor/reviewer seats are NOT shell-less by identity.
+    """
+    if identity_facts is None:
+        return True
+    config = args.config
+    if config is None:
+        return False
+    if config.disabled_tools is not None and "bash" in config.disabled_tools:
+        return True
+    override = (config.tools or {}).get("bash")
+    return override is not None and override.permission is ToolPermission.NEVER
+
+
+def _capture_admission_head(cwd: Path) -> str | None:
+    """Capture the admission HEAD baseline for one run (P4, round-7).
+
+    PRE-EXECUTION: called at admission, never at finalization, so a worker
+    commit moves the publication HEAD away from the captured baseline. A
+    probe failure (not a repository, unborn HEAD, git unavailable) is
+    informational: the baseline is None, never an admission failure.
+    """
+    try:
+        return GitRepo.head_commit_at(cwd)
+    except GitError:
+        return None
+
+
+def _budget_fit_description(
+    run_max_price: float | None, run_max_session_tokens: int | None
+) -> str:
+    """The advisory budget-fit description for one admission (P14)."""
+    limits = []
+    if run_max_price is not None:
+        limits.append(f"price<={run_max_price:.2f}")
+    if run_max_session_tokens is not None:
+        limits.append(f"tokens<={run_max_session_tokens}")
+    return ", ".join(limits) if limits else "unconfigured (no run-budget middleware)"
+
+
+def freeze_run_admission(
+    *,
+    args: TaskArgs,
+    identity: str,
+    identity_revision: str | None,
+    tier: PackageTier | None,
+    runtime: SessionRuntime,
+    parent: SessionRuntime,
+) -> tuple[FrozenCompletionContract, str | None]:
+    """Freeze the completion contract at admission, capture the HEAD baseline.
+
+    The contract freezes identity/seat/tier, cwd/roots, the mandates, the
+    envelope requirement/exemption, the audit mode, and the capability
+    inputs. The admission HEAD baseline is captured alongside the frozen
+    contract — only when the contract mandates a commit artifact; runs
+    without a commit mandate perform no HEAD probes.
+    """
+    loop = runtime.agent_loop
+    try:
+        roots = tuple(
+            str(root) for root in loop.tool_manager.workspace.authorized_roots
+        )
+    except Exception:
+        # The workspace is the canonical authority; a loop that cannot
+        # report it still admits — the contract falls back to the cwd.
+        roots = (str(loop.cwd),)
+    identity_facts = get_builtin_identity(identity.removeprefix("builtin:"))
+    contract = FrozenCompletionContract.freeze(
+        identity=identity,
+        identity_revision=identity_revision,
+        seat=args.seat,
+        tier=tier,
+        cwd=str(loop.cwd),
+        roots=roots,
+        completion_check=args.completion_check,
+        required_artifacts=args.required_artifacts,
+        shell_less=_shell_less_launch(args, identity_facts),
+        audit_mode=loop.config.completion.mode,
+        capability=_verification_capability(parent),
+    )
+    admission_head = (
+        _capture_admission_head(loop.cwd) if contract.requires_commit_artifact else None
+    )
+    return contract, admission_head
+
+
 class ExecutionStateView(Protocol):
     """Narrow typed view over the registry-owned execution state.
 
@@ -182,6 +556,9 @@ class ExecutionStateView(Protocol):
     _suppressed_notifications: set[str]
     _retention_policy: RetentionPolicy
     _clock: Callable[[], float]
+
+    # C4: the launch-admission collaborator owns the override mint.
+    _launch_admission: ChildLaunchAdmission
 
     def _validate_background_admission(
         self, parent: SessionRuntime, identity: tuple[str, int]
@@ -293,6 +670,14 @@ class ForegroundExecutionContext:
     turn_id: str | None = None
     completion: asyncio.Task[PublicTurn] | None = None
     result: TaskResult | None = None
+    # P4: the completion contract frozen at foreground admission, and the
+    # admission HEAD baseline captured alongside it (only when the contract
+    # mandates a commit artifact).
+    completion_contract: FrozenCompletionContract | None = None
+    admission_head: str | None = None
+    # P2/P3: the receipt sink installed on the child loop at admission (the
+    # run accumulator's side-channel callback); cleared at run teardown.
+    completion_evidence_sink: Callable[[CompletionEvidenceReceipt], None] | None = None
 
     async def consume_event(self, event: BaseEvent) -> None:
         """Feed one child event into the bounded progress queue.
@@ -367,6 +752,10 @@ class BackgroundExecutionContext:
     completion_metadata_mark: tuple[int, int]
     completion_placeholder: asyncio.Future[None]
     publication_token: object
+    # P2/P3: the receipt sink installed on the child loop at admission (the
+    # run accumulator's side-channel callback); cleared at run teardown so a
+    # retained loop never hands a later run's receipts to a spent accumulator.
+    completion_evidence_sink: Callable[[CompletionEvidenceReceipt], None] | None = None
     monitor: asyncio.Task[None] | None = None
     turn_id: str | None = None
     action: TurnStartAction | None = None
@@ -376,6 +765,10 @@ class BackgroundExecutionContext:
     # replacement launch (carries the milestone notice with its honest cost
     # implication); None for unclaimed launches.
     replacement_decision: ReplacementDecision | None = None
+    # C4: the bounded un-stick diagnostics snapshot for an explicit
+    # override_cooldown launch, taken pre-start (the child's first model
+    # call consumes the coordinator binding); None for ordinary launches.
+    override_diagnostics: dict[str, object] | None = None
 
     async def consume_event(self, event: BaseEvent) -> None:
         """Feed one child event into the run record's progress summaries.
@@ -562,15 +955,63 @@ class SubagentExecution:
         launch_identity: str | None = None
         effective_task = summary_task if summary_task is not None else args.task
         prepared_reconfiguration = None
+        override_diagnostics: dict[str, object] | None = None
         if record is not None:
+            # C4: an explicit override_cooldown request mints its permit here,
+            # after the record/admission checks and before the candidate
+            # resolution (the deep validation must resolve the cooled forced
+            # deployment THROUGH the permit). A ledger denial raises before
+            # any budget is consumed. The mint runs INSIDE the
+            # rollback-protected region: the reuse reservation above already
+            # flipped the record to RUNNING, so a denial (or a model-resolution
+            # failure) must restore the retained record to IDLE — stranding it
+            # RUNNING leaves it permanently busy with no run.
+            from chartreux.app_server._subagent_launch import (
+                bind_override_to_loop,
+                override_launch_diagnostics,
+            )
+
+            mint: OverrideMint | None = None
+            try:
+                mint = self._view._launch_admission.mint_override_permit(
+                    parent, args, committed=record.runtime.agent_loop.committed_model
+                )
+            except BaseException:
+                if mint is not None:
+                    mint.ledger.release(mint.permit)
+                await self._view._rollback_reused_claim(
+                    record, previous_idle_since, apply_policy=replacement is not None
+                )
+                raise
             if args.config is not None or isinstance(
                 record.runtime.agent_loop.launch_overrides, LaunchConfig
             ):
                 try:
-                    retained_candidate = self._view._resolve_launch_candidate(
-                        parent, args, runtime=record.runtime, identity=record.identity
-                    )
+                    if mint is not None:
+                        # C4: the minted permit must reach the model-assignment
+                        # availability predicate, and the registry's thin
+                        # delegate has a fixed signature — the override path
+                        # resolves through the admission collaborator directly.
+                        retained_candidate = (
+                            self._view._launch_admission.resolve_candidate(
+                                parent,
+                                args,
+                                runtime=record.runtime,
+                                identity=record.identity,
+                                override_permit=mint.permit,
+                                override_ledger=mint.ledger,
+                            )
+                        )
+                    else:
+                        retained_candidate = self._view._resolve_launch_candidate(
+                            parent,
+                            args,
+                            runtime=record.runtime,
+                            identity=record.identity,
+                        )
                 except BaseException:
+                    if mint is not None:
+                        mint.ledger.release(mint.permit)
                     await self._view._rollback_reused_claim(
                         record,
                         previous_idle_since,
@@ -587,6 +1028,8 @@ class SubagentExecution:
                         expected_parent_authority_revision=reserved_parent_authority_revision,
                     )
                 except BaseException:
+                    if mint is not None:
+                        mint.ledger.release(mint.permit)
                     await self._view._rollback_reused_claim(
                         record,
                         previous_idle_since,
@@ -620,12 +1063,22 @@ class SubagentExecution:
                         await record.runtime.agent_loop.abort_launch_reconfiguration(
                             prepared_reconfiguration
                         )
+                    if mint is not None:
+                        mint.ledger.release(mint.permit)
                     await self._view._rollback_reused_claim(
                         record,
                         previous_idle_since,
                         apply_policy=replacement is not None,
                     )
                     raise
+            if mint is not None:
+                # The permit binds to the retained child's NEXT logical model
+                # call (C3's slot channel); the diagnostics snapshot is taken
+                # pre-start, before the child consumes the binding.
+                bind_override_to_loop(record.runtime.agent_loop, mint)
+                override_diagnostics = override_launch_diagnostics(
+                    record.runtime.agent_loop
+                )
             runtime = record.runtime
         else:
             requested_identity = requested_identity_reference(args)
@@ -634,6 +1087,15 @@ class SubagentExecution:
             runtime, launch_identity = await self._view._create_registered_child(
                 parent, args, ctx
             )
+            # C4: the fresh launch minted its permit inside create_registered
+            # and bound it to the child's first model call; snapshot the
+            # bounded diagnostics pre-start, before the child consumes the
+            # binding.
+            from chartreux.app_server._subagent_launch import (
+                override_launch_diagnostics,
+            )
+
+            override_diagnostics = override_launch_diagnostics(runtime.agent_loop)
             agent_id = await self._view._issue_agent_id(parent)
             # WP5: a claimed replacement launch (args.agent_id is None with
             # a config.predecessor_agent_id claim) gets a NEW agent_id whose
@@ -720,7 +1182,47 @@ class SubagentExecution:
         previous_event_sink = runtime.turns._event_sink
         publication_token = object()
         accumulator = SubagentRunAccumulator()
+        # P2/P3 wiring: install the run's receipt sink on the child loop —
+        # the post-tool finalization seam emits each invocation's receipt
+        # into THIS run's accumulator chronology. Cleared at run teardown:
+        # the loop persists across a retained agent's runs, and a stale
+        # sink must never receive a later run's receipts (P3 requires a
+        # fresh accumulator per run).
+        completion_evidence_sink = accumulator.completion_evidence_sink()
+        runtime.agent_loop._completion_evidence_sink = completion_evidence_sink
         completion_placeholder = asyncio.get_running_loop().create_future()
+        # P4: freeze the completion contract at admission. A resume carries
+        # the failed run's run-scoped snapshot (contract and admission HEAD
+        # baseline); every other admission — fresh, reuse, replacement —
+        # freezes a NEW contract from this launch's args.
+        if resume is not None:
+            completion_contract = resume.failed_run.completion_contract
+            admission_head = resume.failed_run.admission_head
+        else:
+            completion_contract, admission_head = freeze_run_admission(
+                args=args,
+                identity=record.identity,
+                identity_revision=record.identity_revision,
+                tier=(
+                    retained_candidate.effective_tier
+                    if retained_candidate is not None
+                    else runtime.agent_loop.launch_package_tier
+                ),
+                runtime=runtime,
+                parent=parent,
+            )
+        # P14: the ONE advisory budget-fit log line at admission. Advisory
+        # only: it never gates admission and never rejects a launch.
+        run_budget = runtime.agent_loop.runtime_policy
+        logger.info(
+            "Budget-fit advisory for %s/%s (%s): %s",
+            agent_id,
+            run_id,
+            record.identity,
+            _budget_fit_description(
+                run_budget.run_max_price, run_budget.run_max_session_tokens
+            ),
+        )
         run_record = RunRecord(
             run_id=run_id,
             agent_id=agent_id,
@@ -738,6 +1240,8 @@ class SubagentExecution:
                 if args.config is not None and args.config.difficulty is not None
                 else None
             ),
+            completion_contract=completion_contract,
+            admission_head=admission_head,
         )
         record.current_run = run_record
         record.latest_run_id = run_id
@@ -745,6 +1249,14 @@ class SubagentExecution:
         # The run's attribution join key: the child loop stamps every ledger
         # record made during this run with the run id (cleared at run end).
         runtime.agent_loop.run_identity = run_id
+        # C5b: the first-semantic-progress deadline arms ONLY for an
+        # explicitly marked resumed context (the WP2 resume admission);
+        # every other admission clears any stale watch, so ordinary runs
+        # are structurally unaffected.
+        if resume is not None:
+            arm_resume_progress_deadline(runtime.agent_loop)
+        else:
+            clear_resume_progress_deadline(runtime.agent_loop)
         # Commit the retention policy for this admission. A fresh launch
         # resolves explicit task arg -> generation snapshot default; a reuse
         # inherits the committed policy unless the caller explicitly overrides
@@ -797,10 +1309,12 @@ class SubagentExecution:
             prior_idle_since=prior_idle_since,
             previous_event_sink=previous_event_sink,
             accumulator=accumulator,
+            completion_evidence_sink=completion_evidence_sink,
             completion_metadata_mark=completion_metadata_mark,
             completion_placeholder=completion_placeholder,
             publication_token=publication_token,
             replacement_decision=replacement_decision,
+            override_diagnostics=override_diagnostics,
         )
 
     async def rollback_background(
@@ -819,7 +1333,13 @@ class SubagentExecution:
         itself is unused on rollback), the prior-state restore, and the
         created/reused rollback, moved intact. The caller's except block
         keeps the re-raise tail.
+
+        C4: an unaccepted run releases its bound override permit — a typed
+        no-op when the transport already consumed it or another net ran.
         """
+        from chartreux.app_server._subagent_launch import release_bound_override
+
+        release_bound_override(context.runtime.agent_loop)
         if context.action is not None and not context.committed:
             context.action.abort()
         if context.prepared_reconfiguration is not None and not context.committed:
@@ -832,6 +1352,13 @@ class SubagentExecution:
                     context.prepared_reconfiguration
                 )
         context.runtime.turns._event_sink = context.previous_event_sink
+        # P2/P3 rollback: the unaccepted run's receipt sink is spent —
+        # clear it so a retained loop never leaks into a later run.
+        if (
+            context.runtime.agent_loop._completion_evidence_sink
+            is context.completion_evidence_sink
+        ):
+            context.runtime.agent_loop._completion_evidence_sink = None
         attempted = context.run_record.completion_task
         if not attempted.done():
             attempted.cancel()
@@ -1029,6 +1556,17 @@ class SubagentExecution:
             context.run_record.status, context.run_record.stop_reason = (
                 self._view._resolve_run_outcome(context.run_record, turn)
             )
+            # P6b case (a): a run cancelled before the audit starts takes
+            # the cancellation disposition — the reason is recorded, the
+            # stub finalization is cached, and no check spawns.
+            if context.run_record.status is RunStatus.CANCELLED:
+                apply_cancellation_disposition(
+                    context.accumulator,
+                    context.run_id,
+                    context.run_record.completion_contract,
+                    context.run_record.admission_head,
+                    context.run_record.stop_reason,
+                )
             # WP1: the public typed failure envelope rides the failed run's
             # result and run record; bounded and redacted, full diagnostics
             # stay in the private observation carrier.
@@ -1041,10 +1579,47 @@ class SubagentExecution:
             )
             if failure_envelope is not None:
                 context.run_record.failure = failure_envelope
-            context.run_record.result = context.accumulator.build_result(
+            # P6a: the once-only finalization, awaited immediately BEFORE
+            # the result build — build_result reads the accumulator's
+            # finalization cache and runs no checks itself. No registry
+            # lock is held across the check subprocesses. P6b wraps the
+            # finalization with the drain so a cancellation mid-audit kills
+            # this run's in-flight check processes and discards the partial
+            # findings.
+            await finalize_run_with_drain(
+                run_id=context.run_id,
+                accumulator=context.accumulator,
+                contract=context.run_record.completion_contract,
+                admission_head=context.run_record.admission_head,
+                runtime=context.runtime,
+            )
+            # P12: the call site wires the composition surface — the run
+            # key (the once-only finalization cache read), the frozen
+            # contract (the mandate surface and the audit mode), the
+            # worker's receipt claim (operative only on a healthy
+            # completed turn), and the acceptance-check runner.
+            result = context.accumulator.build_result(
                 turns_used=turns_used,
                 completed=turn.status is PublicTurnStatus.COMPLETED,
-            ).model_copy(
+                run_id=context.run_id,
+                contract=context.run_record.completion_contract,
+                claim=operative_completion_claim(
+                    context.accumulator,
+                    turn_completed=context.run_record.status is RunStatus.COMPLETED,
+                ),
+                runner=_check_runner(context.runtime),
+            )
+            # P12: the publication-rejection lifecycle — an audit rejection
+            # finalizes the run FAILED with the measured rejection envelope;
+            # the result's audit stamp, the run status, and the envelope
+            # agree.
+            envelope = rejection_envelope(context, result)
+            if envelope is not None:
+                context.run_record.status = RunStatus.FAILED
+                context.run_record.stop_reason = RunStopReason.ERROR
+                context.run_record.failure = envelope
+                failure_envelope = envelope
+            context.run_record.result = result.model_copy(
                 update=self._result_update(
                     context, failure_envelope, context.run_record.status
                 )
@@ -1056,6 +1631,21 @@ class SubagentExecution:
                     context.runtime.turns.operation_terminal_turn(turn_id),
                 )
             )
+            # P6b: the cancelled run takes the cancellation disposition even
+            # when the monitor never reached the normal path — the reason is
+            # recorded (no worker credit), the stub finalization is cached,
+            # and exactly one terminal result builds with completed=False.
+            apply_cancellation_disposition(
+                context.accumulator,
+                context.run_id,
+                context.run_record.completion_contract,
+                context.run_record.admission_head,
+                context.run_record.stop_reason,
+            )
+            # P12: the cancelled run wires the mandate surface and the
+            # finalization cache read; the worker's claim is NOT operative
+            # on a cancelled run, so no claim rides (the cancellation
+            # reason stays the run's primary disposition).
             context.run_record.result = context.accumulator.build_result(
                 turns_used=sum(
                     message.role is Role.assistant
@@ -1063,6 +1653,9 @@ class SubagentExecution:
                 )
                 - context.run_record.start_count,
                 completed=context.run_record.status is RunStatus.COMPLETED,
+                run_id=context.run_id,
+                contract=context.run_record.completion_contract,
+                runner=_check_runner(context.runtime),
             ).model_copy(
                 update={
                     "agent_id": context.agent_id,
@@ -1113,8 +1706,28 @@ class SubagentExecution:
             if context.run_record.failure is None:
                 context.run_record.failure = monitor_envelope
             failure_envelope = context.run_record.failure
+            # P6a: the once-only finalization is awaited before this
+            # fallback build too — a cache hit when the normal path already
+            # finalized (a result-build failure), a fresh finalization when
+            # the monitor never reached the normal build. The cancellation
+            # path caches the stub finalization (P6b) and runs no checks.
+            await finalize_run_with_drain(
+                run_id=context.run_id,
+                accumulator=context.accumulator,
+                contract=context.run_record.completion_contract,
+                admission_head=context.run_record.admission_head,
+                runtime=context.runtime,
+            )
+            # P12: the fallback build wires the mandate surface and the
+            # finalization cache read; the worker's claim is NOT operative
+            # here — the run's primary failure stays authoritative (no
+            # rejection envelope ever replaces it).
             context.run_record.result = context.accumulator.build_result(
-                turns_used=turns_used, completed=False
+                turns_used=turns_used,
+                completed=False,
+                run_id=context.run_id,
+                contract=context.run_record.completion_contract,
+                runner=_check_runner(context.runtime),
             ).model_copy(
                 update=self._result_update(context, failure_envelope, RunStatus.FAILED)
             )
@@ -1139,6 +1752,18 @@ class SubagentExecution:
             context.runtime.turns._event_sink = context.previous_event_sink
             if context.runtime.agent_loop.run_identity == context.run_id:
                 context.runtime.agent_loop.run_identity = None
+            # P2/P3 run-end hygiene: the run's receipt sink is spent — a
+            # retained loop must never hand a later run's receipts to this
+            # run's accumulator. Guarded: a successor run may already have
+            # installed its own sink on the same loop.
+            if (
+                context.runtime.agent_loop._completion_evidence_sink
+                is context.completion_evidence_sink
+            ):
+                context.runtime.agent_loop._completion_evidence_sink = None
+            # C5b run-end hygiene: the run's resume-progress watch is spent —
+            # no later run of this loop inherits it.
+            clear_resume_progress_deadline(context.runtime.agent_loop)
             if not context.committed:
                 return  # noqa: B012
             context.run_record.completed_at = self._view._clock()
@@ -1528,6 +2153,14 @@ class SubagentExecution:
                         "replacement_run_id": context.run_id,
                     }
                     if replacement is not None
+                    else {}
+                ),
+                # C4: the bounded un-stick diagnostics for an explicit
+                # override_cooldown launch (selected deployment, exclusions
+                # bypassed, remaining allowance, next permitted time).
+                **(
+                    {"cooldown_override": context.override_diagnostics}
+                    if context.override_diagnostics is not None
                     else {}
                 ),
             },

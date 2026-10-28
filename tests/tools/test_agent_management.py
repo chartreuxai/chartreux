@@ -84,7 +84,7 @@ class FakeSubagentManager:
         self.release_error: ValueError | None = None
         self.resume_error: ValueError | None = None
         self.reconcile_error: ValueError | None = None
-        self.resume_calls: list[tuple[str, str, str, str]] = []
+        self.resume_calls: list[tuple[str, str, str, str, bool]] = []
         self.reconcile_calls: list[tuple[str, str, str, list, str]] = []
 
     async def check_agents(self) -> list[AgentSummary]:
@@ -165,6 +165,7 @@ class FakeSubagentManager:
         idempotency_key: str,
         *,
         requester_session_id: str,
+        override_cooldown: bool = False,
     ) -> ResumeAgentResult:
         if self.resume_error is not None:
             raise self.resume_error
@@ -173,6 +174,7 @@ class FakeSubagentManager:
             expected_run_id,
             idempotency_key,
             requester_session_id,
+            override_cooldown,
         ))
         return ResumeAgentResult(
             outcome=ResumeOutcome.NOT_RESUMABLE,
@@ -818,7 +820,11 @@ async def test_resume_agent_forwards_requester_and_displays_disposition() -> Non
     )
     assert result == expected
     manager.resume_agent.assert_awaited_once_with(
-        "agent-1", "run-1", "agent-1:run-1", requester_session_id="parent"
+        "agent-1",
+        "run-1",
+        "agent-1:run-1",
+        requester_session_id="parent",
+        override_cooldown=False,
     )
     display = tool.get_result_display(
         ToolResultEvent(
@@ -843,7 +849,29 @@ async def test_resume_agent_forwards_requester_and_displays_disposition() -> Non
         )
     )
     manager.resume_agent.assert_awaited_once_with(
-        "agent-1", "run-1", "key-1", requester_session_id="parent"
+        "agent-1",
+        "run-1",
+        "key-1",
+        requester_session_id="parent",
+        override_cooldown=False,
+    )
+
+    # C6b: the strict override_cooldown flag is forwarded verbatim too.
+    manager.resume_agent.reset_mock()
+    await collect_result(
+        tool.run(
+            ResumeAgentArgs(
+                agent_id="agent-1", expected_run_id="run-1", override_cooldown=True
+            ),
+            ctx,
+        )
+    )
+    manager.resume_agent.assert_awaited_once_with(
+        "agent-1",
+        "run-1",
+        "agent-1:run-1",
+        requester_session_id="parent",
+        override_cooldown=True,
     )
 
 

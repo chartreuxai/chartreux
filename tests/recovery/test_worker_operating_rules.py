@@ -3,6 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from chartreux.core.agents import AgentManager
+from chartreux.core.completion_contract import (
+    CompletionArtifactKind,
+    CompletionCheckTemplate,
+)
 from chartreux.core.skills.manager import SkillManager
 from chartreux.core.system_prompt import get_universal_system_prompt
 from tests.conftest import build_test_vibe_config
@@ -11,6 +15,7 @@ from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
 ROOT = Path(__file__).resolve().parents[2]
 
 CHILD_RULES_FRAGMENT = ROOT / "chartreux/core/prompts/fragments/bounded_child.md"
+CODER_IDENTITY = ROOT / "chartreux/core/prompts/identities/coder.md"
 
 
 def _child_prompt() -> str:
@@ -79,3 +84,82 @@ def test_child_denial_and_authority_rules_are_served_verbatim() -> None:
     ):
         assert sentence in fragment
         assert sentence in rendered
+
+
+def test_child_evidence_rules_are_served_verbatim() -> None:
+    rendered = _child_prompt()
+    fragment = CHILD_RULES_FRAGMENT.read_text(encoding="utf-8")
+
+    for sentence in (
+        "7. Evidence-linked work loop: the default pattern for every assignment",
+        "8. Receipts and tool-result trust: every tool result you issued is evidence",
+        "9. No-edit proof obligation: a claim that nothing changed",
+        "10. File-state metadata is not authority:",
+        "11. Completion citations: when the assignment produced a commit",
+        "12. Completion envelope emission: when a completion contract frozen at admission",
+        # The post-B exemption pin (binding): evidence obligations never
+        # create an unconditional commit mandate for exempt/read-only seats.
+        "never create an unconditional commit mandate for exempt or read-only assignments",
+        # Envelope emission keyed to the P4 render.
+        "Completion contract (frozen at admission):",
+        "envelope required: yes",
+        "completion_envelope_v1",
+    ):
+        assert sentence in fragment
+        assert sentence in rendered
+
+
+def test_child_envelope_instruction_is_keyed_to_the_rendered_contract() -> None:
+    from chartreux.app_server._subagent_records import (
+        CompletionCapability,
+        FrozenCompletionContract,
+    )
+    from chartreux.core.recovery_models import PackageTier
+
+    contract = FrozenCompletionContract.freeze(
+        identity="coder",
+        identity_revision=None,
+        seat=None,
+        tier=PackageTier.SUBSTANTIVE,
+        cwd="/workspace",
+        roots=("/workspace",),
+        completion_check=[CompletionCheckTemplate.PYTEST],
+        required_artifacts=[CompletionArtifactKind.COMMIT],
+        shell_less=False,
+        audit_mode="stamp",
+        capability=CompletionCapability.AVAILABLE,
+    )
+    section = contract.render_prompt_section()
+    assert "Completion contract (frozen at admission):" in section
+    assert "- envelope required: yes" in section
+    assert "- schema version: 1" in section
+    # The served instruction keys on the exact strings the P4 render emits.
+    fragment = CHILD_RULES_FRAGMENT.read_text(encoding="utf-8")
+    for key in (
+        "Completion contract (frozen at admission):",
+        "envelope required: yes",
+        "completion_envelope_v1",
+    ):
+        assert key in fragment
+
+
+def test_coder_identity_carries_the_evidence_linked_completion_rules() -> None:
+    body = CODER_IDENTITY.read_text(encoding="utf-8")
+    rendered = _child_prompt()
+
+    for sentence in (
+        "**Evidence-linked completion**",
+        "emit the strict completion receipt",
+        "at least the seven-character prefix",
+    ):
+        assert sentence in body
+        assert sentence in rendered
+    # The lean coder identity keeps its model-tier ban: the completion
+    # vocabulary never names tiers.
+    for anchor in (
+        "mechanical-tier",
+        "model-tier",
+        "package tier",
+        "substantive package",
+    ):
+        assert anchor not in body

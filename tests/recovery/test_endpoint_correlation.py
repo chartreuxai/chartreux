@@ -26,7 +26,15 @@ from chartreux.core.model_catalog.availability import (
 )
 from chartreux.core.model_catalog.loader import CatalogSnapshot
 from chartreux.core.model_catalog.schema import ModelCatalog
-from chartreux.core.recovery_models import canonical_endpoint_identity
+from chartreux.core.recovery_models import (
+    CallEvidence,
+    FailureClass,
+    RecoveryEligibility,
+    attach_call_evidence,
+    build_failure_envelope,
+    canonical_endpoint_identity,
+)
+from chartreux.core.recovery_observation import observe_exception
 from chartreux.core.session_types import CommittedModelIdentity
 from tests.recovery.conftest import FakeClock
 
@@ -434,6 +442,37 @@ def test_all_deployments_unavailable_carries_endpoint_cooldown(
     assert len(exc_info.value.exclusions) == 1
     assert exc_info.value.exclusions[0].reason is ExclusionReason.ENDPOINT_COOLDOWN
     assert exc_info.value.exclusions[0].reason.value == "endpoint-cooldown"
+
+
+def test_endpoint_cooldown_exclusions_classify_transient_launch_failure() -> None:
+    """C7: a pure endpoint-cooldown exclusion set is a transient launch
+    exclusion — the same time-based block as a per-deployment cooldown —
+    while a mixed set containing a permanent reason stays prohibited.
+    """
+    admission_error = AllDeploymentsUnavailableError("base", ())
+    attach_call_evidence(admission_error, CallEvidence.admission_phase())
+    observation = observe_exception(admission_error, phase="turn", turn_id="t")
+
+    endpoint_only = build_failure_envelope(
+        observation=observation,
+        agent_id="a",
+        run_id="r",
+        exclusion_reasons=["endpoint-cooldown"],
+    )
+    assert endpoint_only.failure.failure_class is FailureClass.LAUNCH_FAILURE
+    assert endpoint_only.recovery.eligibility is RecoveryEligibility.ELIGIBLE
+    assert "transient_launch_failure" in endpoint_only.recovery.reason_codes
+    assert "endpoint_cooldown_exclusion" in endpoint_only.failure.evidence_codes
+
+    mixed = build_failure_envelope(
+        observation=observation,
+        agent_id="a",
+        run_id="r",
+        exclusion_reasons=["endpoint-cooldown", "disabled"],
+    )
+    assert mixed.recovery.eligibility is RecoveryEligibility.PROHIBITED
+    assert "permanent_launch_exclusion" in mixed.recovery.reason_codes
+    assert "permanent_exclusion" in mixed.failure.evidence_codes
 
 
 def test_endpoint_cooldown_checked_before_disabled(fake_clock: FakeClock) -> None:

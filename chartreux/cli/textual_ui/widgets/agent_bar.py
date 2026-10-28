@@ -1337,9 +1337,10 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
             compacting=agent.compacting,
             last_recorded=availability in {"closed", "evicted"},
         )
-        return self._bounded_details(
-            details, _separator().join((context, model, f"turns {turns}"))
-        )
+        second = [context, model, f"turns {turns}"]
+        if agent.resumed_from_run_id is not None:
+            second.append(f"resumed from {agent.resumed_from_run_id}")
+        return self._bounded_details(details, _separator().join(second))
 
     def full_metadata(self, agent: AgentSummaryModel | None = None) -> str:
         """Unclipped public metadata for Main or a child, in a scrollable view.
@@ -1392,6 +1393,7 @@ class AgentBar(Vertical):  # noqa: PLR0904 -- Textual actions and event handlers
             ("Thinking", agent.effective_thinking),
             ("Turns", str(agent.turns_used) if agent.turns_used is not None else None),
             ("Run ID", agent.current_run_id or agent.latest_run_id),
+            ("Resumed from run ID", agent.resumed_from_run_id),
             ("Duration", self._duration_details(agent)),
             (
                 "Idle seconds",

@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel
 
@@ -149,6 +150,18 @@ class ToolExecutor:
         # cancelled post-hook collection stays shielded in the mixin; and
         # observation then success accounting stay after post-tool
         # finalization.
+        #
+        # P2 (round-9, binding): the receipt occurrence ID is MINTED HERE —
+        # before the invocation starts, at the tool-call dispatch site, by
+        # the executor when the call begins. Result callbacks (the
+        # post-tool evidence receipt) can execute before the accumulator
+        # observes the queued result event, so the ID is minted up front
+        # and propagates through BOTH paths: the callback payload
+        # (PostToolFinalization.occurrence_id) and the result events the
+        # accumulator collects (ToolResultEvent.occurrence_id). Reminting
+        # downstream is prohibited; tool_call_id alone never keys pairing
+        # (ids are reused across turns).
+        occurrence_id = str(uuid4())
         try:
             tool_instance = self._tool_manager_getter().get(tool_call.tool_name)
         except Exception as exc:
@@ -179,8 +192,7 @@ class ToolExecutor:
         if resolution.denial_event is not None:
             yield resolution.denial_event
             return
-        tool_call = resolution.tool_call
-        tool_input = resolution.tool_input
+        tool_call, tool_input = resolution.tool_call, resolution.tool_input
 
         decision: ToolDecision | None = None
         tool_started = False
@@ -197,7 +209,12 @@ class ToolExecutor:
 
             tool_started = True
             async for ev in self.invoke_tool(
-                tool_call, tool_instance, tool_input, decision, timing
+                tool_call,
+                tool_instance,
+                tool_input,
+                decision,
+                timing,
+                occurrence_id=occurrence_id,
             ):
                 yield ev
 
@@ -230,6 +247,7 @@ class ToolExecutor:
                 error_mutation_roots_unknown=bool(
                     getattr(exc, "mutation_roots_unknown", False)
                 ),
+                occurrence_id=occurrence_id,
                 tool_call_id=tool_call.call_id,
             )
             async for ev in self._finalize_cancelled_tool(
@@ -283,6 +301,7 @@ class ToolExecutor:
                 error_mutation_roots_unknown=bool(
                     getattr(exc, "mutation_roots_unknown", False)
                 ),
+                occurrence_id=occurrence_id,
                 tool_call_id=tool_call.call_id,
             )
             async for ev in self._run_post_tool_and_finalize(
@@ -295,6 +314,7 @@ class ToolExecutor:
                     duration_ms=timing.duration_ms,
                     duration=timing.duration,
                     initial_text=error_msg,
+                    occurrence_id=occurrence_id,
                 ),
             ):
                 yield ev
@@ -306,6 +326,7 @@ class ToolExecutor:
         tool_input: dict[str, Any],
         decision: ToolDecision,
         timing: InvocationTiming,
+        occurrence_id: str | None = None,
     ) -> AsyncGenerator[ToolResultEvent | ToolStreamEvent | HookEvent]:
         self._stats_getter().tool_calls_agreed += 1
 
@@ -389,6 +410,7 @@ class ToolExecutor:
             result=result_model,
             cancelled=result_cancelled,
             duration=duration,
+            occurrence_id=occurrence_id,
             tool_call_id=tool_call.call_id,
         )
         result_event = result_event.model_copy(
@@ -411,6 +433,7 @@ class ToolExecutor:
                 duration_ms=duration * 1000.0,
                 duration=duration,
                 initial_text=text,
+                occurrence_id=occurrence_id,
             ),
         ):
             yield ev

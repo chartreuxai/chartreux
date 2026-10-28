@@ -225,6 +225,90 @@ class TestBuiltinSkills:
         )
         assert "no identity-specific retention setting" in prompt
 
+    def test_chartreux_skill_documents_completion_audit(self) -> None:
+        prompt = BUILTIN_SKILLS["chartreux"].prompt
+        # Typed audit location and truth-table vocabulary.
+        for documented in (
+            "completion_audit",
+            "claim_matched",
+            "claim_unverified",
+            "claim_contradicted",
+            "disclosure facts, never worker faults",
+        ):
+            assert documented in prompt, documented
+        # Stamp/enforce modes and the envelope marker.
+        assert "`[completion]` config section sets the audit mode" in prompt
+        assert "never blocks publication" in prompt
+        assert "completion_envelope_v1" in prompt
+        # Closed template and artifact vocabularies.
+        for template in (
+            "pytest",
+            "ruff_check",
+            "pyright",
+            "git_head",
+            "git_status",
+            "git_diff_stat",
+        ):
+            assert f"`{template}`" in prompt, template
+        for artifact in ("commit", "touched_path", "check_pass", "envelope"):
+            assert f"`{artifact}`" in prompt, artifact
+        # Optional mandates fail open; occurrence ids pair invocations
+        # with receipts.
+        assert "None` mandates disable only themselves (fail-open)" in prompt
+        assert "executor-minted occurrence ids" in prompt
+        # Capability restrictions.
+        assert "template-only" in prompt
+        assert "never prompts at finalization" in prompt
+        # Documented residuals: the stamp is not correctness; the check
+        # runs project code; containment is not promised; managed-job,
+        # custom-tool, and MCP-tool write exclusions.
+        assert "it never means the task was actually correct" in prompt
+        assert "executes project code" in prompt
+        assert "not containment" in prompt
+        assert "not check evidence" in prompt
+        assert "outside the touched-path accounting" in prompt
+        # Retention limitation and cancellation/rejection semantics.
+        assert "caps at 128 entries" in prompt
+        assert "an availability fact, never a contradiction" in prompt
+        assert "until result expiry" in prompt
+        assert "cancellation disposition" in prompt
+        assert "never re-run" in prompt
+        assert "prohibited for recovery" in prompt
+        # No TUI rendering promised.
+        assert "No TUI rendering of the stamp is provided." in prompt
+
+    def test_chartreux_skill_documents_cooldown_override_and_resume_deadline(
+        self,
+    ) -> None:
+        prompt = BUILTIN_SKILLS["chartreux"].prompt
+        # The explicit un-stick override is request-only on both entry
+        # points, ledger-bounded, and never automatic.
+        for documented in (
+            "override_cooldown",
+            "`task` (fresh and replacement launches)",
+            "`resume_agent`",
+            "two forced starts per episode",
+            "30s between starts",
+            "an attempt in flight",
+            "denied mint consumes nothing",
+            "never automatically replayed",
+            "automatic paths never acquire permits",
+            "bounded un-stick diagnostics",
+            "next permitted start",
+        ):
+            assert documented in prompt, documented
+        # The first-semantic-progress deadline is the one hard in-flight
+        # deadline in the otherwise advisory recovery policy.
+        for documented in (
+            "resume_progress_deadline_seconds",
+            "180s",
+            "resume_progress_deadline",
+            "semantic delta",
+            "Heartbeat and usage-only chunks do not count as progress",
+            "ordinary (non-resumed) runs are structurally unaffected",
+        ):
+            assert documented in prompt, documented
+
     def test_chartreux_skill_documents_dangerous_command_approval(self) -> None:
         prompt = BUILTIN_SKILLS["chartreux"].prompt
         for documented in (

@@ -331,7 +331,11 @@ async def test_pre_commit_monitor_finalization_stores_nothing(
             self._action.abort()
 
     def failing_start(
-        runtime: Any, task_args: TaskArgs, ctx: InvokeContext, session_id: str
+        runtime: Any,
+        task_args: TaskArgs,
+        ctx: InvokeContext,
+        session_id: str,
+        **_kwargs: Any,
     ) -> tuple[str, Any]:
         turn_id, action = original_start(runtime, task_args, ctx, session_id)
         return turn_id, _FailingStartAction(action)

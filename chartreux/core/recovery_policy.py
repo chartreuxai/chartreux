@@ -55,6 +55,7 @@ from chartreux.core.recovery_models import (
     FailureEnvelope,
     PackageTier,
     canonical_endpoint_identity,
+    measured_timeout_reason_of,
 )
 
 if TYPE_CHECKING:
@@ -456,10 +457,13 @@ def _milestone_notice(
     failure_class = envelope.failure.failure_class.value
     failed_model = envelope.deployment.base_model or "unknown model"
     failed_endpoint = envelope.deployment.endpoint or "unknown endpoint"
+    measured = measured_timeout_reason_of(envelope)
+    measured_text = f", measured reason {measured.value}" if measured else ""
     wire = claimed.wire_name or claimed.base_model
     return (
         f"Replacement milestone: package {envelope.work_package_id or 'unnamed'} — "
-        f"agent {envelope.agent_id} run {envelope.run_id} failed ({failure_class}) "
+        f"agent {envelope.agent_id} run {envelope.run_id} failed ({failure_class}"
+        f"{measured_text}) "
         f"on {failed_model}@{failed_endpoint}; replacement {claimed.base_model} "
         f"({claimed.provider}/{wire}) selected on endpoint {claimed.endpoint} "
         f"(endpoint-independent of the failed call); package tier "
@@ -485,6 +489,116 @@ def _endpoint_identity(endpoint: str | None) -> str | None:
     return endpoint.strip().lower() or None
 
 
+def _select_completion_rejection_replacement(
+    *,
+    envelope: FailureEnvelope,
+    package_tier: PackageTier,
+    claimed: ReplacementCandidate,
+    config: RecoveryConfig,
+) -> ReplacementDecision:
+    """The new class's replacement authorization — completion rejections only.
+
+    A typed completion-audit rejection is a worker-side disposition, not an
+    infrastructure failure: the escalation replaces the AGENT through the
+    existing lineage (P14's task.md replacement claim validation), so the
+    endpoint-independence guards do not apply — the rejection is not an
+    endpoint-level failure and the substitution is not throttling-motivated.
+    Every eligibility invariant that does not depend on a failed endpoint
+    still applies: tier capability, the separate candidate capability axis,
+    the allowlist, and the price cap. No same-agent auto-retry: the
+    replacement is a NEW agent carrying the predecessor/package lineage (the
+    failed agent is never resumed; the envelope's recovery block stays
+    PROHIBITED).
+    """
+    if envelope.failure.failure_class is not FailureClass.COMPLETION_REJECTION:
+        raise ReplacementPolicyError(
+            ["completion_rejection_authorization_misapplied"],
+            "the completion-rejection replacement authorization applies only "
+            f"to the completion_rejection class, not "
+            f"{envelope.failure.failure_class.value}",
+        )
+    guards: list[tuple[bool, list[str], str]] = [
+        (
+            package_tier is PackageTier.SUBSTANTIVE
+            and claimed.tier is PackageTier.MECHANICAL,
+            ["mechanical_tier_rejected_for_substantive_package"],
+            f"replacement {claimed.base_model} is a mechanical-tier model and "
+            "the package is substantive; luna-class models are mechanical-only",
+        ),
+        (
+            package_tier is PackageTier.SUBSTANTIVE
+            and claimed.effective_capability is not ReplacementCapability.SUBSTANTIVE,
+            ["candidate_capability_below_package_tier"],
+            f"replacement {claimed.base_model} is marked "
+            f"{claimed.effective_capability.value}-capable at the model level "
+            "and the package is substantive; replacement eligibility is an "
+            "intrinsic model capability, evaluated separately from the "
+            "package tier",
+        ),
+        (
+            package_tier is PackageTier.MECHANICAL
+            and claimed.effective_capability is ReplacementCapability.NONE,
+            ["candidate_capability_not_execution_marked"],
+            f"replacement {claimed.base_model} carries no explicit "
+            "execution-capability marking; a candidate is eligible only if "
+            "its model-level capability is explicitly marked execution-capable "
+            "for the requested work",
+        ),
+        (
+            bool(config.fallback_allowed_base_models)
+            and claimed.base_model not in config.fallback_allowed_base_models,
+            ["base_model_not_in_fallback_allowlist"],
+            f"replacement {claimed.base_model} is not in the configured "
+            "fallback_allowed_base_models allowlist",
+        ),
+    ]
+    for fired, reason_codes, detail in guards:
+        if fired:
+            return _reject(envelope, reason_codes, detail)
+    cap = config.fallback_max_output_price_per_million
+    if cap is not None:
+        price = claimed.output_price_per_million
+        if price is None:
+            return _reject(
+                envelope,
+                ["fallback_price_unavailable_cap_unverifiable"],
+                f"replacement {claimed.base_model} has no known output price, "
+                "so the configured price cap cannot be verified",
+            )
+        if price > cap:
+            return _reject(
+                envelope,
+                ["fallback_price_cap_exceeded"],
+                f"replacement {claimed.base_model} output price ${price:.2f}/M "
+                f"exceeds the configured cap ${cap:.2f}/M",
+            )
+    return ReplacementDecision(
+        disposition="selected",
+        reason_codes=[
+            "completion_rejection_replacement_authorized",
+            "new_agent_lineage_no_same_agent_retry",
+        ],
+        candidate=claimed,
+        cost_implication=(
+            f"replacement {claimed.base_model} "
+            f"{_format_price(claimed.output_price_per_million)}; the failed "
+            "run's spend is unchanged — a worker-side rejection escalation, "
+            "not a provider substitution"
+        ),
+        notice=(
+            f"Replacement milestone: package {envelope.work_package_id or 'unnamed'} — "
+            f"agent {envelope.agent_id} run {envelope.run_id} failed its completion "
+            f"audit ({envelope.failure.failure_class.value}); replacement "
+            f"{claimed.base_model} ({claimed.provider}/{claimed.wire_name or claimed.base_model}) "
+            "selected as the escalation — a NEW agent carrying the "
+            "predecessor/package lineage (the failed agent is never "
+            f"auto-resumed); package tier {package_tier.value}; "
+            f"{_format_price(claimed.output_price_per_million)}."
+        ),
+        **_context(envelope),
+    )
+
+
 def validate_replacement_selection(
     *,
     envelope: FailureEnvelope,
@@ -503,6 +617,14 @@ def validate_replacement_selection(
     classes (preflight, cancellation, authorization, permanent config,
     budget stop, task) and unknown/internal causes never substitute — a
     HEAD/branch/workspace preflight stop is preserved, never bypassed.
+
+    C5a: a failure carrying a specific measured timeout reason (e.g. the
+    resume progress deadline) is still an infrastructure stall for the
+    claim procedure — the AUTOMATIC same-payload continuation is prohibited
+    by the recovery controller's gate, while an explicit replacement claim
+    remains the orchestrator's escalation route. The decision's milestone
+    notice names the measured reason, so the audit trail shows the claim
+    crossed a measured no-progress deadline.
     """
     failure_class = envelope.failure.failure_class
     # Endpoint independence is enforced against the ATTEMPTED failed
@@ -512,6 +634,14 @@ def validate_replacement_selection(
     # side cannot prove independence.
     failed_identity = _endpoint_identity(envelope.deployment.endpoint)
     claimed_identity = _endpoint_identity(claimed.endpoint)
+    if failure_class is FailureClass.COMPLETION_REJECTION:
+        # P11: a typed audit rejection is a worker-side disposition the
+        # failure-time policy authorizes a cross-agent replacement for (the
+        # escalation joins the package's lineage); it never authorizes a
+        # warm same-agent auto-resume (P12's suspension gates stay shut).
+        return _select_completion_rejection_replacement(
+            envelope=envelope, package_tier=package_tier, claimed=claimed, config=config
+        )
     guards: list[tuple[bool, list[str], str]] = [
         (
             failure_class is FailureClass.PREFLIGHT,

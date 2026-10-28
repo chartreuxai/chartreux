@@ -87,7 +87,10 @@ from chartreux.core.agent_loop.title_controller import (
     TitleGateInputs,
     TitleScheduleInputs,
 )
-from chartreux.core.agent_loop_hooks import AgentLoopHooksMixin
+from chartreux.core.agent_loop_hooks import (
+    AgentLoopHooksMixin,
+    CompletionEvidenceReceipt,
+)
 from chartreux.core.agents.identities import validate_identity_selection
 from chartreux.core.agents.launch import LaunchCandidate
 from chartreux.core.agents.manager import AgentManager
@@ -1039,6 +1042,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._hook_session_context = lambda: self._build_hook_session_context()
         self._stats_getter = lambda: self.stats
         self._messages_getter = lambda: self.messages
+        # P2: the completion-evidence side-channel sink. None until a
+        # consumer (P3's accumulator) registers it; the getter seam keeps
+        # hook-reload and session-reset interception semantics.
+        self._completion_evidence_sink: (
+            Callable[[CompletionEvidenceReceipt], None] | None
+        ) = None
+        self._completion_evidence_sink_getter = lambda: self._completion_evidence_sink
         checkpointer = Checkpointer()
         file_store = FileStore()
         self.checkpoint_recorder = CheckpointRecorder(

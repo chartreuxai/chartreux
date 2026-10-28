@@ -34,6 +34,16 @@ class ResumeAgentArgs(BaseModel):
             "'<agent_id>:<expected_run_id>'"
         ),
     )
+    override_cooldown: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "Force the un-stick attempt past the committed model's cooldown "
+            "by minting an endpoint-bound permit from the recovery ledger; "
+            "the ledger still denies the mint when the episode is exhausted, "
+            "spacing-bound, or has an attempt in flight"
+        ),
+    )
 
 
 class ResumeAgentConfig(BaseToolConfig):
@@ -103,6 +113,7 @@ class ResumeAgent(
                 args.expected_run_id,
                 args.idempotency_key or f"{args.agent_id}:{args.expected_run_id}",
                 requester_session_id=ctx.session_id,
+                override_cooldown=args.override_cooldown,
             )
         except ValueError as exc:
             raise ToolError(str(exc)) from exc

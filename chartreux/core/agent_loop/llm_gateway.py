@@ -21,7 +21,9 @@ from chartreux.core.agent_loop.errors import (
     EmptyLLMResponseError,
     EmptyReplayBudgetStop,
     ImagesNotSupportedError,
+    OverrideStartDeniedError,
 )
+from chartreux.core.agent_loop.resume_progress import ResumeProgressWatch
 from chartreux.core.compaction.context import (
     reorder_for_tool_adjacency,
     select_model_context,
@@ -47,6 +49,11 @@ from chartreux.core.llm_models import (
     posting_time,
 )
 from chartreux.core.recovery_models import CallEvidence, attach_call_evidence
+from chartreux.core.recovery_override import (
+    CooldownOverrideLedger,
+    OverridePermit,
+    OverridePhase,
+)
 from chartreux.core.session_types import AgentStats, CommittedModelIdentity
 from chartreux.core.usage import (
     AccountingSink,
@@ -100,6 +107,16 @@ class CallResources:
     # Measured per-logical-call evidence (WP1); minted by the gateway facade
     # and shared across the bounded in-call empty replay.
     call_evidence: CallEvidence | None = None
+    # C3 forced-override binding: the permit/ledger pair for the one explicit
+    # un-stick attempt. The permit is consumed at the ACTUAL transport start
+    # (the request-start observer) and released when the attempt ends before
+    # any transport started; a bound permit also denies the empty replay.
+    override_permit: OverridePermit | None = None
+    override_ledger: CooldownOverrideLedger | None = None
+    # C5b: the resumed run's first-semantic-progress deadline watch. Only an
+    # explicitly marked resumed context carries one (the app-server's resume
+    # admission arms it); ordinary runs bind None and are never watched.
+    resume_progress: ResumeProgressWatch | None = None
 
 
 @dataclass(frozen=True)
@@ -418,10 +435,41 @@ class LLMGateway:
 
         start_time = time.perf_counter()
         finalizer = CallFinalizer(inputs, resources, attempt_ordinal=attempt_ordinal)
-        observer_token = request_start_observer.set(finalizer.start)
+        # C3: the forced-override permit is consumed at the ACTUAL transport
+        # start — the backend fires the observer right before the real HTTP
+        # send — never at coordinator entry, and exactly once per attempt.
+        permit = _forced_override_permit(resources)
+        override_started = False
+        # C5b: the resumed run's first-progress deadline — armed at this
+        # logical call's entry (first call of the run), observed at the
+        # processed result, and translated from its own cancellation after
+        # the cleanup below joined.
+        watch = _resume_watch(inputs, resources)
+
+        def transport_start() -> None:
+            nonlocal override_started
+            finalizer.start()
+            if permit is not None and not override_started:
+                assert resources.override_ledger is not None
+                outcome = resources.override_ledger.start(permit)
+                if outcome.phase is not OverridePhase.STARTED:
+                    # The ledger denied the transport start (the episode
+                    # closed between reserve and transport, or the
+                    # spacing/pressure bound refuses it): abort BEFORE any
+                    # transport. The pretransport release in the finally
+                    # frees the reservation, and a local denial is never a
+                    # measured endpoint failure.
+                    raise OverrideStartDeniedError(outcome.denial, permit)
+                override_started = True
+
+        observer_token = request_start_observer.set(
+            transport_start if permit is not None else finalizer.start
+        )
         original_error: BaseException | None = None
         response_received = False
         try:
+            if watch is not None:
+                watch.enter_call()
             backend_messages = messages_for_backend(inputs.messages, inputs.model)
             logger.debug(
                 "Model call starting model=%s provider=%s messages=%d tools=%d thinking=%s",
@@ -474,6 +522,8 @@ class LLMGateway:
                     account_conversation=inputs.account_conversation,
                 )
                 raise
+            if watch is not None:
+                watch.observe(result.message)
             try:
                 _validate_output(result, inputs)
             except (
@@ -510,6 +560,11 @@ class LLMGateway:
                 response_started=response_received,
                 semantic_output_published=False,
             )
+            if watch is not None and watch.expired:
+                # C5b: THIS watch killed the call — translate the deadline
+                # cancellation into the typed C5a-contract failure. The
+                # cleanup in the finally below joins before it propagates.
+                raise watch.deadline_failure() from error
             raise
         except Exception as error:
             original_error = error
@@ -529,6 +584,15 @@ class LLMGateway:
             raise _map_call_error(error, inputs) from error
         finally:
             request_start_observer.reset(observer_token)
+            if watch is not None:
+                watch.exit_call()
+            # C3 pretransport release: the attempt ended before any transport
+            # started, so the reservation frees without consuming the start
+            # allowance. A started permit is no longer outstanding — the
+            # ledger's token check denies a late release harmlessly.
+            if permit is not None and not override_started:
+                assert resources.override_ledger is not None
+                resources.override_ledger.release(permit)
             try:
                 await finalizer.finalize()
             except asyncio.CancelledError:
@@ -615,7 +679,7 @@ class LLMGateway:
                 raise stop from error
             raise
 
-    async def _stream(  # noqa: PLR0912, PLR0915 -- explicit stream exit/settlement paths
+    async def _stream(  # noqa: PLR0912, PLR0914, PLR0915 -- explicit stream exit/settlement paths
         self,
         inputs: CompletionInputs,
         resources: CallResources,
@@ -633,8 +697,36 @@ class LLMGateway:
         buffered: list[LLMChunk] = []
         start_time = time.perf_counter()
         finalizer = CallFinalizer(inputs, resources, attempt_ordinal=attempt_ordinal)
+        # C3: same forced-override consumption as the nonstreaming attempt —
+        # the permit is consumed exactly once, at the ACTUAL transport start.
+        permit = _forced_override_permit(resources)
+        override_started = False
+        # C5b: the resumed run's first-progress deadline, same as the
+        # nonstreaming attempt — armed at this logical call's entry, observed
+        # at every processed chunk, translated from its own cancellation
+        # after the cleanup below joined.
+        watch = _resume_watch(inputs, resources)
+
+        def transport_start() -> None:
+            nonlocal override_started
+            finalizer.start()
+            if permit is not None and not override_started:
+                assert resources.override_ledger is not None
+                outcome = resources.override_ledger.start(permit)
+                if outcome.phase is not OverridePhase.STARTED:
+                    # The ledger denied the transport start (the episode
+                    # closed between reserve and transport, or the
+                    # spacing/pressure bound refuses it): abort BEFORE any
+                    # transport. The pretransport release in the finally
+                    # frees the reservation, and a local denial is never a
+                    # measured endpoint failure.
+                    raise OverrideStartDeniedError(outcome.denial, permit)
+                override_started = True
+
         original_error: BaseException | None = None
         try:
+            if watch is not None:
+                watch.enter_call()
             backend_messages = messages_for_backend(inputs.messages, inputs.model)
             logger.debug(
                 "Model call starting model=%s provider=%s messages=%d tools=%d streaming=%s",
@@ -659,7 +751,9 @@ class LLMGateway:
             ) as stream:
                 while True:
                     # Scope context to backend advancement, never across a yield.
-                    observer_token = request_start_observer.set(finalizer.start)
+                    observer_token = request_start_observer.set(
+                        transport_start if permit is not None else finalizer.start
+                    )
                     try:
                         with (
                             bind_retry_budget(resources.retry_budget)
@@ -697,6 +791,8 @@ class LLMGateway:
                     )
                     if chunk.usage is not None:
                         usage = chunk.usage if usage is None else usage + chunk.usage
+                    if watch is not None:
+                        watch.observe(processed_chunk.message)
                     if published:
                         yield processed_chunk
                         continue
@@ -759,6 +855,11 @@ class LLMGateway:
                 )
             if not transcript_appended and published:
                 _append_interrupted(transcript, chunk_agg)
+            if watch is not None and watch.expired:
+                # C5b: THIS watch killed the call — translate the deadline
+                # cancellation into the typed C5a-contract failure. The
+                # cleanup in the finally below joins before it propagates.
+                raise watch.deadline_failure() from error
             raise
         except GeneratorExit as error:
             original_error = error
@@ -810,6 +911,15 @@ class LLMGateway:
                 _append_interrupted(transcript, chunk_agg)
             raise _map_call_error(error, inputs) from error
         finally:
+            # C3 pretransport release: the stream ended before any transport
+            # started, so the reservation frees without consuming the start
+            # allowance. A started permit is no longer outstanding — the
+            # ledger's token check denies a late release harmlessly.
+            if watch is not None:
+                watch.exit_call()
+            if permit is not None and not override_started:
+                assert resources.override_ledger is not None
+                resources.override_ledger.release(permit)
             try:
                 await finalizer.finalize()
             except asyncio.CancelledError:
@@ -884,10 +994,46 @@ def _validate_output(chunk: LLMChunk, inputs: CompletionInputs) -> None:
         raise error
 
 
+def _forced_override_permit(resources: CallResources) -> OverridePermit | None:
+    """The call's bound forced-attempt permit, or None when no override runs.
+
+    Fail-closed (C2 pairing): a permit presented without its minting ledger
+    is not a forced attempt.
+    """
+    if resources.override_permit is None or resources.override_ledger is None:
+        return None
+    return resources.override_permit
+
+
+def _resume_watch(
+    inputs: CompletionInputs, resources: CallResources
+) -> ResumeProgressWatch | None:
+    """The call's resume-progress deadline watch, or None (C5b).
+
+    Only an explicitly marked resumed run binds a watch, and only the
+    conversation purpose is watched: sideband calls (title, compaction,
+    worktree naming) neither arm the deadline nor disarm it with their
+    content.
+    """
+    watch = resources.resume_progress
+    if watch is None or inputs.purpose is not UsagePurpose.CONVERSATION:
+        return None
+    return watch
+
+
+def _replay_admitted(resources: CallResources) -> bool:
+    """Whether the logical call's bounded in-call empty replay is admitted.
+
+    A bound forced-override permit denies the replay (C3): the forced attempt
+    consumes its reservation at the actual transport start and never replays.
+    """
+    if _forced_override_permit(resources) is not None:
+        return False
+    return resources.admit_replay is None or resources.admit_replay()
+
+
 def _admit_empty_replay(error: Exception, resources: CallResources) -> bool:
-    return isinstance(error, EmptyLLMResponseError) and (
-        resources.admit_replay is None or resources.admit_replay()
-    )
+    return isinstance(error, EmptyLLMResponseError) and _replay_admitted(resources)
 
 
 def _replay_budget_stop(
@@ -897,13 +1043,14 @@ def _replay_budget_stop(
 
     The translation lives at the logical-call terminal boundary, not only in
     the retry predicate: both retry decorators bypass ``is_retryable`` on the
-    last attempt or an exhausted deadline, and the streaming decorator also
-    stops replaying once an item has been published. No admission callback,
-    or an admitting callback, preserves the original error.
+    last attempt or an exhausted deadline, the streaming decorator also
+    stops replaying once an item has been published, and a bound
+    forced-override permit denies the replay structurally (C3). No admission
+    callback, or an admitting callback, preserves the original error.
     """
     if not isinstance(error, EmptyLLMResponseError):
         return None
-    if resources.admit_replay is None or resources.admit_replay():
+    if _replay_admitted(resources):
         return None
     return EmptyReplayBudgetStop(error)
 
