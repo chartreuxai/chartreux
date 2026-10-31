@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
+import errno
 import json
 import os
 from pathlib import Path
@@ -11,10 +13,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from chartreux.core.agent_loop._transcript_integrity import TranscriptIntegrityError
 from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session.session_loader import SessionLoader
-from chartreux.core.session.session_logger import SessionLogger
+import chartreux.core.session.session_logger as session_logger_module
+from chartreux.core.session.session_logger import (
+    TRANSCRIPT_VERIFY_INTERVAL,
+    SessionLogger,
+)
 from chartreux.core.session_types import AgentStats
 from chartreux.core.tools.manager import ToolManager
 from tests.conftest import build_test_vibe_config
@@ -927,3 +934,306 @@ class TestSessionLoggerCleanupTmpFiles:
             logger.maybe_cleanup_tmp_files()
 
         assert cleanup_spy.call_count == 2
+
+
+class TestTranscriptRepairRewrite:
+    """P4b: the repair rewrite streams into an atomic replacement."""
+
+    async def _save(
+        self,
+        logger: SessionLogger,
+        messages: list[LLMMessage],
+        config: ChartreuxConfigSchema,
+        tool_manager: ToolManager,
+    ) -> None:
+        await logger.save_interaction(
+            messages=messages,
+            stats=AgentStats(steps=1),
+            config=config,
+            tool_manager=tool_manager,
+        )
+
+    async def _populated_logger(
+        self,
+        session_config: SessionLoggingConfig,
+        config: ChartreuxConfigSchema,
+        tool_manager: ToolManager,
+        *,
+        corrupt: bool = True,
+    ) -> tuple[SessionLogger, list[LLMMessage], Path]:
+        messages = [
+            LLMMessage(role=Role.system, content="System prompt"),
+            LLMMessage(role=Role.user, content="Hello"),
+            LLMMessage(role=Role.assistant, content="Hi there"),
+        ]
+        logger = SessionLogger(session_config, "repair-rewrite")
+        await self._save(logger, messages, config, tool_manager)
+        assert logger.session_dir is not None
+        messages_path = logger.session_dir / "messages.jsonl"
+        if corrupt:
+            with messages_path.open("a", encoding="utf-8") as transcript_file:
+                transcript_file.write('{"corrupt": true\n')
+        return logger, messages, messages_path
+
+    def _expected_records(self, messages: list[LLMMessage]) -> list[dict[str, Any]]:
+        return [
+            message.model_dump(exclude_none=True, mode="json")
+            for message in messages
+            if message.role != Role.system
+        ]
+
+    @pytest.mark.asyncio
+    async def test_repair_rewrite_publishes_the_transcript_before_metadata(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        logger, messages, messages_path = await self._populated_logger(
+            session_config, mock_vibe_config, mock_tool_manager
+        )
+        assert logger.session_dir is not None
+        session_dir = logger.session_dir
+
+        publish_events: list[str] = []
+        transcript_at_metadata_publish: list[list[str]] = []
+        original_overwrite = SessionLogger._overwrite_messages_sync
+        original_metadata = SessionLogger._persist_metadata_sync
+
+        def overwrite(
+            records: Iterable[dict[str, Any]], target_session_dir: Path
+        ) -> None:
+            publish_events.append("transcript")
+            original_overwrite(records, target_session_dir)
+
+        def metadata(metadata_dump: Any, target_session_dir: Path) -> None:
+            publish_events.append("metadata")
+            transcript_at_metadata_publish.append(
+                messages_path.read_text(encoding="utf-8").splitlines()
+            )
+            original_metadata(metadata_dump, target_session_dir)
+
+        monkeypatch.setattr(
+            SessionLogger, "_overwrite_messages_sync", staticmethod(overwrite)
+        )
+        monkeypatch.setattr(
+            SessionLogger, "_persist_metadata_sync", staticmethod(metadata)
+        )
+
+        logger._transcript_saves_since_verify = TRANSCRIPT_VERIFY_INTERVAL - 1
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
+
+        expected = self._expected_records(messages)
+        # The transcript is durable before the metadata that describes it.
+        assert publish_events == ["transcript", "metadata"]
+        assert [json.loads(line) for line in transcript_at_metadata_publish[0]] == (
+            expected
+        )
+        published_metadata = json.loads(
+            (session_dir / "meta.json").read_text(encoding="utf-8")
+        )
+        assert published_metadata["total_messages"] == len(expected)
+
+    @pytest.mark.asyncio
+    async def test_repair_rewrite_streams_one_record_per_chunk(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        logger, messages, messages_path = await self._populated_logger(
+            session_config, mock_vibe_config, mock_tool_manager
+        )
+        chunks_by_target: dict[str, list[bytes]] = {}
+        original_stream = session_logger_module.durable_replace_stream
+
+        def recording_stream(target: Path, chunks: Iterable[bytes]) -> None:
+            recorded = list(chunks)
+            chunks_by_target[target.name] = recorded
+            original_stream(target, recorded)
+
+        def must_not_materialize(records: Any) -> bytes:
+            raise AssertionError("the repair rewrite must stream its payload")
+
+        monkeypatch.setattr(
+            session_logger_module, "durable_replace_stream", recording_stream
+        )
+        monkeypatch.setattr(
+            SessionLogger, "_transcript_bytes", staticmethod(must_not_materialize)
+        )
+
+        logger._transcript_saves_since_verify = TRANSCRIPT_VERIFY_INTERVAL - 1
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
+
+        expected = self._expected_records(messages)
+        rewrite_chunks = chunks_by_target["messages.jsonl"]
+        assert [json.loads(chunk) for chunk in rewrite_chunks] == expected
+        assert all(chunk.endswith(b"\n") for chunk in rewrite_chunks)
+        assert [
+            json.loads(line) for line in messages_path.read_text().splitlines()
+        ] == (expected)
+
+    @pytest.mark.asyncio
+    async def test_repair_rewrite_failure_before_replace_leaves_no_partial_transcript(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        logger, messages, messages_path = await self._populated_logger(
+            session_config, mock_vibe_config, mock_tool_manager
+        )
+        assert logger.session_dir is not None
+        session_dir = logger.session_dir
+        original_replace = os.replace
+
+        def failing_replace(source: Any, target: Any) -> None:
+            if Path(target).name == "messages.jsonl":
+                raise OSError(errno.EIO, "injected rewrite failure")
+            original_replace(source, target)
+
+        monkeypatch.setattr(os, "replace", failing_replace)
+        logger._transcript_saves_since_verify = TRANSCRIPT_VERIFY_INTERVAL - 1
+        with pytest.raises(RuntimeError, match="injected rewrite failure"):
+            await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
+
+        # The failed replacement is never visible: no live transcript, no temp
+        # file, and the quarantined original keeps the corrupt bytes.
+        assert not messages_path.exists()
+        quarantined = list(session_dir.glob("messages.jsonl.corrupt-*"))
+        assert len(quarantined) == 1
+        assert quarantined[0].read_text(encoding="utf-8").endswith('{"corrupt": true\n')
+        assert sorted(path.name for path in session_dir.iterdir()) == sorted([
+            "meta.json",
+            quarantined[0].name,
+        ])
+
+    @pytest.mark.asyncio
+    async def test_repair_rewrite_retry_after_failure_writes_records_once(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: ChartreuxConfigSchema,
+        mock_tool_manager: ToolManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        logger, messages, messages_path = await self._populated_logger(
+            session_config, mock_vibe_config, mock_tool_manager
+        )
+        assert logger.session_dir is not None
+        session_dir = logger.session_dir
+        original_replace = os.replace
+
+        def failing_replace(source: Any, target: Any) -> None:
+            if Path(target).name == "messages.jsonl":
+                raise OSError(errno.EIO, "injected rewrite failure")
+            original_replace(source, target)
+
+        with monkeypatch.context() as failure:
+            failure.setattr(os, "replace", failing_replace)
+            logger._transcript_saves_since_verify = TRANSCRIPT_VERIFY_INTERVAL - 1
+            with pytest.raises(RuntimeError, match="injected rewrite failure"):
+                await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
+        assert not messages_path.exists()
+
+        logger._transcript_saves_since_verify = TRANSCRIPT_VERIFY_INTERVAL - 1
+        await self._save(logger, messages, mock_vibe_config, mock_tool_manager)
+
+        expected = self._expected_records(messages)
+        assert [
+            json.loads(line) for line in messages_path.read_text().splitlines()
+        ] == (expected)
+        assert len(list(session_dir.glob("messages.jsonl.corrupt-*"))) == 1
+
+    def test_migrate_repaired_transcript_streams_the_original_off_disk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        messages_path = tmp_path / "messages.jsonl"
+        original_bytes = b"".join(
+            (json.dumps({"role": "user", "content": f"line {index}"}) + "\n").encode()
+            for index in range(64)
+        )
+        messages_path.write_bytes(original_bytes)
+        repaired = [
+            LLMMessage(role=Role.user, content=f"repaired {index}")
+            for index in range(3)
+        ]
+
+        def must_not_materialize(path: Path) -> bytes:
+            raise AssertionError("the repair must stream the original off disk")
+
+        with monkeypatch.context() as streaming:
+            streaming.setattr(Path, "read_bytes", must_not_materialize)
+            artifact_path = SessionLogger.migrate_repaired_transcript(
+                messages_path, repaired
+            )
+
+        assert artifact_path.read_bytes() == original_bytes
+        assert [
+            json.loads(line) for line in messages_path.read_text().splitlines()
+        ] == (self._expected_records(list(repaired)))
+
+    def test_migrate_repaired_transcript_replace_failure_keeps_the_original(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        messages_path = tmp_path / "messages.jsonl"
+        original_bytes = b'{"role": "user", "content": "kept"}\n'
+        messages_path.write_bytes(original_bytes)
+        original_replace = os.replace
+
+        def failing_replace(source: Any, target: Any) -> None:
+            if Path(target) == messages_path:
+                raise OSError(errno.EIO, "injected live replace failure")
+            original_replace(source, target)
+
+        monkeypatch.setattr(os, "replace", failing_replace)
+        with pytest.raises(TranscriptIntegrityError) as excinfo:
+            SessionLogger.migrate_repaired_transcript(
+                messages_path, [LLMMessage(role=Role.user, content="repaired")]
+            )
+
+        assert excinfo.value.violations[0].kind == "transcript_repair_failed"
+        # The live transcript is untouched and no partial file is visible.
+        assert messages_path.read_bytes() == original_bytes
+        artifacts = list(tmp_path.glob("messages.jsonl.recovered-*"))
+        assert len(artifacts) == 1
+        assert artifacts[0].read_bytes() == original_bytes
+        assert sorted(path.name for path in tmp_path.iterdir()) == sorted([
+            "messages.jsonl",
+            artifacts[0].name,
+        ])
+
+    def test_migrate_repaired_transcript_retry_after_failure_preserves_original(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        messages_path = tmp_path / "messages.jsonl"
+        original_bytes = b'{"role": "user", "content": "kept"}\n'
+        messages_path.write_bytes(original_bytes)
+        repaired = [LLMMessage(role=Role.user, content="repaired")]
+        original_replace = os.replace
+
+        def failing_replace(source: Any, target: Any) -> None:
+            if Path(target) == messages_path:
+                raise OSError(errno.EIO, "injected live replace failure")
+            original_replace(source, target)
+
+        with monkeypatch.context() as failure:
+            failure.setattr(os, "replace", failing_replace)
+            with pytest.raises(TranscriptIntegrityError):
+                SessionLogger.migrate_repaired_transcript(messages_path, repaired)
+
+        artifact_path = SessionLogger.migrate_repaired_transcript(
+            messages_path, repaired
+        )
+
+        expected = self._expected_records(repaired)
+        assert [
+            json.loads(line) for line in messages_path.read_text().splitlines()
+        ] == (expected)
+        # Every attempt preserved the then-live original before replacing it.
+        artifacts = list(tmp_path.glob("messages.jsonl.recovered-*"))
+        assert len(artifacts) == 2
+        assert artifact_path in artifacts
+        assert all(path.read_bytes() == original_bytes for path in artifacts)

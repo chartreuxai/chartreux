@@ -33,7 +33,7 @@ All transports are controlled fakes — an unmocked provider call cannot occur
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 import json
 from pathlib import Path
 from typing import Any, cast
@@ -1134,11 +1134,12 @@ class TestS4LoadRepair:
         original_bytes = messages_path.read_bytes()
         messages, metadata = SessionLoader.load_session(session_dir)
 
-        def failing_replace(target: Path, data: bytes) -> None:
+        def failing_replace(target: Path, chunks: Iterable[bytes]) -> None:
             raise OSError("injected backup failure")
 
         monkeypatch.setattr(
-            "chartreux.core.session.session_logger.durable_replace", failing_replace
+            "chartreux.core.session.session_logger.durable_replace_stream",
+            failing_replace,
         )
         with pytest.raises(TranscriptIntegrityError) as excinfo:
             _install_transcript_repair(session_dir, messages, metadata)

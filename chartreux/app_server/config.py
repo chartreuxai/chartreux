@@ -49,6 +49,7 @@ class ConfigView(ProtocolModel):
     status_line: StatusLineConfigView = Field(default_factory=StatusLineConfigView)
     ascii_chrome: bool = False
     enable_notifications: bool
+    emit_program_status: bool = True
     enable_system_trust_store: bool = False
     models: list[ModelConfigView]
     validation_warnings: list[str]

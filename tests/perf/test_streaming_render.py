@@ -23,7 +23,12 @@ from chartreux.app_server.models import (
 )
 from chartreux.cli.textual_ui.app import ChartreuxApp
 from chartreux.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
-from chartreux.cli.textual_ui.widgets.messages import AssistantMessage
+from chartreux.cli.textual_ui.widgets.messages import (
+    STREAM_WRITE_FRAME_SECONDS_MAX,
+    AssistantMessage,
+    ReasoningMessage,
+    StreamingMessageBase,
+)
 from chartreux.cli.textual_ui.widgets.tool_widgets import (
     EFFECT_WIDGETS,
     BashResultWidget,
@@ -32,9 +37,20 @@ from chartreux.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMe
 from chartreux.core.llm.types import BackendLike
 from chartreux.core.llm_models import LLMChunk
 from chartreux.utils.tool_presentation import ToolEffectKind
-from tests.conftest import build_test_agent_loop, build_test_chartreux_app
+from tests.conftest import (
+    build_test_agent_loop,
+    build_test_chartreux_app,
+    build_test_vibe_config,
+)
 from tests.mock.utils import mock_llm_chunk
-from tests.perf._metrics import machine_context, percentiles, record
+from tests.perf._metrics import (
+    machine_context,
+    measure_loop_lag,
+    percentiles,
+    record,
+    rss_mib,
+    rss_peak_mib,
+)
 from tests.stubs.fake_backend import FakeBackend
 
 ASSISTANT_CHUNK_COUNT = 500
@@ -48,9 +64,12 @@ pytestmark = pytest.mark.skipif(
 class YieldingStreamingBackend(FakeBackend):
     """Fake backend paced to allow Textual's 50ms stream flush to run."""
 
-    def __init__(self, chunks: list[LLMChunk]) -> None:
+    def __init__(
+        self, chunks: list[LLMChunk], *, total_chunks: int | None = None
+    ) -> None:
         super().__init__(chunks)
         self.chunks_yielded = 0
+        self._chunk_total = len(chunks) if total_chunks is None else total_chunks
 
     async def complete_streaming(self, **kwargs: Any) -> AsyncGenerator[LLMChunk, None]:
         async for chunk in super().complete_streaming(**kwargs):
@@ -59,17 +78,22 @@ class YieldingStreamingBackend(FakeBackend):
             # Keep the 50ms timer observable across the stream and guarantee a
             # final timer flush before the completion event finalizes the widget.
             await asyncio.sleep(
-                0.001 if self.chunks_yielded < ASSISTANT_CHUNK_COUNT else 0.075
+                0.001 if self.chunks_yielded < self._chunk_total else 0.075
             )
 
 
-def _build_streaming_app(backend: BackendLike) -> ChartreuxApp:
+def _build_streaming_app(backend: BackendLike, *, config: Any = None) -> ChartreuxApp:
     """Build the real Textual app with the requested streaming backend.
 
-    WP5 should reuse this helper/signature for its combined-load stream pilot.
+    ``config`` is passed to BOTH the agent loop and the app so content-shape
+    fixtures can flip UI-affecting settings (e.g. show_thinking_nodes) on the
+    same config object. WP5 should reuse this helper/signature for its
+    combined-load scenario.
     """
-    agent_loop = build_test_agent_loop(backend=backend, enable_streaming=True)
-    return build_test_chartreux_app(agent_loop=agent_loop)
+    agent_loop = build_test_agent_loop(
+        backend=backend, enable_streaming=True, config=config
+    )
+    return build_test_chartreux_app(config=config, agent_loop=agent_loop)
 
 
 async def _wait_until(
@@ -363,6 +387,410 @@ async def test_streaming_shell_output(
             "turn_wall_ms": round(turn_wall_ms, 3),
             "live_stream_widget": "ToolCallMessage.set_stream_message",
             "final_result_widget": "BashResultWidget",
+            "machine": machine_context(),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# P0c — streaming content-shape baselines. Two DISTINCT kinds of frozen values
+# live below:
+#
+# CEILINGS (non-regression upper bounds, asserted in the tests): exceeding one
+# is a blocker. Frozen at 4x the recorded baseline for latencies (P0a
+# convention) and 6x for RSS (P0b convention), so host load cannot mask a real
+# regression.
+#
+# The LONG-STREAM OPTIMIZATION TARGET (_P0C_LONG_STREAM_FRAME_P95_TARGET_MS) was
+# frozen as the P5 trigger and is NOT a P0c ceiling. P5 is gated ON (its
+# recorded baseline exceeded the target), so the target is asserted from P5
+# onward: the long-stream fixture must meet or beat it. The 150ms figure below
+# is P5's implementation cap on its own change, a different value entirely.
+#
+# All memory metrics below are FIRST-OBSERVATION BASELINES: no earlier recorded
+# values exist, and they are valid on the baseline machine only.
+# ---------------------------------------------------------------------------
+
+_P0C_STREAM_ITERATIONS = 3
+_P0C_LONG_STREAM_CHUNK_COUNT = 2000
+_P0C_SHAPE_CHUNK_COUNT = 400
+# 400 streamed bullets cost a 176s turn wall (frame p50 ~640ms) in the
+# measurement run — the pathological long-list shape P5 targets — too heavy
+# for a bounded baseline fixture; frozen at 120 items instead, with the 400-item
+# finding recorded in the P0c baseline meta.
+_P0C_LIST_ITEM_COUNT = 120
+_P0C_REASONING_CHUNK_COUNT = 600
+
+# CEILINGS frozen from the 2026-10-29 measurement run at commit 4e0d579c on the
+# baseline machine (AMD Ryzen 9 5900X, 24 cores): 4x the recorded baseline for
+# latencies, 6x for RSS, with a 10ms floor on loop-lag p50 so tiny baselines do
+# not produce flake-prone bounds. See perf-baselines/p0c-streaming-baseline.meta.json.
+_P0C_FRAME_P95_CEILINGS_MS: dict[str, float] = {
+    "long_paragraph": 692.0,
+    "fenced_code": 659.0,
+    "list": 1992.0,
+    "expanded_reasoning": 545.0,
+}
+# fenced_code/expanded_reasoning flush-cost p95 ceilings removed at freeze calibration (heavy-tail jitter, user-approved 2026-10-28).
+_P0C_FLUSH_P95_CEILINGS_MS: dict[str, float] = {"long_paragraph": 17.0, "list": 35.4}
+_P0C_LOOP_LAG_P50_CEILINGS_MS: dict[str, float] = {
+    "long_paragraph": 11.2,
+    "fenced_code": 10.0,
+    "list": 89.0,
+    "expanded_reasoning": 10.0,
+}
+_P0C_RSS_PEAK_CEILING_MIB = 1954.0
+
+# LONG-STREAM OPTIMIZATION TARGET — frozen as the P5 trigger from the recorded
+# long-paragraph baseline (median frame-interval p95 of the measurement run's
+# three iterations: 160.989 / 172.886 / 167.681 -> 168.0) against the 176.677 ms
+# recorded P0c denominator. P5 asserts it on the long-paragraph fixture: the
+# adaptive cadence must meet or beat the target. The 150ms figure below is P5's
+# implementation cap on the scheduled interval, a different value entirely.
+_P0C_LONG_STREAM_FRAME_P95_TARGET_MS = 168.0
+_P0C_LONG_STREAM_FRAME_P95_BASELINE_MS = 176.677
+
+# P5 implementation cap: the scheduled batching interval never exceeds 150ms.
+_P5_SCHEDULED_INTERVAL_CAP_SECONDS = 0.15
+
+
+def _stream_chunks(texts: list[str]) -> list[LLMChunk]:
+    return [
+        mock_llm_chunk(
+            content=text, stop_reason="stop" if index == len(texts) - 1 else None
+        )
+        for index, text in enumerate(texts)
+    ]
+
+
+def _long_paragraph_texts() -> list[str]:
+    texts = []
+    for index in range(_P0C_LONG_STREAM_CHUNK_COUNT):
+        text = (
+            f"Clause {index:05d} feeds the renderer another substantive piece of "
+            "prose, so each flushed frame must reflow a paragraph that keeps "
+            "growing instead of appending isolated short tokens"
+        )
+        text += ".\n\n" if index % 20 == 19 else ". "
+        texts.append(text)
+    return texts
+
+
+def _fenced_code_texts() -> list[str]:
+    texts = ["Streaming a module into a live fence:\n\n```python\n"]
+    for index in range(_P0C_SHAPE_CHUNK_COUNT - 2):
+        if index % 4 == 0:
+            texts.append(f"def handler_{index:03d}(payload: dict) -> bool:\n")
+        elif index % 4 == 1:
+            texts.append(f"    return payload.get('kind_{index:03d}') is not None\n")
+        elif index % 4 == 2:
+            texts.append("\n\n")
+        else:
+            texts.append(f"# tail comment {index:03d} keeps the fence open\n")
+    texts.append("```\n")
+    texts.append("The fence closed after the streamed module.")
+    return texts
+
+
+def _list_texts() -> list[str]:
+    texts = ["Plan under construction:\n\n"]
+    for index in range(_P0C_LIST_ITEM_COUNT):
+        texts.append(
+            f"- Item {index:03d}: a streamed bullet whose text is long enough to "
+            "wrap and force list-aware markdown layout on each flush\n"
+        )
+    return texts
+
+
+def _reasoning_chunks() -> list[LLMChunk]:
+    chunks = [
+        mock_llm_chunk(
+            content="",
+            reasoning_content=(
+                f"Step {index:04d} weighs the streaming cadence against the flush "
+                "budget, since expanded reasoning renders live while the spinner "
+                "spins and every delta extends the reasoning markdown. "
+            ),
+            stop_reason=None,
+        )
+        for index in range(_P0C_REASONING_CHUNK_COUNT)
+    ]
+    chunks.append(
+        mock_llm_chunk(content="Done - reasoning complete.", stop_reason="stop")
+    )
+    return chunks
+
+
+class StreamingFrameObserver:
+    """Records flush frame cadence and cost across all streaming widgets.
+
+    Frames are start-to-start intervals between non-empty write-buffer flushes,
+    so they capture the visible update cadence for both AssistantMessage and
+    ReasoningMessage (both flush through StreamingMessageBase).
+    """
+
+    def __init__(self) -> None:
+        self.frame_intervals_ms: list[float] = []
+        self.flush_costs_ms: list[float] = []
+        self.scheduled_delays_s: list[float] = []
+        self.flush_count = 0
+        self._last_flush_started: float | None = None
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        original = StreamingMessageBase._flush_write_buffer
+
+        async def timed_flush(stream_widget: StreamingMessageBase) -> None:
+            if not stream_widget._to_write_buffer:
+                await original(stream_widget)
+                return
+            # The delay that scheduled this frame; the adaptive cadence must keep
+            # every one of them under the P5 implementation cap.
+            self.scheduled_delays_s.append(stream_widget._frame_delay)
+            started = perf_counter()
+            if self._last_flush_started is not None:
+                self.frame_intervals_ms.append(
+                    (started - self._last_flush_started) * 1000
+                )
+            self._last_flush_started = started
+            started_ns = perf_counter_ns()
+            try:
+                await original(stream_widget)
+            finally:
+                self.flush_costs_ms.append((perf_counter_ns() - started_ns) / 1_000_000)
+                self.flush_count += 1
+
+        monkeypatch.setattr(StreamingMessageBase, "_flush_write_buffer", timed_flush)
+
+
+async def _stream_fixture_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    chunks: list[LLMChunk],
+    *,
+    assert_final: Callable[[ChartreuxApp], None],
+    config: Any = None,
+    expand_reasoning: bool = False,
+) -> dict[str, Any]:
+    """Stream ``chunks`` through the real app; measure frames and loop lag."""
+    backend = YieldingStreamingBackend(chunks)
+    app = _build_streaming_app(backend, config=config)
+    observer = StreamingFrameObserver()
+    observer.install(monkeypatch)
+    turn_walls_ms: list[float] = []
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+
+        async def run_turn() -> None:
+            submitted_at = perf_counter()
+            chat_input = app.query_one(ChatInputContainer)
+            chat_input.post_message(
+                ChatInputContainer.Submitted("streaming perf pilot")
+            )
+            if expand_reasoning:
+                # Reasoning nodes always mount collapsed (expansion_state
+                # register default); expanding mid-stream is the real user
+                # flow that turns on live reasoning rendering.
+                await _wait_until(pilot, lambda: len(app.query(ReasoningMessage)) > 0)
+                await app.query_one(ReasoningMessage).set_collapsed(False)
+            await _wait_until(
+                pilot, lambda: backend.chunks_yielded == len(chunks), timeout=240.0
+            )
+            await _wait_until(pilot, lambda: not app._agent_job_active(), timeout=180.0)
+            turn_walls_ms.append((perf_counter() - submitted_at) * 1000)
+            assert_final(app)
+
+        lag = await measure_loop_lag(run_turn(), interval_s=0.005)
+
+    assert observer.flush_count > 0
+    assert observer.frame_intervals_ms
+    return {
+        "chunk_count": backend.chunks_yielded,
+        "flush_count": observer.flush_count,
+        "frame_interval_ms": percentiles(observer.frame_intervals_ms),
+        "flush_cost_ms": percentiles(observer.flush_costs_ms),
+        "max_scheduled_delay_s": max(observer.scheduled_delays_s),
+        "loop_lag_ms": lag,
+        "turn_wall_ms": round(turn_walls_ms[0], 3),
+        "rss_current_mib": rss_mib(),
+        # Process-wide monotonic high-water mark: includes prior tests in the
+        # same worker process, so this is a lower-bound attribution.
+        "rss_peak_mib": rss_peak_mib(),
+    }
+
+
+def _assert_p5_scheduled_interval_cap(metrics: dict[str, Any]) -> None:
+    """P5: no scheduled batching interval may exceed the 150ms implementation cap."""
+    assert STREAM_WRITE_FRAME_SECONDS_MAX <= _P5_SCHEDULED_INTERVAL_CAP_SECONDS, (
+        f"configured frame-delay cap {STREAM_WRITE_FRAME_SECONDS_MAX}s exceeds "
+        f"the P5 implementation cap {_P5_SCHEDULED_INTERVAL_CAP_SECONDS}s"
+    )
+    assert metrics["max_scheduled_delay_s"] <= _P5_SCHEDULED_INTERVAL_CAP_SECONDS, (
+        f"scheduled frame delay {metrics['max_scheduled_delay_s']}s exceeds the "
+        f"P5 implementation cap {_P5_SCHEDULED_INTERVAL_CAP_SECONDS}s"
+    )
+
+
+def _assert_p5_long_stream_target(metrics: dict[str, Any]) -> None:
+    """P5: the long-stream frame interval must meet or beat the frozen target."""
+    p95 = metrics["frame_interval_ms"]["p95"]
+    assert p95 <= _P0C_LONG_STREAM_FRAME_P95_TARGET_MS, (
+        f"long-stream frame-interval p95 {p95}ms misses the P5 target "
+        f"{_P0C_LONG_STREAM_FRAME_P95_TARGET_MS}ms (P0c baseline "
+        f"{_P0C_LONG_STREAM_FRAME_P95_BASELINE_MS}ms)"
+    )
+
+
+def _assert_p0c_ceilings(fixture: str, metrics: dict[str, Any]) -> None:
+    assert metrics["frame_interval_ms"]["p95"] <= _P0C_FRAME_P95_CEILINGS_MS[fixture], (
+        f"frame-interval p95 {metrics['frame_interval_ms']['p95']} exceeds ceiling "
+        f"{_P0C_FRAME_P95_CEILINGS_MS[fixture]} for {fixture}"
+    )
+    flush_p95_ceiling = _P0C_FLUSH_P95_CEILINGS_MS.get(fixture)
+    if flush_p95_ceiling is not None:
+        assert metrics["flush_cost_ms"]["p95"] <= flush_p95_ceiling, (
+            f"flush-cost p95 {metrics['flush_cost_ms']['p95']} exceeds ceiling "
+            f"{flush_p95_ceiling} for {fixture}"
+        )
+    assert metrics["loop_lag_ms"]["p50"] <= _P0C_LOOP_LAG_P50_CEILINGS_MS[fixture], (
+        f"loop-lag p50 {metrics['loop_lag_ms']['p50']} exceeds ceiling "
+        f"{_P0C_LOOP_LAG_P50_CEILINGS_MS[fixture]} for {fixture}"
+    )
+    assert metrics["rss_peak_mib"] <= _P0C_RSS_PEAK_CEILING_MIB, (
+        f"rss peak {metrics['rss_peak_mib']} exceeds ceiling "
+        f"{_P0C_RSS_PEAK_CEILING_MIB}"
+    )
+    _assert_p5_scheduled_interval_cap(metrics)
+
+
+@pytest.mark.asyncio
+@pytest.mark.perf
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("iteration", range(_P0C_STREAM_ITERATIONS))
+async def test_streaming_long_paragraph_frames(
+    iteration: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    texts = _long_paragraph_texts()
+
+    def assert_final(app: ChartreuxApp) -> None:
+        assert app.query_one(AssistantMessage).get_content() == "".join(texts)
+
+    metrics = await _stream_fixture_turn(
+        monkeypatch, _stream_chunks(texts), assert_final=assert_final
+    )
+    _assert_p0c_ceilings("long_paragraph", metrics)
+    _assert_p5_long_stream_target(metrics)
+    record(
+        "streaming_long_paragraph_frames",
+        {
+            "iteration": iteration,
+            "fixture": "long-paragraph",
+            "total_bytes": len("".join(texts).encode()),
+            "p5_long_stream_frame_p95_target_ms": _P0C_LONG_STREAM_FRAME_P95_TARGET_MS,
+            "p5_long_stream_frame_p95_baseline_ms": (
+                _P0C_LONG_STREAM_FRAME_P95_BASELINE_MS
+            ),
+            "p5_scheduled_interval_cap_s": _P5_SCHEDULED_INTERVAL_CAP_SECONDS,
+            **metrics,
+            "machine": machine_context(),
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.perf
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("iteration", range(_P0C_STREAM_ITERATIONS))
+async def test_streaming_fenced_code_frames(
+    iteration: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    texts = _fenced_code_texts()
+
+    def assert_final(app: ChartreuxApp) -> None:
+        content = app.query_one(AssistantMessage).get_content()
+        assert content == "".join(texts)
+        assert content.count("```") == 2
+
+    metrics = await _stream_fixture_turn(
+        monkeypatch, _stream_chunks(texts), assert_final=assert_final
+    )
+    _assert_p0c_ceilings("fenced_code", metrics)
+    record(
+        "streaming_fenced_code_frames",
+        {
+            "iteration": iteration,
+            "fixture": "fenced-code",
+            "total_bytes": len("".join(texts).encode()),
+            **metrics,
+            "machine": machine_context(),
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.perf
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("iteration", range(_P0C_STREAM_ITERATIONS))
+async def test_streaming_list_frames(
+    iteration: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    texts = _list_texts()
+
+    def assert_final(app: ChartreuxApp) -> None:
+        content = app.query_one(AssistantMessage).get_content()
+        assert content == "".join(texts)
+        assert content.count("\n- ") == _P0C_LIST_ITEM_COUNT
+
+    metrics = await _stream_fixture_turn(
+        monkeypatch, _stream_chunks(texts), assert_final=assert_final
+    )
+    _assert_p0c_ceilings("list", metrics)
+    record(
+        "streaming_list_frames",
+        {
+            "iteration": iteration,
+            "fixture": "list",
+            "total_bytes": len("".join(texts).encode()),
+            **metrics,
+            "machine": machine_context(),
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.perf
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("iteration", range(_P0C_STREAM_ITERATIONS))
+async def test_streaming_expanded_reasoning_frames(
+    iteration: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chunks = _reasoning_chunks()
+    reasoning_text = "".join(
+        chunk.message.reasoning_content or "" for chunk in chunks[:-1]
+    )
+    final_text = chunks[-1].message.content or ""
+    config = build_test_vibe_config(show_thinking_nodes=True)
+
+    def assert_final(app: ChartreuxApp) -> None:
+        reasoning = app.query_one(ReasoningMessage)
+        assert reasoning.get_content() == reasoning_text
+        assistant = app.query_one(AssistantMessage)
+        assert assistant.get_content() == final_text
+
+    metrics = await _stream_fixture_turn(
+        monkeypatch,
+        chunks,
+        assert_final=assert_final,
+        config=config,
+        expand_reasoning=True,
+    )
+    _assert_p0c_ceilings("expanded_reasoning", metrics)
+    record(
+        "streaming_expanded_reasoning_frames",
+        {
+            "iteration": iteration,
+            "fixture": "expanded-reasoning",
+            "total_bytes": len((reasoning_text + final_text).encode()),
+            **metrics,
             "machine": machine_context(),
         },
     )

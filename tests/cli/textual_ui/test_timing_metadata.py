@@ -19,6 +19,7 @@ from chartreux.app_server.models import (
     InlineImageSource,
     JsonPatchOperation,
     PublicEntryGenerationStatus,
+    PublicMessageEntry,
     PublicReasoningEntry,
 )
 from chartreux.cli.textual_ui.handlers.event_handler import EventHandler
@@ -304,6 +305,104 @@ async def test_settled_timing_patch_registry_skips_removed_and_windowed_rows() -
         await pilot.pause()
         assert rebuilt.header.turn_duration_ms == 372000
         assert window.mounted_entry_widgets("removed-empty") == []
+
+
+@pytest.mark.asyncio
+async def test_admitted_timing_patch_skips_bulk_admission_and_keeps_geometry() -> None:
+    entry = _message(0).model_copy(
+        update={"posted_at": datetime(2026, 7, 12, tzinfo=UTC)}
+    )
+    window = TranscriptWindow()
+    window.admit([entry], start_index=0)
+    widget = window.build_unit(entry.id, WeakKeyDictionary())[0]
+    assert isinstance(widget, AssistantMessage)
+    app = TimingApp()
+    area = Vertical()
+    admissions: list[str] = []
+    presenter: Any = TranscriptPresenter(get_show_timestamps=lambda: False)
+    presenter._transcript = window
+    presenter._app = SimpleNamespace(
+        event_handler=None,
+        app_server=SimpleNamespace(history=[entry]),
+        _request_transcript_reconcile=lambda: None,
+        _messages_area=area,
+        _admit_live_history=lambda: admissions.append("admit"),
+    )
+    handler = EventHandler(
+        area.mount,
+        lambda: True,
+        mounted_entry_widgets=presenter.mounted_timing_widgets,
+        update_retained_entry=window.update_entry,
+    )
+    presenter._app.event_handler = handler
+
+    async def timing_patch(previous: PublicMessageEntry, duration_ms: int) -> None:
+        await handler._handle_entry_updated(
+            HistoryEntryUpdated(
+                previous,
+                previous.model_copy(update={"turn_duration_ms": duration_ms}),
+                [
+                    JsonPatchOperation(
+                        op="replace", path="/turnDurationMs", value=duration_ms
+                    )
+                ],
+            ),
+            None,
+        )
+
+    async with app.run_test() as pilot:
+        await app.mount(area)
+        await area.mount(widget)
+        window.register_mounted(entry.id, [widget])
+        await pilot.pause()
+        await pilot.pause()
+        unit = window.units[entry.id]
+        admitted_end = window.admitted_end_index
+        message_region = widget.region
+        header_region = widget.header.region
+        assert header_region.height == 1
+
+        # The handler is bound to the presenter wrapper, so an admitted entry
+        # must resolve without any bulk admission.
+        await timing_patch(entry, 372_000)
+        await pilot.pause()
+        assert admissions == []
+        assert window.admitted_end_index == admitted_end
+        assert window.has_admitted_entry(entry.id)
+        assert window.units[entry.id] is unit
+        assert app.query_one(AssistantMessage) is widget
+        assert not unit.placeholders
+        assert widget.header.turn_duration_ms == 372_000
+        # Geometry neutrality established by measurement, not assumed: the
+        # rendered duration changes while the message and header regions stay
+        # put, which is why a timing patch needs no re-admission or remount.
+        assert widget.header.metadata_for_width(10_000).endswith("6m12s")
+        assert widget.region == message_region
+        assert widget.header.region == header_region
+
+        await timing_patch(
+            entry.model_copy(update={"turn_duration_ms": 372_000}), 214_000
+        )
+        await pilot.pause()
+        assert widget.header.metadata_for_width(10_000).endswith("3m34s")
+        assert widget.region == message_region
+        assert widget.header.region == header_region
+        assert admissions == []
+
+        # Evicted units resolve without admission too; retained data refreshes.
+        await window.evict_unit(entry.id)
+        assert window.has_admitted_entry(entry.id)
+        await timing_patch(
+            entry.model_copy(update={"turn_duration_ms": 214_000}), 60_000
+        )
+        assert admissions == []
+        retained = unit.entries[0]
+        assert isinstance(retained, PublicMessageEntry)
+        assert retained.turn_duration_ms == 60_000
+
+        # Only entries outside the registry keep the admission fallback.
+        assert presenter.mounted_timing_widgets("absent-entry") == []
+        assert admissions == ["admit"]
 
 
 @pytest.mark.asyncio

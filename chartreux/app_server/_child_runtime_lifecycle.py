@@ -405,6 +405,7 @@ class ChildDrainView(Protocol):
     _child_links: dict[str, tuple[SessionRuntime, str]]
     _stored_children: dict[str, StoredChildSession]
     _readable_children: dict[str, SessionRuntime]
+    _readable_children_identities: dict[str, tuple[str, int]]
     _detached_child_ids: set[str]
     _pending_child_closes: dict[str, tuple[SessionRuntime, asyncio.Task[None]]]
     _teardown_tasks: set[asyncio.Task[None]]
@@ -620,6 +621,7 @@ class ChildDrain:
             self._view._child_links.clear()
             self._view._stored_children.clear()
             self._view._readable_children.clear()
+            self._view._readable_children_identities.clear()
             self._view._detached_child_ids.clear()
 
     async def _drain_tracked_teardowns(self, context: DrainContext) -> None:

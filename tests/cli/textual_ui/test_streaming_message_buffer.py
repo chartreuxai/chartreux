@@ -51,6 +51,8 @@ class MessageTestDouble(StreamingMessageBase):
         self._write_timer = None
         self._stream = None
         self._markdown = None
+        self._frame_delay = STREAM_WRITE_FRAME_SECONDS
+        self._last_frame_started = None
         self._at_bottom = at_bottom
         self._should_write = should_write
         self._fake_stream: FakeStream = FakeStream()

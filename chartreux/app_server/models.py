@@ -285,9 +285,20 @@ class UserInputCallbackExpiry(ProtocolModel):
 
 
 class UserInputCallbackDetail(ProtocolModel):
+    """Public snapshot of an open user-input prompt.
+
+    ``origin`` carries the trusted provenance of the request (a model question
+    or a runtime approval prompt) so clients can present it accordingly. The
+    field serializes as an explicit ``"origin": null`` rather than being
+    omitted: the addition is FORWARD-compatible only, so an older strict
+    client rejects the new key and client and server must run the same
+    protocol version.
+    """
+
     kind: Literal["user_input"] = "user_input"
     request: UserQuestionRequest
     related_entry_id: str | None = None
+    origin: str | None = None
     unattended_expiry: UserInputCallbackExpiry | None = None
 
 

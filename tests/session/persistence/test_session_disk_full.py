@@ -5,10 +5,12 @@ import json
 import logging
 import os
 from pathlib import Path
+import stat
 from unittest.mock import MagicMock
 
 import pytest
 
+from chartreux.core.agent_loop._transcript_integrity import TranscriptIntegrityError
 from chartreux.core.config import SessionLoggingConfig
 from chartreux.core.llm_models import LLMMessage, Role
 from chartreux.core.session.session_logger import (
@@ -314,3 +316,59 @@ class TestQuarantineDiskFull:
 
         assert any("corrupted" in record.getMessage() for record in caplog.records)
         assert _disk_full_warnings(caplog)
+
+
+class TestRepairRewriteDiskFull:
+    def test_recovery_artifact_enospc_fails_closed_and_keeps_the_original(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        messages_path = tmp_path / "messages.jsonl"
+        original_bytes = b'{"role": "user", "content": "kept"}\n'
+        messages_path.write_bytes(original_bytes)
+        _patch_replace(monkeypatch, _enospc)
+
+        with pytest.raises(TranscriptIntegrityError) as excinfo:
+            SessionLogger.migrate_repaired_transcript(
+                messages_path, [LLMMessage(role=Role.user, content="repaired")]
+            )
+
+        assert excinfo.value.violations[0].kind == "transcript_repair_failed"
+        assert isinstance(excinfo.value.__cause__, OSError)
+        assert excinfo.value.__cause__.errno == errno.ENOSPC
+        # Fail closed: the live transcript is intact and no partial is visible.
+        assert messages_path.read_bytes() == original_bytes
+        assert list(tmp_path.iterdir()) == [messages_path]
+
+    @pytest.mark.asyncio
+    async def test_streamed_repair_rewrite_enospc_leaves_no_partial_transcript(
+        self, session_config: SessionLoggingConfig, monkeypatch, caplog
+    ) -> None:
+        logger = SessionLogger(session_config, "repair-disk-full")
+        assert logger.session_dir is not None
+        session_dir = logger.session_dir
+        messages_path = session_dir / "messages.jsonl"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        corrupt_bytes = b'{"role": "user", "content": "kept"}\n{"corrupt": true\n'
+        messages_path.write_bytes(corrupt_bytes)
+
+        original_fsync = os.fsync
+
+        def fsync(descriptor: int) -> None:
+            # Deferred allocation reports ENOSPC at the sync of the streamed
+            # rewrite's temp file, before it can be renamed into place.
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                _enospc()
+            original_fsync(descriptor)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            await _save(logger, [LLMMessage(role=Role.user, content="kept")])
+
+        assert not messages_path.exists()
+        quarantined = list(session_dir.glob("messages.jsonl.corrupt-*"))
+        assert len(quarantined) == 1
+        assert quarantined[0].read_bytes() == corrupt_bytes
+        # The temp file is gone: nothing partial is published or left behind.
+        assert [path.name for path in session_dir.iterdir()] == [quarantined[0].name]
+        assert _disk_full_warnings(caplog)
+        assert not logger.persisted

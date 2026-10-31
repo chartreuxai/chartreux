@@ -446,12 +446,23 @@ async def test_full_app_child_completion_and_steering_emit_one_wait_result(
         await asyncio.wait_for(submission, 5)
         child_backend.release.set()
         finish_result.set()
-    assert await _wait_until(pilot, lambda: not app.app_server.turn_active)
-    results = [
-        m
-        for m in parent.messages
-        if m.role is Role.tool and m.tool_call_id == launch.agent_id
-    ]
+
+    def wait_results():
+        return [
+            m
+            for m in parent.messages
+            if m.role is Role.tool and m.tool_call_id == launch.agent_id
+        ]
+
+    # The result record lands asynchronously relative to the turn-active flag
+    # under load, so wait for the emitted result instead of reading the
+    # transcript the moment the turn clears.
+    assert await _wait_until(
+        pilot,
+        lambda: not app.app_server.turn_active and bool(wait_results()),
+        timeout=5,
+    )
+    results = wait_results()
     assert len(results) == 1
     assert results[0].tool_result is not None
     assert results[0].tool_result.cancelled is not completion_first

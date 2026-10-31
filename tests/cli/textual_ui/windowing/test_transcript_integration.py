@@ -263,17 +263,19 @@ async def test_under_budget_scroll_reuses_resident_geometry_without_scans(
         tick()
         assert candidates.call_count == 1
         assert window._reconcile_task is None
-        scans = units.scans
+        # Post-P3b2b the gate answers from the reconcile indexes, so a tick
+        # never scans units.values() at all.
+        assert units.scans == 0
         for _ in range(5):
             tick()
         assert candidates.call_count == 1
-        assert units.scans == scans
+        assert units.scans == 0
         assert window._reconcile_task is None
 
         window.geometry_version += 1
         tick()
-        assert candidates.call_count == 2
-        assert units.scans > scans
+        assert candidates.call_count == 2  # A geometry change forces re-evaluation.
+        assert units.scans == 0
         assert window._reconcile_task is None
 
         window._reconcile_task = asyncio.create_task(asyncio.sleep(10))

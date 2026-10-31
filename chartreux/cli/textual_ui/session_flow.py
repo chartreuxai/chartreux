@@ -827,6 +827,12 @@ class SessionFlowController:
 
         old_session_id = self._app.app_server.session_id
         await self._app._request_agent_transcript_close(restore_focus=False)
+        # A rewind replaces the record's owner: the pending automatic
+        # continuation was armed for the state being rewound away, so the
+        # invalidation happens before the wire call. An in-place rewind keeps
+        # the session id, so the epoch bump below is what retires the old
+        # owner; the prompt is back once the rewind lands.
+        self._app._invalidate_user_input()
         try:
             result = await self._app.app_server.resources.sessions.rewind(
                 entry_id, restore_files=restore_files, inplace=inplace
@@ -839,6 +845,7 @@ class SessionFlowController:
 
         message_content = result.message
         restore_errors = result.restore_errors
+        self._app._advance_record_epoch()
 
         for error in restore_errors:
             self._app.notify(error, severity="warning")
@@ -851,6 +858,7 @@ class SessionFlowController:
             await self._mount_rewind_fork_message(old_session_id)
         if self._app._chat_input_container:
             self._app._chat_input_container.value = message_content
+        self._app._mark_session_ready()
 
     async def _mount_rewind_fork_message(self, old_session_id: str) -> None:
         """Mount the fork notice after a non-inplace rewind."""

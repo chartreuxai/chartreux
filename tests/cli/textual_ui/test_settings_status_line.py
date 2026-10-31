@@ -610,7 +610,7 @@ async def test_status_line_nested_save_restores_opener_and_revision() -> None:
     service = FakeService()
     async with Harness(service).run_test(size=(100, 32)) as pilot:
         parent = cast(SettingsScreen, pilot.app.screen)
-        await pilot.press(*"status", "enter")
+        await pilot.press(*"status_line", "enter")
         child = cast(StatusLineSettingsScreen, pilot.app.screen)
         assert parent.is_mounted and parent in pilot.app.screen_stack
         await pilot.press("space")
@@ -618,7 +618,7 @@ async def test_status_line_nested_save_restores_opener_and_revision() -> None:
         await pilot.pause()
         assert pilot.app.screen is parent
         options = parent.query_one(SettingsOptionList)
-        assert options._query == "status" and options.has_focus
+        assert options._query == "status_line" and options.has_focus
         assert (
             options.highlighted_option
             and options.highlighted_option.id == "status_line"
@@ -651,7 +651,7 @@ async def test_status_line_warning_survives_unchanged_child_return(
     )
     async with Harness(service).run_test(size=(100, 32)) as pilot:
         parent = cast(SettingsScreen, pilot.app.screen)
-        await pilot.press(*"status", "enter", "space")
+        await pilot.press(*"status_line", "enter", "space")
         child = cast(StatusLineSettingsScreen, pilot.app.screen)
         child.action_apply()
         await pilot.pause()

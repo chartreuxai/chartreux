@@ -209,6 +209,16 @@ class _CallbackQuestionStandIn:
     def callback_delivery_uncertain(self, value: Any) -> None:
         self._app._callback_delivery_uncertain = value
 
+    def agent_job_active(self) -> bool:
+        # The real supervisor reads its own turn/interrupt state; the app's
+        # delegate owns that state for this stand-in.
+        return bool(self._app._agent_job_active())
+
+    def _emit_blocked_callback(self, callback: Any) -> None:
+        # The downstream OSC blocked report is out of scope for these unit
+        # tests; the presented-callback assertions above stay unchanged.
+        return None
+
 
 def _callback_stand_in(app: MagicMock) -> Any:
     return _CallbackQuestionStandIn(app)

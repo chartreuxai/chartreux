@@ -200,6 +200,7 @@ show_thinking_nodes = false  # Show reasoning/thinking nodes in the UI
 # Behavior
 compaction_model = ""             # Canonical model or @role; empty uses current main model, same provider required
 enable_notifications = true
+emit_program_status = true        # Report idle/working/blocked as the OSC 7501 root record, cleared on exit
 enable_system_trust_store = false  # Use OS trust store for outbound HTTPS
 api_timeout = 720.0               # API request timeout in seconds
 api_connect_timeout = 10.0        # HTTP connection timeout in seconds

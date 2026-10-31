@@ -407,6 +407,7 @@ class ChartreuxConfigSchema(ConfigSchema):
     include_project_context: Annotated[bool, WithReplaceMerge()] = True
     include_prompt_detail: Annotated[bool, WithReplaceMerge()] = True
     enable_notifications: Annotated[bool, WithReplaceMerge()] = True
+    emit_program_status: Annotated[bool, WithReplaceMerge()] = True
     enable_system_trust_store: Annotated[bool, WithReplaceMerge()] = False
     api_timeout: Annotated[float, WithReplaceMerge()] = DEFAULT_API_TIMEOUT
     api_retry_max_elapsed_time: Annotated[float, WithReplaceMerge()] = (

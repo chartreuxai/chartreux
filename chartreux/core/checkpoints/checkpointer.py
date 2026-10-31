@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from hashlib import blake2b
 
 from chartreux.core.checkpoints._events import (
     _Decide,
@@ -36,6 +37,39 @@ class _OpenTurn:
     post: dict[str, FileState] = field(default_factory=dict)
 
 
+class _StatePool:
+    """Interns immutable :class:`FileState` objects by ``(path, content digest)``
+    so identical byte content recorded across turns shares one object instead of
+    retaining a fresh copy per turn. A digest hit is confirmed by full byte
+    equality, so only identical content ever shares. The pool substitutes equal
+    objects only — it never removes events, turn marks or carried paths, so
+    rewind structure is unaffected. It holds no authority: the log's own event
+    references keep interned states alive after the pool is cleared.
+    """
+
+    __slots__ = ("_states",)
+
+    def __init__(self) -> None:
+        self._states: dict[tuple[str, bytes | None], FileState] = {}
+
+    def intern(self, path: str, state: FileState) -> FileState:
+        digest = (
+            None if state.data is None else blake2b(state.data, digest_size=16).digest()
+        )
+        key = (path, digest)
+        pooled = self._states.get(key)
+        if pooled is not None and pooled == state:
+            return pooled
+        self._states[key] = state
+        return state
+
+    def clear(self) -> None:
+        self._states.clear()
+
+    def __len__(self) -> int:
+        return len(self._states)
+
+
 class Checkpointer:
     """An append-only log of turns, manual edits and decisions, resolved into
     file states through a pure :class:`History`.
@@ -64,6 +98,7 @@ class Checkpointer:
         self._seq = 0
         self._manual_index = 0
         self._open: _OpenTurn | None = None
+        self._pool = _StatePool()
 
     def _bump(self) -> int:
         self._seq += 1
@@ -76,6 +111,11 @@ class Checkpointer:
     @property
     def has_open_turn(self) -> bool:
         return self._open is not None
+
+    @property
+    def interned_state_count(self) -> int:
+        """Distinct states the content-intern pool currently holds (diagnostic)."""
+        return len(self._pool)
 
     def has_checkpoint(self, path: str) -> bool:
         """Whether ``path`` was captured by a checkpoint in this session."""
@@ -96,6 +136,7 @@ class Checkpointer:
         # The first touch in a turn owns that turn's pre-edit state.
         if path in self._open.mark.pre:
             return
+        pre = self._pool.intern(path, pre)
         # If the file already drifted from the projection since it was last seen,
         # that is a between-turn manual edit. Seal it as a manual edit ordered just
         # before this turn's marker (it happened before the turn began), so a
@@ -110,6 +151,7 @@ class Checkpointer:
     def _insert_local_before_mark(
         self, mark: _TurnMark, path: str, before: FileState, after: FileState
     ) -> None:
+        before = self._pool.intern(path, before)
         deps = History(self._events).compute_deps(path, before, after)
         edit = _Edit(
             seq=self._bump(),
@@ -124,7 +166,7 @@ class Checkpointer:
     def record_post_edit(self, path: str, post: FileState) -> None:
         if self._open is None:
             raise TurnStateError("record_post_edit requires an open turn")
-        self._open.post[path] = post
+        self._open.post[path] = self._pool.intern(path, post)
 
     def seal_turn(self) -> None:
         if self._open is None:
@@ -138,6 +180,8 @@ class Checkpointer:
     def _append_edit(
         self, owner: Owner, path: str, before: FileState, after: FileState
     ) -> None:
+        before = self._pool.intern(path, before)
+        after = self._pool.intern(path, after)
         if before == after:
             return
         deps = History(self._events).compute_deps(path, before, after)
@@ -157,6 +201,7 @@ class Checkpointer:
         self._seq = 0
         self._manual_index = 0
         self._open = None
+        self._pool.clear()
 
     @contextmanager
     def atomic(self) -> Iterator[None]:
@@ -183,6 +228,7 @@ class Checkpointer:
         if index is not None:
             self._events = self._events[:index]
             self._open = None
+            self._pool.clear()
 
     # -- Manual-edit capture ---------------------------------------------------
 

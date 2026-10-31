@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import sys
 import time
+from time import perf_counter
+import tracemalloc
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -21,8 +24,17 @@ from chartreux.cli.textual_ui.widgets.chat_input.container import ChatInputConta
 from chartreux.cli.textual_ui.widgets.messages import AssistantMessage
 from chartreux.core.agent_loop import AgentLoop
 from chartreux.core.agents.launch import LaunchCandidate
+from chartreux.core.config import ChartreuxConfigSchema, SessionLoggingConfig
 from chartreux.core.llm_models import LLMChunk, LLMMessage
+from chartreux.core.session.session_logger import (
+    TRANSCRIPT_VERIFY_INTERVAL,
+    SessionLogger,
+    _TranscriptCursor,
+)
+from chartreux.core.session_types import AgentStats, SessionMetadata
 from chartreux.core.subagents import TaskResult, WaitStatus
+from chartreux.core.tools.manager import ToolManager
+from tests.conftest import build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
 from tests.perf._harness import (
     GatedSequenceBackend,
@@ -487,6 +499,346 @@ async def test_combined_load(monkeypatch: pytest.MonkeyPatch) -> None:
             "directional": True,
             "label": "DIRECTIONAL ONLY",
             "iterations": iterations,
+            "machine": machine_context(),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# P0d: long-history streaming + repeated duration-invalidated full verify
+# ---------------------------------------------------------------------------
+
+# Sizing: 20k records matches the P0b persistence fixture denominators, so the
+# verify cost recorded here is directly comparable to P0b's isolated
+# duration-verify numbers (awaited p50 131.2 ms at 5a1e121f). The verifies run
+# back-to-back for as long as the streaming turn lasts, capped at
+# _P0D_VERIFY_REPEAT_CAP (worst case roughly 10-20 s of added verify wall time
+# at P0b's p50 ceiling); a single comparison pair (stream-only, then combined)
+# keeps the whole scenario inside a couple of minutes.
+_P0D_VERIFY_RECORD_COUNT = 20_000
+_P0D_VERIFY_REPEAT_CAP = 40
+
+# FROZEN CEILINGS (P0d). Non-regression upper bounds for the combined
+# streaming + duration-invalidated-verify load at 20k records: exceeding one is
+# a blocker, never a threshold change. Baseline: the perf-baselines/
+# p0d-combined-load-baseline.jsonl run at 441467b7 (see the artifact's
+# .meta.json for machine context): stream-only flush p95 50.965 ms,
+# duration-verify awaited p50 238.2 ms under the stream, verify sync-worker p50
+# 182.0 ms, verify worker peak 20.1170 MiB (matches P0b's isolated 20.1161 MiB),
+# combined loop-lag p50 4.798 ms. Values are 4x (latency) or 6x (memory) the
+# recorded baseline, so host load cannot mask a real regression; loop-lag p50
+# is frozen at 4x, above the P0c 10 ms floor convention.
+# THE MEMORY CEILING IS A FIRST-OBSERVATION BASELINE: no earlier recorded
+# combined-load value exists for it, and it is valid on the baseline machine
+# only. The combined-phase flush p95 (81.4 ms, +59.6% over stream-only) is
+# recorded as a comparison metric, not ceiled — the stream-only p95 ceiling
+# guards the render baseline.
+_P0D_STREAM_FLUSH_P95_CEILING_MS = 204.0
+_P0D_VERIFY_AWAITED_P50_CEILING_MS = 953.0
+_P0D_VERIFY_WORKER_P50_CEILING_MS = 728.0
+_P0D_VERIFY_WORKER_PEAK_CEILING_MIB = 120.7
+_P0D_COMBINED_LOOP_LAG_P50_CEILING_MS = 19.2
+
+
+@dataclass
+class _VerifyMeasurements:
+    sync_worker_ms: list[float] = field(default_factory=list)
+    full_verify_calls: int = 0
+    measure_next_worker: bool = False
+    worker_peak_mb: float | None = None
+
+
+def _perf_tool_manager() -> MagicMock:
+    tool_manager = MagicMock(spec=ToolManager)
+    tool_manager.available_tools = {}
+    tool_manager.available_tool_specs.return_value = []
+    return tool_manager
+
+
+def _instrument_verify_logger(
+    logger: SessionLogger, monkeypatch: pytest.MonkeyPatch
+) -> _VerifyMeasurements:
+    """Count full verifies, time the sync save worker, and trace one peak.
+
+    Duplicated (reduced) from tests/perf/test_persistence.py on purpose: the
+    Wave-0 perf files stay file-disjoint, and duplicating the small helper is
+    cheaper than coupling perf modules across packages.
+    """
+    measurements = _VerifyMeasurements()
+
+    save_interaction_sync = logger._save_interaction_sync
+
+    def timed_save_interaction_sync(
+        messages: list[LLMMessage],
+        stats: AgentStats,
+        tool_manager: ToolManager,
+        session_dir: Path,
+        session_metadata: SessionMetadata,
+        allow_empty: bool,
+        launch_config_dirty: bool,
+        cursor: _TranscriptCursor | None,
+        saves_since_verify: int,
+    ) -> tuple[_TranscriptCursor | None, int]:
+        measure_memory = measurements.measure_next_worker
+        measurements.measure_next_worker = False
+        was_tracing = tracemalloc.is_tracing()
+        starting_memory = 0
+        if measure_memory:
+            if not was_tracing:
+                tracemalloc.start()
+            tracemalloc.reset_peak()
+            starting_memory, _ = tracemalloc.get_traced_memory()
+
+        started_at = perf_counter()
+        try:
+            return save_interaction_sync(
+                messages,
+                stats,
+                tool_manager,
+                session_dir,
+                session_metadata,
+                allow_empty,
+                launch_config_dirty,
+                cursor,
+                saves_since_verify,
+            )
+        finally:
+            measurements.sync_worker_ms.append((perf_counter() - started_at) * 1_000)
+            if measure_memory:
+                _, peak_memory = tracemalloc.get_traced_memory()
+                measurements.worker_peak_mb = max(0, peak_memory - starting_memory) / (
+                    1024 * 1024
+                )
+                if not was_tracing:
+                    tracemalloc.stop()
+
+    monkeypatch.setattr(logger, "_save_interaction_sync", timed_save_interaction_sync)
+
+    save_full_verify = logger._save_full_verify
+
+    def counted_save_full_verify(
+        messages: list[LLMMessage],
+        stats: AgentStats,
+        tool_manager: ToolManager,
+        session_dir: Path,
+        session_metadata: SessionMetadata,
+        launch_config_dirty: bool,
+    ) -> _TranscriptCursor:
+        measurements.full_verify_calls += 1
+        return save_full_verify(
+            messages,
+            stats,
+            tool_manager,
+            session_dir,
+            session_metadata,
+            launch_config_dirty,
+        )
+
+    monkeypatch.setattr(logger, "_save_full_verify", counted_save_full_verify)
+    return measurements
+
+
+async def _run_duration_invalidated_verifies(
+    logger: SessionLogger,
+    messages: list[LLMMessage],
+    config: ChartreuxConfigSchema,
+    tool_manager: ToolManager,
+    stats: AgentStats,
+    stop: asyncio.Event,
+    awaited_ms: list[float],
+) -> int:
+    """Issue duration-invalidated full verifies until asked to stop.
+
+    Each save pins the save counter one below the verify interval, so the save
+    full-verifies because the counter reached the interval, not because the
+    cursor was invalidated: the populated read + parse + compare branch.
+    """
+    count = 0
+    while not stop.is_set() and count < _P0D_VERIFY_REPEAT_CAP:
+        logger._transcript_saves_since_verify = TRANSCRIPT_VERIFY_INTERVAL - 1
+        started_at = perf_counter()
+        await logger.save_interaction(
+            messages, stats=stats, config=config, tool_manager=tool_manager
+        )
+        awaited_ms.append((perf_counter() - started_at) * 1_000)
+        count += 1
+        await asyncio.sleep(0)
+    return count
+
+
+@pytest.mark.asyncio
+@pytest.mark.perf
+@pytest.mark.timeout(600)
+async def test_combined_load_streaming_plus_full_verify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config: ChartreuxConfigSchema = build_test_vibe_config()
+    stats = AgentStats()
+    tool_manager = _perf_tool_manager()
+
+    message_count = _P0D_VERIFY_RECORD_COUNT
+    messages = synthetic_messages(20_000, message_count)
+    assert len(messages) == message_count
+    session_config = SessionLoggingConfig(
+        save_dir=str(tmp_path / "sessions-combined-verify"),
+        session_prefix="perf",
+        enabled=True,
+    )
+    logger = SessionLogger(session_config, "combined-load-verify")
+
+    # The initial full save establishes the cursor and the populated transcript;
+    # it sits outside the instrumented phases and is not part of the load.
+    await logger.save_interaction(
+        messages, stats=stats, config=config, tool_manager=tool_manager
+    )
+    assert logger._transcript_cursor is not None
+    assert logger.session_dir is not None
+    messages_path = logger.messages_filepath
+    transcript_file_bytes = messages_path.stat().st_size
+
+    measurements = _instrument_verify_logger(logger, monkeypatch)
+    rss_before_mb = _rss_mb()
+
+    # Phase A: the streaming turn alone (no persistence load) — comparison base.
+    only_lag_ms: list[float] = []
+    stop_only_heartbeat = asyncio.Event()
+    only_heartbeat = asyncio.create_task(_heartbeat(stop_only_heartbeat, only_lag_ms))
+    try:
+        stream_only = await _measure_stream(
+            MidStreamGatedBackend(_chunks(), pause_at_midpoint=False), monkeypatch
+        )
+    finally:
+        stop_only_heartbeat.set()
+        heartbeat_results = await asyncio.gather(only_heartbeat, return_exceptions=True)
+    assert all(
+        result is None or isinstance(result, asyncio.CancelledError)
+        for result in heartbeat_results
+    ), f"stream-only heartbeat failed: {heartbeat_results}"
+
+    # Phase B: the same streaming turn plus repeated duration-invalidated full
+    # verifies issued concurrently on the same event loop. The save's sync
+    # worker runs in a thread, so this contends on CPU, GIL, and disk with the
+    # render loop — the real combined-load shape.
+    verify_awaited_ms: list[float] = []
+    combined_lag_ms: list[float] = []
+    stop_verifies = asyncio.Event()
+    stop_combined_heartbeat = asyncio.Event()
+    verify_task = asyncio.create_task(
+        _run_duration_invalidated_verifies(
+            logger,
+            messages,
+            config,
+            tool_manager,
+            stats,
+            stop_verifies,
+            verify_awaited_ms,
+        )
+    )
+    combined_heartbeat = asyncio.create_task(
+        _heartbeat(stop_combined_heartbeat, combined_lag_ms)
+    )
+    try:
+        combined = await _measure_stream(
+            MidStreamGatedBackend(_chunks(), pause_at_midpoint=False), monkeypatch
+        )
+    finally:
+        stop_verifies.set()
+        stop_combined_heartbeat.set()
+        verify_count = await verify_task
+        heartbeat_results = await asyncio.gather(
+            combined_heartbeat, return_exceptions=True
+        )
+    assert all(
+        result is None or isinstance(result, asyncio.CancelledError)
+        for result in heartbeat_results
+    ), f"combined heartbeat failed: {heartbeat_results}"
+    assert verify_count >= 3, f"only {verify_count} verifies ran under the stream"
+    assert len(verify_awaited_ms) == verify_count
+    assert len(measurements.sync_worker_ms) == verify_count
+    assert measurements.full_verify_calls == verify_count
+
+    # One traced repeat for the verify worker peak, outside both streaming
+    # phases so tracemalloc cannot inflate the latency samples.
+    logger._transcript_saves_since_verify = TRANSCRIPT_VERIFY_INTERVAL - 1
+    measurements.measure_next_worker = True
+    started_at = perf_counter()
+    await logger.save_interaction(
+        messages, stats=stats, config=config, tool_manager=tool_manager
+    )
+    traced_awaited_ms = (perf_counter() - started_at) * 1_000
+    assert measurements.full_verify_calls == verify_count + 1
+    assert measurements.worker_peak_mb is not None
+    verify_worker_peak_mb = measurements.worker_peak_mb
+
+    # Preserved behavior: the repeated verifies never rewrote or appended to
+    # the transcript, and the cursor still matches the file on disk.
+    cursor = logger._transcript_cursor
+    assert cursor is not None
+    assert cursor.file_size == messages_path.stat().st_size == transcript_file_bytes
+    assert len(messages_path.read_text(encoding="utf-8").splitlines()) == message_count
+
+    assert combined.chunk_count == stream_only.chunk_count == ASSISTANT_CHUNK_COUNT
+    assert combined.total_bytes == stream_only.total_bytes
+
+    stream_only_flush = percentiles(stream_only.flush_delay_ms)
+    combined_flush = percentiles(combined.flush_delay_ms)
+    verify_awaited = percentiles(verify_awaited_ms)
+    verify_worker = percentiles(measurements.sync_worker_ms[:verify_count])
+    assert stream_only_flush["p95"] <= _P0D_STREAM_FLUSH_P95_CEILING_MS
+    assert verify_awaited["p50"] <= _P0D_VERIFY_AWAITED_P50_CEILING_MS
+    assert verify_worker["p50"] <= _P0D_VERIFY_WORKER_P50_CEILING_MS
+    assert verify_worker_peak_mb <= _P0D_VERIFY_WORKER_PEAK_CEILING_MIB
+    combined_lag = percentiles(combined_lag_ms)
+    assert combined_lag["p50"] <= _P0D_COMBINED_LOOP_LAG_P50_CEILING_MS
+
+    degradation_pct = (
+        (combined_flush["p95"] - stream_only_flush["p95"])
+        / stream_only_flush["p95"]
+        * 100
+    )
+    record(
+        "combined_load_streaming_plus_full_verify",
+        {
+            "package": "P0d",
+            "record_count": message_count,
+            "transcript_file_bytes": transcript_file_bytes,
+            "verify_repeats_under_stream": verify_count,
+            "full_verify_calls": measurements.full_verify_calls,
+            "stream_only_flush_delay_p50_ms": stream_only_flush["p50"],
+            "stream_only_flush_delay_p95_ms": stream_only_flush["p95"],
+            "combined_flush_delay_p50_ms": combined_flush["p50"],
+            "combined_flush_delay_p95_ms": combined_flush["p95"],
+            "flush_delay_p95_degradation_pct": round(degradation_pct, 3),
+            "loop_lag_p50_ms": {
+                "stream_only": percentiles(only_lag_ms)["p50"],
+                "combined": combined_lag["p50"],
+            },
+            "loop_lag_p99_ms": {
+                "stream_only": percentiles(only_lag_ms)["p99"],
+                "combined": combined_lag["p99"],
+            },
+            "verify_awaited_ms": verify_awaited,
+            "verify_sync_worker_ms": verify_worker,
+            "traced_repeat_awaited_ms": round(traced_awaited_ms, 3),
+            "verify_worker_peak_mb": verify_worker_peak_mb,
+            "verify_worker_peak_note": (
+                "tracemalloc peak of one populated duration-invalidated full "
+                "verify (read + parse + compare, no transcript rewrite); "
+                "first-observation baseline, valid on this machine only"
+            ),
+            "p0b_isolated_reference_awaited_p50_ms": 131.2,
+            "turn_wall_ms": {
+                "stream_only": round(stream_only.turn_wall_ms, 3),
+                "combined": round(combined.turn_wall_ms, 3),
+            },
+            "rss_before_mib": round(rss_before_mb, 3),
+            "rss_at_end_mb": round(_rss_mb(), 3),
+            "stream_chunk_count": combined.chunk_count,
+            "stream_total_bytes": combined.total_bytes,
+            "memory_baseline_kind": (
+                "first-observation baseline (no earlier recorded values; "
+                "valid on this machine only)"
+            ),
             "machine": machine_context(),
         },
     )

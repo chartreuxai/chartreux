@@ -285,6 +285,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         self._child_links: dict[str, tuple[SessionRuntime, str]] = {}
         self._stored_children: dict[str, StoredChildSession] = {}
         self._readable_children: dict[str, SessionRuntime] = {}
+        self._readable_children_identities: dict[str, tuple[str, int]] = {}
         self._ensure_child_lock = asyncio.Lock()
         self._policy_reserved = False
         self._creating_children = 0
@@ -827,6 +828,22 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
         for agent_id in removed_tombstones:
             self._evicted_agents.pop(agent_id, None)
             self._pending_evictions.pop(agent_id, None)
+        # P1c: a retired generation forfeits its read-only closed-child
+        # snapshots too. Logging-disabled children have no on-disk
+        # transcript, so their transcript reads and grant resolution degrade
+        # after this clear — design-accepted for this release.
+        retired_readable = (
+            [
+                session_id
+                for session_id, identity in self._readable_children_identities.items()
+                if identity == old_identity
+            ]
+            if old_identity is not None
+            else []
+        )
+        for session_id in retired_readable:
+            self._readable_children.pop(session_id, None)
+            self._readable_children_identities.pop(session_id, None)
         for record in records:
             self._acquire_notification_suppression(record.agent_id)
             # WP3: a retired generation forfeits its suspended records'
@@ -1021,6 +1038,7 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
             if stored is not None and not self.stored_child_is_current(stored):
                 self._stored_children.pop(session_id, None)
                 self._readable_children.pop(session_id, None)
+                self._readable_children_identities.pop(session_id, None)
                 self._detached_child_ids.discard(session_id)
                 stored = None
             resolved = (
@@ -1785,8 +1803,13 @@ class SessionRuntimeRegistry(SubagentRunnerPort):  # noqa: PLR0904
                 else:
                     # Logging-disabled children have no on-disk transcript. Retain the
                     # closed runtime as a read-only snapshot after removing it from
-                    # reuse and policy ownership.
+                    # reuse and policy ownership. The owning root identity rides
+                    # alongside so generation retirement can drop the snapshot.
                     self._readable_children[child.session_id] = runtime
+                    self._readable_children_identities[child.session_id] = (
+                        parent_loop.session_id,
+                        parent_loop._session_generation,
+                    )
                 self._children.pop(child.session_id, None)
                 self._child_links.pop(child.session_id, None)
                 self._detached_child_ids.add(child.session_id)

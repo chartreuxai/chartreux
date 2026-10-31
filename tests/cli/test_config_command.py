@@ -20,6 +20,10 @@ def mock_suspend():
     yield
 
 
+def _resolvable_editor_command(_cls: type[ExternalEditor]) -> list[str]:
+    return ["editor"]
+
+
 def _stub_reload(app: Any) -> AsyncMock:
     reload_mock = AsyncMock(
         return_value=SimpleNamespace(
@@ -43,6 +47,9 @@ async def test_config_command_creates_missing_file_and_reloads_on_change(
         )
 
     monkeypatch.setattr(ExternalEditor, "edit_file", staticmethod(fake_edit))
+    monkeypatch.setattr(
+        ExternalEditor, "resolve_command", classmethod(_resolvable_editor_command)
+    )
     app = build_test_chartreux_app(config=build_test_vibe_config())
 
     async with app.run_test() as pilot:
@@ -67,6 +74,9 @@ async def test_config_command_skips_reload_when_file_unchanged(
 
     monkeypatch.setattr(
         ExternalEditor, "edit_file", staticmethod(lambda *_a, **_k: None)
+    )
+    monkeypatch.setattr(
+        ExternalEditor, "resolve_command", classmethod(_resolvable_editor_command)
     )
     app = build_test_chartreux_app(config=build_test_vibe_config())
 
@@ -97,6 +107,9 @@ async def test_config_command_reports_editor_failure(
         raise OSError("no editor")
 
     monkeypatch.setattr(ExternalEditor, "edit_file", staticmethod(failing_edit))
+    monkeypatch.setattr(
+        ExternalEditor, "resolve_command", classmethod(_resolvable_editor_command)
+    )
     app = build_test_chartreux_app(config=build_test_vibe_config())
 
     async with app.run_test() as pilot:

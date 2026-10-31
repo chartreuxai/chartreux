@@ -293,6 +293,7 @@ async def test_child_waits_for_operation_and_interrupts_successor(cancel: bool) 
     registry._child_links = {"child": (MagicMock(), "task")}
     registry._stored_children = {}
     registry._readable_children = {}
+    registry._readable_children_identities = {}
     registry._detached_child_ids = set()
     registry._pending_child_closes = {}
     registry._teardown_tasks = set()

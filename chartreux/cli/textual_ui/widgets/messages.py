@@ -4,6 +4,8 @@ import asyncio
 from datetime import datetime
 import os
 from pathlib import Path
+import subprocess
+from time import monotonic
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from chartreux.app_server.models import (
@@ -52,7 +54,21 @@ from chartreux.ui.shortcut_hints import shortcut, shortcut_hint
 from chartreux.ui.widgets.no_markup_static import NoMarkupStatic, NonSelectableStatic
 
 # Full-content MarkdownStream reparsing per delta dominated CPU; 50ms frames cut it ~40%.
+# The delay is a target cadence, not a fixed wait: the pump can hand a frame its
+# turn ~50ms late while a dense stream keeps it busy, which doubles the visible
+# frame period. Each frame therefore measures the period it actually achieved and
+# corrects the delay toward STREAM_WRITE_FRAME_SECONDS; the delay is clamped to
+# [STREAM_WRITE_FRAME_SECONDS_MIN, STREAM_WRITE_FRAME_SECONDS_MAX] so
+# back-pressure cannot stretch the transcript past the hard cap.
 STREAM_WRITE_FRAME_SECONDS = 0.05
+STREAM_WRITE_FRAME_SECONDS_MIN = 0.025
+STREAM_WRITE_FRAME_SECONDS_MAX = 0.15
+STREAM_WRITE_FRAME_CORRECTION_GAIN = 0.5
+# Corrections smaller than this only add jitter to the cadence.
+STREAM_WRITE_FRAME_DEADBAND_SECONDS = 0.005
+# A pause longer than this is the stream idling, not render back-pressure: the
+# next frame restarts cadence tracking instead of over-correcting for the gap.
+STREAM_WRITE_FRAME_GAP_RESET_SECONDS = 0.25
 
 # A fatal provider error can carry a multi-kilobyte single-line excerpt that
 # fold-wraps into dozens of rows and obscures the transcript. Errors estimated
@@ -328,6 +344,8 @@ class StreamingMessageBase(Static):
         self._write_timer: Timer | None = None
         self._content_initialized = False
         self._to_write_buffer = ""
+        self._frame_delay = STREAM_WRITE_FRAME_SECONDS
+        self._last_frame_started: float | None = None
 
     def _get_markdown(self) -> Markdown:
         if self._markdown is None:
@@ -362,7 +380,7 @@ class StreamingMessageBase(Static):
         self._to_write_buffer += content
         if self._is_chat_at_bottom() and self._write_timer is None:
             self._write_timer = self.set_timer(
-                STREAM_WRITE_FRAME_SECONDS, self._flush_write_buffer
+                self._frame_delay, self._flush_write_buffer
             )
 
     async def _flush_write_buffer(self) -> None:
@@ -374,10 +392,39 @@ class StreamingMessageBase(Static):
         ):
             return
 
+        self._adapt_frame_delay(monotonic())
         to_write = self._to_write_buffer
         self._to_write_buffer = ""
         stream = self._ensure_stream()
         await stream.write(to_write)
+
+    def _adapt_frame_delay(self, started: float) -> None:
+        """Steer the scheduled delay so frames land every STREAM_WRITE_FRAME_SECONDS.
+
+        A late frame means the pump was busy elsewhere; shortening the delay lets
+        the next frame take its turn sooner, which is what keeps the *achieved*
+        period near the target. The clamp stops back-pressure from stretching the
+        transcript: the scheduled interval never exceeds the hard cap.
+        """
+        previous = self._last_frame_started
+        self._last_frame_started = started
+        if previous is None:
+            return
+
+        achieved = started - previous
+        if achieved > STREAM_WRITE_FRAME_GAP_RESET_SECONDS:
+            return
+
+        correction = (STREAM_WRITE_FRAME_SECONDS - achieved) * (
+            STREAM_WRITE_FRAME_CORRECTION_GAIN
+        )
+        if abs(correction) < STREAM_WRITE_FRAME_DEADBAND_SECONDS:
+            return
+
+        self._frame_delay = min(
+            STREAM_WRITE_FRAME_SECONDS_MAX,
+            max(STREAM_WRITE_FRAME_SECONDS_MIN, self._frame_delay + correction),
+        )
 
     def _cancel_write_timer(self) -> None:
         if self._write_timer is not None:
@@ -864,9 +911,27 @@ class PlanFileMessage(Widget):
         from chartreux.cli.textual_ui.external_editor import ExternalEditor
 
         try:
+            ExternalEditor.resolve_command()
+        except (OSError, ValueError):
+            editor = ExternalEditor.get_editor()
+            logger.warning(
+                "Failed to resolve editor command: %s", editor, exc_info=True
+            )
+            self.app.notify(
+                f"Could not start editor: {editor}", severity="error", timeout=6
+            )
+            return
+
+        try:
             self._file_path.parent.mkdir(parents=True, exist_ok=True)
+            edit_error: Exception | None = None
             with self.app.suspend():
-                ExternalEditor.edit_file(self._file_path)
+                try:
+                    ExternalEditor.edit_file(self._file_path)
+                except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+                    edit_error = exc
+            if edit_error is not None:
+                raise edit_error
         except OSError:
             logger.warning(
                 "Failed to open plan file in editor: %s", self._file_path, exc_info=True

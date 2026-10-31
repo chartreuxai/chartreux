@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+from collections.abc import Iterable, Iterator
 import json
 from pathlib import Path
 from threading import Event
@@ -63,16 +64,16 @@ class TestTranscriptCursor:
                 raise TimeoutError("save worker was not released")
             return original_save(*args, **kwargs)
 
-        original_read = SessionLogger._read_persisted_messages
+        original_stream = SessionLogger._stream_persisted_records
         reads: list[Path] = []
 
-        def track_read(messages_path: Path) -> tuple[list[dict], bool]:
+        def track_read(messages_path: Path) -> Iterator[dict[str, Any]]:
             reads.append(messages_path)
-            return original_read(messages_path)
+            yield from original_stream(messages_path)
 
         monkeypatch.setattr(logger, "_save_interaction_sync", block_save)
         monkeypatch.setattr(
-            SessionLogger, "_read_persisted_messages", staticmethod(track_read)
+            SessionLogger, "_stream_persisted_records", staticmethod(track_read)
         )
 
         save_task = asyncio.create_task(
@@ -111,7 +112,7 @@ class TestTranscriptCursor:
         messages_path = logger.session_dir / "messages.jsonl"
         original_append = SessionLogger._persist_messages_sync
         original_overwrite = SessionLogger._overwrite_messages_sync
-        original_read = SessionLogger._read_persisted_messages
+        original_stream = SessionLogger._stream_persisted_records
         original_path_open = Path.open
         original_builtin_open = builtins.open
         append_sizes: list[int] = []
@@ -145,13 +146,14 @@ class TestTranscriptCursor:
             append_sizes.append(len(messages))
             return original_append(messages, session_dir)
 
-        def overwrite(messages: list[dict], session_dir: Path) -> None:
-            overwrite_calls.append(messages)
-            original_overwrite(messages, session_dir)
+        def overwrite(messages: Iterable[dict], session_dir: Path) -> None:
+            records = list(messages)
+            overwrite_calls.append(records)
+            original_overwrite(records, session_dir)
 
-        def read(messages_path: Path) -> tuple[list[dict], bool]:
+        def stream(messages_path: Path) -> Iterator[dict[str, Any]]:
             reads.append(messages_path)
-            return original_read(messages_path)
+            yield from original_stream(messages_path)
 
         monkeypatch.setattr(Path, "open", track_path_open)
         monkeypatch.setattr(builtins, "open", track_builtin_open)
@@ -162,7 +164,7 @@ class TestTranscriptCursor:
             SessionLogger, "_overwrite_messages_sync", staticmethod(overwrite)
         )
         monkeypatch.setattr(
-            SessionLogger, "_read_persisted_messages", staticmethod(read)
+            SessionLogger, "_stream_persisted_records", staticmethod(stream)
         )
 
         messages = [LLMMessage(role=Role.user, content="one")]
@@ -202,9 +204,10 @@ class TestTranscriptCursor:
             append_calls.append(messages)
             return original_append(messages, session_dir)
 
-        def overwrite(messages: list[dict], session_dir: Path) -> None:
-            overwrite_calls.append(messages)
-            original_overwrite(messages, session_dir)
+        def overwrite(messages: Iterable[dict], session_dir: Path) -> None:
+            records = list(messages)
+            overwrite_calls.append(records)
+            original_overwrite(records, session_dir)
 
         monkeypatch.setattr(
             SessionLogger, "_persist_messages_sync", staticmethod(append)
@@ -304,9 +307,10 @@ class TestTranscriptCursor:
         original_overwrite = SessionLogger._overwrite_messages_sync
         overwrite_calls: list[list[dict]] = []
 
-        def overwrite(messages: list[dict], session_dir: Path) -> None:
-            overwrite_calls.append(messages)
-            original_overwrite(messages, session_dir)
+        def overwrite(messages: Iterable[dict], session_dir: Path) -> None:
+            records = list(messages)
+            overwrite_calls.append(records)
+            original_overwrite(records, session_dir)
 
         monkeypatch.setattr(
             SessionLogger, "_overwrite_messages_sync", staticmethod(overwrite)
@@ -413,15 +417,15 @@ class TestTranscriptCursor:
         resumed_logger = SessionLogger(
             session_config, "cursor-resume", session_dir=original_logger.session_dir
         )
-        original_read = SessionLogger._read_persisted_messages
+        original_stream = SessionLogger._stream_persisted_records
         reads: list[Path] = []
 
-        def read(messages_path: Path) -> tuple[list[dict], bool]:
+        def read(messages_path: Path) -> Iterator[dict[str, Any]]:
             reads.append(messages_path)
-            return original_read(messages_path)
+            yield from original_stream(messages_path)
 
         monkeypatch.setattr(
-            SessionLogger, "_read_persisted_messages", staticmethod(read)
+            SessionLogger, "_stream_persisted_records", staticmethod(read)
         )
         await self._save(resumed_logger, messages, mock_vibe_config, mock_tool_manager)
         assert len(reads) == 1

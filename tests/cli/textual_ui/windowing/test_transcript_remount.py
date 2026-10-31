@@ -584,6 +584,158 @@ async def test_initializer_can_restore_another_unit(
         assert all(not unit.placeholders for unit in window.units.values())
 
 
+@pytest.mark.asyncio
+async def test_restore_scan_sees_an_eviction_before_its_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An eviction is a restore candidate before its placeholder is measured.
+
+    ``evict_unit`` mounts the placeholder and returns; the layout that measures
+    it is a later frame. A scroll arriving in between reaches the reconcile
+    with a zero-width placeholder, which reads as row 0 above every
+    scrolled-up neighbour and breaks the placement index's screen ordering --
+    a bisected window then walks past the unit that was just evicted (the
+    scroll round-trip never remounted it).
+    """
+    window, roots = await _fixture()
+    app = _App()
+    async with app.run_test() as pilot:
+        stream = app.query_one("#stream", VerticalScroll)
+        await stream.mount_all(roots)
+        await pilot.pause()
+        for unit_id, root in zip(window.unit_ids, roots, strict=True):
+            window.register_mounted(unit_id, [root])
+        stream.scroll_end(animate=False, immediate=True)
+        await pilot.pause()
+        unit_id = window.unit_ids[0]
+        placeholder = (await window.evict_unit(unit_id))[0]
+        assert placeholder.region.width == 0, (
+            "the placeholder was laid out before the scroll: this scenario "
+            "must exercise the unmeasured placement"
+        )
+
+        stream.scroll_to(y=0, animate=False, force=True, immediate=True)
+        top, height = stream.region.y, stream.region.height
+        assert unit_id in window._restore_candidates(top, height), (
+            "the restore scan dropped the unit evicted this frame"
+        )
+
+        monkeypatch.setattr(window, "build_unit", lambda *_: [_Measured(8)])
+        await window._reconcile_once(
+            stream,
+            WeakKeyDictionary(),
+            None,
+            False,
+            1000,
+            1500,
+            frozenset(),
+            frozenset(),
+            frozenset(),
+        )
+        assert window.units[unit_id].mounted_roots
+        assert not window.units[unit_id].placeholders
+
+
+@pytest.mark.asyncio
+async def test_unmeasured_placement_settles_after_the_layout() -> None:
+    """The unmeasured-placement guard clears once the rows land.
+
+    The full placeholder scan it selects is a fallback for the eviction frame
+    only: a member that stays marked keeps the per-tick restore scan
+    proportional to the registry's placeholder count.
+    """
+    window, roots = await _fixture(4)
+    app = _App()
+    async with app.run_test() as pilot:
+        stream = app.query_one("#stream", VerticalScroll)
+        await stream.mount_all(roots)
+        await pilot.pause()
+        for unit_id, root in zip(window.unit_ids, roots, strict=True):
+            window.register_mounted(unit_id, [root])
+        unit_id = window.unit_ids[0]
+        placeholder = (await window.evict_unit(unit_id))[0]
+        assert window._unmeasured_placements == {unit_id}
+        assert window._unmeasured_placement_pending()
+        await pilot.pause()
+        assert placeholder.region.width > 0
+        assert not window._unmeasured_placement_pending()
+        assert window._unmeasured_placements == set()
+
+
+@pytest.mark.asyncio
+async def test_identity_adoption_carries_the_unmeasured_mark() -> None:
+    """Adopting a public id moves the unmeasured mark with the unit.
+
+    ``adopt_identity`` carries every shadow facet across the rename; a mark
+    left on the transient id names a unit that no longer exists, so the
+    pending check discards it and the restore scan windows past the still
+    unmeasured placeholder -- the just-evicted unit is dropped again.
+    """
+    window = TranscriptWindow()
+    entries = [_message(index) for index in range(64)]
+    pending = entries[32]
+    pending.id = ""
+    window.admit(entries, start_index=0)
+    transient_id = window.unit_ids[32]
+    assert transient_id.startswith("transient-")
+    roots = [_Measured(8) for _ in range(64)]
+    app = _App()
+    async with app.run_test() as pilot:
+        stream = app.query_one("#stream", VerticalScroll)
+        await stream.mount_all(roots)
+        await pilot.pause()
+        for unit_id, root in zip(window.unit_ids, roots, strict=True):
+            window.register_mounted(unit_id, [root])
+        await pilot.pause()
+        stream.scroll_to(y=0, animate=False)
+        await pilot.pause()
+
+        placeholder = (await window.evict_unit(transient_id))[0]
+        assert placeholder.region.width == 0, (
+            "the placeholder was laid out before the adoption: this scenario "
+            "must exercise the unmeasured placement"
+        )
+        pending.id = "message-32"
+        window.admit([pending], start_index=32)
+        assert window.unit_ids[32] == "message-32"
+        assert window._unmeasured_placements == {"message-32"}
+        assert window._unmeasured_placement_pending()
+        top, height = stream.region.y, stream.region.height
+        assert "message-32" in window._restore_candidates(top, height), (
+            "the restore scan lost the unit whose mark did not follow the rename"
+        )
+
+
+@pytest.mark.asyncio
+async def test_removed_and_reset_units_forget_the_unmeasured_mark() -> None:
+    """A mark must not outlive the unit it names.
+
+    ``reset`` clears the registry, the placement index and the evicting set,
+    and ``remove_unit`` drops a unit outright; a mark left behind keeps a
+    stale id in the guard until the next restore scan drains it.
+    """
+    window, roots = await _fixture(4)
+    app = _App()
+    async with app.run_test() as pilot:
+        stream = app.query_one("#stream", VerticalScroll)
+        await stream.mount_all(roots)
+        await pilot.pause()
+        for unit_id, root in zip(window.unit_ids, roots, strict=True):
+            window.register_mounted(unit_id, [root])
+
+        removed = window.unit_ids[0]
+        await window.evict_unit(removed)
+        assert window._unmeasured_placements == {removed}
+        window.remove_unit(removed)
+        assert removed not in window._unmeasured_placements
+
+        await window.evict_unit(window.unit_ids[0])
+        assert window._unmeasured_placements
+        window.reset()
+        assert window._unmeasured_placements == set()
+        assert not window._unmeasured_placement_pending()
+
+
 def test_new_id_cannot_claim_known_index_and_width_invalidates_off_batch() -> None:
     window = TranscriptWindow()
     window.admit([_message(i) for i in range(4)], start_index=0, geometry_width=60)
@@ -595,3 +747,170 @@ def test_new_id_cannot_claim_known_index_and_width_invalidates_off_batch() -> No
     window.admit([_message(3)], start_index=3, geometry_width=40)
     assert off_batch.content_height is None
     assert off_batch.geometry_width == 40
+
+
+@pytest.mark.asyncio
+async def test_restore_marks_the_root_before_its_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restored root has no rows until the layout pass that measures it.
+
+    ``restore_unit`` mounts the unit's real roots while its placeholders still
+    hold the slot, so for that frame the unit's placement reads as row 0 --
+    above every scrolled-up neighbour -- and the placement index stops being
+    ordered by screen row, exactly as for a freshly mounted placeholder. An
+    anchor captured in that window (load-more prepend, resize, picker open)
+    bisects an out-of-order index and resolves far below the viewport.
+    """
+    window, roots = await _fixture(64)
+    app = _App()
+    async with app.run_test() as pilot:
+        stream = app.query_one("#stream", VerticalScroll)
+        await stream.mount_all(roots)
+        await pilot.pause()
+        for unit_id, root in zip(window.unit_ids, roots, strict=True):
+            window.register_mounted(unit_id, [root])
+        await pilot.pause()
+        for unit_id in window.unit_ids:
+            await window.evict_unit(unit_id)
+        await pilot.pause()
+        assert not window._unmeasured_placement_pending()
+
+        unit_id = window.unit_ids[32]
+        restored = _Measured(8)
+        # A root the stream never arranges stands in for the frame between the
+        # mount and its measuring layout: display:none keeps its region empty.
+        restored.styles.display = "none"
+        monkeypatch.setattr(window, "build_unit", lambda *_: [restored])
+
+        # The measuring layout is the frame after the mount; hold it back so
+        # the probe observes the in-flight restore rather than its result.
+        async def held_layout(_parent: object) -> None:
+            return None
+
+        monkeypatch.setattr(window, "_layout_pass", held_layout)
+        observed: list[tuple[bool, object]] = []
+
+        async def initialize(_widgets: object) -> None:
+            assert window.units[unit_id].restoring
+            assert restored.region.width == 0, (
+                "the restored root was measured before the probe: this "
+                "scenario must exercise the unmeasured placement"
+            )
+            observed.append((
+                window._unmeasured_placement_pending(),
+                window._reading_anchor(stream),
+            ))
+
+        assert await window.restore_unit(
+            unit_id,
+            stream,
+            WeakKeyDictionary(),
+            follow_bottom=False,
+            initialize=initialize,
+        )
+        assert observed
+        pending, anchor = observed[0]
+        assert pending, "the in-flight restore left its unmeasured root unmarked"
+        assert anchor == window._walk_anchor(stream.region.y)
+        assert window._unmeasured_placement_pending()
+        captured = window.capture_anchor(stream, following=False)
+        assert captured is not None
+        assert (captured.entry_id, captured.history_index, captured.row_offset) == (
+            "message-0",
+            0,
+            0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_identity_adoption_during_restore_keeps_both_representatives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rename mid-restore must not detach the unit's roots and placeholders.
+
+    ``restore_unit`` mounts the real roots while the placeholders still hold
+    the unit's slot, and admission adopts the entry's public id during any of
+    the awaits in between (admission does not take the reconcile lock). The
+    completion and rollback checks addressed the unit by its entry-time id, so
+    the rename read as "the unit left the registry": the rollback removed both
+    representatives from the DOM, the release and the mark were skipped, and
+    the renamed unit kept a detached placement mid-index -- its slot never
+    measured again and its placeholder unreachable for a retry.
+    """
+    window = TranscriptWindow()
+    entries = [_message(index) for index in range(64)]
+    pending = entries[32]
+    pending.id = ""
+    window.admit(entries, start_index=0)
+    transient_id = window.unit_ids[32]
+    assert transient_id.startswith("transient-")
+    roots = [_Measured(8) for _ in range(64)]
+    app = _App()
+    async with app.run_test() as pilot:
+        stream = app.query_one("#stream", VerticalScroll)
+        await stream.mount_all(roots)
+        await pilot.pause()
+        for unit_id, root in zip(window.unit_ids, roots, strict=True):
+            window.register_mounted(unit_id, [root])
+        await pilot.pause()
+        await window.evict_unit(transient_id)
+        await pilot.pause()
+        placeholder = window.units[transient_id].placeholders[0]
+        assert not window._unmeasured_placement_pending()
+        assert placeholder.parent is stream
+
+        restored = _Measured(8)
+        monkeypatch.setattr(window, "build_unit", lambda *_: [restored])
+
+        async def adopt(_widgets: object) -> None:
+            # The public id arrives between the mount and the completion: the
+            # window where the restore holds no reconcile lock.
+            assert window.units[transient_id].restoring
+            pending.id = "message-32"
+            window.admit([pending], start_index=32)
+            assert window.unit_ids[32] == "message-32"
+            assert "message-32" in window._unmeasured_placements, (
+                "the restore's mark did not follow the adopted id"
+            )
+
+        # The rename re-fingerprints the entry, so the attempt aborts: the
+        # roots it mounted were built for the pre-rename id.
+        assert not await window.restore_unit(
+            transient_id,
+            stream,
+            WeakKeyDictionary(),
+            follow_bottom=False,
+            initialize=adopt,
+        )
+        unit = window.units["message-32"]
+        assert not unit.mounted_roots, "the aborted restore kept stale roots"
+        assert restored.parent is None
+        assert unit.placeholders == [placeholder]
+        assert placeholder.parent is stream, (
+            "the rollback detached the placeholder the unit still owns"
+        )
+        assert window._placement(unit) is placeholder
+        for unit_id in window._placements:
+            placement = window._placement(window.units[unit_id])
+            assert placement is not None and placement.parent is stream, (
+                f"{unit_id} kept a detached representative inside the index"
+            )
+        await pilot.pause()
+        assert not window._unmeasured_placement_pending()
+        assert window._unmeasured_placements == set()
+
+        # The slot was never lost, so the retry restores the renamed unit.
+        assert await window.restore_unit(
+            "message-32", stream, WeakKeyDictionary(), follow_bottom=False
+        ), "the adopted unit could not be restored again"
+        assert not unit.placeholders
+        assert unit.mounted_roots and unit.mounted_roots[0].parent is stream
+        await pilot.pause()
+        assert not window._unmeasured_placement_pending()
+        assert window._unmeasured_placements == set()
+        assert window._reading_anchor(stream) == window._walk_anchor(stream.region.y)
+        # The restored slot is registered, so a second retry has nothing to do.
+        assert not await window.restore_unit(
+            "message-32", stream, WeakKeyDictionary(), follow_bottom=False
+        )

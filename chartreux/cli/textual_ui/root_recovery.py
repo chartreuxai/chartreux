@@ -34,7 +34,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from chartreux.app_server.events import TurnCompleted
 from chartreux.app_server.models import PublicTurnStatus
@@ -42,7 +42,7 @@ from chartreux.app_server.session import AppServerTurnError
 from chartreux.observability.logging import logger
 
 if TYPE_CHECKING:
-    from chartreux.cli.textual_ui.app import ChartreuxApp
+    from chartreux.cli.textual_ui.app import ChartreuxApp, TurnOwnership
     from chartreux.cli.textual_ui.turn_supervisor import TurnSupervisor
 
 
@@ -59,6 +59,14 @@ class _PendingSchedule:
     limit: int
     session_id: str
     input_generation: int
+    # The ownership the failed turn held, popped from the app's keyed store at
+    # observation time: either a frozen token or the missing-ownership
+    # sentinel. It is never minted from live app state, so a successor that
+    # starts during a later await cannot lend this schedule its epoch.
+    ownership: object
+    # The failed turn's epoch, frozen from the token above; None when the
+    # ownership was withheld, which suppresses the reports only.
+    record_epoch: int | None
     # The stashed original terminal failure — mounted as the manual fallback
     # if the gate declines at admission time (after the pending window).
     error: AppServerTurnError
@@ -108,6 +116,13 @@ class RootRecoveryController:
         error = self._terminal_error(source, solicited=solicited)
         if error is None or not error.turn_id:
             return False
+        # Consumed synchronously before any await, uniformly over the duplicate
+        # and queued-work returns below: the arm freezes the ownership the
+        # failure was observed under, and a successor starting during the
+        # schedule request must not lend it its epoch.
+        token = self._app._failure_tokens.pop(
+            error.turn_id, self._app._OWNERSHIP_MISSING
+        )
         app = self._app
         try:
             session_id = app.app_server.session_id
@@ -153,6 +168,15 @@ class RootRecoveryController:
             limit=response.limit,
             session_id=session_id,
             input_generation=app._input_generation,
+            ownership=token,
+            # The identity comparison is the real-versus-withheld test: the
+            # sentinel carries no epoch, and a real token's epoch is frozen
+            # here so no later read can adopt a successor's.
+            record_epoch=(
+                None
+                if token is self._app._OWNERSHIP_MISSING
+                else cast("TurnOwnership", token).record_epoch
+            ),
             error=error,
         )
         self._arm_timer(response.delay_seconds)
@@ -240,7 +264,7 @@ class RootRecoveryController:
         if app._queue.has_server_work:
             await self._cancel_remote(pending, reason="queued_work")
             self._drop_pending()
-            self._offer_manual_fallback(pending.error)
+            self._offer_manual_fallback(pending.error, pending.ownership)
             return
         try:
             response = await app.app_server.admit_root_recovery(
@@ -253,7 +277,7 @@ class RootRecoveryController:
             # Meta-recovery: park to the manual fallback — one state, no loop.
             logger.warning("root recovery admission request failed", exc_info=True)
             self._drop_pending()
-            self._offer_manual_fallback(pending.error)
+            self._offer_manual_fallback(pending.error, pending.ownership)
             return
         match response.decision:
             case "admitted":
@@ -284,7 +308,7 @@ class RootRecoveryController:
                 if response.turn_id is None:
                     # The admission was consumed but no successor start was
                     # observed: park to the manual fallback, never loop.
-                    self._offer_manual_fallback(pending.error)
+                    self._offer_manual_fallback(pending.error, pending.ownership)
             case "deferred":
                 # A read-only availability wait: re-arm within the episode
                 # (never consumes a retry).
@@ -294,7 +318,7 @@ class RootRecoveryController:
                 # the stashed failure with the manual R1 fallback.
                 self._pending = None
                 self._cancel_timer()
-                self._offer_manual_fallback(pending.error)
+                self._offer_manual_fallback(pending.error, pending.ownership)
 
     # ------------------------------------------------------------------
     # Local cancellation (the input-generation token's other half)
@@ -314,6 +338,22 @@ class RootRecoveryController:
         self._cancel_timer()
         if pending is None:
             return
+        # Pinned predicate (``pending is not None`` is settled above): the user
+        # took over an armed continuation that never produced a successor, so
+        # the record returns to the prompt. The session and epoch conjuncts
+        # stop this report from overwriting an INDEPENDENT successor that owns
+        # the record now, and a withheld ownership never matches (None != int).
+        try:
+            live_session_id: str | None = self._app.app_server.session_id
+        except Exception:
+            live_session_id = None
+        if (
+            not self._shutdown
+            and pending.input_generation != self._app._input_generation
+            and pending.session_id == live_session_id
+            and pending.record_epoch == self._app._record_epoch
+        ):
+            self._app._program_status.emit("idle")
         try:
             asyncio.create_task(
                 self._app.app_server.cancel_root_recovery(
@@ -345,18 +385,24 @@ class RootRecoveryController:
         except Exception:
             logger.warning("root recovery cancel request failed", exc_info=True)
 
-    def _offer_manual_fallback(self, error: AppServerTurnError) -> None:
+    def _offer_manual_fallback(
+        self, error: AppServerTurnError, ownership: object
+    ) -> None:
         """Surface the stashed terminal failure with the manual R1 fallback
         (the error widget's retry affordance where the code offers it).
+
+        The arm's frozen ownership travels with it: the fallback fires long
+        after the failure, and only the ownership the failure was observed
+        under may report for it.
         """
         supervisor: TurnSupervisor = self._app._turn_supervisor
-        asyncio.create_task(self._mount_fallback(error, supervisor))
+        asyncio.create_task(self._mount_fallback(error, supervisor, ownership))
 
     async def _mount_fallback(
-        self, error: AppServerTurnError, supervisor: TurnSupervisor
+        self, error: AppServerTurnError, supervisor: TurnSupervisor, ownership: object
     ) -> None:
         try:
             message = supervisor._resolve_turn_error_message(error)
-            await supervisor._mount_turn_error(error, message)
+            await supervisor._mount_turn_error(error, message, ownership=ownership)
         except Exception:
             logger.exception("root recovery manual fallback mount failed")

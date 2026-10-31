@@ -197,6 +197,10 @@ class AppServerSession:  # noqa: PLR0904
         self._event_generation = 0
         self._consumed_turn_id: str | None = None
         self._starting_turn = False
+        # Terminal status of the most recently consumed solicited turn, keyed
+        # by that turn's id. Read only after a generator completes normally;
+        # the exception unwind carries its own outcome.
+        self.last_turn_status: tuple[str, PublicTurnStatus] | None = None
         self._callback_sessions: dict[str, str] = {}
         self._events: asyncio.Queue[_QueuedEvent] = asyncio.Queue(
             maxsize=_EVENT_QUEUE_MAX_SIZE
@@ -409,6 +413,7 @@ class AppServerSession:  # noqa: PLR0904
                     continue
                 event = item.event
                 if isinstance(event, TurnCompleted) and event.turn.id == turn_id:
+                    self.last_turn_status = (turn_id, event.turn.status)
                     if event.turn.next_turn_id is not None:
                         turn_id = event.turn.next_turn_id
                         yield event
@@ -436,6 +441,10 @@ class AppServerSession:  # noqa: PLR0904
         finally:
             if not operation_completed:
                 self._consumed_turn_id = None
+                # A stream that ends without a terminal status (interrupt,
+                # cancellation, close) defaults to INTERRUPTED rather than
+                # leaving an earlier turn's status readable.
+                self.last_turn_status = (turn_id, PublicTurnStatus.INTERRUPTED)
 
     async def events(self) -> AsyncGenerator[AppServerEvent, None]:
         try:

@@ -6,7 +6,8 @@ import asyncio
 from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import aclosing, suppress
-from typing import TYPE_CHECKING, Any
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any, TypedDict
 from uuid import uuid4
 
 from chartreux.app_server.events import (
@@ -46,6 +47,36 @@ if TYPE_CHECKING:
     from chartreux.cli.textual_ui.app import ChartreuxApp
     from chartreux.cli.textual_ui.widgets.messages import SlashCommandMessage
     from chartreux.cli.textual_ui.widgets.question_app import QuestionApp
+
+
+class TurnOutcome(StrEnum):
+    """Terminal outcome a finalizing turn reports (design §4 dispatch rows)."""
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+    NO_REPORT = "no_report"
+
+
+_OUTCOME_BY_STATUS = {
+    PublicTurnStatus.COMPLETED: TurnOutcome.COMPLETED,
+    PublicTurnStatus.INTERRUPTED: TurnOutcome.INTERRUPTED,
+    PublicTurnStatus.FAILED: TurnOutcome.NO_REPORT,
+}
+
+
+class _TurnInvocation(TypedDict):
+    """Ownership context frozen by ``handle_turn`` for one invocation.
+
+    ``turn_id`` is the last ``TurnStarted`` id observed in this invocation's
+    stream. ``frozen`` is the ``(turn_id, ownership epoch)`` pair read after
+    that event's handler ran; an epoch-less pair is not a frozen context and
+    the app-side factory falls through to the accepted-start slot.
+    """
+
+    turn_id: str | None
+    frozen: tuple[str, int | None] | None
+
 
 # Expected turn outcomes with bespoke user messages; not worth reporting to Sentry.
 _BENIGN_TURN_ERROR_CODES = {
@@ -248,7 +279,12 @@ class TurnSupervisor:
         self._app = app
 
     async def finalize_turn_ui(
-        self, *, notify_complete: bool = True, turn_ui_generation: int | None = None
+        self,
+        *,
+        notify_complete: bool = True,
+        turn_ui_generation: int | None = None,
+        outcome: TurnOutcome = TurnOutcome.NO_REPORT,
+        turn_id: str | None = None,
     ) -> None:
         async with self._app._turn_ui_lock():
             if (
@@ -265,6 +301,19 @@ class TurnSupervisor:
             self.agent_task = None
             self._clear_pending_turn()
             self.maybe_settle_interrupt()
+            # Retirement and the durable terminal report run after both early
+            # returns but BEFORE the teardown awaits below: a successor turn
+            # accepted during them reports its own state, and a stale finalizer
+            # emitting afterwards would overwrite it. The early returns above
+            # still guarantee a stale or partially-finalized invocation never
+            # retires a successor's entry or drops the record's outcome.
+            if notify_complete:
+                if turn_id is not None and self._app._active_turn_id == turn_id:
+                    self._app.turn_epoch_map.pop(turn_id, None)
+                if outcome is TurnOutcome.COMPLETED:
+                    self._app._program_status.emit("done")
+                elif outcome is TurnOutcome.INTERRUPTED:
+                    self._app._program_status.emit("idle")
             if self._app._loading_widget:
                 await self._app._loading_widget.remove()
             self._app._loading_widget = None
@@ -341,6 +390,18 @@ class TurnSupervisor:
             if self._app._loading_widget is not None:
                 self._app._loading_widget.set_status(INTERRUPTING_LOADING_STATUS)
         self._clear_pending_turn()
+
+        # An accepted interruption retires the active turn's ownership and
+        # settles the record synchronously, before the cancel await below:
+        # finalization may never run (a cancelled client task unwinds straight
+        # out of cancel(), and finish_interrupt never finalizes), and a
+        # detached fallback must not speak for a turn the user already stopped.
+        retired_turn_id = self._app._active_turn_id
+        if retired_turn_id is not None:
+            self._app.turn_epoch_map.pop(retired_turn_id, None)
+        self._app._active_turn_id = None
+        self._app._advance_record_epoch()
+        self._app._program_status.emit("idle")
 
         # Invariant: a turn is driven EITHER by a client task (``_agent_task``,
         # used for retry/auto-retry) OR by the server promoting an enqueued turn
@@ -524,10 +585,32 @@ class TurnSupervisor:
             self._app._refresh_banner()
 
     async def _handle_turn_events(
-        self, events: AsyncGenerator[AppServerEvent, None]
+        self, events: AsyncGenerator[AppServerEvent, None], holder: _TurnInvocation
     ) -> None:
         async for event in events:
-            await self._app._handle_turn_event(event)
+            try:
+                await self._app._handle_turn_event(event)
+            except BaseException:
+                # The handler binds ownership synchronously before its awaited
+                # presentation work, so a failure after that point must still
+                # freeze this invocation's pair: otherwise the except arm in
+                # handle_turn sees no context and withholds the only `error`.
+                if isinstance(event, TurnStarted):
+                    holder["turn_id"] = event.turn.id
+                    holder["frozen"] = (
+                        event.turn.id,
+                        self._app.turn_epoch_map.get(event.turn.id),
+                    )
+                raise
+            if isinstance(event, TurnStarted):
+                # Freeze this invocation's ownership pair only after the
+                # handler's synchronous binding ran. ``.get`` keeps an absent
+                # entry as an epoch-less pair, which is not a frozen context.
+                holder["turn_id"] = event.turn.id
+                holder["frozen"] = (
+                    event.turn.id,
+                    self._app.turn_epoch_map.get(event.turn.id),
+                )
 
     def show_no_output_outcome(self) -> None:
         # agent_is_active is read through the app wrapper so tests patching
@@ -561,7 +644,14 @@ class TurnSupervisor:
             ):
                 self.show_no_output_outcome()
 
-    async def _begin_unsolicited_turn(self) -> None:
+    async def _begin_unsolicited_turn(self, *, bound_epoch: int) -> None:
+        # ``bound_epoch`` is the epoch the listener bound synchronously at
+        # ``_record_turn_owner``, passed in instead of read here: the queue
+        # await sits between that bind and this call, so an interrupt or any
+        # other ownership bump (/clear, /compact, a context reset) landing
+        # there settles the record and advances the epoch. Reading the live
+        # epoch at entry would adopt the new owner and report `working` over
+        # that settlement.
         async with self._app._turn_ui_lock():
             self.turn_ui_generation += 1
             if self._app.event_handler:
@@ -578,6 +668,8 @@ class TurnSupervisor:
                 else DEFAULT_LOADING_STATUS
             )
             self._app._queue.notify_busy_changed()
+            if not self.interrupt_requested and self._app._record_epoch == bound_epoch:
+                self._app._program_status.emit("working")
 
     async def _complete_unsolicited_turn(self, event: TurnCompleted) -> None:
         from chartreux.app_server.session import AppServerTurnError
@@ -585,28 +677,58 @@ class TurnSupervisor:
         if event.turn.next_turn_id is not None:
             return
         recovery_pending = False
-        if event.turn.status is PublicTurnStatus.FAILED:
-            error = AppServerTurnError(event.turn.error, turn_id=event.turn.id)
-            await self._handle_turn_error()
-            # R2/OD3: the one terminal observation path — the app-server
-            # gate decides eligibility/budget/barriers; the TUI controller
-            # owns the local timer. The legacy incomplete-stream immediate
-            # continuation is MERGED into that controller (OD4a: when
-            # [recovery.root] is disabled no automatic continuation runs).
-            recovery_pending = await self._app._root_recovery.observe_terminal(
-                event, solicited=False
+        outcome = TurnOutcome.NO_REPORT
+        captured_turn_id: str | None = None
+        captured_token: object | None = None
+        try:
+            if event.turn.status is PublicTurnStatus.FAILED:
+                error = AppServerTurnError(event.turn.error, turn_id=event.turn.id)
+                # First failure observation: the unsolicited turn is always
+                # typed, so the token is captured and stored before any await.
+                token = self._app._ownership_token_for(event.turn.id, None)
+                self._app._failure_tokens[event.turn.id] = token
+                captured_turn_id = event.turn.id
+                captured_token = token
+                await self._handle_turn_error()
+                # R2/OD3: the one terminal observation path — the app-server
+                # gate decides eligibility/budget/barriers; the TUI controller
+                # owns the local timer. The legacy incomplete-stream immediate
+                # continuation is MERGED into that controller (OD4a: when
+                # [recovery.root] is disabled no automatic continuation runs).
+                recovery_pending = await self._app._root_recovery.observe_terminal(
+                    event, solicited=False
+                )
+                if recovery_pending:
+                    if self._app.event_handler is not None:
+                        self._app.event_handler.offer_retry()
+                else:
+                    message = self._resolve_turn_error_message(error)
+                    await self._mount_turn_error(error, message, ownership=token)
+            elif event.turn.status is PublicTurnStatus.INTERRUPTED:
+                outcome = TurnOutcome.INTERRUPTED
+                await self._handle_turn_error(cancelled=True)
+            elif event.turn.status is PublicTurnStatus.COMPLETED:
+                # The consumed turn's terminal event is in scope here; the
+                # session-wide tracker belongs to the solicited path only.
+                outcome = TurnOutcome.COMPLETED
+        finally:
+            # First statement of the finally: a cancellation inside the
+            # finalize awaits below must not strand this invocation's key.
+            # Only this invocation's own unconsumed write is removed: a
+            # same-id successor that recorded its token after the observation
+            # consumed ours must survive.
+            if (
+                captured_turn_id is not None
+                and self._app._failure_tokens.get(captured_turn_id) is captured_token
+            ):
+                self._app._failure_tokens.pop(captured_turn_id, None)
+            await self.finalize_turn_ui(
+                notify_complete=not recovery_pending,
+                outcome=outcome,
+                turn_id=event.turn.id,
             )
-            if recovery_pending:
-                if self._app.event_handler is not None:
-                    self._app.event_handler.offer_retry()
-            else:
-                message = self._resolve_turn_error_message(error)
-                await self._mount_turn_error(error, message)
-        elif event.turn.status is PublicTurnStatus.INTERRUPTED:
-            await self._handle_turn_error(cancelled=True)
-        await self.finalize_turn_ui(notify_complete=not recovery_pending)
 
-    async def handle_turn(
+    async def handle_turn(  # noqa: PLR0914, PLR0915 - ownership threading
         self,
         prompt: str,
         *,
@@ -617,13 +739,23 @@ class TurnSupervisor:
         incomplete_stream_retries: int = 0,
         idempotency_key: str | None = None,
     ) -> None:
+        # Bound before the protected section: ensure_runtime_ready can raise
+        # before any stream exists, and the except/finally arms must always see
+        # a holder and an outcome.
+        holder: _TurnInvocation = {"turn_id": None, "frozen": None}
         turn_ui_generation = self.turn_ui_generation
+        outcome = TurnOutcome.NO_REPORT
+        invocation_turn_id: str | None = None
+        captured_turn_id: str | None = None
+        captured_token: object | None = None
+        recovery_pending = False
         if self.active_turn_start is None:
             self.active_turn_start = self._app._transcript.admitted_end_index
-        await self._app._remove_loading_widget()
-        recovery_pending = False
 
         try:
+            # The pre-try loading-widget await used to sit outside this block,
+            # so a cancellation there left the record stuck at `working`.
+            await self._app._remove_loading_widget()
             await self.ensure_runtime_ready()
             await self._app._ensure_loading_widget(
                 "Retrying" if incomplete_stream_retries else DEFAULT_LOADING_STATUS
@@ -638,6 +770,7 @@ class TurnSupervisor:
                     prompt
                 )
                 if prepared is None:
+                    self._app._program_status.emit("idle")
                     return
                 prompt_text = prepared.prompt_text
                 auto_title = prepared.auto_title
@@ -656,16 +789,41 @@ class TurnSupervisor:
                     idempotency_key=idempotency_key,
                 )
             ) as events:
-                await self._handle_turn_events(events)
+                await self._handle_turn_events(events, holder)
+            # Normal generator completion only: the session tracker records the
+            # consumed turn's terminal status; an unwind below never reads it.
+            tracked = self._app.app_server.last_turn_status
+            if tracked is not None:
+                invocation_turn_id, tracked_status = tracked
+                outcome = _OUTCOME_BY_STATUS.get(tracked_status, TurnOutcome.NO_REPORT)
+            else:
+                invocation_turn_id = holder["turn_id"]
         except asyncio.CancelledError:
+            outcome = TurnOutcome.INTERRUPTED
             await self._handle_turn_error(cancelled=True)
             raise
         except Exception as e:
+            # First failure observation: capture synchronously, before the
+            # widget-remove await inside _handle_turn_error, and key the token
+            # by the typed turn id before any await (consumed by the recovery
+            # observation path; the finally pop bounds it otherwise).
+            token = self._app._ownership_token_for(
+                getattr(e, "turn_id", None), holder["frozen"]
+            )
+            failure_turn_id = getattr(e, "turn_id", None)
+            if failure_turn_id is not None:
+                self._app._failure_tokens[failure_turn_id] = token
+                captured_turn_id = failure_turn_id
+                captured_token = token
+            invocation_turn_id = holder["turn_id"] or failure_turn_id
+            outcome = TurnOutcome.FAILED
             await self._handle_turn_error()
 
             # _watch_init_completion already rendered the fatal startup error
-            # and told the user to exit -- don't duplicate the message.
+            # and told the user to exit -- don't duplicate the message, but do
+            # account for the record acceptance put into `working`.
             if self._app._fatal_init_error:
+                self._app._program_status.emit("idle")
                 return
 
             # R2/OD3: the one terminal observation path — the app-server
@@ -678,6 +836,8 @@ class TurnSupervisor:
                 e, solicited=True
             )
             if recovery_pending:
+                # The automatic continuation owns the record; report nothing.
+                outcome = TurnOutcome.NO_REPORT
                 # Auto-retry silently: don't surface the error while we retry.
                 # Arm the retry presentation (without an error widget) so the
                 # partial assistant message is reused when the retry streams in.
@@ -688,14 +848,28 @@ class TurnSupervisor:
 
                 message = self._resolve_turn_error_message(e)
 
-                await self._mount_turn_error(e, message)
+                await self._mount_turn_error(e, message, ownership=token)
         finally:
+            # First statement of the finally: a cancellation inside the
+            # finalize awaits below must not strand this invocation's key.
+            # Only this invocation's own unconsumed write is removed: a
+            # same-id successor that recorded its token after the observation
+            # consumed ours must survive.
+            if (
+                captured_turn_id is not None
+                and self._app._failure_tokens.get(captured_turn_id) is captured_token
+            ):
+                self._app._failure_tokens.pop(captured_turn_id, None)
             await self.finalize_turn_ui(
                 notify_complete=not recovery_pending,
                 turn_ui_generation=turn_ui_generation,
+                outcome=outcome,
+                turn_id=invocation_turn_id,
             )
 
-    async def _mount_turn_error(self, error: Exception, message: str) -> None:
+    async def _mount_turn_error(
+        self, error: Exception, message: str, *, ownership: object | None = None
+    ) -> None:
         from chartreux.app_server.session import AppServerTurnError
 
         event_handler = self._app.event_handler
@@ -721,6 +895,25 @@ class TurnSupervisor:
         if offer_retry and event_handler is not None:
             event_handler.offer_retry(widget)
             self._app._refresh_command_registry()
+        # The token is opaque here (the app owns the type): a real frozen
+        # token speaks only while its epoch and session still own the record;
+        # the missing-ownership sentinel suppresses the report; None keeps the
+        # compat-ungated behavior for direct callers. Suppression affects the
+        # OSC report only -- the transcript mount above already happened.
+        if ownership is not None:
+            token_epoch = getattr(ownership, "record_epoch", None)
+            token_session = getattr(ownership, "session_id", None)
+            if token_epoch is None or token_session is None:
+                return
+            if token_epoch != self._app._record_epoch:
+                return
+            try:
+                live_session = self._app.app_server.session_id
+            except Exception:
+                return
+            if live_session != token_session:
+                return
+        self._app._program_status.emit("error", msg=message)
 
     def _resolve_turn_error_message(self, e: Exception) -> str:
         from chartreux.app_server.session import AppServerTurnError
@@ -815,7 +1008,11 @@ class TurnSupervisor:
         await self._app._await_interrupt_settled()
         if self._app.event_handler is None or not self._app.event_handler.begin_retry():
             return
+        # Accepted start: the bump, the pending slot, and the report land
+        # together. No await sits between the count snapshot and the bump.
+        self._app._record_accepted_start(self._app._started_count_snapshot())
         self.agent_task = asyncio.current_task()
+        self._app._program_status.emit("working")
         self._app._queue.notify_busy_changed()
         await self._app._handle_turn(
             build_retry_prompt(""),
@@ -845,6 +1042,9 @@ class TurnSupervisor:
             command_message
         ):
             return
+        # Accepted start: bump and stash the slot only after every rejecting
+        # guard returned, so a rejected retry never advances ownership.
+        self._app._record_accepted_start(self._app._started_count_snapshot())
         self._app._refresh_command_registry()
         self.agent_task = asyncio.create_task(
             self._app._handle_turn(
@@ -854,6 +1054,7 @@ class TurnSupervisor:
                 incomplete_stream_retries=incomplete_stream_retries,
             )
         )
+        self._app._program_status.emit("working")
         self._app._queue.notify_busy_changed()
 
     async def question_answered(self, message: QuestionApp.Answered) -> None:
@@ -927,7 +1128,16 @@ class TurnSupervisor:
                 return
             if self._app._loading_widget is not None:
                 self._app._loading_widget.end_action_required()
+            generation = self._app._program_status.generation
             await self._app._switch_to_input_app()
+            # An active turn resumes after its question expires; without one
+            # the prompt is back. The switch awaits, so a turn that finished in
+            # the gap has already settled a durable outcome: report only while
+            # this return still owns the record.
+            if self._app._program_status.generation == generation:
+                self._app._program_status.emit(
+                    "working" if self.agent_job_active() else "idle"
+                )
             return
         # A queued callback expired before it was ever displayed.
         self.pending_callbacks = deque(
@@ -1002,6 +1212,51 @@ class TurnSupervisor:
             await self._app._show_callback(self.pending_callbacks.popleft())
         self._app._indicate_pending_action()
 
+    @staticmethod
+    def _callback_kind(callback: PublicCallbackEntry) -> str | None:
+        """Map the callback's provenance to an OSC ``kind`` (string literals).
+
+        No core import: the origin values are compared against their wire
+        strings, so the TUI boundary stays clean.
+        """
+        origin = callback.detail.origin
+        if origin == "model_question":
+            return "question"
+        if origin == "runtime_approval":
+            return "permission"
+        return None
+
+    @staticmethod
+    def _blocked_message(callback: PublicCallbackEntry, kind: str) -> str | None:
+        """The report's message: the question text, or the approval summary.
+
+        An approval prompt carries its subject on the line after the question
+        (``Allow this command?\\n\\n<command>``); the first line alone would
+        drop it after sanitization, so the first further non-empty line is
+        joined with one space.
+        """
+        questions = callback.detail.request.questions
+        if not questions:
+            return None
+        text = questions[0].question
+        if kind != "permission":
+            return text
+        lines = text.splitlines()
+        first = lines[0].strip() if lines else ""
+        for line in lines[1:]:
+            stripped = line.strip()
+            if stripped:
+                return f"{first} {stripped}" if first else stripped
+        return first or None
+
+    def _emit_blocked_callback(self, callback: PublicCallbackEntry) -> None:
+        kind = self._callback_kind(callback)
+        if kind is None:
+            return
+        self._app._program_status.emit(
+            "blocked", kind=kind, msg=self._blocked_message(callback, kind)
+        )
+
     async def show_callback(self, callback: PublicCallbackEntry) -> None:
         if (
             self.active_callback is not None
@@ -1032,6 +1287,9 @@ class TurnSupervisor:
                 self._app._indicate_pending_action()
                 return
             self._app._terminal_notifier.notify(NotificationContext.ACTION_REQUIRED)
+            # Only a prompt that is actually presented blocks the record: the
+            # deferral checks above all returned already.
+            self._emit_blocked_callback(callback)
             await self._app._switch_to_question_app(callback.detail.request)
             # Attach the callback identity and the armed unattended-expiry
             # policy so the widget can correlate messages and count down
@@ -1057,6 +1315,10 @@ class TurnSupervisor:
             or self.callback_delivery_uncertain
         ):
             return
+        # Snapshot before the response await: a turn that finishes while the
+        # answer is in flight already settled a durable outcome, and the
+        # return emission below would overwrite it with `idle`/`working`.
+        generation = self._app._program_status.generation
         self.callback_submitting = True
         question = self._app.query_one(_get_question_app_class())
         question.set_submission_status("Running: Sending answer")
@@ -1097,6 +1359,14 @@ class TurnSupervisor:
             if self._app._loading_widget is not None:
                 self._app._loading_widget.end_action_required()
             await self._app._switch_to_input_app()
+            # Only the actual return-to-input path reports: the early return
+            # above shows the next pending callback, which owns the record. And
+            # only while this return still owns it: both awaits above let a
+            # turn finish, which already settled a durable outcome.
+            if self._app._program_status.generation == generation:
+                self._app._program_status.emit(
+                    "working" if self.agent_job_active() else "idle"
+                )
 
     async def wait_for_typing_pause(self) -> None:
         # The debounce resolver stays an app module global (test seam); the

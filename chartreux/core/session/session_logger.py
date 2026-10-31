@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator, Sequence
 import contextlib
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import errno
 import getpass
 import hashlib
+import io
+import itertools
 import json
 import logging
 import os
@@ -42,7 +44,12 @@ from chartreux.core.session_types import (
 )
 from chartreux.core.tools.secret_redaction import scrub_child_env
 from chartreux.core.utils import utc_now
-from chartreux.utils.durable_io import durable_append, durable_replace
+from chartreux.utils.durable_io import (
+    durable_append,
+    durable_replace,
+    durable_replace_stream,
+    read_chunks,
+)
 from chartreux.utils.io import read_safe, read_safe_async
 from chartreux.utils.platform import resolve_git_executable
 from chartreux.utils.session_id import shorten_session_id
@@ -80,6 +87,54 @@ def _is_enospc(exc: BaseException) -> bool:
     if isinstance(exc, BaseExceptionGroup):
         return any(_is_enospc(child) for child in exc.exceptions)
     return isinstance(exc, OSError) and exc.errno == errno.ENOSPC
+
+
+class _PersistedTranscriptError(ValueError):
+    """A persisted transcript line could not be parsed as a JSON record.
+
+    The streaming full-verify reader raises this instead of returning a
+    partial result; the caller treats it as a corrupted transcript
+    (quarantine + rewrite), exactly like the bulk reader's failure result.
+    """
+
+
+def _transcript_encoding(prefix: bytes) -> str:
+    """The codec the transcript's byte-order mark selects.
+
+    Applies the same BOM table as ``decode_safe``, the pre-streaming bulk
+    reader's decode path: a UTF-16/UTF-32 transcript that reader accepted
+    must keep decoding rather than classify as corrupt. The 32-bit marks are
+    checked first because the UTF-32-LE mark starts with the UTF-16-LE one.
+    Without a mark the transcript is UTF-8.
+    """
+    if prefix.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    if prefix.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return "utf-32"
+    if prefix.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
+    return "utf-8"
+
+
+class _SizedByteStream:
+    """A byte iterator whose ``__length_hint__`` sizes ``bytes()`` exactly.
+
+    ``bytes()`` pre-sizes its buffer from the source's length hint when one
+    is available; without it the buffer grows with over-allocation, which
+    on a multi-megabyte transcript payload is measurable residency.
+    """
+
+    __slots__ = ("_source", "_total")
+
+    def __init__(self, source: Iterator[int], total: int) -> None:
+        self._source = source
+        self._total = total
+
+    def __iter__(self) -> Iterator[int]:
+        return self._source
+
+    def __length_hint__(self) -> int:
+        return self._total
 
 
 @dataclass(frozen=True)
@@ -459,7 +514,7 @@ class SessionLogger:  # noqa: PLR0904
             raise cancellation
 
     @staticmethod
-    def _persist_messages_sync(messages: list[dict], session_dir: Path) -> int:
+    def _persist_messages_sync(messages: Iterable[dict], session_dir: Path) -> int:
         messages_filepath = session_dir / MESSAGES_FILENAME
         try:
             durable_append(
@@ -484,11 +539,19 @@ class SessionLogger:  # noqa: PLR0904
         )
 
     @staticmethod
-    def _overwrite_messages_sync(messages: list[dict], session_dir: Path) -> None:
+    def _overwrite_messages_sync(
+        messages: Iterable[dict[str, Any]], session_dir: Path
+    ) -> None:
+        """Rewrite the transcript from records produced one at a time (P4b).
+
+        The records stream into the replacement, so neither the record list
+        nor the serialized payload is resident whole; the caller may pass a
+        generator over the live messages.
+        """
         messages_filepath = session_dir / MESSAGES_FILENAME
         try:
-            durable_replace(
-                messages_filepath, SessionLogger._transcript_bytes(messages)
+            durable_replace_stream(
+                messages_filepath, SessionLogger._transcript_chunks(messages)
             )
         except Exception as e:
             if _is_enospc(e):
@@ -713,6 +776,32 @@ class SessionLogger:  # noqa: PLR0904
         return quarantine_path
 
     @staticmethod
+    def _stage_recovery_artifact(messages_path: Path, artifact_path: Path) -> None:
+        """Copy the original transcript to its recovery artifact, streamed (P4b).
+
+        The original is never held whole: the copy hashes and writes one
+        bounded chunk at a time, and the read-back verification hashes the
+        artifact off disk the same way. The digest is an exact identity
+        check, so the read-back proves the same thing the whole-byte
+        comparison did. The artifact is published atomically, so a failed
+        staging write leaves only the original.
+        """
+        digest = hashlib.sha256()
+
+        def chunks() -> Iterator[bytes]:
+            for chunk in read_chunks(messages_path):
+                digest.update(chunk)
+                yield chunk
+
+        durable_replace_stream(artifact_path, chunks())
+        restrict_private_file(artifact_path)
+        read_back = hashlib.sha256()
+        for chunk in read_chunks(artifact_path):
+            read_back.update(chunk)
+        if read_back.digest() != digest.digest():
+            raise OSError(f"recovery artifact read-back mismatch at {artifact_path}")
+
+    @staticmethod
     def migrate_repaired_transcript(
         messages_path: Path, repaired_messages: Sequence[LLMMessage]
     ) -> Path:
@@ -725,7 +814,9 @@ class SessionLogger:  # noqa: PLR0904
         transcript-integrity diagnostic — the write-owning resume install
         fails closed, never a silent partial migration. The repair never
         deletes genuine structured tool results; the serialization matches a
-        normal full save, so the transcript cursor stays consistent.
+        normal full save, so the transcript cursor stays consistent. Neither
+        side is materialized (P4b): the artifact copies off disk in chunks and
+        the repaired records stream into the replacement one line at a time.
         """
         from chartreux.core.agent_loop._transcript_integrity import (
             TranscriptIntegrityError,
@@ -734,9 +825,6 @@ class SessionLogger:  # noqa: PLR0904
         non_system_messages = [
             message for message in repaired_messages if message.role != Role.system
         ]
-        repaired_bytes = SessionLogger._transcript_bytes([
-            SessionLogger._message_record(message) for message in non_system_messages
-        ])
         timestamp = utc_now().strftime("%Y%m%dT%H%M%S%fZ")
         artifact_path = messages_path.with_name(
             f"{messages_path.name}.recovered-{timestamp}-{uuid4().hex}"
@@ -746,14 +834,14 @@ class SessionLogger:  # noqa: PLR0904
                 f"{messages_path.name}.recovered-{timestamp}-{uuid4().hex}"
             )
         try:
-            original_bytes = messages_path.read_bytes()
-            durable_replace(artifact_path, original_bytes)
-            restrict_private_file(artifact_path)
-            if artifact_path.read_bytes() != original_bytes:
-                raise OSError(
-                    f"recovery artifact read-back mismatch at {artifact_path}"
-                )
-            durable_replace(messages_path, repaired_bytes)
+            SessionLogger._stage_recovery_artifact(messages_path, artifact_path)
+            durable_replace_stream(
+                messages_path,
+                SessionLogger._transcript_chunks(
+                    SessionLogger._message_record(message)
+                    for message in non_system_messages
+                ),
+            )
         except OSError as exc:
             raise TranscriptIntegrityError.migration_failed(messages_path, exc) from exc
         message = (
@@ -768,17 +856,56 @@ class SessionLogger:  # noqa: PLR0904
     def _read_persisted_messages(
         messages_path: Path,
     ) -> tuple[list[dict[str, Any]], bool]:
+        """Bulk reader: every persisted record at once, plus validity.
+
+        The full-verify no longer uses this (P4a streams the comparison via
+        ``_stream_persisted_records``); it remains the shared bulk entry for
+        callers that genuinely want the whole transcript.
+        """
         persisted_messages: list[dict[str, Any]] = []
         try:
-            if messages_path.exists():
-                for line in read_safe(messages_path).text.splitlines():
-                    message = json.loads(line)
-                    if not isinstance(message, dict):
-                        return [], False
-                    persisted_messages.append(message)
-        except (OSError, json.JSONDecodeError):
+            persisted_messages.extend(
+                SessionLogger._stream_persisted_records(messages_path)
+            )
+        except _PersistedTranscriptError:
             return [], False
         return persisted_messages, True
+
+    @staticmethod
+    def _stream_persisted_records(messages_path: Path) -> Iterator[dict[str, Any]]:
+        """Stream persisted transcript records one at a time (P4a).
+
+        The full-verify comparison must not materialize the transcript, so
+        each line is parsed and yielded individually; the comparison holds
+        one persisted record and one live record at a time. The raw bytes
+        stream through a text wrapper using the codec the BOM selects, so a
+        UTF-16/UTF-32 transcript decodes as it did through the bulk reader's
+        ``read_safe``; the wrapper's incremental decoder never splits a
+        multi-byte sequence across lines, and universal-newline iteration
+        keeps the documented line-splitting behavior. A line that fails to
+        parse — or parses to a non-record — raises
+        ``_PersistedTranscriptError``, the per-line analogue of the bulk
+        reader's ``(list, False)`` result. A missing file yields nothing.
+        """
+        try:
+            if not messages_path.exists():
+                return
+            with messages_path.open("rb") as raw:
+                encoding = _transcript_encoding(raw.peek(4)[:4])
+                with io.TextIOWrapper(raw, encoding=encoding) as lines:
+                    for line in lines:
+                        message = json.loads(line)
+                        if not isinstance(message, dict):
+                            raise _PersistedTranscriptError(
+                                f"{messages_path}: transcript line is not a JSON object"
+                            )
+                        yield message
+        except _PersistedTranscriptError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise _PersistedTranscriptError(
+                f"{messages_path}: unreadable transcript: {exc}"
+            ) from exc
 
     @staticmethod
     def _transcript_line_digest(message_data: dict[str, Any]) -> str:
@@ -787,18 +914,37 @@ class SessionLogger:  # noqa: PLR0904
 
     @classmethod
     def _cursor_for_messages(
-        cls, messages: list[dict[str, Any]], messages_path: Path
+        cls, live_count: int, last_live_message: LLMMessage | None, messages_path: Path
     ) -> _TranscriptCursor:
+        """The verified-boundary cursor for the live transcript."""
         file_size = messages_path.stat().st_size if messages_path.exists() else 0
-        boundary_digest = (
-            cls._transcript_line_digest(messages[-1]) if messages else None
-        )
         return _TranscriptCursor(
-            count=len(messages),
-            boundary_digest=boundary_digest,
+            count=live_count,
+            boundary_digest=(
+                cls._transcript_line_digest(cls._message_record(last_live_message))
+                if last_live_message is not None
+                else None
+            ),
             file_size=file_size,
             metadata_published=True,
         )
+
+    @staticmethod
+    def _tail_records(
+        messages: Sequence[LLMMessage], verified_prefix: int
+    ) -> Iterator[dict[str, Any]]:
+        """The live records past the verified boundary, streamed (P4a).
+
+        The verified prefix is skipped by position, without serializing it
+        again; the tail records are dumped one at a time.
+        """
+        live_index = 0
+        for message in messages:
+            if message.role == Role.system:
+                continue
+            if live_index >= verified_prefix:
+                yield SessionLogger._message_record(message)
+            live_index += 1
 
     def _interaction_metadata_dump(
         self,
@@ -946,10 +1092,86 @@ class SessionLogger:  # noqa: PLR0904
         return updated_cursor, saves_since_verify + 1
 
     @staticmethod
-    def _transcript_bytes(messages: list[dict[str, Any]]) -> bytes:
-        return "".join(
-            json.dumps(message, ensure_ascii=False) + "\n" for message in messages
-        ).encode("utf-8")
+    def _transcript_chunks(messages: Iterable[dict[str, Any]]) -> Iterator[bytes]:
+        """Yield the transcript payload one encoded record line at a time (P4b).
+
+        The streamed rewrite writes each line as it is produced, so the
+        payload is never resident whole.
+        """
+        for message in messages:
+            yield (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
+
+    @staticmethod
+    def _transcript_bytes(messages: Iterable[dict[str, Any]]) -> bytes:
+        """Serialize records into the transcript payload, one line at a time.
+
+        Each record is encoded and folded into the payload buffer
+        immediately, so the intermediate full-text copy the join-then-encode
+        form held is gone (P4a); the accepted iterable may be a generator,
+        keeping the caller's record construction streaming too. When the
+        records are re-iterable the encoded size is measured first so the
+        buffer is allocated exactly once instead of growing with
+        over-allocation slack. The rewrite path streams instead (P4b).
+        """
+        if isinstance(messages, Sequence):
+            total = sum(
+                len(line) for line in SessionLogger._transcript_chunks(messages)
+            )
+            return bytes(
+                _SizedByteStream(
+                    itertools.chain.from_iterable(
+                        SessionLogger._transcript_chunks(messages)
+                    ),
+                    total,
+                )
+            )
+        return bytes(
+            itertools.chain.from_iterable(SessionLogger._transcript_chunks(messages))
+        )
+
+    def _verify_persisted_boundary(
+        self, messages: list[LLMMessage], messages_path: Path
+    ) -> tuple[int, bool, bool, LLMMessage | None]:
+        """Stream-compare the persisted transcript against the live records.
+
+        Returns the verified prefix count, whether the persisted transcript
+        parsed cleanly, whether its records are a prefix of the live
+        records, and the last verified live message. Neither side is
+        materialized: the persisted records stream off disk and the live
+        records dump one at a time, so the residency is one record pair
+        (P4a).
+        """
+        persisted_count = 0
+        transcript_valid = True
+        boundary_unchanged = True
+        last_live_message: LLMMessage | None = None
+        try:
+            persisted_records = SessionLogger._stream_persisted_records(messages_path)
+            for live_message in (
+                message for message in messages if message.role != Role.system
+            ):
+                persisted_record = next(persisted_records, None)
+                if persisted_record is None:
+                    break
+                if persisted_record != SessionLogger._message_record(live_message):
+                    boundary_unchanged = False
+                    break
+                persisted_count += 1
+                last_live_message = live_message
+            else:
+                if next(persisted_records, None) is not None:
+                    # The persisted transcript is longer than the live one:
+                    # the boundary is not a prefix, so the rewrite replaces it.
+                    boundary_unchanged = False
+            # Drain the remainder: the comparison stops early, but a corrupt
+            # line anywhere in the transcript must still quarantine it, so
+            # every line is parsed exactly once across compare and drain.
+            for _ in persisted_records:
+                pass
+        except _PersistedTranscriptError:
+            transcript_valid = False
+            boundary_unchanged = False
+        return persisted_count, transcript_valid, boundary_unchanged, last_live_message
 
     def _save_full_verify(
         self,
@@ -977,23 +1199,25 @@ class SessionLogger:  # noqa: PLR0904
         # messages.jsonl is authoritative for the persisted boundary. Metadata
         # is published separately and may lag after an interrupted save.
         messages_path = session_dir / MESSAGES_FILENAME
-        persisted_messages, transcript_valid = self._read_persisted_messages(
-            messages_path
-        )
 
-        non_system_messages = [m for m in messages if m.role != Role.system]
+        # P4a: the verification compares the persisted transcript against the
+        # live records one PAIR at a time — neither side is materialized. The
+        # persisted records stream off disk; the live records dump lazily.
+        # Each pair compares as dicts, the same per-record equality the bulk
+        # reader's list comparison applied, so numeric-type drift (1 vs 1.0,
+        # True vs 1) and key-order differences still compare equal, and a
+        # NaN record still fails its own equality, exactly as before. The
+        # full-rewrite repair below streams too (P4b): the live records are
+        # dumped and encoded one line at a time into the replacement.
+        persisted_count, transcript_valid, boundary_unchanged, last_live_message = (
+            self._verify_persisted_boundary(messages, messages_path)
+        )
+        live_count = sum(1 for message in messages if message.role != Role.system)
 
         if not transcript_valid and messages_path.exists():
             self._quarantine_corrupt_transcript(messages_path)
-            persisted_messages = []
-
-        persisted_count = len(persisted_messages)
-        current_data = [
-            SessionLogger._message_record(message) for message in non_system_messages
-        ]
-        boundary_unchanged = transcript_valid and persisted_count <= len(current_data)
-        if boundary_unchanged:
-            boundary_unchanged = persisted_messages == current_data[:persisted_count]
+            persisted_count = 0
+            boundary_unchanged = False
 
         # Preserve the existing no-op behavior only when the metadata cache
         # confirms the transcript boundary. If publication failed previously,
@@ -1003,7 +1227,7 @@ class SessionLogger:  # noqa: PLR0904
         if (
             not launch_config_dirty
             and boundary_unchanged
-            and len(current_data) == persisted_count
+            and live_count == persisted_count
         ):
             try:
                 cached_metadata = json.loads(read_safe(metadata_path).text)
@@ -1012,30 +1236,42 @@ class SessionLogger:  # noqa: PLR0904
                 ) == persisted_count and cached_metadata.get(
                     "last_message_fingerprint"
                 ) == (
-                    self._message_fingerprint(non_system_messages[-1])
-                    if non_system_messages
+                    self._message_fingerprint(last_live_message)
+                    if last_live_message is not None
                     else None
                 ):
-                    return self._cursor_for_messages(current_data, messages_path)
+                    return self._cursor_for_messages(
+                        live_count, last_live_message, messages_path
+                    )
             except (OSError, json.JSONDecodeError):
                 pass
 
         try:
             if (
-                len(current_data) > persisted_count
+                live_count > persisted_count
                 and boundary_unchanged
                 and messages_path.exists()
             ):
                 SessionLogger._persist_messages_sync(
-                    current_data[persisted_count:], session_dir
+                    SessionLogger._tail_records(messages, persisted_count), session_dir
                 )
             elif (
-                len(current_data) != persisted_count
+                live_count != persisted_count
                 or not boundary_unchanged
                 or not messages_path.exists()
             ):
-                SessionLogger._overwrite_messages_sync(current_data, session_dir)
+                SessionLogger._overwrite_messages_sync(
+                    (
+                        SessionLogger._message_record(message)
+                        for message in messages
+                        if message.role != Role.system
+                    ),
+                    session_dir,
+                )
 
+            non_system_messages = [
+                message for message in messages if message.role != Role.system
+            ]
             metadata_dump = self._interaction_metadata_dump(
                 messages, non_system_messages, stats, tool_manager, session_metadata
             )
@@ -1046,7 +1282,11 @@ class SessionLogger:  # noqa: PLR0904
             raise RuntimeError(f"Failed to save session to {session_dir}: {e}") from e
         finally:
             self.maybe_cleanup_tmp_files()
-        return self._cursor_for_messages(current_data, messages_path)
+        return self._cursor_for_messages(
+            live_count,
+            non_system_messages[-1] if non_system_messages else None,
+            messages_path,
+        )
 
     def install_launch_config(self, launch_config: LaunchMetadata) -> int:
         """Synchronously make an accepted envelope authoritative for later saves."""

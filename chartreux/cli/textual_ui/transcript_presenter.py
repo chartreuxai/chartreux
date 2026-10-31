@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from bisect import bisect_left
 from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -9,7 +10,6 @@ from weakref import WeakKeyDictionary
 from textual.widget import Widget
 
 from chartreux.app_server.models import (
-    PublicCheckpointEntry,
     PublicEffectEntry,
     PublicHistoryEntry,
     PublicMessageEntry,
@@ -125,6 +125,10 @@ class TranscriptPresenter:
         self._transcript._app = app
 
     def mounted_timing_widgets(self, entry_id: str) -> list[Widget]:
+        # Timing patches never change placement geometry, so entries that are
+        # already admitted (mounted or merely evicted) need no bulk admission.
+        if self._transcript.has_admitted_entry(entry_id):
+            return self._transcript.mounted_entry_widgets(entry_id)
         self._app._admit_live_history()
         return self._transcript.mounted_entry_widgets(entry_id)
 
@@ -182,9 +186,13 @@ class TranscriptPresenter:
                 return
         preview = TranscriptWindow()
         preview.admit(batch, start_index=start)
+        transcript = self._transcript
+        # The residency index names the mounted units; scanning the registry
+        # here would walk every unit on each live-history admission.
         mounted = {
             root
-            for unit in self._transcript.units.values()
+            for unit_id in transcript._shadow.mounted
+            if (unit := transcript.units.get(unit_id)) is not None
             for root in unit.mounted_roots
         }
         candidates = [
@@ -257,27 +265,20 @@ class TranscriptPresenter:
         if scroll_driven and idle and budget_key == self._transcript_under_budget_key:
             # Eviction/restoration bumps geometry_version; no resident scan is
             # needed on scroll ticks while the measured placement is unchanged.
+            transcript._invalidate_live_index()
             return
         if not scroll_driven:
             self._transcript_under_budget_key = None
-        has_placeholders = any(unit.placeholders for unit in transcript.units.values())
+        has_placeholders = transcript.has_placeholders
         needs_protection = has_placeholders or bool(
             transcript.eviction_candidates(chat.region.y, chat.region.height)
         )
         if scroll_driven and idle and not needs_protection:
             # Only cache the genuine under-budget case: a temporarily protected
             # over-budget unit must be reconsidered on the next scroll.
-            budgeted_rows = sum(
-                unit.mounted_roots[-1].region.bottom - unit.mounted_roots[0].region.y
-                for unit in transcript.units.values()
-                if unit.mounted_roots
-                and not unit.pin_reasons
-                and unit.mounted_roots[-1].region.bottom
-                - unit.mounted_roots[0].region.y
-                <= _TRANSCRIPT_HIGH_MARK
-            )
-            if budgeted_rows <= _TRANSCRIPT_HIGH_MARK:
+            if transcript.budgeted_rows(_TRANSCRIPT_HIGH_MARK) <= _TRANSCRIPT_HIGH_MARK:
                 self._transcript_under_budget_key = budget_key
+            transcript._invalidate_live_index()
             return
         selected = (
             self._selected_transcript_units() if needs_protection else frozenset()
@@ -294,16 +295,51 @@ class TranscriptPresenter:
         ):
             if widget is not None:
                 retained.add(widget)
-        live: set[str] = set()
-        neighbors: set[str] = set()
-        for key in self._transcript.unit_ids:
-            unit = self._transcript.units[key]
-            if (
-                self._app._active_turn_start is not None
-                and unit.start_index >= self._app._active_turn_start
-            ):
-                unit.pin_reasons.add("active-turn")
-            if needs_protection and any(
+        live, neighbors = self._protection_sets(retained, needs_protection)
+        self._transcript.request_reconcile(
+            self._app._messages_area,
+            self._history_widget_indices,
+            follow_bottom=chat.is_at_bottom,
+            selected=selected,
+            live=live,
+            compaction_neighbors=neighbors,
+        )
+
+    def _protection_sets(
+        self, retained: set[Widget], needs_protection: bool
+    ) -> tuple[frozenset[str], frozenset[str]]:
+        """Resolve retained/live and checkpoint adjacency from the indexes.
+
+        Retained/live protection is widget-side state that moves without a
+        registry transition, so the live index is a dirty-marked cache: the
+        presenter re-reads only the units the index marked dirty (a changed
+        retained set dirties every resident unit) and commits each
+        observation. A tick that evaluates no liveness invalidates the cache
+        instead of committing an unchecked empty set.
+        """
+        transcript = self._transcript
+        shadow = transcript._shadow
+        active_start = self._app._active_turn_start
+        if active_start is not None:
+            # unit_ids is ordered by start_index, so the pinned range is a
+            # suffix: bisect to its first member instead of walking the
+            # registry on every tick of the turn.
+            ids = transcript.unit_ids
+            first = bisect_left(
+                ids, active_start, key=lambda key: transcript.units[key].start_index
+            )
+            for key in ids[first:]:
+                unit = transcript.units[key]
+                if unit.start_index >= active_start:
+                    unit.pin_reasons.add("active-turn")
+                    transcript._mark_live_dirty((key,))
+        if not needs_protection:
+            transcript._invalidate_live_index()
+            return frozenset(), frozenset(shadow.neighbors)
+        transcript._begin_live_scan(retained)
+        for key in sorted(shadow.live_dirty):
+            unit = transcript.units.get(key)
+            is_live = unit is not None and any(
                 node in retained
                 or getattr(node, "_is_spinning", False)
                 or getattr(node, "_stream_write_timer", None) is not None
@@ -312,43 +348,30 @@ class TranscriptPresenter:
                 or getattr(node, "_to_write_buffer", None)
                 for root in unit.mounted_roots
                 for node in (root, *root.walk_children())
-            ):
-                live.add(key)
-        for index, key in enumerate(self._transcript.unit_ids):
-            unit = self._transcript.units[key]
-            if not any(
-                isinstance(entry, PublicCheckpointEntry) for entry in unit.entries
-            ):
-                continue
-            adjacent = self._transcript.unit_ids[max(index - 1, 0) : index + 2]
-            if any(
-                self._transcript.units[item].mounted_roots
-                for item in adjacent
-                if item != key
-            ):
-                neighbors.add(key)
-        self._transcript.request_reconcile(
-            self._app._messages_area,
-            self._history_widget_indices,
-            follow_bottom=chat.is_at_bottom,
-            selected=selected,
-            live=frozenset(live),
-            compaction_neighbors=frozenset(neighbors),
-        )
+            )
+            transcript._observe_live(key, is_live)
+        transcript._commit_live_scan()
+        return frozenset(shadow.live), frozenset(shadow.neighbors)
 
     def request_scroll_driven_reconcile(self) -> None:
         """Kick a scroll-driven reconcile tick (injected into ChatScroll)."""
         self._app._request_transcript_reconcile(scroll_driven=True)
 
     def _selected_transcript_units(self) -> frozenset[str]:
+        # Only resident units can hold a selection; the resident index bounds
+        # the walk to residency, not registry size.
         selected: set[str] = set()
-        for key, unit in self._transcript.units.items():
+        transcript = self._transcript
+        for unit_id in transcript._shadow.mounted:
+            unit = transcript.units.get(unit_id)
+            if unit is None:
+                continue
             for root in unit.mounted_roots:
                 if any(
                     getattr(node, "text_selection", None)
                     for node in (root, *root.walk_children())
                 ):
-                    selected.add(key)
+                    selected.add(unit_id)
         return frozenset(selected)
 
     def remember_transcript_anchor(self) -> None:
@@ -457,9 +480,14 @@ class TranscriptPresenter:
             else self._entry_expansion_state
         )
         previous = set(self._transcript.unit_ids)
-        self._transcript.admit(
+        prefix_shift = self._transcript.admit(
             batch, start_index=start_index, geometry_width=messages_area.size.width
         )
+        if prefix_shift and self._app._active_turn_start is not None:
+            # A re-admitted whole-history prefix shifts the whole timeline;
+            # keep the active-turn marker on its turn instead of leaving it
+            # stale-low and over-pinning the older suffix.
+            self._app._active_turn_start += prefix_shift
         new_ids = [key for key in self._transcript.unit_ids if key not in previous]
         widgets_by_unit = [
             (key, self._transcript.build_unit(key, self._history_widget_indices))

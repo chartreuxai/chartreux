@@ -1931,6 +1931,7 @@ class TurnController:  # noqa: PLR0904
             UserInputCallbackDetail(
                 request=event.args,
                 related_entry_id=event.tool_call_id,
+                origin=event.origin,
                 unattended_expiry=expiry,
             ),
             title="User input required",

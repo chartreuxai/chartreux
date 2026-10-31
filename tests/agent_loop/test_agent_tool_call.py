@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 import json
 from pathlib import Path
 from typing import Any, cast
@@ -157,9 +157,10 @@ async def test_missing_tool_response_rewrites_repeated_boundary_transcript(
     original_overwrite = SessionLogger._overwrite_messages_sync
     overwrite_calls: list[list[dict]] = []
 
-    def record_overwrite(messages: list[dict], session_dir: Path) -> None:
-        overwrite_calls.append(messages)
-        original_overwrite(messages, session_dir)
+    def record_overwrite(messages: Iterable[dict], session_dir: Path) -> None:
+        records = list(messages)
+        overwrite_calls.append(records)
+        original_overwrite(records, session_dir)
 
     monkeypatch.setattr(
         SessionLogger, "_overwrite_messages_sync", staticmethod(record_overwrite)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import ExitStack
 import os
 from pathlib import Path
@@ -183,3 +184,109 @@ def test_durable_append_repairs_missing_newline(tmp_path: Path) -> None:
     path.write_bytes(b"first")
     durable_io.durable_append(path, b"second\n", ensure_newline=True)
     assert path.read_bytes() == b"first\nsecond\n"
+
+
+class _ChunkRecordingStream:
+    """Wraps a real temp stream and records every write call separately."""
+
+    def __init__(self, stream: Any, writes: list[bytes]) -> None:
+        self._stream = stream
+        self._writes = writes
+        self.name = stream.name
+
+    def __enter__(self) -> _ChunkRecordingStream:
+        self._stream.__enter__()
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self._stream.__exit__(*exc_info)
+
+    def write(self, chunk: bytes) -> int:
+        self._writes.append(chunk)
+        return int(self._stream.write(chunk))
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def fileno(self) -> int:
+        return int(self._stream.fileno())
+
+
+def test_durable_replace_stream_writes_each_chunk_separately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "durable"
+    writes: list[bytes] = []
+    original_named_temporary_file = durable_io.tempfile.NamedTemporaryFile
+
+    def recording_named_temporary_file(**kwargs: Any) -> _ChunkRecordingStream:
+        return _ChunkRecordingStream(original_named_temporary_file(**kwargs), writes)
+
+    monkeypatch.setattr(
+        durable_io.tempfile, "NamedTemporaryFile", recording_named_temporary_file
+    )
+    durable_io.durable_replace_stream(path, iter([b"first\n", b"second\n", b"third\n"]))
+    # The payload is never joined: each chunk is written as it is produced.
+    assert writes == [b"first\n", b"second\n", b"third\n"]
+    assert path.read_bytes() == b"first\nsecond\nthird\n"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_durable_replace_stream_without_chunks_publishes_an_empty_file(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "durable"
+    path.write_bytes(b"old")
+    durable_io.durable_replace_stream(path, iter(()))
+    assert path.read_bytes() == b""
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_durable_replace_stream_fsyncs_the_file_before_renaming_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    original_fsync = os.fsync
+    original_replace = os.replace
+
+    def fsync(descriptor: int) -> None:
+        kind = "directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
+        events.append(f"{kind}_fsync")
+        original_fsync(descriptor)
+
+    def replace(source: Any, target: Any) -> None:
+        events.append("rename")
+        # The temp file is a same-directory sibling, so the rename is atomic.
+        assert Path(source).parent == Path(target).parent
+        assert Path(source) != Path(target)
+        original_replace(source, target)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    path = tmp_path / "durable"
+    path.write_bytes(b"old")
+    durable_io.durable_replace_stream(path, [b"new", b"er"])
+    assert events == ["file_fsync", "rename", "directory_fsync"]
+    assert path.read_bytes() == b"newer"
+
+
+def test_durable_replace_stream_chunk_failure_keeps_original_and_no_partial_file(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "durable"
+    path.write_bytes(b"original")
+
+    def failing_chunks() -> Iterator[bytes]:
+        yield b"partial"
+        raise OSError("injected chunk failure")
+
+    with pytest.raises(OSError, match="injected chunk failure"):
+        durable_io.durable_replace_stream(path, failing_chunks())
+    assert path.read_bytes() == b"original"
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_read_chunks_yields_bounded_chunks(tmp_path: Path) -> None:
+    path = tmp_path / "source"
+    path.write_bytes(b"abcdefghij")
+    assert list(durable_io.read_chunks(path, chunk_size=4)) == [b"abcd", b"efgh", b"ij"]

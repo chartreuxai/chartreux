@@ -177,6 +177,13 @@ EDITABLE_SETTINGS: tuple[SettingDescriptor, ...] = (
         "bool",
         "Interface",
     ),
+    _field(
+        "emit_program_status",
+        "Program Status",
+        "Report idle, working, blocked, done, and error states to the terminal.",
+        "bool",
+        "Interface",
+    ),
     SettingDescriptor(
         "status_line.segments",
         "Status Line Segments",

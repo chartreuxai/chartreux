@@ -152,3 +152,39 @@ When `enable_notifications` is enabled (the default) and the interface does not 
 ```toml
 enable_notifications = false
 ```
+
+## Program status (OSC 7501)
+
+While the interactive interface runs, Chartreux reports what the program is doing to
+terminals that implement the
+[OSC 7501 program status protocol](https://www.superlogical.com/rex/docs/build/program-status):
+`idle` at the prompt, `working` during an agent turn, `blocked` while waiting on a
+question or a permission prompt, and `done` or `error` at the end of a turn. A
+`blocked` report also names the reason (`question` or `permission`) and carries a short
+message. Presentation stays with the terminal; Chartreux draws no progress indicator of
+its own.
+
+Chartreux writes each report as the terminal's root record — `state`, an optional
+`kind`, `app=chartreux`, and an optional `msg`, with no `id` pair — which is what a
+terminal shows as the status of the pane the program runs in.
+On exit Chartreux clears its record — `done` and `error` records included — as the
+first statement of shutdown, so a finished session leaves no stale status behind. The
+clear is a bare `state=clear` that removes every OSC 7501 record on the terminal —
+Chartreux's own root record and any child records other programs wrote included. That
+deliberately diverges from spec rev 0.4, which recommends keeping `done` and `error`
+records after the program that wrote them exits: Chartreux treats the leftover record
+at the prompt as the worse outcome. A `SIGKILL` is the residual gap — the process
+never reaches shutdown, so the record survives it. The wider wipe is the accepted
+cost: a concurrent OSC 7501 program writing to the same terminal would lose its
+records at Chartreux's exit too, which the fullscreen interface makes tolerable
+because it owns the terminal while it runs.
+
+Terminals without OSC 7501 support ignore the sequence, and programmatic, headless, and
+ACP runs emit nothing. Reporting is on by default; disable it in
+[configuration](configuration.md):
+
+```toml
+emit_program_status = false
+```
+
+`CHARTREUX_EMIT_PROGRAM_STATUS=false` applies the same override from the environment.

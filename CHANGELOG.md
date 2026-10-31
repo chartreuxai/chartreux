@@ -2,6 +2,128 @@
 
 All notable changes to Chartreux are documented in this file.
 
+## 0.6.1 (2026-10-31)
+
+### Added
+
+- OSC 7501 program-status reporting for the interactive interface: while the
+  TUI runs, it reports `idle` at the prompt, `working` during an agent turn,
+  `blocked` while waiting on a user question or a permission prompt, and `done`
+  or `error` at turn end, so a supporting terminal can show what the program
+  is doing. Reporting is on by default and controlled by the new
+  `emit_program_status` key (or `CHARTREUX_EMIT_PROGRAM_STATUS`); headless,
+  programmatic, and ACP runs emit nothing, and terminals without OSC 7501
+  support ignore the sequence.
+
+- The OSC 7501 record Chartreux writes is the terminal's root record, so a
+  supporting terminal shows program status as the status of the pane Chartreux
+  runs in. Chartreux also clears that record from the terminal on exit —
+  including `done` and `error` records — as the first statement of shutdown,
+  with a bare `state=clear` that removes every OSC 7501 record on the terminal,
+  Chartreux's own root record and any child records other programs wrote
+  included. That is a deliberate, documented divergence from spec rev 0.4,
+  which recommends (as a SHOULD, not a MUST) that `done` and `error` records
+  survive the exit of the program that wrote them: a stale status at the prompt
+  is the worse outcome. A `SIGKILL` never reaches shutdown, so the record
+  survives it.
+
+- Public protocol additions: `UserInputCallbackDetail` gains `origin`
+  (serialized as an explicit `"origin": null` when unset) and `ConfigView`
+  gains `emit_program_status`. Both wire models are strict (`extra="forbid"`),
+  so the additions are forward-compatible only: a new client accepts payloads
+  from an older app server, but an older strict client rejects the new keys.
+  Clients and the app server must run the same version.
+
+### Changed
+
+- Generation retirement now drops the read-only snapshots of
+  logging-disabled subagent children (`_readable_children`): when a root
+  session generation is retired, the closed in-memory snapshots belonging to
+  it are released instead of being retained for the registry's lifetime.
+  Stored results, tombstones, and children with on-disk transcripts (read
+  through their stored links) are unaffected. Accepted degradation:
+  logging-disabled children have no disk transcript, so after their
+  generation is retired their transcripts become unreadable — transcript
+  reads fall to "no transcript", child lookups raise, and the grant ports'
+  session resolution returns None.
+
+- Adaptive streaming cadence for live assistant output: the write delay is
+  no longer a fixed 50 ms. Under sustained load the pump can run a frame
+  late, which doubled the visible frame period, so each frame now measures
+  the period it actually achieved and steers the next delay toward the
+  50 ms target, clamped to 25-150 ms. Streaming output therefore paces
+  itself instead of waiting a constant interval: the scheduled interval can
+  drop toward the 25 ms floor when a frame arrives late (back-pressure
+  shortens the next delay so the achieved period stays near the 50 ms
+  target) and can rise toward the 150 ms cap when frames arrive early.
+  Visible text can appear sooner than the old fixed cadence allowed, and
+  the worst-case scheduled interval is now 150 ms rather than 50 ms.
+
+### Performance
+
+- Long-session transcript windowing: the per-tick reconcile no longer scans
+  the whole registry. Admitted entries resolve without bulk admission, the
+  visible window resolves from a scroll-invariant ordered placement index,
+  and the reconcile's membership indexes (mounted, live, live-dirty,
+  neighbours, placeholders) are maintained incrementally instead of rebuilt
+  each tick. Measured on the registry fixture, unchanged-tick cost is flat
+  across 1k/10k/50k entries (the perf suite asserts the frozen bounds:
+  scaling <= 2.0x, tick <= 5 ms, allocation plateau <= 0.05 MiB). The shadow
+  index sets also shed their peak-sized hash tables after membership spikes.
+- Persistence memory: full transcript verification streams the persisted
+  records and compares them one by one with exact parsed-dict equality,
+  instead of loading the whole transcript and deep-comparing message lists;
+  at 20k records the verify worker's peak dropped from about 20 MiB to
+  about 8 MiB. Repair rewrites now stream through the atomic-replace writer
+  instead of materializing the rewritten payload, and checkpoint file
+  states are interned by (path, digest) with byte-equality confirmation.
+
+### Fixed
+
+- Full-verify transcript line splitting: the streamed reader reads records
+  through the file's universal-newline iteration (`\n`, `\r\n`, `\r`)
+  instead of `str.splitlines()`, which additionally splits on U+2028,
+  U+2029, `\x0b`, `\x0c`, `\x1c`-`\x1e`, and `\x85`. A persisted
+  transcript whose records embed one of those characters inside a JSON
+  string is no longer misread as corrupt on save: it verifies clean and is
+  not quarantined and rewritten. This changes corrupt-transcript
+  classification for such transcripts, which previously lost their
+  persisted boundary; genuinely unparseable lines still quarantine exactly
+  as before.
+
+- Full-verify transcript encoding detection: the streamed reader opens the
+  transcript as raw bytes and decodes with the codec its byte-order mark
+  selects (UTF-8, UTF-16, or UTF-32), as the bulk reader's `read_safe` did,
+  instead of forcing UTF-8. A BOM-marked UTF-16/UTF-32 transcript verifies
+  clean and keeps its persisted boundary instead of being quarantined as
+  corrupt. Residual difference: text without a BOM is still read as UTF-8,
+  so `read_safe`'s heuristic fallbacks (locale preference, charset
+  detection) are not reproduced — a non-UTF-8 transcript carrying no BOM
+  that the old bulk reader could guess still classifies as corrupt.
+  Mixed-encoding window: the writer still emits UTF-8, so a BOM-marked
+  non-UTF-8 transcript that verifies clean read-only becomes a
+  mixed-encoding file as soon as the next incremental append is written to
+  it, and the following full verify quarantines that file exactly as
+  before.
+
+- Transcript fingerprint admission no longer raises on a payload string
+  holding a lone surrogate (what JSON-decoding an escaped `\ud800`
+  produces): the canonical UTF-8 encoding failure now maps to the
+  always-changed fallback, so the entry is admitted and re-rendered
+  instead of aborting the window update. Persistence is forfeited for
+  such payloads: the writer's UTF-8 serialization still cannot encode a
+  lone surrogate, so while such a payload is in history every save fails;
+  the writer's format is unchanged.
+
+- Transcript fingerprints no longer collide for fold-ambiguous datetimes:
+  two datetimes with the same wall-clock time inside a DST fold (`fold=0`
+  vs `fold=1`) are different to pydantic but normalize to the same UTC
+  instant, so they previously shared a fingerprint and a window update could
+  be skipped for a changed entry. Fold-ambiguous values now compare
+  always-changed, and datetimes whose UTC conversion overflows (extreme
+  offsets near year 1 or 9999) fall back to always-changed instead of
+  aborting admission.
+
 ## 0.6.0 (2026-10-28)
 
 This is a combined release: everything shipped since v0.5.8 — the

@@ -68,8 +68,8 @@ def test_tools_inventory_intersects_filters_without_changing_other_categories(
 
 
 def test_curated_registry_is_complete_and_validated() -> None:
-    assert len(EDITABLE_SETTINGS) == len(EDITABLE_BY_PATH) == 47
-    assert len(VISIBLE_SETTINGS) == 44
+    assert len(EDITABLE_SETTINGS) == len(EDITABLE_BY_PATH) == 48
+    assert len(VISIBLE_SETTINGS) == 45
     visible = {item.path: item for item in VISIBLE_SETTINGS}
     assert visible["status_line"].control == "status_line"
     assert "status_line" not in EDITABLE_BY_PATH
@@ -146,6 +146,25 @@ def test_curated_registry_is_complete_and_validated() -> None:
     with pytest.raises(ValueError):
         TASK_DENYLIST_SETTING.validate(["ok", False])
     TASK_DENYLIST_SETTING.validate(["coder", "re:*"])
+
+
+@pytest.mark.asyncio
+async def test_emit_program_status_loads_with_default_true_and_respects_false() -> None:
+    default_overlay = OverridesLayer(data={})
+    default_orchestrator = await ConfigOrchestrator.create(
+        schema=ChartreuxConfigSchema,
+        layers=[DefaultConfigLayer(schema=ChartreuxConfigSchema), default_overlay],
+        default_layer_resolver=lambda: default_overlay,
+    )
+    assert default_orchestrator.config.emit_program_status is True
+
+    disabled_overlay = OverridesLayer(data={"emit_program_status": False})
+    disabled_orchestrator = await ConfigOrchestrator.create(
+        schema=ChartreuxConfigSchema,
+        layers=[DefaultConfigLayer(schema=ChartreuxConfigSchema), disabled_overlay],
+        default_layer_resolver=lambda: disabled_overlay,
+    )
+    assert disabled_orchestrator.config.emit_program_status is False
 
 
 @pytest.mark.asyncio

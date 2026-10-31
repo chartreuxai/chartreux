@@ -60,7 +60,10 @@ from chartreux.app_server.events import (
     TurnUpdated,
 )
 from chartreux.app_server.models import (
+    CancelledEffectState,
+    CompletedEffectState,
     ConfigIssue,
+    FailedEffectState,
     ImageAttachment,
     PreparedPrompt,
     PublicCallbackEntry,
@@ -117,6 +120,7 @@ from chartreux.cli.textual_ui.message_queue import (
     SideChannelPorts,
 )
 from chartreux.cli.textual_ui.notifications import TextualNotificationAdapter
+from chartreux.cli.textual_ui.program_status import ProgramStatusEmitter
 from chartreux.cli.textual_ui.provider_services import (
     _ProviderConfigService,
     _ProviderCredentials,
@@ -146,6 +150,7 @@ from chartreux.cli.textual_ui.turn_supervisor import (
     _INTERRUPT_WAIT_TIMEOUT as _INTERRUPT_WAIT_TIMEOUT,
     _MAX_INCOMPLETE_STREAM_RETRIES as _MAX_INCOMPLETE_STREAM_RETRIES,
     _RETRYABLE_TURN_ERROR_CODES as _RETRYABLE_TURN_ERROR_CODES,
+    TurnOutcome,
     TurnSupervisor,
     _public_entry as _public_entry,
 )
@@ -512,6 +517,61 @@ class StartupOptions:
     continue_latest: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class TurnOwnership:
+    """The session and ownership epoch a turn held when it failed.
+
+    Captured once at first failure observation and carried frozen: reading the
+    epoch live later would let a successor's ownership authorize a predecessor's
+    report.
+    """
+
+    session_id: str
+    record_epoch: int
+    terminal_turn_id: str | None
+
+
+class _OwnershipMissingSentinel:
+    """Marker for a failure whose owning epoch could not be established."""
+
+    __slots__ = ()
+
+
+_OWNERSHIP_MISSING = _OwnershipMissingSentinel()
+
+
+class _TurnEpochMap(dict[str, int]):
+    """Turn-ownership epochs that remember every entry removed from the map.
+
+    Removing an entry is how the record retires a turn, and the retirement
+    sites live in the supervisor as well as here, so the memory of what was
+    retired rides on the map itself: a duplicate ``TurnStarted`` handling must
+    never re-authorize a turn the record already handed off.
+    """
+
+    def __init__(self, retired: set[str]) -> None:
+        super().__init__()
+        self._retired = retired
+
+    def pop(self, key: str, *args: Any) -> Any:
+        if key in self:
+            self._retired.add(key)
+        return super().pop(key, *args)
+
+
+@dataclass(slots=True)
+class _BashSettlement:
+    """Terminal-report bookkeeping for one ``!bash`` invocation.
+
+    The first authoritative outcome wins: ``settled`` flips synchronously
+    before any await, so a cancellation or a late failure path reports nothing
+    over an outcome the user already saw.
+    """
+
+    settled: bool = False
+    entry_id: str | None = None
+
+
 def _split_app_server_source(
     source: AppServerSource,
 ) -> tuple[AppServerSession | None, AppServerStarter | None]:
@@ -615,6 +675,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
         startup: StartupOptions | None = None,
         current_version: str = CORE_VERSION,
         terminal_notifier: TextualNotificationAdapter | None = None,
+        program_status: ProgramStatusEmitter | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -630,6 +691,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             ),
             default_title="Chartreux",
         )
+        self._program_status = self._init_program_status(program_status)
         # The turn/interrupt/retry state moved to the turn supervisor (10.2a);
         # the app forwards every field through the properties defined below.
         # Rebinding replaces the attached session and all presentation derived
@@ -711,6 +773,33 @@ class ChartreuxApp(App):  # noqa: PLR0904
         if self._app_server is not None:
             self._initialize_client_dependencies()
 
+    def _init_program_status(
+        self, program_status: ProgramStatusEmitter | None
+    ) -> ProgramStatusEmitter:
+        """Build the emitter and the ownership state that gates its reports."""
+        # Ownership epochs decide whether a late failure may still speak for the
+        # record. Every transition that can change the owner advances the epoch,
+        # and a turn's own start either claims the acceptance-time epoch through
+        # the pending slot or bumps one of its own.
+        self._record_epoch = 0
+        self._turn_started_count = 0
+        # Retired ids never re-bind: the duplicate-binding guard below reads
+        # this set and the map's own pop records into it. Only a session
+        # replacement clears it (turn ids are per-session UUIDs), so it stays
+        # bounded across sessions without ever being wiped mid-session.
+        self._retired_turn_ids: set[str] = set()
+        self.turn_epoch_map: dict[str, int] = _TurnEpochMap(self._retired_turn_ids)
+        self._pending_start_epoch: int | None = None
+        self._active_turn_id: str | None = None
+        self._failure_tokens: dict[str, TurnOwnership | _OwnershipMissingSentinel] = {}
+        self._OWNERSHIP_MISSING = _OWNERSHIP_MISSING
+        return program_status or ProgramStatusEmitter(
+            self,
+            get_enabled=lambda: (
+                self._app_server is not None and self.config.emit_program_status
+            ),
+        )
+
     def _init_cached_widgets(self) -> None:
         self._banner: Banner | None = None
         self._whats_new_message: WhatsNewMessage | None = None
@@ -740,6 +829,116 @@ class ChartreuxApp(App):  # noqa: PLR0904
         self._session_ready.set()
         self._sync_usage_subscription()
         self._sync_terminal_title()
+        # Ready means the prompt is back: five call sites collapse onto one
+        # byte-identical idle report, and none of them changes ownership.
+        self._program_status.emit("idle")
+
+    def _advance_record_epoch(self, *, clear_retired: bool = False) -> None:
+        """Change the record's owner and invalidate any outstanding start slot.
+
+        Only a session replacement (resume, /clear, /compact, context cleared)
+        passes ``clear_retired``: turn ids are per-session UUIDs, so dropping
+        the set there keeps it bounded across sessions. Every other bump names a
+        new owner WITHIN the session — a successor's accepted start included —
+        and must leave the set alone: the predecessor's in-flight duplicate
+        binding is still waiting on its queue await, and clearing the set would
+        let it re-bind a turn that was already retired.
+        """
+        self._record_epoch += 1
+        self._pending_start_epoch = None
+        if clear_retired:
+            self._retired_turn_ids.clear()
+
+    def _started_count_snapshot(self) -> int:
+        """Ownership bindings so far, read before an enqueue await."""
+        return self._turn_started_count
+
+    def _record_accepted_start(self, started_count: int) -> None:
+        """Bump for an accepted start that no TurnStarted has bound yet.
+
+        An event-first TurnStarted binds the turn itself — through the queue's
+        own start reconciliation — before acceptance returns, so the captured
+        count moved and the start must not bump a second time.
+        """
+        if self._turn_started_count != started_count:
+            return
+        self._advance_record_epoch()
+        self._pending_start_epoch = self._record_epoch
+
+    def _record_turn_owner(self, turn_id: str) -> int:
+        """Bind *turn_id* to the epoch that owns it; idempotent per turn.
+
+        Both event routes call this synchronously, so the second call for the
+        same turn must neither bump the epoch nor count as a fresh start. The
+        bound epoch is returned so a caller that awaits before reporting can
+        gate on the ownership it was bound at.
+
+        A RETIRED turn is the exception to idempotence: its entry was removed
+        because the record handed it off (interrupt settlement, finalize, or a
+        successor's supersede). Re-binding it here would make it the owner
+        again and let its stale failure speak over the settlement that retired
+        it, so the current epoch is returned without binding or counting.
+        """
+        if turn_id in self.turn_epoch_map:
+            return self.turn_epoch_map[turn_id]
+        if turn_id in self._retired_turn_ids:
+            return self._record_epoch
+        if (
+            self._pending_start_epoch is not None
+            and self._pending_start_epoch == self._record_epoch
+        ):
+            # The acceptance already bumped; this turn claims that epoch.
+            epoch = self._pending_start_epoch
+            self._pending_start_epoch = None
+            self._turn_started_count += 1
+        else:
+            self._advance_record_epoch()
+            epoch = self._record_epoch
+            self._turn_started_count += 1
+        self.turn_epoch_map[turn_id] = epoch
+        if self._active_turn_id is not None and self._active_turn_id != turn_id:
+            # Chained predecessors never finalize, so supersede-time retirement
+            # is what keeps the map bounded along a chain.
+            self.turn_epoch_map.pop(self._active_turn_id, None)
+        self._active_turn_id = turn_id
+        return epoch
+
+    def _ownership_token_for(
+        self, error_turn_id: str | None, frozen_pair: tuple[str, int | None] | None
+    ) -> TurnOwnership | _OwnershipMissingSentinel:
+        """Freeze the ownership a failure may speak for, or withhold it.
+
+        Called synchronously at first failure observation. The session-id read is
+        the only guarded one: the app server can be absent or closing by then.
+        """
+        if error_turn_id is not None:
+            epoch = self.turn_epoch_map.get(error_turn_id)
+            if epoch is None:
+                # No live-active fallback: it could adopt a successor's epoch.
+                return self._OWNERSHIP_MISSING
+            terminal_turn_id: str | None = error_turn_id
+        else:
+            # An epoch-less pair is not a frozen context; fall through to the slot.
+            frozen_turn_id, frozen_epoch = (
+                frozen_pair if frozen_pair is not None else (None, None)
+            )
+            if frozen_epoch is not None:
+                epoch = frozen_epoch
+                terminal_turn_id = frozen_turn_id
+            elif (
+                self._pending_start_epoch is not None
+                and self._pending_start_epoch == self._record_epoch
+            ):
+                # Accepted start whose TurnStarted never arrived.
+                epoch = self._pending_start_epoch
+                terminal_turn_id = None
+            else:
+                return self._OWNERSHIP_MISSING
+        try:
+            session_id = self.app_server.session_id
+        except Exception:
+            return self._OWNERSHIP_MISSING
+        return TurnOwnership(session_id, epoch, terminal_turn_id)
 
     def _on_session_title_changed(self, title: str) -> None:
         self._terminal_notifier.set_default_title(title)
@@ -864,8 +1063,14 @@ class ChartreuxApp(App):  # noqa: PLR0904
 
     def _clear_active_turn_pins(self) -> None:
         self._active_turn_start = None
+        released: list[str] = []
         for unit in self._transcript.units.values():
-            unit.pin_reasons.discard("active-turn")
+            if "active-turn" in unit.pin_reasons:
+                unit.pin_reasons.discard("active-turn")
+                released.append(unit.id)
+        # Protection released outside the registry: the shadow index's cached
+        # liveness for these placements is no longer trustworthy.
+        self._transcript._mark_live_dirty(released)
 
     def _set_loading_queue_count(self, count: int) -> None:
         if self._loading_widget is not None:
@@ -2086,6 +2291,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
             case Skill(command=command):
                 await self._handle_user_message(command)
             case Bash(command=command):
+                # A shell run has no turn id and never enters the epoch map,
+                # but it does own the record: the bump is what keeps a detached
+                # predecessor failure from reporting over it.
+                self._advance_record_epoch()
                 self._bash_task = asyncio.create_task(
                     self._handle_bash_command(command)
                 )
@@ -2757,16 +2966,53 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return None
         return Skill(command=user_input, name=skill.name)
 
+    def _settle_bash(
+        self, settlement: _BashSettlement, state: str, msg: str | None = None
+    ) -> None:
+        """Report the terminal state of one ``!bash`` run; the first one wins.
+
+        Synchronous on purpose: every caller settles before it awaits, so a
+        cancellation arriving inside a later await cannot displace the outcome
+        the user already saw.
+        """
+        if settlement.settled:
+            return
+        settlement.settled = True
+        self._program_status.emit(state, msg=msg)
+
+    def _report_shell_effect(
+        self, settlement: _BashSettlement, entry: PublicHistoryEntry
+    ) -> None:
+        """Map this run's own shell entry terminal state onto a report."""
+        if not isinstance(entry, PublicEffectEntry):
+            return
+        state = entry.state
+        if isinstance(state, CompletedEffectState):
+            self._settle_bash(settlement, "done")
+        elif isinstance(state, FailedEffectState):
+            # The error's own message wins; the captured output is the fallback.
+            message = state.error.message or state.output_text
+            self._settle_bash(settlement, "error", message)
+        elif isinstance(state, CancelledEffectState):
+            self._settle_bash(settlement, "idle")
+
     async def _handle_bash_command(self, command: str) -> None:
+        settlement = _BashSettlement()
         try:
-            await self._handle_bash_command_inner(command)
+            await self._handle_bash_command_inner(command, settlement)
         finally:
+            if not settlement.settled:
+                # Unwound before any terminal event -- typically a cancellation
+                # during setup or cleanup: the prompt is back either way.
+                self._settle_bash(settlement, "idle")
             current = asyncio.current_task()
             if self._bash_task is current:
                 self._bash_task = None
             self._queue.notify_busy_changed()
 
-    async def _handle_bash_command_inner(self, command: str) -> None:
+    async def _handle_bash_command_inner(
+        self, command: str, settlement: _BashSettlement
+    ) -> None:
         if not command:
             await self._mount_and_scroll(
                 ErrorMessage(
@@ -2775,21 +3021,32 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
             return
 
-        await self._ensure_loading_widget("Running command")
-        self._queue.notify_busy_changed()
+        # Bound before the try: the finally reads it when a cancellation lands
+        # inside the loading-widget await itself, and it is re-read after that
+        # await because the widget may have been replaced meanwhile.
         bash_loading_widget = self._loading_widget
-
         try:
+            await self._ensure_loading_widget("Running command")
+            bash_loading_widget = self._loading_widget
+            self._program_status.emit("working")
+            self._queue.notify_busy_changed()
             async for event in self.app_server.resources.shell.run(command):
+                if settlement.entry_id is None:
+                    settlement.entry_id = event.entry.id
+                # Settled before the forwarding await: a cancellation inside
+                # the handler must not displace this run's own outcome.
+                self._report_shell_effect(settlement, event.entry)
                 if self.event_handler is not None:
                     await self.event_handler.handle_event(
                         event, loading_widget=self._loading_widget
                     )
         except asyncio.CancelledError:
-            pass
+            self._settle_bash(settlement, "idle")
         except Exception as e:
+            message = f"Command failed: {e}"
+            self._settle_bash(settlement, "error", message)
             await self._mount_and_scroll(
-                ErrorMessage(f"Command failed: {e}", collapsed=self._tools_collapsed)
+                ErrorMessage(message, collapsed=self._tools_collapsed)
             )
         finally:
             if self._loading_widget is bash_loading_widget:
@@ -2803,20 +3060,35 @@ class ChartreuxApp(App):  # noqa: PLR0904
         # renders it as a normal message (not "queued") -- matching the legacy
         # local-turn behavior. _begin_unsolicited_turn clears it on TurnStarted.
         self._begin_pending_turn()
-        await self._ensure_loading_widget()
+        # Read before the awaits below: a detached predecessor fallback can emit
+        # a durable `error` while this prompt is being enqueued, and that report
+        # owns the record. The cleanup paths then leave it alone instead of
+        # overwriting it with an idle the prompt never reached.
+        generation = self._program_status.generation
         try:
+            await self._ensure_loading_widget()
+            started_count = self._started_count_snapshot()
             if await self._enqueue_prompt_with_resources(
                 message, optimistic_start=True
             ):
+                # Only an accepted start owns the record, so the bump and the
+                # report land together and a detached fallback cannot slip in
+                # between them.
+                self._record_accepted_start(started_count)
+                self._program_status.emit("working")
                 return
         except BaseException:
             self._turn_supervisor._clear_pending_turn()
             self._clear_active_turn_pins()
+            if self._program_status.generation == generation:
+                self._program_status.emit("idle")
             raise
         # Enqueue was rejected (e.g. prompt prep aborted): leave the in-flight
         # state so the UI returns to idle instead of a stuck spinner.
         self._turn_supervisor._clear_pending_turn()
         self._clear_active_turn_pins()
+        if self._program_status.generation == generation:
+            self._program_status.emit("idle")
         await self._remove_loading_widget()
         input_widget = self.query_one(ChatInputContainer)
         if not input_widget.value:
@@ -2937,6 +3209,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._root_compacting = False
             self._refresh_context_progress()
         if isinstance(event, TurnStarted):
+            self._record_turn_owner(event.turn.id)
             self._refresh_context_progress()
         if isinstance(event, TurnCompleted):
             self._schedule_branch_refresh()
@@ -3020,6 +3293,8 @@ class ChartreuxApp(App):  # noqa: PLR0904
             self._sync_retry_command_availability()
 
     async def _shutdown(self) -> None:
+        # First, so a later teardown step can neither skip nor delay the clear.
+        self._program_status.clear_record()
         # Stop consuming app-server events before Textual tears down the DOM.
         # An in-flight turn (e.g. a queued skill) can still be streaming effects
         # that _listen_app_server_events mounts; Textual only cancels workers
@@ -3052,6 +3327,13 @@ class ChartreuxApp(App):  # noqa: PLR0904
                     await self._resume_ui_ready.wait()
                     async with self._app_server_event_handler_lock:
                         if isinstance(event, TurnStarted):
+                            # Bind before the awaits below: the turn owns the
+                            # record from here on, and a failure observed during
+                            # them must already resolve to this epoch. The bound
+                            # epoch travels to the supervisor, because the queue
+                            # await can settle the record and hand ownership to
+                            # a newer one before the turn is surfaced.
+                            bound_epoch = self._record_turn_owner(event.turn.id)
                             self._active_turn_start = (
                                 self._active_turn_start
                                 if self._active_turn_start is not None
@@ -3063,7 +3345,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
                             # wake any interrupt waiting for it.
                             self._turn_supervisor._clear_pending_turn()
                             await self._queue.turn_started(event.turn.queue_item_id)
-                            await self._turn_supervisor._begin_unsolicited_turn()
+                            await self._turn_supervisor._begin_unsolicited_turn(
+                                bound_epoch=bound_epoch
+                            )
                         await self._handle_turn_event(event)
                         if isinstance(event, TurnCompleted):
                             await self._turn_supervisor._complete_unsolicited_turn(
@@ -3127,10 +3411,16 @@ class ChartreuxApp(App):  # noqa: PLR0904
         )
 
     async def _finalize_turn_ui(
-        self, *, notify_complete: bool = True, turn_ui_generation: int | None = None
+        self,
+        *,
+        notify_complete: bool = True,
+        turn_ui_generation: int | None = None,
+        outcome: TurnOutcome = TurnOutcome.NO_REPORT,
     ) -> None:
         await self._turn_supervisor.finalize_turn_ui(
-            notify_complete=notify_complete, turn_ui_generation=turn_ui_generation
+            notify_complete=notify_complete,
+            turn_ui_generation=turn_ui_generation,
+            outcome=outcome,
         )
 
     async def _interrupt_turn(self) -> None:
@@ -3710,6 +4000,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         await self._session_flow.on_session_picker_app_cancelled(event)
 
     async def _resume_local_session(self, session_id: str) -> None:
+        # A resume replaces the session, so the record changes owner here; the
+        # bump precedes the cancellation so it cannot emit an idle of its own.
+        self._advance_record_epoch(clear_retired=True)
         # R2/OD3: a session change invalidates any pending automatic
         # continuation synchronously (the schedule belongs to the old
         # session's episode; the gate is invalidated server-side too).
@@ -3797,7 +4090,7 @@ class ChartreuxApp(App):  # noqa: PLR0904
             return str(e)
         return None
 
-    async def _config_command(self, **kwargs: Any) -> None:
+    async def _config_command(self, **kwargs: Any) -> None:  # noqa: PLR0912, PLR0915
         """Open the user config file in an external editor, then reload on change."""
         config_path = get_chartreux_home() / "config.toml"
         try:
@@ -3836,8 +4129,24 @@ class ChartreuxApp(App):  # noqa: PLR0904
             if config_path.is_symlink():
                 raise OSError("Config file is a symbolic link")
             before = config_path.read_text("utf-8")
+            try:
+                ExternalEditor.resolve_command()
+            except OSError:
+                await self._mount_and_scroll(
+                    ErrorMessage(
+                        f"Could not start editor: {ExternalEditor.get_editor()}",
+                        collapsed=self._tools_collapsed,
+                    )
+                )
+                return
+            editor_error: Exception | None = None
             with self.suspend():
-                ExternalEditor.edit_file(config_path, check=True)
+                try:
+                    ExternalEditor.edit_file(config_path, check=True)
+                except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+                    editor_error = exc
+            if editor_error is not None:
+                raise editor_error
             changed = config_path.read_text("utf-8") != before
         except SuspendNotSupported:
             await self._mount_and_scroll(
@@ -3947,6 +4256,11 @@ class ChartreuxApp(App):  # noqa: PLR0904
             )
             return
 
+        # /clear starts a fresh conversation: the record changes owner and the
+        # prompt is back, so the terminal hears idle rather than the old turn.
+        self._advance_record_epoch(clear_retired=True)
+        self._program_status.emit("idle")
+
         if prompt:
             await self._handle_user_message(prompt)
 
@@ -3957,6 +4271,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         on-screen widgets and posts a notice that implementation is starting. The
         approved plan is re-mounted so it stays visible in the discussion.
         """
+        # The handoff replaces the session, so the record changes owner too.
+        self._advance_record_epoch(clear_retired=True)
+        self._program_status.emit("idle")
         await self._reset_message_widgets()
         if plan_file_path is not None:
             await self._mount_and_scroll(PlanFileMessage(file_path=plan_file_path))
@@ -4038,6 +4355,10 @@ class ChartreuxApp(App):  # noqa: PLR0904
             # own and it would keep showing the context compaction replaced.
             self._refresh_context_progress()
             compact_msg.set_complete()
+            # Compaction rewrote the context: the record changes owner back to
+            # an idle prompt instead of leaving the pre-compaction state.
+            self._advance_record_epoch(clear_retired=True)
+            self._program_status.emit("idle")
 
         except asyncio.CancelledError:
             compact_msg.set_error("Compaction interrupted")
@@ -4868,6 +5189,9 @@ class ChartreuxApp(App):  # noqa: PLR0904
         # Textual doesn't repaint after resuming from Ctrl+Z (SIGTSTP);
         # force a full layout refresh so the UI isn't garbled.
         self.refresh(layout=True)
+        # The terminal drops the record when the shell prompt reappears, so the
+        # last report is re-sent; this bypasses the dedup cache on purpose.
+        self._program_status.republish()
 
     def _handle_exception(self, error: Exception) -> None:
         if not isinstance(error, WorkerFailed):

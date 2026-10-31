@@ -6,6 +6,7 @@ retrying must reconcile that state rather than assume the write did not happen.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 import contextlib
 import os
 from pathlib import Path
@@ -83,16 +84,29 @@ def durable_append(
         fsync_directory(path.parent)
 
 
-def durable_replace(path: Path, content: bytes) -> None:
-    """Publish an owner-only same-directory replacement with file and dir barriers.
+def read_chunks(path: Path, *, chunk_size: int = 1024 * 1024) -> Iterator[bytes]:
+    """Yield a file's bytes in bounded chunks, never holding the whole file."""
+    with path.open("rb") as stream:
+        while chunk := stream.read(chunk_size):
+            yield chunk
 
-    The parent must exist. Failure after replace is not a rollback.
+
+def durable_replace_stream(path: Path, chunks: Iterable[bytes]) -> None:
+    """Stream chunks into an owner-only same-directory replacement (P4b).
+
+    Each chunk is written and dropped before the next is requested, so the
+    payload is never resident whole. Barriers match ``durable_replace``: the
+    temp file is synced before the rename publishes it, and the parent
+    directory is synced after. A failure before the rename — including one
+    raised by the chunk source — leaves ``path`` exactly as it was and
+    removes the temp file; a failure after the rename is not a rollback.
     """
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
             temp_path = Path(stream.name)
-            stream.write(content)
+            for chunk in chunks:
+                stream.write(chunk)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp_path, path)
@@ -101,3 +115,11 @@ def durable_replace(path: Path, content: bytes) -> None:
         if temp_path is not None:
             with contextlib.suppress(FileNotFoundError):
                 temp_path.unlink()
+
+
+def durable_replace(path: Path, content: bytes) -> None:
+    """Publish an owner-only same-directory replacement with file and dir barriers.
+
+    The parent must exist. Failure after replace is not a rollback.
+    """
+    durable_replace_stream(path, (content,))

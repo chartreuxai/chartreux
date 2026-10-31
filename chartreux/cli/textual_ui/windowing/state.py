@@ -45,6 +45,11 @@ class SessionWindowing:
         start_index = max(self._backfill_cursor - self.load_more_batch_size, 0)
         batch = self._backfill_entries[start_index : self._backfill_cursor]
         self._backfill_cursor = start_index
+        if start_index == 0:
+            # Full admission: release the backfill list. Entries aliased by
+            # the live projection history stay alive; superseded versions
+            # pinned only here become collectable.
+            self._backfill_entries = []
         if not batch:
             return None
         return LoadMoreBatch(start_index=start_index, entries=batch)

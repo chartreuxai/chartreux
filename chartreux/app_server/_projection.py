@@ -134,6 +134,7 @@ def project_config_view(
         ),
         ascii_chrome=config.ascii_chrome,
         enable_notifications=config.enable_notifications,
+        emit_program_status=config.emit_program_status,
         enable_system_trust_store=config.enable_system_trust_store,
         models=[
             _project_model_config(model) for model in config.available_models().values()

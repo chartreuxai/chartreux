@@ -32,6 +32,7 @@ POPULAR_SETTINGS: frozenset[str] = frozenset({
     "autocopy_to_clipboard",
     "ask_confirmation_on_exit",
     "enable_notifications",
+    "emit_program_status",
 })
 
 _SCALAR_KINDS: tuple[tuple[type, ConfigFieldKind], ...] = (

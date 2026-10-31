@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 import os
+import sys
 from time import perf_counter_ns
-from typing import TypedDict
+from types import SimpleNamespace
+from typing import Any, TypedDict, cast
 from weakref import WeakKeyDictionary
 
 import pytest
-from textual.geometry import Size
+from textual.geometry import Region, Size
 from textual.pilot import Pilot
 from textual.screen import Screen
 from textual.widget import Widget
@@ -19,11 +21,14 @@ from chartreux.app_server.models import (
     CompletedEffectState,
     PublicCheckpointEntry,
     PublicEffectEntry,
+    PublicEntryGenerationStatus,
     PublicHistoryEntry,
     PublicMessageEntry,
+    TextContentBlock,
 )
 from chartreux.app_server.session import AppServerSession
 from chartreux.cli.textual_ui.app import _TRANSCRIPT_HIGH_MARK, ChartreuxApp, ChatScroll
+from chartreux.cli.textual_ui.transcript_presenter import TranscriptPresenter
 from chartreux.cli.textual_ui.widgets.collapsible import CollapsibleSection
 from chartreux.cli.textual_ui.widgets.entry_expansion import EntryExpansionState
 from chartreux.cli.textual_ui.widgets.load_more import HistoryLoadMoreMessage
@@ -33,7 +38,16 @@ from chartreux.cli.textual_ui.widgets.tools import ToolGroup, ToolResultMessage
 from chartreux.cli.textual_ui.windowing.history import _build_history_widgets_raw
 from chartreux.cli.textual_ui.windowing.transcript import TranscriptWindow
 from tests.conftest import build_test_agent_loop, build_test_chartreux_app
-from tests.perf._metrics import machine_context, percentiles, record
+from tests.perf._metrics import (
+    alloc_peak,
+    machine_context,
+    measure_loop_lag,
+    percentiles,
+    record,
+    repeat_timed_ms,
+    rss_mib,
+    rss_peak_mib,
+)
 from tests.perf._transcript import (
     OVERSIZED_GROUP_LINE_COUNT,
     SHELL_LINE_COUNT,
@@ -1259,4 +1273,1149 @@ async def test_transcript_windowing_baseline(
             "warmup_sample": warmup_metrics,
             "machine": machine_context(),
         },
+    )
+
+
+# --- P0a: bounded registry-scale baseline ----------------------------------
+#
+# Measures the reconcile scans as a function of REGISTRY size at a FIXED
+# residency, with no Textual app and no DOM: a bare TranscriptWindow for the
+# engine scans, plus the real TranscriptPresenter tick (the gate
+# ``TranscriptPresenter.request_transcript_reconcile``, where the
+# registry-wide scans lived pre-P3b2b) driven against a stub host. The
+# existing 400-entry scenario above measures bounded residency through the
+# app; this fixture measures the denominators that bound registry scale, and
+# it is scope-independent (it does not follow _ENTRY_COUNTS
+# or _REPETITIONS).
+#
+# This fixture RECORDS the pre-optimization baseline and FREEZES the values
+# later packages compare against. The flat-scaling, unchanged-tick, and
+# allocation-plateau assertions below were gated off at P0a and are TURNED ON
+# by P3b2b's gate cutover; P3b1 turned the anchor-scaling assertion on with
+# its ordered placement index. Exceeding a frozen ceiling is a blocker;
+# meeting a frozen improvement bound is the named later package's
+# acceptance.
+#
+# FROZEN FIXTURE SIZE (decided here, before any threshold): 50k, not the 20k
+# fallback. Measured on the baseline machine while deciding: admission 1.30 s
+# untraced / 3.88 s traced, presenter tick 39.7 ms p50 at 50k, whole three-size
+# fixture ~11 s against the package's 60 s budget. Runtime therefore never
+# argues for the fallback, while 20k would halve the 1k->top span that makes the
+# P3b2b flat-scaling bound discriminating (the recorded baseline grows 82.7x
+# from 1k to 50k; the frozen bound is 2.0x).
+#
+# Entries are deliberately ungrouped (one registry unit per entry) so registry
+# size maps to a known unit count; tool-group unit behavior is covered by the
+# Textual scenario above and by the windowing suites, not re-measured here.
+
+_REGISTRY_SIZES = (1_000, 10_000, 50_000)
+_REGISTRY_TOP_SIZE = 50_000
+_REGISTRY_RESIDENT_UNITS = 24
+_REGISTRY_RESIDENT_ROWS = 6
+_REGISTRY_CHECKPOINT_STRIDE = 50
+_REGISTRY_GEOMETRY_WIDTH = TRANSCRIPT_WIDTH
+_REGISTRY_VIEWPORT_HEIGHT = TRANSCRIPT_HEIGHT
+_REGISTRY_TICKS = 16
+_REGISTRY_ANCHOR_REPS = 8
+# ACTIVE-TURN VARIANT (deep-review finding 1). The fixture used to run only
+# with _active_turn_start = None, so the presenter's active-turn pin path
+# (_protection_sets: the start_index bisect and the pinned-suffix walk) was
+# never measured at registry scale. The deep review measured that path at
+# 52.6x from 1k to 50k and 12.4 ms per tick at 50k -- inside all three frozen
+# P3b2b bounds, so none of them could see the regression. The variant below
+# sets a non-None start on this same fixture: a turn begins at the registry
+# tail (its own newest units are the resident ones a real turn pins), so the
+# pinned suffix is a constant 24 units at every size. A return to the
+# registry-wide walk then fails the flat-scaling bound: a scratch probe of the
+# pre-fix loop on this fixture's 50k registry measured 2.48 ms p50 against
+# 0.0023 ms for the shipped suffix walk, i.e. ~50x from 1k to 50k.
+# SCOPE LIMIT (deep-review round 5, disposition): the per-tick pin walk is
+# O(turn units) -- the suffix bisect is O(log units) but the pin loop visits
+# every unit of the turn -- and this variant fixes the turn at the resident
+# unit count, so the frozen P3b2b ceilings are met at every registry size.
+# A turn LONGER than _REGISTRY_RESIDENT_UNITS is therefore NOT observed by
+# the frozen ceilings: those ticks stay proportional to the turn, not to
+# registry size, which is the property the ceilings bound. Recorded only; no
+# large-turn variant is measured here.
+_REGISTRY_ACTIVE_TURN_UNITS = _REGISTRY_RESIDENT_UNITS
+# Queries per timed sample. One indexed anchor lookup costs microseconds, below
+# what the millisecond percentile rounding can resolve, so each sample batches
+# them and the ratio compares like with like.
+_REGISTRY_ANCHOR_QUERIES = 32
+# Wall-clock guard only, not a per-measurement ceiling: the recorded baseline
+# runs in roughly 11 s against the package's 60 s budget.
+_REGISTRY_TIMEOUT = 180
+
+# FROZEN CEILINGS (P0a). Non-regression upper bounds: exceeding one is a
+# blocker, never a threshold change. PERF SCOPE: these apply in BOTH perf
+# scopes -- the default 400-entry x 2-rep transcript smoke and
+# CHARTREUX_PERF_TRANSCRIPT_FULL=1 -- because this fixture is scope-independent.
+# Baseline: the committed perf-baselines/p0a-registry-baseline.jsonl run at
+# 57217e5f (whole-file order, so the registry fixture runs after the ~380 s
+# Textual scenario in the same process): admission p50 13.9/150.6/2098.2 ms,
+# tick p50 0.79/8.88/80.65 ms. Run-to-run variance on this host: 50k admission
+# 2.10-3.17 s, 50k tick p50 80.65-84.80 ms. An isolated -k run measures lower,
+# so these cover both. Values are 4x (latency) or 6x (tick max, memory) that
+# recorded baseline, so host load cannot mask a real regression.
+# MEMORY CEILINGS ARE FIRST-OBSERVATION BASELINES: no earlier recorded values
+# exist for them (tick alloc peak 0.013/0.082/0.387 MiB, admission alloc peak
+# 3.06/30.83/157.36 MiB, admission RSS delta 0.0/16.5/122.3 MiB -- RSS deltas
+# vary with heap warmth, hence the 1k floor at 25 MiB).
+_REGISTRY_ADMIT_P50_CEILING_MS = {1_000: 62.0, 10_000: 640.0, 50_000: 12_700.0}
+_REGISTRY_TICK_P50_CEILING_MS = {1_000: 3.2, 10_000: 56.0, 50_000: 340.0}
+_REGISTRY_TICK_MAX_CEILING_MS = {1_000: 6.5, 10_000: 105.0, 50_000: 540.0}
+_REGISTRY_TICK_ALLOC_CEILING_MIB = {1_000: 0.08, 10_000: 0.5, 50_000: 2.4}
+_REGISTRY_ADMIT_ALLOC_CEILING_MIB = {1_000: 19.0, 10_000: 185.0, 50_000: 945.0}
+_REGISTRY_ADMIT_RSS_CEILING_MIB = {1_000: 25.0, 10_000: 74.0, 50_000: 460.0}
+
+# FROZEN IMPROVEMENT BOUNDS (P0a) -- acceptance values for LATER packages, not
+# baseline properties. A miss by the named package is a blocker for that
+# package. Recorded denominators (committed artifact, second run in brackets):
+# tick p50 1k=0.79 ms / 50k=80.65 ms, 102x (107x), with 6 registry visits per
+# unit per tick (6,000 / 300,000); tick allocation peak 50k=0.387 MiB; anchor
+# query 50k=13.50 ms against 1k=0.101 ms, 134x (196x), because the oldest-first
+# scan walked the whole registry. The 1k anchor sample is sub-0.1 ms, so its
+# ratio is the noisy side of that bound; the 50k absolute value is stable.
+# ANCHOR SAMPLES ARE NOW BATCHED: P3b1's ordered placement index answers the
+# query in microseconds, so each sample times _REGISTRY_ANCHOR_QUERIES lookups
+# and the ratio stays a like-for-like comparison of per-query cost.
+_P3B2B_FLAT_SCALING_MAX_RATIO = 2.0
+_P3B2B_UNCHANGED_TICK_MAX_MS = 5.0
+_P3B2B_ALLOC_PLATEAU_MAX_MIB = 0.05
+_P3B1_ANCHOR_SCALING_MAX_RATIO = 2.0
+# The indexed query reads content order and live rows only, so it must not walk
+# the registry at all; the replaced oldest-first scan visited every unit
+# (~50k per query at the top size).
+_P3B1_ANCHOR_REGISTRY_VISIT_CEILING = 0
+
+# FROZEN IMPROVEMENT BOUND (P2b). P0a recorded admission-time retention cost
+# WITH entry_snapshots live: traced admission alloc peak 3.056 / 30.8276 /
+# 157.3558 MiB at 1k / 10k / 50k, from the committed
+# perf-baselines/p0a-registry-baseline.meta.json run at 57217e5f. P2b replaced
+# those per-entry deep copies with per-entry fingerprints. Measured on this
+# tree (f82706a6): 1.4364 / 14.4111 / 76.9472 MiB, i.e. 53.0% / 53.3% / 51.1%
+# below the baseline. The bound freezes 40%, ~11 points under the worst
+# measured size, so a regression that brings any share of the copies back is
+# a blocker. Full record: perf-baselines/p2b-snapshot-retention-bound.meta.json.
+_P2B_BASELINE_ADMIT_ALLOC_PEAK_MIB = {1_000: 3.056, 10_000: 30.8276, 50_000: 157.3558}
+_P2B_ADMIT_ALLOC_REDUCTION_MIN_PCT = 40.0
+
+# Populated by test_transcript_registry_scale_baseline; the bound tests below
+# read it. File order populates it before they could run.
+_REGISTRY_BASELINE: dict[int, dict[str, float]] = {}
+
+
+def _registry_entry(index: int) -> PublicHistoryEntry:
+    if index % _REGISTRY_CHECKPOINT_STRIDE == _REGISTRY_CHECKPOINT_STRIDE - 1:
+        return PublicCheckpointEntry(
+            id=f"registry-checkpoint-{index:06d}",
+            session_id="registry-perf-session",
+            turn_id=None,
+            created_at=index,
+            updated_at=index,
+            generation_status=PublicEntryGenerationStatus.COMPLETED,
+            kind="compaction",
+            message="Synthetic registry compaction checkpoint",
+        )
+    return PublicMessageEntry(
+        id=f"registry-message-{index:06d}",
+        session_id="registry-perf-session",
+        turn_id=f"registry-turn-{index // 6:06d}",
+        created_at=index,
+        updated_at=index,
+        generation_status=PublicEntryGenerationStatus.COMPLETED,
+        role="assistant" if index % 2 else "user",
+        content=[TextContentBlock(text=f"Registry fixture body {index:06d}.")],
+        source="harness",
+    )
+
+
+def _build_registry_entries(entry_count: int) -> list[PublicHistoryEntry]:
+    return [_registry_entry(index) for index in range(entry_count)]
+
+
+class _StubPlacementStream(Widget):
+    """Placement parent that lets the fixture register roots without a mount.
+
+    ``register_mounted`` validates that a unit's roots share one ``Widget``
+    parent and are contiguous there; layout stays stubbed, so ``children`` and
+    ``size`` stand in for measured geometry.
+    """
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self._stub_children: list[Widget] = []
+        self._stub_size = Size(width, _REGISTRY_VIEWPORT_HEIGHT)
+
+    @property
+    def children(self) -> Sequence[Widget]:
+        return self._stub_children
+
+    @property
+    def size(self) -> Size:
+        return self._stub_size
+
+    def attach(self, placement: Widget) -> None:
+        self._stub_children.append(placement)
+
+
+class _PlacementStub(Widget):
+    """Screen-geometry stand-in for one mounted placement root.
+
+    The registry reads ``region`` off mounted roots and walks their children.
+    A real Textual mount would measure layout instead of registry scale and
+    cost seconds per size, so the fixture registers these with the real
+    ``register_mounted`` seam and stubs the measured region.
+    """
+
+    def __init__(self, parent: _StubPlacementStream, top: int, height: int) -> None:
+        super().__init__()
+        self._stub_parent = parent
+        self._stub_region = Region(0, top, parent.size.width, height)
+
+    @property
+    def parent(self) -> _StubPlacementStream | None:
+        return self._stub_parent
+
+    @property
+    def region(self) -> Region:
+        return self._stub_region
+
+    @property
+    def text_selection(self) -> None:
+        # The selection gate reads this off mounted rows; an unmounted stub
+        # has none (and no screen to resolve one against).
+        return None
+
+
+class _StubPlaceholder:
+    """Stand-in for an evicted unit's PlacementPlaceholder with fixed geometry."""
+
+    __slots__ = ("parent", "region")
+
+    def __init__(self, top: int, height: int = 8) -> None:
+        self.parent = None
+        self.region = Region(0, top, _REGISTRY_GEOMETRY_WIDTH, height)
+
+    def invalidate_geometry(self) -> None:
+        return None
+
+
+class _SpikeRoot:
+    """Mounted-root stand-in for the mounted-spike phase (finding G).
+
+    The spike mounts the whole registry and is evicted before any tick runs,
+    so no scan ever reads these roots; they exist only to drive
+    ``shadow.mounted`` through its peak and back down.
+    """
+
+    __slots__ = ("region",)
+
+    def __init__(self) -> None:
+        self.region = Region(0, -8, _REGISTRY_GEOMETRY_WIDTH, 8)
+
+
+class _VisitCounter:
+    """Counts registry unit visits made by the reconcile scans in one tick."""
+
+    __slots__ = ("visits",)
+
+    def __init__(self) -> None:
+        self.visits = 0
+
+
+class _CountingUnitIds(list[str]):
+    """Registry id list that counts the ``unit_ids`` traversals scans perform.
+
+    Slices are not counted (the checkpoint-neighbour slice adds at most three
+    visits per checkpoint unit); the full traversals are the denominators.
+    """
+
+    def __init__(self, unit_ids: list[str], counter: _VisitCounter) -> None:
+        super().__init__(unit_ids)
+        self.counter = counter
+
+    def __iter__(self) -> Iterator[str]:
+        for unit_id in super().__iter__():
+            self.counter.visits += 1
+            yield unit_id
+
+
+class _StubMessagesArea:
+    """Minimal stand-in for the app's message area, which is reconcile's stream."""
+
+    def __init__(self, width: int, height: int) -> None:
+        self.size = SimpleNamespace(width=width, height=height)
+        self.virtual_size = SimpleNamespace(width=width, height=height)
+        self.region = SimpleNamespace(y=0, bottom=height, height=height)
+        self.parent = None
+
+
+class _StubChatScroll:
+    """Minimal stand-in for the chat scroll container."""
+
+    def __init__(self, height: int) -> None:
+        self.region = SimpleNamespace(y=0, bottom=height, height=height)
+        self.is_at_bottom = True
+
+
+class _PresenterHostStub:
+    """Exactly the host attributes ``request_transcript_reconcile`` reads."""
+
+    def __init__(self, width: int, height: int) -> None:
+        self._shutdown_started = False
+        self._chat_widget = _StubChatScroll(height)
+        self._messages_area = _StubMessagesArea(width, height)
+        self.event_handler = None
+        self._rewind_highlighted_widget = None
+        self._queue_selected_widget = None
+        self._agent_transcript_focus_target = None
+        self._active_turn_start = None
+
+
+class _RetainedWidgetsStub:
+    """``event_handler`` stand-in whose retained set holds the given widgets."""
+
+    def __init__(self, widgets: list[Widget]) -> None:
+        self._widgets = widgets
+
+    def retained_widgets(self) -> set[Widget]:
+        return set(self._widgets)
+
+
+def _place_resident_units(
+    window: TranscriptWindow, stream: _StubPlacementStream
+) -> None:
+    """Give the tail units fixed placement geometry inside the viewport.
+
+    The resident window sits at the END of the registry -- a long session
+    scrolled to its newest messages -- so the anchor query resolves against
+    resident rows only while resident rows stay far under the eviction high
+    mark (24 * 6 rows against 1500), which keeps residency fixed across sizes.
+    """
+    resident_ids = window.unit_ids[-_REGISTRY_RESIDENT_UNITS:]
+    for offset, unit_id in enumerate(resident_ids):
+        stub = _PlacementStub(
+            stream, offset * _REGISTRY_RESIDENT_ROWS, _REGISTRY_RESIDENT_ROWS
+        )
+        stream.attach(stub)
+        window.register_mounted(unit_id, [stub])
+
+
+def _evict_to_placeholders(window: TranscriptWindow, resident: int) -> int:
+    """Give every non-resident unit a stub placeholder above the viewport.
+
+    Simulates evicting all but the resident tail, so placeholders dominate the
+    registry (deep-review rerun E1: the idle and active-turn variants assert
+    zero placeholders and cannot see the restore path's per-tick cost). The
+    stub regions keep the placement regions monotonic in content order -- the
+    resident tail sits at the viewport top, the evicted slots above it.
+    """
+    total = len(window.unit_ids)
+    for position, unit_id in enumerate(window.unit_ids):
+        if position >= total - resident:
+            continue
+        unit = window.units[unit_id]
+        unit.mounted_roots = []
+        unit.placeholders = [cast("Any", _StubPlaceholder((position - total) * 8))]
+        window._shadow_unit(unit)
+    window._placements = list(window.unit_ids)
+    return total - resident
+
+
+def _frozen_registry_baseline() -> dict[int, dict[str, float]]:
+    assert _REGISTRY_BASELINE, (
+        "the gated bound tests read the recorded baseline; run "
+        "test_transcript_registry_scale_baseline first (file order does this)"
+    )
+    return _REGISTRY_BASELINE
+
+
+async def _sample_ticks(
+    tick: Callable[[], Awaitable[None]], counter: _VisitCounter
+) -> tuple[list[float], list[int]]:
+    """Warm up, then time ``_REGISTRY_TICKS`` reconcile ticks.
+
+    Returns one wall-clock millisecond sample per tick plus the registry
+    visits the counting ``unit_ids`` observed during it; ``counter`` resets
+    per sample.
+    """
+    await tick()  # warmup, excluded from the samples and the visit counts
+    tick_ms: list[float] = []
+    visits_per_tick: list[int] = []
+    for _ in range(_REGISTRY_TICKS):
+        counter.visits = 0
+        started = perf_counter_ns()
+        await tick()
+        tick_ms.append((perf_counter_ns() - started) / 1_000_000)
+        visits_per_tick.append(counter.visits)
+    return tick_ms, visits_per_tick
+
+
+async def _measure_engine_window(
+    entries: list[PublicHistoryEntry], entry_count: int
+) -> dict[str, object]:
+    """Admit a bare engine window and time its registry-wide scans.
+
+    Kept in its own frame so the registry is released when it returns; the
+    presenter phase below builds its own window.
+    """
+    window = TranscriptWindow(
+        tools_collapsed=True,
+        expansion_state=ToolGroupExpansionState(),
+        entry_expansion_state=EntryExpansionState(),
+    )
+    admission_ms: list[float] = []
+
+    async def admit() -> None:
+        started = perf_counter_ns()
+        window.admit(entries, start_index=0, geometry_width=_REGISTRY_GEOMETRY_WIDTH)
+        admission_ms.append((perf_counter_ns() - started) / 1_000_000)
+
+    rss_before = rss_mib()
+    admission_lag = await measure_loop_lag(admit())
+    rss_after = rss_mib()
+    rss_peak = rss_peak_mib()
+
+    assert len(window.unit_ids) == entry_count
+    assert len(window.units) == entry_count
+    placements = _StubPlacementStream(_REGISTRY_GEOMETRY_WIDTH)
+    _place_resident_units(window, placements)
+    view = _StubMessagesArea(_REGISTRY_GEOMETRY_WIDTH, _REGISTRY_VIEWPORT_HEIGHT)
+
+    def placeholders_scan() -> None:
+        any(unit.placeholders for unit in window.units.values())
+
+    def eviction_scan() -> None:
+        window.eviction_candidates(view.region.y, view.region.height)
+
+    scan_ms = {
+        # The presenter's placeholder gate: a full miss visits every unit.
+        "has_placeholders": percentiles(
+            repeat_timed_ms(placeholders_scan, reps=_REGISTRY_TICKS)
+        ),
+        "eviction_candidates": percentiles(
+            repeat_timed_ms(eviction_scan, reps=_REGISTRY_TICKS)
+        ),
+    }
+
+    # The anchor query is batched per sample: a single indexed lookup costs
+    # microseconds, which the millisecond percentile rounding cannot resolve.
+    counter = _VisitCounter()
+    window.unit_ids = _CountingUnitIds(window.unit_ids, counter)
+
+    def anchor_scan() -> None:
+        for _ in range(_REGISTRY_ANCHOR_QUERIES):
+            reading = window.capture_anchor(cast(Widget, view), following=True)
+            assert reading is not None
+
+    counter.visits = 0
+    scan_ms["capture_anchor"] = percentiles(
+        repeat_timed_ms(anchor_scan, reps=_REGISTRY_ANCHOR_REPS)
+    )
+    anchor_visits = counter.visits
+
+    # Residency must stay fixed: nothing evicted, nothing replaced.
+    assert window.eviction_candidates(view.region.y, view.region.height) == []
+    assert (
+        sum(len(unit.mounted_roots) for unit in window.units.values())
+        == _REGISTRY_RESIDENT_UNITS
+    )
+    return {
+        "admission_ms": percentiles(admission_ms),
+        "admission_loop_lag_ms": admission_lag,
+        "rss_delta_mib": round(rss_after - rss_before, 3),
+        "rss_after_mib": round(rss_after, 3),
+        "rss_peak_mib": round(rss_peak, 3),
+        "scan_ms": scan_ms,
+        "anchor_registry_visits": anchor_visits,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.perf
+@pytest.mark.timeout(_REGISTRY_TIMEOUT)
+@pytest.mark.parametrize("entry_count", _REGISTRY_SIZES)
+async def test_transcript_registry_scale_baseline(entry_count: int) -> None:
+    """Record registry-scale reconcile costs and assert the frozen ceilings."""
+    entries = _build_registry_entries(entry_count)
+    checkpoint_count = entry_count // _REGISTRY_CHECKPOINT_STRIDE
+
+    engine = await _measure_engine_window(entries, entry_count)
+    engine_scan_ms = cast(dict[str, dict[str, float]], engine["scan_ms"])
+    admission_stats = cast(dict[str, float], engine["admission_ms"])
+    rss_delta = cast(float, engine["rss_delta_mib"])
+
+    # --- presenter window: the real per-tick gate -------------------------
+    presenter = TranscriptPresenter(get_show_timestamps=lambda: False)
+    presenter._bind_app(  # the presenter's documented late-bind seam
+        cast(
+            ChartreuxApp,
+            _PresenterHostStub(_REGISTRY_GEOMETRY_WIDTH, _REGISTRY_VIEWPORT_HEIGHT),
+        )
+    )
+    window = presenter._transcript
+
+    # Allocation pass: tracing inflates latency, so this one is memory only.
+    with alloc_peak() as admission_alloc:
+        traced_started = perf_counter_ns()
+        window.admit(entries, start_index=0, geometry_width=_REGISTRY_GEOMETRY_WIDTH)
+        traced_admission_ms = (perf_counter_ns() - traced_started) / 1_000_000
+
+    _place_resident_units(window, _StubPlacementStream(_REGISTRY_GEOMETRY_WIDTH))
+    counter = _VisitCounter()
+    window.unit_ids = _CountingUnitIds(window.unit_ids, counter)
+
+    async def tick() -> None:
+        presenter.request_transcript_reconcile()
+        task = window._reconcile_task
+        assert task is not None
+        await task
+
+    tick_ms, visits_per_tick = await _sample_ticks(tick, counter)
+    assert len(set(visits_per_tick)) == 1, "registry visits drifted between ticks"
+    # Post-P3b2b the gate answers from the reconcile indexes, so an unchanged
+    # tick no longer traverses unit_ids at all; the count below records that.
+
+    with alloc_peak() as tick_alloc:
+        for _ in range(_REGISTRY_TICKS):
+            await tick()
+
+    # --- ACTIVE-TURN VARIANT: the same registry, a live turn ---------------
+    # The app sets this marker at TurnStarted; the fixture's host starts idle,
+    # so the assignment below is the same transition on the same registry. The
+    # pin loop then bisects the start_index-ordered unit_ids to the turn's
+    # suffix instead of walking the registry, and it iterates a plain-list
+    # slice, so _CountingUnitIds does not count those visits: tick time, not
+    # the visit counter, is what bounds this path.
+    active_turn_start = entry_count - _REGISTRY_ACTIVE_TURN_UNITS
+    presenter._app._active_turn_start = active_turn_start
+    active_tick_ms, active_visits_per_tick = await _sample_ticks(tick, counter)
+    assert len(set(active_visits_per_tick)) == 1, (
+        "active-turn registry visits drifted between ticks"
+    )
+    pinned_ids = {
+        unit_id
+        for unit_id in window.unit_ids
+        if window.units[unit_id].start_index >= active_turn_start
+    }
+    # Pin coverage must equal the start_index range the bisect resolves: a
+    # cheaper tick that pins less (or pins the whole registry) is a behavior
+    # change this bound must not absorb.
+    assert pinned_ids == set(window.unit_ids[-_REGISTRY_ACTIVE_TURN_UNITS:]), (
+        "active-turn pin coverage diverged from the start_index range"
+    )
+    assert all(
+        "active-turn" in window.units[unit_id].pin_reasons for unit_id in pinned_ids
+    ), "the active turn did not pin every unit in its range"
+    assert not any(
+        "active-turn" in unit.pin_reasons
+        for unit_id, unit in window.units.items()
+        if unit_id not in pinned_ids
+    ), "the active turn pinned units before its start"
+
+    with alloc_peak() as active_tick_alloc:
+        for _ in range(_REGISTRY_TICKS):
+            await tick()
+
+    assert all(
+        window.units[unit_id].mounted_roots
+        for unit_id in window.unit_ids[-_REGISTRY_RESIDENT_UNITS:]
+    )
+    assert not any(unit.placeholders for unit in window.units.values())
+
+    # --- PLACEHOLDERS-HEAVY VARIANT (deep-review rerun E1) -----------------
+    # The variants above assert zero placeholders, so they cannot see the
+    # restore path's per-tick cost. This one evicts every unit except the
+    # resident tail, so placeholders dominate the registry; the frozen P3b2b
+    # bounds below must hold on it exactly as on the idle/active-turn variants.
+    presenter._app._active_turn_start = None
+    for unit in window.units.values():
+        unit.pin_reasons.clear()
+    evicted_count = _evict_to_placeholders(window, _REGISTRY_RESIDENT_UNITS)
+    assert evicted_count == entry_count - _REGISTRY_RESIDENT_UNITS
+    assert window.has_placeholders
+    placeholders_tick_ms, placeholders_visits = await _sample_ticks(tick, counter)
+    assert len(set(placeholders_visits)) == 1, (
+        "placeholders-variant registry visits drifted between ticks"
+    )
+    with alloc_peak() as placeholders_tick_alloc:
+        for _ in range(_REGISTRY_TICKS):
+            await tick()
+    # Residency must stay fixed through the variant: nothing was restored.
+    assert all(
+        window.units[unit_id].mounted_roots
+        for unit_id in window.unit_ids[-_REGISTRY_RESIDENT_UNITS:]
+    )
+    assert len(window._shadow.placeholders) == evicted_count
+
+    # --- COMBINED LIVE+PLACEHOLDERS VARIANT (deep-review round 3, finding 1) --
+    # The placeholders variant above leaves every unit non-live, so its dirty
+    # set empties and the empty-clear releases the hash table. This variant
+    # keeps the resident tail LIVE while the registry-wide dirty spike
+    # settles, so the surviving live members keep live_dirty nonempty; its
+    # table must compact back to live membership, or every tick's
+    # sorted(live_dirty) scan walks the spike-sized table. Measured pre-fix:
+    # 0.05648/0.11711/0.34933 ms at 1k/10k/50k = 6.185x against the frozen
+    # 2.0x flat-scaling bound, with a ~2 MB table behind 24 members.
+    resident_ids = window.unit_ids[-_REGISTRY_RESIDENT_UNITS:]
+    presenter._app.event_handler = cast(
+        "Any",
+        _RetainedWidgetsStub([
+            window.units[unit_id].mounted_roots[0] for unit_id in resident_ids
+        ]),
+    )
+    window._mark_live_dirty(window.units.keys())  # the placement-transition spike
+    live_tick_ms, live_visits = await _sample_ticks(tick, counter)
+    assert len(set(live_visits)) == 1, (
+        "live+placeholders-variant registry visits drifted between ticks"
+    )
+    with alloc_peak() as live_tick_alloc:
+        for _ in range(_REGISTRY_TICKS):
+            await tick()
+    # Residency and liveness must stay fixed through the variant: nothing
+    # restored, the resident tail live, everything else observed dead.
+    assert all(window.units[unit_id].mounted_roots for unit_id in resident_ids)
+    assert len(window._shadow.placeholders) == evicted_count
+    assert window._shadow.live == set(resident_ids)
+    assert set(window._shadow.live_dirty) == set(resident_ids)
+
+    # --- MOUNTED-SPIKE VARIANT (deep-review round 4, finding G) ------------
+    # The variants above mount only the resident tail before creating
+    # placeholders, so shadow.mounted never spikes and its hash table stays
+    # small. This variant mounts the WHOLE registry first (the spike), then
+    # evicts back down to the resident tail with placeholders: mounted ends
+    # at 24 members behind a peak-sized table, and the per-tick selection and
+    # eviction scans iterate mounted, so pre-fix they walk the spike table
+    # (measured tick p50 0.095/0.206/0.681 ms at 1k/10k/50k = 7.18x against
+    # the frozen 2.0x bound; rehashing mounted alone drops the 50k tick to
+    # 0.087 ms).
+    for unit_id in window.unit_ids[:-_REGISTRY_RESIDENT_UNITS]:
+        unit = window.units[unit_id]
+        unit.placeholders = []
+        unit.mounted_roots = [cast("Any", _SpikeRoot())]
+        window._shadow_unit(unit)
+    assert len(window._shadow.mounted) == entry_count
+    assert _evict_to_placeholders(window, _REGISTRY_RESIDENT_UNITS) == evicted_count
+    mounted_spike_tick_ms, mounted_spike_visits = await _sample_ticks(tick, counter)
+    assert len(set(mounted_spike_visits)) == 1, (
+        "mounted-spike-variant registry visits drifted between ticks"
+    )
+    with alloc_peak() as mounted_spike_tick_alloc:
+        for _ in range(_REGISTRY_TICKS):
+            await tick()
+    # Residency must stay fixed through the variant: nothing was restored,
+    # the resident tail mounted, everything else a placeholder again.
+    assert all(window.units[unit_id].mounted_roots for unit_id in resident_ids)
+    assert len(window._shadow.placeholders) == evicted_count
+    assert set(window._shadow.mounted) == set(resident_ids)
+    resident_set = set(resident_ids)
+
+    # --- LIVE-MEMBERSHIP SPIKE VARIANT (deep-review round 5, finding 1) ---
+    # No variant above leaves ``live`` behind a peak-sized table: it only
+    # grows while a unit stays retained, and the variants that settle the
+    # dirty set re-observe the same resident tail. This one retains the WHOLE
+    # registry for one observation pass (the live spike), then settles back
+    # onto the resident tail. The presenter reads ``frozenset(shadow.live)``
+    # on every protection tick, so pre-fix the tick walked the spike-sized
+    # table: measured tick p50 0.100/0.127/0.215 ms at 1k/10k/50k = 2.15x
+    # against the frozen 2.0x bound, at 2,097,368 B behind 24 members.
+    window._mark_live_dirty(window.unit_ids)
+    for unit_id in window.unit_ids:
+        window._observe_live(unit_id, True)  # the live-membership spike
+    assert len(window._shadow.live) == entry_count
+    live_spike_table_bytes = sys.getsizeof(window._shadow.live)
+    window._mark_live_dirty(window.unit_ids)
+    for unit_id in window.unit_ids:
+        window._observe_live(unit_id, unit_id in resident_set)
+    assert window._shadow.live == resident_set
+    live_settled_table_bytes = sys.getsizeof(window._shadow.live)
+    live_spike_tick_ms, live_spike_visits = await _sample_ticks(tick, counter)
+    assert len(set(live_spike_visits)) == 1, (
+        "live-spike-variant registry visits drifted between ticks"
+    )
+    with alloc_peak() as live_spike_tick_alloc:
+        for _ in range(_REGISTRY_TICKS):
+            await tick()
+    # Membership must stay settled through the variant: the resident tail
+    # live, everything else placeholder.
+    assert window._shadow.live == resident_set
+    assert len(window._shadow.placeholders) == evicted_count
+
+    # --- CHECKPOINT-NEIGHBOUR SPIKE VARIANT (round 5, finding 2) -----------
+    # ``neighbors`` only holds checkpoints with a mounted neighbour, and this
+    # fixture's checkpoints sit on a stride, so no variant above can push the
+    # set past entry_count // _REGISTRY_CHECKPOINT_STRIDE. This one makes
+    # EVERY unit a checkpoint while the whole registry is mounted (the
+    # checkpoint-dense spike), then settles back onto the resident tail. The
+    # presenter reads ``frozenset(shadow.neighbors)`` on every protection
+    # tick, so pre-fix the tick walked the spike-sized table: measured tick
+    # p50 0.101/0.141/0.272 ms = 2.69x against the frozen 2.0x bound, at
+    # 2,097,368 B behind 24 members. Pre-fix this variant also inherited the
+    # previous variant's uncompacted live table (live never shrank either);
+    # that is the same defect and this change releases both.
+    # ``checkpoints`` goes through the same spike but is read per transition,
+    # never per tick, so it is out of this variant's scope.
+    saved_entries = {
+        unit_id: window.units[unit_id].entries for unit_id in window.unit_ids
+    }
+    for unit_id in window.unit_ids[:-_REGISTRY_RESIDENT_UNITS]:
+        unit = window.units[unit_id]
+        unit.placeholders = []
+        unit.mounted_roots = [cast("Any", _SpikeRoot())]
+        window._shadow_unit(unit)
+    spike_checkpoint = _registry_entry(_REGISTRY_CHECKPOINT_STRIDE - 1)
+    for unit_id in window.unit_ids:
+        unit = window.units[unit_id]
+        unit.entries = [spike_checkpoint]
+        window._shadow_entries(unit)
+    # The triple re-derivation can discard a unit whose neighbour had not
+    # been re-derived yet, so re-derive every unit's triple once more.
+    for unit_id in window.unit_ids:
+        window._shadow_neighbors(unit_id)
+    assert len(window._shadow.neighbors) == entry_count
+    neighbors_spike_table_bytes = sys.getsizeof(window._shadow.neighbors)
+    assert _evict_to_placeholders(window, _REGISTRY_RESIDENT_UNITS) == evicted_count
+    for unit_id in window.unit_ids:
+        if unit_id in resident_set:
+            continue
+        window.units[unit_id].entries = saved_entries[unit_id]
+        window._shadow_entries(window.units[unit_id])
+    assert set(window._shadow.neighbors) == resident_set
+    neighbors_settled_table_bytes = sys.getsizeof(window._shadow.neighbors)
+    neighbors_spike_tick_ms, neighbors_spike_visits = await _sample_ticks(tick, counter)
+    assert len(set(neighbors_spike_visits)) == 1, (
+        "neighbors-spike-variant registry visits drifted between ticks"
+    )
+    with alloc_peak() as neighbors_spike_tick_alloc:
+        for _ in range(_REGISTRY_TICKS):
+            await tick()
+    # Membership must stay settled: every resident unit is a checkpoint with
+    # a mounted neighbour, and nothing outside the tail is either.
+    assert set(window._shadow.neighbors) == resident_set
+    assert len(window._shadow.placeholders) == evicted_count
+    # The spike's checkpoint stubs are not part of the fixture's registry, so
+    # put the resident tail's entries back now that the variant is measured.
+    for unit_id in resident_ids:
+        window.units[unit_id].entries = saved_entries[unit_id]
+        window._shadow_entries(window.units[unit_id])
+    del saved_entries
+    # Set semantics survive the settle: re-derive neighbour membership from
+    # the registry and require the index to agree.
+    settled_shadow = window._shadow
+    expected_neighbors = {
+        unit_id
+        for unit_id in window.unit_ids
+        if any(
+            isinstance(entry, PublicCheckpointEntry)
+            for entry in window.units[unit_id].entries
+        )
+        and any(
+            neighbour is not None and neighbour in settled_shadow.mounted
+            for neighbour in (
+                settled_shadow.before.get(unit_id),
+                settled_shadow.after.get(unit_id),
+            )
+        )
+    }
+    assert set(settled_shadow.neighbors) == expected_neighbors, (
+        "neighbor membership diverged from the checkpoint adjacency derivation"
+    )
+
+    tick_p50 = percentiles(tick_ms)["p50"]
+    tick_max = percentiles(tick_ms)["max"]
+    active_tick_p50 = percentiles(active_tick_ms)["p50"]
+    active_tick_max = percentiles(active_tick_ms)["max"]
+    placeholders_tick_p50 = percentiles(placeholders_tick_ms)["p50"]
+    placeholders_tick_max = percentiles(placeholders_tick_ms)["max"]
+    live_tick_p50 = percentiles(live_tick_ms)["p50"]
+    live_tick_max = percentiles(live_tick_ms)["max"]
+    mounted_spike_tick_p50 = percentiles(mounted_spike_tick_ms)["p50"]
+    mounted_spike_tick_max = percentiles(mounted_spike_tick_ms)["max"]
+    live_spike_tick_p50 = percentiles(live_spike_tick_ms)["p50"]
+    live_spike_tick_max = percentiles(live_spike_tick_ms)["max"]
+    neighbors_spike_tick_p50 = percentiles(neighbors_spike_tick_ms)["p50"]
+    neighbors_spike_tick_max = percentiles(neighbors_spike_tick_ms)["max"]
+    anchor_p50 = engine_scan_ms["capture_anchor"]["p50"]
+    anchor_registry_visits = cast(int, engine["anchor_registry_visits"])
+    admission_p50 = cast(dict[str, float], engine["admission_ms"])["p50"]
+
+    record(
+        f"transcript_registry.{entry_count}",
+        {
+            "package": "P0a",
+            "entry_count": entry_count,
+            "registry_units": len(window.units),
+            "checkpoint_units": checkpoint_count,
+            "resident_units": _REGISTRY_RESIDENT_UNITS,
+            "resident_rows": _REGISTRY_RESIDENT_UNITS * _REGISTRY_RESIDENT_ROWS,
+            "geometry": {
+                "width": _REGISTRY_GEOMETRY_WIDTH,
+                "viewport_height": _REGISTRY_VIEWPORT_HEIGHT,
+            },
+            "measured_ticks": _REGISTRY_TICKS,
+            "anchor_query_reps": _REGISTRY_ANCHOR_REPS,
+            "admission_ms": admission_stats,
+            "admission_loop_lag_ms": engine["admission_loop_lag_ms"],
+            "admission_rss_delta_mib": engine["rss_delta_mib"],
+            "admission_rss_after_mib": engine["rss_after_mib"],
+            "admission_rss_peak_mib": engine["rss_peak_mib"],
+            "admission_traced": {
+                "peak_mib": admission_alloc.peak_mib,
+                "net_mib": admission_alloc.net_mib,
+                "traced_ms_not_a_baseline": round(traced_admission_ms, 1),
+            },
+            "engine_scan_ms": engine_scan_ms,
+            "anchor_queries_per_sample": _REGISTRY_ANCHOR_QUERIES,
+            "anchor_registry_visits_per_sample": anchor_registry_visits,
+            "presenter_tick_ms": percentiles(tick_ms),
+            "registry_visits_per_tick": visits_per_tick[0],
+            "presenter_tick_alloc_traced": {
+                "peak_mib": tick_alloc.peak_mib,
+                "net_mib": tick_alloc.net_mib,
+                "ticks": _REGISTRY_TICKS,
+            },
+            "active_turn": {
+                "turn_start_index": active_turn_start,
+                "pinned_units": len(pinned_ids),
+                "presenter_tick_ms": percentiles(active_tick_ms),
+                "registry_visits_per_tick": active_visits_per_tick[0],
+                "presenter_tick_alloc_traced": {
+                    "peak_mib": active_tick_alloc.peak_mib,
+                    "net_mib": active_tick_alloc.net_mib,
+                    "ticks": _REGISTRY_TICKS,
+                },
+            },
+            "placeholders_variant": {
+                "evicted_units": evicted_count,
+                "presenter_tick_ms": percentiles(placeholders_tick_ms),
+                "registry_visits_per_tick": placeholders_visits[0],
+                "presenter_tick_alloc_traced": {
+                    "peak_mib": placeholders_tick_alloc.peak_mib,
+                    "net_mib": placeholders_tick_alloc.net_mib,
+                    "ticks": _REGISTRY_TICKS,
+                },
+            },
+            "live_placeholders_variant": {
+                "evicted_units": evicted_count,
+                "live_units": _REGISTRY_RESIDENT_UNITS,
+                "presenter_tick_ms": percentiles(live_tick_ms),
+                "registry_visits_per_tick": live_visits[0],
+                "presenter_tick_alloc_traced": {
+                    "peak_mib": live_tick_alloc.peak_mib,
+                    "net_mib": live_tick_alloc.net_mib,
+                    "ticks": _REGISTRY_TICKS,
+                },
+            },
+            "mounted_spike_variant": {
+                "spike_units": entry_count,
+                "evicted_units": evicted_count,
+                "mounted_units": _REGISTRY_RESIDENT_UNITS,
+                "presenter_tick_ms": percentiles(mounted_spike_tick_ms),
+                "registry_visits_per_tick": mounted_spike_visits[0],
+                "presenter_tick_alloc_traced": {
+                    "peak_mib": mounted_spike_tick_alloc.peak_mib,
+                    "net_mib": mounted_spike_tick_alloc.net_mib,
+                    "ticks": _REGISTRY_TICKS,
+                },
+            },
+            "live_spike_variant": {
+                "spike_units": entry_count,
+                "live_units": _REGISTRY_RESIDENT_UNITS,
+                "evicted_units": evicted_count,
+                "spike_table_bytes": live_spike_table_bytes,
+                "settled_table_bytes": live_settled_table_bytes,
+                "presenter_tick_ms": percentiles(live_spike_tick_ms),
+                "registry_visits_per_tick": live_spike_visits[0],
+                "presenter_tick_alloc_traced": {
+                    "peak_mib": live_spike_tick_alloc.peak_mib,
+                    "net_mib": live_spike_tick_alloc.net_mib,
+                    "ticks": _REGISTRY_TICKS,
+                },
+            },
+            "neighbors_spike_variant": {
+                "spike_units": entry_count,
+                "neighbor_units": _REGISTRY_RESIDENT_UNITS,
+                "evicted_units": evicted_count,
+                "spike_table_bytes": neighbors_spike_table_bytes,
+                "settled_table_bytes": neighbors_settled_table_bytes,
+                "presenter_tick_ms": percentiles(neighbors_spike_tick_ms),
+                "registry_visits_per_tick": neighbors_spike_visits[0],
+                "presenter_tick_alloc_traced": {
+                    "peak_mib": neighbors_spike_tick_alloc.peak_mib,
+                    "net_mib": neighbors_spike_tick_alloc.net_mib,
+                    "ticks": _REGISTRY_TICKS,
+                },
+            },
+            "measurement_scope": (
+                "no Textual mount: engine scans on a bare TranscriptWindow with "
+                "synthetic placement geometry; the tick drives the real presenter "
+                "gate against a stub host, so DOM layout, restore and paint costs "
+                "are out of scope"
+            ),
+            "memory_scope": (
+                "RSS deltas are first-observation baselines: they vary with heap "
+                "warmth and have no earlier comparison point. The traced admission "
+                "peak is compared against the P0a snapshot-retention baseline by "
+                "the P2b bound; both are valid on the baseline machine only"
+            ),
+            "perf_scope": (
+                "applies in both perf scopes (default 400-entry x 2-rep smoke and "
+                "CHARTREUX_PERF_TRANSCRIPT_FULL=1); this fixture is scope-independent"
+            ),
+            "frozen_ceilings": {
+                "admit_p50_ms": _REGISTRY_ADMIT_P50_CEILING_MS[entry_count],
+                "tick_p50_ms": _REGISTRY_TICK_P50_CEILING_MS[entry_count],
+                "tick_max_ms": _REGISTRY_TICK_MAX_CEILING_MS[entry_count],
+                "tick_alloc_mib": _REGISTRY_TICK_ALLOC_CEILING_MIB[entry_count],
+                "admit_alloc_mib": _REGISTRY_ADMIT_ALLOC_CEILING_MIB[entry_count],
+                "admit_rss_mib": _REGISTRY_ADMIT_RSS_CEILING_MIB[entry_count],
+            },
+            "frozen_improvement_bounds": {
+                "p3b2b_flat_scaling_max_ratio": _P3B2B_FLAT_SCALING_MAX_RATIO,
+                "p3b2b_unchanged_tick_max_ms": _P3B2B_UNCHANGED_TICK_MAX_MS,
+                "p3b2b_alloc_plateau_max_mib": _P3B2B_ALLOC_PLATEAU_MAX_MIB,
+                "p3b1_anchor_scaling_max_ratio": _P3B1_ANCHOR_SCALING_MAX_RATIO,
+                "p2b_admit_alloc_reduction_min_pct": (
+                    _P2B_ADMIT_ALLOC_REDUCTION_MIN_PCT
+                ),
+            },
+            "active_assertions": [
+                "p2b:test_transcript_registry_scale_baseline",
+                "p3b1:test_transcript_registry_anchor_scaling_bound",
+                "p3b2b:test_transcript_registry_flat_scaling_bound",
+                "p3b2b:test_transcript_registry_unchanged_tick_bound",
+                "p3b2b:test_transcript_registry_allocation_plateau_bound",
+            ],
+            "machine": machine_context(),
+        },
+    )
+
+    _REGISTRY_BASELINE[entry_count] = {
+        "admission_p50_ms": admission_p50,
+        "admission_alloc_peak_mib": admission_alloc.peak_mib,
+        "admission_rss_delta_mib": rss_delta,
+        "tick_p50_ms": tick_p50,
+        "tick_max_ms": tick_max,
+        "tick_alloc_peak_mib": tick_alloc.peak_mib,
+        "active_turn_tick_p50_ms": active_tick_p50,
+        "active_turn_tick_max_ms": active_tick_max,
+        "active_turn_tick_alloc_peak_mib": active_tick_alloc.peak_mib,
+        "active_turn_pinned_units": float(len(pinned_ids)),
+        "placeholders_tick_p50_ms": placeholders_tick_p50,
+        "placeholders_tick_max_ms": placeholders_tick_max,
+        "placeholders_tick_alloc_peak_mib": placeholders_tick_alloc.peak_mib,
+        "placeholders_units": float(evicted_count),
+        "live_placeholders_tick_p50_ms": live_tick_p50,
+        "live_placeholders_tick_max_ms": live_tick_max,
+        "live_placeholders_tick_alloc_peak_mib": live_tick_alloc.peak_mib,
+        "mounted_spike_tick_p50_ms": mounted_spike_tick_p50,
+        "mounted_spike_tick_max_ms": mounted_spike_tick_max,
+        "mounted_spike_tick_alloc_peak_mib": mounted_spike_tick_alloc.peak_mib,
+        "live_spike_tick_p50_ms": live_spike_tick_p50,
+        "live_spike_tick_max_ms": live_spike_tick_max,
+        "live_spike_tick_alloc_peak_mib": live_spike_tick_alloc.peak_mib,
+        "live_spike_table_bytes": float(live_spike_table_bytes),
+        "live_spike_settled_table_bytes": float(live_settled_table_bytes),
+        "neighbors_spike_tick_p50_ms": neighbors_spike_tick_p50,
+        "neighbors_spike_tick_max_ms": neighbors_spike_tick_max,
+        "neighbors_spike_tick_alloc_peak_mib": neighbors_spike_tick_alloc.peak_mib,
+        "neighbors_spike_table_bytes": float(neighbors_spike_table_bytes),
+        "neighbors_spike_settled_table_bytes": float(neighbors_settled_table_bytes),
+        "anchor_p50_ms": anchor_p50,
+        "anchor_registry_visits": float(anchor_registry_visits),
+        "registry_units": float(len(window.units)),
+        "registry_visits_per_tick": float(visits_per_tick[0]),
+    }
+
+    # Frozen ceilings: non-regression upper bounds, always asserted.
+    assert admission_p50 <= _REGISTRY_ADMIT_P50_CEILING_MS[entry_count], (
+        f"registry admission p50 {admission_p50:.1f} ms exceeds the frozen "
+        f"ceiling {_REGISTRY_ADMIT_P50_CEILING_MS[entry_count]} ms"
+    )
+    assert tick_p50 <= _REGISTRY_TICK_P50_CEILING_MS[entry_count], (
+        f"presenter tick p50 {tick_p50:.1f} ms exceeds the frozen ceiling "
+        f"{_REGISTRY_TICK_P50_CEILING_MS[entry_count]} ms"
+    )
+    assert tick_max <= _REGISTRY_TICK_MAX_CEILING_MS[entry_count], (
+        f"presenter tick max {tick_max:.1f} ms exceeds the frozen ceiling "
+        f"{_REGISTRY_TICK_MAX_CEILING_MS[entry_count]} ms"
+    )
+    assert tick_alloc.peak_mib <= _REGISTRY_TICK_ALLOC_CEILING_MIB[entry_count], (
+        f"tick allocation peak {tick_alloc.peak_mib} MiB exceeds the frozen "
+        f"ceiling {_REGISTRY_TICK_ALLOC_CEILING_MIB[entry_count]} MiB"
+    )
+    assert live_tick_p50 <= _REGISTRY_TICK_P50_CEILING_MS[entry_count], (
+        f"live+placeholders presenter tick p50 {live_tick_p50:.1f} ms exceeds "
+        f"the frozen ceiling {_REGISTRY_TICK_P50_CEILING_MS[entry_count]} ms"
+    )
+    assert live_tick_max <= _REGISTRY_TICK_MAX_CEILING_MS[entry_count], (
+        f"live+placeholders presenter tick max {live_tick_max:.1f} ms exceeds "
+        f"the frozen ceiling {_REGISTRY_TICK_MAX_CEILING_MS[entry_count]} ms"
+    )
+    assert live_tick_alloc.peak_mib <= _REGISTRY_TICK_ALLOC_CEILING_MIB[entry_count], (
+        f"live+placeholders tick allocation peak {live_tick_alloc.peak_mib} MiB "
+        f"exceeds the frozen ceiling "
+        f"{_REGISTRY_TICK_ALLOC_CEILING_MIB[entry_count]} MiB"
+    )
+    assert mounted_spike_tick_p50 <= _REGISTRY_TICK_P50_CEILING_MS[entry_count], (
+        f"mounted-spike presenter tick p50 {mounted_spike_tick_p50:.1f} ms exceeds "
+        f"the frozen ceiling {_REGISTRY_TICK_P50_CEILING_MS[entry_count]} ms"
+    )
+    assert mounted_spike_tick_max <= _REGISTRY_TICK_MAX_CEILING_MS[entry_count], (
+        f"mounted-spike presenter tick max {mounted_spike_tick_max:.1f} ms exceeds "
+        f"the frozen ceiling {_REGISTRY_TICK_MAX_CEILING_MS[entry_count]} ms"
+    )
+    assert (
+        mounted_spike_tick_alloc.peak_mib
+        <= _REGISTRY_TICK_ALLOC_CEILING_MIB[entry_count]
+    ), (
+        f"mounted-spike tick allocation peak {mounted_spike_tick_alloc.peak_mib} "
+        f"MiB exceeds the frozen ceiling "
+        f"{_REGISTRY_TICK_ALLOC_CEILING_MIB[entry_count]} MiB"
+    )
+    assert live_spike_tick_p50 <= _REGISTRY_TICK_P50_CEILING_MS[entry_count], (
+        f"live-spike presenter tick p50 {live_spike_tick_p50:.1f} ms exceeds "
+        f"the frozen ceiling {_REGISTRY_TICK_P50_CEILING_MS[entry_count]} ms"
+    )
+    assert live_spike_tick_max <= _REGISTRY_TICK_MAX_CEILING_MS[entry_count], (
+        f"live-spike presenter tick max {live_spike_tick_max:.1f} ms exceeds "
+        f"the frozen ceiling {_REGISTRY_TICK_MAX_CEILING_MS[entry_count]} ms"
+    )
+    assert (
+        live_spike_tick_alloc.peak_mib <= _REGISTRY_TICK_ALLOC_CEILING_MIB[entry_count]
+    ), (
+        f"live-spike tick allocation peak {live_spike_tick_alloc.peak_mib} MiB "
+        f"exceeds the frozen ceiling "
+        f"{_REGISTRY_TICK_ALLOC_CEILING_MIB[entry_count]} MiB"
+    )
+    assert neighbors_spike_tick_p50 <= _REGISTRY_TICK_P50_CEILING_MS[entry_count], (
+        f"neighbors-spike presenter tick p50 {neighbors_spike_tick_p50:.1f} ms "
+        f"exceeds the frozen ceiling {_REGISTRY_TICK_P50_CEILING_MS[entry_count]} ms"
+    )
+    assert neighbors_spike_tick_max <= _REGISTRY_TICK_MAX_CEILING_MS[entry_count], (
+        f"neighbors-spike presenter tick max {neighbors_spike_tick_max:.1f} ms "
+        f"exceeds the frozen ceiling {_REGISTRY_TICK_MAX_CEILING_MS[entry_count]} ms"
+    )
+    assert (
+        neighbors_spike_tick_alloc.peak_mib
+        <= _REGISTRY_TICK_ALLOC_CEILING_MIB[entry_count]
+    ), (
+        f"neighbors-spike tick allocation peak "
+        f"{neighbors_spike_tick_alloc.peak_mib} MiB exceeds the frozen ceiling "
+        f"{_REGISTRY_TICK_ALLOC_CEILING_MIB[entry_count]} MiB"
+    )
+    assert admission_alloc.peak_mib <= _REGISTRY_ADMIT_ALLOC_CEILING_MIB[entry_count], (
+        f"admission allocation peak {admission_alloc.peak_mib} MiB exceeds the "
+        f"frozen ceiling {_REGISTRY_ADMIT_ALLOC_CEILING_MIB[entry_count]} MiB"
+    )
+    assert rss_delta <= _REGISTRY_ADMIT_RSS_CEILING_MIB[entry_count], (
+        f"admission RSS delta {rss_delta} MiB exceeds the frozen ceiling "
+        f"{_REGISTRY_ADMIT_RSS_CEILING_MIB[entry_count]} MiB"
+    )
+
+    # FROZEN IMPROVEMENT BOUND (P2b): admission keeps per-entry fingerprints
+    # instead of deep copies, so the traced admission peak must sit well below
+    # the P0a snapshot-retention baseline recorded with the copies live.
+    p0a_peak = _P2B_BASELINE_ADMIT_ALLOC_PEAK_MIB[entry_count]
+    reduction_pct = (1 - admission_alloc.peak_mib / p0a_peak) * 100
+    assert reduction_pct >= _P2B_ADMIT_ALLOC_REDUCTION_MIN_PCT, (
+        f"admission allocation peak {admission_alloc.peak_mib} MiB is only "
+        f"{reduction_pct:.1f}% below the P0a snapshot-retention baseline "
+        f"{p0a_peak} MiB; P2b must hold "
+        f"{_P2B_ADMIT_ALLOC_REDUCTION_MIN_PCT}%"
+    )
+
+
+# TURNED ON by P3b2b's gate cutover (the reconcile indexes are now the live
+# path): these three are that package's acceptance values. They are asserted
+# on ALL SEVEN recorded variants -- the idle gate, the active-turn pin path,
+# the placeholders-heavy restore path, the combined live+placeholders
+# variant, the mounted-spike variant, and the live-membership and
+# checkpoint-neighbour spike variants -- because an active turn, a
+# placeholder-dominated registry, a dirty spike that settles onto live
+# survivors, a residency spike that settles onto the resident tail, and a
+# live/neighbour spike that settles behind a peak-sized hash table are the
+# cases the deep-review rounds found unbounded.
+_IDLE_VARIANT = "idle"
+_ACTIVE_TURN_VARIANT = "active_turn"
+_PLACEHOLDERS_VARIANT = "placeholders"
+_LIVE_PLACEHOLDERS_VARIANT = "live_placeholders"
+_MOUNTED_SPIKE_VARIANT = "mounted_spike"
+_LIVE_SPIKE_VARIANT = "live_spike"
+_NEIGHBORS_SPIKE_VARIANT = "neighbors_spike"
+_REGISTRY_TICK_VARIANTS = (
+    _IDLE_VARIANT,
+    _ACTIVE_TURN_VARIANT,
+    _PLACEHOLDERS_VARIANT,
+    _LIVE_PLACEHOLDERS_VARIANT,
+    _MOUNTED_SPIKE_VARIANT,
+    _LIVE_SPIKE_VARIANT,
+    _NEIGHBORS_SPIKE_VARIANT,
+)
+
+
+def _variant_tick_metrics(entry_count: int, variant: str) -> dict[str, float]:
+    """Recorded tick metrics for one variant at one registry size.
+
+    The idle variant's keys are the unprefixed P0a record; the active-turn
+    variant's carry its prefix.
+    """
+    baseline = _frozen_registry_baseline()[entry_count]
+    prefix = "" if variant == _IDLE_VARIANT else f"{variant}_"
+    return {
+        "tick_p50_ms": baseline[f"{prefix}tick_p50_ms"],
+        "tick_alloc_peak_mib": baseline[f"{prefix}tick_alloc_peak_mib"],
+    }
+
+
+def test_transcript_registry_flat_scaling_bound() -> None:
+    for variant in _REGISTRY_TICK_VARIANTS:
+        root = _variant_tick_metrics(_REGISTRY_SIZES[0], variant)["tick_p50_ms"]
+        top = _variant_tick_metrics(_REGISTRY_TOP_SIZE, variant)["tick_p50_ms"]
+        ratio = top / root
+        assert ratio <= _P3B2B_FLAT_SCALING_MAX_RATIO, (
+            f"{variant} presenter tick p50 grew {ratio:.2f}x from "
+            f"{_REGISTRY_SIZES[0]} to {_REGISTRY_TOP_SIZE} units at fixed "
+            f"residency; P3b2b must hold {_P3B2B_FLAT_SCALING_MAX_RATIO}x"
+        )
+
+
+def test_transcript_registry_unchanged_tick_bound() -> None:
+    for variant in _REGISTRY_TICK_VARIANTS:
+        tick_p50 = _variant_tick_metrics(_REGISTRY_TOP_SIZE, variant)["tick_p50_ms"]
+        assert tick_p50 <= _P3B2B_UNCHANGED_TICK_MAX_MS, (
+            f"{variant} presenter tick p50 at {_REGISTRY_TOP_SIZE} units is "
+            f"{tick_p50:.2f} ms; P3b2b must hold the unchanged-tick bound "
+            f"{_P3B2B_UNCHANGED_TICK_MAX_MS} ms"
+        )
+
+
+def test_transcript_registry_allocation_plateau_bound() -> None:
+    for variant in _REGISTRY_TICK_VARIANTS:
+        peak = _variant_tick_metrics(_REGISTRY_TOP_SIZE, variant)["tick_alloc_peak_mib"]
+        assert peak <= _P3B2B_ALLOC_PLATEAU_MAX_MIB, (
+            f"{variant} traced tick allocation peak at {_REGISTRY_TOP_SIZE} "
+            f"units is {peak:.4f} MiB; P3b2b must hold the allocation plateau "
+            f"{_P3B2B_ALLOC_PLATEAU_MAX_MIB} MiB"
+        )
+
+
+# TURNED ON by P3b1: the ordered placement index replaced the oldest-first
+# anchor scan this bound measures.
+def test_transcript_registry_anchor_scaling_bound() -> None:
+    baseline = _frozen_registry_baseline()
+    root = baseline[_REGISTRY_SIZES[0]]["anchor_p50_ms"]
+    top = baseline[_REGISTRY_TOP_SIZE]["anchor_p50_ms"]
+    ratio = top / root
+    assert ratio <= _P3B1_ANCHOR_SCALING_MAX_RATIO, (
+        f"anchor query p50 grew {ratio:.2f}x from {_REGISTRY_SIZES[0]} to "
+        f"{_REGISTRY_TOP_SIZE} units; P3b1 must hold "
+        f"{_P3B1_ANCHOR_SCALING_MAX_RATIO}x"
+    )
+    visits = baseline[_REGISTRY_TOP_SIZE]["anchor_registry_visits"]
+    assert visits <= _P3B1_ANCHOR_REGISTRY_VISIT_CEILING, (
+        f"anchor query walks {visits:.0f} registry units per sample at "
+        f"{_REGISTRY_TOP_SIZE}; the placement index must answer from content "
+        f"order alone"
     )

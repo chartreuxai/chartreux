@@ -227,6 +227,7 @@ from the end, preserving directory and context.
 | Key | Default | Accepted value |
 | --- | --- | --- |
 | `enable_notifications` | `true` | Boolean. |
+| `emit_program_status` | `true` | Boolean; report `idle`, `working`, `blocked`, `done`, and `error` to a supporting terminal with OSC 7501 as the terminal's root program-status record, which Chartreux clears when it exits. See [program status](../guides/terminal.md#program-status-osc-7501). |
 | `enable_system_trust_store` | `false` | Boolean; use OS roots instead of bundled Certifi roots. See [networking](../integrations/networking.md). |
 | `api_timeout` | `720.0` | Number of seconds. |
 | `api_retry_max_elapsed_time` | `300.0` | Number of seconds. |
